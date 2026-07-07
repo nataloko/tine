@@ -23,6 +23,9 @@ samples/*/publish
 screenshots/
 scripts/app-icon-1024.png
 
+# Local verification build artifacts (scripts/build-appimage-container.sh)
+*.AppImage
+
 # Local agent working agreement (per-machine, not shared)
 /CLAUDE.md
 
