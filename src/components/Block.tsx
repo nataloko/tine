@@ -88,6 +88,7 @@ import { calcSource, wrapCalc, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
 import { seedAssetBlob } from "../assetCache";
+import { newDiagramName, BLANK_DRAWIO_SVG, launchEditor } from "../diagramEditors";
 import { openPageInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
@@ -1209,6 +1210,32 @@ export function Editor(props: { id: string }): JSX.Element {
     }
   };
 
+  // Create a new blank drawio diagram: write the editable-SVG stub as an asset,
+  // insert its image reference at the caret, then open it in the external editor.
+  // Mirrors uploadAsset (await the save → build the ref from the final name).
+  const createDiagram = async () => {
+    try {
+      const name = newDiagramName();
+      const bytes = new TextEncoder().encode(BLANK_DRAWIO_SVG);
+      const saved = await backend().saveAsset(name, bytes);
+      seedAssetBlob(saved, bytes); // render the (blank) diagram without a re-read
+      const md = assetMarkdown(saved);
+      const pos = ref.selectionStart;
+      const nr = ref.value.slice(0, pos) + md + ref.value.slice(pos);
+      commit(nr);
+      const c = pos + md.length;
+      queueMicrotask(() => {
+        ref.value = nr;
+        ref.setSelectionRange(c, c);
+        ref.focus();
+        autosize();
+      });
+      await launchEditor(saved);
+    } catch (err) {
+      pushToast(`Couldn’t create the diagram (${String(err)})`, "error");
+    }
+  };
+
   const selectAc = (item: AcItem) => {
     const t = ac();
     if (!t) return;
@@ -1272,6 +1299,10 @@ export function Editor(props: { id: string }): JSX.Element {
       case "upload-asset":
         replaceTrigger(""); // drop the "/upload" trigger text
         uploadAsset();
+        return;
+      case "create-drawio":
+        replaceTrigger(""); // drop the "/drawio" trigger text
+        createDiagram();
         return;
       case "priority-a":
       case "priority-b":

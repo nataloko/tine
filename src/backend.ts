@@ -139,6 +139,11 @@ export interface Backend {
   /** Open a graph asset (by its `assets/`-relative name) in the OS default app —
    *  e.g. a video/audio file in the system player. */
   openAsset(name: string): Promise<void>;
+  /** Open an `assets/`-relative file in an external EDITOR. `command` is the
+   *  user's launcher (null → the OS file association). Desktop only. */
+  editAssetExternal(name: string, command: string | null): Promise<void>;
+  /** Autodetect an installed drawio launcher command, or null. Desktop only. */
+  detectDrawio(): Promise<string | null>;
   /** Top-level `assets/` files no block references (orphans), for cleanup. */
   listOrphanAssets(): Promise<AssetInfo[]>;
   /** Move an orphaned asset to the recoverable trash. */
@@ -453,6 +458,12 @@ class TauriBackend implements Backend {
   }
   openAsset(name: string) {
     return this.call<void>("open_asset", { name });
+  }
+  editAssetExternal(name: string, command: string | null) {
+    return this.call<void>("edit_asset_external", { name, command });
+  }
+  detectDrawio() {
+    return this.call<string | null>("detect_drawio");
   }
   listOrphanAssets() {
     return this.call<AssetInfo[]>("list_orphan_assets");

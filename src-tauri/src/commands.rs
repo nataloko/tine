@@ -1,6 +1,6 @@
 use crate::debug::diag;
 #[cfg(desktop)]
-use crate::platform::opener_command;
+use crate::platform::{opener_command, system_opener};
 use crate::state::{refresh_graph, with_graph, AppState};
 use std::sync::Arc;
 use tauri::State;
@@ -514,35 +514,29 @@ pub(crate) fn import_asset(
     })
 }
 
+/// Resolve an `assets/`-relative `name` to a canonical on-disk path, erroring if
+/// it escapes the assets dir. Shared by every command that spawns an OS handler on
+/// an asset (`open_asset`, `edit_asset_external`) so the path guard lives once.
+fn canon_asset_path(g: &tine_core::model::Graph, name: &str) -> Result<std::path::PathBuf, String> {
+    let assets = g.assets_path();
+    let canon_assets = assets.canonicalize().map_err(|e| e.to_string())?;
+    let canon = assets.join(name).canonicalize().map_err(|e| e.to_string())?;
+    if !canon.starts_with(&canon_assets) {
+        return Err("asset path escapes assets dir".to_string());
+    }
+    Ok(canon)
+}
+
 /// Open a graph asset (by its `assets/`-relative name) in the OS default app,
 /// e.g. a video/audio file in the system player. Path-gated to the assets dir
 /// (canonicalized) so a crafted name can't open a file outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: State<'_, AppState>) -> Result<(), String> {
-    let target = with_graph(&state, |g| {
-        let assets = g.assets_path();
-        let canon_assets = assets.canonicalize().map_err(|e| e.to_string())?;
-        let canon = assets
-            .join(&name)
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        if !canon.starts_with(&canon_assets) {
-            return Err("asset path escapes assets dir".to_string());
-        }
-        Ok(canon)
-    })?;
+    let target = with_graph(&state, |g| canon_asset_path(g, &name))?;
     #[cfg(desktop)]
     {
-        #[cfg(target_os = "linux")]
-        let prog = "xdg-open";
-        #[cfg(target_os = "macos")]
-        let prog = "open";
-        #[cfg(target_os = "windows")]
-        let prog = "explorer";
-        diag(format!(
-            "open_asset: {name} -> {} ({prog})",
-            target.display()
-        ));
+        let prog = system_opener();
+        diag(format!("open_asset: {name} -> {} ({prog})", target.display()));
         opener_command(prog)
             .arg(&target)
             .spawn()
@@ -555,6 +549,162 @@ pub(crate) fn open_asset(name: String, state: State<'_, AppState>) -> Result<(),
         let _ = (&name, &target);
         Err("open asset externally is not supported on this platform".into())
     }
+}
+
+/// Open a graph asset in an external EDITOR (e.g. drawio on a `.drawio.svg`),
+/// piggybacking whatever the user already has installed rather than bundling it.
+///
+/// `command` is the user-configured launcher (Settings → Files → Diagram editors).
+/// When set it is whitespace-split into `program [args…]` — NO shell, so a crafted
+/// asset name or command can't inject; a `{}` token is replaced by the asset path,
+/// otherwise the path is appended as the final argument. When empty we fall back to
+/// the system opener (the OS file association). The same env-scrub + detach as
+/// `open_asset` applies (see `opener_command`). Path-gated to `assets/`.
+///
+/// Note: the command template is whitespace-split, so a program PATH containing
+/// spaces (some Windows installs) must instead be on `PATH` or use a spaceless
+/// launcher (e.g. `flatpak run …`, `open -a …`). The asset path itself is passed
+/// as one argument, so spaces in the asset name are fine.
+#[tauri::command]
+pub(crate) fn edit_asset_external(
+    name: String,
+    command: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let target = with_graph(&state, |g| canon_asset_path(g, &name))?;
+    #[cfg(desktop)]
+    {
+        let custom = command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        match custom {
+            Some(cmd) => {
+                let mut parts = cmd.split_whitespace();
+                let prog = parts.next().ok_or("empty editor command")?;
+                let mut c = opener_command(prog);
+                let mut placed = false;
+                for a in parts {
+                    if a == "{}" {
+                        c.arg(&target);
+                        placed = true;
+                    } else {
+                        c.arg(a);
+                    }
+                }
+                if !placed {
+                    c.arg(&target);
+                }
+                diag(format!("edit_asset_external: {name} -> {cmd} ({})", target.display()));
+                c.spawn().map_err(|e| e.to_string())?;
+            }
+            None => {
+                let prog = system_opener();
+                diag(format!(
+                    "edit_asset_external: {name} -> {} (system opener {prog})",
+                    target.display()
+                ));
+                opener_command(prog)
+                    .arg(&target)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (&name, &command, &target);
+        Err("editing an asset externally is not supported on this platform".into())
+    }
+}
+
+/// Best-effort autodetect of an installed drawio launcher, used to prefill the
+/// Settings command when it's empty. Returns a ready-to-use command string (the
+/// asset path is appended by `edit_asset_external`), or `None` if not found.
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) fn detect_drawio() -> Option<String> {
+    // 1. A `drawio` / `draw.io` binary on PATH — the common Linux/macOS case.
+    for name in ["drawio", "draw.io"] {
+        if program_on_path(name) {
+            return Some(name.to_string());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 2. Flathub app. Check the EXPORTED LAUNCHER FILE directly (system + user
+        //    installs) rather than only shelling out to `flatpak` — when Tine runs
+        //    as an AppImage the child `flatpak` inherits the bundle's LD_LIBRARY_PATH
+        //    and fails, so a subprocess probe under-reports. `flatpak_app_installed`
+        //    (now env-scrubbed) stays as a fallback for non-standard export dirs.
+        let id = "com.jgraph.drawio.desktop";
+        let mut exports = vec![std::path::PathBuf::from(format!(
+            "/var/lib/flatpak/exports/bin/{id}"
+        ))];
+        if let Some(home) = std::env::var_os("HOME") {
+            exports.push(std::path::Path::new(&home).join(format!(
+                ".local/share/flatpak/exports/bin/{id}"
+            )));
+        }
+        if exports.iter().any(|p| p.exists()) || flatpak_app_installed(id) {
+            return Some(format!("flatpak run {id}"));
+        }
+        // 3. Snap, and common absolute paths not always on a GUI-launched PATH.
+        for p in ["/snap/bin/drawio", "/usr/local/bin/drawio", "/opt/drawio/drawio"] {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    // 4. macOS: the app bundle, launched via `open -a`.
+    #[cfg(target_os = "macos")]
+    if std::path::Path::new("/Applications/draw.io.app").exists() {
+        return Some("open -a draw.io".to_string());
+    }
+    // 5. Windows: a default install location (no spaces, so it survives the split).
+    #[cfg(target_os = "windows")]
+    for p in [r"C:\Program Files\draw.io\draw.io.exe"] {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+/// Android has no external process launch; return `None` so the setting stays empty.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub(crate) fn detect_drawio() -> Option<String> {
+    None
+}
+
+/// Is `name` an executable file on one of the `PATH` directories?
+#[cfg(desktop)]
+fn program_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&paths) {
+        if dir.join(name).is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if dir.join(format!("{name}.exe")).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is a Flatpak app with this id installed? (`flatpak info <id>` exits 0.) Uses the
+/// env-scrubbed `opener_command` so that when Tine runs as an AppImage the child
+/// `flatpak` doesn't inherit the bundle's LD_LIBRARY_PATH and fail to start.
+#[cfg(all(desktop, target_os = "linux"))]
+fn flatpak_app_installed(id: &str) -> bool {
+    opener_command("flatpak")
+        .arg("info")
+        .arg(id)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Orphaned `assets/` files (no block references them) for the cleanup UI.

@@ -1,4 +1,13 @@
+import { createSignal } from "solid-js";
 import { backend } from "./backend";
+
+// Bumped whenever an asset's cached blob is invalidated (e.g. after it was edited
+// externally). <img> loaders (AssetImage) read this so they re-fetch the changed
+// asset without a graph reload. Global epoch + per-rel cache eviction: only the
+// invalidated rel actually re-reads; every other rel is still a cache hit and
+// keeps its existing blob URL, so its <img src> is unchanged (no reload flash).
+const [assetEpoch, setAssetEpoch] = createSignal(0);
+export { assetEpoch };
 
 // Cache of graph-asset blob URLs keyed by path relative to `assets/`. Without it
 // every <img> mount (re-render, scroll back into view, or a second reference to
@@ -106,6 +115,18 @@ export function seedAssetBlob(rel: string, bytes: Uint8Array): string {
   const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: mimeFromExt(rel) }));
   cache.set(rel, Promise.resolve(url));
   return url;
+}
+
+/** Drop the cached blob for `rel` (revoking its URL) and bump `assetEpoch` so any
+ *  mounted <img> for it re-reads the file from disk. Use after the asset's bytes
+ *  changed on disk (e.g. an external editor saved it). */
+export function invalidateAssetBlob(rel: string): void {
+  const prior = cache.get(rel);
+  if (prior) {
+    void prior.then((url) => url && URL.revokeObjectURL(url)).catch(() => {});
+    cache.delete(rel);
+  }
+  setAssetEpoch((n) => n + 1);
 }
 
 /** Revoke every cached blob URL and empty the cache. Call on graph switch so the

@@ -156,6 +156,7 @@ export type CommandAction =
   | "today"
   | "query-builder"
   | "page-props"
+  | "create-drawio"
   | "priority-a"
   | "priority-b"
   | "priority-c";
@@ -197,6 +198,7 @@ export const COMMANDS: Command[] = [
   { label: "Page reference", insert: "[[]]", caret: 2 },
   { label: "Link", insert: "[]()", caret: 1 },
   { label: "Upload an asset", action: "upload-asset" },
+  { label: "Diagram (drawio)", action: "create-drawio", key: "drawio" },
   { label: "Code block", insert: "```\n\n```", caret: 4 },
   { label: "Calculator", insert: "```calc\n\n```", caret: 8 },
   { label: "Quote", insert: "> " },

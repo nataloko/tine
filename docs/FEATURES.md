@@ -91,6 +91,12 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
 - **Orphaned-media cleanup** (Settings → Backups): scan for `assets/` files no block
   references and move them to the recoverable trash — deleting a block never deletes
   its media, so this is how unused files get reclaimed.
+- **Diagrams in a note via your own drawio** (`/drawio`): inserts a new blank
+  `assets/…​.drawio.svg` and opens it in the **drawio you already have installed** —
+  Tine bundles nothing. The diagram renders inline as an image (with an **Edit in
+  drawio** button on hover), and refreshes when you switch back after saving. Because
+  it's a plain SVG image reference, it also renders in Logseq. Point Tine at your
+  launcher in Settings → Files → *drawio command* (autodetected when possible).
 
 ## Linking, references & queries
 

@@ -83,6 +83,7 @@ import {
   STAMPED_ASSET_NAME_FORMAT,
 } from "../assetSettings";
 import { formatAssetName } from "../media";
+import { diagramCommand, setDiagramCommand } from "../diagramEditors";
 import { galleryThemes, selectedGalleryTheme, applyTheme as applyGalleryTheme } from "../themeGallery";
 import type { GalleryTheme } from "../styles/themes";
 import { openPage, openFile } from "../router";
@@ -1611,6 +1612,30 @@ function FilesTab(): JSX.Element {
             Poll (3s)
           </button>
         </div>
+      </Field>
+
+      <div class="settings-section">Diagram editors</div>
+      <Field
+        label="drawio command"
+        hint={
+          <>
+            Tine renders <code>*.drawio.svg</code> diagrams inline and opens them in
+            your own installed <b>drawio</b> — nothing is bundled. The launcher to
+            run, e.g. <code>drawio</code>, <code>flatpak run com.jgraph.drawio.desktop</code>,
+            or <code>open -a draw.io</code> (macOS). The diagram’s path is appended;
+            put <code>{"{}"}</code> where it should go instead. Leave blank to use the
+            system file association. Autodetected on first run when possible.
+          </>
+        }
+      >
+        <input
+          type="text"
+          class="settings-input mono"
+          value={diagramCommand("drawio")}
+          spellcheck={false}
+          placeholder="drawio"
+          onChange={(e) => setDiagramCommand("drawio", e.currentTarget.value)}
+        />
       </Field>
 
       <AssetsTab />

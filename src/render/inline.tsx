@@ -23,7 +23,8 @@ import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
 import { AstBody } from "./body";
 import { backend } from "../backend";
-import { loadAssetBlob, loadLocalImageBlob } from "../assetCache";
+import { loadAssetBlob, loadLocalImageBlob, assetEpoch } from "../assetCache";
+import { editorFor, launchEditor } from "../diagramEditors";
 import { resolveBlockBatched } from "../resolveBatch";
 import { doc, setRaw, formatForPage, formatForBlock } from "../store";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
@@ -499,14 +500,16 @@ function AssetImage(props: {
   // Served from a shared, graph-scoped blob cache so repeated references and
   // re-mounts don't re-read the file or mint duplicate blob URLs. The cache owns
   // the URL's lifetime (cleared on graph switch), so we don't revoke on unmount.
+  // Depends on assetEpoch so an external edit (invalidateAssetBlob) forces a
+  // re-read; `.latest` keeps the prior URL visible during the refetch (no flash).
   const [diskSrc] = createResource(
-    () => (external ? null : props.url),
-    async (url) => {
+    () => (external ? null : ([props.url, assetEpoch()] as const)),
+    async ([url]) => {
       const rel = assetRelPath(url);
       return rel ? await loadAssetBlob(rel) : "";
     }
   );
-  const src = () => (external ? props.url : diskSrc());
+  const src = () => (external ? props.url : diskSrc.latest);
 
   let wrapEl: HTMLSpanElement | undefined;
   let imgEl: HTMLImageElement | undefined;
@@ -537,6 +540,13 @@ function AssetImage(props: {
   // copy the image to the OS clipboard, and trash it (drop the block reference + move
   // the file to the recoverable trash).
   const assetActions = () => !external && !!props.blockId;
+  // A diagram asset (e.g. *.drawio.svg) gets an extra "edit externally" action.
+  const diagramEditor = () => (external ? undefined : editorFor(props.url));
+  const onEditDiagram = (e: MouseEvent) => {
+    e.stopPropagation();
+    const rel = assetRelPath(props.url);
+    if (rel) void launchEditor(rel);
+  };
   const onCopyAsset = (e: MouseEvent) => {
     e.stopPropagation();
     const s = src();
@@ -579,6 +589,18 @@ function AssetImage(props: {
         />
         <Show when={assetActions()}>
           <span class="asset-action-bar" aria-hidden="true">
+            <Show when={diagramEditor()}>
+              <button
+                class="asset-action-btn"
+                title={`Edit in ${diagramEditor()!.label}`}
+                onClick={onEditDiagram}
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
+              </button>
+            </Show>
             <button class="asset-action-btn" title="Copy image" onClick={onCopyAsset}>
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="9" y="9" width="11" height="11" rx="2" />

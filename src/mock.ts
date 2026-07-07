@@ -644,6 +644,12 @@ export function mockBackend(): Backend {
     async openAsset(): Promise<void> {
       // no OS opener in the browser mock
     },
+    async editAssetExternal(): Promise<void> {
+      // no external editor launch in the browser mock
+    },
+    async detectDrawio(): Promise<string | null> {
+      return null; // no OS process probing in the browser mock
+    },
     async listOrphanAssets() {
       return [
         { name: "old_screenshot_20260601_091500.png", size: 184_320, modified: 1_748_762_100 },

@@ -189,6 +189,24 @@ pub(crate) fn opener_command(prog: &str) -> std::process::Command {
     cmd
 }
 
+/// The OS "open with the default app" program for this platform, used both to
+/// open an asset and as the fallback when no custom editor command is configured.
+#[cfg(desktop)]
+pub(crate) fn system_opener() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "xdg-open"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "open"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "explorer"
+    }
+}
+
 /// SIGKILL WebKitGTK's helper subprocesses (`WebKitWebProcess` /
 /// `WebKitNetworkProcess` / `WebKitGPUProcess`) that are direct children of THIS
 /// process, before we quit.
