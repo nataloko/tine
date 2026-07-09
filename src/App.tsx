@@ -84,6 +84,7 @@ import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
 import { initCopySettings } from "./copySettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
+import { initBulletThreading, threadingEnabled } from "./bulletThreading";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initAssetSettings } from "./assetSettings";
@@ -440,6 +441,7 @@ export function App(): JSX.Element {
   onMount(() => void initSmoothScroll());
   onMount(() => void initCopySettings());
   onMount(() => void initRefCompletionSettings());
+  onMount(() => void initBulletThreading());
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
@@ -727,6 +729,7 @@ export function App(): JSX.Element {
         "wide-mode": wideMode(),
         "document-mode": documentMode(),
         "focus-mode": focusMode(),
+        "thread-enabled": threadingEnabled(),
         // macOS draws a transparent Overlay title bar over our content (rounded
         // corners + traffic lights); reserve the top-left so the lights don't sit
         // on the sidebar header / sidebar-toggle button. See nativeChrome.ts + app.css.

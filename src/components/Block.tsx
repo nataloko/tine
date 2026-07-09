@@ -20,6 +20,7 @@ import { typoTypeReplace } from "../render/typography";
 import { linkFirstMatch } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
+import { threadingEnabled, threadRoles, THREAD_PALETTE } from "../bulletThreading";
 import {
   doc,
   pageByName,
@@ -315,9 +316,28 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  // Bullet threading: this block's role in the active-path thread (elbow at a path
+  // node, or a spine segment on a preceding sibling). Reads threadRoles only while
+  // threading is on, so it stays zero-cost when the feature is off. The per-depth
+  // rainbow colour is handed to CSS via an inline --thread-color.
+  const threadRole = () => (threadingEnabled() ? threadRoles().get(props.id) : undefined);
+  const threadColor = () => {
+    const r = threadRole();
+    if (!r) return undefined;
+    return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
+  };
 
   return (
-    <div class="ls-block" classList={{ collapsed: collapsed() }} data-block-id={props.id}>
+    <div
+      class="ls-block"
+      classList={{
+        collapsed: collapsed(),
+        "thread-elbow": threadRole()?.elbow !== undefined,
+        "thread-spine": threadRole()?.spine !== undefined,
+      }}
+      style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
+      data-block-id={props.id}
+    >
       <div
         class="block-main"
         classList={{

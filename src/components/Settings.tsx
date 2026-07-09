@@ -64,6 +64,7 @@ import {
 } from "../copySettings";
 import { navReuseTabs, setNavReuseTabs } from "../navSettings";
 import { spaceAfterRefCompletion, setSpaceAfterRefCompletion } from "../refCompletionSettings";
+import { threadingEnabled, setThreadingEnabled } from "../bulletThreading";
 import { allowLocalFileImages, setAllowLocalFileImages } from "../localFileSettings";
 import { linkFirstMatch, setLinkFirstMatch } from "../editor/linkDefault";
 import {
@@ -452,6 +453,13 @@ function AppearanceTab(): JSX.Element {
 
       <Field label="Document mode" hint="Hides bullets and indent guides for a cleaner prose view.">
         <Toggle on={documentMode()} onClick={toggleDocumentMode} />
+      </Field>
+
+      <Field
+        label="Bullet threading"
+        hint="Trace a rounded thread down the active path — from the top level to the block you're editing — curving into each bullet, coloured per depth. Helps you see where you are in a deep outline. A Tine touch, off by default."
+      >
+        <Toggle on={threadingEnabled()} onClick={() => setThreadingEnabled(!threadingEnabled())} />
       </Field>
 
       <Field

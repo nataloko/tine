@@ -3008,6 +3008,37 @@ body {
   border-left-color: var(--guide-hover);
 }
 
+/* Bullet threading (opt-in, Settings → Bullet threading) — see src/bulletThreading.ts.
+   A rounded elbow thread traces the active path (the block you're editing + each
+   ancestor): every level curves the thread into its bullet, coloured per depth.
+   It's drawn with ::before on reactively-marked blocks, so it reflows with the
+   outline and can never desync. Geometry is tuned to Tine's bullet column: the
+   parent guide sits ~5px left of a child .ls-block, the bullet centre is ~26px in
+   and ~13px down. --thread-color is set inline per marked block (per-depth colour).
+     · .thread-spine  — a preceding sibling of a path node: a vertical segment so the
+                        spine stays continuous when a path node isn't a first child.
+     · .thread-elbow  — a path node: the vertical + a rounded turn into its bullet. */
+.thread-enabled .ls-block.thread-spine::before,
+.thread-enabled .ls-block.thread-elbow::before {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  left: -5px;
+  top: -16px;
+  border-left: 3px solid var(--thread-color, var(--accent));
+}
+.thread-enabled .ls-block.thread-spine::before {
+  bottom: 0;
+  width: 0;
+  border-radius: 2px 0 0 0;
+}
+.thread-enabled .ls-block.thread-elbow::before {
+  width: 28px;   /* from the spine (-5) across to the bullet's left edge (~23) */
+  height: 31px;  /* top(-16) down to the bullet centre (~14) */
+  border-bottom: 3px solid var(--thread-color, var(--accent));
+  border-bottom-left-radius: 10px;
+}
+
 /* editor */
 .editor-wrap {
   position: relative;
