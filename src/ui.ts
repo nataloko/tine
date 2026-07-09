@@ -951,7 +951,7 @@ export function closeContextMenu() {
   setContextMenu(null);
 }
 
-export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "improve" | "shortcuts" | "about";
+export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "improve" | "shortcuts" | "about";
 
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [settingsTabRequest, setSettingsTabRequest] = createSignal<SettingsTabId | null>(null);
