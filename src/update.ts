@@ -1,16 +1,16 @@
 // "A newer Tine is available" check — best-effort, once per launch.
 //
-// Notifier: ask GitHub for the latest *published* release and, if it's newer than
-// the running build, show a sticky toast. This is the cross-platform half and is
-// always the way a user LEARNS an update exists.
+// Notifier: ask GitHub for the latest *published* release of UPSTREAM Tine and, if
+// it's newer than the running build, show a sticky, NOTIFICATION-ONLY toast (no
+// action button — only the ✕ to dismiss). In this fork it's a nudge to go merge
+// upstream's changes into your own version; it never self-updates the app.
 //
-// Installer (the toast's action): on **Windows/Linux** in the packaged app, run the
-// Tauri v2 updater — `check()` → `downloadAndInstall()` → `relaunch()` — so the
-// update applies in place. On **macOS** (bundle is unsigned → Gatekeeper would
-// reject a self-replaced app) and outside Tauri, fall back to opening the releases
-// page in the browser. The updater is inert until a signed release with a
-// `latest.json` exists; any failure (no manifest yet, bad signature, offline) is
-// caught and also falls back to the releases page — it can never brick the app.
+// Installer: still available, but only behind the About tab's explicit "Check for
+// updates" button (checkForUpdateNow → applyUpdateOrOpen). On Windows/Linux in the
+// packaged app that would run the Tauri v2 updater (`check()` → `downloadAndInstall()`
+// → `relaunch()`); on macOS / outside Tauri / any failure it opens the releases page.
+// The updater is inert until a signed `latest.json` exists, so today it just opens
+// the releases page — it can never brick the app.
 //
 // Deliberately quiet: Tauri-only check, silent on ANY failure (offline, rate-
 // limited, blocked) — it must never block startup or nag with an error.
@@ -48,9 +48,9 @@ function openReleases(): void {
   void backend().openExternal(RELEASES_PAGE).catch(() => {});
 }
 
-/** The toast's "Download" action. Win/Linux packaged app → run the Tauri updater
- *  in place and relaunch; everything else (macOS, browser, or any failure) → open
- *  the releases page. Never throws. */
+/** The About tab's "Check for updates" installer path (the startup toast no longer
+ *  triggers it). Win/Linux packaged app → run the Tauri updater in place and relaunch;
+ *  everything else (macOS, browser, or any failure) → open the releases page. Never throws. */
 async function applyUpdateOrOpen(): Promise<void> {
   if (!canSelfUpdate()) {
     openReleases();
@@ -94,16 +94,12 @@ export async function checkForUpdate(): Promise<void> {
     const latest = typeof tag === "string" ? parseVer(tag) : null;
     if (!latest || !isNewer(latest, cur)) return;
 
+    // Notification only: no action button. This toast just tells you a newer
+    // upstream Tine exists so you can go merge it into your fork (see mine.md).
     pushToast(
       `Tine ${latest.join(".")} is available — you're on ${cur.join(".")}.`,
       "info",
-      {
-        sticky: true,
-        action: {
-          label: "Download",
-          run: () => void applyUpdateOrOpen(),
-        },
-      }
+      { sticky: true }
     );
   } catch {
     // offline / rate-limited / network blocked — never bother the user.
