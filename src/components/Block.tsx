@@ -20,7 +20,7 @@ import { typoTypeReplace } from "../render/typography";
 import { linkFirstMatch } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
-import { threadingEnabled, threadRoles, THREAD_PALETTE } from "../bulletThreading";
+import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
 import {
   doc,
   pageByName,
@@ -324,6 +324,8 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
   const threadColor = () => {
     const r = threadRole();
     if (!r) return undefined;
+    // Accent mode: leave --thread-color unset so the CSS falls back to var(--accent).
+    if (threadColorMode() === "accent") return undefined;
     return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
   };
 

@@ -64,7 +64,14 @@ import {
 } from "../copySettings";
 import { navReuseTabs, setNavReuseTabs } from "../navSettings";
 import { spaceAfterRefCompletion, setSpaceAfterRefCompletion } from "../refCompletionSettings";
-import { threadingEnabled, setThreadingEnabled } from "../bulletThreading";
+import {
+  threadingEnabled,
+  setThreadingEnabled,
+  threadColorMode,
+  setThreadColorMode,
+  threadWeight,
+  setThreadWeight,
+} from "../bulletThreading";
 import type { GitStatus } from "../backend";
 import {
   gitEnabled,
@@ -635,10 +642,53 @@ function ExtrasTab(): JSX.Element {
       <div class="settings-section">Extra features</div>
       <Field
         label="Bullet threading"
-        hint="Trace a rounded thread down the active path — from the top level to the block you're editing — curving into each bullet, coloured per depth. Helps you see where you are in a deep outline. A Tine touch, off by default."
+        hint="Trace a rounded thread down the active path — from the top level to the block you're editing — curving into each bullet. Helps you see where you are in a deep outline. A Tine touch, off by default."
       >
         <Toggle on={threadingEnabled()} onClick={() => setThreadingEnabled(!threadingEnabled())} />
       </Field>
+      <Show when={threadingEnabled()}>
+        <Field
+          label="Thread colour"
+          hint="Rainbow cycles a distinct colour per nesting depth; Accent draws the whole thread in the single accent colour."
+        >
+          <div class="settings-segment">
+            <button
+              classList={{ active: threadColorMode() === "rainbow" }}
+              onClick={() => setThreadColorMode("rainbow")}
+            >
+              Rainbow
+            </button>
+            <button
+              classList={{ active: threadColorMode() === "accent" }}
+              onClick={() => setThreadColorMode("accent")}
+            >
+              Accent
+            </button>
+          </div>
+        </Field>
+        <Field label="Thread thickness" hint="How bold the thread line is.">
+          <div class="settings-segment">
+            <button
+              classList={{ active: threadWeight() === "thin" }}
+              onClick={() => setThreadWeight("thin")}
+            >
+              Thin
+            </button>
+            <button
+              classList={{ active: threadWeight() === "medium" }}
+              onClick={() => setThreadWeight("medium")}
+            >
+              Medium
+            </button>
+            <button
+              classList={{ active: threadWeight() === "thick" }}
+              onClick={() => setThreadWeight("thick")}
+            >
+              Thick
+            </button>
+          </div>
+        </Field>
+      </Show>
       <GitSection />
     </>
   );

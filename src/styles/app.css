@@ -3071,12 +3071,13 @@ body {
   content: "";
   position: absolute;
   pointer-events: none;
-  /* Vertical guide centred on the parent bullet (x = -4): a 3px line centred there
-     starts at -5.5px. Top reaches the parent bullet centre (~18px up) for a first
-     child, or overlaps the preceding sibling's spine otherwise. */
-  left: -5.5px;
+  /* Vertical guide centred on the parent bullet (x = -4) for ANY line weight:
+     left = -4 - tt/2 → the border centre lands on -4. Top reaches the parent bullet
+     centre (~18px up) for a first child, or overlaps the preceding sibling's spine.
+     --thread-thickness is set on .app-container (Settings → weight); default 3px. */
+  left: calc(-4px - var(--thread-thickness, 3px) / 2);
   top: -18px;
-  border-left: 3px solid var(--thread-color, var(--accent));
+  border-left: var(--thread-thickness, 3px) solid var(--thread-color, var(--accent));
 }
 .thread-enabled .ls-block.thread-spine::before {
   bottom: 0;
@@ -3084,9 +3085,11 @@ body {
   border-radius: 2px 0 0 0;
 }
 .thread-enabled .ls-block.thread-elbow::before {
-  width: 31.5px;   /* from the guide (-5.5) across to this block's bullet centre (26) */
-  height: 33.5px;  /* top(-18) down so the horizontal sits on the bullet centre (y=14) */
-  border-bottom: 3px solid var(--thread-color, var(--accent));
+  /* right end = left + width = 26 (this block's bullet centre); bottom = top + height
+     so the horizontal centre sits on the bullet centre (y = 14). Both track the weight. */
+  width: calc(30px + var(--thread-thickness, 3px) / 2);
+  height: calc(32px + var(--thread-thickness, 3px) / 2);
+  border-bottom: var(--thread-thickness, 3px) solid var(--thread-color, var(--accent));
   border-bottom-left-radius: 10px;
 }
 

@@ -12,23 +12,53 @@ import { editingId } from "./editorController";
 import { doc } from "./store";
 
 const KEY = "bullet_threading";
+const COLOR_KEY = "bullet_threading_color";
+const WEIGHT_KEY = "bullet_threading_weight";
+
+/** Colour of the thread: a per-depth rainbow (default) or a single accent colour. */
+export type ThreadColorMode = "rainbow" | "accent";
+/** Line weight of the thread. */
+export type ThreadWeight = "thin" | "medium" | "thick";
+const WEIGHT_PX: Record<ThreadWeight, number> = { thin: 2, medium: 3, thick: 4 };
 
 const [enabled, setEnabledSig] = createSignal(false);
+const [colorMode, setColorModeSig] = createSignal<ThreadColorMode>("rainbow");
+const [weight, setWeightSig] = createSignal<ThreadWeight>("medium");
 
 /** Reactive: is bullet threading turned on? Default OFF. */
 export const threadingEnabled = enabled;
+/** Reactive: rainbow (per-depth) vs accent (single colour). Default rainbow. */
+export const threadColorMode = colorMode;
+/** Reactive: the thread's line weight (thin/medium/thick). Default medium. */
+export const threadWeight = weight;
+/** The current line weight in px, for the `--thread-thickness` CSS variable. */
+export const threadThicknessPx = () => WEIGHT_PX[weight()];
 
 export function setThreadingEnabled(on: boolean): void {
   setEnabledSig(on);
   void backend().setAppBool(KEY, on).catch(() => {});
 }
 
-/** Load the persisted preference at startup. Default: OFF. */
+export function setThreadColorMode(mode: ThreadColorMode): void {
+  setColorModeSig(mode);
+  void backend().setAppString(COLOR_KEY, mode).catch(() => {});
+}
+
+export function setThreadWeight(w: ThreadWeight): void {
+  setWeightSig(w);
+  void backend().setAppString(WEIGHT_KEY, w).catch(() => {});
+}
+
+/** Load the persisted preferences at startup. Defaults: OFF, rainbow, medium. */
 export async function initBulletThreading(): Promise<void> {
   try {
     setEnabledSig(await backend().getAppBool(KEY, false));
+    const c = await backend().getAppString(COLOR_KEY, "rainbow");
+    setColorModeSig(c === "accent" ? "accent" : "rainbow");
+    const w = await backend().getAppString(WEIGHT_KEY, "medium");
+    setWeightSig(w === "thin" || w === "thick" ? w : "medium");
   } catch {
-    /* default off */
+    /* defaults */
   }
 }
 

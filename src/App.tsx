@@ -84,7 +84,7 @@ import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
 import { initCopySettings } from "./copySettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
-import { initBulletThreading, threadingEnabled } from "./bulletThreading";
+import { initBulletThreading, threadingEnabled, threadThicknessPx } from "./bulletThreading";
 import {
   initGit,
   commitOnClose,
@@ -771,6 +771,7 @@ export function App(): JSX.Element {
         // toggling dim (t b) or entering focus (t f) is visible immediately.
         "dim-mode": dimInactiveBlocks(),
       }}
+      style={{ "--thread-thickness": `${threadThicknessPx()}px` }}
     >
       <Show when={parserFailed()}>
         <div class="parser-error-banner" role="alert">

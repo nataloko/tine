@@ -13,10 +13,14 @@ its ancestors, from the top level down — curving into each bullet, coloured pe
 It helps you see where you are in a deep outline, like the Logseq bullet-threading plugin.
 
 - **Enable:** Settings → **mine (extras)** → **Bullet threading**. **Off by default.**
+- **Colour:** *Rainbow* (a distinct colour per nesting depth, the default) or *Accent* (the whole
+  thread in your single accent colour).
+- **Thickness:** *Thin* / *Medium* / *Thick* — the geometry re-centres itself on the bullet dots at
+  any weight, so it stays pixel-aligned.
 - Pure CSS draws it on the blocks the editor marks as on-path, so it reflows with the outline and
   can never desync from the caret.
-- The preference is stored device-locally (it survives restarts even though WebKitGTK doesn't keep
-  `localStorage` across launches).
+- The preferences are stored device-locally (they survive restarts even though WebKitGTK doesn't
+  keep `localStorage` across launches).
 
 ---
 
