@@ -47,6 +47,34 @@ retired but existing Datalog query blocks still render.)
 
 ---
 
+## Git integration
+
+Commit your graph as you edit and sync it to a remote — a local-first **backup** or
+**multi-device** workflow, in the spirit of the `logseq-plugin-git` plugin but routed through Tine's
+data-safety protocol so it can never clobber your notes. Answers upstream issue #33.
+
+- **Enable:** Settings → **mine (extras)** → **Git integration**. **Off by default.**
+- **Uses the `git` already on your machine** — nothing is bundled — and **your existing credentials**
+  (credential helper / ssh-agent). No passwords are stored; an unauthenticated remote just fails with
+  a clear message instead of hanging.
+- **Commit** happens automatically when you pause editing (~60s idle) and when you close Tine, with a
+  descriptive message naming the pages that changed. **Push timing is yours to choose:** *On close*
+  (default), *On every save*, or *Manual*.
+- **Pull** is opt-in: turn on **Pull on startup** to fetch before you edit, or use the manual **Pull**
+  button. It's fast-forward-only, so it never merges over local edits — pulled files reload through
+  the normal watcher and any conflict with an unsaved page is surfaced in the usual conflict UI.
+- **Push never forces.** If the remote moved ahead, you get a sticky *"Remote moved — Pull first"*
+  toast rather than a rejected-push error.
+- **Not a repo yet?** The Git section offers **Initialize git repo**, which runs `git init` and writes
+  a sensible Logseq `.gitignore` (skips backups, the recycle bin, version files, and trash).
+- A compact **status badge** sits in the topbar (branch · uncommitted · ↑ahead ↓behind); clicking it
+  does the most useful next step — pull, then commit, then push.
+
+Design record: `docs/adr/0039-git-integration.md`. Commit only ever happens once your edits are
+safely on disk; git touches only `.git/`, never your markdown, so it stays out of Tine's save path.
+
+---
+
 ## Settings → "mine (extras)"
 
 A dedicated Settings tab that collects this fork's toggles, kept out of the stock settings
