@@ -85,6 +85,15 @@ import { initSmoothScroll } from "./smoothScroll";
 import { initCopySettings } from "./copySettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
 import { initBulletThreading, threadingEnabled } from "./bulletThreading";
+import {
+  initGit,
+  commitOnClose,
+  gitEnabled,
+  gitStatus,
+  gitBadgeText,
+  gitBadgeTitle,
+  runGitBadgeAction,
+} from "./git";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initAssetSettings } from "./assetSettings";
@@ -451,6 +460,9 @@ export function App(): JSX.Element {
   onMount(() => void initCopySettings());
   onMount(() => void initRefCompletionSettings());
   onMount(() => void initBulletThreading());
+  // Optional git integration (issue #33). Loads prefs; if enabled + pull-on-start,
+  // pulls before any edits (clean reload through the watcher). Off by default.
+  onMount(() => void initGit());
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
@@ -541,6 +553,16 @@ export function App(): JSX.Element {
           await Promise.race([flushSession(), new Promise((r) => setTimeout(r, 1000))]);
         } catch {
           // best-effort
+        }
+        // Optional git integration: commit (and push, unless push-mode is manual)
+        // now that the disk is current. Best-effort and capped so a slow network
+        // push can never wedge quit; a no-op when the integration is off.
+        if (gitEnabled()) {
+          try {
+            await Promise.race([commitOnClose(), new Promise((r) => setTimeout(r, 4000))]);
+          } catch {
+            // never block quit on git
+          }
         }
         closing = true;
         // Quit via the backend so it can SIGKILL WebKitGTK's helper processes
@@ -880,6 +902,26 @@ export function App(): JSX.Element {
                 <line x1="15" y1="4" x2="15" y2="20" stroke="currentColor" stroke-width="1.7" />
               </svg>
             </button>
+            {/* Git status badge (issue #33) — only when the integration is on and
+                the graph is a repo. Compact branch + dirty/ahead/behind; a click
+                does the most useful next step (pull → commit → push). */}
+            <Show when={gitEnabled() && gitStatus()?.is_repo}>
+              <span class="topbar-sep" />
+              <button
+                class="icon-btn git-badge"
+                classList={{ "git-dirty": (gitStatus()?.dirty_count ?? 0) > 0 }}
+                title={gitBadgeTitle(gitStatus())}
+                onClick={() => void runGitBadgeAction()}
+              >
+                <svg viewBox="0 0 24 24" class="nav-icon" aria-hidden="true">
+                  <circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <circle cx="6" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <circle cx="18" cy="7" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <path d="M6 8.4v7.2M18 9.4c0 4-4 3.6-6 5.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                </svg>
+                <span class="git-badge-text">{gitBadgeText(gitStatus())}</span>
+              </button>
+            </Show>
             {/* Settings sits apart at the far right (separated by a divider) so
                 it reads as app-level config, not another content control. */}
             <span class="topbar-sep" />

@@ -65,6 +65,22 @@ import {
 import { navReuseTabs, setNavReuseTabs } from "../navSettings";
 import { spaceAfterRefCompletion, setSpaceAfterRefCompletion } from "../refCompletionSettings";
 import { threadingEnabled, setThreadingEnabled } from "../bulletThreading";
+import type { GitStatus } from "../backend";
+import {
+  gitEnabled,
+  setGitEnabled,
+  gitPushMode,
+  setGitPushMode,
+  gitPullOnStart,
+  setGitPullOnStart,
+  gitStatus,
+  reloadGitStatus,
+  commitNow,
+  pushNow,
+  pullNow,
+  initRepo,
+  type PushMode,
+} from "../git";
 import { allowLocalFileImages, setAllowLocalFileImages } from "../localFileSettings";
 import { linkFirstMatch, setLinkFirstMatch } from "../editor/linkDefault";
 import {
@@ -623,6 +639,114 @@ function ExtrasTab(): JSX.Element {
       >
         <Toggle on={threadingEnabled()} onClick={() => setThreadingEnabled(!threadingEnabled())} />
       </Field>
+      <GitSection />
+    </>
+  );
+}
+
+/** One-line human summary of the repo state for the status hint. */
+function gitStatusHint(s: GitStatus | null): string {
+  if (!s || !s.is_repo) return "Not a git repository.";
+  const bits: string[] = [`On ${s.branch || "(detached)"}`];
+  bits.push(
+    s.dirty_count === 0
+      ? "clean"
+      : `${s.dirty_count} uncommitted change${s.dirty_count === 1 ? "" : "s"}`,
+  );
+  if (s.has_upstream) {
+    if (s.ahead) bits.push(`↑${s.ahead} to push`);
+    if (s.behind) bits.push(`↓${s.behind} to pull`);
+    if (!s.ahead && !s.behind) bits.push("in sync");
+  } else {
+    bits.push("no remote tracking");
+  }
+  let line = bits.join(" · ");
+  if (s.last_commit) line += ` · last: ${s.last_commit}`;
+  return line;
+}
+
+// Git integration (issue #33), in the "mine (extras)" tab so it stays out of the
+// original settings. Off by default; when on, exposes push-timing, opt-in
+// pull-on-start, manual sync buttons, and a live status line.
+function GitSection(): JSX.Element {
+  onMount(() => {
+    if (gitEnabled()) void reloadGitStatus();
+  });
+  const modeBtn = (m: PushMode, label: string) => (
+    <button classList={{ active: gitPushMode() === m }} onClick={() => setGitPushMode(m)}>
+      {label}
+    </button>
+  );
+  return (
+    <>
+      <div class="settings-section">Git</div>
+      <Field
+        label="Git integration"
+        hint={
+          <>
+            Commit your graph as you edit and sync it to a remote — a local-first backup or
+            multi-device workflow. Uses the <code>git</code> already installed on your machine and
+            its existing credential setup; nothing is bundled and no passwords are stored. Off by
+            default.
+          </>
+        }
+      >
+        <Toggle on={gitEnabled()} onClick={() => setGitEnabled(!gitEnabled())} />
+      </Field>
+
+      <Show when={gitEnabled()}>
+        <Show
+          when={gitStatus()?.is_repo}
+          fallback={
+            <Field
+              label="Repository"
+              hint="This graph folder isn’t a git repository yet. Initialize one to start committing — it adds a default Logseq .gitignore (skips backups, the recycle bin, version files, and trash)."
+            >
+              <button class="btn-secondary" onClick={() => void initRepo()}>
+                Initialize git repo
+              </button>
+            </Field>
+          }
+        >
+          <Field label="Status" hint={gitStatusHint(gitStatus())}>
+            <button class="btn-secondary" onClick={() => void reloadGitStatus()}>
+              Refresh
+            </button>
+          </Field>
+          <Field
+            label="Push"
+            hint="Commits happen automatically when you pause editing and when you close Tine. Choose when those commits get pushed to the remote."
+          >
+            <div class="settings-segment">
+              {modeBtn("on-close", "On close")}
+              {modeBtn("on-idle", "On every save")}
+              {modeBtn("manual", "Manual")}
+            </div>
+          </Field>
+          <Field
+            label="Pull on startup"
+            hint="When Tine opens, pull the latest from the remote first (fast-forward only, so it never merges over local edits). Off by default."
+          >
+            <Toggle
+              on={gitPullOnStart()}
+              onClick={() => setGitPullOnStart(!gitPullOnStart())}
+            />
+          </Field>
+          <Field label="Manual sync" hint="Commit, push, or pull right now.">
+            <div class="git-actions">
+              <button class="btn-secondary" onClick={() => void commitNow()}>
+                Commit now
+              </button>
+              <button class="btn-secondary" onClick={() => void pushNow()}>
+                Push
+              </button>
+              <button class="btn-secondary" onClick={() => void pullNow()}>
+                Pull
+              </button>
+            </div>
+          </Field>
+        </Show>
+      </Show>
     </>
   );
 }

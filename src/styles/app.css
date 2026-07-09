@@ -910,6 +910,37 @@ body {
   background: transparent;
 }
 
+/* Git status badge (issue #33) — a compact branch + counts pill in the topbar,
+   shown only when the integration is on and the graph is a repo. */
+.git-badge {
+  gap: 5px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.git-badge .nav-icon {
+  width: 16px;
+  height: 16px;
+}
+.git-badge-text {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Uncommitted changes present — nudge the badge toward the accent so it reads. */
+.git-badge.git-dirty {
+  color: var(--link-color);
+}
+
+/* Manual Commit / Push / Pull button row in the Git settings section. */
+.git-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 /* ---------------------------------------------------------------- page */
 
 .page-title-row {
