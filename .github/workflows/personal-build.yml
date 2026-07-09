@@ -123,8 +123,8 @@ jobs:
           set -euo pipefail
           files=$(find dist -type f)
           echo "Release assets:"; echo "$files"
-          title="Tine — bullet threading ($TAG)"
-          notes="Personal build of Tine with the bullet-threading feature (rebased on upstream master). Auto-updater is disabled. Assets: portable Linux AppImage (x64) + Windows x64 installer."
+          title="Tine — nataloko extras ($TAG)"
+          notes="Personal build of Tine with nataloko's extra features (see Settings → Extras), rebased on upstream master. Auto-updater is disabled. Assets: portable Linux AppImage (x64) + Windows x64 installer."
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" $files --clobber --repo "$REPO"
           else
