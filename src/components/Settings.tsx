@@ -1796,7 +1796,9 @@ function MediaEditorsSection(): JSX.Element {
         creates a new editable <code>.drawio.svg</code>; hovering any matching image shows an
         “Edit in …” button. Leave a command blank to use the system default opener. A{" "}
         <code class="mono">{"{}"}</code> in the command is replaced by the file path (otherwise it’s
-        appended). Desktop only; device-local.
+        appended). Wrap a path with spaces in quotes, e.g.{" "}
+        <code class="mono">{'"C:\\Program Files\\draw.io\\draw.io.exe" {}'}</code>. Desktop only;
+        device-local.
       </div>
       <For each={MEDIA_EDITORS}>
         {(ed) => (
