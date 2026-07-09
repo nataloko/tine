@@ -2,7 +2,7 @@ import { For, Show, Switch, Match, createMemo, createResource, createSignal, typ
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch } from "../ui";
-import { blockProperty, doc, formatForPage, formatForBlock, setBlockProperty, setRaw, withUndoUnit } from "../store";
+import { blockProperty, doc, formatForPage, formatForBlock, pageByName, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
@@ -16,9 +16,12 @@ import {
 } from "../editor/queryBuilder";
 import { foldAggregate, groupRows } from "../editor/queryAggregate";
 import { quoteEdnString, unquoteEdnString, splitTrailingMap, queryMacroExtents } from "../editor/edn";
-import { visibleBody } from "../render/block";
+import { pageProperties, visibleBody } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { sheetConfig } from "../sheet/config";
+import { createFormulaFilterMemo, type FormulaEvalRow } from "../sheet/formulaEval";
+import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
+import { regroupSurvivors } from "../editor/queryFilter";
 import { InlineText } from "../render/inline";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
@@ -245,7 +248,42 @@ export function QueryMacro(props: {
       return backend().runQuery(form());
     }
   );
-  const total = () => groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
+  // Optional Sheets-formula refinement (`tine.query-filter::`) over the coarse
+  // query's returned blocks. Reuses the sheet-filter engine verbatim: flatten the
+  // groups to `{id, page, dto}` rows, evaluate the boolean formula per row, then
+  // re-group preserving the engine's original order. Fail-open (keep everything +
+  // a notice), just like a sheet filter; the property is inert in Logseq.
+  const queryFilter = () => sheet()?.queryFilter ?? null;
+  const queryFormulas = createMemo<ReadonlyMap<string, string>>(() => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    if (!blockId || !node) return new Map();
+    const page = pageByName(node.page);
+    const pageFormulas = page ? formulasOf(pageProperties(page.preBlock, page.format)) : new Map<string, string>();
+    const blockFormulas = formulasOf(facetsOf(node.raw, formatForBlock(blockId)).properties);
+    return mergeFormulas(pageFormulas, blockFormulas);
+  });
+  const filterRows = createMemo<FormulaEvalRow[]>(() =>
+    (groups() ?? []).flatMap((g) => g.blocks.map((b) => ({ id: b.id, page: g.page, dto: b })))
+  );
+  const queryFilterState = createFormulaFilterMemo({
+    rows: filterRows,
+    formulas: queryFormulas,
+    filter: queryFilter,
+    ownerId: props.blockId,
+  });
+  const filterError = () => queryFilterState().error;
+  // Re-group the surviving rows, preserving `groups()` order — and its identity
+  // when nothing was removed (no filter / fail-open / everything matched), so the
+  // keyed <For> never needlessly remounts a block you're editing in a result.
+  const filteredGroups = createMemo<RefGroup[] | undefined>(() => {
+    const gs = groups();
+    if (!gs || !queryFilter()?.trim()) return gs;
+    const state = queryFilterState();
+    if (state.error) return gs;
+    return regroupSurvivors(gs, new Set(state.rows.map((r) => r.id)));
+  });
+  const total = () => filteredGroups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
   // A `(sort-by …)` query is sorted GLOBALLY by the engine and returned as one
   // block per group in that order — so the list view must render flat (a single
   // ordered sequence with a per-row page breadcrumb), not grouped by page, or the
@@ -255,7 +293,7 @@ export function QueryMacro(props: {
   const [sortDir, setSortDir] = createSignal(1);
 
   const rows = createMemo<Row[]>(() =>
-    (groups() ?? []).flatMap((g) =>
+    (filteredGroups() ?? []).flatMap((g) =>
       g.blocks.map((b) => {
         // Properties come off the DTO (computed once in Rust off the lsdoc parse);
         // the row's text is the visible body. No re-derivation here.
@@ -447,6 +485,13 @@ export function QueryMacro(props: {
               <QueryBuilder dsl={form} onChange={applyDsl} blockId={props.blockId} />
             </Show>
             <Show when={!collapsed()}>
+              <Show when={filterError()}>
+                {(err) => (
+                  <div class="query-filter-error" onClick={stop} title={err()}>
+                    {err()}
+                  </div>
+                )}
+              </Show>
               <Show
                 when={sheetFace()}
                 fallback={
@@ -492,7 +537,7 @@ export function QueryMacro(props: {
                       )}
                     </Show>
                     <Show
-                      when={groups() && groups()!.length > 0}
+                      when={filteredGroups() && filteredGroups()!.length > 0}
                       fallback={<div class="query-empty">No results</div>}
                     >
                       <Show
@@ -501,7 +546,7 @@ export function QueryMacro(props: {
                           <Show
                             when={globalSort()}
                             fallback={
-                              <For each={groups() ?? []}>
+                              <For each={filteredGroups() ?? []}>
                                 {(g) => <QueryGroup page={g.page} group={() => g} />}
                               </For>
                             }
@@ -509,7 +554,7 @@ export function QueryMacro(props: {
                             {/* Sorted: flat global order (each group holds one block). Iterate the
                                 groups DIRECTLY and pass the group object — re-`find()`ing the group
                                 by page/id for every row was O(groups²) on broad queries (audit #3). */}
-                            <For each={groups() ?? []}>
+                            <For each={filteredGroups() ?? []}>
                               {(g) => <QueryGroup page={g.page} group={() => g} flat />}
                             </For>
                           </Show>
@@ -565,15 +610,15 @@ export function QueryMacro(props: {
                   </>
                 }
               >
-                <Show when={groups() && groups()!.length > 0} fallback={<div class="query-empty">No results</div>}>
+                <Show when={filteredGroups() && filteredGroups()!.length > 0} fallback={<div class="query-empty">No results</div>}>
                   <Show when={(sheet()?.view === "table" || sheet()?.view === "board") && props.blockId}>
                     <SheetContainer>
                       <Switch>
                         <Match when={sheet()?.view === "table"}>
-                          <SheetTable ownerId={props.blockId!} rowSource="query" groups={groups() ?? []} />
+                          <SheetTable ownerId={props.blockId!} rowSource="query" groups={filteredGroups() ?? []} />
                         </Match>
                         <Match when={sheet()?.view === "board"}>
-                          <SheetBoard ownerId={props.blockId!} rowSource="query" groupBy={sheet()?.groupBy} groups={groups() ?? []} />
+                          <SheetBoard ownerId={props.blockId!} rowSource="query" groupBy={sheet()?.groupBy} groups={filteredGroups() ?? []} />
                         </Match>
                       </Switch>
                     </SheetContainer>

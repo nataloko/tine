@@ -189,6 +189,29 @@ describe("FormulaEditor", () => {
     dispose();
   });
 
+  it("routes filter saves to the given filterKey (query filter), not tine.filter", () => {
+    loadEditorDoc();
+    const { root, dispose } = mount(() => <FormulaEditor />);
+    openFormulaEditor({
+      mode: "filter",
+      ownerId: "table",
+      filterKey: "tine.query-filter",
+      x: 10,
+      y: 10,
+      expr: "",
+      formulas: [],
+      fields: ["priority"],
+    });
+    const textarea = root.querySelector(".formula-editor-textarea") as HTMLTextAreaElement;
+    textarea.value = 'priority == "A"';
+    input(textarea);
+    saveButton(root).click();
+
+    expect(blockProperty("table", "tine.query-filter")).toBe(`priority == "A"`);
+    expect(blockProperty("table", "tine.filter")).toBeNull();
+    dispose();
+  });
+
   it("opens a conditional formula as an IF/THEN/ELSE face", () => {
     loadEditorDoc();
     const { root, dispose } = mount(() => <FormulaEditor />);

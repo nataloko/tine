@@ -6200,6 +6200,18 @@ img.emoji {
   font-style: italic;
   margin-bottom: 2px;
 }
+/* Fail-open notice when the `tine.query-filter::` formula can't run (parse error
+   or non-boolean result). Results are shown unfiltered above/below it. */
+.query-filter-error {
+  display: inline-block;
+  margin: 2px 0 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--marker-todo) 14%, transparent);
+  color: var(--marker-todo);
+  font-size: 11px;
+  font-weight: 700;
+}
 
 /* Result summary panel (aggregation / group-by), shown above the result list. */
 .query-summary {

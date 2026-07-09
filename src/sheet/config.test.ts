@@ -144,6 +144,19 @@ describe("sheetConfig", () => {
     expect(cfg.filter).toBe('"((x)" + "#tag"');
   });
 
+  it("reads tine.query-filter as a decoded formula expression, independent of tine.filter", () => {
+    const cfg = sheetConfig([
+      ["tine.filter", `priority == "A"`],
+      ["tine.query-filter", String.raw`deadline < today() && "\#urgent"`],
+    ]);
+    expect(cfg.filter).toBe(`priority == "A"`);
+    expect(cfg.queryFilter).toBe(`deadline < today() && "#urgent"`);
+  });
+
+  it("leaves queryFilter null when the key is absent", () => {
+    expect(sheetConfig([["tine.filter", `state == "DONE"`]]).queryFilter).toBe(null);
+  });
+
   it("serializes field schemas in schema order and filters unsafe entries", () => {
     expect(
       serializeFields([

@@ -96,6 +96,37 @@ function loadQueryDoc(queryRaw: string) {
   vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
 }
 
+// Two TODO results with distinct `owner::` values, so a `tine.query-filter::`
+// formula can pick a subset. Properties are read live off each block's raw
+// (doc.byId path in readFormulaRowField), so the raw carries the owner.
+function loadFilteredQueryDoc(filter: string) {
+  const filterLine = filter ? `\ntine.query-filter:: ${filter}` : "";
+  setDoc({
+    byId: {
+      query: node("query", `{{query (todo TODO)}}${filterLine}`, null),
+      alpha: node("alpha", "TODO Alpha\nowner:: Martin", null),
+      bravo: node("bravo", "TODO Bravo\nowner:: Sam", null),
+    },
+    pages: [page(["query", "alpha", "bravo"])],
+    feed: ["Sheet"],
+    loaded: true,
+  });
+  vi.spyOn(backend(), "runQuery").mockResolvedValue([
+    {
+      page: "Sheet",
+      kind: "page",
+      blocks: (["alpha", "bravo"] as const).map((id) => ({
+        id,
+        raw: doc.byId[id].raw,
+        collapsed: false,
+        children: [],
+        marker: "TODO",
+        properties: [["owner", id === "alpha" ? "Martin" : "Sam"]],
+      })),
+    } as RefGroup,
+  ]);
+}
+
 function loadAdvancedQueryDoc(queryRaw: string) {
   setDoc({
     byId: {
@@ -235,6 +266,44 @@ describe("QueryMacro sheet integration", () => {
     expect(blockProperty("query", "tine.view")).toBeNull();
     expect(root.querySelectorAll(".query-table")).toHaveLength(1);
     expect(root.querySelectorAll(".sheet-table")).toHaveLength(0);
+
+    dispose();
+  });
+
+  it("refines list results with a tine.query-filter formula and counts the filtered set", async () => {
+    loadFilteredQueryDoc(`owner == "Martin"`);
+
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="query" />
+        <ContextMenu />
+      </>
+    ));
+    await settleQuery();
+
+    expect(root.textContent).toContain("Alpha");
+    expect(root.textContent).not.toContain("Bravo");
+    expect(root.querySelector(".query-count")?.textContent).toBe("1");
+    expect(root.querySelector(".query-filter-error")).toBeNull();
+
+    dispose();
+  });
+
+  it("fails open on a bad query-filter: keeps all results and shows a notice", async () => {
+    loadFilteredQueryDoc("owner >");
+
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="query" />
+        <ContextMenu />
+      </>
+    ));
+    await settleQuery();
+
+    expect(root.textContent).toContain("Alpha");
+    expect(root.textContent).toContain("Bravo");
+    expect(root.querySelector(".query-count")?.textContent).toBe("2");
+    expect(root.querySelector(".query-filter-error")).not.toBeNull();
 
     dispose();
   });

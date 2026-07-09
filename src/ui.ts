@@ -743,6 +743,10 @@ export interface FormulaEditorTarget {
   formulas: readonly [string, string][];
   fields: readonly string[];
   home?: FormulaEditorHome | null;
+  /** For `mode:"filter"`, the block-property key the filter saves under. Defaults
+   *  to `"tine.filter"` (sheet views); query blocks pass `"tine.query-filter"` so
+   *  a query can carry both a sheet filter and a result-refining query filter. */
+  filterKey?: string;
 }
 export const [formulaEditor, setFormulaEditor] = createSignal<FormulaEditorTarget | null>(null);
 export function openFormulaEditor(target: FormulaEditorTarget) {
