@@ -44,6 +44,17 @@ let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
 // resolved). Until then the source keeps the block on disk, so it's never lost.
 const heldSources = new Set<string>();
 const heldByDest = new Map<string, string[]>();
+// Names of pages written to disk since the last drain — a read-only sink consumed
+// by the optional git integration to compose a descriptive commit message. Purely
+// additive: it never affects the save protocol (dirty/baseRev/tombstone) above.
+const savedSinceDrain = new Set<string>();
+/** Take (and clear) the set of page names written since the last call — used by
+ *  the git integration to name the pages a commit covers. */
+export function drainSavedPages(): string[] {
+  const out = [...savedSinceDrain];
+  savedSinceDrain.clear();
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -130,6 +141,7 @@ export function resetSaveState() {
   deletedPages.clear();
   heldSources.clear();
   heldByDest.clear();
+  savedSinceDrain.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +191,7 @@ async function doSave(name: string, force: boolean): Promise<boolean> {
   try {
     const rev = await backend().savePage(dto, baseRev.get(name) ?? null, force);
     if (token === graphToken) baseRev.set(name, rev);
+    savedSinceDrain.add(name); // record for the git commit-message composer (read-only)
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
