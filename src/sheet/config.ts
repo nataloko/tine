@@ -28,6 +28,10 @@ export interface SheetConfig {
   colAggregates: ReadonlyMap<string, AggregateFn>;
   fields: readonly FieldSpec[];
   filter: string | null;
+  /** Optional Sheets-formula refinement over a {{query}}'s result blocks. Stored
+   *  under a distinct key from `filter` (sheet views) so a query block can carry
+   *  both; inert in Logseq (graceful degradation). See ADR on query filtering. */
+  queryFilter: string | null;
 }
 
 const VIEWS = new Set<SheetView>(["table", "grid", "board"]);
@@ -153,6 +157,7 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
   let colAggregates: ReadonlyMap<string, AggregateFn> = new Map();
   let fields: readonly FieldSpec[] = [];
   let filter: string | null = null;
+  let queryFilter: string | null = null;
 
   for (const [rawKey, rawValue] of props) {
     const key = rawKey.trim().toLowerCase();
@@ -172,10 +177,12 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
       fields = parseFields(value);
     } else if (key === "tine.filter") {
       filter = value ? decodeFormulaExpr(value) : null;
+    } else if (key === "tine.query-filter") {
+      queryFilter = value ? decodeFormulaExpr(value) : null;
     }
   }
 
-  return { view, groupBy, header, colWidths, colAggregates, fields, filter };
+  return { view, groupBy, header, colWidths, colAggregates, fields, filter, queryFilter };
 }
 
 /** Sheet config straight from a block's raw text, through the ONE block-property

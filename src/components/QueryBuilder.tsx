@@ -12,8 +12,6 @@ import { backend } from "../backend";
 import {
   parseQuery,
   toDsl,
-  clauseToAdvanced,
-  stashSimpleForm,
   clauseLabel,
   addChild,
   removeAt,
@@ -30,7 +28,12 @@ import {
   type SortPreset,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
-import { pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { openFormulaEditor, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { blockProperty, doc, formatForBlock, pageByName } from "../store";
+import { facetsOf } from "../render/facets";
+import { pageProperties } from "../render/block";
+import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
+import { decodeFormulaExpr } from "../sheet/formula";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
 // The DSL text is the single source of truth — we parse it to a tree, apply an
@@ -304,19 +307,16 @@ function PropNameInput(props: { onCommit: (key: string) => void }): JSX.Element 
   );
 }
 
-// "Switch to advanced" converts the CURRENT builder tree to its single-line
-// Datalog equivalent (clauseToAdvanced) — it must never discard the query and
-// never write a multi-line macro: lsdoc `{{query …}}` macros don't span lines,
-// so the old multi-line skeleton made the block stop parsing as a query at all
-// and silently destroyed the user's simple query (Jul 8 data-mutation bug).
-// The clause cheat-sheet lives in the pill's tooltip instead of the file.
-const ADVANCED_CHEATSHEET =
-  'Convert this query to an advanced (Datalog) [:find …] form. Supported clauses: ' +
-  '(task ?b "TODO" "DOING"), (priority ?b "A"), (page-ref ?b "Page"), (property ?b :key "v"), ' +
-  '(page-property ?b :key), (page-tags ?b "tag"), (scheduled ?b), (deadline ?b), (journal ?b), ' +
-  '(page ?b "Name"), (namespace ?b "Parent"), (between ?b "2026-01-01" "2026-12-31"), ' +
-  'combined with (and …) (or …) (not …). Unsupported clauses are flagged, never guessed. ' +
-  'Keep it on ONE line and avoid #{…} sets — a query macro cannot span lines or contain braces.';
+// The formula-filter escape hatch. The coarse chip-bar above answers the common
+// "which blocks" question and round-trips to Logseq; this button opens the Sheets
+// formula editor to *refine* those results with a readable boolean expression
+// (`priority == "A" && deadline < today()`), stored as `tine.query-filter::` — a
+// property Logseq ignores. It replaces the old "⚙ advanced" Datalog conversion,
+// which added no real power (see the query-filtering ADR).
+const FILTER_TOOLTIP =
+  'Refine results with a formula (e.g. priority == "A" && deadline < today()). ' +
+  "Saved as tine.query-filter — evaluated in Tine, ignored by Logseq.";
+const BUILTIN_FILTER_FIELDS = ["state", "priority", "scheduled", "deadline", "tags", "page"];
 
 export function QueryBuilder(props: {
   dsl: () => string;
@@ -338,33 +338,57 @@ export function QueryBuilder(props: {
     setAdding(null);
   };
 
+  // Formula-filter button plumbing. `fields` are autocomplete hints in the editor
+  // (block builtins + the property keys used across the graph); `formulas` are the
+  // named formulas the expression may reference (`formula.x`), taken from the query
+  // block's own + its page's `tine.formula.*` properties, mirroring the sheet views.
+  const [facets] = createResource(() => backend().queryFacets());
+  const filterFields = () => [...BUILTIN_FILTER_FIELDS, ...(facets() ?? []).map(([k]) => k)];
+  const queryFormulas = createMemo<[string, string][]>(() => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    if (!blockId || !node) return [];
+    const page = pageByName(node.page);
+    const pageF = page ? formulasOf(pageProperties(page.preBlock, page.format)) : new Map<string, string>();
+    const blockF = formulasOf(facetsOf(node.raw, formatForBlock(blockId)).properties);
+    return [...mergeFormulas(pageF, blockF).entries()];
+  });
+  const currentFilter = () => {
+    const blockId = props.blockId;
+    const stored = blockId ? blockProperty(blockId, "tine.query-filter") : null;
+    return stored ? decodeFormulaExpr(stored) : "";
+  };
+  const openFilterEditor = (e: MouseEvent) => {
+    stop(e);
+    if (!props.blockId) return;
+    openFormulaEditor({
+      mode: "filter",
+      ownerId: props.blockId,
+      filterKey: "tine.query-filter",
+      x: e.clientX,
+      y: e.clientY,
+      expr: currentFilter(),
+      formulas: queryFormulas(),
+      fields: filterFields(),
+    });
+  };
+
   return (
     <div class="qb-bar" onClick={stop}>
       <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply}
         openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding} />
       <SortControl tree={tree} apply={apply} />
       <SummarizeControl tree={tree} apply={apply} />
-      <button
-        class="qb-sort qb-advanced"
-        title={ADVANCED_CHEATSHEET}
-        onClick={(e) => {
-          stop(e);
-          const conv = clauseToAdvanced(tree());
-          if (!conv.ok) {
-            pushToast(`Can't auto-convert to Datalog: ${conv.unsupported.join(", ")} has no advanced equivalent — write the [:find …] form by hand`);
-            return;
-          }
-          if (props.blockId) stashSimpleForm(props.blockId, props.dsl());
-          props.onChange(conv.dsl);
-          pushToast(
-            conv.dropped.length
-              ? `Converted to an advanced Datalog query (dropped: ${conv.dropped.join(", ")}) — undo restores the simple form`
-              : "Converted to an advanced Datalog query — undo restores the simple form"
-          );
-        }}
-      >
-        ⚙ advanced
-      </button>
+      <Show when={props.blockId}>
+        <button
+          class="qb-sort qb-advanced"
+          classList={{ active: currentFilter().trim() !== "" }}
+          title={FILTER_TOOLTIP}
+          onClick={openFilterEditor}
+        >
+          ƒ filter
+        </button>
+      </Show>
     </div>
   );
 }
