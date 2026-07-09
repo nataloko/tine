@@ -7,6 +7,7 @@ mod android_media;
 mod backup;
 mod commands;
 mod debug;
+mod git;
 mod graph;
 mod migrate_identifier;
 mod platform;
@@ -33,6 +34,7 @@ use commands::{
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
 };
+use git::{git_commit, git_init, git_pull, git_push, git_status};
 use graph::{
     app_platform, begin_warm_cache, create_graph, default_graph_parent, load_graph, resolve_root,
     warm_cache_async, warm_done,
@@ -416,6 +418,11 @@ pub fn run() {
             list_spellcheck_dictionaries,
             debug_info,
             debug_log,
+            git_status,
+            git_init,
+            git_commit,
+            git_push,
+            git_pull,
             tine_quit,
             tine_open_devtools
         ])

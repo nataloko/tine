@@ -65,3 +65,4 @@ see the project `CLAUDE.md`.
 | [0036](0036-in-app-guide.md) | In-app Guide pages are read-only bundled templates with explicit copy-into-graph writes | Accepted |
 | [0037](0037-sheet-paste-mode-nest-vs-splat.md) | Sheet paste: edit mode nests a subgrid, select mode splats the region into the grid (amends 0031) | Accepted |
 | [0038](0038-query-formula-refinement.md) | Query filtering: coarse structural query (Rust, Logseq-parity) + optional `tine.query-filter::` formula refinement (frontend); Datalog retired-but-rendered | Accepted |
+| [0039](0039-git-integration.md) | Optional Git integration via the system git (no bundling/credentials); commit only when disk is current, push never forces, pull is `--ff-only` and reloads through the watcher → conflict UI | Accepted |

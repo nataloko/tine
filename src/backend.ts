@@ -319,6 +319,41 @@ export interface Backend {
   debugInfo(): Promise<DebugInfo>;
   /** Forward a frontend milestone / error into the backend debug log. */
   debugLog(line: string): Promise<void>;
+  /** Optional Git integration (issue #33). All shell out to the *system* git in
+   *  the graph root; off unless enabled in the "mine (extras)" tab. Read-only
+   *  status of the graph repo (is-repo, branch, dirty/ahead/behind, last commit). */
+  gitStatus(): Promise<GitStatus>;
+  /** `git init` the graph root + write a default Logseq `.gitignore`; returns the
+   *  fresh status. */
+  gitInit(): Promise<GitStatus>;
+  /** `git add -A && git commit -m <message>`. "Nothing to commit" is a success
+   *  no-op, not an error. */
+  gitCommit(message: string): Promise<GitResult>;
+  /** Push the current branch (never forced — a non-fast-forward reject returns
+   *  ok:false with a "Pull first" detail). Awaited, so an on-close push finishes. */
+  gitPush(): Promise<GitResult>;
+  /** `git pull --ff-only`. Pulled files land on disk and reload through the normal
+   *  watcher → reloadDisposition path (dirty pages guarded by the conflict UI). */
+  gitPull(): Promise<GitResult>;
+}
+
+/** Repo status for the git integration's status line / topbar badge. */
+export interface GitStatus {
+  is_repo: boolean;
+  branch: string;
+  dirty_count: number;
+  has_upstream: boolean;
+  ahead: number;
+  behind: number;
+  last_commit: string;
+}
+
+/** Outcome of a git op, for a toast. `ok:false` is a handled failure (friendly
+ *  `detail`), not a thrown error. `op` is "commit" | "push" | "pull". */
+export interface GitResult {
+  op: string;
+  ok: boolean;
+  detail: string;
 }
 
 export interface DebugInfo {
@@ -743,6 +778,21 @@ class TauriBackend implements Backend {
   }
   debugLog(line: string) {
     return this.call<void>("debug_log", { line });
+  }
+  gitStatus() {
+    return this.call<GitStatus>("git_status");
+  }
+  gitInit() {
+    return this.call<GitStatus>("git_init");
+  }
+  gitCommit(message: string) {
+    return this.call<GitResult>("git_commit", { message });
+  }
+  gitPush() {
+    return this.call<GitResult>("git_push");
+  }
+  gitPull() {
+    return this.call<GitResult>("git_pull");
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

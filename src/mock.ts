@@ -2,7 +2,7 @@
 // outside Tauri (browser dev / Playwright screenshots). Mirrors the real
 // backend's shape so the UI behaves identically.
 
-import type { Backend, GpuEnv, DebugInfo } from "./backend";
+import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult } from "./backend";
 import type { BlockDto, GraphMeta, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
@@ -386,6 +386,10 @@ let mockGuideAnnounced = false;
 const mockAssets: Record<string, Uint8Array> = {};
 const mockAppBools: Record<string, boolean> = {};
 const mockAppStrings: Record<string, string> = {};
+// A tiny simulated git repo so the "mine (extras)" Git UI is exercisable in the
+// browser mock (`npm run dev`). Not a real repo — just enough state to click
+// through: commit clears the dirty count, push clears "ahead", pull is a no-op.
+const mockGit = { is_repo: true, branch: "main", dirty: 2, ahead: 1, behind: 0, last: "a1b2c3d edits" };
 
 // A tiny valid silent WAV (0.2s, 8kHz/8-bit mono) so the mock audio asset actually
 // renders the <audio> player — WAV is natively decodable in headless Chromium,
@@ -1136,6 +1140,36 @@ export function mockBackend(): Backend {
     },
     async debugLog(_line: string): Promise<void> {
       // no-op in the browser mock
+    },
+    async gitStatus(): Promise<GitStatus> {
+      return {
+        is_repo: mockGit.is_repo,
+        branch: mockGit.branch,
+        dirty_count: mockGit.dirty,
+        has_upstream: true,
+        ahead: mockGit.ahead,
+        behind: mockGit.behind,
+        last_commit: mockGit.last,
+      };
+    },
+    async gitInit(): Promise<GitStatus> {
+      mockGit.is_repo = true;
+      return this.gitStatus();
+    },
+    async gitCommit(message: string): Promise<GitResult> {
+      if (mockGit.dirty === 0) return { op: "commit", ok: true, detail: "Nothing to commit." };
+      mockGit.dirty = 0;
+      mockGit.ahead += 1;
+      mockGit.last = `mock ${message.slice(0, 24)}`;
+      return { op: "commit", ok: true, detail: "Committed changes." };
+    },
+    async gitPush(): Promise<GitResult> {
+      mockGit.ahead = 0;
+      return { op: "push", ok: true, detail: "Pushed to remote." };
+    },
+    async gitPull(): Promise<GitResult> {
+      mockGit.behind = 0;
+      return { op: "pull", ok: true, detail: "Already up to date." };
     },
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];
