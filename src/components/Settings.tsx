@@ -130,7 +130,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "files", label: "Files" },
   { id: "backups", label: "Backups & recovery" },
   { id: "graph", label: "Graph" },
-  { id: "extras", label: "Extras" },
+  { id: "extras", label: "mine (extras)" },
   { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
   { id: "about", label: "About" },
@@ -611,12 +611,12 @@ function DateFormatSelect(): JSX.Element {
   );
 }
 
-// "Extras" — this fork's own, non-Logseq features live here in ONE dedicated tab,
-// kept out of the original settings sections. Add future fork toggles to this tab.
+// "mine (extras)" — this fork's own, non-Logseq features live here in ONE dedicated
+// tab, kept out of the original settings sections. Add future fork toggles here.
 function ExtrasTab(): JSX.Element {
   return (
     <>
-      <div class="settings-section">Tine extras</div>
+      <div class="settings-section">Extra features</div>
       <Field
         label="Bullet threading"
         hint="Trace a rounded thread down the active path — from the top level to the block you're editing — curving into each bullet, coloured per depth. Helps you see where you are in a deep outline. A Tine touch, off by default."
