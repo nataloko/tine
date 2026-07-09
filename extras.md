@@ -80,3 +80,23 @@ safely on disk; git touches only `.git/`, never your markdown, so it stays out o
 A dedicated Settings tab that collects this fork's toggles, kept out of the stock settings
 sections. Any future fork feature adds its control here rather than scattering into the original
 tabs.
+
+---
+
+## Fixes carried on top of upstream
+
+Not features — bug fixes this fork ships ahead of upstream (candidates to upstream back). No
+toggle; they just work.
+
+### draw.io on Windows (GH #38)
+
+Launching draw.io from a **default Windows install** now works out of the box:
+
+- The external-editor command is **quote-aware**, so a path with spaces like
+  `"C:\Program Files\draw.io\draw.io.exe" {}` is parsed as one program plus the file argument
+  (it used to split on the space and fail).
+- **Autodetect** also probes the per-machine install at `%ProgramFiles%\draw.io\draw.io.exe`
+  (and the `(x86)` sibling), not just the per-user `%LOCALAPPDATA%` path — and returns it quoted.
+
+This removes the need for the directory-junction / 8.3-short-path workarounds (the short-path route
+broke draw.io's own Electron UI). Configure or re-detect under **Settings → Files → Diagram editors**.
