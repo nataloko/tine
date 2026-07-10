@@ -80,7 +80,9 @@ fn graph_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// works — this only disables the blocking *interactive* fallback). On Linux we
 /// also scrub the WebKit/AppImage env vars Tine may set for its own rendering so
 /// the system git never loads bundled libs (hygiene, mirrors
-/// `platform::opener_command`).
+/// `platform::opener_command`). On Windows we set CREATE_NO_WINDOW so `git.exe`
+/// (a console program) never flashes a terminal window — otherwise every status
+/// poll / commit / push pops a black console for a fraction of a second (GH #33).
 fn git_base(root: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(root)
@@ -96,6 +98,13 @@ fn git_base(root: &Path) -> Command {
         "GTK_IM_MODULE_FILE",
     ] {
         cmd.env_remove(k);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000): run git without allocating a console, so no
+        // terminal window flashes when a GUI app spawns it.
+        cmd.creation_flags(0x0800_0000);
     }
     cmd
 }
