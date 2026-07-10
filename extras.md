@@ -107,3 +107,34 @@ Launching draw.io from a **default Windows install** now works out of the box:
 
 This removes the need for the directory-junction / 8.3-short-path workarounds (the short-path route
 broke draw.io's own Electron UI). Configure or re-detect under **Settings → Files → Diagram editors**.
+
+### Git integration on Windows (GH #33)
+
+Running git from the app no longer flashes a console window on Windows — the git subprocess is
+launched with `CREATE_NO_WINDOW`, so status polls / commits / pushes are silent (they popped a
+black terminal for a fraction of a second before).
+
+### Code-block editing (GH #66 + friends)
+
+Fenced code blocks (and the ```calc calculator) now edit sensibly:
+
+- **Enter inside a fence adds a new line** instead of splitting the block into a new bullet (which
+  used to break multi-line code — GH #66).
+- **Enter on a trailing blank line exits** to a new bullet below (the "double-Enter" idiom), so a
+  code/calc block that's last in the page no longer traps the caret.
+- A **language picker** on the opening fence: typing ```lang (or running `/code`) offers an
+  autocomplete of ~95 languages, mirroring the `[[` / `#` popup; picking one drops the caret onto
+  the code line. Tine loads the *full* highlight.js, so all of them actually colour (not just the
+  common few).
+- **Live syntax highlighting while editing** (Settings → mine (extras) → *Live code highlighting*,
+  on by default): the code is coloured *as you type*, in a box that looks like the rendered block
+  (no jump on blur). A syntax-highlighted layer is painted behind the real textarea (which stays the
+  sole caret owner — the editor's focus/caret invariant is untouched); turn it off if the caret is
+  ever hard to see on your system. Design record: `docs/adr/0040-live-code-highlighting-overlay.md`.
+
+### Click below to add a block
+
+Every page has a Logseq-style **click-to-add** area below its content — a discreet, invisible strip
+(text cursor + tooltip on hover). Click the empty space under the last block to add a new bullet and
+start typing (it focuses a trailing empty block instead of stacking blanks). A general escape hatch,
+so a trailing code/calc block (or anything) never leaves you with nowhere to click.

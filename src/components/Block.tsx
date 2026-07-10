@@ -1,4 +1,4 @@
-import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
+import { Show, Switch, Match, For, createMemo, createSignal, createResource, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { backend } from "../backend";
 import {
@@ -13,6 +13,7 @@ import {
   COMMANDS,
   commandScore,
   fuzzyScore,
+  filterLanguages,
   type Trigger,
 } from "../editor/autocomplete";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
@@ -83,7 +84,8 @@ import {
 } from "../editor/format";
 import { isRenderHiddenProp, isPropertyLine } from "../render/block";
 import { facetsOf } from "../render/facets";
-import { AstBody } from "../render/body";
+import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
+import { codeHlEnabled } from "../codeHighlightSettings";
 import { InlineText } from "../render/inline";
 import { editorOffsetFromRenderedRange } from "../render/spans";
 import {
@@ -111,7 +113,7 @@ import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
 import { taskCheckboxState } from "../markers";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim, isOpeningFenceLine, fencedCodeBlock } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
@@ -985,6 +987,21 @@ export function Editor(props: { id: string }): JSX.Element {
   });
   const isCalc = () => editingCalc;
   const calcRows = createMemo(() => (isCalc() ? evalCalc(calcLive() ?? "") : []));
+  // Live syntax highlighting while editing a fenced code block: a highlighted <pre>
+  // painted BEHIND the (still sole-owner) textarea, whose text goes transparent with
+  // a visible caret. Purely visual → ADR-0013-safe. `fencedCodeBlock` returns null
+  // for calc/mixed content, so this never collides with the calc path. Derived from
+  // `editorValue()` (committed, reactive) exactly like `calcLive`, so it updates live.
+  const codeEdit = createMemo(() => (codeHlEnabled() ? fencedCodeBlock(editorValue()) : null));
+  const isCodeEdit = () => codeEdit() !== null;
+  const [hljsOverlay] = createResource(loadHljs);
+  const codeOverlayHtml = createMemo(() => {
+    const f = codeEdit();
+    return f ? highlightFencedForOverlay(hljsOverlay(), f, editorValue()) : "";
+  });
+  // While an IME composition is active, the pre-commit string lives in the textarea
+  // (not yet in the overlay), so briefly un-hide the textarea text in code mode.
+  const [composing, setComposing] = createSignal(false);
   const commit = (text: string, opts?: { timetracking?: boolean; calc?: boolean }) => {
     const commitAsCalc = opts?.calc ?? isCalc();
     // For calc, `text` is the bare expressions the user sees — re-fence it.
@@ -1086,6 +1103,11 @@ export function Editor(props: { id: string }): JSX.Element {
     }
     setAc(t);
     setAcIndex(0);
+    if (t.kind === "lang") {
+      // ```lang picker — a language list, mirroring the [[ / # popup.
+      setAcItems(filterLanguages(t.query).map((l) => ({ label: l, insert: l })));
+      return;
+    }
     if (t.kind === "command") {
       const q = t.query;
       const tmpls = await getTemplates();
@@ -1428,6 +1450,24 @@ export function Editor(props: { id: string }): JSX.Element {
   const selectAc = (item: AcItem) => {
     const t = ac();
     if (!t) return;
+    if (t.kind === "lang") {
+      // Put the language on the fence line, then drop the caret onto the code line
+      // below (the fence's content), so typing goes straight into the code and
+      // Enter there adds lines (per the fence editing fix) rather than splitting.
+      const lang = item.insert ?? "";
+      const value = ref.value.slice(0, t.start) + lang + ref.value.slice(t.end);
+      const nl = value.indexOf("\n", t.start + lang.length);
+      const caret = nl === -1 ? value.length : nl + 1;
+      commit(value);
+      closeAc();
+      queueMicrotask(() => {
+        ref.value = value;
+        ref.setSelectionRange(caret, caret);
+        ref.focus();
+        autosize();
+      });
+      return;
+    }
     if (item.blockRef) {
       // Insert `((uuid))` now (resolves in-session via the in-memory uuid), then
       // durably stamp the target's id:: in the background so it survives restart.
@@ -1451,6 +1491,14 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     switch (item.action) {
+      case "code-block": {
+        // Insert the fence with the caret right after the opening ```, then open
+        // the language picker so a language can be chosen immediately (like Logseq).
+        // Choosing one drops the caret onto the code line (see the "lang" branch).
+        replaceTrigger("```\n\n```", 3);
+        queueMicrotask(() => void updateAutocomplete());
+        return;
+      }
       case "scheduled":
       case "deadline": {
         // Drop the "/scheduled" trigger text, then open the calendar popup
@@ -1681,6 +1729,7 @@ export function Editor(props: { id: string }): JSX.Element {
     refreshAutocompleteAfterInput();
   };
   const onCompositionEnd = () => {
+    setComposing(false);
     if (!applyFullWidthRefReplace()) return;
     commit(ref.value);
     autosize();
@@ -2138,9 +2187,44 @@ export function Editor(props: { id: string }): JSX.Element {
     }
 
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-      // In a calc block, Enter adds a new expression line (stays in the block) —
-      // let the textarea insert the newline natively, like OG.
-      if (isCalc()) return;
+      // Inside a calc block or a fenced code block, Enter continues the block (a
+      // newline) rather than splitting into a new bullet, which would break the
+      // code (GH #66). To exit to a new sibling, press Enter on a trailing blank
+      // line (the "double-Enter" idiom) — otherwise a trailing code/calc block
+      // would trap the caret with no way to add a bullet after it.
+      const inMultiline = isCalc() || (!isAnnot() && caretInFence(raw, start));
+      if (inMultiline) {
+        if (start === end) {
+          const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
+          if (trimmed !== null) {
+            e.preventDefault();
+            commit(trimmed);
+            const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
+            startEditing(newId, 0);
+            return;
+          }
+        }
+        return; // continue the block: let the textarea insert the newline natively
+      }
+      // Caret on an OPENING fence line (```lang): Enter drops INTO the code body
+      // (the line below) instead of splitting the block — so `/code` then Escape,
+      // or typing ```lang then Enter, lands you in the code, not a broken split.
+      if (!isAnnot()) {
+        const fLineStart = raw.lastIndexOf("\n", start - 1) + 1;
+        const fLineEnd = raw.indexOf("\n", start);
+        const fLine = raw.slice(fLineStart, fLineEnd === -1 ? raw.length : fLineEnd);
+        if (/^\s*(`{3,}|~{3,})/.test(fLine) && isOpeningFenceLine(raw, fLineStart)) {
+          e.preventDefault();
+          if (fLineEnd === -1) {
+            // Unterminated fence (fence line is last): open a code line below.
+            applyEdit({ text: raw + "\n", start: raw.length + 1, end: raw.length + 1 });
+          } else {
+            const caret = fLineEnd + 1; // start of the code body line
+            ref.setSelectionRange(caret, caret);
+          }
+          return;
+        }
+      }
       e.preventDefault();
       // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
       // (new item below, same marker/indent; a checkbox item starts a fresh `[ ]`)
@@ -2417,7 +2501,15 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   return (
-    <div class="editor-wrap" classList={{ "calc-wrap": isCalc() }}>
+    <div class="editor-wrap" classList={{ "calc-wrap": isCalc(), "code-wrap": isCodeEdit() }}>
+      {/* Live code-highlight overlay: painted BEHIND the textarea (first child →
+          lower paint order), purely visual (aria-hidden, pointer-events:none).
+          Its text is byte-for-byte the editor value, so glyphs sit under the caret. */}
+      <Show when={isCodeEdit()}>
+        <pre class="code-hl-overlay" aria-hidden="true">
+          <code class="hljs" innerHTML={codeOverlayHtml()} />
+        </pre>
+      </Show>
       <Show when={isCalc()}>
         <div class="calc-gutter" aria-hidden="true">
           <For each={calcRows()}>{(_, i) => <div class="calc-lineno">{i() + 1}</div>}</For>
@@ -2426,11 +2518,12 @@ export function Editor(props: { id: string }): JSX.Element {
       <textarea
         ref={ref}
         class="block-editor"
-        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null }}
-        spellcheck={spellcheckEnabled()}
+        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-editing": isCodeEdit(), composing: composing() }}
+        spellcheck={isCodeEdit() ? false : spellcheckEnabled()}
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
+        onCompositionStart={() => setComposing(true)}
         onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
         onFocus={() => {

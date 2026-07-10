@@ -74,6 +74,7 @@ import {
   threadAnimation,
   setThreadAnimation,
 } from "../bulletThreading";
+import { codeHlEnabled, setCodeHlEnabled } from "../codeHighlightSettings";
 import type { GitStatus } from "../backend";
 import {
   gitEnabled,
@@ -716,6 +717,12 @@ function ExtrasTab(): JSX.Element {
           </div>
         </Field>
       </Show>
+      <Field
+        label="Live code highlighting"
+        hint="Syntax-highlight fenced code blocks (and colour them) WHILE you edit, in a box that looks like the rendered block. On by default; turn it off if the caret is hard to see on your system."
+      >
+        <Toggle on={codeHlEnabled()} onClick={() => setCodeHlEnabled(!codeHlEnabled())} />
+      </Field>
       <GitSection />
     </>
   );

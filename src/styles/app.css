@@ -949,6 +949,15 @@ body {
   gap: 8px;
 }
 
+/* "Click to add a block" — a discreet clickable strip below a page's blocks
+   (Logseq's click-to-add): invisible empty space with a text cursor + a native
+   tooltip, present on every page, so a trailing code/calc block never leaves you
+   nowhere to click. */
+.page-add-tail {
+  min-height: 26px;
+  cursor: text;
+}
+
 .page-title {
   font-size: var(--ls-page-title-size);
   font-weight: 600;
@@ -3353,6 +3362,68 @@ body {
 .block-editor.h5 { font-size: 1.0em; font-weight: 600; line-height: 1.3; }
 .block-editor.h6 { font-size: 0.9em; font-weight: 600; line-height: 1.3; }
 
+/* Live code-block editing (WYSIWYG). The editor box is styled like the rendered
+   .code-block, and a syntax-highlighted <pre> is painted BEHIND a transparent-text
+   textarea (visible caret). The textarea and the overlay MUST share every metric in
+   the shared rule below or glyphs drift out from under the caret. The chrome
+   (bg/border) lives on the wrap with padding:0; equal padding on both text layers
+   keeps their text boxes aligned. See src/codeHighlightSettings.ts + Block.tsx. */
+.editor-wrap.code-wrap {
+  background: var(--code-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  margin: 4px 0;
+  padding: 0;
+}
+.block-editor.code-editing,
+.code-hl-overlay {
+  font-family: var(--ls-font-mono);
+  font-size: 0.86em;
+  line-height: 1.5;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere; /* match the textarea's long-word soft-wrapping */
+  word-break: normal;
+  tab-size: 8;
+  letter-spacing: normal;
+  font-variant-ligatures: no-contextual;
+  box-sizing: border-box;
+  width: 100%;
+  border: 0;
+  margin: 0;
+}
+.block-editor.code-editing {
+  color: transparent;
+  caret-color: var(--text-primary);
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+/* While composing (IME), briefly show the textarea text so the pre-commit string
+   is visible (it isn't in the overlay until compositionend). */
+.block-editor.code-editing.composing {
+  color: var(--text-primary);
+}
+.code-hl-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  color: var(--text-primary);
+}
+.code-hl-overlay code.hljs {
+  padding: 0;
+  background: none;
+  font: inherit;
+  white-space: inherit;
+  overflow-wrap: inherit;
+  word-break: inherit;
+}
+.code-hl-overlay .code-hl-fence {
+  color: var(--text-muted);
+}
+
 /* markers — colored by state */
 .block-marker {
   font-size: 0.74em;
@@ -4540,16 +4611,19 @@ body.file-drop-active::after {
   border-radius: 6px;
   padding: 10px 12px;
   margin: 4px 0;
-  overflow-x: auto;
   font-family: var(--ls-font-mono);
   font-size: 0.86em;
   line-height: 1.5;
 }
+/* Wrap long lines (like the live editor) so the read view matches the edit view —
+   no height jump on blur (see .block-editor.code-editing). */
 .code-block code {
   font-family: inherit;
   background: none;
   padding: 0;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 .hljs {
   color: var(--text-primary);

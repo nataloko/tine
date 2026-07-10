@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertOutlineAfter, type FeedPage } from "../store";
 import { sameRoute, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
@@ -322,6 +322,28 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
     setNewName(props.page.name);
     setRenaming(true);
   };
+  // Click the empty area below a page's blocks to add a new bullet at the end and
+  // focus it — Logseq's "click to add" affordance (works on every page, so a
+  // trailing code/calc block never leaves you with nowhere to click). Focuses a
+  // trailing EMPTY block instead of stacking another, so repeated clicks don't pile
+  // up blanks.
+  const addBlockAtEnd = () => {
+    if (props.page.readOnly || props.page.guide) return;
+    const roots = props.page.roots;
+    if (roots.length === 0) {
+      const id = ensureEmptyBlock(props.page.name);
+      if (id) startEditing(id, 0);
+      return;
+    }
+    const lastRoot = roots[roots.length - 1];
+    const last = doc.byId[lastRoot];
+    if (last && last.raw.trim() === "" && last.children.length === 0) {
+      startEditing(lastRoot, 0);
+      return;
+    }
+    const newId = insertOutlineAfter(lastRoot, [{ raw: "", children: [] }]);
+    startEditing(newId, 0);
+  };
   const commitRename = async () => {
     const next = newName().trim();
     setRenaming(false);
@@ -494,6 +516,9 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       <div class="page-blocks">
         <For each={props.page.roots}>{(id) => <Block id={id} />}</For>
       </div>
+      <Show when={!props.page.readOnly && !props.page.guide}>
+        <div class="page-add-tail" onClick={addBlockAtEnd} title="Click to add a block" aria-label="Add a block" />
+      </Show>
     </div>
   );
 }
