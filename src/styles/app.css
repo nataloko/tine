@@ -11,6 +11,11 @@ body {
 
 body {
   font-family: var(--ls-font-family);
+  /* Prefer text (outline) presentation for any raw emoji in editable fields, so
+     WebKitGTK reaches for the bundled "Noto Emoji" outline instead of the system
+     color font (whose COLRv1 painter aborts the webview). Harmless where the
+     property is unsupported; display emoji are <img> and unaffected. See theme.css. */
+  font-variant-emoji: text;
   font-size: 16px;
   line-height: 1.5;
   color: var(--text-primary);
