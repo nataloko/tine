@@ -119,7 +119,8 @@ black terminal for a fraction of a second before).
 Fenced code blocks (and the ```calc calculator) now edit sensibly:
 
 - **Enter inside a fence adds a new line** instead of splitting the block into a new bullet (which
-  used to break multi-line code — GH #66).
+  used to break multi-line code — GH #66). Upstream shipped its own fix for this in **v0.5.2**; the
+  fork now uses upstream's handler for the plain newline and layers the rest below on top of it.
 - **Enter on a trailing blank line exits** to a new bullet below (the "double-Enter" idiom), so a
   code/calc block that's last in the page no longer traps the caret.
 - A **language picker** on the opening fence: typing ```lang (or running `/code`) offers an

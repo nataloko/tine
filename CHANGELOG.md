@@ -8,6 +8,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-10
+
+In-app Guide link/reference fixes, context menus that stay on-screen, faster
+sheet mounting, and a parser refresh (lsdoc 0.5.1). No new features.
+
+### Fixed
+
+- **Context menus no longer open off-screen.** A right-click menu near the bottom of the
+  window (e.g. deleting a namespace low in the sidebar) now opens *upward* when there isn't
+  room below, and is clamped horizontally, so all of its items stay reachable.
+- **Links and block references now work on the in-app Guide.** Guide pages linked to
+  `[[Welcome to Tine]]` and `[[Project/Roadmap]]`, which weren't part of the bundled
+  guide set, so those links opened a blank page; and block references / embeds
+  (`((…))`, `{{embed …}}`) never resolved because the Guide is virtual (never written
+  to disk) while resolution only scanned the on-disk graph. The guide set is now closed
+  under its own links (a test enforces it), and refs/embeds fall back to the loaded
+  guide pages. Everything resolves consistently in the in-app Guide, in the
+  copied-into-graph copy, and in the published website demo.
+- **Page aliases typed as the first bullet now work.** Writing `alias:: book` as the
+  first bullet on a page (the natural outliner action, matching Logseq) now registers
+  the page alias, so `#book`/`[[book]]` references resolve to that page and appear in
+  its backlinks — previously the alias only took effect when set via the page
+  properties panel. (GH #62)
+- **Shift-click in the left sidebar opens the page in the right sidebar.** Shift-clicking
+  a favorite, recent, all-pages, or namespace-tree entry now opens it in the side panel
+  (as inline links already did) instead of navigating in the center pane and selecting
+  text. (GH #63)
+- **Query-builder dropdowns no longer render behind the backlinks section.** (GH #64)
+- **Enter inside a fenced code block inserts a newline** instead of splitting off a new
+  bullet and breaking the fence. (GH #66)
+
+### Performance
+
+- **Large sheet tables and boards mount much faster.** A row's / card's heavy content
+  (title parsing, value chips, formula results) is now rendered lazily as it scrolls
+  near the viewport instead of all at once, mirroring the existing block-body
+  virtualization. Selection, keyboard navigation and drag still work over the whole
+  sheet. On a synthetic 2000-row table this cut initial mount cost by ~2.6×. (The grid
+  view gets the same treatment in a follow-up.)
+
+### Changed
+
+- **Parser updated to lsdoc 0.5.1.** Page-reference and backlink extraction now follow
+  Logseq/mldoc semantics more closely, alongside lexer performance improvements. Purely
+  a parser refresh — your files are unchanged.
+
 ## [0.5.1] - 2026-07-10
 
 Data-safety hardening, an application-ID correction, and PDF fixes. No feature changes.

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PageKind {
     Journal,
@@ -326,7 +326,12 @@ pub struct Graph {
     /// re-parsing the entire tree on every keystroke. `None` = not yet built.
     // `Arc<Document>` so a cache snapshot or a save's scoped-invalidation copy is
     // an O(1) refcount bump, not a deep clone of the whole page (see cache_upsert).
-    cache: RwLock<Option<Vec<(PageEntry, Arc<Document>)>>>,
+    cache: RwLock<Option<Arc<Vec<(PageEntry, Arc<Document>)>>>>,
+    /// Companion index for `cache`: `(kind, page_key(name)) -> Vec slot`. The Vec
+    /// stays the source of truth for whole-graph iteration; this makes warm
+    /// by-name cache probes O(1). `None` means "rebuild from the Vec on next
+    /// lookup" and is preferred over risking a stale slot after broad mutations.
+    cache_index: RwLock<Option<PageCacheIndex>>,
     /// Bumped on every cache mutation (upsert/remove). The lock-free cache build
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
@@ -368,6 +373,11 @@ pub struct Graph {
     /// keystroke. An externally-created page not yet seen by the watcher is at most
     /// one watcher tick (≤3s) stale here.
     page_list_cache: RwLock<Option<(u64, Vec<PageEntry>)>>,
+    /// Memoized exact `find_entry(name, kind)` resolution, keyed by `cache_gen`.
+    /// Unlike `list_pages()`, this index is built from raw `list_md` output so it
+    /// preserves `find_entry`'s duplicate selection: date-stem file first, else
+    /// first directory-walk match.
+    find_entry_cache: RwLock<Option<(u64, FindEntryIndex)>>,
     /// `path → content_rev` of the bytes Tine last wrote to each page file,
     /// recorded *before* the write lands on disk. The file watcher reads files
     /// outside the cache lock, so during the window between a save's atomic rename
@@ -411,6 +421,31 @@ fn rev_key(kind: PageKind, name: &str) -> String {
     format!("{kind:?}\u{1}{}", crate::refs::page_key(name))
 }
 
+type PageCacheIndex = std::collections::HashMap<(PageKind, String), usize>;
+
+fn page_cache_key(kind: PageKind, name: &str) -> (PageKind, String) {
+    (kind, crate::refs::page_key(name))
+}
+
+fn build_page_cache_index(pages: &[(PageEntry, Arc<Document>)]) -> PageCacheIndex {
+    let mut index = std::collections::HashMap::with_capacity(pages.len());
+    for (i, (entry, _)) in pages.iter().enumerate() {
+        // Preserve Vec `.find` semantics if duplicates ever slip in: first wins.
+        index
+            .entry(page_cache_key(entry.kind, &entry.name))
+            .or_insert(i);
+    }
+    index
+}
+
+fn is_date_stem_entry(entry: &PageEntry) -> bool {
+    entry
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| crate::date::JournalDate::from_file_stem(s).is_some())
+}
+
 /// Gen+today-tagged cache of derived scan results. Reset wholesale whenever the
 /// tag no longer matches — so every entry is always consistent with the current
 /// graph state (no per-entry invalidation to get wrong).
@@ -426,6 +461,36 @@ struct AdvancedCache {
     gen: u64,
     today: i64,
     results: std::collections::HashMap<String, Arc<crate::query::AdvancedResult>>,
+}
+
+struct FindEntryIndex {
+    entries: std::collections::HashMap<(PageKind, String), PageEntry>,
+    pages_loaded: bool,
+    journals_loaded: bool,
+}
+
+impl FindEntryIndex {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            pages_loaded: false,
+            journals_loaded: false,
+        }
+    }
+
+    fn has_kind(&self, kind: PageKind) -> bool {
+        match kind {
+            PageKind::Journal => self.journals_loaded,
+            PageKind::Page => self.pages_loaded,
+        }
+    }
+
+    fn mark_kind_loaded(&mut self, kind: PageKind) {
+        match kind {
+            PageKind::Journal => self.journals_loaded = true,
+            PageKind::Page => self.pages_loaded = true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,6 +551,7 @@ impl Graph {
             config,
             journal_format,
             cache: RwLock::new(None),
+            cache_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             build_lock: std::sync::Mutex::new(()),
             alias_cache: RwLock::new(None),
@@ -494,6 +560,7 @@ impl Graph {
             derived_cache: RwLock::new(None),
             advanced_cache: RwLock::new(None),
             page_list_cache: RwLock::new(None),
+            find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             referenced_names_cache: RwLock::new(None),
@@ -1334,6 +1401,8 @@ impl Graph {
         // disappearance from journals/) show up immediately; the parsed-doc cache
         // folds the new file in on its next load / the watcher's create event.
         *self.page_list_cache.write().unwrap() = None;
+        self.cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1446,34 +1515,66 @@ impl Graph {
     /// first (which could mismatch the save target and raise a phantom conflict).
     /// The stray is reached by path via `load_by_path`.
     pub fn find_entry(&self, name: &str, kind: PageKind) -> Option<PageEntry> {
-        let dir = match kind {
-            PageKind::Journal => self.journals_path(),
-            PageKind::Page => self.pages_path(),
-        };
-        let rel_dir = match kind {
-            PageKind::Journal => &self.config.journals_dir,
-            PageKind::Page => &self.config.pages_dir,
-        };
-        let matches: Vec<PageEntry> = list_md(
-            &dir,
-            kind,
-            &self.journal_format,
-            self.config.file_name_format,
-            rel_dir,
-        )
-        .into_iter()
-        .filter(|e| crate::refs::same_page(&e.name, name))
-        .collect();
-        matches
-            .iter()
-            .find(|e| {
-                e.path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| crate::date::JournalDate::from_file_stem(s).is_some())
-            })
-            .or_else(|| matches.first())
-            .cloned()
+        let key = (kind, crate::refs::page_key(name));
+        loop {
+            let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            if let Some((g, index)) = self.find_entry_cache.read().unwrap().as_ref() {
+                if *g == gen && index.has_kind(kind) {
+                    return index.entries.get(&key).cloned();
+                }
+            }
+
+            let dir = match kind {
+                PageKind::Journal => self.journals_path(),
+                PageKind::Page => self.pages_path(),
+            };
+            let rel_dir = match kind {
+                PageKind::Journal => &self.config.journals_dir,
+                PageKind::Page => &self.config.pages_dir,
+            };
+            let mut built = FindEntryIndex::new();
+            for entry in list_md(
+                &dir,
+                kind,
+                &self.journal_format,
+                self.config.file_name_format,
+                rel_dir,
+            ) {
+                let entry_key = (kind, crate::refs::page_key(&entry.name));
+                match built.entries.get_mut(&entry_key) {
+                    Some(winner) => {
+                        if !is_date_stem_entry(winner) && is_date_stem_entry(&entry) {
+                            *winner = entry;
+                        }
+                    }
+                    None => {
+                        built.entries.insert(entry_key, entry);
+                    }
+                }
+            }
+            built.mark_kind_loaded(kind);
+
+            let found = {
+                let mut guard = self.find_entry_cache.write().unwrap();
+                match guard.as_mut() {
+                    Some((g, index)) if *g == gen => {
+                        if !index.has_kind(kind) {
+                            index.entries.extend(built.entries);
+                            index.mark_kind_loaded(kind);
+                        }
+                        index.entries.get(&key).cloned()
+                    }
+                    _ => {
+                        let found = built.entries.get(&key).cloned();
+                        *guard = Some((gen, built));
+                        found
+                    }
+                }
+            };
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == gen {
+                return found;
+            }
+        }
     }
 
     /// Load a page by name; returns `None` if it doesn't exist on disk. Falls
@@ -1627,16 +1728,67 @@ impl Graph {
         arc
     }
 
+    /// Locate a page in the parsed-doc cache by logical `(kind, name)` without
+    /// scanning the Vec on warm paths. Callers must already hold either
+    /// `cache.read()` or `cache.write()`; this function only touches the companion
+    /// index, preserving the lock order cache -> cache_index.
+    fn cached_page_index(
+        &self,
+        pages: &[(PageEntry, Arc<Document>)],
+        kind: PageKind,
+        name: &str,
+    ) -> Option<usize> {
+        let key = page_cache_key(kind, name);
+        {
+            let guard = self.cache_index.read().unwrap();
+            if let Some(index) = guard.as_ref() {
+                if let Some(&i) = index.get(&key) {
+                    if pages.get(i).is_some_and(|(e, _)| {
+                        e.kind == kind && crate::refs::same_page(&e.name, name)
+                    }) {
+                        return Some(i);
+                    }
+                    // A mismatched slot means a previous mutation dropped/shifted
+                    // entries without rebuilding. Rebuild below rather than
+                    // serving whatever the stale slot now points at.
+                } else {
+                    return None;
+                }
+            }
+        }
+
+        let mut guard = self.cache_index.write().unwrap();
+        let rebuild = match guard.as_ref() {
+            Some(index) => index.get(&key).is_some_and(|&i| {
+                !pages
+                    .get(i)
+                    .is_some_and(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
+            }),
+            None => true,
+        };
+        if rebuild {
+            #[cfg(test)]
+            count_cache_linear_scan(pages.len());
+            *guard = Some(build_page_cache_index(pages));
+        }
+        guard
+            .as_ref()
+            .and_then(|index| index.get(&key).copied())
+            .filter(|&i| {
+                pages
+                    .get(i)
+                    .is_some_and(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
+            })
+    }
+
     /// A page DTO from the cache ONLY if the cache is already built — never
     /// triggers a (synchronous, whole-graph) build. `None` on a cold cache or a
     /// page not yet cached, so latency-path callers can parse just one file.
     fn peek_cached_page(&self, entry: &PageEntry) -> Option<PageDto> {
         let guard = self.cache.read().unwrap();
-        guard
-            .as_ref()?
-            .iter()
-            .find(|(e, _)| e.kind == entry.kind && crate::refs::same_page(&e.name, &entry.name))
-            .map(|(e, d)| page_dto(e, d))
+        let pages = guard.as_ref()?;
+        let i = self.cached_page_index(pages, entry.kind, &entry.name)?;
+        pages.get(i).map(|(e, d)| page_dto(e, d))
     }
 
     /// Load a page by entry. Served from the in-memory cache so block uuids are
@@ -1794,20 +1946,31 @@ impl Graph {
             .into_iter()
             .map(|(e, d, _)| (e, Arc::new(d)))
             .collect();
+        let index = build_page_cache_index(&pages);
         // Publish cache + revs atomically under the cache lock (cache → disk_revs
         // order), so no reader observes a fresh rev paired with a stale cache.
         let mut guard = self.cache.write().unwrap();
-        *guard = Some(pages);
+        *guard = Some(Arc::new(pages));
+        *self.cache_index.write().unwrap() = Some(index);
         *self.disk_revs.write().unwrap() = revs;
         drop(guard);
     }
 
-    /// Run `f` over every parsed page, building the cache on first use. The
-    /// borrow is held for the duration of `f`, so callers get references without
-    /// cloning the documents.
+    /// Run `f` over every parsed page, building the cache on first use.
+    ///
+    /// `f` scans a consistent snapshot: a concurrent save/delete may or may not be
+    /// visible depending on whether it published before this method cloned the
+    /// snapshot Arc, but the scan never sees torn or partially-mutated cache
+    /// contents. The cache read lock is held only while cloning the Arc; mutations
+    /// use copy-on-write under `cache.write()` when a scan still holds an older
+    /// snapshot.
     pub fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
-        if let Some(pages) = self.cache.read().unwrap().as_ref() {
-            return f(pages);
+        let snapshot = {
+            let guard = self.cache.read().unwrap();
+            guard.as_ref().map(Arc::clone)
+        };
+        if let Some(snapshot) = snapshot {
+            return f(snapshot.as_slice());
         }
         // Single-flight build: serialize builders on `build_lock` (NOT the cache
         // lock) so the whole-graph parse happens once, not once per racing caller,
@@ -1829,7 +1992,11 @@ impl Graph {
             }
         }
         drop(_bl);
-        f(self.cache.read().unwrap().as_ref().unwrap())
+        let snapshot = {
+            let guard = self.cache.read().unwrap();
+            guard.as_ref().map(Arc::clone).unwrap()
+        };
+        f(snapshot.as_slice())
     }
 
     /// Eagerly build the page cache plus graph-open derived maps (call once after
@@ -1902,6 +2069,7 @@ impl Graph {
     pub fn invalidate_cache(&self) {
         let mut guard = self.cache.write().unwrap();
         *guard = None;
+        *self.cache_index.write().unwrap() = None;
         self.disk_revs.write().unwrap().clear(); // under the cache lock (cache → disk_revs)
                                                  // Bump the generation AFTER discarding the cache (under the cache lock), so
                                                  // a reader that loads the new gen then reads the cache sees None (and
@@ -1940,17 +2108,20 @@ impl Graph {
         let mut guard = self.cache.write().unwrap();
         let cache_built = guard.is_some();
         if let Some(pages) = guard.as_mut() {
-            match pages
-                .iter_mut()
-                .find(|(e, _)| e.kind == entry.kind && crate::refs::same_page(&e.name, &entry.name))
-            {
-                Some(slot) => {
+            let pages = Arc::make_mut(pages);
+            match self.cached_page_index(pages, entry.kind, &entry.name) {
+                Some(i) => {
+                    let slot = &mut pages[i];
                     alias_touched = new_has_alias || doc_has_alias(&slot.1);
                     slot.1 = doc;
                 }
                 None => {
                     is_new_page = true;
+                    let index_key = page_cache_key(entry.kind, &entry.name);
                     pages.push((entry, doc));
+                    if let Some(index) = self.cache_index.write().unwrap().as_mut() {
+                        index.entry(index_key).or_insert(pages.len() - 1);
+                    }
                 }
             }
             // Update disk_revs WHILE STILL HOLDING the cache write lock, so the
@@ -2056,17 +2227,16 @@ impl Graph {
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
         if let Some(pages) = guard.as_mut() {
-            if let Some((_, d)) = pages
-                .iter()
-                .find(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
-            {
-                alias_touched = doc_has_alias(d);
+            let pages = Arc::make_mut(pages);
+            if let Some(i) = self.cached_page_index(pages, kind, name) {
+                alias_touched = doc_has_alias(&pages[i].1);
             }
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
             // Drop the rev under the cache lock (same cache → disk_revs order as
             // cache_upsert) so the two never diverge.
             self.disk_revs.write().unwrap().remove(&rev_key(kind, name));
         }
+        *self.cache_index.write().unwrap() = None;
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
@@ -3096,14 +3266,17 @@ impl Graph {
                 // the page SET may have changed (this could be a newly-created
                 // file). Drop the page-list memo so list_pages — and the eventual
                 // warm build that reads it — re-scan the dir and include it.
+                // This path does NOT bump cache_gen, so the gen-keyed find_entry
+                // index would otherwise stay stale here (miss the new/removed file)
+                // until some other op bumps the gen — drop it alongside the list memo.
                 drop(guard);
                 *self.page_list_cache.write().unwrap() = None;
+                *self.find_entry_cache.write().unwrap() = None;
+                *self.cache_index.write().unwrap() = None;
                 return None;
             };
-            if let Some((_, cached)) = cache
-                .iter()
-                .find(|(e, _)| e.kind == entry.kind && crate::refs::same_page(&e.name, &entry.name))
-            {
+            if let Some(i) = self.cached_page_index(cache, entry.kind, &entry.name) {
+                let cached = &cache[i].1;
                 // Compare CONTENT, not the in-memory uuids: cached blocks carry
                 // generated uuids (assigned at cache build / upsert), while a
                 // fresh `parse` leaves them empty for non-ref-target blocks, so a
@@ -3136,11 +3309,9 @@ impl Graph {
         let entry = self.entry_for_path(path)?;
         let was_cached = {
             let guard = self.cache.read().unwrap();
-            guard.as_ref().is_some_and(|c| {
-                c.iter().any(|(e, _)| {
-                    e.kind == entry.kind && crate::refs::same_page(&e.name, &entry.name)
-                })
-            })
+            guard
+                .as_ref()
+                .is_some_and(|c| self.cached_page_index(c, entry.kind, &entry.name).is_some())
         };
         self.cache_remove(&entry.name, entry.kind);
         was_cached.then_some(entry)
@@ -3338,9 +3509,8 @@ impl Graph {
             && (changed || {
                 let guard = self.cache.read().unwrap();
                 guard.as_ref().is_some_and(|pages| {
-                    !pages.iter().any(|(e, _)| {
-                        e.kind == page.kind && crate::refs::same_page(&e.name, &page.name)
-                    })
+                    self.cached_page_index(pages, page.kind, &page.name)
+                        .is_none()
                 })
             });
         if need_cache_update {
@@ -3523,6 +3693,17 @@ fn dedup_journal_days(entries: Vec<PageEntry>) -> Vec<PageEntry> {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    static LIST_MD_CALLS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static CACHE_LINEAR_SCAN_STEPS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+fn count_cache_linear_scan(n: usize) {
+    CACHE_LINEAR_SCAN_STEPS.with(|steps| steps.set(steps.get() + n));
+}
+
 fn list_md(
     dir: &Path,
     kind: PageKind,
@@ -3530,6 +3711,9 @@ fn list_md(
     name_fmt: FileNameFormat,
     rel_dir: &str,
 ) -> Vec<PageEntry> {
+    #[cfg(test)]
+    LIST_MD_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut out = Vec::new();
     walk_page_files(dir, |path| {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -4302,18 +4486,42 @@ mod tests {
         // the counter goes BEFORE the whole `.drawio.svg` suffix so the collided
         // name still matches the editor affordance (GH #38). A naive last-dot
         // split would have produced `flow.drawio_1.svg`.
-        assert_eq!(reserve_asset(&dir, "flow.drawio.svg").unwrap().0, "flow.drawio.svg");
-        assert_eq!(reserve_asset(&dir, "flow.drawio.svg").unwrap().0, "flow_1.drawio.svg");
-        assert_eq!(reserve_asset(&dir, "flow.drawio.svg").unwrap().0, "flow_2.drawio.svg");
+        assert_eq!(
+            reserve_asset(&dir, "flow.drawio.svg").unwrap().0,
+            "flow.drawio.svg"
+        );
+        assert_eq!(
+            reserve_asset(&dir, "flow.drawio.svg").unwrap().0,
+            "flow_1.drawio.svg"
+        );
+        assert_eq!(
+            reserve_asset(&dir, "flow.drawio.svg").unwrap().0,
+            "flow_2.drawio.svg"
+        );
         // Case-insensitive suffix match, and .excalidraw.png too.
-        assert_eq!(reserve_asset(&dir, "S.DRAWIO.SVG").unwrap().0, "S.DRAWIO.SVG");
-        assert_eq!(reserve_asset(&dir, "S.DRAWIO.SVG").unwrap().0, "S_1.DRAWIO.SVG");
-        assert_eq!(reserve_asset(&dir, "art.excalidraw.png").unwrap().0, "art.excalidraw.png");
-        assert_eq!(reserve_asset(&dir, "art.excalidraw.png").unwrap().0, "art_1.excalidraw.png");
+        assert_eq!(
+            reserve_asset(&dir, "S.DRAWIO.SVG").unwrap().0,
+            "S.DRAWIO.SVG"
+        );
+        assert_eq!(
+            reserve_asset(&dir, "S.DRAWIO.SVG").unwrap().0,
+            "S_1.DRAWIO.SVG"
+        );
+        assert_eq!(
+            reserve_asset(&dir, "art.excalidraw.png").unwrap().0,
+            "art.excalidraw.png"
+        );
+        assert_eq!(
+            reserve_asset(&dir, "art.excalidraw.png").unwrap().0,
+            "art_1.excalidraw.png"
+        );
         // An ordinary double-dotted name (not a known compound) still splits on
         // the last dot — `my.file.txt` → `my.file_1.txt`.
         assert_eq!(reserve_asset(&dir, "my.file.txt").unwrap().0, "my.file.txt");
-        assert_eq!(reserve_asset(&dir, "my.file.txt").unwrap().0, "my.file_1.txt");
+        assert_eq!(
+            reserve_asset(&dir, "my.file.txt").unwrap().0,
+            "my.file_1.txt"
+        );
         // Every reserved name is a real, distinct file on disk.
         for n in [
             "paper.pdf",
@@ -4395,6 +4603,52 @@ mod tests {
     }
 
     #[test]
+    fn gh62_alias_from_first_bullet_merges_backlinks() {
+        // GH #62: a user types `alias:: book` as the FIRST bullet on the "books"
+        // page (the natural outliner action). OG treats a properties-only first
+        // block as page properties, so `#book` references must resolve to "books"
+        // and appear in its backlinks. Before the fix this only worked when the
+        // alias lived in the page pre-block (dedicated properties panel / Logseq
+        // file convention); the bulleted form silently did nothing.
+        let build = |books_body: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("tine-gh62-{}-{}", books_body.len(), std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("journals")).unwrap();
+            fs::create_dir_all(dir.join("pages")).unwrap();
+            fs::write(dir.join("pages").join("books.md"), books_body).unwrap();
+            fs::write(dir.join("pages").join("note.md"), "- I read a #book today\n").unwrap();
+            let g = Graph::open(&dir);
+            g.warm_cache();
+            let aliases = g.page_aliases();
+            let n: usize = g.backlinks("books").iter().map(|grp| grp.blocks.len()).sum();
+            let _ = fs::remove_dir_all(&dir);
+            (aliases, n)
+        };
+
+        // Alias as the first bullet — now recognized.
+        let (a, n) = build("- alias:: book\n- I like reading\n");
+        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "first-bullet alias registered");
+        assert_eq!(n, 1, "#book backlink merges onto the books page");
+
+        // Pre-block alias keeps working (Logseq file convention / properties panel).
+        let (a, n) = build("alias:: book\n\n- I like reading\n");
+        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "pre-block alias still registered");
+        assert_eq!(n, 1, "pre-block alias backlink still merges");
+
+        // A NON-first bullet with `alias::` is a block property, NOT a page alias
+        // (OG parity — only the first properties block counts).
+        let (a, n) = build("- I like reading\n- alias:: book\n");
+        assert!(a.is_empty(), "alias in a non-first block is not a page alias: {a:?}");
+        assert_eq!(n, 0, "no backlink merge for a mid-page block alias");
+
+        // A first block that mixes content with the property is a regular block,
+        // not a page-properties block.
+        let (a, _) = build("- reading list\nalias:: book\n");
+        assert!(a.is_empty(), "content+property first block is not page properties: {a:?}");
+    }
+
+    #[test]
     fn quick_switch_includes_referenced_pages() {
         // A page referenced by `#tag` / `[[link]]` but with no file of its own
         // still "exists" (OG semantics) and must show up in quick-switch — that's
@@ -4454,6 +4708,366 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    fn reset_list_md_calls() {
+        LIST_MD_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn list_md_calls() -> usize {
+        LIST_MD_CALLS.with(|calls| calls.get())
+    }
+
+    fn reset_cache_linear_scan_steps() {
+        CACHE_LINEAR_SCAN_STEPS.with(|steps| steps.set(0));
+    }
+
+    fn cache_linear_scan_steps() -> usize {
+        CACHE_LINEAR_SCAN_STEPS.with(|steps| steps.get())
+    }
+
+    fn reference_find_entry(g: &Graph, name: &str, kind: PageKind) -> Option<PageEntry> {
+        let dir = match kind {
+            PageKind::Journal => g.journals_path(),
+            PageKind::Page => g.pages_path(),
+        };
+        let rel_dir = match kind {
+            PageKind::Journal => &g.config.journals_dir,
+            PageKind::Page => &g.config.pages_dir,
+        };
+        let matches: Vec<PageEntry> = list_md(
+            &dir,
+            kind,
+            &g.journal_format,
+            g.config.file_name_format,
+            rel_dir,
+        )
+        .into_iter()
+        .filter(|e| crate::refs::same_page(&e.name, name))
+        .collect();
+        matches
+            .iter()
+            .find(|e| is_date_stem_entry(e))
+            .or_else(|| matches.first())
+            .cloned()
+    }
+
+    #[test]
+    fn find_entry_cache_avoids_per_lookup_list_md_fanout() {
+        let dir = scratch("find-entry-cache-fanout");
+        for i in 0..16 {
+            fs::write(dir.join("pages").join(format!("Page {i}.md")), "- body\n").unwrap();
+        }
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        reset_list_md_calls();
+        for i in 0..16 {
+            let entry = g
+                .find_entry(&format!("Page {i}"), PageKind::Page)
+                .expect("page exists");
+            assert_eq!(entry.name, format!("Page {i}"));
+        }
+        assert_eq!(
+            list_md_calls(),
+            1,
+            "all page lookups in one generation should share one raw page scan"
+        );
+
+        for i in 0..16 {
+            assert!(g.find_entry(&format!("Page {i}"), PageKind::Page).is_some());
+        }
+        assert_eq!(
+            list_md_calls(),
+            1,
+            "warm find_entry index should serve repeated lookups without rescanning"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_matches_old_list_md_selection() {
+        let dir = scratch("find-entry-cache-equivalence");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Foo.md"), "- normal\n").unwrap();
+        fs::create_dir_all(dir.join("pages").join("sub")).unwrap();
+        fs::write(
+            dir.join("pages").join("sub").join("Nested.md"),
+            "- nested\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals").join("2026_06_26.org"), "* canonical\n").unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.org"),
+            "* stray\n",
+        )
+        .unwrap();
+        let g = Graph::open(&dir);
+
+        for (name, kind) in [
+            ("foo", PageKind::Page),
+            ("Nested", PageKind::Page),
+            ("Friday, 26-06-2026", PageKind::Journal),
+        ] {
+            let expected = reference_find_entry(&g, name, kind)
+                .unwrap_or_else(|| panic!("reference missing {kind:?} {name:?}"));
+            let actual = g
+                .find_entry(name, kind)
+                .unwrap_or_else(|| panic!("cached lookup missing {kind:?} {name:?}"));
+            assert_eq!(
+                actual.path, expected.path,
+                "cached lookup must match old selection for {kind:?} {name:?}"
+            );
+        }
+
+        let journal = g
+            .find_entry("Friday, 26-06-2026", PageKind::Journal)
+            .unwrap();
+        assert_eq!(journal.rel_path, "journals/2026_06_26.org");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parsed_doc_cache_index_avoids_warm_open_linear_scans() {
+        let dir = scratch("doc-cache-index-fanout");
+        for i in 0..24 {
+            fs::write(dir.join("pages").join(format!("Page {i}.md")), "- body\n").unwrap();
+        }
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        assert!(
+            g.cache_index.read().unwrap().is_some(),
+            "warm cache should install the by-name parsed-doc index"
+        );
+
+        reset_cache_linear_scan_steps();
+        for i in 0..24 {
+            let page = g
+                .load_named(&format!("Page {i}"), PageKind::Page)
+                .unwrap()
+                .expect("page exists");
+            assert_eq!(page.name, format!("Page {i}"));
+        }
+        assert_eq!(
+            cache_linear_scan_steps(),
+            0,
+            "warm page opens must not fall back to Vec scans"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parsed_doc_cache_index_does_not_serve_deleted_page() {
+        let dir = scratch("doc-cache-index-delete");
+        fs::write(dir.join("pages").join("Gone.md"), "- old\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let entry = g.find_entry("Gone", PageKind::Page).unwrap();
+        assert!(g.load_page(&entry).is_ok());
+
+        g.delete_page("Gone", PageKind::Page).unwrap();
+        assert!(
+            g.load_page(&entry).is_err(),
+            "stale cache/index must not serve the deleted entry"
+        );
+        assert!(g.load_named("Gone", PageKind::Page).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parsed_doc_cache_index_rebuilds_after_rename() {
+        let dir = scratch("doc-cache-index-rename");
+        fs::write(
+            dir.join("pages").join("Old.md"),
+            "- links [[Old]] and #Old\n",
+        )
+        .unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let old_entry = g.find_entry("Old", PageKind::Page).unwrap();
+        assert!(g.load_page(&old_entry).is_ok());
+
+        g.rename_page("Old", "New").unwrap();
+        assert!(
+            g.load_page(&old_entry).is_err(),
+            "old entry must not be served after rename"
+        );
+        assert!(g.load_named("Old", PageKind::Page).unwrap().is_none());
+        let new_page = g
+            .load_named("New", PageKind::Page)
+            .unwrap()
+            .expect("new name resolves");
+        assert_eq!(new_page.name, "New");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_rebuilds_after_file_rescue_generation_bump() {
+        let dir = scratch("find-entry-cache-rescue");
+        fs::write(dir.join("journals").join("Loose.md"), "- loose\n").unwrap();
+        let g = Graph::open(&dir);
+
+        assert!(g.find_entry("Rescued", PageKind::Page).is_none());
+        assert!(g.find_entry("Loose", PageKind::Journal).is_some());
+
+        g.rename_file_to_page("journals/Loose.md", "Rescued")
+            .unwrap();
+        assert!(g.find_entry("Loose", PageKind::Journal).is_none());
+        assert!(g.find_entry("Rescued", PageKind::Page).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_invalidated_by_cold_sync_file() {
+        // Regression: the gen-keyed find_entry index must not go stale on
+        // sync_file's cold-cache branch (the parsed-doc cache not yet built), which
+        // drops the page-list memo WITHOUT bumping cache_gen. Before the fix,
+        // find_entry kept serving the pre-create index here (missing the new file)
+        // until some other op happened to bump the generation.
+        let dir = scratch("find-entry-cache-cold-sync");
+        fs::write(dir.join("pages").join("Existing.md"), "- body\n").unwrap();
+        let g = Graph::open(&dir);
+
+        // Do NOT warm the doc cache: find_entry builds only its own index, so
+        // self.cache stays cold and sync_file below takes the else-branch.
+        assert!(g.find_entry("New", PageKind::Page).is_none());
+
+        // A brand-new external file appears (as Logseq/Syncthing would create it),
+        // reconciled while the doc cache is still cold.
+        fs::write(dir.join("pages").join("New.md"), "- new body\n").unwrap();
+        g.sync_file(&dir.join("pages").join("New.md"));
+
+        assert!(
+            g.find_entry("New", PageKind::Page).is_some(),
+            "find_entry index must reflect a file added via the cold sync_file branch"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_pages_snapshot_does_not_block_cache_upsert() {
+        let dir = scratch("with-pages-snapshot-nonblocking");
+        fs::write(dir.join("pages").join("A.md"), "- old\n").unwrap();
+        let g = Arc::new(Graph::open(&dir));
+        g.warm_cache();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let scan_graph = Arc::clone(&g);
+        let scan = std::thread::spawn(move || {
+            scan_graph.with_pages(|pages| {
+                assert!(!pages.is_empty());
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test should release the blocked snapshot scan");
+            });
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot scan should enter its closure");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write_graph = Arc::clone(&g);
+        let path = dir.join("pages").join("B.md");
+        fs::write(&path, "- new\n").unwrap();
+        let writer = std::thread::spawn(move || {
+            let content = "- new\n";
+            let entry = PageEntry {
+                name: "B".to_string(),
+                kind: PageKind::Page,
+                date_key: None,
+                rel_path: "pages/B.md".to_string(),
+                path: path.clone(),
+            };
+            write_graph.cache_upsert(entry, parse_doc(&path, content), content_rev(content));
+            done_tx.send(()).unwrap();
+        });
+
+        let writer_finished_while_scan_blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        scan.join().unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            writer_finished_while_scan_blocked,
+            "cache_upsert must not wait for a with_pages closure to finish"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_pages_snapshot_survives_concurrent_upsert() {
+        let dir = scratch("with-pages-snapshot-consistent");
+        let path = dir.join("pages").join("A.md");
+        fs::write(&path, "- old body\n").unwrap();
+        let g = Arc::new(Graph::open(&dir));
+        g.warm_cache();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let scan_graph = Arc::clone(&g);
+        let scan = std::thread::spawn(move || {
+            scan_graph.with_pages(|pages| {
+                let (_, doc) = pages
+                    .iter()
+                    .find(|(entry, _)| entry.kind == PageKind::Page && entry.name == "A")
+                    .expect("cached page exists");
+                let before = doc.roots[0].raw.clone();
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test should release the blocked snapshot scan");
+                let after = doc.roots[0].raw.clone();
+                observed_tx.send((before, after)).unwrap();
+            });
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot scan should enter its closure");
+
+        let new_content = "- new body\n";
+        fs::write(&path, new_content).unwrap();
+        let entry = PageEntry {
+            name: "A".to_string(),
+            kind: PageKind::Page,
+            date_key: None,
+            rel_path: "pages/A.md".to_string(),
+            path: path.clone(),
+        };
+        g.cache_upsert(
+            entry,
+            parse_doc(&path, new_content),
+            content_rev(new_content),
+        );
+
+        release_tx.send(()).unwrap();
+        let (before, after) = observed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot scan should report observed values");
+        scan.join().unwrap();
+
+        assert_eq!(before, "old body");
+        assert_eq!(
+            after, "old body",
+            "a with_pages scan must keep iterating its original snapshot"
+        );
+        let loaded = g
+            .load_named("A", PageKind::Page)
+            .unwrap()
+            .expect("page remains loadable");
+        assert_eq!(loaded.blocks[0].raw, "new body");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5657,7 +6271,9 @@ mod tests {
         );
         // (between scheduled …) is now field-aware, not hardwired to journal-day.
         assert_eq!(
-            count(r#"[:find (pull ?b [*]) :where (between scheduled ?b "2026-06-24" "2026-06-26")]"#),
+            count(
+                r#"[:find (pull ?b [*]) :where (between scheduled ?b "2026-06-24" "2026-06-26")]"#
+            ),
             1
         );
 
@@ -5689,9 +6305,16 @@ mod tests {
         assert!(r.supported, "ran: {:?} ignored: {:?}", r.ran, r.ignored);
         // Only the task clause ran — the commented priority/page-ref/etc. did not.
         assert_eq!(r.ran, vec!["task".to_string()]);
-        assert!(r.ignored.is_empty(), "no clause should be ignored: {:?}", r.ignored);
+        assert!(
+            r.ignored.is_empty(),
+            "no clause should be ignored: {:?}",
+            r.ignored
+        );
         let total: usize = r.groups.iter().map(|grp| grp.blocks.len()).sum();
-        assert_eq!(total, 2, "TODO + DOING match; the commented (page-ref \"Nope\") is inert");
+        assert_eq!(
+            total, 2,
+            "TODO + DOING match; the commented (page-ref \"Nope\") is inert"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

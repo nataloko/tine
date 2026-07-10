@@ -2187,25 +2187,29 @@ export function Editor(props: { id: string }): JSX.Element {
     }
 
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-      // Inside a calc block or a fenced code block, Enter continues the block (a
-      // newline) rather than splitting into a new bullet, which would break the
-      // code (GH #66). To exit to a new sibling, press Enter on a trailing blank
-      // line (the "double-Enter" idiom) — otherwise a trailing code/calc block
-      // would trap the caret with no way to add a bullet after it.
-      const inMultiline = isCalc() || (!isAnnot() && caretInFence(raw, start));
-      if (inMultiline) {
-        if (start === end) {
-          const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
-          if (trimmed !== null) {
-            e.preventDefault();
-            commit(trimmed);
-            const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-            startEditing(newId, 0);
-            return;
-          }
+      // Enter inside a calc or fenced code block continues the block (a newline)
+      // instead of splitting into a new bullet, which would break the code (GH
+      // #66). caretInFence treats a still-unterminated fence (being typed) as
+      // inside, and returns false on a ``` delimiter line, so Enter on the closing
+      // fence still exits the block.
+      const inFence = !isAnnot() && caretInFence(raw, start);
+      // Double-Enter exit: on a trailing blank line, Enter closes the block and
+      // starts a new sibling bullet — otherwise a trailing code/calc block would
+      // trap the caret with no way to add a bullet after it. multilineExitTrim
+      // returns null unless we're on that exit line.
+      if ((isCalc() || inFence) && start === end) {
+        const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
+        if (trimmed !== null) {
+          e.preventDefault();
+          commit(trimmed);
+          const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
+          startEditing(newId, 0);
+          return;
         }
-        return; // continue the block: let the textarea insert the newline natively
       }
+      // Calc continues with a native newline (like OG); the grid re-evals live.
+      if (isCalc()) return;
+      e.preventDefault();
       // Caret on an OPENING fence line (```lang): Enter drops INTO the code body
       // (the line below) instead of splitting the block — so `/code` then Escape,
       // or typing ```lang then Enter, lands you in the code, not a broken split.
@@ -2214,7 +2218,6 @@ export function Editor(props: { id: string }): JSX.Element {
         const fLineEnd = raw.indexOf("\n", start);
         const fLine = raw.slice(fLineStart, fLineEnd === -1 ? raw.length : fLineEnd);
         if (/^\s*(`{3,}|~{3,})/.test(fLine) && isOpeningFenceLine(raw, fLineStart)) {
-          e.preventDefault();
           if (fLineEnd === -1) {
             // Unterminated fence (fence line is last): open a code line below.
             applyEdit({ text: raw + "\n", start: raw.length + 1, end: raw.length + 1 });
@@ -2225,7 +2228,13 @@ export function Editor(props: { id: string }): JSX.Element {
           return;
         }
       }
-      e.preventDefault();
+      // Inside the fence body, Enter inserts a soft newline and stays in the block
+      // (GH #66, upstream's handler). Reached only when the double-Enter exit above
+      // didn't fire, so it's the plain "continue the code" case.
+      if (inFence) {
+        softNewlineCmd();
+        return;
+      }
       // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
       // (new item below, same marker/indent; a checkbox item starts a fresh `[ ]`)
       // instead of splitting the block. To exit, Backspace the empty item down to a

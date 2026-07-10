@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount, untrack, type JSX } from "solid-js";
+import { observeNear, unobserveNear } from "../lazyObserve";
 import { backend } from "../backend";
 import { blockPageReadOnly, doc, ensurePageLoaded, formatForBlock, formatForPage, pageByName, readPageProperty } from "../store";
 import { facetsFromDto, facetsOf, type Facets } from "../render/facets";
@@ -56,6 +57,10 @@ interface BoardColumn {
 }
 
 const NONE_LABEL = "(none)";
+
+export const __sheetBoardTestHooks: {
+  onGroupingRowWalk?: (rowId: string) => void;
+} = {};
 
 export function SheetBoard(props: {
   ownerId: string;
@@ -399,8 +404,31 @@ function buildColumns(
   schema: readonly FieldSpec[] = [],
   opts: { formulas?: ReadonlyMap<string, string>; now?: Date } = {}
 ): BoardColumn[] {
-  const keySets = rows.map((row) => groupKeysForBlock(row, groupBy, opts));
-  const keys = keySets.map((ks) => ks[0] ?? null);
+  const rowsByKey = new Map<string | null, RowRecord[]>();
+  const keys: (string | null)[] = [];
+  const allKeys: (string | null)[] = [];
+  const seenAllKeys = new Set<string | null>();
+  let hasNull = false;
+  let hasFormulaError = false;
+  for (const row of rows) {
+    __sheetBoardTestHooks.onGroupingRowWalk?.(row.id);
+    const rowKeys = groupKeysForBlock(row, groupBy, opts);
+    keys.push(rowKeys[0] ?? null);
+    const seenForRow = new Set<string | null>();
+    for (const key of rowKeys) {
+      hasNull ||= key === null;
+      hasFormulaError ||= key === "(error)";
+      if (!seenAllKeys.has(key)) {
+        seenAllKeys.add(key);
+        allKeys.push(key);
+      }
+      if (seenForRow.has(key)) continue;
+      seenForRow.add(key);
+      const bucket = rowsByKey.get(key);
+      if (bucket) bucket.push(row);
+      else rowsByKey.set(key, [row]);
+    }
+  }
   let order: (string | null)[];
   const enumValues = enumValuesFor(schema, groupBy);
   if (isFormulaField(groupBy)) {
@@ -418,9 +446,7 @@ function buildColumns(
     }
   } else if (groupBy === "tags") {
     order = [];
-    for (const ks of keySets) {
-      for (const key of ks) if (key !== null && !order.includes(key)) order.push(key);
-    }
+    for (const key of allKeys) if (key !== null) order.push(key);
   } else if (enumValues) {
     order = [...enumValues];
     for (const key of keys) if (key !== null && !order.includes(key)) order.push(key);
@@ -437,15 +463,15 @@ function buildColumns(
     order = [];
     for (const key of keys) if (key !== null && !order.includes(key)) order.push(key);
   }
-  if (keySets.some((ks) => ks.includes(null)) && !order.includes(null)) order.push(null);
-  if (isFormulaField(groupBy) && keySets.some((ks) => ks.includes("(error)")) && !order.includes("(error)")) {
+  if (hasNull && !order.includes(null)) order.push(null);
+  if (isFormulaField(groupBy) && hasFormulaError && !order.includes("(error)")) {
     order.push("(error)");
   }
   if (order.length === 0) order = [null];
   return order.map((key) => ({
     key,
     label: key === null ? NONE_LABEL : groupBy === "priority" ? `[#${key}]` : key,
-    rows: rows.filter((_row, i) => keySets[i].includes(key)),
+    rows: rowsByKey.get(key) ?? [],
   }));
 }
 
@@ -539,6 +565,20 @@ function rowTitle(row: RowRecord): string {
   return visibleBody(rowRaw(row))[0] ?? "";
 }
 
+// Lazy-mount virtualization (P2): a board card's heavy content (title
+// InlineText parse, chips, hover handle) is deferred until the card first comes
+// near the viewport, mirroring the table (SheetTable.tsx) and the block-body
+// pattern ([[tine-block-virtualization]]). The <article> shell, its data-row/col
+// attrs, selection class and drag handlers stay mounted for EVERY card so
+// selection / keyboard nav / drag hit-testing keep working off-screen.
+// Render-once-keep: a card rendered once (latched by block id) renders eagerly
+// forever. Module-level, shared across surfaces, bounded by the working set.
+const renderedBoardCards = new Set<string>();
+
+export function resetBoardCardVirtualizationForTests() {
+  renderedBoardCards.clear();
+}
+
 function BoardCard(props: {
   ownerId: string;
   row: RowRecord;
@@ -554,6 +594,15 @@ function BoardCard(props: {
   const cell = (): SheetCellCtx => ({ gridId: props.ownerId, row: props.rowIndex, col: props.colIndex });
   const editing = () => editingId() === props.row.id && editingOwner() === cellOwner(cell());
   const fmt = () => (doc.byId[props.row.id] ? formatForBlock(props.row.id) : formatForPage(props.row.page));
+  const [near, setNear] = createSignal(renderedBoardCards.has(props.row.id));
+  const observeCard = (el: Element) => {
+    if (near()) return;
+    observeNear(el, () => {
+      renderedBoardCards.add(props.row.id);
+      setNear(true);
+    });
+    onCleanup(() => unobserveNear(el));
+  };
   const bgColor = createMemo(() => {
     const f = recordFacets(props.row);
     return f ? blockBackgroundColor(f.properties) : undefined;
@@ -706,8 +755,9 @@ function BoardCard(props: {
       onDblClick={onDoubleClick}
       onContextMenu={openCellMenu}
       style={bgColor() ? { background: bgColor() } : undefined}
+      ref={observeCard}
     >
-      <Show when={doc.byId[props.row.id]}>
+      <Show when={near() && doc.byId[props.row.id]}>
         <button
           class="sheet-cell-handle sheet-card-handle"
           title="Card menu"
@@ -727,12 +777,15 @@ function BoardCard(props: {
       <Show
         when={editing()}
         fallback={
-          <>
+          <Show
+            when={near()}
+            fallback={<div class="sheet-board-card-title sheet-cell-defer">{rowTitle(props.row)}</div>}
+          >
             <div class="sheet-board-card-title">
               <InlineText text={rowTitle(props.row)} format={fmt()} />
             </div>
             <CardChips row={props.row} groupBy={props.groupBy} onFieldClick={onChipClick} />
-          </>
+          </Show>
         }
       >
         <SheetCellContext.Provider value={cell()}>
