@@ -13,7 +13,7 @@
 # current stable branch and is built on the freedesktop 24.08 base, so the SDK
 # extensions are pinned to //24.08.
 
-id: page.tine.app
+id: page.tine.Tine
 runtime: org.gnome.Platform
 runtime-version: "48"
 sdk: org.gnome.Sdk
@@ -85,24 +85,21 @@ modules:
       - cargo build --release --offline --features custom-protocol -p tine
       # 4. Install artefacts into /app.
       - install -Dm755 target/release/tine /app/bin/tine
-      - install -Dm644 flatpak/page.tine.app.desktop /app/share/applications/page.tine.app.desktop
-      - install -Dm644 flatpak/page.tine.app.metainfo.xml /app/share/metainfo/page.tine.app.metainfo.xml
-      - install -Dm644 src-tauri/icons/icon.png       /app/share/icons/hicolor/512x512/apps/page.tine.app.png
-      - install -Dm644 src-tauri/icons/128x128@2x.png /app/share/icons/hicolor/256x256/apps/page.tine.app.png
-      - install -Dm644 src-tauri/icons/128x128.png    /app/share/icons/hicolor/128x128/apps/page.tine.app.png
-      - install -Dm644 src-tauri/icons/64x64.png      /app/share/icons/hicolor/64x64/apps/page.tine.app.png
-      - install -Dm644 src-tauri/icons/32x32.png      /app/share/icons/hicolor/32x32/apps/page.tine.app.png
+      - install -Dm644 flatpak/page.tine.Tine.desktop /app/share/applications/page.tine.Tine.desktop
+      - install -Dm644 flatpak/page.tine.Tine.metainfo.xml /app/share/metainfo/page.tine.Tine.metainfo.xml
+      - install -Dm644 src-tauri/icons/icon.png       /app/share/icons/hicolor/512x512/apps/page.tine.Tine.png
+      - install -Dm644 src-tauri/icons/128x128@2x.png /app/share/icons/hicolor/256x256/apps/page.tine.Tine.png
+      - install -Dm644 src-tauri/icons/128x128.png    /app/share/icons/hicolor/128x128/apps/page.tine.Tine.png
+      - install -Dm644 src-tauri/icons/64x64.png      /app/share/icons/hicolor/64x64/apps/page.tine.Tine.png
+      - install -Dm644 src-tauri/icons/32x32.png      /app/share/icons/hicolor/32x32/apps/page.tine.Tine.png
     sources:
       # The app source, pinned to an exact commit (Flathub requires a pinned
-      # commit, not a moving tag/branch).
-      # ⚠️ RE-PIN BEFORE BUILDING: v0.4.7 still carries the OLD identifier
-      # (dev.tine.app) internally — this Flatpak's id is page.tine.app, so the
-      # source MUST be re-pinned to the FIRST released tag/commit that ships the
-      # page.tine.app identifier (the rename landed on master after v0.4.7).
+      # commit, not a moving tag/branch). v0.5.0 is the first release carrying the
+      # page.tine.Tine identifier.
       - type: git
         url: https://github.com/martinkoutecky/tine.git
-        tag: v0.4.7
-        commit: 9ac44b995a11f1365e08f5683878ad103c132439
+        tag: v0.5.0
+        commit: ef5c0ab7ea5e5a8eac3c28f6f5275b2d1b667dc9
       # Vendored dependency sources (generated — do not hand-edit).
       - cargo-sources.json
       - node-sources.json

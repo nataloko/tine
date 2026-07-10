@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tine",
-  "version": "0.5.0",
-  "identifier": "page.tine.app",
+  "version": "0.5.1",
+  "identifier": "page.tine.Tine",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5181",
