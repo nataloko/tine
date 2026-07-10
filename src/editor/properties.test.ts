@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   caretInFence,
+  fencedCodeBlock,
   multilineExitTrim,
   isSheetCellHidden,
   joinProps,
@@ -191,5 +192,55 @@ describe("multilineExitTrim — Enter on a trailing blank line exits a code/calc
   it("never exits from a blank FIRST line (nothing above to attach after)", () => {
     expect(multilineExitTrim("\ncode", 0, "calc")).toBeNull();
     expect(multilineExitTrim("\ncode", 0, "fence")).toBeNull();
+  });
+});
+
+describe("fencedCodeBlock — detect a standalone fenced code block for the overlay", () => {
+  it("extracts lang + code from a terminated fence", () => {
+    expect(fencedCodeBlock("```js\nconsole.log(1)\n```")).toEqual({
+      lang: "js", codeText: "console.log(1)", openLine: 0, closeLine: 2,
+    });
+  });
+
+  it("tolerates an unterminated fence (mid-typing)", () => {
+    expect(fencedCodeBlock("```js\nconsole.log(1)")).toEqual({
+      lang: "js", codeText: "console.log(1)", openLine: 0, closeLine: null,
+    });
+  });
+
+  it("handles ~~~ fences and multi-line code", () => {
+    expect(fencedCodeBlock("~~~py\na\nb\n~~~")).toEqual({
+      lang: "py", codeText: "a\nb", openLine: 0, closeLine: 3,
+    });
+  });
+
+  it("accepts language chars like c++ and lowercases", () => {
+    expect(fencedCodeBlock("```C++\nx\n```")?.lang).toBe("c++");
+  });
+
+  it("allows an empty language and empty code", () => {
+    expect(fencedCodeBlock("```\n```")).toEqual({ lang: "", codeText: "", openLine: 0, closeLine: 1 });
+  });
+
+  it("ignores leading/trailing blank lines but keeps line indices", () => {
+    expect(fencedCodeBlock("\n```js\nx\n```\n")).toEqual({
+      lang: "js", codeText: "x", openLine: 1, closeLine: 3,
+    });
+  });
+
+  it("returns null for a ```calc block", () => {
+    expect(fencedCodeBlock("```calc\n1+1\n```")).toBeNull();
+  });
+
+  it("returns null for prose before the fence (mixed content)", () => {
+    expect(fencedCodeBlock("note\n```js\nx\n```")).toBeNull();
+  });
+
+  it("returns null for content after the closing fence", () => {
+    expect(fencedCodeBlock("```js\nx\n```\nafter")).toBeNull();
+  });
+
+  it("returns null when there is no fence", () => {
+    expect(fencedCodeBlock("just text")).toBeNull();
   });
 });

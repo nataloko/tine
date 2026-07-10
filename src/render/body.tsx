@@ -7,6 +7,7 @@ import { InlineText, renderInlines, renderRawHtml, MathView, CopyButton } from "
 import type { Block as AstBlock, ListItem as AstListItem, Format } from "./ast";
 import { coarseSpanAttrs, type SpanDomAttrs } from "./spans";
 import { evalCalc } from "../editor/calc";
+import type { CodeFence } from "../editor/properties";
 import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { graphMeta } from "../ui";
 import { isRenderHiddenProp, isPropertyLine } from "./block";
@@ -19,10 +20,51 @@ function escapeHtml(code: string): string {
 }
 
 // highlight.js/common is large — load on first code block, cache the promise.
+// Exported so the editor's live-highlight overlay shares this one cached instance.
 let hljsMod: Promise<typeof import("highlight.js/lib/common").default> | null = null;
-function loadHljs() {
+export function loadHljs() {
   if (!hljsMod) hljsMod = import("highlight.js/lib/common").then((m) => m.default);
   return hljsMod;
+}
+export type HljsInstance = Awaited<ReturnType<typeof loadHljs>>;
+
+/** Build the innerHTML for the live-editing highlight overlay `<pre>`: the SAME
+ *  text as `fullText` line-for-line (so each glyph sits under the textarea's
+ *  matching glyph), with the code region syntax-highlighted and the fence
+ *  delimiter lines dimmed. highlight.js only inserts `<span>`s (never changes
+ *  source characters), so per-line alignment holds. `h` may be undefined before
+ *  highlight.js loads → escaped plain (still aligned), upgrades reactively.
+ *  Mirrors CodeBlock's highlight + try/catch fallbacks. */
+export function highlightFencedForOverlay(
+  h: HljsInstance | undefined,
+  fence: CodeFence,
+  fullText: string
+): string {
+  const lines = fullText.split("\n");
+  const bodyEnd = fence.closeLine ?? lines.length;
+  let bodyHtml: string;
+  if (!h) {
+    bodyHtml = escapeHtml(fence.codeText);
+  } else {
+    try {
+      bodyHtml =
+        fence.lang && h.getLanguage(fence.lang)
+          ? h.highlight(fence.codeText, { language: fence.lang }).value
+          : h.highlightAuto(fence.codeText).value;
+    } catch {
+      bodyHtml = escapeHtml(fence.codeText);
+    }
+  }
+  const dim = (s: string) => `<span class="code-hl-fence">${escapeHtml(s)}</span>`;
+  const segs: string[] = [];
+  for (let i = 0; i < fence.openLine; i++) segs.push(escapeHtml(lines[i])); // leading blanks
+  segs.push(dim(lines[fence.openLine]));
+  if (bodyEnd > fence.openLine + 1) segs.push(bodyHtml); // one segment spanning the code lines
+  if (fence.closeLine !== null) {
+    segs.push(dim(lines[fence.closeLine]));
+    for (let i = fence.closeLine + 1; i < lines.length; i++) segs.push(escapeHtml(lines[i])); // trailing blanks
+  }
+  return segs.join("\n");
 }
 
 // A fenced code block: renders escaped (plain) immediately, then upgrades to

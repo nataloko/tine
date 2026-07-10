@@ -94,6 +94,7 @@ import {
   gitBadgeTitle,
   runGitBadgeAction,
 } from "./git";
+import { initCodeHlSettings } from "./codeHighlightSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initAssetSettings } from "./assetSettings";
@@ -461,6 +462,8 @@ export function App(): JSX.Element {
   onMount(() => void initCopySettings());
   onMount(() => void initRefCompletionSettings());
   onMount(() => void initBulletThreading());
+  // Live syntax highlighting while editing code blocks (default on).
+  onMount(() => void initCodeHlSettings());
   // Optional git integration (issue #33). Loads prefs; if enabled + pull-on-start,
   // pulls before any edits (clean reload through the watcher). Off by default.
   onMount(() => void initGit());

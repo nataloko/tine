@@ -94,6 +94,52 @@ export function isOpeningFenceLine(raw: string, lineStart: number): boolean {
   return fence === null;
 }
 
+/** A block that is a single fenced code block, for the live-highlight overlay. */
+export interface CodeFence {
+  /** Language token from the opening fence (lowercased; "" if none). */
+  lang: string;
+  /** The inner code (lines strictly between the fences), joined with "\n". */
+  codeText: string;
+  /** Line index of the opening ```-fence in the split text. */
+  openLine: number;
+  /** Line index of the closing fence, or null while the fence is still open. */
+  closeLine: number | null;
+}
+
+/** If `text` is ONE fenced code block (optionally with blank lines before/after),
+ *  return its language + inner code + fence line indices; else null. Tolerates an
+ *  unterminated fence (closeLine null) so it works mid-typing. Returns null for a
+ *  ```calc block (the calculator keeps its own editor path) and for mixed
+ *  prose+fence content — the overlay's <pre> must be a clean code block. */
+export function fencedCodeBlock(text: string): CodeFence | null {
+  const lines = text.split("\n");
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === "") i++;
+  if (i >= lines.length) return null;
+  const openLine = i;
+  const open = /^(`{3,}|~{3,})([A-Za-z0-9+#._-]*)\s*$/.exec(lines[openLine]);
+  if (!open) return null;
+  const marker = open[1][0]; // ` or ~
+  const lang = open[2].toLowerCase();
+  if (lang === "calc") return null;
+  let closeLine: number | null = null;
+  for (let j = openLine + 1; j < lines.length; j++) {
+    const m = /^\s*(`{3,}|~{3,})\s*$/.exec(lines[j]);
+    if (m && m[1][0] === marker) {
+      closeLine = j;
+      break;
+    }
+  }
+  // v1 scope: nothing non-blank may sit after the closing fence.
+  if (closeLine !== null) {
+    for (let j = closeLine + 1; j < lines.length; j++) {
+      if (lines[j].trim() !== "") return null;
+    }
+  }
+  const bodyEnd = closeLine === null ? lines.length : closeLine;
+  return { lang, codeText: lines.slice(openLine + 1, bodyEnd).join("\n"), openLine, closeLine };
+}
+
 /** Whether a textarea caret offset is inside a fenced code region. The fence
  *  delimiter lines themselves are outside; the content lines between them are
  *  inside, including an unterminated fence while the user is editing. */

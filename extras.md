@@ -125,6 +125,11 @@ Fenced code blocks (and the ```calc calculator) now edit sensibly:
 - A **language picker** on the opening fence: typing ```lang (or running `/code`) offers an
   autocomplete of common languages, mirroring the `[[` / `#` popup; picking one drops the caret onto
   the code line.
+- **Live syntax highlighting while editing** (Settings → mine (extras) → *Live code highlighting*,
+  on by default): the code is coloured *as you type*, in a box that looks like the rendered block
+  (no jump on blur). A syntax-highlighted layer is painted behind the real textarea (which stays the
+  sole caret owner — the editor's focus/caret invariant is untouched); turn it off if the caret is
+  ever hard to see on your system.
 
 ### Click below to add a block
 

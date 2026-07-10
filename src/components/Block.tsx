@@ -1,4 +1,4 @@
-import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
+import { Show, Switch, Match, For, createMemo, createSignal, createResource, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { backend } from "../backend";
 import {
@@ -84,7 +84,8 @@ import {
 } from "../editor/format";
 import { isRenderHiddenProp, isPropertyLine } from "../render/block";
 import { facetsOf } from "../render/facets";
-import { AstBody } from "../render/body";
+import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
+import { codeHlEnabled } from "../codeHighlightSettings";
 import { InlineText } from "../render/inline";
 import { editorOffsetFromRenderedRange } from "../render/spans";
 import {
@@ -112,7 +113,7 @@ import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
 import { taskCheckboxState } from "../markers";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim, isOpeningFenceLine } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim, isOpeningFenceLine, fencedCodeBlock } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
@@ -986,6 +987,21 @@ export function Editor(props: { id: string }): JSX.Element {
   });
   const isCalc = () => editingCalc;
   const calcRows = createMemo(() => (isCalc() ? evalCalc(calcLive() ?? "") : []));
+  // Live syntax highlighting while editing a fenced code block: a highlighted <pre>
+  // painted BEHIND the (still sole-owner) textarea, whose text goes transparent with
+  // a visible caret. Purely visual → ADR-0013-safe. `fencedCodeBlock` returns null
+  // for calc/mixed content, so this never collides with the calc path. Derived from
+  // `editorValue()` (committed, reactive) exactly like `calcLive`, so it updates live.
+  const codeEdit = createMemo(() => (codeHlEnabled() ? fencedCodeBlock(editorValue()) : null));
+  const isCodeEdit = () => codeEdit() !== null;
+  const [hljsOverlay] = createResource(loadHljs);
+  const codeOverlayHtml = createMemo(() => {
+    const f = codeEdit();
+    return f ? highlightFencedForOverlay(hljsOverlay(), f, editorValue()) : "";
+  });
+  // While an IME composition is active, the pre-commit string lives in the textarea
+  // (not yet in the overlay), so briefly un-hide the textarea text in code mode.
+  const [composing, setComposing] = createSignal(false);
   const commit = (text: string, opts?: { timetracking?: boolean; calc?: boolean }) => {
     const commitAsCalc = opts?.calc ?? isCalc();
     // For calc, `text` is the bare expressions the user sees — re-fence it.
@@ -1713,6 +1729,7 @@ export function Editor(props: { id: string }): JSX.Element {
     refreshAutocompleteAfterInput();
   };
   const onCompositionEnd = () => {
+    setComposing(false);
     if (!applyFullWidthRefReplace()) return;
     commit(ref.value);
     autosize();
@@ -2484,7 +2501,15 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   return (
-    <div class="editor-wrap" classList={{ "calc-wrap": isCalc() }}>
+    <div class="editor-wrap" classList={{ "calc-wrap": isCalc(), "code-wrap": isCodeEdit() }}>
+      {/* Live code-highlight overlay: painted BEHIND the textarea (first child →
+          lower paint order), purely visual (aria-hidden, pointer-events:none).
+          Its text is byte-for-byte the editor value, so glyphs sit under the caret. */}
+      <Show when={isCodeEdit()}>
+        <pre class="code-hl-overlay" aria-hidden="true">
+          <code class="hljs" innerHTML={codeOverlayHtml()} />
+        </pre>
+      </Show>
       <Show when={isCalc()}>
         <div class="calc-gutter" aria-hidden="true">
           <For each={calcRows()}>{(_, i) => <div class="calc-lineno">{i() + 1}</div>}</For>
@@ -2493,11 +2518,12 @@ export function Editor(props: { id: string }): JSX.Element {
       <textarea
         ref={ref}
         class="block-editor"
-        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null }}
-        spellcheck={spellcheckEnabled()}
+        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-editing": isCodeEdit(), composing: composing() }}
+        spellcheck={isCodeEdit() ? false : spellcheckEnabled()}
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
+        onCompositionStart={() => setComposing(true)}
         onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
         onFocus={() => {
