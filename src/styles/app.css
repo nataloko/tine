@@ -980,13 +980,27 @@ body {
   gap: 8px;
 }
 
-/* "Click to add a block" — a discreet clickable strip below a page's blocks
-   (Logseq's click-to-add): invisible empty space with a text cursor + a native
-   tooltip, present on every page, so a trailing code/calc block never leaves you
-   nowhere to click. */
+/* "Click to add a block" — a clickable strip below a page's blocks (Logseq's
+   click-to-add). Invisible until hovered; the hint aligns with the block text so
+   it reads as "start typing here". Present on every page, so a trailing code/calc
+   block never leaves you nowhere to click. */
 .page-add-tail {
-  min-height: 26px;
+  min-height: 28px;
   cursor: text;
+  display: flex;
+  align-items: center;
+  padding-left: 38px;
+}
+.page-add-hint {
+  color: var(--text-muted);
+  font-size: 0.95em;
+  opacity: 0;
+  transition: opacity 0.12s;
+  pointer-events: none;
+  user-select: none;
+}
+.page-add-tail:hover .page-add-hint {
+  opacity: 0.5;
 }
 
 .page-title {

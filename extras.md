@@ -135,7 +135,7 @@ Fenced code blocks (and the ```calc calculator) now edit sensibly:
 
 ### Click below to add a block
 
-Every page has a Logseq-style **click-to-add** area below its content — a discreet, invisible strip
-(text cursor + tooltip on hover). Click the empty space under the last block to add a new bullet and
-start typing (it focuses a trailing empty block instead of stacking blanks). A general escape hatch,
-so a trailing code/calc block (or anything) never leaves you with nowhere to click.
+Every page has a Logseq-style **click-to-add** area below its content — a clickable strip that shows
+a faint "Click to add a block" hint on hover. Click the empty space under the last block to add a new
+bullet and start typing (it focuses a trailing empty block instead of stacking blanks). A general
+escape hatch, so a trailing code/calc block (or anything) never leaves you with nowhere to click.
