@@ -321,16 +321,31 @@ export function filterCommands(query: string): Command[] {
     .map((x) => x.c);
 }
 
-/** Common code-fence languages offered by the ```lang picker. Curated (not the
- *  full highlight.js set) to the ones people actually reach for, so the list stays
- *  usable; any language still works if typed in full (the renderer auto-detects). */
+/** Code-fence languages offered by the ```lang picker — highlight.js identifiers,
+ *  so every entry actually highlights (the full hljs build is loaded). Broad but
+ *  not the entire ~190; the fuzzy filter narrows it, and any other hljs language
+ *  still works if typed in full. */
 export const CODE_LANGUAGES: string[] = [
-  "javascript", "typescript", "jsx", "tsx", "json", "html", "css", "scss",
-  "python", "rust", "go", "java", "kotlin", "c", "cpp", "csharp", "swift",
-  "php", "ruby", "scala", "clojure", "elixir", "erlang", "haskell", "lua",
-  "perl", "r", "julia", "dart", "objectivec", "groovy",
-  "bash", "shell", "powershell", "sql", "graphql", "yaml", "toml", "ini",
-  "xml", "markdown", "dockerfile", "makefile", "nix", "diff", "latex",
+  // mainstream
+  "javascript", "typescript", "python", "ruby", "php", "java", "kotlin", "scala",
+  "groovy", "csharp", "fsharp", "vbnet", "c", "cpp", "objectivec", "swift", "go",
+  "rust", "dart",
+  // scripting / functional
+  "lua", "perl", "r", "julia", "elixir", "erlang", "haskell", "clojure", "scheme",
+  "lisp", "ocaml", "reasonml", "elm", "purescript", "coffeescript", "livescript",
+  "crystal", "nim", "zig", "d", "haxe", "wren", "smalltalk", "tcl", "vala", "gdscript",
+  // legacy / scientific
+  "fortran", "cobol", "delphi", "ada", "prolog", "matlab", "mathematica", "actionscript",
+  // web / markup / data
+  "xml", "html", "css", "scss", "less", "stylus", "json", "yaml", "toml", "ini",
+  "properties", "graphql", "protobuf", "thrift", "handlebars", "twig", "haml", "markdown",
+  "latex", "asciidoc",
+  // shell / ops / db
+  "bash", "shell", "powershell", "dos", "awk", "vim", "nix", "sql", "pgsql",
+  "dockerfile", "makefile", "cmake", "gradle", "nginx", "apache", "puppet", "diff",
+  "http", "gherkin",
+  // hardware / low-level
+  "glsl", "verilog", "vhdl", "x86asm", "llvm", "wasm", "arduino", "processing",
   "plaintext",
 ];
 

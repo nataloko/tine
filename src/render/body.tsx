@@ -19,11 +19,13 @@ function escapeHtml(code: string): string {
   return code.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
-// highlight.js/common is large — load on first code block, cache the promise.
-// Exported so the editor's live-highlight overlay shares this one cached instance.
-let hljsMod: Promise<typeof import("highlight.js/lib/common").default> | null = null;
+// highlight.js (the FULL build — all ~190 languages, so the code-fence language
+// picker's whole list actually highlights) is large, so load it lazily on the
+// first code block and cache the promise. Exported so the editor's live-highlight
+// overlay shares this one cached instance.
+let hljsMod: Promise<typeof import("highlight.js").default> | null = null;
 export function loadHljs() {
-  if (!hljsMod) hljsMod = import("highlight.js/lib/common").then((m) => m.default);
+  if (!hljsMod) hljsMod = import("highlight.js").then((m) => m.default);
   return hljsMod;
 }
 export type HljsInstance = Awaited<ReturnType<typeof loadHljs>>;
@@ -43,14 +45,15 @@ export function highlightFencedForOverlay(
   const lines = fullText.split("\n");
   const bodyEnd = fence.closeLine ?? lines.length;
   let bodyHtml: string;
-  if (!h) {
+  // Only single-language highlight in the LIVE overlay (never highlightAuto, which
+  // would tokenise against all ~190 languages every keystroke); an un-named or
+  // unknown-language fence stays escaped-plain here. The rendered block still
+  // auto-detects (one-time) in CodeBlock.
+  if (!h || !fence.lang || !h.getLanguage(fence.lang)) {
     bodyHtml = escapeHtml(fence.codeText);
   } else {
     try {
-      bodyHtml =
-        fence.lang && h.getLanguage(fence.lang)
-          ? h.highlight(fence.codeText, { language: fence.lang }).value
-          : h.highlightAuto(fence.codeText).value;
+      bodyHtml = h.highlight(fence.codeText, { language: fence.lang }).value;
     } catch {
       bodyHtml = escapeHtml(fence.codeText);
     }

@@ -517,9 +517,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         <For each={props.page.roots}>{(id) => <Block id={id} />}</For>
       </div>
       <Show when={!props.page.readOnly && !props.page.guide}>
-        <div class="page-add-tail" onClick={addBlockAtEnd} title="Click to add a block">
-          <span class="page-add-hint">Click to add a block</span>
-        </div>
+        <div class="page-add-tail" onClick={addBlockAtEnd} title="Click to add a block" aria-label="Add a block" />
       </Show>
     </div>
   );
