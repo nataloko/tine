@@ -14,6 +14,12 @@ when there's something to decide.
 - Remotes: **`origin`** = upstream (`martinkoutecky/tine`), **`fork`** = `nataloko/tine`.
 - **`mine`** = integration branch (upstream `master` + all fork features); builds ship from here.
 - **`feat/*`** = clean per-feature branches — **never touched** by this skill.
+- **Fork ADRs** live on a separate track under **`docs/adr/mine/`** (`0001+`, own README index),
+  NOT interleaved with upstream's `docs/adr/` numbering — so upstream's sequential ADRs never
+  collide. A synced upstream ADR just slots into the main `docs/adr/` track (auto-merges — the fork
+  has no rows there to conflict); new fork ADRs go in `docs/adr/mine/`. (If an old sync ever left a
+  fork ADR on an upstream-range number, move it to `mine/` and fix its cross-refs — never renumber
+  into upstream's range.)
 - Releases: a **`mine-v*`** tag triggers `.github/workflows/personal-build.yml` (AppImage + Windows).
 - Fork feature surfaces (used by the overlap scan): query filter
   (`src/components/Macro.tsx`, `QueryBuilder.tsx`, `src/sheet/config.ts`, `src/editor/queryFilter.ts`),
@@ -90,6 +96,13 @@ sides: `grep -E '"version"|createUpdaterArtifacts|nataloko/tine' src-tauri/tauri
 > Android `bundle.android.versionCode`, so `src/version-code.test.ts` fails (versionCode must equal
 > `major*1_000_000 + minor*1_000 + patch`, e.g. `0.5.1` → `5001`). Fix it by bumping versionCode to the
 > derived value (a 1-line correction; harmless — the fork ships AppImage + Windows, not F-Droid) and note it.
+>
+> Fork **backend** changes: `cargo test -p tine-core` compiles ONLY the core crate, NOT `src-tauri/`
+> (the `tine` app crate). So if an upstream refactor forces a change to a fork `src-tauri/src/*.rs`
+> (e.g. `git.rs` when upstream reshaped `AppState`), a compile break there is invisible to the gates
+> above and only surfaces in the GitHub build. Catch it locally with a `cargo check` on the app crate
+> (needs the WebKit/GTK dev libs the AppImage build uses):
+> `nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'`
 
 ## Step 5 — Push + build
 ```bash
