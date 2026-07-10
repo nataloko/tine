@@ -1,4 +1,4 @@
-# 0040. Live code highlighting via a passive overlay behind the textarea
+# mine/0003. Live code highlighting via a passive overlay behind the textarea
 
 - **Status:** Accepted
 - **Date:** 2026-07-10

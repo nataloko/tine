@@ -8,6 +8,70 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-10
+
+Multi-window graph management, direct file-manager asset paste, PDF and query
+fixes, Android/Flatpak release repair, and comprehensive graph data-safety
+hardening.
+
+### Added
+
+- **Multiple graphs can stay open in independent desktop windows.** The graph
+  switcher now keeps a durable removable MRU list; click switches the current
+  window and Shift-click opens another OS window. Each window owns its graph,
+  watcher events, warm cache, backups, and persisted tab/pane session, while
+  quick capture safely targets only the last-focused graph. A second
+  `tine <graph>` launch opens or focuses that graph in the existing process.
+
+- **Files copied in the OS file manager can be pasted directly into a block.**
+  Tine imports regular files into `assets/` and inserts Logseq-compatible links;
+  multiple files are supported, directories are skipped, native file paths avoid
+  loading large files into the webview, and byte-only clipboard payloads are capped
+  at 64 MiB per file.
+
+### Fixed
+
+- **Graph and recovery operations now stay inside the selected graph.** Unsafe
+  configured page/journal paths and escaping journal filenames are rejected,
+  overlapping graph windows are refused, and every graph-scoped IPC is pinned to
+  the window binding that issued it.
+- **Backups are root-bound and complete before they become restorable.** Snapshot
+  namespaces use a canonical-root digest, complete snapshots carry a hash-verified
+  v2 manifest, partial/legacy-unverified directories are hidden from normal restore,
+  and restore rebuilds the live graph using the snapshot's recorded directories.
+- **Exact duplicate-journal navigation cannot edit the canonical file by mistake.**
+  Loading a path-pinned file replaces a same-name working-set slot and preserves
+  that exact path through save and undo.
+- **Captured media is durable before its Markdown link is inserted.** A crash can
+  leave a recoverable orphan, but not a saved note pointing to bytes that only
+  existed in WebView memory.
+- **Configuration updates and rename rollback preserve concurrent/failing work.**
+  Config read-modify-write retries external changes, and rename rollback now
+  includes the move whose source removal failed.
+- **Android release builds use the stable `page.tine.app` application ID.** The
+  desktop-only app-ID rename no longer makes Tauri search for a nonexistent Java
+  package, which had prevented the signed APK from being produced for v0.5.1 and
+  v0.5.2.
+- **Flatpak's offline dependency bundle is current and checked before releases.**
+  Dependency-lock changes now trigger the Flatpak build-test on `master`, while
+  release tags no longer start that separate non-release workflow.
+- **PDF highlight block references now open the source PDF at the highlighted
+  page.** Plain-clicking an annotation `((block-ref))` follows OG Logseq behavior,
+  including PDF filenames containing spaces; modifier-click navigation remains
+  available. (GH #61)
+- **PDF viewing is bounded against malformed or extreme files.** Tine rejects PDFs
+  over 256 MiB before reading them into memory, caps page/layout and canvas
+  allocations, validates page dimensions, downsamples unusually large valid pages,
+  and releases pdf.js resources on failure instead of risking a blank runaway
+  viewer. (GH #61)
+- **Area highlights now round-trip OG Logseq's `hl-stamp::` metadata.** Newly
+  created area annotations copy the EDN image timestamp exactly, while text
+  highlights correctly omit the property and existing foreign properties remain
+  untouched. (GH #61)
+- **Deleting a page now refreshes live queries.** After deleting a page, open
+  `{{query}}` panels re-run immediately and drop the deleted page's rows, instead of
+  lingering with a stale result until the next edit.
+
 ## [0.5.2] - 2026-07-10
 
 In-app Guide link/reference fixes, context menus that stay on-screen, faster

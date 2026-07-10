@@ -1,4 +1,4 @@
-# 0039. Optional Git integration via the system git, routed through the save protocol
+# mine/0002. Optional Git integration via the system git, routed through the save protocol
 
 - **Status:** Accepted
 - **Date:** 2026-07-09
@@ -75,3 +75,8 @@ that shells out to the *system* git and never bypasses the save/reload protocol.
   "Commit now" covers the "checkpoint this exact moment" case.
 - Fork-local: this ships on `mine` as a "mine (extras)" feature; it is a candidate
   answer to upstream #33 but is not assumed to be merged upstream.
+- **Multi-graph (upstream ADR 0038, adopted v0.5.3):** the git commands resolve the
+  graph of the *calling window* (`slot_for_window(&state, window.label())`), not a
+  single global graph. Each window owns its own graph, so each is its own repo and
+  git acts on the one you invoked it from — auto-commit on a window's close commits
+  that window's graph even with other graph windows open.

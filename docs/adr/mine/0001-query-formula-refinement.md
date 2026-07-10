@@ -1,4 +1,4 @@
-# 0038. Query filtering: coarse structural query + optional formula refinement
+# mine/0001. Query filtering: coarse structural query + optional formula refinement
 
 - **Status:** Accepted
 - **Date:** 2026-07-09

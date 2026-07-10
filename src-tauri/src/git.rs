@@ -16,7 +16,7 @@
 //! also keeps the process alive long enough for an on-close push to finish before
 //! Tine quits.
 
-use crate::state::AppState;
+use crate::state::{slot_for_window, AppState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use tauri::Manager;
@@ -63,15 +63,15 @@ logseq/version-files/
 .trash/
 ";
 
-/// Resolve the current graph root, releasing the state lock before returning (so
-/// the subsequent blocking git work never holds it).
-fn graph_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let state = app.state::<AppState>();
-    let guard = state.graph.read().unwrap();
-    guard
-        .as_ref()
-        .map(|g| g.root.clone())
-        .ok_or_else(|| "no graph loaded".to_string())
+/// Resolve the graph root for the window that invoked the command, releasing the
+/// state lock before returning (so the subsequent blocking git work never holds
+/// it). Each window owns its own graph (ADR 0038 multi-window/multi-graph), so git
+/// acts on *that* window's graph — its own repo — even with other graph windows
+/// open. `slot_for_window` clones the `Arc<GraphSlot>` out under the read lock and
+/// releases it, so no lock is held past this call.
+fn graph_root(window: &tauri::WebviewWindow) -> Result<PathBuf, String> {
+    let state = window.state::<AppState>();
+    Ok(slot_for_window(&state, window.label())?.root_key.clone())
 }
 
 /// A `git` command rooted in the graph, with a clean, non-interactive environment.
@@ -294,8 +294,8 @@ fn pull_in(root: &Path) -> GitResult {
 
 /// Read-only status of the graph repo. Cheap; polled + refreshed after ops.
 #[tauri::command]
-pub(crate) async fn git_status(app: tauri::AppHandle) -> Result<GitStatus, String> {
-    let root = graph_root(&app)?;
+pub(crate) async fn git_status(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
+    let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || status_in(&root))
         .await
         .map_err(|e| e.to_string())
@@ -304,8 +304,8 @@ pub(crate) async fn git_status(app: tauri::AppHandle) -> Result<GitStatus, Strin
 /// `git init` the graph root and drop a default Logseq `.gitignore` if absent. An
 /// affordance for turning an un-versioned graph into a repo — never forced.
 #[tauri::command]
-pub(crate) async fn git_init(app: tauri::AppHandle) -> Result<GitStatus, String> {
-    let root = graph_root(&app)?;
+pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
+    let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || init_in(&root))
         .await
         .map_err(|e| e.to_string())?
@@ -316,9 +316,9 @@ pub(crate) async fn git_init(app: tauri::AppHandle) -> Result<GitStatus, String>
 #[tauri::command]
 pub(crate) async fn git_commit(
     message: String,
-    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<GitResult, String> {
-    let root = graph_root(&app)?;
+    let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || commit_in(&root, &message))
         .await
         .map_err(|e| e.to_string())?
@@ -328,8 +328,8 @@ pub(crate) async fn git_commit(
 /// "Pull first" message. Awaited by the frontend, so an on-close push completes
 /// before the process exits.
 #[tauri::command]
-pub(crate) async fn git_push(app: tauri::AppHandle) -> Result<GitResult, String> {
-    let root = graph_root(&app)?;
+pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+    let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || push_in(&root))
         .await
         .map_err(|e| e.to_string())
@@ -339,8 +339,8 @@ pub(crate) async fn git_push(app: tauri::AppHandle) -> Result<GitResult, String>
 /// rewrites local edits; pulled files land on disk and flow through the watcher →
 /// reloadDisposition, so dirty/edited pages are guarded by the sync-conflict UI.
 #[tauri::command]
-pub(crate) async fn git_pull(app: tauri::AppHandle) -> Result<GitResult, String> {
-    let root = graph_root(&app)?;
+pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+    let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || pull_in(&root))
         .await
         .map_err(|e| e.to_string())

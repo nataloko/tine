@@ -1,7 +1,9 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::AppState;
+use crate::state::{slot_for_context, GraphContext};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::PathBuf;
-use tauri::{Manager, State};
+use tauri::Manager;
 use tine_core::model::{atomic_copy, Graph};
 
 // Snapshot the graph's markdown into the OS app-data dir on open, keeping the
@@ -10,7 +12,8 @@ use tine_core::model::{atomic_copy, Graph};
 // it never blocks startup or holds the graph lock during file copies.
 const BACKUP_KEEP_DEFAULT: usize = 12;
 
-pub(crate) fn backup_async(app: tauri::AppHandle) {
+pub(crate) fn backup_async(app: tauri::AppHandle, graph: &Graph) {
+    let source = BackupSource::from_graph(graph);
     std::thread::spawn(move || {
         // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
         // contend for disk I/O with first-journal paint and the warm-cache parse
@@ -19,7 +22,7 @@ pub(crate) fn backup_async(app: tauri::AppHandle) {
         // the first second — the on-disk files are still intact — so a crash in
         // that window loses nothing the snapshot would have protected.
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        let _ = do_backup(&app, ""); // launch snapshot is best-effort
+        let _ = do_backup_source(&app, source, ""); // launch snapshot is best-effort
     });
 }
 
@@ -39,25 +42,14 @@ pub(crate) fn backup_graph_now(
 /// Returns (files copied, complete) — `complete` is false if ANY graph
 /// text/config/asset-sidecar copy failed, so the caller (restore) can refuse to
 /// proceed without a full rollback snapshot.
-fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
-    // Grab just the paths under the lock, then copy from disk lock-free.
-    let source = {
-        let state: State<'_, AppState> = app.state();
-        let guard = state.graph.read().unwrap();
-        match guard.as_ref() {
-            Some(g) => BackupSource::from_graph(g),
-            None => return (0, false),
-        }
-    };
-    do_backup_source(app, source, suffix)
-}
-
 struct BackupSource {
     journals: PathBuf,
     pages: PathBuf,
     assets: PathBuf,
     cfg: PathBuf,
     root: PathBuf,
+    journals_dir: String,
+    pages_dir: String,
 }
 
 impl BackupSource {
@@ -68,17 +60,130 @@ impl BackupSource {
             assets: g.assets_path(),
             cfg: g.root.join("logseq").join("config.edn"),
             root: g.root.clone(),
+            journals_dir: g.config.journals_dir.clone(),
+            pages_dir: g.config.pages_dir.clone(),
         }
     }
+}
+
+const SNAPSHOT_SCHEMA: u32 = 2;
+const SNAPSHOT_MANIFEST: &str = "snapshot.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotFile {
+    path: String,
+    sha256: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotManifest {
+    schema: u32,
+    root: String,
+    journals_dir: String,
+    pages_dir: String,
+    files: Vec<SnapshotFile>,
+    complete: bool,
+}
+
+fn root_backup_id(root: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let label = canonical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("graph")
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{label}-{}", &digest[..32])
+}
+
+fn write_manifest(dir: &std::path::Path, manifest: &SnapshotManifest) -> std::io::Result<()> {
+    let path = dir.join(SNAPSHOT_MANIFEST);
+    let tmp = dir.join(".snapshot.json.tmp");
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(std::io::Error::other)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)
+}
+
+fn read_manifest(dir: &std::path::Path) -> Option<SnapshotManifest> {
+    let bytes = std::fs::read(dir.join(SNAPSHOT_MANIFEST)).ok()?;
+    let manifest: SnapshotManifest = serde_json::from_slice(&bytes).ok()?;
+    (manifest.schema == SNAPSHOT_SCHEMA && manifest.complete).then_some(manifest)
+}
+
+fn hash_snapshot_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn snapshot_inventory(dir: &std::path::Path) -> std::io::Result<Vec<SnapshotFile>> {
+    let mut files = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), PathBuf::new())];
+    while let Some((current, rel)) = stack.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let rel_child = rel.join(entry.file_name());
+            if file_type.is_dir() {
+                stack.push((entry.path(), rel_child));
+            } else if file_type.is_file()
+                && rel_child != std::path::Path::new(SNAPSHOT_MANIFEST)
+                && rel_child != std::path::Path::new(".snapshot.json.tmp")
+            {
+                let path = rel_child
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.push(SnapshotFile {
+                    path,
+                    sha256: hash_snapshot_file(&entry.path())?,
+                });
+            } else if !file_type.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "snapshot contains a non-regular entry",
+                ));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn verify_snapshot(dir: &std::path::Path, manifest: &SnapshotManifest) -> bool {
+    snapshot_inventory(dir)
+        .map(|files| files == manifest.files)
+        .unwrap_or(false)
 }
 
 fn do_backup_source(app: &tauri::AppHandle, source: BackupSource, suffix: &str) -> (usize, bool) {
     let Ok(data_dir) = app.path().app_data_dir() else {
         return (0, false);
     };
-    let base = data_dir
-        .join("backups")
-        .join(sanitize_id(&source.root.display().to_string()));
+    let base = data_dir.join("backups").join(root_backup_id(&source.root));
     let stamp = backup_stamp();
     let name = if suffix.is_empty() {
         stamp
@@ -93,21 +198,23 @@ fn do_backup_source(app: &tauri::AppHandle, source: BackupSource, suffix: &str) 
     // (non-recursive) fails atomically if the name is taken, so we bump a counter
     // until we win an unused name.
     let _ = std::fs::create_dir_all(&base);
-    let mut dest = base.join(&name);
+    let mut final_dest = base.join(&name);
+    let mut dest = base.join(format!(".partial-{name}"));
     let mut k = 2;
     loop {
         match std::fs::create_dir(&dest) {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                dest = base.join(format!("{name}-{k}"));
+                final_dest = base.join(format!("{name}-{k}"));
+                dest = base.join(format!(".partial-{name}-{k}"));
                 k += 1;
             }
             Err(_) => break, // other error → fall through; copy below is best-effort
         }
     }
     let live_text_n = count_md_recursive(&source.journals) + count_md_recursive(&source.pages);
-    let (cj, fj) = copy_md_dir(&source.journals, &dest.join(dir_name(&source.journals)));
-    let (cp, fp) = copy_md_dir(&source.pages, &dest.join(dir_name(&source.pages)));
+    let (cj, fj) = copy_md_dir(&source.journals, &dest.join("journals"));
+    let (cp, fp) = copy_md_dir(&source.pages, &dest.join("pages"));
     let (ca, fa) = copy_asset_sidecars_dir(&source.assets, &dest.join(dir_name(&source.assets)));
     let mut n = cj + cp + ca;
     let mut failed = fj + fp + fa;
@@ -125,6 +232,29 @@ fn do_backup_source(app: &tauri::AppHandle, source: BackupSource, suffix: &str) 
     if n == 0 {
         let _ = std::fs::remove_dir_all(&dest);
         return (0, complete);
+    }
+    if complete {
+        let Ok(files) = snapshot_inventory(&dest) else {
+            return (n, false);
+        };
+        if files.len() != n {
+            return (n, false);
+        }
+        let manifest = SnapshotManifest {
+            schema: SNAPSHOT_SCHEMA,
+            root: std::fs::canonicalize(&source.root)
+                .unwrap_or(source.root.clone())
+                .display()
+                .to_string(),
+            journals_dir: source.journals_dir,
+            pages_dir: source.pages_dir,
+            files,
+            complete: true,
+        };
+        if write_manifest(&dest, &manifest).is_err() || std::fs::rename(&dest, &final_dest).is_err()
+        {
+            return (n, false);
+        }
     }
     prune_backups(&base, backup_keep(app));
     (n, complete)
@@ -151,36 +281,37 @@ pub(crate) fn get_backup_keep(app: tauri::AppHandle) -> usize {
 }
 
 #[tauri::command]
-pub(crate) fn set_backup_keep(keep: usize, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_backup_keep(
+    keep: usize,
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
     let keep = keep.clamp(1, 1000);
     update_settings(&app, |json| {
         json["backup_keep"] = serde_json::json!(keep);
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
-    if let Some(base) = backup_base(&app) {
+    let slot = slot_for_context(&state)?;
+    if let Some(base) = backup_base(&app, &slot.graph) {
         prune_backups(&base, keep);
     }
     Ok(())
 }
 
 /// The backup directory for the currently-open graph (`<app-data>/backups/<id>`).
-fn backup_base(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let root = {
-        let state: State<'_, AppState> = app.state();
-        let guard = state.graph.read().unwrap();
-        guard.as_ref().map(|g| g.root.clone())?
-    };
+fn backup_base(app: &tauri::AppHandle, graph: &Graph) -> Option<PathBuf> {
+    let root = graph.root.clone();
     let data_dir = app.path().app_data_dir().ok()?;
-    Some(
-        data_dir
-            .join("backups")
-            .join(sanitize_id(&root.display().to_string())),
-    )
+    Some(data_dir.join("backups").join(root_backup_id(&root)))
 }
 
 #[tauri::command]
-pub(crate) fn list_backups(app: tauri::AppHandle) -> Result<Vec<BackupInfo>, String> {
-    let Some(base) = backup_base(&app) else {
+pub(crate) fn list_backups(
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<Vec<BackupInfo>, String> {
+    let slot = slot_for_context(&state)?;
+    let Some(base) = backup_base(&app, &slot.graph) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -190,11 +321,21 @@ pub(crate) fn list_backups(app: tauri::AppHandle) -> Result<Vec<BackupInfo>, Str
             if !p.is_dir() {
                 continue;
             }
+            let Some(manifest) = read_manifest(&p) else {
+                continue;
+            };
+            let current_root = std::fs::canonicalize(&slot.graph.root)
+                .unwrap_or_else(|_| slot.graph.root.clone())
+                .display()
+                .to_string();
+            if manifest.root != current_root || !verify_snapshot(&p, &manifest) {
+                continue;
+            }
             let stamp = match p.file_name().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            let files = count_md_recursive(&p) + count_asset_sidecars_recursive(&p.join("assets"));
+            let files = manifest.files.len();
             out.push(BackupInfo { stamp, files });
         }
     }
@@ -243,7 +384,7 @@ fn count_asset_sidecars_recursive(dir: &std::path::Path) -> usize {
 pub(crate) fn restore_backup(
     stamp: String,
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
+    state: GraphContext<'_>,
 ) -> Result<(), String> {
     // Guard against path traversal — a stamp is only ever `YYYY-MM-DD_HH-MM-SS`.
     if stamp.is_empty()
@@ -253,26 +394,51 @@ pub(crate) fn restore_backup(
     {
         return Err("invalid backup id".into());
     }
-    let (journals, pages, assets, cfg_dest) = {
-        let guard = state.graph.read().unwrap();
-        let g = guard.as_ref().ok_or("no graph loaded")?;
+    let slot = slot_for_context(&state)?;
+    let (journals, pages, assets, cfg_dest, source) = {
+        let g = &slot.graph;
         (
             g.journals_path(),
             g.pages_path(),
             g.assets_path(),
             g.root.join("logseq").join("config.edn"),
+            BackupSource::from_graph(g),
         )
     };
-    let base = backup_base(&app).ok_or("no app-data dir")?;
+    let base = backup_base(&app, &slot.graph).ok_or("no app-data dir")?;
     let src = base.join(&stamp);
     if !src.is_dir() {
         return Err("backup not found".into());
     }
+    let manifest = read_manifest(&src).ok_or("backup is incomplete or unverified")?;
+    let current_root =
+        std::fs::canonicalize(&slot.graph.root).unwrap_or_else(|_| slot.graph.root.clone());
+    if manifest.root != current_root.display().to_string() {
+        return Err("backup belongs to a different graph".into());
+    }
+    if !verify_snapshot(&src, &manifest) {
+        return Err("backup contents do not match the verified manifest".into());
+    }
+    let safe_dir = |raw: &str| -> Result<PathBuf, String> {
+        let rel = std::path::Path::new(raw);
+        if raw.is_empty()
+            || raw.contains('\\')
+            || rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("backup contains an unsafe graph directory".into());
+        }
+        Ok(current_root.join(rel))
+    };
+    let restore_journals = safe_dir(&manifest.journals_dir)?;
+    let restore_pages = safe_dir(&manifest.pages_dir)?;
     // Safety net: snapshot the current (pre-restore) state first, under a distinct
     // name so it can't collide with (or be pruned by) the launch snapshot the
     // post-restore reload will take. Abort if the snapshot fails while the live
     // graph has content — never run a destructive restore without a way back.
-    let (snapshot_n, complete) = do_backup(&app, "pre-restore");
+    let (snapshot_n, complete) = do_backup_source(&app, source, "pre-restore");
     let live_n = count_md_recursive(&journals)
         + count_md_recursive(&pages)
         + count_asset_sidecars_recursive(&assets);
@@ -285,9 +451,9 @@ pub(crate) fn restore_backup(
     }
     // Restore each dir; a copy failure aborts WITHOUT having deleted anything
     // (copy-in happens before delete-extras), so a failure never loses data.
-    restore_md_dir(&src.join(dir_name(&journals)), &journals)
+    restore_md_dir(&src.join("journals"), &restore_journals)
         .map_err(|e| format!("restore journals failed: {e}"))?;
-    restore_md_dir(&src.join(dir_name(&pages)), &pages)
+    restore_md_dir(&src.join("pages"), &restore_pages)
         .map_err(|e| format!("restore pages failed: {e}"))?;
     restore_asset_sidecars_dir(&src.join(dir_name(&assets)), &assets)
         .map_err(|e| format!("restore asset sidecars failed: {e}"))?;
@@ -298,6 +464,7 @@ pub(crate) fn restore_backup(
         }
         atomic_copy(&src_cfg, &cfg_dest).map_err(|e| format!("restore config failed: {e}"))?;
     }
+    crate::state::refresh_graph(&state)?;
     Ok(())
 }
 
@@ -464,11 +631,6 @@ fn dir_name(p: &std::path::Path) -> String {
         .unwrap_or("dir")
         .to_string()
 }
-fn sanitize_id(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect()
-}
 /// Copy every graph text file from `src` to `dest`. Returns (copied, failed) so
 /// the caller can tell a complete snapshot from a partial one.
 fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) {
@@ -582,6 +744,11 @@ fn prune_backups(base: &std::path::Path, keep: usize) {
                 && !p
                     .file_name()
                     .and_then(|s| s.to_str())
+                    .map(|s| s.starts_with(".partial-"))
+                    .unwrap_or(true)
+                && !p
+                    .file_name()
+                    .and_then(|s| s.to_str())
                     .map(|s| s.contains("-pre-restore"))
                     .unwrap_or(false)
         })
@@ -625,6 +792,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn backup_root_ids_do_not_conflate_punctuation() {
+        let root = scratch("backup-root-id");
+        let dash = root.join("a-b");
+        let underscore = root.join("a_b");
+        std::fs::create_dir_all(&dash).unwrap();
+        std::fs::create_dir_all(&underscore).unwrap();
+        assert_ne!(root_backup_id(&dash), root_backup_id(&underscore));
+        assert_eq!(root_backup_id(&dash), root_backup_id(&dash));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_complete_v2_manifests_are_readable() {
+        let root = scratch("backup-manifest");
+        let manifest = SnapshotManifest {
+            schema: SNAPSHOT_SCHEMA,
+            root: root.display().to_string(),
+            journals_dir: "diary".into(),
+            pages_dir: "archive/pages".into(),
+            files: Vec::new(),
+            complete: true,
+        };
+        write_manifest(&root, &manifest).unwrap();
+        let read = read_manifest(&root).unwrap();
+        assert_eq!(read.pages_dir, "archive/pages");
+        assert!(verify_snapshot(&root, &read));
+        std::fs::write(root.join("journals.md"), "- changed\n").unwrap();
+        assert!(!verify_snapshot(&root, &read));
+        std::fs::remove_file(root.join("journals.md")).unwrap();
+        std::fs::write(
+            root.join(SNAPSHOT_MANIFEST),
+            r#"{"schema":2,"root":"x","journals_dir":"journals","pages_dir":"pages","files":[],"complete":false}"#,
+        )
+        .unwrap();
+        assert!(read_manifest(&root).is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

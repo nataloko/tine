@@ -49,7 +49,7 @@ Logseq); the formula *narrows* them.
   "Filter disabled" notice — it never silently empties your query.
 - It reuses Tine's existing Sheets formula engine, so the same expressions work in sheet views.
 
-Design record: `docs/adr/0038-query-formula-refinement.md`. (The old "⚙ advanced" Datalog switch is
+Design record: `docs/adr/mine/0001-query-formula-refinement.md`. (The old "⚙ advanced" Datalog switch is
 retired but existing Datalog query blocks still render.)
 
 ---
@@ -77,7 +77,7 @@ data-safety protocol so it can never clobber your notes. Answers upstream issue 
 - A compact **status badge** sits in the topbar (branch · uncommitted · ↑ahead ↓behind); clicking it
   does the most useful next step — pull, then commit, then push.
 
-Design record: `docs/adr/0039-git-integration.md`. Commit only ever happens once your edits are
+Design record: `docs/adr/mine/0002-git-integration.md`. Commit only ever happens once your edits are
 safely on disk; git touches only `.git/`, never your markdown, so it stays out of Tine's save path.
 
 ---
@@ -131,7 +131,7 @@ Fenced code blocks (and the ```calc calculator) now edit sensibly:
   on by default): the code is coloured *as you type*, in a box that looks like the rendered block
   (no jump on blur). A syntax-highlighted layer is painted behind the real textarea (which stays the
   sole caret owner — the editor's focus/caret invariant is untouched); turn it off if the caret is
-  ever hard to see on your system. Design record: `docs/adr/0040-live-code-highlighting-overlay.md`.
+  ever hard to see on your system. Design record: `docs/adr/mine/0003-live-code-highlighting-overlay.md`.
 
 ### Click below to add a block
 

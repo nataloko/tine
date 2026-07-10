@@ -64,6 +64,9 @@ see the project `CLAUDE.md`.
 | [0035](0035-sheets-formula-builder-text-truth.md) | Sheets formula builder: expression text stays authoritative, AST edits deparse through a round-trip gate, unsupported shapes stay raw | Accepted |
 | [0036](0036-in-app-guide.md) | In-app Guide pages are read-only bundled templates with explicit copy-into-graph writes | Accepted |
 | [0037](0037-sheet-paste-mode-nest-vs-splat.md) | Sheet paste: edit mode nests a subgrid, select mode splats the region into the grid (amends 0031) | Accepted |
-| [0038](0038-query-formula-refinement.md) | Query filtering: coarse structural query (Rust, Logseq-parity) + optional `tine.query-filter::` formula refinement (frontend); Datalog retired-but-rendered | Accepted |
-| [0039](0039-git-integration.md) | Optional Git integration via the system git (no bundling/credentials); commit only when disk is current, push never forces, pull is `--ff-only` and reloads through the watcher → conflict UI | Accepted |
-| [0040](0040-live-code-highlighting-overlay.md) | Live code highlighting while editing via a passive highlighted `<pre>` overlay behind the unchanged textarea (preserves ADR 0013); WYSIWYG, opt-out toggle, full highlight.js | Accepted |
+| [0038](0038-multi-window-multi-graph.md) | Multi-window, multi-graph (#70/#56/#55): one process, per-window graph map; #55 ships first single-graph; desktop-only | Accepted |
+| [0039](0039-filesystem-scope-boundary.md) | Canonical graph root is a hard boundary for configured paths, windows, and backups | Accepted |
+| [0040](0040-file-path-is-storage-identity.md) | Physical file path, not logical page name, is storage identity | Accepted |
+
+**Fork (`mine`) ADRs** — this fork's own extras keep a separate numbering track so upstream syncs
+never collide: see [`mine/README.md`](mine/README.md).

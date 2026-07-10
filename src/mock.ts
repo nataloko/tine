@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult } from "./backend";
-import type { BlockDto, GraphMeta, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
+import type { BlockDto, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -582,8 +582,8 @@ export function mockBackend(): Backend {
   };
 
   return {
-    async loadGraph(): Promise<GraphMeta> {
-      return {
+    async loadGraph() {
+      return { kind: "loaded" as const, binding_generation: 1, meta: {
         root: "/mock/graph",
         journals_dir: "journals",
         pages_dir: "pages",
@@ -607,13 +607,29 @@ export function mockBackend(): Backend {
           hi: "Hello, **$1**! See [[$2]].",
           card: "## $1\n\n$2\n\n+ see [[$1]]",
         },
-      };
+      }};
     },
+    async listKnownGraphs() {
+      return [{ path: "/mock/graph", name: "graph" }];
+    },
+    async openGraphWindow() {
+      return { kind: "focused_existing" as const, window_label: "main" };
+    },
+    async startupGraphPath() {
+      return "/mock/graph";
+    },
+    async captureTarget() {
+      return "main";
+    },
+    async forgetKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       return "desktop";
     },
     async quit(): Promise<void> {
       // No-op in the mock/screenshot harness — there's no process to exit.
+    },
+    async closeGraphWindow(): Promise<void> {
+      // No-op in the mock/screenshot harness.
     },
     async openDevtools(): Promise<void> {
       // No-op in the mock/screenshot harness — no native WebView inspector.
@@ -882,7 +898,8 @@ export function mockBackend(): Backend {
     async resolveBlocks(uuids: string[]): Promise<(RefGroup | null)[]> {
       return Promise.all(uuids.map((u) => this.resolveBlock(u)));
     },
-    async readAsset(name: string): Promise<Uint8Array> {
+    async readAsset(name: string, maxBytes?: number): Promise<Uint8Array> {
+      void maxBytes;
       if (mockAssets[name]) return mockAssets[name];
       if (name === "sample.pdf") return decodeB64(SAMPLE_PDF_B64);
       if (name === "voice_memo.wav") return decodeB64(SILENT_WAV_B64);
@@ -904,6 +921,9 @@ export function mockBackend(): Backend {
     },
     async importAsset(path: string, name?: string): Promise<string> {
       return name ?? path.split("/").pop() ?? path;
+    },
+    async clipboardFiles() {
+      return { files: [], skipped: 0, truncated: false };
     },
     async readTextFile(_path: string): Promise<string> {
       throw new Error("local text files are unavailable in the browser mock");
