@@ -85,6 +85,11 @@ sides: `grep -E '"version"|createUpdaterArtifacts|nataloko/tine' src-tauri/tauri
 > `derived_cache_fuzz` test can diverge (a HashMap-ordering artifact, unrelated to the fork). If the
 > **192 unit tests pass** and only that fuzz test fails, treat it as green and note it; the
 > maintainer's pinned toolchain is the authority.
+>
+> Known upstream slip: a patch release sometimes bumps `version` in `tauri.conf.json` but forgets the
+> Android `bundle.android.versionCode`, so `src/version-code.test.ts` fails (versionCode must equal
+> `major*1_000_000 + minor*1_000 + patch`, e.g. `0.5.1` → `5001`). Fix it by bumping versionCode to the
+> derived value (a 1-line correction; harmless — the fork ships AppImage + Windows, not F-Droid) and note it.
 
 ## Step 5 — Push + build
 ```bash
