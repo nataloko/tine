@@ -91,6 +91,17 @@ jobs:
           fi
           rm -f "$img"                                    # repack over the original
           export ARCH=x86_64
+          # Version label GearLever displays (appimagetool writes $VERSION into the
+          # .desktop as X-AppImage-Version — Tauri's bundler leaves it unset). On a
+          # mine-v* tag use the tag's iteration (0.5.3-N) so every build is
+          # distinguishable; on a manual run fall back to the bundle filename's version.
+          if [[ "${GITHUB_REF_NAME:-}" == mine-v* ]]; then
+            VERSION="${GITHUB_REF_NAME#mine-v}"
+          else
+            VERSION="$(echo "$img" | sed -E 's/^Tine_(.+)_amd64\.AppImage$/\1/')"
+          fi
+          export VERSION
+          echo "Setting X-AppImage-Version=$VERSION"
           /tmp/appimagetool --appimage-extract-and-run \
             -u "gh-releases-zsync|nataloko|tine|latest|Tine_*_amd64.AppImage.zsync" \
             "$appdir" "$img"
