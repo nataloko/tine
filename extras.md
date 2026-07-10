@@ -17,6 +17,9 @@ It helps you see where you are in a deep outline, like the Logseq bullet-threadi
   thread in your single accent colour).
 - **Thickness:** *Thin* / *Medium* / *Thick* — the geometry re-centres itself on the bullet dots at
   any weight, so it stays pixel-aligned.
+- **Animate** (opt-in): *None* (static), *Flow* (dashes moving down the path and into the bullet,
+  like a conveyor), or *Beat* (a slow pulse). The thread is an SVG stroke, so the line lands exactly
+  on the bullet and dashes can follow the rounded corner. Honours the system “reduce motion” setting.
 - Pure CSS draws it on the blocks the editor marks as on-path, so it reflows with the outline and
   can never desync from the caret.
 - The preferences are stored device-locally (they survive restarts even though WebKitGTK doesn't

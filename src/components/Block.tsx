@@ -340,6 +340,24 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}
     >
+      {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
+          it reflows + scrolls locked to the block. Elbow = a path curving into this
+          bullet; spine = a straight line clipped to the block height (see app.css).
+          The .thread-animated class (app root) turns the stroke into flowing dashes. */}
+      <Show when={threadingEnabled() && threadRole()}>
+        <Show
+          when={threadRole()?.elbow !== undefined}
+          fallback={
+            <svg class="thread-svg thread-spine-svg" aria-hidden="true">
+              <line x1="8" y1="0" x2="8" y2="9999" />
+            </svg>
+          }
+        >
+          <svg class="thread-svg thread-elbow-svg" aria-hidden="true">
+            <path d="M -4 -18 V 4 Q -4 14 6 14 H 26" />
+          </svg>
+        </Show>
+      </Show>
       <div
         class="block-main"
         classList={{

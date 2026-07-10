@@ -71,6 +71,8 @@ import {
   setThreadColorMode,
   threadWeight,
   setThreadWeight,
+  threadAnimation,
+  setThreadAnimation,
 } from "../bulletThreading";
 import type { GitStatus } from "../backend";
 import {
@@ -685,6 +687,31 @@ function ExtrasTab(): JSX.Element {
               onClick={() => setThreadWeight("thick")}
             >
               Thick
+            </button>
+          </div>
+        </Field>
+        <Field
+          label="Animate thread"
+          hint="None keeps the thread static. Flow turns it into dashes moving down the path and into the bullet (a conveyor). Beat is a slow pulse. Off by default; follows your system “reduce motion” setting."
+        >
+          <div class="settings-segment">
+            <button
+              classList={{ active: threadAnimation() === "none" }}
+              onClick={() => setThreadAnimation("none")}
+            >
+              None
+            </button>
+            <button
+              classList={{ active: threadAnimation() === "flow" }}
+              onClick={() => setThreadAnimation("flow")}
+            >
+              Flow
+            </button>
+            <button
+              classList={{ active: threadAnimation() === "beat" }}
+              onClick={() => setThreadAnimation("beat")}
+            >
+              Beat
             </button>
           </div>
         </Field>

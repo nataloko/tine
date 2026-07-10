@@ -14,16 +14,21 @@ import { doc } from "./store";
 const KEY = "bullet_threading";
 const COLOR_KEY = "bullet_threading_color";
 const WEIGHT_KEY = "bullet_threading_weight";
+const ANIM_KEY = "bullet_threading_anim";
 
 /** Colour of the thread: a per-depth rainbow (default) or a single accent colour. */
 export type ThreadColorMode = "rainbow" | "accent";
 /** Line weight of the thread. */
 export type ThreadWeight = "thin" | "medium" | "thick";
 const WEIGHT_PX: Record<ThreadWeight, number> = { thin: 2, medium: 3, thick: 4 };
+/** Thread animation: none, flowing dashes (a conveyor), or a slow pulse (beat).
+ *  Mutually exclusive — never flow and beat at once. */
+export type ThreadAnimation = "none" | "flow" | "beat";
 
 const [enabled, setEnabledSig] = createSignal(false);
 const [colorMode, setColorModeSig] = createSignal<ThreadColorMode>("rainbow");
 const [weight, setWeightSig] = createSignal<ThreadWeight>("medium");
+const [anim, setAnimSig] = createSignal<ThreadAnimation>("none");
 
 /** Reactive: is bullet threading turned on? Default OFF. */
 export const threadingEnabled = enabled;
@@ -33,6 +38,9 @@ export const threadColorMode = colorMode;
 export const threadWeight = weight;
 /** The current line weight in px, for the `--thread-thickness` CSS variable. */
 export const threadThicknessPx = () => WEIGHT_PX[weight()];
+/** Reactive: the thread animation — "none" (default), "flow" (dashes conveyor),
+ *  or "beat" (a slow pulse). */
+export const threadAnimation = anim;
 
 export function setThreadingEnabled(on: boolean): void {
   setEnabledSig(on);
@@ -49,7 +57,12 @@ export function setThreadWeight(w: ThreadWeight): void {
   void backend().setAppString(WEIGHT_KEY, w).catch(() => {});
 }
 
-/** Load the persisted preferences at startup. Defaults: OFF, rainbow, medium. */
+export function setThreadAnimation(mode: ThreadAnimation): void {
+  setAnimSig(mode);
+  void backend().setAppString(ANIM_KEY, mode).catch(() => {});
+}
+
+/** Load the persisted preferences at startup. Defaults: OFF, rainbow, medium, no animation. */
 export async function initBulletThreading(): Promise<void> {
   try {
     setEnabledSig(await backend().getAppBool(KEY, false));
@@ -57,6 +70,8 @@ export async function initBulletThreading(): Promise<void> {
     setColorModeSig(c === "accent" ? "accent" : "rainbow");
     const w = await backend().getAppString(WEIGHT_KEY, "medium");
     setWeightSig(w === "thin" || w === "thick" ? w : "medium");
+    const a = await backend().getAppString(ANIM_KEY, "none");
+    setAnimSig(a === "flow" || a === "beat" ? a : "none");
   } catch {
     /* defaults */
   }

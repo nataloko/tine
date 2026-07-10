@@ -84,7 +84,7 @@ import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
 import { initCopySettings } from "./copySettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
-import { initBulletThreading, threadingEnabled, threadThicknessPx } from "./bulletThreading";
+import { initBulletThreading, threadingEnabled, threadThicknessPx, threadAnimation } from "./bulletThreading";
 import {
   initGit,
   commitOnClose,
@@ -761,6 +761,9 @@ export function App(): JSX.Element {
         "document-mode": documentMode(),
         "focus-mode": focusMode(),
         "thread-enabled": threadingEnabled(),
+        // Thread animation mode (mutually exclusive): flowing dashes, or a slow pulse.
+        "thread-anim-flow": threadingEnabled() && threadAnimation() === "flow",
+        "thread-anim-beat": threadingEnabled() && threadAnimation() === "beat",
         // macOS draws a transparent Overlay title bar over our content (rounded
         // corners + traffic lights); reserve the top-left so the lights don't sit
         // on the sidebar header / sidebar-toggle button. See nativeChrome.ts + app.css.
