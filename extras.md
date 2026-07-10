@@ -125,3 +125,10 @@ Fenced code blocks (and the ```calc calculator) now edit sensibly:
 - A **language picker** on the opening fence: typing ```lang (or running `/code`) offers an
   autocomplete of common languages, mirroring the `[[` / `#` popup; picking one drops the caret onto
   the code line.
+
+### Click below to add a block
+
+Every page now has a Logseq-style **"click to add a block"** strip below its content — click the
+empty area under the last block to add a new bullet and start typing (it focuses a trailing empty
+block instead of stacking blanks). A general escape hatch, so a trailing code/calc block (or
+anything) never leaves you with nowhere to click.
