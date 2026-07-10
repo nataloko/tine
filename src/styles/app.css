@@ -11,11 +11,6 @@ body {
 
 body {
   font-family: var(--ls-font-family);
-  /* Prefer text (outline) presentation for any raw emoji in editable fields, so
-     WebKitGTK reaches for the bundled "Noto Emoji" outline instead of the system
-     color font (whose COLRv1 painter aborts the webview). Harmless where the
-     property is unsupported; display emoji are <img> and unaffected. See theme.css. */
-  font-variant-emoji: text;
   font-size: 16px;
   line-height: 1.5;
   color: var(--text-primary);
@@ -1168,6 +1163,40 @@ body {
 .pp-input:focus {
   border-color: var(--link-color);
   outline: none;
+}
+/* Icon field: a Twemoji <img> preview + an input whose raw glyph is never painted
+   (see PageProps.tsx / docs/adr/mine/0004). */
+.pp-icon-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pp-icon-input {
+  flex: 1;
+  min-width: 0;
+}
+.pp-icon-preview {
+  font-size: 20px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+}
+.pp-icon-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.pp-icon-clear {
+  flex: none;
+  padding: 3px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.pp-icon-clear:hover {
+  background: var(--bg-secondary);
 }
 .pp-hint {
   font-size: 11px;

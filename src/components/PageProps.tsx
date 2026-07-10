@@ -2,6 +2,7 @@ import { For, Show, createSignal, onMount, type JSX } from "solid-js";
 import { pagePropsPanel, closePageProps } from "../ui";
 import { readPageProperty, setPageProperty } from "../store";
 import { PAGE_PROP_SPECS, type PagePropSpec } from "../editor/properties";
+import { EmojiText } from "../render/emoji";
 
 // Page-properties panel: labelled fields for the page-level properties that are
 // otherwise only reachable as raw `key:: value` lines (alias, tags, public, …).
@@ -36,7 +37,7 @@ function Panel(props: { name: string; x: number; y: number }): JSX.Element {
     >
       <div ref={el} class="page-props-panel" style={{ left: `${left}px`, top: `${top()}px` }} onClick={(e) => e.stopPropagation()}>
         <div class="pp-head">
-          Page properties <span class="pp-page">{props.name}</span>
+          Page properties <span class="pp-page"><EmojiText text={props.name} /></span>
         </div>
         <For each={PAGE_PROP_SPECS}>{(spec) => <Field name={props.name} spec={spec} />}</For>
         <div class="pp-foot">
@@ -48,6 +49,7 @@ function Panel(props: { name: string; x: number; y: number }): JSX.Element {
 }
 
 function Field(props: { name: string; spec: PagePropSpec }): JSX.Element {
+  if (props.spec.key === "icon") return <IconField name={props.name} spec={props.spec} />;
   const initial = readPageProperty(props.name, props.spec.key) ?? "";
 
   if (props.spec.kind === "bool") {
@@ -97,6 +99,51 @@ function Field(props: { name: string; spec: PagePropSpec }): JSX.Element {
         }}
         onBlur={commit}
       />
+      <div class="pp-hint">{props.spec.hint}</div>
+    </div>
+  );
+}
+
+// The icon field holds an emoji, and painting a raw emoji glyph in a native <input>
+// crashes WebKitGTK (Skia COLRv1 abort — see docs/adr/mine/0004). So the glyph never
+// enters the input: the current icon shows as a Twemoji <img> (font-independent, the
+// same path the page title uses), and an edit is read and then blanked from the input
+// in the SAME tick — before the browser can paint it. No font ever rasterizes it.
+function IconField(props: { name: string; spec: PagePropSpec }): JSX.Element {
+  const initial = readPageProperty(props.name, props.spec.key) ?? "";
+  const [v, setV] = createSignal(initial);
+  const set = (val: string) => {
+    const next = val.trim();
+    if (next === v()) return;
+    setV(next);
+    setPageProperty(props.name, props.spec.key, next || null);
+  };
+  return (
+    <div class="pp-field">
+      <label class="pp-label">{props.spec.label}</label>
+      <div class="pp-icon-row">
+        <Show when={v()} fallback={<span class="pp-icon-empty">none</span>}>
+          <span class="pp-icon-preview"><EmojiText text={v()} /></span>
+        </Show>
+        <input
+          class="pp-input pp-icon-input"
+          value=""
+          placeholder="type or paste an emoji"
+          onInput={(e) => {
+            const t = e.currentTarget.value;
+            e.currentTarget.value = ""; // clear before paint → the glyph is never rasterized
+            if (t) set(t);
+          }}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter" || e.key === "Escape") closePageProps();
+            else if ((e.key === "Backspace" || e.key === "Delete") && v()) set("");
+          }}
+        />
+        <Show when={v()}>
+          <button class="pp-icon-clear" onClick={() => set("")}>Clear</button>
+        </Show>
+      </div>
       <div class="pp-hint">{props.spec.hint}</div>
     </div>
   );
