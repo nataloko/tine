@@ -8,6 +8,7 @@ import {
   pageInsert,
   tagInsert,
   filterCommands,
+  filterLanguages,
   fuzzyScore,
   orderAcItems,
 } from "./autocomplete";
@@ -285,5 +286,44 @@ describe("withRefCompletionSpace (GH #35)", () => {
     const r = withRefCompletionSpace(raw, 10, "[[Page]]", true);
     expect(r.raw).toBe("a [[Page]] tail");
     expect(r.caret).toBe(11);
+  });
+});
+
+describe("detectTrigger — ```lang code-fence language picker", () => {
+  it("triggers on an opening fence with a partial language", () => {
+    const t = detectTrigger("```js", 5);
+    expect(t).toEqual({ kind: "lang", query: "js", start: 3, end: 5 });
+  });
+
+  it("triggers on a bare opening fence (empty query → list all)", () => {
+    const t = detectTrigger("```", 3);
+    expect(t).toEqual({ kind: "lang", query: "", start: 3, end: 3 });
+  });
+
+  it("does NOT trigger on the closing fence", () => {
+    const text = "```js\ncode\n```";
+    expect(detectTrigger(text, text.length)).toBeNull();
+  });
+
+  it("does NOT trigger inside the code body", () => {
+    const text = "```js\nco";
+    expect(detectTrigger(text, text.length)).toBeNull();
+  });
+
+  it("allows language chars like c++ / c# on the fence", () => {
+    expect(detectTrigger("```c++", 6)).toEqual({ kind: "lang", query: "c++", start: 3, end: 6 });
+  });
+});
+
+describe("filterLanguages", () => {
+  it("lists all for an empty query", () => {
+    expect(filterLanguages("").length).toBeGreaterThan(20);
+  });
+  it("ranks the obvious match first", () => {
+    expect(filterLanguages("py")[0]).toBe("python");
+    expect(filterLanguages("typ")[0]).toBe("typescript");
+  });
+  it("returns nothing for a non-match", () => {
+    expect(filterLanguages("zzzzz")).toEqual([]);
   });
 });

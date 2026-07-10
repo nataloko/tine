@@ -40,6 +40,60 @@ function propLineKey(line: string): string | null {
   return m ? m[1].toLowerCase() : null;
 }
 
+/** For a multi-line block that keeps Enter INSIDE it — a calc block or a fenced
+ *  code block — decide whether an Enter at `caret` should EXIT the block (make a
+ *  new sibling) rather than insert another newline. The rule is the common
+ *  "double-Enter to exit" idiom: exit only when the caret sits on a *trailing
+ *  blank line*. Returns the block text with that blank line removed if it should
+ *  exit, or `null` to keep editing (insert a newline).
+ *
+ *  `kind`:
+ *   - "calc"  — no closing fence; exit when the blank line is the last line.
+ *   - "fence" — exit only when the blank line is the last content line, i.e. the
+ *               next line is the closing ``` / ~~~ (so blank lines mid-code stay). */
+export function multilineExitTrim(
+  text: string,
+  caret: number,
+  kind: "calc" | "fence"
+): string | null {
+  const c = Math.max(0, Math.min(caret, text.length));
+  const lineStart = text.lastIndexOf("\n", c - 1) + 1;
+  let lineEnd = text.indexOf("\n", c);
+  if (lineEnd === -1) lineEnd = text.length;
+  // Only exit from a blank line that has a line above it to attach after.
+  if (text.slice(lineStart, lineEnd).trim() !== "") return null;
+  if (lineStart === 0) return null;
+  if (kind === "calc") {
+    // Nothing non-blank may follow — the blank line must be the last line.
+    if (text.slice(lineEnd).trim() !== "") return null;
+    return text.slice(0, lineStart - 1); // drop the trailing "\n<blank>"
+  }
+  // Fenced: the next line must be the closing fence.
+  const after = text.slice(lineEnd + 1);
+  const nl = after.indexOf("\n");
+  const nextLine = nl === -1 ? after : after.slice(0, nl);
+  if (!FENCE_RE.test(nextLine)) return null;
+  // Drop the blank line, keep the closing fence (and anything after it).
+  return text.slice(0, lineStart - 1) + text.slice(lineEnd);
+}
+
+/** Whether the fence-delimiter line beginning at `lineStart` OPENS a fence rather
+ *  than closing one — i.e. no fence is open just before it. Lets the language
+ *  picker fire on an opening ```lang line only, never on the closing ```. */
+export function isOpeningFenceLine(raw: string, lineStart: number): boolean {
+  let fence: string | null = null;
+  let pos = 0;
+  while (pos < lineStart) {
+    const nl = raw.indexOf("\n", pos);
+    const end = nl === -1 ? raw.length : nl;
+    if (end >= lineStart) break; // reached the target line
+    fence = fenceTransition(fence, raw.slice(pos, end)).next;
+    if (nl === -1) break;
+    pos = end + 1;
+  }
+  return fence === null;
+}
+
 /** Whether a textarea caret offset is inside a fenced code region. The fence
  *  delimiter lines themselves are outside; the content lines between them are
  *  inside, including an unterminated fence while the user is editing. */

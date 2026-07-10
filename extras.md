@@ -107,3 +107,21 @@ Launching draw.io from a **default Windows install** now works out of the box:
 
 This removes the need for the directory-junction / 8.3-short-path workarounds (the short-path route
 broke draw.io's own Electron UI). Configure or re-detect under **Settings → Files → Diagram editors**.
+
+### Git integration on Windows (GH #33)
+
+Running git from the app no longer flashes a console window on Windows — the git subprocess is
+launched with `CREATE_NO_WINDOW`, so status polls / commits / pushes are silent (they popped a
+black terminal for a fraction of a second before).
+
+### Code-block editing (GH #66 + friends)
+
+Fenced code blocks (and the ```calc calculator) now edit sensibly:
+
+- **Enter inside a fence adds a new line** instead of splitting the block into a new bullet (which
+  used to break multi-line code — GH #66).
+- **Enter on a trailing blank line exits** to a new bullet below (the "double-Enter" idiom), so a
+  code/calc block that's last in the page no longer traps the caret.
+- A **language picker** on the opening fence: typing ```lang (or running `/code`) offers an
+  autocomplete of common languages, mirroring the `[[` / `#` popup; picking one drops the caret onto
+  the code line.

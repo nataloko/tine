@@ -3,8 +3,9 @@
 
 import { TEMPLATE_VARS } from "./templateVars";
 import { tagRef } from "../tags";
+import { isOpeningFenceLine } from "./properties";
 
-export type TriggerKind = "page" | "tag" | "command" | "block";
+export type TriggerKind = "page" | "tag" | "command" | "block" | "lang";
 
 export interface Trigger {
   kind: TriggerKind;
@@ -56,6 +57,15 @@ export function detectTrigger(raw: string, caret: number): Trigger | null {
   if (cmd) {
     const start = lineStart + before.length - cmd[2].length - 1;
     return { kind: "command", query: cmd[2], start, end: caret };
+  }
+
+  // ```lang — a fenced code OPENER: offer a language list for the language token.
+  // Only on an opening fence (not the closing ``` or the code body), so the picker
+  // appears exactly where you name the language. `+#._-` cover names like c++, c#,
+  // f#, objective-c, plaintext.
+  const fence = /^(`{3,}|~{3,})([A-Za-z0-9+#._-]*)$/.exec(before);
+  if (fence && isOpeningFenceLine(raw, lineStart)) {
+    return { kind: "lang", query: fence[2], start: lineStart + fence[1].length, end: caret };
   }
 
   return null;
@@ -159,6 +169,7 @@ export function orderAcItems<T>(
 /** Action commands need runtime behaviour (date stamps, file picker) rather
  *  than a fixed insertion; the editor resolves these when chosen. */
 export type CommandAction =
+  | "code-block"
   | "scheduled"
   | "deadline"
   | "upload-asset"
@@ -219,7 +230,7 @@ export const COMMANDS: Command[] = [
   { label: "Upload an asset", action: "upload-asset" },
   { label: "Voice recording", action: "record" },
   { label: "Draw.io diagram", action: "drawio" },
-  { label: "Code block", insert: "```\n\n```", caret: 4 },
+  { label: "Code block", action: "code-block" },
   { label: "Calculator", insert: "```calc\n\n```", caret: 8 },
   { label: "Quote", insert: "> " },
   // Org-mode admonitions (Logseq's colored callouts). Caret lands on the empty
@@ -308,4 +319,26 @@ export function filterCommands(query: string): Command[] {
     .filter((x) => x.s > 0)
     .sort((a, b) => b.s - a.s) // stable: equal scores keep their defined order
     .map((x) => x.c);
+}
+
+/** Common code-fence languages offered by the ```lang picker. Curated (not the
+ *  full highlight.js set) to the ones people actually reach for, so the list stays
+ *  usable; any language still works if typed in full (the renderer auto-detects). */
+export const CODE_LANGUAGES: string[] = [
+  "javascript", "typescript", "jsx", "tsx", "json", "html", "css", "scss",
+  "python", "rust", "go", "java", "kotlin", "c", "cpp", "csharp", "swift",
+  "php", "ruby", "scala", "clojure", "elixir", "erlang", "haskell", "lua",
+  "perl", "r", "julia", "dart", "objectivec", "groovy",
+  "bash", "shell", "powershell", "sql", "graphql", "yaml", "toml", "ini",
+  "xml", "markdown", "dockerfile", "makefile", "nix", "diff", "latex",
+  "plaintext",
+];
+
+/** Language matches for `query`, ranked best-first. Empty query lists all. */
+export function filterLanguages(query: string): string[] {
+  if (!query) return CODE_LANGUAGES.slice();
+  return CODE_LANGUAGES.map((l) => ({ l, s: fuzzyScore(query, l) }))
+    .filter((x) => x.s > 0)
+    .sort((a, b) => b.s - a.s)
+    .map((x) => x.l);
 }

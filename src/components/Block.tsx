@@ -13,6 +13,7 @@ import {
   COMMANDS,
   commandScore,
   fuzzyScore,
+  filterLanguages,
   type Trigger,
 } from "../editor/autocomplete";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
@@ -111,7 +112,7 @@ import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
 import { taskCheckboxState } from "../markers";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim, isOpeningFenceLine } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
@@ -1086,6 +1087,11 @@ export function Editor(props: { id: string }): JSX.Element {
     }
     setAc(t);
     setAcIndex(0);
+    if (t.kind === "lang") {
+      // ```lang picker — a language list, mirroring the [[ / # popup.
+      setAcItems(filterLanguages(t.query).map((l) => ({ label: l, insert: l })));
+      return;
+    }
     if (t.kind === "command") {
       const q = t.query;
       const tmpls = await getTemplates();
@@ -1428,6 +1434,24 @@ export function Editor(props: { id: string }): JSX.Element {
   const selectAc = (item: AcItem) => {
     const t = ac();
     if (!t) return;
+    if (t.kind === "lang") {
+      // Put the language on the fence line, then drop the caret onto the code line
+      // below (the fence's content), so typing goes straight into the code and
+      // Enter there adds lines (per the fence editing fix) rather than splitting.
+      const lang = item.insert ?? "";
+      const value = ref.value.slice(0, t.start) + lang + ref.value.slice(t.end);
+      const nl = value.indexOf("\n", t.start + lang.length);
+      const caret = nl === -1 ? value.length : nl + 1;
+      commit(value);
+      closeAc();
+      queueMicrotask(() => {
+        ref.value = value;
+        ref.setSelectionRange(caret, caret);
+        ref.focus();
+        autosize();
+      });
+      return;
+    }
     if (item.blockRef) {
       // Insert `((uuid))` now (resolves in-session via the in-memory uuid), then
       // durably stamp the target's id:: in the background so it survives restart.
@@ -1451,6 +1475,14 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     switch (item.action) {
+      case "code-block": {
+        // Insert the fence with the caret right after the opening ```, then open
+        // the language picker so a language can be chosen immediately (like Logseq).
+        // Choosing one drops the caret onto the code line (see the "lang" branch).
+        replaceTrigger("```\n\n```", 3);
+        queueMicrotask(() => void updateAutocomplete());
+        return;
+      }
       case "scheduled":
       case "deadline": {
         // Drop the "/scheduled" trigger text, then open the calendar popup
@@ -2138,9 +2170,44 @@ export function Editor(props: { id: string }): JSX.Element {
     }
 
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-      // In a calc block, Enter adds a new expression line (stays in the block) —
-      // let the textarea insert the newline natively, like OG.
-      if (isCalc()) return;
+      // Inside a calc block or a fenced code block, Enter continues the block (a
+      // newline) rather than splitting into a new bullet, which would break the
+      // code (GH #66). To exit to a new sibling, press Enter on a trailing blank
+      // line (the "double-Enter" idiom) — otherwise a trailing code/calc block
+      // would trap the caret with no way to add a bullet after it.
+      const inMultiline = isCalc() || (!isAnnot() && caretInFence(raw, start));
+      if (inMultiline) {
+        if (start === end) {
+          const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
+          if (trimmed !== null) {
+            e.preventDefault();
+            commit(trimmed);
+            const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
+            startEditing(newId, 0);
+            return;
+          }
+        }
+        return; // continue the block: let the textarea insert the newline natively
+      }
+      // Caret on an OPENING fence line (```lang): Enter drops INTO the code body
+      // (the line below) instead of splitting the block — so `/code` then Escape,
+      // or typing ```lang then Enter, lands you in the code, not a broken split.
+      if (!isAnnot()) {
+        const fLineStart = raw.lastIndexOf("\n", start - 1) + 1;
+        const fLineEnd = raw.indexOf("\n", start);
+        const fLine = raw.slice(fLineStart, fLineEnd === -1 ? raw.length : fLineEnd);
+        if (/^\s*(`{3,}|~{3,})/.test(fLine) && isOpeningFenceLine(raw, fLineStart)) {
+          e.preventDefault();
+          if (fLineEnd === -1) {
+            // Unterminated fence (fence line is last): open a code line below.
+            applyEdit({ text: raw + "\n", start: raw.length + 1, end: raw.length + 1 });
+          } else {
+            const caret = fLineEnd + 1; // start of the code body line
+            ref.setSelectionRange(caret, caret);
+          }
+          return;
+        }
+      }
       e.preventDefault();
       // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
       // (new item below, same marker/indent; a checkbox item starts a fresh `[ ]`)
