@@ -974,15 +974,25 @@ export function Editor(props: { id: string }): JSX.Element {
   // you exit.
   // A ```calc block edits like OG: the textarea shows ONLY the fence-stripped
   // expressions (calcLive), with a line-number gutter + live results beside it,
-  // and the fence is re-added on commit. Calc mode is captured at editor mount,
-  // not re-derived from the latest committed raw, so an exit commit can still
-  // preserve the fence even if the committed raw is temporarily malformed.
-  const editingCalc = calcSource(editorValue()) !== null;
+  // and the fence is re-added on commit. Calc mode LATCHES: it's true if the block
+  // was a ```calc fence at editor mount, or BECOMES one during the session (typing
+  // the fence, or the /Calculator slash insert), and never flips back to false.
+  // Latching (rather than re-deriving live) means an exit commit still re-fences
+  // even if the committed raw is momentarily malformed, AND a block that turns into
+  // calc mid-edit activates its live results immediately instead of only after a
+  // blur + re-enter (GH: calc block "not activated" on first create).
+  const [editingCalc, setEditingCalc] = createSignal(calcSource(editorValue()) !== null);
+  // Latch on: a settled calc fence (has a newline after the opener, so a half-typed
+  // "```calc" toward some other word — e.g. "```calcite" — never trips it).
+  createEffect(() => {
+    const v = editorValue();
+    if (calcSource(v) !== null && v.includes("\n")) setEditingCalc(true);
+  });
   const calcLive = createMemo(() => {
-    if (!editingCalc) return null;
+    if (!editingCalc()) return null;
     return calcSource(editorValue()) ?? editorValue();
   });
-  const isCalc = () => editingCalc;
+  const isCalc = () => editingCalc();
   const calcRows = createMemo(() => (isCalc() ? evalCalc(calcLive() ?? "") : []));
   // Live syntax highlighting while editing a fenced code block: a highlighted <pre>
   // painted BEHIND the (still sole-owner) textarea, whose text goes transparent with
@@ -1586,6 +1596,22 @@ export function Editor(props: { id: string }): JSX.Element {
         // Choosing one drops the caret onto the code line (see the "lang" branch).
         replaceTrigger("```\n\n```", 3);
         queueMicrotask(() => void updateAutocomplete());
+        return;
+      }
+      case "calc-block": {
+        // Insert an empty ```calc fence and commit it — that flips the editor into
+        // calc mode (editingCalc latches true), so the gutter + live results appear
+        // at once. We DON'T set ref.value here (unlike replaceTrigger): the reactive
+        // value binding now owns the textarea as the fence-stripped expression buffer
+        // (empty), so we only drop the caret onto that line.
+        const r = applyCompletion(ref.value, t.start, t.end, "```calc\n\n```");
+        commit(r.raw);
+        closeAc();
+        queueMicrotask(() => {
+          ref.focus();
+          ref.setSelectionRange(0, 0);
+          autosize();
+        });
         return;
       }
       case "scheduled":

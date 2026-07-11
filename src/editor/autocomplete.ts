@@ -170,6 +170,7 @@ export function orderAcItems<T>(
  *  than a fixed insertion; the editor resolves these when chosen. */
 export type CommandAction =
   | "code-block"
+  | "calc-block"
   | "scheduled"
   | "deadline"
   | "upload-asset"
@@ -231,7 +232,7 @@ export const COMMANDS: Command[] = [
   { label: "Voice recording", action: "record" },
   { label: "Draw.io diagram", action: "drawio" },
   { label: "Code block", action: "code-block" },
-  { label: "Calculator", insert: "```calc\n\n```", caret: 8 },
+  { label: "Calculator", action: "calc-block" },
   { label: "Quote", insert: "> " },
   // Org-mode admonitions (Logseq's colored callouts). Caret lands on the empty
   // content line between BEGIN/END.

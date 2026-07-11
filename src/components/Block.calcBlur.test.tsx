@@ -4,6 +4,7 @@ import { render } from "solid-js/web";
 import { initParser } from "../render/parse";
 import { doc, loadSingle, pageByName, resetStore } from "../store";
 import { startEditing } from "../editorController";
+import { setRaw } from "../store";
 import { calcSource } from "../editor/calc";
 import type { BlockDto, PageDto } from "../types";
 import { Block } from "./Block";
@@ -62,6 +63,37 @@ describe("calc block persistence on blur", () => {
       expect(calcSource(raw)).not.toBeNull();
       // Expression order preserved — planning-normalization did NOT reorder it.
       expect(calcSource(raw)).toBe("1 + 1\n2 + 2\nSCHEDULED: <2026-07-06 Mon>");
+    } finally {
+      dispose();
+    }
+  });
+
+  // A block that BECOMES a ```calc fence while it's being edited (the /Calculator
+  // slash insert, or typing the fence) must activate the live results panel right
+  // away — not only after a blur + re-enter. editingCalc latches on the fence.
+  it("activates the results panel when a block turns into calc mid-edit", () => {
+    loadSingle(page("Calc", [blk("calc-1", "")]));
+    const id = pageByName("Calc")!.roots[0];
+
+    startEditing(id, 0);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Calc")?.roots ?? []}>{(bid) => <Block id={bid} />}</For>
+    ));
+
+    try {
+      // A plain (empty) block: no calc UI yet.
+      expect(root.querySelector(".calc-results")).toBeNull();
+
+      // Content becomes a calc fence in-place (what the slash insert's commit does),
+      // with NO blur.
+      setRaw(id, "```calc\n1 + 1\n```");
+
+      // The gutter + results panel are now live, and show the computed value.
+      expect(root.querySelector(".calc-gutter")).not.toBeNull();
+      const outs = [...root.querySelectorAll(".calc-results .calc-out")].map((n) => n.textContent);
+      expect(outs).toContain("2");
+      // The textarea flipped to the fence-stripped expression buffer.
+      expect((root.querySelector("textarea") as HTMLTextAreaElement).value).toBe("1 + 1");
     } finally {
       dispose();
     }
