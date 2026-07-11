@@ -89,6 +89,8 @@ import {
   commitNow,
   pushNow,
   pullNow,
+  forcePushNow,
+  forcePullNow,
   initRepo,
   type PushMode,
 } from "../git";
@@ -762,6 +764,36 @@ function GitSection(): JSX.Element {
       {label}
     </button>
   );
+  // Native GTK confirm — window.confirm silently returns true under WebKitGTK,
+  // which would run the destructive op with no prompt (see backup restore above).
+  const forcePush = async () => {
+    const s = gitStatus();
+    const branch = s?.branch ? `“${s.branch}”` : "this branch";
+    if (
+      !(await backend().confirm(
+        `Force push ${branch} to the remote?\n\n` +
+          `This overwrites the remote branch with your local one, permanently ` +
+          `discarding any commits on the remote you don’t have. It can’t be undone.`,
+        "Force push",
+      ))
+    )
+      return;
+    await forcePushNow();
+  };
+  const forcePull = async () => {
+    const s = gitStatus();
+    const branch = s?.branch ? `“${s.branch}”` : "this branch";
+    if (
+      !(await backend().confirm(
+        `Force pull ${branch} from the remote?\n\n` +
+          `This discards every local commit and every uncommitted change to tracked ` +
+          `files, resetting this graph to exactly match the remote. It can’t be undone.`,
+        "Force pull",
+      ))
+    )
+      return;
+    await forcePullNow();
+  };
   return (
     <>
       <div class="settings-section">Git</div>
@@ -827,6 +859,25 @@ function GitSection(): JSX.Element {
               </button>
               <button class="btn-secondary" onClick={() => void pullNow()}>
                 Pull
+              </button>
+            </div>
+          </Field>
+          <Field
+            label="Force sync"
+            hint="Escape hatch for a diverged branch. Force push overwrites the remote with your local branch; force pull discards every local commit and uncommitted change to match the remote. Both are irreversible — each asks to confirm first."
+          >
+            <div class="git-actions">
+              <button
+                class="btn-secondary settings-btn-danger"
+                onClick={() => void forcePush()}
+              >
+                Force push
+              </button>
+              <button
+                class="btn-secondary settings-btn-danger"
+                onClick={() => void forcePull()}
+              >
+                Force pull
               </button>
             </div>
           </Field>

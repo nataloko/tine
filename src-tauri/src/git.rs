@@ -290,6 +290,45 @@ fn pull_in(root: &Path) -> GitResult {
     }
 }
 
+/// Force-push the current branch (`git push --force`) — overwrites whatever is on
+/// the remote with the local branch, including rewriting remote history. The
+/// opposite of the normal never-forces `push_in`; only reachable behind an explicit
+/// confirmation in Settings (the manual escape hatch for "make the remote match me").
+fn force_push_in(root: &Path) -> GitResult {
+    match git_base(root).args(["push", "--force"]).output() {
+        Ok(out) if out.status.success() => {
+            GitResult::new("push", true, "Force-pushed — remote now matches local.")
+        }
+        Ok(out) => GitResult::new("push", false, classify_push_error(&combined(&out))),
+        Err(e) => GitResult::new("push", false, format!("couldn't run git: {e}")),
+    }
+}
+
+/// Force-pull: `git fetch` then `git reset --hard @{upstream}` — discards local
+/// commits AND uncommitted changes to tracked files so the working tree exactly
+/// matches the remote branch. Unlike the normal `--ff-only` pull (which never
+/// rewrites local edits), this deliberately overwrites them; it's only reachable
+/// behind an explicit confirmation in Settings. Reset writes land on disk and flow
+/// through the watcher → reloadDisposition like any external change. (Untracked
+/// files are left alone — reset --hard only touches tracked content.)
+fn force_pull_in(root: &Path) -> GitResult {
+    match git_base(root).args(["fetch"]).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => return GitResult::new("pull", false, classify_pull_error(&combined(&out))),
+        Err(e) => return GitResult::new("pull", false, format!("couldn't run git: {e}")),
+    }
+    match git_base(root)
+        .args(["reset", "--hard", "@{upstream}"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            GitResult::new("pull", true, "Reset to remote — local changes discarded.")
+        }
+        Ok(out) => GitResult::new("pull", false, classify_pull_error(&combined(&out))),
+        Err(e) => GitResult::new("pull", false, format!("couldn't run git: {e}")),
+    }
+}
+
 // --- Commands (async; blocking git runs off the main thread) -----------------
 
 /// Read-only status of the graph repo. Cheap; polled + refreshed after ops.
@@ -342,6 +381,27 @@ pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, 
 pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || pull_in(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Force-push the current branch — overwrites remote history. Destructive; the
+/// frontend gates it behind a confirmation dialog.
+#[tauri::command]
+pub(crate) async fn git_force_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+    let root = graph_root(&window)?;
+    tauri::async_runtime::spawn_blocking(move || force_push_in(&root))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Force-pull (fetch + hard reset to upstream) — overwrites local commits and
+/// tracked-file edits. Destructive; the frontend gates it behind a confirmation
+/// dialog. Reset writes reload through the file watcher like any external change.
+#[tauri::command]
+pub(crate) async fn git_force_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+    let root = graph_root(&window)?;
+    tauri::async_runtime::spawn_blocking(move || force_pull_in(&root))
         .await
         .map_err(|e| e.to_string())
 }

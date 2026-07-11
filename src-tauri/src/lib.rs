@@ -35,7 +35,9 @@ use commands::{
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
 };
-use git::{git_commit, git_init, git_pull, git_push, git_status};
+use git::{
+    git_commit, git_force_pull, git_force_push, git_init, git_pull, git_push, git_status,
+};
 use graph::{
     app_platform, capture_target, create_graph, default_graph_parent, load_graph,
     open_graph_window, resolve_root, startup_graph_path, warm_done,
@@ -517,6 +519,8 @@ pub fn run() {
             git_commit,
             git_push,
             git_pull,
+            git_force_push,
+            git_force_pull,
             tine_quit,
             close_graph_window,
             tine_open_devtools

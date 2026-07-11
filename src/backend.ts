@@ -366,6 +366,13 @@ export interface Backend {
   /** `git pull --ff-only`. Pulled files land on disk and reload through the normal
    *  watcher → reloadDisposition path (dirty pages guarded by the conflict UI). */
   gitPull(): Promise<GitResult>;
+  /** `git push --force` — overwrites remote history with the local branch.
+   *  Destructive; callers must confirm first. */
+  gitForcePush(): Promise<GitResult>;
+  /** `git fetch` + `git reset --hard @{upstream}` — discards local commits and
+   *  tracked-file edits so the working tree matches the remote. Destructive;
+   *  callers must confirm first. The reset reloads through the watcher path. */
+  gitForcePull(): Promise<GitResult>;
 }
 
 /** Repo status for the git integration's status line / topbar badge. */
@@ -851,6 +858,12 @@ class TauriBackend implements Backend {
   }
   gitPull() {
     return this.call<GitResult>("git_pull");
+  }
+  gitForcePush() {
+    return this.call<GitResult>("git_force_push");
+  }
+  gitForcePull() {
+    return this.call<GitResult>("git_force_pull");
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

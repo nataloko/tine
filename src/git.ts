@@ -115,6 +115,32 @@ async function runPull(quiet: boolean): Promise<GitResult | null> {
   }
 }
 
+// Force ops are always manual (Settings buttons, behind a confirm) and always
+// loud — they overwrite data, so the outcome must be visible.
+async function runForcePush(): Promise<GitResult | null> {
+  try {
+    const r = await backend().gitForcePush();
+    pushToast(r.detail, r.ok ? "success" : "warn");
+    await refreshGitStatus();
+    return r;
+  } catch (e) {
+    pushToast(`Git force-push failed — ${String(e)}`, "error");
+    return null;
+  }
+}
+
+async function runForcePull(): Promise<GitResult | null> {
+  try {
+    const r = await backend().gitForcePull();
+    pushToast(r.detail, r.ok ? "success" : "warn");
+    await refreshGitStatus();
+    return r;
+  } catch (e) {
+    pushToast(`Git force-pull failed — ${String(e)}`, "error");
+    return null;
+  }
+}
+
 // --- Auto-commit on idle -----------------------------------------------------
 
 let autoTimer: ReturnType<typeof setTimeout> | null = null;
@@ -194,6 +220,14 @@ export async function pushNow(): Promise<void> {
 /** Manual "Pull". */
 export async function pullNow(): Promise<void> {
   await runPull(false);
+}
+/** Manual "Force push" — overwrites the remote. Gate behind a confirm at the UI. */
+export async function forcePushNow(): Promise<void> {
+  await runForcePush();
+}
+/** Manual "Force pull" — overwrites local. Gate behind a confirm at the UI. */
+export async function forcePullNow(): Promise<void> {
+  await runForcePull();
 }
 /** "Initialize git repo" affordance for an un-versioned graph. */
 export async function initRepo(): Promise<void> {

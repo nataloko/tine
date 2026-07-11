@@ -1191,6 +1191,16 @@ export function mockBackend(): Backend {
       mockGit.behind = 0;
       return { op: "pull", ok: true, detail: "Already up to date." };
     },
+    async gitForcePush(): Promise<GitResult> {
+      mockGit.ahead = 0;
+      return { op: "push", ok: true, detail: "Force-pushed — remote now matches local." };
+    },
+    async gitForcePull(): Promise<GitResult> {
+      mockGit.behind = 0;
+      mockGit.dirty = 0;
+      mockGit.ahead = 0;
+      return { op: "pull", ok: true, detail: "Reset to remote — local changes discarded." };
+    },
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];
     },
