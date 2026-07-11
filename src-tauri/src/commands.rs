@@ -780,7 +780,11 @@ fn detect_drawio() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        detect_drawio_windows_with(std::env::var_os, |path| path.is_file())
+        // Wrap `var_os` in a closure so it satisfies the higher-ranked `for<'a>
+        // FnMut(&'a str)` bound — passing the generic fn item directly infers a
+        // single fixed lifetime and fails ("FnMut is not general enough") on
+        // current stable rustc (only compiled on Windows, so CI catches it).
+        detect_drawio_windows_with(|k: &str| std::env::var_os(k), |path| path.is_file())
     }
 }
 
