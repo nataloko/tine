@@ -1224,6 +1224,30 @@ describe("save engine (persistence)", () => {
     ]);
   });
 
+  it("a successful rename re-keys favorites and collapses old/new recent duplicates", () => {
+    setFavorites([
+      { name: "Old", kind: "page" },
+      { name: "New", kind: "page" },
+      { name: "Pinned", kind: "page" },
+    ]);
+    setRecentPages([
+      { name: "New", kind: "page" },
+      { name: "Other", kind: "page" },
+      { name: "Old", kind: "page" },
+    ]);
+
+    renamePageInNavigation("Old", "New");
+
+    expect(favorites()).toEqual([
+      { name: "New", kind: "page" },
+      { name: "Pinned", kind: "page" },
+    ]);
+    expect(recentPages()).toEqual([
+      { name: "New", kind: "page" },
+      { name: "Other", kind: "page" },
+    ]);
+  });
+
   it("seedFavorites replaces (per-graph) on graph open, clearing to empty for a graph with none", () => {
     // Graph A has favorites.
     seedFavorites(["Inbox", "2026-07-05"]);

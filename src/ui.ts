@@ -590,7 +590,10 @@ export interface FavItem {
 }
 export const [favorites, setFavorites] = createSignal<FavItem[]>([]);
 export function isFavorite(name: string): boolean {
-  return favorites().some((f) => f.name === name);
+  const target = resolveAlias(name);
+  return favorites().some((f) =>
+    f.kind === "page" ? resolveAlias(f.name) === target : f.name === name
+  );
 }
 function persistFavorites(next: FavItem[]) {
   // Persist to config.edn :favorites so favorites travel with the graph and stay
@@ -599,8 +602,11 @@ function persistFavorites(next: FavItem[]) {
 }
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
   const f = favorites();
-  const next = f.some((x) => x.name === name)
-    ? f.filter((x) => x.name !== name)
+  const target = kind === "page" ? resolveAlias(name) : name;
+  const matches = (item: FavItem) => item.kind === kind &&
+    (kind === "page" ? resolveAlias(item.name) === target : item.name === name);
+  const next = f.some(matches)
+    ? f.filter((x) => !matches(x))
     : [...f, { name, kind }];
   setFavorites(next);
   persistFavorites(next);
@@ -623,14 +629,18 @@ export function removeDeletedPageFromNavigation(name: string, kind: PageKind) {
     }
   }
 }
-/** Remap favorites + recents when a page is renamed `old` → `next`, so a starred
- *  or recent entry keeps pointing at the live page instead of a dead old name
- *  (config.edn `:favorites` stores names, and the backend rename doesn't touch it).
- *  Matches the backend rename's set: the exact page PLUS any `old/…` namespace
- *  descendant (which the rename also moves). Comparison is case-insensitive to
- *  mirror the backend's normalized page-name matching. Persists the favorites
- *  change to config.edn (the source of truth) and recents to localStorage. */
-export function renamePageInNavigation(old: string, next: string, kind: PageKind) {
+/** Re-key sidebar navigation state after the backend has atomically renamed a
+ *  page `old` → `next`, so a starred or recent entry keeps pointing at the live
+ *  page instead of a dead old name (config.edn `:favorites` stores names, and the
+ *  backend rename doesn't touch it). Matches the backend rename's set: the exact
+ *  page PLUS any `old/…` namespace descendant (which the rename also moves), with
+ *  case-insensitive comparison to mirror the backend's normalized matching. After
+ *  remapping, collapses any duplicate the rename produces (e.g. `old`→`next` where
+ *  `next` already exists), keeping the first entry and a stable order — then
+ *  persists favorites to config.edn (the source of truth) and recents to
+ *  localStorage. `kind` scopes the match to that page kind (defaults to "page",
+ *  which is what the 2-arg callers rename). */
+export function renamePageInNavigation(old: string, next: string, kind: PageKind = "page") {
   const from = old.trim();
   const to = next.trim();
   if (!from || !to) return;
@@ -638,36 +648,44 @@ export function renamePageInNavigation(old: string, next: string, kind: PageKind
   const prefix = `${fromKey}/`;
   // Exact page → new name; namespace child `old/x` → `new/x` (prefix length is the
   // same in either case, so slicing by `from.length` preserves the child's casing).
-  const remap = (name: string): string | null => {
+  const remapName = (name: string): string | null => {
     const key = name.toLowerCase();
     if (key === fromKey) return to;
     if (key.startsWith(prefix)) return to + name.slice(from.length);
     return null;
   };
+  // Remap matching entries of this kind, then dedupe by kind+name — a rename can
+  // fold an entry onto an existing destination (keep the first, drop later ones).
+  const rekey = (items: FavItem[]): { items: FavItem[]; changed: boolean } => {
+    const seen = new Set<string>();
+    const out: FavItem[] = [];
+    let changed = false;
+    for (const item of items) {
+      const mapped = item.kind === kind ? remapName(item.name) : null;
+      const nextItem = mapped === null ? item : { ...item, name: mapped };
+      if (mapped !== null) changed = true;
+      const key = `${nextItem.kind}\0${nextItem.name}`;
+      if (seen.has(key)) {
+        changed = true; // collapsed a duplicate
+        continue;
+      }
+      seen.add(key);
+      out.push(nextItem);
+    }
+    return { items: out, changed };
+  };
 
-  let favChanged = false;
-  const nextFavs = favorites().map((f) => {
-    const r = remap(f.name);
-    if (r === null) return f;
-    favChanged = true;
-    return { ...f, name: r };
-  });
-  if (favChanged) {
-    setFavorites(nextFavs);
-    persistFavorites(nextFavs);
+  const favResult = rekey(favorites());
+  if (favResult.changed) {
+    setFavorites(favResult.items);
+    persistFavorites(favResult.items);
   }
 
-  let recChanged = false;
-  const nextRecents = recentPages().map((r) => {
-    const m = remap(r.name);
-    if (m === null) return r;
-    recChanged = true;
-    return { ...r, name: m };
-  });
-  if (recChanged) {
-    setRecentPages(nextRecents);
+  const recResult = rekey(recentPages());
+  if (recResult.changed) {
+    setRecentPages(recResult.items);
     try {
-      if (nextRecents.length) localStorage.setItem(RECENT_KEY, JSON.stringify(nextRecents));
+      if (recResult.items.length) localStorage.setItem(RECENT_KEY, JSON.stringify(recResult.items));
       else localStorage.removeItem(RECENT_KEY);
     } catch {
       // ignore

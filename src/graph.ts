@@ -2,7 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning } from "./ui";
+import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession } from "./router";
@@ -82,6 +82,12 @@ export async function loadGraphPath(
     clearRecent();
   }
   setGraphMeta(meta ?? null);
+  // Revoke every in-flight result from the previous binding NOW, before the
+  // awaited journal-template step. This is also required for same-root force
+  // refresh (restore): root equality cannot distinguish pre-restore DTOs from
+  // the freshly rebound graph. The second bump below refetches after a default
+  // template has been written, preserving #73's populated-first observation.
+  bumpGraphEpoch();
   setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
   seedFavorites(meta?.favorites ?? []);
@@ -94,11 +100,14 @@ export async function loadGraphPath(
       // ignore
     }
   }
+  // A default journal template writes today's journal to disk. Do that before
+  // invalidating graph-backed resources so the first Journals refetch observes
+  // the populated file instead of caching the synthetic blank page (#73).
+  await ensureJournalTemplate();
   bumpGraphEpoch();
   void injectCustomCss();
   void loadAliases();
   if (!switching) void pruneSidebarBlocks();
-  await ensureJournalTemplate();
   maybeShowGuideAnnouncement();
   // On a genuine graph SWITCH, close ALL the old graph's tabs (their histories
   // point at pages that don't exist in the new graph) and land on a single fresh
@@ -151,7 +160,8 @@ async function loadAliases(): Promise<void> {
  *  References to refetch from the now-correct backend). Aliases may have moved with
  *  the renamed file, so refresh those too. Caller must have run flushAll() first
  *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
-export function refreshAfterRename(): void {
+export function refreshAfterRename(from: string, to: string): void {
+  renamePageInNavigation(from, to);
   resetStore();
   bumpGraphEpoch();
   void refreshAliases();
@@ -176,8 +186,18 @@ async function ensureJournalTemplate(): Promise<void> {
       children: b.children.map(resolve),
     });
     await backend().savePage(
-      { name: title, kind: "journal", title, pre_block: null, blocks: tmpl.blocks.map(resolve) },
-      null, // brand-new journal — no baseline
+      {
+        name: title,
+        kind: "journal",
+        title,
+        pre_block: existing?.pre_block ?? null,
+        blocks: tmpl.blocks.map(resolve),
+        // An empty journal may already exist on disk. Preserve its concrete file
+        // and format rather than re-resolving it as a new canonical markdown page.
+        path: existing?.path,
+        format: existing?.format,
+      },
+      existing?.rev ?? null,
       false
     );
   } catch {

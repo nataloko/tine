@@ -1,16 +1,25 @@
-// "A newer Tine is available" check — a startup toast + an explicit About-tab check.
-// Both are NOTIFICATION-ONLY in this fork: they compare the running build against the
-// latest UPSTREAM Tine release and, if upstream is newer, just tell you — so you can
-// go merge upstream into your own version (see mine.md). Neither installs anything;
-// there is deliberately NO self-update code here, so a non-fork build can never be
-// installed on top of yours. The About tab keeps a plain "Releases" link (opens the
-// page in the browser — a link, not an install).
+// "A newer Tine is available" check — best-effort, once per launch.
 //
-// Deliberately quiet: Tauri-only, silent on ANY failure (offline, rate-limited,
-// blocked) — it must never block startup or nag with an error.
+// Notifier: ask GitHub for the latest *published* release and, if it's newer than
+// the running build, show a sticky toast. This is the cross-platform half and is
+// always the way a user LEARNS an update exists.
+//
+// Installer (the toast's action): on **Windows/Linux** in the packaged app, run the
+// Tauri v2 updater — `check()` → `downloadAndInstall()` → `relaunch()` — so the
+// update applies in place. On **macOS** (bundle is unsigned → Gatekeeper would
+// reject a self-replaced app) and outside Tauri, fall back to opening the releases
+// page in the browser. Android/iOS update through their distribution channel, so
+// both the notifier and installer are disabled there. The updater is inert until
+// a signed release with a `latest.json` exists; any failure (no manifest yet, bad
+// signature, offline) is caught and also falls back to the releases page — it can
+// never brick the app.
+//
+// Deliberately quiet: Tauri-only check, silent on ANY failure (offline, rate-
+// limited, blocked) — it must never block startup or nag with an error.
 
 import { isTauri, backend } from "./backend";
-import { pushToast } from "./ui";
+import { platformKind } from "./platform";
+import { pushToast, dismissToast } from "./ui";
 
 const REPO = "martinkoutecky/tine";
 const RELEASES_PAGE = `https://github.com/${REPO}/releases/latest`;
@@ -30,16 +39,61 @@ function isNewer(a: [number, number, number], b: [number, number, number]): bool
   return false;
 }
 
-/** Open the GitHub releases page in the system browser (the About tab's link — a
- *  link, not an install). */
+type UpdateMode = "self" | "manual" | "unavailable";
+
+/** Resolve update behavior conservatively. Mobile builds update through their
+ * distribution channel; a platform-detection failure must therefore fail closed
+ * instead of accidentally exposing the desktop updater. */
+async function updateMode(): Promise<UpdateMode> {
+  if (!isTauri()) return "unavailable";
+  try {
+    if ((await platformKind()) !== "desktop") return "unavailable";
+  } catch {
+    return "unavailable";
+  }
+  return /\bMac/i.test(typeof navigator !== "undefined" ? navigator.userAgent : "")
+    ? "manual"
+    : "self";
+}
+
+/** Open the GitHub releases page in the system browser (the manual fallback). */
 function openReleases(): void {
   void backend().openExternal(RELEASES_PAGE).catch(() => {});
+}
+
+/** The toast's "Download" action. Win/Linux packaged app → run the Tauri updater
+ *  in place and relaunch; everything else (macOS, browser, or any failure) → open
+ *  the releases page. Never throws. */
+async function applyUpdateOrOpen(): Promise<void> {
+  const mode = await updateMode();
+  if (mode === "unavailable") return;
+  if (mode === "manual") {
+    openReleases();
+    return;
+  }
+  let progressId: number | null = null;
+  try {
+    const { check } = await import("@tauri-apps/plugin-updater");
+    const update = await check();
+    if (!update) {
+      // No signed `latest.json` yet (or already current) → manual path.
+      openReleases();
+      return;
+    }
+    progressId = pushToast(`Downloading Tine ${update.version}…`, "info", { sticky: true });
+    await update.downloadAndInstall();
+    const { relaunch } = await import("@tauri-apps/plugin-process");
+    await relaunch(); // process restarts into the new version (this toast goes with it)
+  } catch {
+    if (progressId != null) dismissToast(progressId);
+    openReleases(); // signature/verify/network failure → never brick, just offer the page
+  }
 }
 
 /** Check GitHub for a newer published release; toast if there is one. Resolves
  *  silently (never throws) in every failure case. */
 export async function checkForUpdate(): Promise<void> {
-  if (!isTauri()) return;
+  if ((await updateMode()) === "unavailable") return;
   try {
     const { getVersion } = await import("@tauri-apps/api/app");
     const cur = parseVer(await getVersion());
@@ -55,12 +109,16 @@ export async function checkForUpdate(): Promise<void> {
     const latest = typeof tag === "string" ? parseVer(tag) : null;
     if (!latest || !isNewer(latest, cur)) return;
 
-    // Notification only: no action button. This toast just tells you a newer
-    // upstream Tine exists so you can go merge it into your fork (see mine.md).
     pushToast(
       `Tine ${latest.join(".")} is available — you're on ${cur.join(".")}.`,
       "info",
-      { sticky: true }
+      {
+        sticky: true,
+        action: {
+          label: "Download",
+          run: () => void applyUpdateOrOpen(),
+        },
+      }
     );
   } catch {
     // offline / rate-limited / network blocked — never bother the user.
@@ -73,11 +131,11 @@ export type UpdateStatus =
   | { kind: "unavailable" }; // offline, rate-limited, or not the packaged app
 
 /** The About tab's explicit "Check for updates" button. Unlike `checkForUpdate`
- *  (silent on the common no-update path), this reports every outcome so the button
- *  can show feedback. Report-only: it NEVER installs — a newer release just means
- *  "go merge upstream into your fork". Never throws. */
+ *  (silent on the common no-update path), this reports every outcome so the
+ *  button can show feedback. If a newer release exists, kicks off the same
+ *  download-or-open flow as the startup toast. Never throws. */
 export async function checkForUpdateNow(): Promise<UpdateStatus> {
-  if (!isTauri()) return { kind: "unavailable" };
+  if ((await updateMode()) === "unavailable") return { kind: "unavailable" };
   try {
     const { getVersion } = await import("@tauri-apps/api/app");
     const curStr = await getVersion();
@@ -92,7 +150,7 @@ export async function checkForUpdateNow(): Promise<UpdateStatus> {
     if (!latest) return { kind: "unavailable" };
 
     if (isNewer(latest, cur)) {
-      // Report only — never install. Merge upstream into your fork instead.
+      void applyUpdateOrOpen();
       return { kind: "available", version: latest.join("."), current: cur.join(".") };
     }
     return { kind: "current", version: cur.join(".") };

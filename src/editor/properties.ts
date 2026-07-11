@@ -1,22 +1,13 @@
 // Pure helpers for reading/editing `key:: value` property lines — a block's
 // continuation lines or a page's pre-block. No store/DOM, so unit-testable.
 
+import { transitionFence, type FenceState } from "./fences";
+
 export const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
-// Built-in properties hidden from the editor by default (like OG): `id::`,
-// `collapsed::`, and `logseq.order-list-type::` (the numbered-list marker) are
-// kept in the file for persistence but never shown in the edit textarea.
-// Annotation (PDF highlight) blocks instead hide ALL properties and edit only
-// their text.
-const BUILTIN_HIDDEN = new Set(["id", "collapsed", "logseq.order-list-type"]);
-/** Hide just the built-in `id::`/`collapsed::` properties (normal blocks). */
-export const isBuiltinHidden = (key: string): boolean => BUILTIN_HIDDEN.has(key);
-/** Hide metadata that should not surface while editing through a sheet cell. */
-export const isSheetCellHidden = (key: string): boolean =>
-  isBuiltinHidden(key) || key.toLowerCase().startsWith("tine.");
-/** Hide every property (annotation blocks edit only their text). */
-export const hideAll = (_key: string): boolean => true;
-
+// Fence scanning for the fork's live-highlight overlay + language-picker
+// autocomplete (kept private here; upstream's fences.ts state machine drives the
+// Enter handler instead). A fence line opens or closes a run of ≥3 ` or ~.
 const FENCE_RE = /^\s*(`{3,}|~{3,})/;
 
 function fenceMarker(line: string): string | null {
@@ -34,6 +25,20 @@ function fenceTransition(
   if (ch === fence) return { opens: false, closes: true, next: null };
   return { opens: false, closes: false, next: fence };
 }
+
+// Built-in properties hidden from the editor by default (like OG): `id::`,
+// `collapsed::`, and `logseq.order-list-type::` (the numbered-list marker) are
+// kept in the file for persistence but never shown in the edit textarea.
+// Annotation (PDF highlight) blocks instead hide ALL properties and edit only
+// their text.
+const BUILTIN_HIDDEN = new Set(["id", "collapsed", "logseq.order-list-type"]);
+/** Hide just the built-in `id::`/`collapsed::` properties (normal blocks). */
+export const isBuiltinHidden = (key: string): boolean => BUILTIN_HIDDEN.has(key);
+/** Hide metadata that should not surface while editing through a sheet cell. */
+export const isSheetCellHidden = (key: string): boolean =>
+  isBuiltinHidden(key) || key.toLowerCase().startsWith("tine.");
+/** Hide every property (annotation blocks edit only their text). */
+export const hideAll = (_key: string): boolean => true;
 
 function propLineKey(line: string): string | null {
   const m = /^\s*([A-Za-z0-9_./-]+)::/.exec(line);
@@ -145,13 +150,13 @@ export function fencedCodeBlock(text: string): CodeFence | null {
  *  inside, including an unterminated fence while the user is editing. */
 export function caretInFence(raw: string, offset: number): boolean {
   const target = Math.max(0, Math.min(offset, raw.length));
-  let fence: string | null = null;
+  let fence: FenceState | null = null;
   let pos = 0;
   while (pos <= raw.length) {
     const nl = raw.indexOf("\n", pos);
     const end = nl === -1 ? raw.length : nl;
     const line = raw.slice(pos, end);
-    const t = fenceTransition(fence, line);
+    const t = transitionFence(fence, line);
     if (target <= end) return fence !== null && !t.closes;
     fence = t.next;
     if (nl === -1) break;
@@ -187,11 +192,11 @@ function classifyLines(
   format: PropFormat
 ): LineClass[] {
   const cls: LineClass[] = new Array(lines.length).fill("v");
-  let fence: string | null = null;
+  let fence: FenceState | null = null;
   let i = 0;
   while (i < lines.length) {
     const l = lines[i];
-    const t = fenceTransition(fence, l);
+    const t = transitionFence(fence, l);
     if (t.opens || t.closes) {
       fence = t.next; // fence delimiter lines are always visible content
       i++;

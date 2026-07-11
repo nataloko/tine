@@ -619,11 +619,9 @@ fn ast_plain_text(blocks: &[Block]) -> String {
 /// Parse + property/planning-filter one block body the way `render_block` does — the
 /// shared front of the render and search-index paths (one lsdoc parse per call).
 fn body_blocks(raw: &str) -> Vec<Block> {
-    crate::render::parse_block(raw, false)
+    crate::doc::strip_planning_lines(crate::render::parse_block(raw, false), raw)
         .into_iter()
-        .filter(|b| {
-            !matches!(b, Block::Properties { .. }) && !crate::doc::block_is_standalone_planning(b)
-        })
+        .filter(|b| !matches!(b, Block::Properties { .. }))
         .collect()
 }
 
@@ -1596,15 +1594,16 @@ fn page_is_public(pre_block: Option<&str>) -> bool {
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let out = graph.root.join("publish");
+    graph.ensure_write_target(&out)?;
     fs::create_dir_all(&out)?;
-    fs::write(out.join("style.css"), STYLE)?;
+    crate::model::atomic_write(&out.join("style.css"), STYLE.as_bytes())?;
     // Sidebar + fuzzy search are JS-driven: Fuse (vendored, OG's version) + our tiny
     // app.js, both loaded as `<script src>` so they work offline / over file://.
-    fs::write(
-        out.join("fuse.min.js"),
-        include_str!("../assets/fuse.min.js"),
+    crate::model::atomic_write(
+        &out.join("fuse.min.js"),
+        include_str!("../assets/fuse.min.js").as_bytes(),
     )?;
-    fs::write(out.join("app.js"), APP_JS)?;
+    crate::model::atomic_write(&out.join("app.js"), APP_JS.as_bytes())?;
     let all_public = graph.config.all_pages_public;
     let favorites: HashSet<&str> = graph.config.favorites.iter().map(|s| s.as_str()).collect();
 
@@ -1680,9 +1679,9 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     for (name, kind, parsed) in &public {
         let slug = slug_of(name);
         let file = format!("{slug}.html");
-        fs::write(
-            out.join(&file),
-            page_html(name, &slug, parsed, *kind, &ctx, &mut all_blocks),
+        crate::model::atomic_write(
+            &out.join(&file),
+            page_html(name, &slug, parsed, *kind, &ctx, &mut all_blocks).as_bytes(),
         )?;
         let journal = *kind == PageKind::Journal;
         let tag = if journal {
@@ -1713,7 +1712,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         serde_json::to_string(&sidebar_pages).unwrap_or_else(|_| "[]".into()),
         serde_json::to_string(&all_blocks).unwrap_or_else(|_| "[]".into()),
     );
-    fs::write(out.join("search-index.js"), data)?;
+    crate::model::atomic_write(&out.join("search-index.js"), data.as_bytes())?;
 
     // Index page <main>: the alphabetical all-pages list — the no-JS fallback / home
     // — wrapped in the same sidebar shell as every page.
@@ -1722,7 +1721,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
 <footer>Published with Tine</footer>",
         index_list
     );
-    fs::write(out.join("index.html"), shell("Index", &main))?;
+    crate::model::atomic_write(&out.join("index.html"), shell("Index", &main).as_bytes())?;
     Ok((out.display().to_string(), count))
 }
 
@@ -2204,7 +2203,7 @@ mod tests {
         .unwrap();
         fs::write(
             dir.join("pages").join("Main.md"),
-            "- TODO [#A] do the thing\n  SCHEDULED: <2026-07-10 Fri>\n\
+            "- TODO [#A] do the thing\n  SCHEDULED: <2026-07-10 Fri>\n  notes after the schedule\n\
              - DONE finished it\n\
              - a note\n  status:: open\n\
              - {{query (task TODO)}}\n\
@@ -2231,6 +2230,17 @@ mod tests {
             "priority badge"
         );
         assert!(main.contains("SCHEDULED:"), "scheduled line");
+        assert!(
+            main.contains("notes after the schedule"),
+            "body after schedule"
+        );
+        let scheduled_trailers = main.matches("class=\"planning scheduled\"").count();
+        assert!(scheduled_trailers > 0, "scheduled trailer rendered");
+        assert_eq!(
+            main.matches("2026-07-10 Fri").count(),
+            scheduled_trailers,
+            "each planning date renders only in trailer chrome, not again in the body"
+        );
         assert!(
             main.contains("class=\"task-checkbox checked\"") && main.contains("class=\"b done\""),
             "DONE checked + muted"

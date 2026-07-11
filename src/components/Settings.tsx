@@ -1674,16 +1674,23 @@ function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => 
   const [decisions, setDecisions] = createSignal<Record<string, MergeDecision>>({});
   const [preChoice, setPreChoice] = createSignal<"mine" | "theirs" | "union">("union");
   const [showUnchanged, setShowUnchanged] = createSignal(false);
-  const [baseRev, setBaseRev] = createSignal<string | undefined>(undefined);
   const [busy, setBusy] = createSignal(false);
   const [diff, { refetch }] = createResource<SyncConflictDiff | null>(() =>
     backend().syncConflictDiff(winner, props.conflict.path)
   );
-  // Fetch the winner's current rev for the base_rev guard (best-effort).
-  void backend()
-    .getPageByPath(winner)
-    .then((d) => setBaseRev(d?.rev ?? undefined))
-    .catch(() => {});
+  let diffVersion: string | undefined;
+  createEffect(() => {
+    const current = diff();
+    if (!current) return;
+    const nextVersion = `${current.base_rev}\0${current.conflict_rev}`;
+    if (diffVersion !== undefined && diffVersion !== nextVersion) {
+      // Choices are row-id decisions for one exact pair of files. A refetch can
+      // publish a different alignment, so never carry old choices into it.
+      setDecisions({});
+      setPreChoice("union");
+    }
+    diffVersion = nextVersion;
+  });
   const setDecision = (id: string, d: MergeDecision) => setDecisions((m) => ({ ...m, [id]: d }));
   const setAll = (d: MergeDecision) => {
     const rows = diff()?.rows ?? [];
@@ -1692,17 +1699,25 @@ function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => 
     setDecisions(next);
   };
   const merge = async () => {
+    const currentDiff = diff();
+    if (!currentDiff || diff.loading) return;
     setBusy(true);
     try {
-      await backend().resolveSyncConflict(winner, props.conflict.path, decisions(), baseRev(), preChoice());
+      await backend().resolveSyncConflict(
+        winner,
+        props.conflict.path,
+        decisions(),
+        currentDiff.base_rev,
+        currentDiff.conflict_rev,
+        preChoice()
+      );
       pushToast(`Merged into “${props.conflict.base_name}”`, "success");
       await refreshSyncConflicts();
       props.onClose();
     } catch (e) {
       if (String(e).includes("conflict")) {
         pushToast("The current page changed on disk — re-reading it, please redo your choices.", "error");
-        setBaseRev(undefined);
-        void backend().getPageByPath(winner).then((d) => setBaseRev(d?.rev ?? undefined)).catch(() => {});
+        setDecisions({});
         void refetch();
       } else {
         pushToast(`Merge failed: ${String(e)}`, "error");
@@ -1791,7 +1806,7 @@ function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => 
           <span class="settings-hint">The copy is moved to trash after a successful merge.</span>
           <span>
             <button class="settings-btn" onClick={props.onClose}>Cancel</button>
-            <button class="settings-btn settings-btn-primary" disabled={busy() || !diff()} onClick={() => void merge()}>
+            <button class="settings-btn settings-btn-primary" disabled={busy() || diff.loading || !diff()} onClick={() => void merge()}>
               {busy() ? "Merging…" : "Merge & trash copy"}
             </button>
           </span>
@@ -1934,8 +1949,7 @@ function MediaEditorsSection(): JSX.Element {
         creates a new editable <code>.drawio.svg</code>; hovering any matching image shows an
         “Edit in …” button. Leave a command blank to use the system default opener. A{" "}
         <code class="mono">{"{}"}</code> in the command is replaced by the file path (otherwise it’s
-        appended). Wrap a path with spaces in quotes, e.g.{" "}
-        <code class="mono">{'"C:\\Program Files\\draw.io\\draw.io.exe" {}'}</code>. Desktop only;
+        appended). Wrap a program or argument containing spaces in double quotes. Desktop only;
         device-local.
       </div>
       <For each={MEDIA_EDITORS}>
