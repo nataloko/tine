@@ -7,6 +7,7 @@ import {
   openPageInSidebar,
   isFavorite,
   toggleFavorite,
+  renamePageInNavigation,
   pushToast,
   graphMeta,
   setJournalTemplate,
@@ -785,6 +786,10 @@ function RenamePage(props: {
         return;
       }
       await backend().renamePage(from, next);
+      // Sidebar favorites/recents key on the page NAME, so remap old → new (the
+      // backend rename doesn't touch config.edn `:favorites`) — otherwise a starred
+      // or recent entry keeps the old name and becomes a dead link.
+      renamePageInNavigation(from, next, kind);
       // Backend rewrote refs across pages via the self-write guard (no watcher
       // reload) → in-memory pages are stale; reset + reload so a stale save can't
       // revert the rename.

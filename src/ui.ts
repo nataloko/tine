@@ -623,6 +623,57 @@ export function removeDeletedPageFromNavigation(name: string, kind: PageKind) {
     }
   }
 }
+/** Remap favorites + recents when a page is renamed `old` → `next`, so a starred
+ *  or recent entry keeps pointing at the live page instead of a dead old name
+ *  (config.edn `:favorites` stores names, and the backend rename doesn't touch it).
+ *  Matches the backend rename's set: the exact page PLUS any `old/…` namespace
+ *  descendant (which the rename also moves). Comparison is case-insensitive to
+ *  mirror the backend's normalized page-name matching. Persists the favorites
+ *  change to config.edn (the source of truth) and recents to localStorage. */
+export function renamePageInNavigation(old: string, next: string, kind: PageKind) {
+  const from = old.trim();
+  const to = next.trim();
+  if (!from || !to) return;
+  const fromKey = from.toLowerCase();
+  const prefix = `${fromKey}/`;
+  // Exact page → new name; namespace child `old/x` → `new/x` (prefix length is the
+  // same in either case, so slicing by `from.length` preserves the child's casing).
+  const remap = (name: string): string | null => {
+    const key = name.toLowerCase();
+    if (key === fromKey) return to;
+    if (key.startsWith(prefix)) return to + name.slice(from.length);
+    return null;
+  };
+
+  let favChanged = false;
+  const nextFavs = favorites().map((f) => {
+    const r = remap(f.name);
+    if (r === null) return f;
+    favChanged = true;
+    return { ...f, name: r };
+  });
+  if (favChanged) {
+    setFavorites(nextFavs);
+    persistFavorites(nextFavs);
+  }
+
+  let recChanged = false;
+  const nextRecents = recentPages().map((r) => {
+    const m = remap(r.name);
+    if (m === null) return r;
+    recChanged = true;
+    return { ...r, name: m };
+  });
+  if (recChanged) {
+    setRecentPages(nextRecents);
+    try {
+      if (nextRecents.length) localStorage.setItem(RECENT_KEY, JSON.stringify(nextRecents));
+      else localStorage.removeItem(RECENT_KEY);
+    } catch {
+      // ignore
+    }
+  }
+}
 /** Seed favorites from config.edn `:favorites` on graph open. config.edn is the
  *  source of truth, so this ALWAYS replaces the current set — including clearing
  *  it to empty when the newly-opened graph has no favorites — otherwise the

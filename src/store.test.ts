@@ -71,6 +71,7 @@ import {
   setFavorites,
   setRecentPages,
   seedFavorites,
+  renamePageInNavigation,
   dataRev,
 } from "./ui";
 import { journalTitle } from "./journal";
@@ -1194,6 +1195,33 @@ describe("save engine (persistence)", () => {
     expect(pageByName("Older")).toBeUndefined();
     expect(favorites()).toEqual([{ name: "Pinned", kind: "page" }]);
     expect(recentPages()).toEqual([{ name: "Pinned", kind: "page" }]);
+  });
+
+  it("renamePageInNavigation remaps favorites + recents (exact + namespace child, case-insensitive)", () => {
+    setFavorites([
+      { name: "Project", kind: "page" },
+      { name: "Project/Notes", kind: "page" },
+      { name: "Unrelated", kind: "page" },
+    ]);
+    setRecentPages([
+      { name: "Project", kind: "page" },
+      { name: "Kept", kind: "page" },
+    ]);
+
+    // Rename with different casing than the stored favorite — still matches.
+    renamePageInNavigation("project", "Roadmap", "page");
+
+    // Exact page → new name, its namespace child follows, unrelated untouched.
+    expect(favorites()).toEqual([
+      { name: "Roadmap", kind: "page" },
+      { name: "Roadmap/Notes", kind: "page" },
+      { name: "Unrelated", kind: "page" },
+    ]);
+    // Recents remapped too — no lingering broken old name.
+    expect(recentPages()).toEqual([
+      { name: "Roadmap", kind: "page" },
+      { name: "Kept", kind: "page" },
+    ]);
   });
 
   it("seedFavorites replaces (per-graph) on graph open, clearing to empty for a graph with none", () => {

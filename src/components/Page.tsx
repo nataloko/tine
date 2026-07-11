@@ -3,7 +3,7 @@ import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePage
 import { sameRoute, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
-  zoomedBlock, isFavorite, toggleFavorite,
+  zoomedBlock, isFavorite, toggleFavorite, renamePageInNavigation,
   graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, openPageProps, dataRev,
 } from "../ui";
@@ -358,6 +358,10 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         return;
       }
       await backend().renamePage(props.page.name, next);
+      // Sidebar favorites/recents key on the page NAME (config.edn `:favorites`
+      // stores names, and the backend rename doesn't touch it), so remap the old
+      // name → new so a starred/recent entry doesn't turn into a dead link.
+      renamePageInNavigation(props.page.name, next, props.page.kind);
       // The backend rewrote refs across many pages via the self-write guard (no
       // watcher reload), so every in-memory page is now potentially stale; reset
       // + reload so a stale copy can't be saved back and revert the rename.
