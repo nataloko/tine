@@ -26,6 +26,44 @@ function fenceTransition(
   return { opens: false, closes: false, next: fence };
 }
 
+/** OG treats a Markdown page's first bullet as page properties when every
+ * nonblank line is a property. Keep this predicate shared by display and edit
+ * paths so the block cannot be hidden in one place but edited as ordinary text
+ * in another. */
+export function isPropertiesOnly(raw: string): boolean {
+  let sawProperty = false;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    if (!PROP_LINE.test(line)) return false;
+    sawProperty = true;
+  }
+  return sawProperty;
+}
+
+/** Split a Markdown page preamble into real page-property lines and ordinary
+ * content. Property-looking text inside a fenced code block stays content. */
+export function splitPagePreamble(raw: string | null | undefined): {
+  properties: string | null;
+  content: string | null;
+} {
+  if (!raw) return { properties: null, content: null };
+  const properties: string[] = [];
+  const content: string[] = [];
+  let fence: FenceState | null = null;
+  for (const line of raw.split("\n")) {
+    const transition = transitionFence(fence, line);
+    if (fence === null && !transition.opens && PROP_LINE.test(line)) properties.push(line);
+    else content.push(line);
+    fence = transition.next;
+  }
+  const trimBlankEdges = (lines: string[]) => {
+    while (lines.length && !lines[0].trim()) lines.shift();
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    return lines.length ? lines.join("\n") : null;
+  };
+  return { properties: trimBlankEdges(properties), content: trimBlankEdges(content) };
+}
+
 // Built-in properties hidden from the editor by default (like OG): `id::`,
 // `collapsed::`, and `logseq.order-list-type::` (the numbered-list marker) are
 // kept in the file for persistence but never shown in the edit textarea.
@@ -45,17 +83,9 @@ function propLineKey(line: string): string | null {
   return m ? m[1].toLowerCase() : null;
 }
 
-/** For a multi-line block that keeps Enter INSIDE it — a calc block or a fenced
- *  code block — decide whether an Enter at `caret` should EXIT the block (make a
- *  new sibling) rather than insert another newline. The rule is the common
- *  "double-Enter to exit" idiom: exit only when the caret sits on a *trailing
- *  blank line*. Returns the block text with that blank line removed if it should
- *  exit, or `null` to keep editing (insert a newline).
- *
- *  `kind`:
- *   - "calc"  — no closing fence; exit when the blank line is the last line.
- *   - "fence" — exit only when the blank line is the last content line, i.e. the
- *               next line is the closing ``` / ~~~ (so blank lines mid-code stay). */
+/** For a multi-line editor that normally keeps Enter inside it, return the text
+ * with its trailing sentinel blank line removed when the caret is on the
+ * double-Enter exit line. Blank lines in the middle remain ordinary content. */
 export function multilineExitTrim(
   text: string,
   caret: number,
@@ -65,20 +95,23 @@ export function multilineExitTrim(
   const lineStart = text.lastIndexOf("\n", c - 1) + 1;
   let lineEnd = text.indexOf("\n", c);
   if (lineEnd === -1) lineEnd = text.length;
-  // Only exit from a blank line that has a line above it to attach after.
-  if (text.slice(lineStart, lineEnd).trim() !== "") return null;
-  if (lineStart === 0) return null;
+  if (text.slice(lineStart, lineEnd).trim() !== "" || lineStart === 0) return null;
+
   if (kind === "calc") {
-    // Nothing non-blank may follow — the blank line must be the last line.
     if (text.slice(lineEnd).trim() !== "") return null;
-    return text.slice(0, lineStart - 1); // drop the trailing "\n<blank>"
+    return text.slice(0, lineStart - 1);
   }
-  // Fenced: the next line must be the closing fence.
+
   const after = text.slice(lineEnd + 1);
-  const nl = after.indexOf("\n");
-  const nextLine = nl === -1 ? after : after.slice(0, nl);
-  if (!FENCE_RE.test(nextLine)) return null;
-  // Drop the blank line, keep the closing fence (and anything after it).
+  const nextNewline = after.indexOf("\n");
+  const nextLine = nextNewline === -1 ? after : after.slice(0, nextNewline);
+  let fence: FenceState | null = null;
+  for (const line of text.slice(0, lineStart).split("\n")) {
+    fence = transitionFence(fence, line).next;
+  }
+  if (!fence || !transitionFence(fence, nextLine).closes) return null;
+  const afterClosing = nextNewline === -1 ? "" : after.slice(nextNewline + 1);
+  if (afterClosing.trim() !== "") return null;
   return text.slice(0, lineStart - 1) + text.slice(lineEnd);
 }
 
@@ -144,7 +177,6 @@ export function fencedCodeBlock(text: string): CodeFence | null {
   const bodyEnd = closeLine === null ? lines.length : closeLine;
   return { lang, codeText: lines.slice(openLine + 1, bodyEnd).join("\n"), openLine, closeLine };
 }
-
 /** Whether a textarea caret offset is inside a fenced code region. The fence
  *  delimiter lines themselves are outside; the content lines between them are
  *  inside, including an unterminated fence while the user is editing. */

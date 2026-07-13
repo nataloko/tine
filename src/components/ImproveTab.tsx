@@ -42,7 +42,8 @@ export function ImproveTab(): JSX.Element {
   };
 
   const divergences = () => (report()?.findings ?? []).filter((f): f is Extract<Finding, { type: "divergence" }> => f.type === "divergence");
-  const otherFindings = () => (report()?.findings ?? []).filter((f) => f.type !== "divergence");
+  const oracleArtifacts = () => (report()?.findings ?? []).filter((f): f is Extract<Finding, { type: "mldoc-oracle-artifact" }> => f.type === "mldoc-oracle-artifact");
+  const otherFindings = () => (report()?.findings ?? []).filter((f) => f.type !== "divergence" && f.type !== "mldoc-oracle-artifact");
 
   const flash = async (text: string, key: string) => {
     try {
@@ -74,6 +75,9 @@ export function ImproveTab(): JSX.Element {
     return [
       "## lsdoc divergences from my Tine graph",
       "",
+      `Tine version: ${report()?.tineVersion ?? "unknown"}`,
+      `lsdoc version: ${report()?.lsdocVersion ?? "unknown"}`,
+      "",
       "These snippets are anonymized (page content scrubbed) and each still reproduces the divergence between lsdoc and Logseq's mldoc.",
       "",
       ...ds.map(findingMarkdown),
@@ -89,9 +93,9 @@ export function ImproveTab(): JSX.Element {
         disagree — which is how you can help make Tine render your notes exactly like Logseq.
       </p>
       <p class="settings-hint">
-        <b>Privacy:</b> nothing is uploaded. Every divergence snippet shown below is <b>anonymized</b> (your words
-        replaced, structure kept) and <b>re-checked</b> to confirm it still reproduces the bug — so it's safe to
-        share. Read it before you post anything.
+        <b>Privacy:</b> nothing is uploaded. Every divergence snippet shown below is <b>anonymized</b> (page names
+        and words replaced; URL schemes kept but hosts and paths scrubbed) and <b>re-checked</b> to confirm it still
+        reproduces the bug — so it's safe to share. Read it before you post anything.
       </p>
 
       <div class="settings-field">
@@ -155,7 +159,7 @@ export function ImproveTab(): JSX.Element {
         {(r) => (
           <div class="improve-report">
             <div class="settings-hint">
-              Scanned {r().stats.files} file(s), {fmtBytes(r().stats.totalBytes)}.
+              Tine {r().tineVersion} · lsdoc {r().lsdocVersion} · Scanned {r().stats.files} file(s), {fmtBytes(r().stats.totalBytes)}.
             </div>
 
             <Show when={!r().lsdocAvailable}>
@@ -194,7 +198,9 @@ export function ImproveTab(): JSX.Element {
                   </Show>
                 </div>
                 <Show when={divergences().length === 0}>
-                  <div class="improve-clean">No divergences — lsdoc matched Logseq's parser on every file.</div>
+                  <div class="improve-clean">
+                    No actionable divergences — lsdoc matched Logseq's parser on every file after verified mldoc oracle artifacts were quarantined.
+                  </div>
                 </Show>
                 <For each={divergences()}>
                   {(f) => (
@@ -217,6 +223,18 @@ export function ImproveTab(): JSX.Element {
                     </div>
                   )}
                 </For>
+                <Show when={oracleArtifacts().length > 0}>
+                  <details class="improve-other">
+                    <summary>{oracleArtifacts().length} suppressed mldoc oracle artifact(s)</summary>
+                    <For each={oracleArtifacts()}>
+                      {(f) => (
+                        <div class="settings-hint">
+                          <code>{f.rel}</code> · lines {f.lineStart}-{f.lineEnd} — {f.detail}
+                        </div>
+                      )}
+                    </For>
+                  </details>
+                </Show>
                 <Show when={otherFindings().length > 0}>
                   <details class="improve-other">
                     <summary>{otherFindings().length} non-divergence issue(s)</summary>

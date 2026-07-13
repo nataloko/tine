@@ -1,7 +1,7 @@
 #[cfg(desktop)]
 use crate::debug::diag;
 #[cfg(desktop)]
-use crate::platform::opener_command;
+use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{refresh_graph, slot_for_context, with_graph, GraphContext};
 use std::sync::Arc;
 use tine_core::model::{PageDto, PageEntry, PageKind, RefGroup};
@@ -652,6 +652,37 @@ pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), St
     }
 }
 
+/// Open or reveal the exact source file recorded on a loaded page. Rust resolves
+/// and canonicalizes the graph-relative identity; the WebView never supplies an
+/// arbitrary absolute path.
+#[tauri::command]
+pub(crate) fn open_page_file(
+    name: String,
+    kind: PageKind,
+    path: Option<String>,
+    reveal: bool,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let target = with_graph(&state, |graph| {
+        graph
+            .page_source_file(&name, kind, path.as_deref())
+            .map_err(|error| error.to_string())
+    })?;
+    #[cfg(desktop)]
+    {
+        if reveal {
+            reveal_page_source(&target)
+        } else {
+            open_page_source(&target)
+        }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (target, reveal);
+        Err("page file actions are available on desktop only".into())
+    }
+}
+
 /// Open a graph asset in a SPECIFIC external editor (drawio/Excalidraw/…) so a
 /// diagram can be edited in place. `command` is the user-configured command
 /// template for that editor (from Settings → Files); empty falls back to the OS
@@ -746,7 +777,6 @@ pub(crate) fn detect_media_editor(id: String) -> Result<String, String> {
 /// platform app bundle. Returns a command template or "".
 #[cfg(desktop)]
 fn detect_drawio() -> String {
-    use std::path::Path;
     #[cfg(target_os = "linux")]
     {
         // Flatpak: the exported bin is a plain wrapper file we can stat.
@@ -763,7 +793,7 @@ fn detect_drawio() -> String {
                 return "flatpak run com.jgraph.drawio.desktop {}".to_string();
             }
         }
-        if Path::new("/snap/bin/drawio").exists() {
+        if std::path::Path::new("/snap/bin/drawio").exists() {
             return "/snap/bin/drawio {}".to_string();
         }
         if let Some(p) = which_on_path("drawio") {
@@ -773,19 +803,23 @@ fn detect_drawio() -> String {
     }
     #[cfg(target_os = "macos")]
     {
-        if Path::new("/Applications/draw.io.app").exists() {
+        if std::path::Path::new("/Applications/draw.io.app").exists() {
             return "open -a draw.io {}".to_string();
         }
         String::new()
     }
     #[cfg(target_os = "windows")]
     {
-        // Wrap `var_os` in a closure so it satisfies the higher-ranked `for<'a>
-        // FnMut(&'a str)` bound — passing the generic fn item directly infers a
-        // single fixed lifetime and fails ("FnMut is not general enough") on
-        // current stable rustc (only compiled on Windows, so CI catches it).
-        detect_drawio_windows_with(|k: &str| std::env::var_os(k), |path| path.is_file())
+        detect_drawio_windows()
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn detect_drawio_windows() -> String {
+    detect_drawio_windows_with(
+        |name: &'static str| std::env::var_os(name),
+        |path| path.is_file(),
+    )
 }
 
 /// Windows installers can be per-user (`LOCALAPPDATA`) or per-machine
@@ -795,7 +829,11 @@ fn detect_drawio() -> String {
 #[cfg(any(target_os = "windows", test))]
 fn detect_drawio_windows_with<V, F>(mut var: V, mut is_file: F) -> String
 where
-    V: FnMut(&str) -> Option<std::ffi::OsString>,
+    // Every probed environment name below is a string literal. Expressing that
+    // lifetime avoids passing the generic `std::env::var_os` function item
+    // through a higher-ranked `FnMut(&str)` bound, which MSVC rejects as "not
+    // general enough" even though host builds accept it.
+    V: FnMut(&'static str) -> Option<std::ffi::OsString>,
     F: FnMut(&std::path::Path) -> bool,
 {
     let locations = [
@@ -893,7 +931,7 @@ fn build_editor_argv(command: &str, target: &str) -> Result<(String, Vec<String>
 
 #[cfg(test)]
 mod editor_argv_tests {
-    use super::{build_editor_argv, detect_drawio_windows_with};
+    use super::{build_editor_argv, detect_drawio_windows, detect_drawio_windows_with};
     use std::{ffi::OsString, path::PathBuf};
 
     #[test]
@@ -997,6 +1035,14 @@ mod editor_argv_tests {
     fn windows_autodetect_returns_empty_when_no_candidate_is_a_file() {
         let command = detect_drawio_windows_with(|_| Some(OsString::from("/missing")), |_| false);
         assert!(command.is_empty());
+    }
+
+    #[test]
+    fn windows_autodetect_real_callbacks_compile_and_run() {
+        // This wrapper is the exact Windows call site. Keeping it compiled in
+        // host tests catches callback lifetime regressions even before the
+        // Windows CI runner builds the cfg(target_os = "windows") branch.
+        let _ = detect_drawio_windows();
     }
 }
 

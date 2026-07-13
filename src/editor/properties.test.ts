@@ -12,6 +12,24 @@ import {
   rawOffsetToVisibleOffset,
 } from "./properties";
 
+describe("multilineExitTrim — Enter on a trailing blank line exits a code/calc block", () => {
+  it("fenced: exits only on the blank last content line and keeps the closing fence", () => {
+    expect(multilineExitTrim("```js\ncode\n\n```", 11, "fence")).toBe("```js\ncode\n```");
+    expect(multilineExitTrim("```js\na\n\nb\n```", 8, "fence")).toBeNull();
+    expect(multilineExitTrim("```js\ncode\n```", 8, "fence")).toBeNull();
+  });
+
+  it("calc: exits only on a trailing blank line", () => {
+    expect(multilineExitTrim("1+1\n2+2\n", 8, "calc")).toBe("1+1\n2+2");
+    expect(multilineExitTrim("1+1\n\n2+2", 4, "calc")).toBeNull();
+  });
+
+  it("never exits from the first blank line", () => {
+    expect(multilineExitTrim("\ncode", 0, "calc")).toBeNull();
+    expect(multilineExitTrim("\n```", 0, "fence")).toBeNull();
+  });
+});
+
 describe("sheet-cell property splitting", () => {
   it("hides built-in and tine properties while preserving them byte-exactly on join", () => {
     const raw = "Body line\ntine.view:: grid\nid:: abc-123";
@@ -175,39 +193,6 @@ describe("org caret mapping across a hidden drawer", () => {
     const insideDrawer = raw.indexOf(":id:") + 2;
     const visOff = rawOffsetToVisibleOffset(raw, insideDrawer, isBuiltinHidden, "org");
     expect(visOff).toBe("Title".length);
-  });
-});
-
-describe("multilineExitTrim — Enter on a trailing blank line exits a code/calc block", () => {
-  it("fenced: exits on the blank last content line, dropping it and keeping the fence", () => {
-    // "```js\ncode\n\n```" — caret on the empty line (offset 11) before the closing ```
-    const text = "```js\ncode\n\n```";
-    expect(multilineExitTrim(text, 11, "fence")).toBe("```js\ncode\n```");
-  });
-
-  it("fenced: a blank line MID-code keeps editing (returns null → newline)", () => {
-    const text = "```js\na\n\nb\n```"; // blank between a and b (offset 8)
-    expect(multilineExitTrim(text, 8, "fence")).toBeNull();
-  });
-
-  it("fenced: a non-blank code line keeps editing", () => {
-    const text = "```js\ncode\n```";
-    expect(multilineExitTrim(text, 8, "fence")).toBeNull(); // caret inside "code"
-  });
-
-  it("calc: exits on the trailing blank line, dropping it", () => {
-    const text = "1+1\n2+2\n"; // caret on the empty last line (offset 8)
-    expect(multilineExitTrim(text, 8, "calc")).toBe("1+1\n2+2");
-  });
-
-  it("calc: a blank line that isn't last keeps editing", () => {
-    const text = "1+1\n\n2+2"; // blank at offset 4, more after
-    expect(multilineExitTrim(text, 4, "calc")).toBeNull();
-  });
-
-  it("never exits from a blank FIRST line (nothing above to attach after)", () => {
-    expect(multilineExitTrim("\ncode", 0, "calc")).toBeNull();
-    expect(multilineExitTrim("\ncode", 0, "fence")).toBeNull();
   });
 });
 
