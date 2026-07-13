@@ -16,6 +16,27 @@ export CARGO_HOME="$TINE_TOOLCHAIN/cargo"
 export RUSTUP_HOME="$TINE_TOOLCHAIN/rustup"
 export PATH="$CARGO_HOME/bin:$PATH"
 
+# Keep Cargo's build cache on the persistent toolchain mount, not in the repo, so
+# `git clean` and container rebuilds don't force a cold recompile (a full cold
+# build is ~9 min on this host; a warm incremental one is seconds). ./target is a
+# symlink into $TINE_TOOLCHAIN/target, so the scripts that read ./target/release/…
+# keep working unchanged.
+export CARGO_TARGET_DIR="$TINE_TOOLCHAIN/target"
+# Migrate a real in-repo target/ onto the persistent mount once (a fresh checkout,
+# or cargo ran before this was sourced): rename when the cache doesn't exist yet
+# (instant on the same fs), else merge without clobbering. Then keep ./target as a
+# symlink so scripts that read target/release/… work unchanged.
+if [ -e "$_repo_root/target" ] && [ ! -L "$_repo_root/target" ]; then
+  if [ ! -e "$CARGO_TARGET_DIR" ]; then
+    mkdir -p "$(dirname "$CARGO_TARGET_DIR")" && mv "$_repo_root/target" "$CARGO_TARGET_DIR"
+  else
+    cp -an "$_repo_root/target/." "$CARGO_TARGET_DIR/" 2>/dev/null || true
+    rm -rf "$_repo_root/target"
+  fi
+fi
+mkdir -p "$CARGO_TARGET_DIR"
+[ -L "$_repo_root/target" ] || ln -s "$CARGO_TARGET_DIR" "$_repo_root/target"
+
 # Playwright browser + the few shared libs we extracted locally (no root), so
 # headless Chromium screenshots work in this sandbox.
 export PLAYWRIGHT_BROWSERS_PATH="$TINE_TOOLCHAIN/ms-playwright"
