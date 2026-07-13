@@ -181,7 +181,7 @@ samples/             Demo graph used by tests/screenshots
 ## Build & run
 
 ```bash
-source scripts/env.sh        # toolchain env (CARGO_HOME/RUSTUP_HOME, lib paths)
+source scripts/env.sh        # toolchain env (CARGO_HOME/RUSTUP_HOME, CARGO_TARGET_DIR, lib paths)
 npm install                  # first time
 
 # Build the release binary (NOT plain `cargo build` — that produces a dev-mode
@@ -191,6 +191,10 @@ npx tauri build --no-bundle
 # Run it against your graph:
 TINE_GRAPH=/path/to/your/graph ./target/release/tine
 ```
+
+> `env.sh` points `CARGO_TARGET_DIR` at the persistent `.toolchain/` mount and symlinks `./target`
+> to it, so a `git clean` or a fresh session reuses the warm build cache instead of recompiling from
+> scratch (`./target/release/…` still resolves through the symlink).
 
 ### Release checklist
 
