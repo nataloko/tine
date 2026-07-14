@@ -1,11 +1,12 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { openPage, openPageInNewTab } from "../router";
+import { openPage, openPageAtBlock, openPageInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
+import { SearchResultRow } from "./SearchResultRow";
 import {
   advancedToClause,
   clearSimpleForm,
@@ -28,11 +29,14 @@ import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
 import type { PageKind, RefGroup } from "../types";
 import { sharedQueryResult } from "../queryResultCache";
+import { savedDslToFriendlySearch } from "../editor/searchQuery";
+import type { QueryExecution, QueryHit } from "../types";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
-type QueryView = "list" | "table" | "board";
-const QUERY_VIEWS: QueryView[] = ["list", "table", "board"];
+type QueryView = "search" | "list" | "table" | "board";
+const QUERY_VIEWS: QueryView[] = ["search", "list", "table", "board"];
 const QUERY_VIEW_LABEL: Record<QueryView, string> = {
+  search: "Search",
   list: "List",
   table: "Table",
   board: "Board",
@@ -109,6 +113,7 @@ export function QueryMacro(props: {
   // display defaults.
   const parsed = createMemo(() => splitQuery(arg()));
   const form = () => parsed().form;
+  const friendlySearch = createMemo(() => savedDslToFriendlySearch(form()));
   const sheet = createMemo(() => {
     if (!props.blockId || !doc.byId[props.blockId]) return null;
     return sheetConfig(facetsOf(doc.byId[props.blockId].raw, formatForBlock(props.blockId)).properties);
@@ -116,7 +121,7 @@ export function QueryMacro(props: {
   const currentView = (): QueryView => {
     if (!props.blockId) return "list";
     const view = blockProperty(props.blockId, "tine.view");
-    return view === "table" || view === "board" ? view : "list";
+    return view === "search" || view === "table" || view === "board" ? view : "list";
   };
   const sheetFace = () => currentView() === "table" || currentView() === "board";
   const legacyTable = () => currentView() === "list" && parsed().tableView === true;
@@ -224,6 +229,7 @@ export function QueryMacro(props: {
   const [advInfo, setAdvInfo] = createSignal<{ ran: string[]; ignored: string[]; supported: boolean } | null>(
     null
   );
+  const [searchExecution, setSearchExecution] = createSignal<QueryExecution | null>(null);
   const collapseKey = () => JSON.stringify([
     graphMeta()?.root ?? "",
     props.blockId ?? currentPage() ?? "global",
@@ -246,6 +252,32 @@ export function QueryMacro(props: {
     () => `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}`,
     async (requestKey) => {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+      const searchSource = friendlySearch();
+      if (searchSource !== null) {
+        setAdvInfo(null);
+        const execution = await sharedQueryResult(
+          scope,
+          `friendly-search\0${requestKey}`,
+          () => backend().runGraphSearch(
+            searchSource,
+            500,
+            5_000,
+            `inline-query:${props.blockId ?? currentPage() ?? "global"}`,
+            false
+          ),
+        );
+        setSearchExecution(execution);
+        const grouped = new Map<string, RefGroup>();
+        for (const hit of execution.hits) {
+          if (hit.entity !== "block") continue;
+          const key = `${hit.kind}\0${hit.page}`;
+          const group = grouped.get(key) ?? { page: hit.page, kind: hit.kind, blocks: [] };
+          group.blocks.push(hit.block);
+          grouped.set(key, group);
+        }
+        return [...grouped.values()];
+      }
+      setSearchExecution(null);
       // Advanced (datalog) queries take a separate path that maps the supported
       // clause subset onto the engine and reports what ran vs was ignored.
       if (isAdvanced()) {
@@ -297,7 +329,25 @@ export function QueryMacro(props: {
     if (state.error) return gs;
     return regroupSurvivors(gs, new Set(state.rows.map((r) => r.id)));
   });
-  const total = () => filteredGroups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
+  // Presentation never changes membership. Canonical `(search "…")` queries
+  // already carry page/block hits and match evidence from QueryPlan. Ordinary
+  // DSL queries return RefGroups, so adapt those same blocks into evidence-free
+  // search rows instead of making the Search presentation appear empty. Draws from
+  // the query-filter-refined groups so `tine.query-filter::` stays honored in Search view.
+  const searchPresentationHits = createMemo<QueryHit[]>(() => {
+    if (friendlySearch() !== null) return searchExecution()?.hits ?? [];
+    return (filteredGroups() ?? []).flatMap((group) => group.blocks.map((block) => ({
+      entity: "block" as const,
+      page: group.page,
+      kind: group.kind,
+      block,
+      display_text: visibleBody(block.raw).join(" "),
+      evidence: [],
+    })));
+  });
+  const total = () => currentView() === "search"
+    ? searchPresentationHits().length
+    : filteredGroups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
   // A `(sort-by …)` query is sorted GLOBALLY by the engine and returned as one
   // block per group in that order — so the list view must render flat (a single
   // ordered sequence with a per-row page breadcrumb), not grouped by page, or the
@@ -510,6 +560,48 @@ export function QueryMacro(props: {
                 when={sheetFace()}
                 fallback={
                   <>
+                    <Show when={currentView() === "search"}>
+                      <div class="query-search-results" role="list" aria-label="Search results" onClick={stop}>
+                        <Show
+                          when={searchPresentationHits().length > 0}
+                          fallback={<div class="query-empty">No results</div>}
+                        >
+                          <For each={searchPresentationHits()}>
+                            {(hit) => (
+                              <Show
+                                when={hit.entity === "block" ? hit : null}
+                                fallback={hit.entity === "page" ? (
+                                  <button
+                                    type="button"
+                                    class="query-search-page"
+                                    onClick={() => openPage(hit.page.name, hit.page.kind)}
+                                  >
+                                    <span class="switcher-kind">{hit.page.kind}</span>
+                                    <span>{hit.display_text}</span>
+                                  </button>
+                                ) : null}
+                              >
+                                {(blockHit) => (
+                                  <button
+                                    type="button"
+                                    class="query-search-hit switcher-row block-result"
+                                    onClick={() => openPageAtBlock(blockHit().page, blockHit().kind, blockHit().block.id)}
+                                  >
+                                    <SearchResultRow
+                                      page={blockHit().page}
+                                      breadcrumb={blockHit().block.breadcrumb ?? []}
+                                      text={blockHit().display_text}
+                                      spans={blockHit().evidence.flatMap((evidence) => evidence.spans)}
+                                    />
+                                  </button>
+                                )}
+                              </Show>
+                            )}
+                          </For>
+                        </Show>
+                      </div>
+                    </Show>
+                    <Show when={currentView() !== "search"}>
                     {/* Summary panel (1a): count/sum/avg overall, or a per-group breakdown.
                         Rendered above the full result list, which stays grouped by page. */}
                     <Show when={summarySingle()}>
@@ -620,6 +712,7 @@ export function QueryMacro(props: {
                           </tbody>
                         </table>
                       </Show>
+                    </Show>
                     </Show>
                   </>
                 }
@@ -836,7 +929,7 @@ export function EmbedMacro(props: { body: string }): JSX.Element {
   return (
     <div class="embed-block">
       <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
-        <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} />
+        <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
       </Show>
     </div>
   );

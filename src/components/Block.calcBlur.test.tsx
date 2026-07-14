@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { For, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { initParser } from "../render/parse";
@@ -94,6 +94,44 @@ describe("calc block persistence on blur", () => {
       expect(outs).toContain("2");
       // The textarea flipped to the fence-stripped expression buffer.
       expect((root.querySelector("textarea") as HTMLTextAreaElement).value).toBe("1 + 1");
+    } finally {
+      dispose();
+    }
+  });
+});
+
+describe("calculator slash-command activation", () => {
+  it("enters live calculator mode immediately without a blur and refocus", async () => {
+    loadSingle(page("Calc slash", [blk("calc-slash", "/Calculator")]));
+    const id = pageByName("Calc slash")!.roots[0];
+
+    startEditing(id, "/Calculator".length);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Calc slash")?.roots ?? []}>{(bid) => <Block id={bid} />}</For>
+    ));
+
+    try {
+      const ta = root.querySelector("textarea") as HTMLTextAreaElement | null;
+      expect(ta).not.toBeNull();
+      ta!.setSelectionRange(ta!.value.length, ta!.value.length);
+      ta!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: "r",
+      }));
+
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete")).not.toBeNull());
+      ta!.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+      }));
+
+      await vi.waitFor(() => expect(root.querySelector(".editor-wrap")?.classList.contains("calc-wrap")).toBe(true));
+      expect(root.querySelector(".calc-gutter")).not.toBeNull();
+      expect(root.querySelector(".calc-results")).not.toBeNull();
+      expect(ta!.value).toBe("");
+      expect(doc.byId[id].raw).toBe("```calc\n\n```");
     } finally {
       dispose();
     }

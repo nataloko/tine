@@ -16,6 +16,21 @@ const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root
 const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || 180_000);
 const suiteStartedAt = new Date().toISOString();
 
+// Rootless/container fallback for native focus tests. CI images normally
+// install openbox + xdotool system-wide; a developer sandbox may instead keep
+// their extracted Debian packages outside the repository. Discover that
+// workspace-local bundle automatically so the documented npm command remains
+// the complete gate rather than requiring a remembered shell incantation.
+const portableDeps = path.resolve(process.env.TINE_E2E_DEPS_ROOT || path.join(root, "../.codex-deps/openbox/root"));
+const baseProcessEnv = { ...process.env };
+if (fs.existsSync(path.join(portableDeps, "usr/bin/openbox")) && fs.existsSync(path.join(portableDeps, "usr/bin/xdotool"))) {
+  const lib = path.join(portableDeps, "usr/lib/x86_64-linux-gnu");
+  baseProcessEnv.PATH = `${path.join(portableDeps, "usr/bin")}${path.delimiter}${baseProcessEnv.PATH || ""}`;
+  baseProcessEnv.LD_LIBRARY_PATH = [lib, baseProcessEnv.LD_LIBRARY_PATH].filter(Boolean).join(path.delimiter);
+  baseProcessEnv.XDG_CONFIG_DIRS = [path.join(portableDeps, "etc/xdg"), baseProcessEnv.XDG_CONFIG_DIRS || "/etc/xdg"].join(path.delimiter);
+  baseProcessEnv.XDG_DATA_DIRS = [path.join(portableDeps, "usr/share"), baseProcessEnv.XDG_DATA_DIRS || "/usr/local/share:/usr/share"].join(path.delimiter);
+}
+
 const suites = {
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
@@ -28,14 +43,23 @@ const suites = {
     ["click-caret", "scripts/e2e-clickcaret-repro.mjs", {}],
     ["block-select", "scripts/e2e-blockselect.mjs", {}],
     ["rename", "scripts/e2e-rename.mjs", {}],
+    ["alias", "scripts/e2e-alias.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["selection-wrap", "scripts/e2e-selectwrap.mjs", {}],
     ["structured-paste", "scripts/e2e-structured-paste.mjs", {}],
     ["media", "scripts/e2e-media.mjs", {}],
+    ["external-assets", "scripts/e2e-external-assets.mjs", {}],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
+    ["block-embed", "scripts/e2e-block-embed.mjs", {}],
+    ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
+    ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
+    ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
+    ["outline-guide", "scripts/e2e-outline-guide.mjs", {}],
+    ["query-workspace", "scripts/e2e-query-workspace.mjs", {}],
+    ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
   ],
   "windows-smoke": [
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
@@ -87,7 +111,7 @@ async function runScenario([id, script, extraEnv]) {
   const nativePort = await freePort();
   const previewPort = await freePort();
   const env = {
-    ...process.env,
+    ...baseProcessEnv,
     ...extraEnv,
     TINE_APP: app,
     E2E_ARTIFACT_DIR: dir,
