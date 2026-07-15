@@ -26,7 +26,7 @@ import { installKeybindings, eventToBindingString } from "./keybindings";
 import { backend } from "./backend";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
-import { resettleIfVisible } from "./captureVisibility";
+import { createCaptureBlurGate, resettleIfVisible } from "./captureVisibility";
 import {
   QUICK_CAPTURE_ACK_TIMEOUT_MS,
   createQuickCaptureRequestId,
@@ -35,6 +35,7 @@ import {
   type QuickCaptureAck,
   type QuickCaptureRequest,
 } from "./quickCaptureAck";
+import { CAPTURE_SCRATCH_NAME, createCaptureScratchPage } from "./captureSeed";
 // theme.css MUST come first: it defines every CSS variable (--bg-primary,
 // --bullet-color, --ls-block-bullet-size, --selection-bg) AND the
 // html[data-theme="dark"] overrides. Without it the capture webview had no
@@ -45,7 +46,7 @@ import "./lsShimInstall";
 import "./styles/app.css";
 import "./styles/capture.css";
 
-const SCRATCH = "·capture·";
+const SCRATCH = CAPTURE_SCRATCH_NAME;
 
 // Pretty-print a binding string ("mod+shift+enter") for a hint ("Ctrl-Shift-Enter").
 // "mod" is Ctrl on Linux/Windows (Cmd on macOS — but this app targets Linux).
@@ -79,14 +80,7 @@ function Capture() {
   const roots = () => pageByName(SCRATCH)?.roots ?? [];
 
   const seed = () => {
-    ensurePageLoaded({
-      name: SCRATCH,
-      kind: "page",
-      title: SCRATCH,
-      pre_block: null,
-      blocks: [{ id: "", raw: "", collapsed: false, children: [] }],
-      rev: null,
-    });
+    ensurePageLoaded(createCaptureScratchPage());
     const root = pageByName(SCRATCH)?.roots[0];
     if (root) startEditing(root, 0, null);
     setReady(true);
@@ -218,6 +212,7 @@ function Capture() {
     resettle();
     activateWhenEditorReady();
   };
+  const blurGate = createCaptureBlurGate();
   let fitRaf: number | undefined;
   const scheduleFit = () => {
     if (fitRaf !== undefined) return;
@@ -228,6 +223,7 @@ function Capture() {
   };
 
   const hideWindow = async () => {
+    blurGate.disarm();
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().hide();
@@ -488,14 +484,17 @@ function Capture() {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
           if (focused) {
+            blurGate.focusChanged(true);
             loadPref(); // pick up a Settings change made while we were hidden
             void requestTheme(); // and a theme change
             void requestShortcuts(); // and a shortcut remap
             resettle();
           } else {
             // Dismiss on blur. The draft is preserved (only Esc/submit clear it)
-            // so an accidental focus loss can't lose text.
-            void hideWindow();
+            // so an accidental focus loss can't lose text. A newly mapped
+            // window may emit an initial false transition before the WM honors
+            // activation; wait until this show has actually held focus.
+            if (blurGate.focusChanged(false)) void hideWindow();
           }
         });
       } catch {

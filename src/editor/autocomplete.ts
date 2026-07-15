@@ -3,9 +3,57 @@
 
 import { TEMPLATE_VARS } from "./templateVars";
 import { tagRef } from "../tags";
-import { isOpeningFenceLine } from "./properties";
 
-export type TriggerKind = "page" | "tag" | "command" | "block" | "lang";
+export type TriggerKind = "page" | "tag" | "command" | "block" | "code-language";
+
+export interface CodeLanguageItem {
+  /** Canonical highlight.js/common identifier written to the fence. */
+  id: string;
+  label: string;
+  aliases: readonly string[];
+}
+
+// Runtime rendering lazy-loads highlight.js/lib/common. Keep this small static
+// mirror so opening the editor does not eagerly pull the highlighter into the
+// main bundle; a drift test compares it with the pinned dependency's registry.
+export const COMMON_CODE_LANGUAGES: readonly CodeLanguageItem[] = [
+  { id: "javascript", label: "JavaScript", aliases: ["js", "jsx", "mjs", "cjs"] },
+  { id: "typescript", label: "TypeScript", aliases: ["ts", "tsx", "mts", "cts"] },
+  { id: "python", label: "Python", aliases: ["py", "gyp", "ipython"] },
+  { id: "bash", label: "Bash", aliases: ["sh", "zsh"] },
+  { id: "json", label: "JSON", aliases: ["jsonc"] },
+  { id: "markdown", label: "Markdown", aliases: ["md", "mkdown", "mkd"] },
+  { id: "xml", label: "HTML, XML", aliases: ["html", "xhtml", "rss", "atom", "xjb", "xsd", "xsl", "plist", "wsf", "svg"] },
+  { id: "css", label: "CSS", aliases: [] },
+  { id: "sql", label: "SQL", aliases: [] },
+  { id: "java", label: "Java", aliases: ["jsp"] },
+  { id: "c", label: "C", aliases: ["h"] },
+  { id: "cpp", label: "C++", aliases: ["cc", "c++", "h++", "hpp", "hh", "hxx", "cxx"] },
+  { id: "csharp", label: "C#", aliases: ["cs", "c#"] },
+  { id: "go", label: "Go", aliases: ["golang"] },
+  { id: "rust", label: "Rust", aliases: ["rs"] },
+  { id: "kotlin", label: "Kotlin", aliases: ["kt", "kts"] },
+  { id: "swift", label: "Swift", aliases: [] },
+  { id: "php", label: "php", aliases: [] },
+  { id: "ruby", label: "Ruby", aliases: ["rb", "gemspec", "podspec", "thor", "irb"] },
+  { id: "yaml", label: "YAML", aliases: ["yml"] },
+  { id: "plaintext", label: "Plain text", aliases: ["text", "txt"] },
+  { id: "diff", label: "Diff", aliases: ["patch"] },
+  { id: "graphql", label: "GraphQL", aliases: ["gql"] },
+  { id: "ini", label: "TOML, also INI", aliases: ["toml"] },
+  { id: "less", label: "Less", aliases: [] },
+  { id: "lua", label: "Lua", aliases: ["pluto"] },
+  { id: "makefile", label: "Makefile", aliases: ["mk", "mak", "make"] },
+  { id: "perl", label: "Perl", aliases: ["pl", "pm"] },
+  { id: "objectivec", label: "Objective-C", aliases: ["mm", "objc", "obj-c", "obj-c++", "objective-c++"] },
+  { id: "php-template", label: "PHP template", aliases: [] },
+  { id: "python-repl", label: "python-repl", aliases: ["pycon"] },
+  { id: "r", label: "R", aliases: [] },
+  { id: "scss", label: "SCSS", aliases: [] },
+  { id: "shell", label: "Shell Session", aliases: ["console", "shellsession"] },
+  { id: "vbnet", label: "Visual Basic .NET", aliases: ["vb"] },
+  { id: "wasm", label: "WebAssembly", aliases: [] },
+];
 
 export interface Trigger {
   kind: TriggerKind;
@@ -17,6 +65,25 @@ export interface Trigger {
   end: number;
 }
 
+/** True when the current line starts inside a preceding Markdown fence. A
+ * fence-looking line inside code is content/closing syntax, never an opening
+ * language declaration. */
+function insideFenceBefore(raw: string, lineStart: number): boolean {
+  let open: { char: "`" | "~"; len: number } | null = null;
+  for (const line of raw.slice(0, lineStart).split("\n")) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!match) continue;
+    const fence = match[1];
+    const char = fence[0] as "`" | "~";
+    if (!open) {
+      open = { char, len: fence.length };
+    } else if (char === open.char && fence.length >= open.len && match[2].trim() === "") {
+      open = null;
+    }
+  }
+  return open !== null;
+}
+
 /** Detect an active completion trigger immediately before `caret`. */
 export function detectTrigger(raw: string, caret: number): Trigger | null {
   // No trigger spans a newline: the `[[` inner forbids it, and `#tag`/`/command`
@@ -26,6 +93,15 @@ export function detectTrigger(raw: string, caret: number): Trigger | null {
   // are offset back into `raw` by `lineStart`, so callers see absolute positions.
   const lineStart = raw.lastIndexOf("\n", caret - 1) + 1;
   const before = raw.slice(lineStart, caret);
+
+  // Opening Markdown fence language. Do not pop a menu for a bare fence typed
+  // by hand (Enter keeps its established behavior); one language character is
+  // enough. The /Code block command explicitly opens the empty picker instead.
+  const fence = /^( {0,3})(`{3,}|~{3,})([\w+#.-]+)$/.exec(before);
+  if (fence && !insideFenceBefore(raw, lineStart)) {
+    const start = lineStart + fence[1].length + fence[2].length;
+    return { kind: "code-language", query: fence[3], start, end: caret };
+  }
 
   // [[page and ((block — an opener with no closer since (the line has no
   // newline). Whichever opener sits closer to the caret wins (you can type a
@@ -57,15 +133,6 @@ export function detectTrigger(raw: string, caret: number): Trigger | null {
   if (cmd) {
     const start = lineStart + before.length - cmd[2].length - 1;
     return { kind: "command", query: cmd[2], start, end: caret };
-  }
-
-  // ```lang — a fenced code OPENER: offer a language list for the language token.
-  // Only on an opening fence (not the closing ``` or the code body), so the picker
-  // appears exactly where you name the language. `+#._-` cover names like c++, c#,
-  // f#, objective-c, plaintext.
-  const fence = /^(`{3,}|~{3,})([A-Za-z0-9+#._-]*)$/.exec(before);
-  if (fence && isOpeningFenceLine(raw, lineStart)) {
-    return { kind: "lang", query: fence[2], start: lineStart + fence[1].length, end: caret };
   }
 
   return null;
@@ -306,6 +373,26 @@ export function fuzzyScore(query: string, str: string): number {
   }
 }
 
+/** Languages actually bundled by highlight.js/common, ranked by canonical id,
+ * readable name, and aliases. Accepting an alias always writes the canonical id
+ * so rendering and future edits have one stable representation. */
+export function codeLanguageItems(query: string): CodeLanguageItem[] {
+  if (!query) return COMMON_CODE_LANGUAGES.slice();
+  return COMMON_CODE_LANGUAGES
+    .map((item, index) => ({
+      item,
+      index,
+      score: Math.max(
+        fuzzyScore(query, item.id),
+        fuzzyScore(query, item.label),
+        ...item.aliases.map((alias) => fuzzyScore(query, alias)),
+      ),
+    }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map(({ item }) => item);
+}
+
 /** Fuzzy score for a command against `query`: the best of its label and its
  *  optional short `key` (so a one-letter query can surface it first). */
 export function commandScore(query: string, c: Command): number {
@@ -320,41 +407,4 @@ export function filterCommands(query: string): Command[] {
     .filter((x) => x.s > 0)
     .sort((a, b) => b.s - a.s) // stable: equal scores keep their defined order
     .map((x) => x.c);
-}
-
-/** Code-fence languages offered by the ```lang picker — highlight.js identifiers,
- *  so every entry actually highlights (the full hljs build is loaded). Broad but
- *  not the entire ~190; the fuzzy filter narrows it, and any other hljs language
- *  still works if typed in full. */
-export const CODE_LANGUAGES: string[] = [
-  // mainstream
-  "javascript", "typescript", "python", "ruby", "php", "java", "kotlin", "scala",
-  "groovy", "csharp", "fsharp", "vbnet", "c", "cpp", "objectivec", "swift", "go",
-  "rust", "dart",
-  // scripting / functional
-  "lua", "perl", "r", "julia", "elixir", "erlang", "haskell", "clojure", "scheme",
-  "lisp", "ocaml", "reasonml", "elm", "purescript", "coffeescript", "livescript",
-  "crystal", "nim", "zig", "d", "haxe", "wren", "smalltalk", "tcl", "vala", "gdscript",
-  // legacy / scientific
-  "fortran", "cobol", "delphi", "ada", "prolog", "matlab", "mathematica", "actionscript",
-  // web / markup / data
-  "xml", "html", "css", "scss", "less", "stylus", "json", "yaml", "toml", "ini",
-  "properties", "graphql", "protobuf", "thrift", "handlebars", "twig", "haml", "markdown",
-  "latex", "asciidoc",
-  // shell / ops / db
-  "bash", "shell", "powershell", "dos", "awk", "vim", "nix", "sql", "pgsql",
-  "dockerfile", "makefile", "cmake", "gradle", "nginx", "apache", "puppet", "diff",
-  "http", "gherkin",
-  // hardware / low-level
-  "glsl", "verilog", "vhdl", "x86asm", "llvm", "wasm", "arduino", "processing",
-  "plaintext",
-];
-
-/** Language matches for `query`, ranked best-first. Empty query lists all. */
-export function filterLanguages(query: string): string[] {
-  if (!query) return CODE_LANGUAGES.slice();
-  return CODE_LANGUAGES.map((l) => ({ l, s: fuzzyScore(query, l) }))
-    .filter((x) => x.s > 0)
-    .sort((a, b) => b.s - a.s)
-    .map((x) => x.l);
 }

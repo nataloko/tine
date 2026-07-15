@@ -259,11 +259,13 @@ pub(crate) async fn open_graph_window(
                 .decorations(true)
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true);
-            #[cfg(not(target_os = "macos"))]
-            let builder = builder.decorations(false);
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let builder = builder.decorations(crate::settings::native_frame_active());
             let built = builder.build();
             match built {
                 Ok(window) => {
+                    #[cfg(target_os = "linux")]
+                    crate::linux_window_identity::apply_to_window(&window);
                     let _ = window.set_focus();
                 }
                 Err(error) => {

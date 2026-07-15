@@ -4,11 +4,14 @@
 
 mod android_folder_picker;
 mod android_media;
+mod android_system_bars;
 mod backup;
 mod commands;
 mod debug;
 mod git;
 mod graph;
+#[cfg(target_os = "linux")]
+mod linux_window_identity;
 mod migrate_identifier;
 mod media_protocol;
 mod platform;
@@ -25,13 +28,13 @@ use commands::{
     graph_source_files, guide_pages, import_asset, journal_content_days, journals_desc,
     list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts, list_templates,
     merge_pages, open_asset, open_page_file, page_aliases, page_icons, page_print_html, publish_html, query_facets,
-    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
+    open_pdf, quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
     read_local_image, read_text_file, rename_file_to_page, rename_page, resolve_block,
     resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search, run_query, save_asset, save_page,
     save_pdf_area_image, search, set_default_journal_template, set_favorites, set_guide_announced,
     set_journal_title_format, set_preferred_format, set_preferred_workflow, set_start_of_week,
     set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, write_highlights,
+    trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
@@ -60,6 +63,31 @@ use std::sync::{Mutex, RwLock};
 use tauri::Emitter;
 use tauri::Manager;
 use watcher::{get_watch_mode, set_watch_mode, start_watcher};
+
+#[cfg(desktop)]
+const MAIN_WINDOW_REVEAL_FALLBACK_MS: u64 = 3_000;
+
+/// The frontend normally reveals the main window after its themed App has
+/// painted. Keep a native fail-safe so a parser/session/frontend failure cannot
+/// strand the process as an invisible application.
+#[cfg(desktop)]
+fn schedule_main_window_reveal_fallback(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(
+            MAIN_WINDOW_REVEAL_FALLBACK_MS,
+        ));
+        let main_thread_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let Some(window) = main_thread_app.get_webview_window("main") else {
+                return;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                let _ = window.show();
+            }
+        });
+    });
+}
 
 /// Show + focus the always-on-top quick-capture mini window (created hidden at
 /// startup). Each show resets it to the small base size and anchors it near the
@@ -333,10 +361,43 @@ pub fn run() {
     // page.tine.app and run_early() is a no-op there.
     migrate_identifier::run_early();
 
+    // Wayland resolves the shell/titlebar icon by matching a window app ID to a
+    // desktop-entry basename. Packages ship that identity themselves; the raw
+    // binary Martin runs is self-contained, so publish its marker-owned entry
+    // before Tauri maps the first window.
+    #[cfg(target_os = "linux")]
+    linux_window_identity::install_desktop_identity();
+
+    // Tao cannot reliably change Linux decorations after a GTK window exists.
+    // Read the device preference before Tauri constructs the configured windows,
+    // and expose the frozen value to each webview so custom controls never flash.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let native_frame_active = settings::init_native_frame_active();
+    let context = tauri::generate_context!();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let context = {
+        let mut context = context;
+        if let Some(main) = context
+            .config_mut()
+            .app
+            .windows
+            .iter_mut()
+            .find(|window| window.label == "main")
+        {
+            main.decorations = native_frame_active;
+        }
+        context
+    };
+
     let builder = tauri::Builder::default().register_uri_scheme_protocol(
         "tine-media",
         |ctx, request| media_protocol::respond(ctx, request),
     );
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let builder = builder.append_invoke_initialization_script(format!(
+        "globalThis.__TINE_NATIVE_FRAME__ = {native_frame_active};"
+    ));
 
     #[cfg(desktop)]
     let builder = builder
@@ -385,6 +446,8 @@ pub fn run() {
     let builder = builder.plugin(android_folder_picker::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_media::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_system_bars::init());
     // Mobile has no xdg-open/open/explorer, so `open_external` routes URL opens
     // through this plugin's platform Intent instead (GH #49). Desktop keeps its
     // env-scrubbed spawn; the plugin is compiled/registered on mobile only.
@@ -434,6 +497,17 @@ pub fn run() {
         })
         .setup(|app| {
             diag("setup() begin");
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    linux_window_identity::apply_to_window(&window);
+                }
+                if let Some(window) = app.get_webview_window("capture") {
+                    linux_window_identity::apply_to_window(&window);
+                }
+            }
+            #[cfg(desktop)]
+            schedule_main_window_reveal_fallback(app.handle());
             // Eagerly open the graph if one was configured at startup.
             let startup_root = resolve_root("").or_else(|| settings::last_graph_path(app.handle()));
             if let Some(root) = startup_root {
@@ -533,6 +607,7 @@ pub fn run() {
             android_media::start_recording,
             android_media::stop_recording,
             android_media::cancel_recording,
+            android_system_bars::set_system_bar_appearance,
             list_pages,
             journals_desc,
             get_page,
@@ -598,7 +673,9 @@ pub fn run() {
             import_asset,
             save_asset,
             read_highlights,
+            open_pdf,
             write_highlights,
+            write_pdf_view_state,
             save_pdf_area_image,
             get_backup_keep,
             set_backup_keep,
@@ -637,6 +714,6 @@ pub fn run() {
             close_graph_window,
             tine_open_devtools
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

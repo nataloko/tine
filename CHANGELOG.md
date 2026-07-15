@@ -8,6 +8,130 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-07-14
+
+### Added
+
+- **Linked and unlinked references now share exact source evidence.** Each
+  matching block carries parser-owned explicit or plain occurrences, so a block
+  with both kinds appears correctly in both panels, code and syntax boundaries
+  stay consistent, and target-scoped diagnostics explain the same engine rather
+  than running a second matcher. (GH #137)
+- **Large reference panels now show bounded, highlighted excerpts.** Several
+  mentions remain one block row with a count and exact jump actions; each source
+  page can be collapsed independently, with bulk controls when several groups
+  are present. Excerpt windows preserve Unicode graphemes and full blocks remain
+  available on demand. (GH #144, GH #145)
+- **Ctrl+K can learn repeated deliberate choices without changing search
+  truth.** Page results expose exact, prefix, substring, and fuzzy objective
+  classes (including aliases); device-local, graph-scoped frecency may reorder
+  only ties inside one class after repeated activation. The bounded history can
+  be disabled or reset, and saved searches and queries remain deterministic.
+  (GH #143)
+
+- **Opening fenced code blocks now offer language completion.** Typing at least
+  one language character after backtick or tilde fences searches only the
+  languages bundled for highlighting, accepts common aliases while writing the
+  canonical identifier, and never activates on closing fences. `/Code block`
+  opens the same bounded picker immediately; bare and unsupported fences keep
+  their previous Enter behavior. (GH #94)
+- **Ctrl/Cmd+Enter now cycles every selected block's task state in one step.**
+  Mixed selections advance independently through the configured workflow,
+  repeaters keep their existing rollover behavior, blank blocks stay blank, and
+  the complete change is one atomic Undo while the selection remains active.
+  The command remains remappable. (GH #136)
+- **Tabs can now be reordered directly in the overflow menu.** A visible drag
+  handle and Alt+Up/Down keyboard actions update the pane's canonical tab order
+  while preserving active, pinned, split-pane, close, and persistence behavior.
+  (GH #141)
+- **The selection toolbar can now toggle page links and inline code.** The
+  actions preserve the inner selection, unwrap existing syntax, participate in
+  Undo, and keep the toolbar compact through a narrow-layout overflow. (GH #142)
+- **Page-valued properties now provide direct navigation.** Bare values in
+  `tags`, `alias`, and `aliases` are rendered as page links (including
+  comma-separated values), while custom and wholly quoted properties stay
+  literal unless they contain an explicit page reference. (GH #139)
+
+### Changed
+
+- **PDF uploads and annotations now follow Logseq OG's file-graph contract.**
+  Upload links retain the original source name while Tine's configurable
+  filename template controls the stored asset, resolve from the actual page
+  path, and use the correct Markdown or Org syntax. The viewer restores and
+  persists page/scale state, creates `hls__` pages in the graph's preferred
+  format, copies a new highlight's block reference, and writes OG-shaped area
+  metadata while retaining Tine's guarded merge and foreign-data protections.
+- **Search now has one visible home beside the primary navigation controls.**
+  The duplicate read-only sidebar field is gone; the labelled toolbar button,
+  Ctrl+K shortcut, complete switcher, and “Open search tab” flow are unchanged.
+  (GH #100)
+
+### Fixed
+
+- **Block reference-count badges now refresh after a reference is saved.**
+  Creating or removing a `((block reference))` updates the source block's badge
+  without requiring the graph to be reopened. (GH #154)
+- **Linux windows now advertise Tine's stable desktop identity.** Main, graph,
+  and Quick Capture windows use the packaged application ID, and standalone
+  binaries provide the matching desktop entry and icon without interfering with
+  single-instance shortcut forwarding. A remaining Plasma task-switcher lookup
+  problem is tracked separately rather than being treated as covered here.
+- **Linux system titlebar controls work when native window decorations are
+  enabled.** GTK now propagates pointer events to the window-manager frame, so
+  its minimize, maximize, and close buttons are interactive; close still runs
+  through Tine's guarded save-and-session flush path.
+- **Quick Capture accepts typing on its first show and has a visible frame.**
+  Its scratch bullet now has a real block identity, allowing the existing
+  activation path to enter edit mode immediately instead of waiting for a first
+  click. Plasma users can invoke the shortcut and type directly into the bullet,
+  and the frameless window now draws a subtle theme-aware border.
+- **Page property settings preserve the surrounding Markdown layout.** Editing
+  one field now updates it in place without moving it below other properties or
+  deleting blank separators, so unrelated page-header metadata remains intact.
+  (GH #163)
+- **Logseq PDF highlights open safely and round-trip between both apps.** The
+  bounded EDN reader now consumes Logseq's UUID tags and list-shaped rectangles
+  without runaway allocation, preserves creation-zoom coordinates for correct
+  placement, and writes Logseq's current sidecar shape back without erasing
+  foreign metadata. Newly inserted PDFs also use Logseq's compatible embed form.
+  (GH #61)
+- **Linux Developer Tools now detach reliably where the native backend supports
+  it.** On X11/XWayland, the old implementation asked an asynchronously-created
+  inspector to detach too early, so the request was normally a no-op. A one-shot,
+  timer-free lifecycle hook now detaches after WebKit's actual attach event and
+  leaves later manual reattachment alone. Native Wayland remains docked because
+  current Fedora/WebKitGTK renders the detached inspector black; its docked
+  inspector is correctly scaled. AppImage mixed-DPI rendering remains a separate
+  packaging diagnostic rather than an unverified scaling change. (GH #31)
+- **Help with Tine now canonicalizes optional parser fields before classifying
+  known oracle artifacts.** A harmless `undefined`-versus-omitted field can no
+  longer make a backtick-state-only mismatch look like a new divergence.
+  (GH #82)
+- **Deep outlines keep a useful text column on Android.** Coarse-pointer phone
+  layouts use a tighter nesting step, keep guide lines under their parent
+  bullets, and expose folding as a visible trailing touch action; desktop
+  geometry is unchanged. (GH #150)
+- **Android status and navigation icons now follow Tine's selected theme.** The
+  native edge-to-edge bars restore the persisted appearance during launch and
+  resume, then stay synchronized across repeated light/dark switches. (GH #149)
+- **Persistent Search results now fit their pane and retain their evidence.**
+  Search, List, Table, and Board keep the matched terms highlighted; result
+  rows wrap instead of widening a narrow pane; and Ctrl+F searches the visible
+  query results as well as linked and unlinked reference rows. (GH #140)
+- **Enter now adds another page property when editing the first properties-only
+  bullet.** A second Enter on the trailing empty line exits cleanly to a normal
+  body bullet, matching Logseq without splitting the property list. (GH #138)
+- **Android's Interface size setting now scales the complete application.** It
+  uses the document-level Chromium path on Android, where Wry's native zoom API
+  is a no-op, while desktop and iOS retain native webview scaling. (GH #133)
+- **Desktop startup no longer exposes intermediate unthemed layout frames.**
+  The main window is revealed only after the themed app has painted, with a
+  bounded native fallback so a frontend failure cannot leave Tine invisible.
+  (GH #132)
+- **Arrow navigation and empty-block deletion inside a block embed keep the
+  caret in the visible embed.** The underlying source outline is still edited,
+  but structural focus no longer jumps to the source block. (GH #134)
+
 ## [0.5.8] - 2026-07-13
 
 ### Added

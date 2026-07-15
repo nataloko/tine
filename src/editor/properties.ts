@@ -5,27 +5,6 @@ import { transitionFence, type FenceState } from "./fences";
 
 export const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
-// Fence scanning for the fork's live-highlight overlay + language-picker
-// autocomplete (kept private here; upstream's fences.ts state machine drives the
-// Enter handler instead). A fence line opens or closes a run of ≥3 ` or ~.
-const FENCE_RE = /^\s*(`{3,}|~{3,})/;
-
-function fenceMarker(line: string): string | null {
-  const m = FENCE_RE.exec(line);
-  return m ? m[1][0] : null;
-}
-
-function fenceTransition(
-  fence: string | null,
-  line: string
-): { opens: boolean; closes: boolean; next: string | null } {
-  const ch = fenceMarker(line);
-  if (ch === null) return { opens: false, closes: false, next: fence };
-  if (fence === null) return { opens: true, closes: false, next: ch };
-  if (ch === fence) return { opens: false, closes: true, next: null };
-  return { opens: false, closes: false, next: fence };
-}
-
 /** OG treats a Markdown page's first bullet as page properties when every
  * nonblank line is a property. Keep this predicate shared by display and edit
  * paths so the block cannot be hidden in one place but edited as ordinary text
@@ -38,6 +17,17 @@ export function isPropertiesOnly(raw: string): boolean {
     sawProperty = true;
   }
   return sawProperty;
+}
+
+/** Whether the textarea caret is on a complete `key:: value` line. This is
+ * deliberately line-local: an empty line after a run of page properties is the
+ * double-Enter exit sentinel, not another property line. */
+export function caretOnPropertyLine(raw: string, caret: number): boolean {
+  const c = Math.max(0, Math.min(caret, raw.length));
+  const lineStart = raw.lastIndexOf("\n", c - 1) + 1;
+  const nextNewline = raw.indexOf("\n", c);
+  const lineEnd = nextNewline === -1 ? raw.length : nextNewline;
+  return PROP_LINE.test(raw.slice(lineStart, lineEnd));
 }
 
 /** Split a Markdown page preamble into real page-property lines and ordinary
@@ -89,7 +79,7 @@ function propLineKey(line: string): string | null {
 export function multilineExitTrim(
   text: string,
   caret: number,
-  kind: "calc" | "fence"
+  kind: "calc" | "fence" | "properties"
 ): string | null {
   const c = Math.max(0, Math.min(caret, text.length));
   const lineStart = text.lastIndexOf("\n", c - 1) + 1;
@@ -97,7 +87,7 @@ export function multilineExitTrim(
   if (lineEnd === -1) lineEnd = text.length;
   if (text.slice(lineStart, lineEnd).trim() !== "" || lineStart === 0) return null;
 
-  if (kind === "calc") {
+  if (kind === "calc" || kind === "properties") {
     if (text.slice(lineEnd).trim() !== "") return null;
     return text.slice(0, lineStart - 1);
   }
@@ -113,23 +103,6 @@ export function multilineExitTrim(
   const afterClosing = nextNewline === -1 ? "" : after.slice(nextNewline + 1);
   if (afterClosing.trim() !== "") return null;
   return text.slice(0, lineStart - 1) + text.slice(lineEnd);
-}
-
-/** Whether the fence-delimiter line beginning at `lineStart` OPENS a fence rather
- *  than closing one — i.e. no fence is open just before it. Lets the language
- *  picker fire on an opening ```lang line only, never on the closing ```. */
-export function isOpeningFenceLine(raw: string, lineStart: number): boolean {
-  let fence: string | null = null;
-  let pos = 0;
-  while (pos < lineStart) {
-    const nl = raw.indexOf("\n", pos);
-    const end = nl === -1 ? raw.length : nl;
-    if (end >= lineStart) break; // reached the target line
-    fence = fenceTransition(fence, raw.slice(pos, end)).next;
-    if (nl === -1) break;
-    pos = end + 1;
-  }
-  return fence === null;
 }
 
 /** A block that is a single fenced code block, for the live-highlight overlay. */
@@ -390,23 +363,35 @@ export function readPropertyValue(block: string | null, key: string): string | n
 }
 
 /** Add / replace / remove a `key:: value` line. A null or empty value removes
- *  the key. Other property lines are preserved (blank lines dropped); returns
- *  null when nothing is left (so an emptied pre-block isn't written as "").  */
+ *  the key. Replace the first matching line in place and preserve every
+ *  unrelated line and blank separator byte-for-byte; page-property grouping
+ *  and order are user data, not disposable formatting. Duplicate matching
+ *  keys retain the prior single-value behavior and collapse to the first slot.
+ *  Returns null when no nonblank content remains. */
 export function upsertPropertyLine(
   block: string | null,
   key: string,
   value: string | null
 ): string | null {
-  const kept = (block ?? "")
-    .split("\n")
-    .filter((l) => {
-      const m = PROP_LINE.exec(l);
-      return !(m && m[1].toLowerCase() === key.toLowerCase());
-    })
-    .filter((l) => l.trim() !== "");
   const v = value == null ? null : value.trim();
-  if (v) kept.push(`${key}:: ${v}`);
-  return kept.length ? kept.join("\n") : null;
+  const lines = block == null || block === "" ? [] : block.split("\n");
+  const out: string[] = [];
+  let matched = false;
+  for (const line of lines) {
+    const m = PROP_LINE.exec(line);
+    if (m && m[1].toLowerCase() === key.toLowerCase()) {
+      if (!matched && v) out.push(`${m[1]}:: ${v}`);
+      matched = true;
+      continue;
+    }
+    out.push(line);
+  }
+  if (!matched && v) {
+    let insertAt = out.length;
+    while (insertAt > 0 && out[insertAt - 1].trim() === "") insertAt--;
+    out.splice(insertAt, 0, `${key}:: ${v}`);
+  }
+  return out.some((line) => line.trim() !== "") ? out.join("\n") : null;
 }
 
 /** The page-level properties we surface in the page-properties panel, with a

@@ -523,24 +523,50 @@ pub(crate) fn tine_open_devtools(window: tauri::WebviewWindow) {
     if window.is_devtools_open() {
         window.close_devtools();
     } else {
-        window.open_devtools();
-        // #31 follow-up: open the inspector as its OWN window (detached) instead of
-        // docked into the app. Docked, WebKitGTK puts the window's resize grip at the
-        // top of the inspector pane (confusing) and the inspector renders at the wrong
-        // scale on HiDPI/fractional displays; a separate top-level window avoids both.
-        // Best-effort + Linux-only: if detach isn't possible it stays docked (no worse
-        // than before). WebKitGTK's inspector keeps an attach button for docking back.
+        // #31 follow-up: on X11/XWayland, open the inspector as its OWN window
+        // instead of docked into the app. Docked, WebKitGTK puts the window's resize
+        // grip at the top of the inspector pane. Do not force this on native Wayland:
+        // Fedora 44 / WebKitGTK 2.52 renders the detached inspector black, while its
+        // docked inspector is correctly scaled and usable. Query the actual GDK
+        // display rather than session environment variables because an AppImage in a
+        // Wayland session deliberately runs GTK through XWayland.
+        // WebKit creates/attaches the inspector asynchronously, so an immediate
+        // is_attached()+detach() races and usually does nothing. Arm a one-shot hook
+        // BEFORE opening instead. The attach signal is the event boundary; its idle
+        // continuation runs after WebKit's default attach handler has finished, then
+        // detaches. There is deliberately no guessed timeout. Disconnecting first
+        // also lets the user attach the already-open inspector manually afterward.
         #[cfg(target_os = "linux")]
         {
             let _ = window.with_webview(|wv| {
-                use webkit2gtk::{WebInspectorExt, WebViewExt};
+                use std::{cell::RefCell, rc::Rc};
+                use gtk::{gdk::prelude::DisplayExtManual, prelude::WidgetExt};
+                use webkit2gtk::{glib, glib::prelude::ObjectExt, WebInspectorExt, WebViewExt};
+                if wv.inner().display().backend().is_wayland() {
+                    return;
+                }
                 if let Some(inspector) = wv.inner().inspector() {
-                    if inspector.is_attached() {
-                        inspector.detach();
-                    }
+                    let handler_slot = Rc::new(RefCell::new(None));
+                    let callback_slot = Rc::clone(&handler_slot);
+                    let handler_id = inspector.connect_attach(move |inspector| {
+                        if let Some(handler_id) = callback_slot.borrow_mut().take() {
+                            inspector.disconnect(handler_id);
+                        }
+                        let inspector = inspector.clone();
+                        glib::idle_add_local_once(move || {
+                            if inspector.is_attached() {
+                                inspector.detach();
+                            }
+                        });
+                        false
+                    });
+                    *handler_slot.borrow_mut() = Some(handler_id);
                 }
             });
         }
+        // Tauri queues UI-thread messages in order: with_webview installs the
+        // hook above before this open request is dispatched.
+        window.open_devtools();
     }
 }
 
@@ -1217,6 +1243,15 @@ pub(crate) fn read_highlights(
 }
 
 #[tauri::command]
+pub(crate) fn open_pdf(
+    pdf: String,
+    label: String,
+    state: GraphContext<'_>,
+) -> Result<tine_core::pdf::PdfState, String> {
+    with_graph(&state, |g| g.open_pdf(&pdf, &label).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
 pub(crate) fn write_highlights(
     pdf: String,
     label: String,
@@ -1226,6 +1261,19 @@ pub(crate) fn write_highlights(
 ) -> Result<(), String> {
     with_graph(&state, |g| {
         g.write_highlights(&pdf, &label, &highlights, &base_ids)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn write_pdf_view_state(
+    pdf: String,
+    page: i64,
+    scale: f64,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    with_graph(&state, |g| {
+        g.write_pdf_view_state(&pdf, page, scale)
             .map_err(|e| e.to_string())
     })
 }

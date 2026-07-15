@@ -1,6 +1,7 @@
-// Linux real-WebKit regression for GH #98/#99/#69: authoritative evidence in
-// Ctrl+K, a graph-scoped virtual query tab that survives restart, friendly
-// filters/explanation, and guarded materialization as one ordinary query page.
+// Linux real-WebKit regression for GH #98/#99/#69/#137/#144/#145:
+// authoritative evidence in Ctrl+K and references, a graph-scoped virtual
+// query tab that survives restart, friendly filters/explanation, and guarded
+// materialization as one ordinary query page.
 import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -35,6 +36,14 @@ fs.writeFileSync(`${GRAPH}/pages/Query parity.md`, [
   "",
 ].join("\n"));
 fs.writeFileSync(`${GRAPH}/pages/Templates.md`, "- TODO [#A] Excluded template result\n");
+const unlinkedRaw = [
+  "Unlinked visible phrase names Query parity near the start",
+  ...Array.from({ length: 48 }, (_, index) => `context-${index + 1}`),
+  "and closes with Query parity",
+].join(" ");
+fs.writeFileSync(`${GRAPH}/pages/Unlinked source.md`, `- ${unlinkedRaw}\n`);
+fs.writeFileSync(`${GRAPH}/pages/Second unlinked.md`, "- A second source also names Query parity without brackets\n");
+fs.writeFileSync(`${GRAPH}/pages/Linked source.md`, "- [[Query parity]] appears explicitly and [[Query parity]] appears again\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- Open [[Research]] and [[Query parity]]\n");
@@ -90,23 +99,83 @@ async function inlineQueryViewButton(browser, label) {
   throw new Error(`missing inline-query ${label} view button`);
 }
 
+async function assertInPageFind(browser, query, activeSelector) {
+  // WebKitWebDriver itself reserves native Ctrl+F on some builds; dispatch the
+  // identical cancelable DOM chord so this still exercises Tine's real global
+  // keybinding and find UI without handing the session to the driver's browser UI.
+  await browser.execute(() => window.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true,
+  })));
+  const input = await browser.$(".inpage-find-input");
+  await input.waitForExist({ timeout: 5_000 });
+  await input.setValue(query);
+  try {
+    await browser.waitUntil(async () => {
+      const count = (await browser.$(".inpage-find-count").getText()).trim();
+      return count !== "" && count !== "No results";
+    }, { timeout: 10_000, timeoutMsg: `in-page find did not find ${query}` });
+  } catch (error) {
+    const proof = await browser.execute(() => ({
+      value: document.querySelector(".inpage-find-input")?.value,
+      count: document.querySelector(".inpage-find-count")?.textContent,
+      paneIds: [...document.querySelectorAll("[data-pane-id]")].map((element) => element.getAttribute("data-pane-id")),
+      surfaces: [...document.querySelectorAll("[data-inpage-find-surface]")].map((element) => ({
+        id: element.getAttribute("data-inpage-find-surface"), text: element.textContent?.trim().slice(0, 200),
+      })),
+    }));
+    throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
+  }
+  await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  await browser.execute(() => document.querySelector(".inpage-find-input")?.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true })
+  ));
+  await input.waitForExist({ reverse: true, timeout: 5_000 });
+}
+
 await withApp(0, async (browser) => {
+  // The page outline is viewport-lazy; wait for the observed AST body rather
+  // than treating its short-lived literal fallback as app readiness.
+  await browser.$(".page-ref").waitForExist({ timeout: 10_000 });
   const routed = await browser.execute(() => {
     const refs = [...document.querySelectorAll(".page-ref")];
     const ref = refs.find((element) => element.textContent?.includes("Query parity"));
-    if (!ref) return { ok: false, refs: refs.map((element) => element.textContent?.trim()) };
+    if (!ref) return {
+      ok: false,
+      refs: refs.map((element) => element.textContent?.trim()),
+      title: document.querySelector("h1.page-title")?.textContent?.trim(),
+      text: document.querySelector(".page")?.textContent?.trim().slice(0, 500),
+      parser: document.documentElement.dataset.lsdocParser,
+      bodyHtml: document.querySelector(".block-content")?.innerHTML.slice(0, 1_000),
+    };
     for (const type of ["mousedown", "mouseup", "click"]) {
       ref.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
     }
-    return { ok: true, refs: [] };
+    return { ok: true, refs: [], title: "", text: "" };
   });
-  if (!routed.ok) throw new Error(`query fixture page-ref is missing: ${JSON.stringify(routed.refs)}`);
+  if (!routed.ok) throw new Error(`query fixture page-ref is missing: ${JSON.stringify(routed)}`);
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Query parity", {
     timeout: 10_000, timeoutMsg: "could not route to the DSL query fixture",
   });
   await browser.waitUntil(async () => (await browser.$(".query-count").getText()).trim() === "9", {
     timeout: 10_000, timeoutMsg: "ordinary query did not produce its nine expected blocks",
   });
+  const referenceBlocks = await browser.$(".reference-blocks");
+  await referenceBlocks.waitForExist({ timeout: 10_000 });
+  await referenceBlocks.scrollIntoView();
+  await browser.waitUntil(async () => (await browser.$(".reference-blocks").getText()).includes("Open"), {
+    timeout: 10_000, timeoutMsg: "linked-reference content did not finish rendering",
+  });
+  await assertInPageFind(browser, "Open", ".reference-blocks.inpage-find-active-block");
+  await browser.$(".unlinked-references .references-header").click();
+  const unlinkedBlocks = await browser.$(".unlinked-references .reference-blocks");
+  await unlinkedBlocks.waitForExist({ timeout: 10_000 });
+  await unlinkedBlocks.scrollIntoView();
+  await browser.waitUntil(() => browser.execute(() =>
+    [...document.querySelectorAll(".unlinked-references .reference-blocks")]
+      .some((group) => group.textContent?.includes("names Query parity near the start"))), {
+    timeout: 10_000, timeoutMsg: "unlinked-reference content did not finish rendering",
+  });
+  await assertInPageFind(browser, "names Query parity near the start", ".unlinked-references .reference-blocks.inpage-find-active-block");
   const inlineSearchButton = await inlineQueryViewButton(browser, "Search");
   await inlineSearchButton.click();
   await browser.waitUntil(async () => (await browser.$$(".query-search-results .query-search-hit")).length === 9, {
@@ -164,6 +233,53 @@ await withApp(0, async (browser) => {
   await browser.$(".query-workspace").waitForExist({ timeout: 10_000 });
   const source = await browser.$(".query-workspace-source");
   if ((await source.getValue()) !== "alpha beta -draft") throw new Error("query workspace lost the Ctrl+K source");
+
+  // GH #140: every persistent presentation keeps the authoritative evidence
+  // highlights, and every visible result remains an in-page-find surface.
+  await browser.setWindowSize(720, 700);
+  const presentations = [
+    ["Search", ".query-results-search"],
+    ["List", ".query-results-list"],
+    ["Table", ".query-results-table"],
+    ["Board", ".query-results-board"],
+  ];
+  for (const [label, selector] of presentations) {
+    await (await presentationButton(browser, label)).click();
+    await browser.$(selector).waitForExist({ timeout: 5_000 });
+    await browser.waitUntil(async () => (await browser.$$(".query-workspace mark")).length >= 4, {
+      timeout: 5_000, timeoutMsg: `${label} presentation dropped search highlights`,
+    });
+    const presentationProof = await browser.execute(() => ({
+      rows: [...document.querySelectorAll(".query-workspace [data-inpage-find-surface]")].map((row) => ({
+        marks: [...row.querySelectorAll("mark")].map((mark) => mark.textContent?.toLowerCase()),
+      })),
+    }));
+    if (presentationProof.rows.length !== 2
+      || presentationProof.rows.some((row) => !row.marks.includes("alpha") || !row.marks.includes("beta"))) {
+      throw new Error(`${label} evidence/surface mismatch: ${JSON.stringify(presentationProof)}`);
+    }
+  }
+  await (await presentationButton(browser, "Search")).click();
+  const wrapProof = await browser.execute(() => {
+    const workspace = document.querySelector(".query-workspace")?.getBoundingClientRect();
+    return [...document.querySelectorAll(".query-result-row")].map((row) => {
+      const rect = row.getBoundingClientRect();
+      return {
+        scrollWidth: row.scrollWidth,
+        clientWidth: row.clientWidth,
+        left: rect.left,
+        right: rect.right,
+        workspaceLeft: workspace?.left,
+        workspaceRight: workspace?.right,
+      };
+    });
+  });
+  if (!wrapProof.length || wrapProof.some((row) => row.scrollWidth > row.clientWidth + 1
+    || row.left < row.workspaceLeft - 1 || row.right > row.workspaceRight + 1)) {
+    throw new Error(`persistent search rows overflow the narrow pane: ${JSON.stringify(wrapProof)}`);
+  }
+  await assertInPageFind(browser, "alpha", ".query-result-row.inpage-find-active-block");
+
   await browser.$(".query-explain-toggle").click();
   await browser.$(".query-workspace-explanation").waitForExist({ timeout: 10_000 });
   await browser.$(".query-advanced-toggle").click();
@@ -189,7 +305,14 @@ await withApp(1, async (browser) => {
     throw new Error("restart lost the query presentation");
   }
   const graphFilesBefore = fs.readdirSync(`${GRAPH}/pages`).sort();
-  const expectedBefore = ["Query parity.md", "Research.md", "Templates.md"];
+  const expectedBefore = [
+    "Linked source.md",
+    "Query parity.md",
+    "Research.md",
+    "Second unlinked.md",
+    "Templates.md",
+    "Unlinked source.md",
+  ];
   if (JSON.stringify(graphFilesBefore) !== JSON.stringify(expectedBefore)) {
     throw new Error(`virtual query wrote a temporary page: ${graphFilesBefore.join(", ")}`);
   }
@@ -207,4 +330,126 @@ await withApp(1, async (browser) => {
   }
 });
 
-console.log("PASS: typed search evidence, persistent virtual query workspace, explanation, and guarded save work in WebKit");
+// A final fresh process proves the reference evidence controls in the actual
+// native WebKit app without disturbing the virtual-workspace restore scenario.
+await withApp(2, async (browser) => {
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 5_000 });
+  await input.setValue("Query parity");
+  await browser.waitUntil(() => browser.execute(() =>
+    [...document.querySelectorAll(".switcher-row")].some((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === "Query parity")), {
+    timeout: 10_000, timeoutMsg: "exact Query parity page result did not render",
+  });
+  const opened = await browser.execute(() => {
+    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === "Query parity");
+    if (!row) return false;
+    row.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    return true;
+  });
+  if (!opened) throw new Error("could not activate the exact Query parity result");
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Query parity", {
+    timeout: 10_000, timeoutMsg: "could not route back to Query parity for reference evidence proof",
+  });
+
+  await browser.$(".linked-references .reference-bulk-controls").waitForExist({ timeout: 10_000 });
+  await browser.execute(() => {
+    const source = [...document.querySelectorAll(".linked-references .reference-group")]
+      .find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Linked source");
+    source?.scrollIntoView({ block: "center" });
+  });
+  await browser.waitUntil(() => browser.execute(() =>
+    [...document.querySelectorAll(".linked-references .reference-group")]
+      .some((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Linked source"
+        && group.querySelector(".reference-mention-count")?.textContent?.trim() === "2 mentions")), {
+    timeout: 10_000, timeoutMsg: "linked reference evidence did not lazy-mount",
+  });
+  const linkedProof = await browser.execute(() => {
+    const groups = [...document.querySelectorAll(".linked-references .reference-group")];
+    const source = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Linked source");
+    return {
+      groupCount: groups.length,
+      mentions: source?.querySelector(".reference-mention-count")?.textContent?.trim(),
+      jumps: source?.querySelectorAll(".reference-occurrence-jump").length,
+    };
+  });
+  if (linkedProof.groupCount < 2 || linkedProof.mentions !== "2 mentions" || linkedProof.jumps !== 2) {
+    throw new Error(`linked reference evidence is incomplete: ${JSON.stringify(linkedProof)}`);
+  }
+  const linkedBulk = await browser.$$(".linked-references .reference-bulk-controls button");
+  await linkedBulk[0].click();
+  await browser.waitUntil(async () => (await browser.$$(".linked-references .reference-blocks")).length === 0, {
+    timeout: 5_000, timeoutMsg: "Collapse all did not unmount linked reference bodies",
+  });
+  await linkedBulk[1].click();
+  await browser.waitUntil(async () => (await browser.$$(".linked-references .reference-blocks")).length === linkedProof.groupCount, {
+    timeout: 5_000, timeoutMsg: "Expand all did not restore linked reference bodies",
+  });
+
+  await browser.$(".unlinked-references .references-header").click();
+  await browser.$(".unlinked-references .reference-bulk-controls").waitForExist({ timeout: 10_000 });
+  const unlinkedProof = await browser.execute((expectedRaw) => {
+    const groups = [...document.querySelectorAll(".unlinked-references .reference-group")];
+    const source = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
+    const excerpt = source?.querySelector(".reference-excerpt-text")?.textContent ?? "";
+    return {
+      groupCount: groups.length,
+      mentions: source?.querySelector(".reference-mention-count")?.textContent?.trim(),
+      jumps: source?.querySelectorAll(".reference-occurrence-jump").length,
+      marks: source?.querySelectorAll("mark").length,
+      bounded: excerpt.length < expectedRaw.length,
+    };
+  }, unlinkedRaw);
+  if (unlinkedProof.groupCount < 2 || unlinkedProof.mentions !== "2 mentions"
+    || unlinkedProof.jumps !== 2 || unlinkedProof.marks !== 2 || !unlinkedProof.bounded) {
+    throw new Error(`unlinked reference evidence is incomplete: ${JSON.stringify(unlinkedProof)}`);
+  }
+
+  const showFull = await browser.$(".unlinked-references .reference-group .reference-show-full");
+  await showFull.click();
+  if ((await showFull.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("Show full block did not expose the complete source block");
+  }
+  await showFull.click();
+
+  const unlinkedBulk = await browser.$$(".unlinked-references .reference-bulk-controls button");
+  await unlinkedBulk[0].click();
+  await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === 0, {
+    timeout: 5_000, timeoutMsg: "Collapse all did not unmount unlinked reference bodies",
+  });
+  await unlinkedBulk[1].click();
+  await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === unlinkedProof.groupCount, {
+    timeout: 5_000, timeoutMsg: "Expand all did not restore unlinked reference bodies",
+  });
+
+  const jumped = await browser.execute(() => {
+    const source = [...document.querySelectorAll(".unlinked-references .reference-group")]
+      .find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
+    const jump = source?.querySelectorAll(".reference-occurrence-jump")[1];
+    if (!(jump instanceof HTMLButtonElement)) return false;
+    jump.click();
+    return true;
+  });
+  if (!jumped) throw new Error("second unlinked occurrence control is missing");
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Unlinked source", {
+    timeout: 10_000, timeoutMsg: "occurrence jump did not open its source page",
+  });
+  const editor = await browser.$("textarea.block-editor");
+  await editor.waitForExist({ timeout: 10_000 });
+  const caret = await browser.execute(() => {
+    const textarea = document.querySelector("textarea.block-editor");
+    return textarea instanceof HTMLTextAreaElement
+      ? { value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd }
+      : null;
+  });
+  const expectedOffset = unlinkedRaw.lastIndexOf("Query parity");
+  if (!caret || caret.value !== unlinkedRaw || caret.start !== expectedOffset || caret.end !== expectedOffset) {
+    throw new Error(`exact occurrence jump landed at the wrong caret: ${JSON.stringify({ caret, expectedOffset })}`);
+  }
+});
+
+console.log("PASS: typed search/reference evidence, persistent virtual query workspace, disclosure, exact jumps, explanation, and guarded save work in WebKit");

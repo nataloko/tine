@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import hljs from "highlight.js/lib/common";
 import {
   detectTrigger,
   applyCompletion,
@@ -8,9 +9,10 @@ import {
   pageInsert,
   tagInsert,
   filterCommands,
-  filterLanguages,
   fuzzyScore,
   orderAcItems,
+  codeLanguageItems,
+  COMMON_CODE_LANGUAGES,
 } from "./autocomplete";
 
 describe("autoPairEdit (OG-style [[ ]] auto-pairing)", () => {
@@ -99,6 +101,13 @@ describe("orderAcItems (autocomplete default action)", () => {
 });
 
 describe("detectTrigger", () => {
+  it("detects language text only on opening backtick and tilde fences", () => {
+    expect(detectTrigger("```j", 4)).toEqual({ kind: "code-language", query: "j", start: 3, end: 4 });
+    expect(detectTrigger("~~~~py", 6)).toEqual({ kind: "code-language", query: "py", start: 4, end: 6 });
+    expect(detectTrigger("```", 3)).toBeNull();
+    expect(detectTrigger("```js\ncode\n```p", 16)).toBeNull();
+  });
+
   it("detects [[ page trigger", () => {
     const t = detectTrigger("see [[log", 9);
     expect(t).toEqual({ kind: "page", query: "log", start: 4, end: 9 });
@@ -163,6 +172,33 @@ describe("detectTrigger", () => {
     expect(detectTrigger(raw, raw.length)).toEqual({
       kind: "block", query: "blk", start: 7, end: raw.length,
     });
+  });
+});
+
+describe("codeLanguageItems", () => {
+  it("stays in lockstep with the languages and aliases bundled for rendering", () => {
+    expect(new Set(COMMON_CODE_LANGUAGES.map((item) => item.id))).toEqual(new Set(hljs.listLanguages()));
+    for (const item of COMMON_CODE_LANGUAGES) {
+      expect(new Set(item.aliases), item.id).toEqual(new Set(hljs.getLanguage(item.id)?.aliases ?? []));
+    }
+  });
+
+  it("canonicalizes highlight.js aliases while keeping readable labels", () => {
+    expect(codeLanguageItems("js")[0]).toMatchObject({ id: "javascript", label: "JavaScript" });
+    expect(codeLanguageItems("ts")[0]).toMatchObject({ id: "typescript", label: "TypeScript" });
+    expect(codeLanguageItems("html")[0]).toMatchObject({ id: "xml", label: "HTML, XML" });
+  });
+
+  it("offers a bounded full picker for the slash-command path", () => {
+    const all = codeLanguageItems("");
+    expect(all.length).toBeGreaterThan(20);
+    expect(all.length).toBeLessThan(50);
+    expect(new Set(all.map((item) => item.id)).size).toBe(all.length);
+  });
+
+  it("does not rewrite language identifiers outside the bundled highlighter", () => {
+    expect(codeLanguageItems("brainfuck")).toEqual([]);
+    expect(codeLanguageItems("calc")).toEqual([]);
   });
 });
 
@@ -289,41 +325,3 @@ describe("withRefCompletionSpace (GH #35)", () => {
   });
 });
 
-describe("detectTrigger — ```lang code-fence language picker", () => {
-  it("triggers on an opening fence with a partial language", () => {
-    const t = detectTrigger("```js", 5);
-    expect(t).toEqual({ kind: "lang", query: "js", start: 3, end: 5 });
-  });
-
-  it("triggers on a bare opening fence (empty query → list all)", () => {
-    const t = detectTrigger("```", 3);
-    expect(t).toEqual({ kind: "lang", query: "", start: 3, end: 3 });
-  });
-
-  it("does NOT trigger on the closing fence", () => {
-    const text = "```js\ncode\n```";
-    expect(detectTrigger(text, text.length)).toBeNull();
-  });
-
-  it("does NOT trigger inside the code body", () => {
-    const text = "```js\nco";
-    expect(detectTrigger(text, text.length)).toBeNull();
-  });
-
-  it("allows language chars like c++ / c# on the fence", () => {
-    expect(detectTrigger("```c++", 6)).toEqual({ kind: "lang", query: "c++", start: 3, end: 6 });
-  });
-});
-
-describe("filterLanguages", () => {
-  it("lists all for an empty query", () => {
-    expect(filterLanguages("").length).toBeGreaterThan(20);
-  });
-  it("ranks the obvious match first", () => {
-    expect(filterLanguages("py")[0]).toBe("python");
-    expect(filterLanguages("typ")[0]).toBe("typescript");
-  });
-  it("returns nothing for a non-match", () => {
-    expect(filterLanguages("zzzzz")).toEqual([]);
-  });
-});

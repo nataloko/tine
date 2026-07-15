@@ -12,8 +12,8 @@ import {
   orderAcItems,
   COMMANDS,
   commandScore,
+  codeLanguageItems,
   fuzzyScore,
-  filterLanguages,
   type Trigger,
 } from "../editor/autocomplete";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
@@ -58,6 +58,7 @@ import {
   withUndoUnit,
   blockIsGridView,
   trackAssetWrite,
+  formatForBlock,
   collapsibleDescendantIds,
   setCollapsedDescendants,
   type OutlineScope,
@@ -89,6 +90,11 @@ import {
   setPriority,
   type Edit,
 } from "../editor/format";
+import {
+  essentialSelectionActions,
+  secondarySelectionActions,
+  type SelectionAction,
+} from "../editor/selectionActions";
 import { isRenderHiddenProp, isPropertyLine } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
@@ -122,7 +128,7 @@ import {
   caretColumnOnVisualRow,
   caretOffsetOnLastRow,
 } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim, fencedCodeBlock } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, fencedCodeBlock } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
@@ -1020,7 +1026,7 @@ function templateToOutline(
   };
 }
 // Markdown for a freshly saved asset: images embed inline, everything else
-// (PDFs included) becomes a link — a .pdf link renders as a clickable chip that
+// (PDFs included) becomes an asset reference — a .pdf reference renders as a clickable chip that
 // opens the PDF pane.
 // `onSubmit`/`onCancel` (set only by the quick-capture window) repurpose a plain
 // Enter / Escape when the autocomplete popup is closed: Enter commits the capture
@@ -1036,9 +1042,10 @@ export function Editor(props: { id: string }): JSX.Element {
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
   // Generic ref/query surfaces intentionally return structural keyboard edits to
-  // the primary outline. An embed is a live editing surface: Enter-created blocks
-  // must remain in the transclusion the user is looking at.
-  const enterSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  // the primary outline. An embed is a live editing surface: structural destinations
+  // (Enter, Arrow navigation, and empty-block merge/delete) must remain in the
+  // transclusion the user is looking at.
+  const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   // Caret/selection stashed when the *window* (not this block) loses focus, so
   // returning to Tine resumes editing exactly where you left off.
@@ -1047,6 +1054,13 @@ export function Editor(props: { id: string }): JSX.Element {
   const sheetInitialRaw = sheetCell ? node()?.raw ?? "" : null;
   // Page format drives in-block list markers (`-` is an org bullet, not md).
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
+  const isFirstPagePropertiesBlock = (raw: string) => {
+    const page = pageByName(node().page);
+    return page?.format === "md"
+      && !page.preBlock
+      && page.roots[0] === props.id
+      && isPropertiesOnly(raw);
+  };
 
   // What the textarea shows. Annotation (PDF highlight) blocks expose only their
   // highlight text (all metadata hidden); every other block hides just the
@@ -1205,9 +1219,15 @@ export function Editor(props: { id: string }): JSX.Element {
     }
     setAc(t);
     setAcIndex(0);
-    if (t.kind === "lang") {
-      // ```lang picker — a language list, mirroring the [[ / # popup.
-      setAcItems(filterLanguages(t.query).map((l) => ({ label: l, insert: l })));
+    if (t.kind === "code-language") {
+      setAcItems(codeLanguageItems(t.query).map((language) => ({
+        label: language.label,
+        sub: [language.id, ...language.aliases].join(" · "),
+        insert: language.id,
+        // If a completed fence scaffold already follows, land on its code line;
+        // a hand-typed one-line fence stays at the end and Enter behaves normally.
+        caret: language.id.length + (ref.value[t.end] === "\n" ? 1 : 0),
+      })));
       return;
     }
     if (t.kind === "command") {
@@ -1304,13 +1324,24 @@ export function Editor(props: { id: string }): JSX.Element {
   // non-empty selection exists in this block's editor.
   const [hasSel, setHasSel] = createSignal(false);
   const updateSel = () => setHasSel(ref.selectionStart !== ref.selectionEnd);
-  const fmt = (left: string, right?: string) => {
-    applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, left, right));
+  const [selectionOverflowOpen, setSelectionOverflowOpen] = createSignal(false);
+  const runSelectionAction = (action: SelectionAction) => {
+    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd));
+    setSelectionOverflowOpen(false);
     queueMicrotask(updateSel);
   };
-  const doLink = () => {
-    applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd));
-    setHasSel(false);
+  const selectionActionLabel = (action: SelectionAction): JSX.Element => {
+    if (action.id === "bold") return <b>{action.label}</b>;
+    if (action.id === "italic") return <i>{action.label}</i>;
+    if (action.id === "strikethrough") return <s>{action.label}</s>;
+    if (action.id === "highlight") return <mark>{action.label}</mark>;
+    if (action.id === "link") return (
+      <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+        <path d="M9 15l6-6M10 6l1-1a4 4 0 015.7 5.7l-1 1M14 18l-1 1a4 4 0 01-5.7-5.7l1-1"
+          fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </svg>
+    );
+    return action.label;
   };
 
   // Insert `text` in place of the active trigger and restore the caret. If the
@@ -1379,7 +1410,12 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     if (stored !== candidate) seedAssetBlob(stored, bytes);
-    const md = assetMarkdown(stored);
+    const page = pageByName(doc.byId[props.id]?.page ?? "");
+    const md = assetMarkdown(stored, {
+      label: origName,
+      pagePath: page?.path,
+      format: formatForBlock(props.id),
+    });
     // The user may have kept typing while a large capture was being fsynced; use
     // the current selection instead of replaying a stale pre-write offset.
     const start = ref.selectionStart;
@@ -1394,9 +1430,14 @@ export function Editor(props: { id: string }): JSX.Element {
     });
   };
 
-  const insertStoredAssets = (names: string[]) => {
-    if (!names.length) return;
-    const markdown = names.map(assetMarkdown).join("\n");
+  const insertStoredAssets = (assets: { stored: string; label?: string }[]) => {
+    if (!assets.length) return;
+    const page = pageByName(doc.byId[props.id]?.page ?? "");
+    const markdown = assets.map(({ stored, label }) => assetMarkdown(stored, {
+      label,
+      pagePath: page?.path,
+      format: formatForBlock(props.id),
+    })).join("\n");
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
     const newRaw = ref.value.slice(0, start) + markdown + ref.value.slice(end);
@@ -1432,7 +1473,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const toastId = pushToast("Pasting files…", "info");
     let skipped = 0;
     let nativeUnavailable = false;
-    const stored: string[] = [];
+    const stored: { stored: string; label?: string }[] = [];
     try {
       const native = await backend().clipboardFiles().catch(() => {
         nativeUnavailable = true;
@@ -1442,7 +1483,10 @@ export function Editor(props: { id: string }): JSX.Element {
         skipped += native.skipped;
         for (const file of native.files) {
           try {
-            stored.push(await trackAssetWrite(backend().importAsset(file.path, assetFileName(file.name))));
+            stored.push({
+              stored: await trackAssetWrite(backend().importAsset(file.path, assetFileName(file.name))),
+              label: file.name,
+            });
           } catch {
             skipped += 1;
           }
@@ -1485,7 +1529,7 @@ export function Editor(props: { id: string }): JSX.Element {
             }
             const candidate = assetFileName(file.name || undefined);
             const saved = await trackAssetWrite(backend().saveAsset(candidate, bytes));
-            stored.push(saved);
+            stored.push({ stored: saved, label: file.name || undefined });
             try {
               seedAssetBlob(saved, bytes);
             } catch {
@@ -1617,7 +1661,12 @@ export function Editor(props: { id: string }): JSX.Element {
       // Store with a timestamped name (keeps the original + a sortable insert time).
       const orig = path.split(/[\\/]/).pop() || undefined;
       const saved = await trackAssetWrite(backend().importAsset(path, assetFileName(orig)));
-      const md = assetMarkdown(saved);
+      const page = pageByName(doc.byId[props.id]?.page ?? "");
+      const md = assetMarkdown(saved, {
+        label: orig,
+        pagePath: page?.path,
+        format: formatForBlock(props.id),
+      });
       const pos = ref.selectionStart;
       const nr = ref.value.slice(0, pos) + md + ref.value.slice(pos);
       commit(nr); // reattach hidden id::/collapsed:: (nr is visible-only text)
@@ -1650,7 +1699,11 @@ export function Editor(props: { id: string }): JSX.Element {
       const saved = await trackAssetWrite(
         backend().saveAsset(captureAssetFileName(ed.blank.ext), bytes)
       );
-      const md = assetMarkdown(saved);
+      const page = pageByName(doc.byId[props.id]?.page ?? "");
+      const md = assetMarkdown(saved, {
+        pagePath: page?.path,
+        format: formatForBlock(props.id),
+      });
       const pos = ref.selectionStart;
       const nr = ref.value.slice(0, pos) + md + ref.value.slice(pos);
       commit(nr); // reattach hidden id::/collapsed:: (nr is visible-only text)
@@ -1674,24 +1727,6 @@ export function Editor(props: { id: string }): JSX.Element {
   const selectAc = (item: AcItem) => {
     const t = ac();
     if (!t) return;
-    if (t.kind === "lang") {
-      // Put the language on the fence line, then drop the caret onto the code line
-      // below (the fence's content), so typing goes straight into the code and
-      // Enter there adds lines (per the fence editing fix) rather than splitting.
-      const lang = item.insert ?? "";
-      const value = ref.value.slice(0, t.start) + lang + ref.value.slice(t.end);
-      const nl = value.indexOf("\n", t.start + lang.length);
-      const caret = nl === -1 ? value.length : nl + 1;
-      commit(value);
-      closeAc();
-      queueMicrotask(() => {
-        ref.value = value;
-        ref.setSelectionRange(caret, caret);
-        ref.focus();
-        autosize();
-      });
-      return;
-    }
     if (item.blockRef) {
       // Insert `((uuid))` now (resolves in-session via the in-memory uuid), then
       // durably stamp the target's id:: in the background so it survives restart.
@@ -1715,14 +1750,6 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     switch (item.action) {
-      case "code-block": {
-        // Insert the fence with the caret right after the opening ```, then open
-        // the language picker so a language can be chosen immediately (like Logseq).
-        // Choosing one drops the caret onto the code line (see the "lang" branch).
-        replaceTrigger("```\n\n```", 3);
-        queueMicrotask(() => void updateAutocomplete());
-        return;
-      }
       case "calc-block": {
         // Insert an empty ```calc fence and commit it — that flips the editor into
         // calc mode (editingCalc latches true), so the gutter + live results appear
@@ -1760,6 +1787,34 @@ export function Editor(props: { id: string }): JSX.Element {
         closeAc();
         setQueryBuilderAutoOpen(props.id);
         endEdit("query-builder");
+        return;
+      }
+      case "code-block": {
+        // Keep the familiar complete fence scaffold, but open the language
+        // picker immediately even though an empty hand-typed fence stays quiet.
+        const scaffold = "```\n\n```";
+        const result = applyCompletion(ref.value, t.start, t.end, scaffold, 3);
+        const languageTrigger: Trigger = {
+          kind: "code-language",
+          query: "",
+          start: t.start + 3,
+          end: t.start + 3,
+        };
+        commit(result.raw);
+        setAc(languageTrigger);
+        setAcIndex(0);
+        setAcItems(codeLanguageItems("").map((language) => ({
+          label: language.label,
+          sub: [language.id, ...language.aliases].join(" · "),
+          insert: language.id,
+          caret: language.id.length + 1,
+        })));
+        queueMicrotask(() => {
+          ref.value = result.raw;
+          ref.setSelectionRange(result.caret, result.caret);
+          ref.focus();
+          autosize();
+        });
         return;
       }
       case "page-props": {
@@ -2462,12 +2517,14 @@ export function Editor(props: { id: string }): JSX.Element {
 
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       const inFence = !isAnnot() && caretInFence(raw, start);
+      const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence) && start === end) {
-        const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
+      if ((isCalc() || inFence || inPageProperties) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : "properties";
+        const trimmed = multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
           let newId = props.id;
@@ -2475,9 +2532,20 @@ export function Editor(props: { id: string }): JSX.Element {
             commit(trimmed);
             newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
           });
-          startEditing(newId, 0, null, enterSurface());
+          startEditing(newId, 0, null, editSurface());
           return;
         }
+      }
+      // A Markdown page's first properties-only bullet is OG's page-property
+      // editor. Enter after a property stays in the same textarea so the next
+      // `key:: value` pair can be typed; Enter again on the empty trailing line
+      // takes the double-Enter exit above and creates an ordinary body bullet.
+      // Use the explicit edit path instead of relying on a browser textarea's
+      // native default so the update/autosize/undo behavior is deterministic.
+      if (inPageProperties && caretOnPropertyLine(raw, start)) {
+        e.preventDefault();
+        softNewlineCmd();
+        return;
       }
       // In a calc block, Enter adds a new expression line (stays in the block) —
       // let the textarea insert the newline natively, like OG.
@@ -2513,10 +2581,10 @@ export function Editor(props: { id: string }): JSX.Element {
         // adds a new sibling bullet below, which the user can Tab to nest as a
         // note under the highlight.
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-        startEditing(newId, 0, null, enterSurface());
+        startEditing(newId, 0, null, editSurface());
       } else {
         const zoomRoot = outlineScope?.forceExpandedRoot === props.id;
-        splitBlock(props.id, start, zoomRoot, zoomRoot, enterSurface());
+        splitBlock(props.id, start, zoomRoot, zoomRoot, editSurface());
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both
@@ -2544,7 +2612,7 @@ export function Editor(props: { id: string }): JSX.Element {
         // Never merge a highlight or calc block away (their structure must stay).
         if (isAnnot() || isCalc()) return;
         commit(raw);
-        if (mergeWithPrev(props.id, outlineScope)) {
+        if (mergeWithPrev(props.id, outlineScope, editSurface())) {
           e.preventDefault();
           return;
         }
@@ -2553,7 +2621,7 @@ export function Editor(props: { id: string }): JSX.Element {
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
-          startEditing(next, 0);
+          startEditing(next, 0, null, editSurface());
         }
       }
     } else if (e.key === "ArrowUp" && !e.shiftKey) {
@@ -2568,7 +2636,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" });
+          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, editSurface());
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -2583,7 +2651,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, { col, edge: "first" });
+          startEditing(next, { col, edge: "first" }, null, editSurface());
         } else {
           // No next LOADED block. In the journal feed, pull in the next day so
           // Down-arrow keeps going past the loaded window (previously only a
@@ -2592,7 +2660,9 @@ export function Editor(props: { id: string }): JSX.Element {
           if (!outlineScope) {
             e.preventDefault();
             commit(raw);
-            void nextVisibleOrExtend(props.id).then((n) => n && startEditing(n, { col, edge: "first" }));
+            void nextVisibleOrExtend(props.id).then((n) =>
+              n && startEditing(n, { col, edge: "first" }, null, editSurface())
+            );
           }
         }
       }
@@ -2859,16 +2929,46 @@ export function Editor(props: { id: string }): JSX.Element {
       </Show>
       <Show when={hasSel()}>
         <div class="sel-toolbar" onMouseDown={(e) => e.preventDefault()}>
-          <button title="Bold (mod+b)" onClick={() => fmt("**")}><b>B</b></button>
-          <button title="Italic (mod+i)" onClick={() => fmt("*")}><i>I</i></button>
-          <button title="Strikethrough" onClick={() => fmt("~~")}><s>S</s></button>
-          <button title="Highlight" onClick={() => fmt("==")}><mark>H</mark></button>
-          <button title="Link" onClick={doLink}>
-            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
-              <path d="M9 15l6-6M10 6l1-1a4 4 0 015.7 5.7l-1 1M14 18l-1 1a4 4 0 01-5.7-5.7l1-1"
-                fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-            </svg>
-          </button>
+          <For each={essentialSelectionActions}>{(action) => (
+            <button
+              classList={{ "sel-action-page-link": action.id === "page-link" }}
+              title={action.title}
+              aria-label={action.title}
+              data-selection-action={action.id}
+              onClick={() => runSelectionAction(action)}
+            >{selectionActionLabel(action)}</button>
+          )}</For>
+          <div class="sel-toolbar-secondary">
+            <For each={secondarySelectionActions}>{(action) => (
+              <button
+                title={action.title}
+                aria-label={action.title}
+                data-selection-action={action.id}
+                onClick={() => runSelectionAction(action)}
+              >{selectionActionLabel(action)}</button>
+            )}</For>
+          </div>
+          <button
+            class="sel-toolbar-more"
+            title="More formatting"
+            aria-label="More formatting"
+            aria-haspopup="menu"
+            aria-expanded={selectionOverflowOpen()}
+            onClick={() => setSelectionOverflowOpen((open) => !open)}
+          >…</button>
+          <Show when={selectionOverflowOpen()}>
+            <div class="sel-toolbar-overflow" role="menu" aria-label="More formatting">
+              <For each={secondarySelectionActions}>{(action) => (
+                <button
+                  role="menuitem"
+                  title={action.title}
+                  aria-label={action.title}
+                  data-selection-action={action.id}
+                  onClick={() => runSelectionAction(action)}
+                >{selectionActionLabel(action)}</button>
+              )}</For>
+            </div>
+          </Show>
         </div>
       </Show>
       <Show when={ac() && acItems().length > 0 && acRect()}>

@@ -125,6 +125,11 @@ import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision } from "../types";
 import { formatJournal } from "../journal";
+import {
+  launcherRankingEnabled,
+  resetLauncherRanking,
+  setLauncherRankingEnabled,
+} from "../launcherRanking";
 
 // Journal display-title formats offered in the date-format dropdown — OG's
 // `journal-title-formatters` set (frontend/date.cljs). Display-only; the on-disk
@@ -182,6 +187,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "editor", label: "File format", description: "new pages Markdown Org" },
   { tab: "editor", label: "Link autocomplete default", description: "create page first match", level: "advanced" },
   { tab: "editor", label: "Switch to an already-open tab when navigating", description: "reuse tabs", level: "advanced" },
+  { tab: "editor", label: "Learn Ctrl+K choices", description: "adaptive launcher ranking reset history", level: "advanced" },
   { tab: "editor", label: "Spell checker", description: "dictionaries languages spelling" },
   { tab: "editor", label: "Copy a parent block's sub-blocks", description: "clipboard subtree", level: "advanced" },
   { tab: "editor", label: "Strip collapsed:: when copying", description: "clipboard properties", level: "advanced" },
@@ -533,6 +539,21 @@ function ThemeGalleryCard(props: {
 }
 
 function AppearanceTab(props: { search: string }): JSX.Element {
+  const [savingNativeFrame, setSavingNativeFrame] = createSignal(false);
+  const changeNativeFrame = async () => {
+    if (savingNativeFrame()) return;
+    setSavingNativeFrame(true);
+    const next = !nativeFrameEnabled();
+    try {
+      await setNativeFrame(next);
+      pushToast("Saved. Restart Tine to apply the window-frame change.", "info");
+    } catch (error) {
+      pushToast(`Couldn't save the window-frame setting. (${String(error)})`, "error");
+    } finally {
+      setSavingNativeFrame(false);
+    }
+  };
+
   return (
     <>
       <div class="settings-row">
@@ -684,9 +705,9 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       <Show when={isTauri() && !isMac}>
         <Field
           label="System title bar & window controls"
-          hint="Use your OS's native window frame (title bar, minimize/maximize/close, rounded corners) instead of Tine's compact built-in controls. Off by default — the built-in controls save a row of vertical space."
+          hint="Use your OS's native window frame (title bar, minimize/maximize/close, rounded corners) instead of Tine's compact built-in controls. Restart Tine after changing this setting. Off by default — the built-in controls save a row of vertical space."
         >
-          <Toggle on={nativeFrameEnabled()} onClick={() => setNativeFrame(!nativeFrameEnabled())} />
+          <Toggle on={nativeFrameEnabled()} onClick={() => void changeNativeFrame()} />
         </Field>
       </Show>
       <Show when={isTauri() && isMac}>
@@ -1137,6 +1158,28 @@ function EditorTab(props: { search: string }): JSX.Element {
           hint="Plain navigation to a page, journal, or exact zoomed/file-pinned view focuses the matching tab if one is already open. Middle-click and explicit Open in new tab still create another tab."
         >
           <Toggle on={navReuseTabs()} onClick={() => setNavReuseTabs(!navReuseTabs())} />
+        </Field>
+
+        <Field
+          label="Learn Ctrl+K choices"
+          hint="After you deliberately open the same result more than once for a query, Ctrl+K may prefer it only among equally strong matches. History stays on this device and in this graph; saved searches and queries remain deterministic."
+        >
+          <>
+            <Toggle
+              on={launcherRankingEnabled()}
+              onClick={() => setLauncherRankingEnabled(!launcherRankingEnabled())}
+            />
+            <button
+              type="button"
+              class="og-revert"
+              onClick={() => {
+                resetLauncherRanking(graphMeta()?.root ?? "");
+                pushToast("Ctrl+K ranking reset for this graph");
+              }}
+            >
+              Reset ranking
+            </button>
+          </>
         </Field>
 
         <OgField
