@@ -7,6 +7,11 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
+  /* Cap the scroll chain at the shell so an inner pane hitting its top edge
+     doesn't propagate to the viewport, where WebKitGTK rubber-bands the whole
+     painted surface (sidebar + topbar bounce along with the content). The app
+     shell never scrolls itself, so this only removes the elastic overscroll. */
+  overscroll-behavior: none;
 }
 
 body {
