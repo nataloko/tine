@@ -30,6 +30,14 @@ fs.writeFileSync(`${GRAPH}/pages/Research.md`, [
   "- alpha repeats alpha and beta remains visible",
   "",
 ].join("\n"));
+const longPageToken = `GH140-${"unbroken-page-token-".repeat(8)}`;
+for (let index = 0; index < 140; index += 1) {
+  const suffix = index === 0 ? longPageToken : `result-${String(index).padStart(3, "0")}`;
+  // The persistent workspace returns at most 40 page hits plus 100 block hits.
+  // Matching both the title and body reproduces the reporter's literal 140-row
+  // result composition instead of a smaller page-only approximation.
+  fs.writeFileSync(`${GRAPH}/pages/Overflow ${suffix}.md`, "- Overflow geometry witness alpha\n");
+}
 fs.writeFileSync(`${GRAPH}/pages/Query parity.md`, [
   "- {{query (and (task TODO) (priority A) (not (page Templates)) (sort-by modified desc))}}",
   ...Array.from({ length: 9 }, (_, index) => `- TODO [#A] Included result ${index + 1}`),
@@ -193,6 +201,28 @@ await withApp(0, async (browser) => {
     || inlineProof.rows.some((row) => row.page !== "Query parity" || !row.text?.includes("Included result") || row.marks !== 0)) {
     throw new Error(`DSL Search presentation changed membership or invented evidence: ${JSON.stringify(inlineProof)}`);
   }
+  // The inline query's left-hand Filters/Advanced builder is a sibling Search
+  // renderer to the reporter's persistent workspace. Both result families must
+  // obey the same narrow-pane geometry contract.
+  await browser.setWindowSize(720, 700);
+  const inlineWrapProof = await browser.execute(() => {
+    const container = document.querySelector(".query-search-results")?.getBoundingClientRect();
+    return [...document.querySelectorAll(".query-search-results .query-search-hit")].map((row) => {
+      const rect = row.getBoundingClientRect();
+      return {
+        scrollWidth: row.scrollWidth,
+        clientWidth: row.clientWidth,
+        left: rect.left,
+        right: rect.right,
+        containerLeft: container?.left,
+        containerRight: container?.right,
+      };
+    });
+  });
+  if (!inlineWrapProof.length || inlineWrapProof.some((row) => row.scrollWidth > row.clientWidth + 1
+    || row.left < row.containerLeft - 1 || row.right > row.containerRight + 1)) {
+    throw new Error(`inline Filters/Advanced Search rows overflow the narrow pane: ${JSON.stringify(inlineWrapProof)}`);
+  }
   await browser.saveScreenshot(path.join(ARTIFACTS, "inline-query-search.png"));
 
   await browser.keys(["Control", "k"]);
@@ -280,6 +310,64 @@ await withApp(0, async (browser) => {
   }
   await assertInPageFind(browser, "alpha", ".query-result-row.inpage-find-active-block");
 
+  // The reporter's v0.5.9 follow-up was not a two-block row case: it was the
+  // persistent workspace with roughly 140 PAGE hits, including an intrinsically
+  // wide title. Drive that literal family and assert the complete pane/grid
+  // chain, because a row-only white-space assertion missed the grid item's
+  // automatic min-content width and let the entire pane grow horizontally.
+  const clearedSource = await browser.execute(() => {
+    const input = document.querySelector(".query-workspace-source");
+    if (!(input instanceof HTMLInputElement)) return false;
+    input.value = "";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContent" }));
+    return true;
+  });
+  if (!clearedSource) throw new Error("persistent query source was not available to clear");
+  await browser.$(".query-advanced-toggle").click();
+  await browser.$(".query-advanced-modal").waitForExist({ timeout: 5_000 });
+  const friendlyInputs = await browser.$$(".query-friendly-fields input");
+  await friendlyInputs[0].setValue("Overflow");
+  await browser.$(".query-advanced-actions .primary").click();
+  await browser.$(".query-advanced-modal").waitForExist({ reverse: true, timeout: 5_000 });
+  await browser.waitUntil(async () => (await browser.$$(".query-results-search .query-result-row")).length === 140, {
+    timeout: 15_000, timeoutMsg: "persistent workspace did not render the 140 page-result fixture",
+  });
+  const fullPaneWrapProof = await browser.execute(() => {
+    const pane = document.querySelector(".query-workspace")?.closest(".main-content");
+    const workspace = document.querySelector(".query-workspace");
+    const grid = document.querySelector(".query-results-search");
+    const items = [...document.querySelectorAll('.query-results-search > [role="listitem"]')];
+    const rows = [...document.querySelectorAll(".query-results-search .query-result-row")];
+    const measure = (element) => element ? {
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+      left: element.getBoundingClientRect().left,
+      right: element.getBoundingClientRect().right,
+    } : null;
+    return {
+      viewport: document.documentElement.clientWidth,
+      bodyScrollWidth: document.body.scrollWidth,
+      pane: measure(pane),
+      workspace: measure(workspace),
+      grid: measure(grid),
+      items: items.map(measure),
+      rows: rows.map(measure),
+    };
+  });
+  const overflows = (entry) => !entry || entry.scrollWidth > entry.clientWidth + 1
+    || entry.left < -1 || entry.right > fullPaneWrapProof.viewport + 1;
+  if (fullPaneWrapProof.bodyScrollWidth > fullPaneWrapProof.viewport + 1
+    || overflows(fullPaneWrapProof.pane)
+    || overflows(fullPaneWrapProof.workspace)
+    || overflows(fullPaneWrapProof.grid)
+    || fullPaneWrapProof.items.length !== 140
+    || fullPaneWrapProof.items.some(overflows)
+    || fullPaneWrapProof.rows.length !== 140
+    || fullPaneWrapProof.rows.some(overflows)) {
+    throw new Error(`persistent 140-page Search workspace overflows its pane: ${JSON.stringify(fullPaneWrapProof)}`);
+  }
+  await browser.saveScreenshot(path.join(ARTIFACTS, "query-workspace-140-page-wrap.png"));
+
   await browser.$(".query-explain-toggle").click();
   await browser.$(".query-workspace-explanation").waitForExist({ timeout: 10_000 });
   await browser.$(".query-advanced-toggle").click();
@@ -299,7 +387,7 @@ await withApp(0, async (browser) => {
 await withApp(1, async (browser) => {
   await browser.$(".query-workspace").waitForExist({ timeout: 20_000 });
   const source = await browser.$(".query-workspace-source");
-  if ((await source.getValue()) !== "alpha beta -draft") throw new Error("restart lost the virtual query source");
+  if ((await source.getValue()) !== "Overflow") throw new Error("restart lost the edited virtual query source");
   const restoredTable = await presentationButton(browser, "Table");
   if ((await restoredTable.getAttribute("aria-pressed")) !== "true") {
     throw new Error("restart lost the query presentation");
@@ -312,7 +400,11 @@ await withApp(1, async (browser) => {
     "Second unlinked.md",
     "Templates.md",
     "Unlinked source.md",
-  ];
+    ...Array.from({ length: 140 }, (_, index) => {
+      const suffix = index === 0 ? longPageToken : `result-${String(index).padStart(3, "0")}`;
+      return `Overflow ${suffix}.md`;
+    }),
+  ].sort();
   if (JSON.stringify(graphFilesBefore) !== JSON.stringify(expectedBefore)) {
     throw new Error(`virtual query wrote a temporary page: ${graphFilesBefore.join(", ")}`);
   }
@@ -325,7 +417,7 @@ await withApp(1, async (browser) => {
   });
   await sleep(1000);
   const saved = fs.readFileSync(`${GRAPH}/pages/Saved evidence search.md`, "utf8");
-  if (!saved.includes('{{query (search "alpha beta -draft")}}') || !saved.includes("tine.view:: table")) {
+  if (!saved.includes('{{query (search "Overflow")}}') || !saved.includes("tine.view:: table")) {
     throw new Error(`materialized page is not the canonical one-block query:\n${saved}`);
   }
 });

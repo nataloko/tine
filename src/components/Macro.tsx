@@ -4,6 +4,7 @@ import { openPage, openPageAtBlock, openPageInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
+import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
 import { SearchResultRow } from "./SearchResultRow";
@@ -329,6 +330,16 @@ export function QueryMacro(props: {
     if (state.error) return gs;
     return regroupSurvivors(gs, new Set(state.rows.map((r) => r.id)));
   });
+  const groupsError = () => {
+    const error = groups.error;
+    if (!error) return null;
+    const message = error instanceof Error ? error.message : String(error);
+    const oversized = message.startsWith("result-too-large:");
+    return {
+      lead: oversized ? "Query result is too large to display safely:" : "Query couldn't be loaded:",
+      message: message.replace(/^result-too-large:\s*/, ""),
+    };
+  };
   // Presentation never changes membership. Canonical `(search "…")` queries
   // already carry page/block hits and match evidence from QueryPlan. Ordinary
   // DSL queries return RefGroups, so adapt those same blocks into evidence-free
@@ -548,6 +559,13 @@ export function QueryMacro(props: {
             <Show when={props.blockId && !isAdvanced()}>
               <QueryBuilder dsl={form} onChange={applyDsl} blockId={props.blockId} />
             </Show>
+            <Show when={groupsError()}>
+              {(message) => (
+                <div class="query-unsupported" role="alert">
+                  {message().lead} {message().message}
+                </div>
+              )}
+            </Show>
             <Show when={!collapsed()}>
               <Show when={filterError()}>
                 {(err) => (
@@ -698,6 +716,7 @@ export function QueryMacro(props: {
                                       }
                                     }}
                                     onContextMenu={(e) => {
+                                      if (!shouldOpenTextContextMenu(e.target)) return;
                                       e.preventDefault();
                                       e.stopPropagation();
                                       openPageContextMenu(e.clientX, e.clientY, r.page, r.kind);
@@ -769,6 +788,7 @@ function QueryGroup(props: { page: string; group: () => RefGroup | undefined; fl
               }
             }}
             onContextMenu={(e) => {
+              if (!shouldOpenTextContextMenu(e.target)) return;
               e.preventDefault();
               e.stopPropagation();
               openPageContextMenu(e.clientX, e.clientY, props.page, kind());
@@ -906,7 +926,7 @@ export function EmbedMacro(props: { body: string }): JSX.Element {
   const target = () => props.body.replace(/^embed\s*/i, "").trim();
 
   const [data] = createResource(
-    () => `${target()} ${graphEpoch()}`,
+    () => `${target()} ${graphEpoch()} ${dataRev()}`,
     async () => {
     const t = target();
     const blockRef = /^\(\(([^)]+)\)\)$/.exec(t);

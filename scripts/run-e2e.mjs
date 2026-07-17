@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import net from "node:net";
@@ -15,6 +15,7 @@ const app = path.resolve(process.env.TINE_APP || path.join(root, process.platfor
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
 const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || 180_000);
 const suiteStartedAt = new Date().toISOString();
+const checkoutRevision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 
 // Rootless/container fallback for native focus tests. CI images normally
 // install openbox + xdotool system-wide; a developer sandbox may instead keep
@@ -49,23 +50,32 @@ if (portableX11Deps) {
 }
 
 const suites = {
+  "og-parity-pilot": [
+    ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
+  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
   ],
   "linux-release": [
+    ["wayland-app-id", "scripts/e2e-wayland-app-id.mjs", {}],
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["caret-page", "scripts/e2e-caret.mjs", { CARET_MODE: "page", CARET_LABEL: "runner" }],
     ["click-caret", "scripts/e2e-clickcaret-repro.mjs", {}],
     ["block-select", "scripts/e2e-blockselect.mjs", {}],
     ["block-ref-count", "scripts/e2e-block-ref-count.mjs", {}],
+    ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
     ["rename", "scripts/e2e-rename.mjs", {}],
+    ["split-history", "scripts/e2e-split-history.mjs", {}],
     ["alias", "scripts/e2e-alias.mjs", {}],
+    ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
+    ["journal-future-feed", "scripts/e2e-journal-future-feed.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["selection-wrap", "scripts/e2e-selectwrap.mjs", {}],
+    ["tag-autocomplete", "scripts/e2e-tag-autocomplete.mjs", {}],
     ["structured-paste", "scripts/e2e-structured-paste.mjs", {}],
     ["media", "scripts/e2e-media.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", {}],
@@ -73,17 +83,25 @@ const suites = {
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
+    ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
     ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
+    ["mobile-drawers", "scripts/e2e-mobile-drawers.mjs", { TINE_E2E_FORCE_MOBILE_DRAWERS: "1" }],
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
     ["outline-guide", "scripts/e2e-outline-guide.mjs", {}],
     ["query-workspace", "scripts/e2e-query-workspace.mjs", {}],
+    ["empty-query-workspace", "scripts/e2e-empty-query-workspace.mjs", {}],
     ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
+    ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
   ],
   "windows-smoke": [
+    ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
+    ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", {}],
+    ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
+    ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
   ],
 };
 
@@ -130,6 +148,17 @@ function isRetryableDriverTransportFailure(output, errors, timedOut) {
     && /(UND_ERR_SOCKET|ECONNREFUSED|ECONNRESET|socket hang up)/.test(combined);
 }
 
+function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
+  if (timedOut || id !== "capture") return false;
+  const combined = `${output}\n${errors}`;
+  // Hosted Openbox occasionally leaves its active-window property pointing at
+  // a frame destroyed during the short single-instance forwarder's teardown.
+  // Retry the entire isolated scenario once; the second run must still prove
+  // first-show native + DOM focus and save real keyboard input.
+  return /BadWindow \(invalid Window parameter\)/.test(combined)
+    && /Quick Capture never received native focus/.test(combined);
+}
+
 function archiveInfrastructureAttempt(dir, attempt) {
   const archive = path.join(dir, `infrastructure-attempt-${attempt}`);
   fs.mkdirSync(archive, { recursive: true });
@@ -157,11 +186,30 @@ async function runScenario([id, script, extraEnv]) {
       E2E_DRIVER_PORT: String(driverPort),
       E2E_NATIVE_PORT: String(nativePort),
       E2E_PREVIEW_PORT: String(previewPort),
+      TINE_SOURCE_REVISION: process.env.TINE_SOURCE_REVISION || checkoutRevision,
       E2E_LEGACY_NOTES: "0",
       TAURI_DRIVER: process.env.TAURI_DRIVER || "tauri-driver",
-      WEBKIT_DRIVER: process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
     };
-    const nativeLinux = process.platform === "linux" && id !== "selection-wrap";
+    if (process.platform === "linux") {
+      env.WEBKIT_DRIVER = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
+    } else if (process.env.WEBKIT_DRIVER) {
+      env.WEBKIT_DRIVER = process.env.WEBKIT_DRIVER;
+    }
+    // Windows WebView2 session creation can fail before WebDriver exposes any
+    // application output. Preserve Tine's own startup milestones and panic hook
+    // beside the scenario evidence so hosted failures can be classified as an
+    // app regression or driver infrastructure rather than guessed from Edge's
+    // generic DevToolsActivePort error.
+    if (process.platform === "win32") {
+      env.TINE_DEBUG = process.env.TINE_DEBUG || "1";
+      env.TINE_DEBUG_LOG = process.env.TINE_DEBUG_LOG || path.join(dir, "tine-debug.log");
+      env.RUST_BACKTRACE = process.env.RUST_BACKTRACE || "1";
+    }
+    if (id === "og-parity-references") {
+      env.E2E_TMP_DIR = process.env.E2E_TMP_DIR
+        || path.join(os.tmpdir(), `tine-e2e-${suiteName}-${id}-${process.pid}-${driverPort}`);
+    }
+    const nativeLinux = process.platform === "linux" && id !== "selection-wrap" && id !== "wayland-app-id";
     // Tauri's Linux single-instance plugin owns a well-known session-bus name.
     // Give each native scenario a private bus so a slow WebKit/Tauri teardown
     // cannot forward the next scenario into the previous app. Processes spawned
@@ -192,8 +240,13 @@ async function runScenario([id, script, extraEnv]) {
     const output = fs.readFileSync(path.join(dir, "stdout.log"), "utf8");
     const errors = fs.readFileSync(path.join(dir, "stderr.log"), "utf8");
     const status = result.code === 0 && !timedOut ? "passed" : "failed";
-    if (status === "failed" && attempt === 1 && isRetryableDriverTransportFailure(output, errors, timedOut)) {
-      process.stdout.write(`RETRY ${id}: WebDriver session transport failed before app assertions; retaining attempt 1\n`);
+    const retryDriver = isRetryableDriverTransportFailure(output, errors, timedOut);
+    const retryNativeHarness = isRetryableNativeHarnessFailure(id, output, errors, timedOut);
+    if (status === "failed" && attempt === 1 && (retryDriver || retryNativeHarness)) {
+      const reason = retryDriver
+        ? "WebDriver session transport failed before app assertions"
+        : "hosted X11 active-window state raced a destroyed transient frame";
+      process.stdout.write(`RETRY ${id}: ${reason}; retaining attempt 1\n`);
       process.stdout.write(`${output.slice(-1200)}\n${errors.slice(-1200)}\n`);
       archiveInfrastructureAttempt(dir, attempt);
       continue;

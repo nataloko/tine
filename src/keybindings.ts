@@ -13,8 +13,6 @@ import {
   openDevtools,
   toggleTheme,
   toggleSidebar,
-  closeSwitcher,
-  closeSettings,
   openSettings,
   toggleHelpPopup,
   toggleRightSidebar,
@@ -24,24 +22,14 @@ import {
   toggleDimInactiveBlocks,
   focusMode,
   exitFocusMode,
-  switcherOpen,
-  switcherEmbryo,
-  settingsOpen,
   carryDays,
-  audioPlayer,
-  contextMenu,
-  datePicker,
-  exportModal,
-  formulaEditor,
-  helpPopupOpen,
-  lightbox,
-  pagePropsPanel,
-  pdfExportPage,
   pushToast,
   openPdfExport,
   pdfTarget,
-  welcomeOpen,
+  dismissMobileDrawer,
 } from "./ui";
+import { restoreDrawerFocus } from "./mobileDrawers";
+import { dismissTopTransient } from "./transientLayers";
 import { carryDaysBack } from "./carry";
 import {
   openJournals,
@@ -70,7 +58,7 @@ import {
 } from "./store";
 import { startEditing } from "./editorController";
 import { copyOutline } from "./clipboard";
-import { closeInPageFind, inPageFindOpen, openInPageFind } from "./inpageFind";
+import { openInPageFind } from "./inpageFind";
 import { cellSel, enterGridSelection, handleCellSelectionKey, handleSheetPasteEvent, outlinedGridSelectionId } from "./sheet/selection";
 import { decodeNavIntent } from "./navProtocol";
 import {
@@ -225,23 +213,6 @@ export function handlePaneSelectKey(e: KeyboardEvent): boolean {
   }
 }
 
-function anyOverlayOpen(): boolean {
-  return !!(
-    switcherOpen() ||
-    settingsOpen() ||
-    datePicker() ||
-    formulaEditor() ||
-    pagePropsPanel() ||
-    exportModal() ||
-    contextMenu() ||
-    helpPopupOpen() ||
-    lightbox() ||
-    audioPlayer() ||
-    pdfExportPage() ||
-    welcomeOpen()
-  );
-}
-
 // Default command table. Editor command ids mirror OG Logseq where practical.
 const COMMANDS: CommandDef[] = [
   { id: "go/search", binding: "mod+k", label: "Search / quick switch", scope: "global", run: openSwitcher, global: true },
@@ -347,7 +318,7 @@ const COMMANDS: CommandDef[] = [
   { id: "editor/italics", binding: "mod+i", label: "Italic", scope: "editor" },
   { id: "editor/strike-through", binding: "mod+shift+s", label: "Strikethrough", scope: "editor" },
   { id: "editor/highlight", binding: "mod+shift+h", label: "Highlight", scope: "editor" },
-  { id: "editor/insert-link", binding: "mod+shift+l", label: "Insert link", scope: "editor" },
+  { id: "editor/insert-link", binding: "mod+l", label: "Insert link", scope: "editor" },
   { id: "editor/clear-block", binding: "alt+l", label: "Clear block content", scope: "editor" },
   // Emacs-style cursor/kill motions.
   { id: "editor/kill-line-before", binding: "alt+u", label: "Delete to line start", scope: "editor" },
@@ -586,6 +557,19 @@ function eventToChord(e: KeyboardEvent): Chord {
   };
 }
 
+/** WebKitGTK can report Shift+Tab with a non-Tab key, but preserves its code. */
+export function isTabLikeEvent(e: KeyboardEvent, chord = eventToChord(e)): boolean {
+  return e.code === "Tab" || chord.key === "tab";
+}
+
+/** Bare Tab permits Shift but declines every platform modifier.
+ *
+ * Raw Control is deliberate: on macOS eventToChord maps `mod` from Meta, so
+ * Ctrl+Tab must not normalize into a plain editor Tab. */
+export function isPermittedTabGesture(e: KeyboardEvent, chord = eventToChord(e)): boolean {
+  return isTabLikeEvent(e, chord) && !e.ctrlKey && !chord.mod && !chord.alt && !chord.meta;
+}
+
 function chordEq(a: Chord, b: Chord): boolean {
   return a.mod === b.mod && a.shift === b.shift && a.alt === b.alt && a.meta === b.meta && a.key === b.key;
 }
@@ -683,6 +667,11 @@ function isEditableTarget(t: EventTarget | null): boolean {
   return tag === "TEXTAREA" || tag === "INPUT" || el.isContentEditable;
 }
 
+function isOutlineBlockEditorTarget(t: EventTarget | null): boolean {
+  const el = t as { tagName?: unknown; classList?: { contains?: (name: string) => boolean } } | null;
+  return el?.tagName === "TEXTAREA" && el.classList?.contains?.("block-editor") === true;
+}
+
 function focusedGridSurface(gridId: string): string | null {
   const paneId = focusedPaneId();
   const expected = paneId === "main" ? "main" : `pane:${paneId}`;
@@ -768,21 +757,14 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
   };
 
   const handler = (e: KeyboardEvent) => {
-    if (suspended) return;
+    // IME composition owns Escape.  It must not fall through to a transient,
+    // shortcut recorder, editor, or pane handler.
+    if (e.isComposing || e.keyCode === 229) return;
     // Ignore bare modifier presses (incl. Super/Windows).
     if (isModifierKey(e)) return;
 
     const chord = eventToChord(e);
     const editing = isEditableTarget(e.target);
-
-    // !editing guard: pane-select must NEVER eat keys while a text field has
-    // focus — a stale mode (entered via Esc, then click into a block) would
-    // otherwise swallow every printable/arrow/Enter and break typing.
-    if (paneSel() && !editing && handlePaneSelectKey(e)) {
-      e.preventDefault();
-      resetSeq();
-      return;
-    }
 
     // Escape, in priority order, so focus mode peels off one layer at a time
     // (Logseq-like): overlays first; then if editing a block's text let the
@@ -790,20 +772,22 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     // deselects (and in focus mode that same Esc exits focus); else exit focus.
     // Net: editing → Esc (to block-select) → Esc (exit focus) = twice, not once.
     if (e.key === "Escape") {
-      if (inPageFindOpen()) {
-        closeInPageFind();
-        e.preventDefault();
-        resetSeq();
-        return;
+      if (dismissTopTransient("escape")) {
+        e.preventDefault(); e.stopImmediatePropagation(); resetSeq(); return;
       }
-      if (switcherOpen() || settingsOpen()) {
-        const embryo = switcherEmbryo();
-        closeSwitcher();
-        if (embryo) closePane(embryo.paneId);
-        closeSettings();
-        e.preventDefault();
-        resetSeq();
-        return;
+      if (dismissMobileDrawer("escape")) {
+        restoreDrawerFocus("escape");
+        e.preventDefault(); e.stopImmediatePropagation(); resetSeq(); return;
+      }
+      // Settings shortcut recording suspends only the ordinary shortcut/editor/
+      // pane ladder. Escape's transient/drawer prefix above remains available,
+      // but an unconsumed Escape must be stopped at capture so it cannot reach a
+      // target-local editor handler.
+      if (suspended) {
+        e.preventDefault(); e.stopImmediatePropagation(); resetSeq(); return;
+      }
+      if (paneSel() && !editing && handlePaneSelectKey(e)) {
+        e.preventDefault(); resetSeq(); return;
       }
       if (editing) return; // defer to the editor's own Esc (capture phase)
       if (cellSel() && handleCellSelectionKey(e)) {
@@ -828,11 +812,19 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
         resetSeq();
         return;
       }
-      if (anyOverlayOpen()) {
-        resetSeq();
-        return;
-      }
       enterPaneSelectFromFocus();
+      e.preventDefault();
+      resetSeq();
+      return;
+    }
+
+    // Settings shortcut recording still declines non-Escape input so its own
+    // capture listener can record ordinary chords.
+    if (suspended) return;
+
+    // !editing guard: pane-select must NEVER eat ordinary keys while a text
+    // field has focus. Escape itself was handled after transient/drawer.
+    if (paneSel() && !editing && handlePaneSelectKey(e)) {
       e.preventDefault();
       resetSeq();
       return;
@@ -875,9 +867,10 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     // While typing, only modifier chords are eligible (so "g j" doesn't fire).
     if (editing && !chord.mod) {
       // Cancel GTK/browser focus traversal on Tab/Shift+Tab in the capture
-      // phase (WebKitGTK grabs it before the textarea can), but still let the
-      // event reach the editor so it can indent/outdent.
-      if (e.code === "Tab" || chord.key === "tab") e.preventDefault();
+      // phase (WebKitGTK grabs it before an outline editor can), but still let
+      // that editor receive its owned gesture. Native form controls retain
+      // their browser focus traversal and blur behavior.
+      if (isOutlineBlockEditorTarget(e.target) && isPermittedTabGesture(e, chord)) e.preventDefault();
       resetSeq();
       return;
     }

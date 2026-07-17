@@ -8,6 +8,202 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-07-16
+
+### Added
+
+- **At viewport widths below 640 px, sidebars now behave as modal drawers.**
+  They overlay instead of squeezing the page, isolate background controls, and
+  dismiss safely via the scrim, Escape, or Android Back while restoring focus.
+  At 640 px and wider, including tablets, persistent sidebar and split-pane
+  behavior is unchanged. (GH #161)
+
+### Fixed
+
+- **Split-pane Back and Forward stay with the pane you focused.** Clicking the
+  global navigation toolbar no longer retargets history to the main pane before
+  the action runs; pane-targeted Search and Journals controls preserve the same
+  focused-router contract. (GH #170)
+- **Existing PDF highlights now expose their reference workflow.** On desktop,
+  text and area highlights offer **Copy ref** and **Linked references** from the
+  same click or right-click menu; both actions safely ensure the annotation
+  block before copying or opening it with its ordinary referrers visible.
+  (GH #168)
+- **Search tabs can now be opened before entering a search.** Empty virtual
+  search tabs focus their own input and remain independent until a valid search
+  is explicitly named and saved. (GH #172)
+
+- **Future-dated journals no longer displace today from the Journals feed.** They
+  remain intact and directly reachable through search, links, the calendar, and
+  All pages. (GH #171)
+
+- **Mobile disclosure controls stay separate from bullets without stealing text
+  taps.** Foldable blocks keep a wide trailing touch target on narrow Android
+  layouts, while leaf blocks no longer retain an invisible right-edge disclosure
+  hit area. Nested outlines, headings, live embeds, and sidebar rows share the
+  same touch-geometry regression. (GH #159)
+- **Bare `/` now defaults to Page reference.** `/` then Enter, Tab, or pointer
+  selection inserts `[[]]`, leaves the caret inside it, and continues directly
+  into page completion without changing typed slash-command ranking. (GH #155)
+- **Page and tag completion now use OG's adaptive default.** Exact pages remain
+  exact; strict-prefix candidates lead deterministically with Create immediately
+  after the leading match, while fuzzy-only matches leave Create first. Advanced
+  Settings also offer explicit existing-first and typed-first policies. Rapidly
+  accepting a visible result now replaces the complete current trigger, and a
+  slower older lookup cannot overwrite results for newer input.
+- **Mod-L now inserts a format-aware external link.** Markdown and Org handle
+  empty text, selected labels, and selected parser-recognized links/references
+  through the same command, toolbar, and simple slash-Link boundary.
+- **Native form fields now retain Tab and Shift+Tab focus traversal, including
+  their blur commits, while outline and Sheet-cell editors keep their
+  application-owned indentation, autocomplete, and cell-navigation behavior.**
+  (GH #157)
+- **The page-bottom Add block target now opens one focused, writable editor in
+  the originating pane.** It reuses only a rendered empty structural leaf;
+  collapsed and opaque Sheet storage tails create at the normal page or zoom
+  boundary instead of selecting an unmounted descendant. (GH #158)
+- **Bare hashtag autocomplete stays open for Unicode IME input.** CJK, Kana,
+  Hangul, Thai, accented, emoji, and namespaced tag prefixes now use the same
+  hard-stop contract as the parser instead of JavaScript's ASCII-only word
+  class, while punctuation and embedded-hash boundaries still close the picker.
+  (GH #167)
+- **Static publication is now a closed capability boundary.** Ambiguous
+  public/private source identities fail closed, generated anchors are escaped
+  separately for HTML attributes and URL fragments, ordinary links and media
+  macros share a safe-scheme policy, and the site CSP no longer permits inline
+  script handlers.
+- **PDF resources, highlight navigation, and Find have the right lifetimes.**
+  Changing assets tears down the old viewer before mounting the new identity,
+  including delayed state writes and late pdf.js loads; references into the
+  already-open asset keep it mounted and scroll to the exact highlight rather
+  than only its page, while a targetless direct reopen preserves the current
+  reading location, with both Markdown and Org annotation-page metadata.
+  Find retains a bounded text LRU, caps page text and occurrences, and drops
+  cancelled work. (GH #169)
+- **Graph-open background work and result construction have hard ceilings.** A
+  replaced graph binding cancels warm-cache and backup work between files,
+  process-wide permits prevent I/O amplification, failed `.partial-*` backups
+  are removed, and queries, references, facets, block resolution, publishing,
+  and query export enforce row/byte limits while constructing—not after cloning
+  a complete result. Reference occurrence evidence is capped while scanning,
+  all live bounded result families retain warm caches across unrelated edits
+  (including pages with unchanged aliases), semantic alias transitions still
+  invalidate them, and overflow metadata is never retained across an unknowable
+  negative transition. Persisted simple and advanced query sources fail closed
+  at shared byte and nesting ceilings before parser recursion or cache-key
+  construction, including static publication's now-bounded query memo.
+  Unlinked-reference edges follow Logseq's ASCII boundary rule.
+- **Clipboard image paste validates dimensions before decoding RGBA.** Pixel,
+  raw-buffer, PNG, frontend IPC, and native base64 limits now form one bounded
+  ingress path, avoiding several simultaneous unbounded image copies.
+- **PDF export now bounds image bytes before crossing the native/WebView
+  boundary.** Each image has a 12 MiB ceiling and one export shares a 32 MiB
+  source-byte budget; missing, remote, oversized, and over-budget images become
+  inert omission markers instead of being read, base64-expanded, copied through
+  IPC, and materialized in the print DOM without a limit.
+- **Long high-zoom PDF sessions have a real memory ceiling.** Canvas admission
+  now uses aggregate backing-store pixels (with a lower mobile budget) instead
+  of retaining up to 24 maximum-size pages, evicts before allocating, and zeroes
+  each canvas before removal so WebKit releases its bitmap promptly.
+- **Help improve Tine now fails closed when a parser reproduction cannot be
+  irreversibly anonymized.** The reversible fallback was removed, non-ASCII
+  content and custom Org identifiers are always scrubbed, only fixed public
+  grammar tokens may survive, and the UI no longer makes an absolute sharing
+  guarantee.
+- **PDF export documents no longer inherit Tine's native privileges.** Math and
+  code highlighting are rendered from bundled libraries before printing; the
+  resulting document is script-free, carries a restrictive content-security
+  policy, and runs in a sandbox without script permission instead of loading
+  executable code from a CDN inside the app origin.
+- **Nested query, reference, and block-resolution results no longer amplify
+  overlapping subtrees quadratically or omit valid nested occurrences.** Query
+  shaping now transcribes Logseq's actual rule—suppress a match only when its
+  immediate parent also matched—while reference panels retain every independently
+  countable occurrence. All native result rows stay shallow; hover previews are
+  bounded by nodes and bytes before transport, and all query macros in one
+  Copy/Export session are hydrated natively under one shared root/node/byte
+  budget without transferring their complete source pages to the WebView.
+- **The release performance gate now rejects noisy measurements instead of
+  changing its verdict on retry.** Candidate, v0.4.7, and the previous release
+  run in three order-rotated rounds; decisions use the median round result, keep
+  every sample as evidence, and fail reliability when an individual metric's
+  cross-round spread exceeds its declared limit.
+- **Backup restore stays inside the selected graph under symlink and directory
+  races.** Recovery areas and live-file publication are now bound to opened
+  directory capabilities, use create-without-replace semantics, and refuse a
+  replaced ancestor instead of following it outside the graph or approved
+  assets root.
+- **Android photo capture and picking are memory-bounded.** Camera and picker
+  results are checked for byte and pixel limits, streamed through a native cache
+  token, and then streamed into the graph without whole-file or base64 copies
+  across the Kotlin/WebView/Rust bridge.
+- **Static publishing now treats the public page set as a hard privacy
+  boundary.** Queries, page/block embeds, and namespace macros cannot expand
+  private content; each export is assembled in a guarded staging tree and then
+  swapped as one unit through bound directory capabilities, so formerly public
+  pages disappear and concurrent staging, recovery, or `publish/` symlink and
+  junction swaps cannot redirect generated writes outside the graph. The
+  previous output remains in Tine's recoverable conflict trash.
+- **Voice memos have one bounded, reachable recorder.** Desktop recording is
+  process-owned, cancels when its editor disappears, rejects concurrent starts,
+  and stops at 30 minutes or 32 MiB; Android applies the same duration/size
+  ceilings and streams the native temp directly into the graph instead of
+  multiplying a valid recording through Kotlin, JavaScript, and Rust base64
+  buffers. Failed native setup also releases its recorder and temp file.
+- **Android long-press text selection keeps the native selection UI.** Tine no
+  longer intercepts textual `contextmenu` gestures with desktop menus, including
+  page links, block references, reference panels, namespaces, embeds, and query
+  results; the bullet remains the explicit mobile block-action target.
+  (GH #162)
+- **Inline block-reference text follows every landed source transaction.** Loaded
+  targets update immediately through their reactive editor node; visible UUIDs
+  whose source was never loaded are batch-refreshed after external edits and
+  become missing after deletion, without graph-wide work on each keystroke.
+  Block embeds, previews, referrer panels, and count badges share the revision
+  invalidation contract. (GH #166)
+- **Page-property settings preserve the literal page-header structure.** New
+  properties follow Logseq's prepend behavior, updates stay in place, and the
+  real UI-to-disk round trip preserves CRLF, blank separators, and all unrelated
+  lines. The guarded native writer rejects even a forced save if an existing
+  header property has been reclassified as outline content. (GH #163)
+- **Large Search result sets remain inside persistent and inline query panes.**
+  The full workspace/grid/item chain can shrink around long unbroken content,
+  including the Filters/Advanced path with hundreds of page hits. (GH #140)
+- **Help-with-Tine anonymization now preserves the structural identity of a
+  parser divergence.** A safe scrub tier is accepted only when it retains the
+  original mismatch paths and classes; a different surviving mismatch is not
+  treated as the same report. (GH #82)
+- **Ctrl+K now includes favorites in its bounded adaptive tie-breaking.** A
+  favorite can rank first only within the same objective relevance class, just
+  like local selection history; neither signal can promote a weaker match over
+  an exact or prefix result. (GH #143)
+- **Graph writes are safer under sync and filesystem races.** New pages, PDF
+  artifacts, and demo files use no-replace publication when no baseline exists;
+  PDF highlight sidecars are restored or quarantined if their paired annotation
+  page fails; config creation merges rather than overwrites a concurrent creator;
+  rename rollback and Copy Guide withdrawal preserve files replaced during their
+  final syscall race; and Copy Guide rechecks page and asset containment at write
+  time.
+- **Settled edits avoid two graph-sized background costs.** Tine's own atomic-save
+  temp events stay on the incremental watcher path and are scoped to their owning
+  graph, while edits that do not alter block references reuse the existing badge
+  count index; any necessary rebuild now runs off the command thread.
+- **Broken audio and MKV fallback is memory-bounded.** Inline and expanded-player
+  fallbacks share one process-wide budget, cancel and release work when closed,
+  use lower size ceilings, and avoid a redundant JavaScript copy. Expanded audio
+  now keeps a streaming scrubber instead of fetching and decoding the entire
+  track into potentially gigabytes of PCM; normal media remains range-streamed
+  and larger files retain the external-player escape hatch.
+- **Plasma Wayland task switchers now resolve Tine's icon for standalone
+  binaries.** Tine replaces GTK's executable-name fallback only after the
+  Wayland top-level exists, while retaining the compatible post-map update for
+  older GTK 3.24 runtimes; the advertised ID now matches the installed desktop
+  entry before the first visible buffer.
+- **Linux Quick Capture secondary launches no longer risk an Xlib/XCB abort.**
+  Xlib's process-wide thread mode is initialized before GTK or Tauri, so the
+  short-lived global-shortcut forwarder can hand off safely while the primary
+  app is active.
+
 ## [0.5.9] - 2026-07-14
 
 ### Added

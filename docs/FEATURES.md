@@ -127,9 +127,16 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   literal unless they contain explicit page-reference syntax.
 - The `((` popup full-text-searches blocks and inserts a **durable** reference
   (writes a stable `id::` first).
-- The `[[`/`#` Enter default is configurable (Settings → *Journals & tasks* →
-  **Link autocomplete default**): create-a-new-page (default, like Logseq) or
-  link-the-first-match.
+- **Page references lead the bare `/` menu.** `/` then Enter inserts `[[]]`,
+  keeps the caret inside, and opens page completion once you start typing;
+  typed slash commands retain their existing fuzzy ranking (including `/A`).
+- The `[[`/`#` Enter default is configurable (Settings → *Editor* → Advanced →
+  **Link autocomplete default**): **OG adaptive** (default: strict-prefix
+  matches lead, fuzzy-only matches keep Create first), **Prefer existing**, or
+  **Prefer exactly what I typed**. Exact existing names always select the page.
+- **Mod-L inserts an external link** in Markdown or Org. It wraps selected plain
+  text as a label, or uses a selected URL/page/block/already-formatted link as
+  the target with an empty label.
 - **Linked & unlinked references** on every page (live/editable), with co-reference
   filtering and hover previews — and in the **right sidebar** page view too
   (shift-click a page to open it there). Both panels use the same parser-owned
@@ -169,6 +176,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   surface, a Gmail-style filter dialog, the interactive **visual query builder**
   (chip/clause bar), and the raw DSL all compile to the same query plan. Explanations
   show what Tine understood and diagnostics identify unsupported or invalid parts.
+  Nested query matches follow Logseq's exact top-level-result rule: a match is
+  suppressed only when its immediate parent is also a match, so a valid match
+  below a non-matching gap remains visible. Reference surfaces keep every direct
+  occurrence. Transport rows stay shallow, while explicit previews/exports are
+  node-and-byte/work bounded before hydration or serialization.
   The builder's **Sort** control offers one-click presets
   — *Newest / Oldest first*, *Priority*, *Page*, *Deadline*, *Scheduled* — plus a
   free-text field for any other property. *Newest first* orders results on one
@@ -177,7 +189,8 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   chronologically. (`sort-by modified/priority/page/deadline/scheduled` extend
   Logseq's property-only `sort-by`.)
 - ⊕ **Persistent search/query workspaces** — Ctrl+K can open its complete page and
-  block result set in a graph-scoped virtual tab. The workspace survives restart,
+  block result set in a graph-scoped virtual tab; an empty workspace can be opened
+  first and then searched directly in its own input. The workspace survives restart,
   switches between Search/List/Table/Board without changing membership, and remains
   outside the graph until named. Giving it a title materializes one ordinary query
   page, so exploratory search and durable dashboards share a single path.
@@ -533,6 +546,11 @@ within a column; merged cells are still v2+.
   a hardware **Back** button that navigates within Tine (exiting only at the root),
   and compact journal headers and settings for a phone. Interface size scales the
   complete Android document and persists locally.
+- **Width-responsive sidebars** — below 640 px, the left and right sidebars are
+  modal drawers over an unchanged page: tap the shaded outside edge, use their
+  close control, press Escape, or press Android Back to dismiss them safely. At
+  640 px and wider—including tablets—they remain persistent desktop-style panes,
+  can be open together, and retain their resize controls.
 - **Distribution** — sideloaded, release-signed APK attached to each GitHub
   release (built and signed in CI). Play Store / F-Droid are planned; iOS is
   being scoped.

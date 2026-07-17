@@ -23,6 +23,35 @@ export interface BlockDto {
   properties?: [string, string][];
 }
 
+/** Node-and-byte-bounded subtree used only for block-reference previews/exports. */
+export interface BlockPreview {
+  group: RefGroup;
+  /** Nodes omitted after the requested preview construction budget. */
+  truncated: number;
+}
+
+/** One rendered query macro requested by a Copy / Export session. */
+export interface QueryExportSpec {
+  key: string;
+  query: string;
+  advanced: boolean;
+}
+
+/** Native hierarchy projection for one query macro. */
+export interface QueryExportResult {
+  key: string;
+  groups: RefGroup[];
+  shown: number;
+  total: number;
+  omitted_nodes: number;
+}
+
+/** Every result in this batch shared one native root/node/byte budget. */
+export interface QueryExportBatch {
+  results: QueryExportResult[];
+  omitted_queries: number;
+}
+
 /** On-disk page format: markdown (default) or org. */
 export type Format = "md" | "org";
 
@@ -48,6 +77,15 @@ export interface PageDto {
   /** Bundled in-app Guide page: read-only, ephemeral, and excluded from normal
    *  graph persistence/search/reference surfaces. */
   guide?: boolean;
+}
+
+/** One authoritative Journals-feed transaction.  Cursor fields are ordinal
+ * journal days, never counts of returned DTOs (a selected file may vanish). */
+export interface JournalFeedPage {
+  pages: PageDto[];
+  next_before_day: number | null;
+  done: boolean;
+  as_of_day: number;
 }
 
 export interface GuidePage {

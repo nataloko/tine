@@ -1,22 +1,23 @@
 import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, recentPages, graphMeta } from "../ui";
-import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, openQueryInNewTab, route } from "../router";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, recentPages, graphMeta, isFavorite, pushToast } from "../ui";
+import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
-import { closePane, focusPane, openRouteInOtherPane, paneRouter } from "../panes";
+import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
 import { fuzzyScore } from "../editor/autocomplete";
 import { SEARCH_SYNTAX } from "../editor/searchQuery";
 import { EmojiText } from "../render/emoji";
 import { SearchResultRow } from "./SearchResultRow";
 import type { MatchSpan, ObjectiveMatchClass, PageKind } from "../types";
 import { rankLauncherItems, recordLauncherActivation } from "../launcherRanking";
+import { dismissTopTransient, registerTransientLayer } from "../transientLayers";
 
 // One selectable result row.
 type Item =
-  | { t: "page"; name: string; pageKind: PageKind; path?: string; spans?: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string }
+  | { t: "page"; name: string; pageKind: PageKind; path?: string; spans?: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean }
   | { t: "create"; name: string }
   | { t: "command"; label: string; binding: string; run: () => void }
-  | { t: "block"; page: string; pageKind: PageKind; blockId: string; text: string; crumb: string[]; spans: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string };
+  | { t: "block"; page: string; pageKind: PageKind; blockId: string; text: string; crumb: string[]; spans: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean };
 
 interface Section {
   header: string;
@@ -52,6 +53,8 @@ export function QuickSwitcher(): JSX.Element {
   });
   let inputRef: HTMLInputElement | undefined;
   let resultsRef: HTMLDivElement | undefined;
+  let originPaneId: string | null = null;
+  let wasOpen = false;
   // X11/WebKitGTK pastes the PRIMARY selection into the focused input on ANY
   // middle-click (not cancelable from the row's mousedown). We want that paste
   // only when the user middle-clicks the input itself — so a middle-click on a
@@ -124,6 +127,7 @@ export function QuickSwitcher(): JSX.Element {
         pageKind: r.kind,
         adaptiveClass: "exact",
         adaptiveIdentity: `page:${r.kind}:${r.name.toLocaleLowerCase()}`,
+        adaptiveFavorite: isFavorite(r.name),
       }));
       if (recents.length) out.push({ header: "Recent", items: recents });
       return out;
@@ -142,6 +146,7 @@ export function QuickSwitcher(): JSX.Element {
         spans: hit.evidence.flatMap((evidence) => evidence.spans),
         adaptiveClass: hit.match_class ?? "substring",
         adaptiveIdentity: `page:${hit.page.kind}:${hit.page.path || hit.page.name.toLocaleLowerCase()}`,
+        adaptiveFavorite: isFavorite(hit.page.name),
       }));
     const rankedPages = rankLauncherItems(
       graphMeta()?.root ?? "",
@@ -183,6 +188,7 @@ export function QuickSwitcher(): JSX.Element {
           spans: hit.evidence.flatMap((evidence) => evidence.spans),
           adaptiveClass: hit.match_class ?? "body_evidence",
           adaptiveIdentity: `block:${hit.kind}:${hit.page.toLocaleLowerCase()}:${hit.block.id}`,
+          adaptiveFavorite: isFavorite(hit.page),
         },
         onCur: !!(cur && hit.page === cur),
       });
@@ -227,12 +233,15 @@ export function QuickSwitcher(): JSX.Element {
   const flat = createMemo<Item[]>(() => sections().flatMap((s) => s.items));
 
   createEffect(() => {
-    if (switcherOpen()) {
+    const open = switcherOpen();
+    if (open && !wasOpen) {
+      originPaneId = switcherEmbryo()?.paneId ?? focusedRouter().paneId;
       setQuery(switcherEmbryo()?.prefill ?? "");
       setSel(0);
       setSyntaxOpen(false);
       queueMicrotask(() => inputRef?.focus());
     }
+    wasOpen = open;
   });
   // Keep the highlight in range as results change.
   createEffect(() => {
@@ -363,13 +372,8 @@ export function QuickSwitcher(): JSX.Element {
         else choose(it);
       }
     } else if (e.key === "Escape") {
-      e.preventDefault();
-      if (syntaxOpen()) {
-        setSyntaxOpen(false);
-        queueMicrotask(() => inputRef?.focus());
-      } else {
-        cancelSwitcher();
-      }
+      if (e.isComposing || e.keyCode === 229) return;
+      if (dismissTopTransient("escape")) e.preventDefault();
     }
   };
 
@@ -378,6 +382,20 @@ export function QuickSwitcher(): JSX.Element {
     closeSwitcher();
     if (embryo) closePane(embryo.paneId);
   };
+  createEffect(() => {
+    if (!switcherOpen()) return;
+    const unregister = registerTransientLayer({
+      id: "quick-switcher",
+      root: () => document.querySelector(".switcher"),
+      trigger: () => inputRef ?? null,
+      dismiss: () => {
+        if (syntaxOpen()) { setSyntaxOpen(false); queueMicrotask(() => inputRef?.focus()); return true; }
+        cancelSwitcher();
+        return true;
+      },
+    });
+    onCleanup(unregister);
+  });
 
   // Running flat index for a given (section, itemIndex), to match the cursor.
   const flatIndex = (sIdx: number, iIdx: number): number => {
@@ -508,13 +526,18 @@ export function QuickSwitcher(): JSX.Element {
                 type="button"
                 class="switcher-syntax-toggle"
                 data-open-search-tab
-                disabled={!query().trim() || !!graphResults()?.diagnostics.length}
                 onClick={() => {
-                  openQueryInNewTab(query().trim(), "search", true);
+                  const paneId = originPaneId;
+                  if (!paneId || !layoutPaneIds().includes(paneId)) {
+                    pushToast("That pane is no longer available. Close this search and try again.", "error");
+                    return;
+                  }
+                  focusPane(paneId);
+                  paneRouter(paneId).openQueryInNewTab(query().trim(), "search", true);
                   closeSwitcher();
                 }}
               >
-                Open results in tab
+                Open search tab
               </button>
             </Show>
           </div>

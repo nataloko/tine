@@ -22,19 +22,21 @@ mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    asset_trash_stats, block_ref_counts, block_referrers, close_graph_window,
+    asset_trash_stats, block_ref_counts, block_referrers, capture_quick_switch, close_graph_window,
     copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
-    empty_asset_trash, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
-    graph_source_files, guide_pages, import_asset, journal_content_days, journals_desc,
-    list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts, list_templates,
-    merge_pages, open_asset, open_page_file, page_aliases, page_icons, page_print_html, publish_html, query_facets,
-    open_pdf, quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
+    empty_asset_trash, export_query_subtrees, get_backlinks, get_page, get_page_by_path,
+    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
+    journal_content_days, journal_feed_page, list_journal_conflicts, list_orphan_assets, list_pages,
+    list_sync_conflicts, list_templates, merge_pages, open_asset, open_page_file, open_pdf,
+    page_aliases, page_icons, page_print_html, preview_block, publish_html, query_facets,
+    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
     read_local_image, read_text_file, rename_file_to_page, rename_page, resolve_block,
-    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search, run_query, save_asset, save_page,
-    save_pdf_area_image, search, set_default_journal_template, set_favorites, set_guide_announced,
-    set_journal_title_format, set_preferred_format, set_preferred_workflow, set_start_of_week,
-    set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
+    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search, run_query,
+    save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
+    set_favorites, set_guide_announced, set_journal_title_format, set_preferred_format,
+    set_preferred_workflow, set_start_of_week, set_timetracking_enabled, stream_asset_path,
+    sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset, trash_journal_file,
+    trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
@@ -43,7 +45,7 @@ use git::{
     git_commit, git_force_pull, git_force_push, git_init, git_pull, git_push, git_status,
 };
 use graph::{
-    app_platform, approve_external_assets, capture_target, create_graph, default_graph_parent,
+    app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph, default_graph_parent,
     inspect_graph_access, load_graph, open_graph_window, resolve_root, startup_graph_path, warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
@@ -66,6 +68,43 @@ use watcher::{get_watch_mode, set_watch_mode, start_watcher};
 
 #[cfg(desktop)]
 const MAIN_WINDOW_REVEAL_FALLBACK_MS: u64 = 3_000;
+
+/// Test-only policy used by the native WebKit drawer scenario.  Keeping this
+/// narrow (only `main`) prevents a phone-sized E2E process from changing capture
+/// or later graph windows.
+fn force_mobile_drawers_e2e() -> bool {
+    std::env::var("TINE_E2E_FORCE_MOBILE_DRAWERS").as_deref() == Ok("1")
+}
+
+fn apply_mobile_drawer_e2e_window_policy(
+    windows: &mut [tauri::utils::config::WindowConfig],
+    force: bool,
+) -> bool {
+    if !force {
+        return false;
+    }
+    if let Some(main) = windows.iter_mut().find(|window| window.label == "main") {
+        main.width = 390.0;
+        main.height = 844.0;
+        main.min_width = Some(390.0);
+        true
+    } else {
+        false
+    }
+}
+
+/// Xlib's thread mode is process-global and must be selected before the first
+/// GTK/Xlib call. Secondary `--capture` launches are short-lived forwarders, but
+/// GTK and Tauri can still touch X11 from separate threads during their startup
+/// and teardown; without this initialization XCB aborts instead of forwarding.
+#[cfg(target_os = "linux")]
+fn init_xlib_threads() {
+    // SAFETY: this is the first native-window call in `run`, before GTK/Tauri is
+    // initialized. Repeated calls across tests or an AppImage re-exec are safe.
+    unsafe {
+        let _ = x11::xlib::XInitThreads();
+    }
+}
 
 /// The frontend normally reveals the main window after its themed App has
 /// painted. Keep a native fail-safe so a parser/session/frontend failure cannot
@@ -107,6 +146,14 @@ fn show_capture(app: &tauri::AppHandle) {
             let _ = w.center();
         }
         let _ = w.show();
+        // Retarget the read-only capture lease before the window can receive
+        // the fallback focus. Until its frontend obtains this generation, old
+        // WebView requests fail stale instead of querying a previously selected
+        // graph after a hidden-window reopen.
+        let state = app.state::<AppState>();
+        if graph::refresh_capture_graph_binding(&state).is_err() {
+            state.clear_capture_graph();
+        }
         // Do not activate until the frontend acknowledges that its textarea and
         // capture-shown listener exist. Activating a newly mapped window first
         // lets a fast typist send keys into an unready WebView; Plasma can also
@@ -282,6 +329,9 @@ mod multi_window_tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    init_xlib_threads();
+
     // Bring up debug logging FIRST (TINE_DEBUG=1 / --debug), so every later
     // milestone — and any panic — is captured to the log file from the very start.
     debug_init();
@@ -373,10 +423,14 @@ pub fn run() {
     // and expose the frozen value to each webview so custom controls never flash.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let native_frame_active = settings::init_native_frame_active();
-    let context = tauri::generate_context!();
+    let force_mobile_drawers = force_mobile_drawers_e2e();
+    let mut context = tauri::generate_context!();
+    let deny_main_window_state_restore = apply_mobile_drawer_e2e_window_policy(
+        &mut context.config_mut().app.windows,
+        force_mobile_drawers,
+    );
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let context = {
-        let mut context = context;
+    {
         if let Some(main) = context
             .config_mut()
             .app
@@ -386,8 +440,7 @@ pub fn run() {
         {
             main.decorations = native_frame_active;
         }
-        context
-    };
+    }
 
     let builder = tauri::Builder::default().register_uri_scheme_protocol(
         "tine-media",
@@ -438,7 +491,7 @@ pub fn run() {
                         | tauri_plugin_window_state::StateFlags::POSITION
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED,
                 )
-                .with_denylist(&["capture"])
+                .with_denylist(if deny_main_window_state_restore { &["capture", "main"] } else { &["capture"] })
                 .build(),
         );
 
@@ -467,9 +520,12 @@ pub fn run() {
             let state = app.state::<AppState>();
             match event {
                 tauri::WindowEvent::Focused(true) => {
-                    let changed = state.note_focused(label);
-                    if changed {
-                        if let Ok(slot) = state::slot_for_window(&state, label) {
+                    // Auxiliary windows (Quick Capture in particular) never own
+                    // a graph slot. Letting one replace `last_focused` makes a
+                    // later capture fall back to HashMap iteration and can route
+                    // it to the wrong graph in a multi-window session.
+                    if let Ok(slot) = state::slot_for_window(&state, label) {
+                        if state.note_focused(label) {
                             let _ =
                                 settings::remember_graph(app, &slot.root_key.display().to_string());
                         }
@@ -492,6 +548,7 @@ pub fn run() {
             graph_load: Mutex::new(()),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
+            capture_graph: Mutex::new(None),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
         })
@@ -598,6 +655,7 @@ pub fn run() {
             open_graph_window,
             startup_graph_path,
             capture_target,
+            capture_graph_binding,
             capture_frontend_ready,
             create_graph,
             app_platform,
@@ -609,7 +667,7 @@ pub fn run() {
             android_media::cancel_recording,
             android_system_bars::set_system_bar_appearance,
             list_pages,
-            journals_desc,
+            journal_feed_page,
             get_page,
             graph_source_files,
             save_page,
@@ -625,6 +683,7 @@ pub fn run() {
             publish_html,
             page_print_html,
             run_query,
+            export_query_subtrees,
             run_graph_search,
             run_advanced_query,
             query_facets,
@@ -662,15 +721,18 @@ pub fn run() {
             rename_file_to_page,
             search,
             quick_switch,
+            capture_quick_switch,
             list_templates,
             journal_content_days,
             resolve_block,
             resolve_blocks,
+            preview_block,
             read_asset,
             stream_asset_path,
             read_local_image,
             read_text_file,
             import_asset,
+            import_native_capture,
             save_asset,
             read_highlights,
             open_pdf,
@@ -716,4 +778,59 @@ pub fn run() {
         ])
         .run(context)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod mobile_drawer_policy_tests {
+    use super::apply_mobile_drawer_e2e_window_policy;
+
+    #[test]
+    fn production_policy_does_not_mutate_the_real_window_config() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let before = context.config_mut().app.windows.clone();
+        assert!(!apply_mobile_drawer_e2e_window_policy(
+            &mut context.config_mut().app.windows,
+            false,
+        ));
+        assert_eq!(context.config_mut().app.windows, before);
+    }
+
+    #[test]
+    fn forced_policy_changes_only_main_in_the_real_window_config() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let capture = context
+            .config_mut()
+            .app
+            .windows
+            .iter()
+            .find(|window| window.label == "capture")
+            .expect("configured capture window")
+            .clone();
+        let mut neighbor = capture.clone();
+        neighbor.label = "neighbor".into();
+        neighbor.width = 777.0;
+        context.config_mut().app.windows.push(neighbor.clone());
+
+        assert!(apply_mobile_drawer_e2e_window_policy(
+            &mut context.config_mut().app.windows,
+            true,
+        ));
+        let windows = &context.config_mut().app.windows;
+        let main = windows
+            .iter()
+            .find(|window| window.label == "main")
+            .unwrap();
+        assert_eq!(
+            (main.width, main.height, main.min_width),
+            (390.0, 844.0, Some(390.0))
+        );
+        assert_eq!(
+            windows.iter().find(|window| window.label == "capture"),
+            Some(&capture)
+        );
+        assert_eq!(
+            windows.iter().find(|window| window.label == "neighbor"),
+            Some(&neighbor)
+        );
+    }
 }

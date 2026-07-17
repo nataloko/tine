@@ -18,7 +18,7 @@ import {
 } from "../editor/autocomplete";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
-import { linkFirstMatch } from "../editor/linkDefault";
+import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
 import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
@@ -113,13 +113,15 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
+import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest } from "../ui";
 import { seedAssetBlob } from "../assetCache";
 import { openPageInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
-import { editorCommandFor } from "../keybindings";
+import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
 import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
+import { registerTransientLayer } from "../transientLayers";
+
 import { taskCheckboxState } from "../markers";
 import { applyTemplateVars } from "../editor/templateVars";
 import {
@@ -136,7 +138,14 @@ import { AnnotationBody } from "./AnnotationBody";
 import { logbookInfo, type LogbookInfo } from "../logbook";
 import { inPageFindPreservesEditorBlur } from "../inpageFind";
 import { registerFocusedEditorCommandBridge, type MobileEditorCommandId } from "../editorCommandBridge";
-import { isRecordingAudio, setRecordingAudio, base64ToBytes } from "../mediaCapture";
+import {
+  isRecordingAudio,
+  setRecordingAudio,
+  cancelDesktopVoiceRecording,
+  desktopVoiceRecordingActive,
+  startDesktopVoiceRecording,
+  stopDesktopVoiceRecording,
+} from "../mediaCapture";
 import { sheetConfig } from "../sheet/config";
 import { SheetCellContext } from "../sheet/context";
 import { appendSheetCellChild, structuralSheetPasteNode } from "../sheet/mutations";
@@ -147,6 +156,7 @@ import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { blockBackgroundColor } from "../blockColors";
 import { SheetContainer } from "./SheetContainer";
+import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
 
 type SheetSlashView = "grid" | "table" | "board";
 
@@ -265,6 +275,9 @@ export interface CaptureApi {
   /** Grey-italic placeholder for an empty capture bullet (e.g. "Edit as usual,
    *  Ctrl-Shift-Enter to submit"), with the live, configured submit shortcut. */
   bulletHint?: () => string;
+  /** The capture WebView may only query page/tag candidates through its
+   * dedicated native capability; it never receives the general graph route. */
+  quickSwitch: (query: string, limit: number) => Promise<import("../types").PageEntry[]>;
 }
 export const CaptureCtx = createContext<CaptureApi | null>(null);
 
@@ -279,8 +292,10 @@ export interface CollapseSurfaceApi {
   toggle: (id: string, current: boolean) => void;
   setMany: (ids: readonly string[], collapsed: boolean) => void;
 }
-// A transclusion can fold a source block locally, matching Logseq, without
-// writing collapsed:: into the source outline.
+// Deliberate Tine divergence from OG Logseq: OG block embeds use the source
+// block's persisted collapsed state, while Tine lets a secondary/transcluded
+// rendering fold locally so interacting with a view cannot mutate its source.
+// Keep this surface-local contract explicit when changing collapse parity.
 export const CollapseSurfaceContext = createContext<CollapseSurfaceApi | null>(null);
 
 export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
@@ -361,6 +376,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   const editorIsUniline = createMemo(() => !editorVisibleValue().includes("\n"));
   // Block-level "linked references" panel toggled by the reference-count badge.
   const [showRefs, setShowRefs] = createSignal(false);
+  createEffect(() => {
+    if (blockReferencesRequest()?.id === props.id) setShowRefs(true);
+  });
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
   // not its children); null for a normal bullet.
   const orderMarker = () => orderedListMarker(props.id);
@@ -434,6 +452,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           editing: editing(),
         }}
         onContextMenu={(e) => {
+          if (!shouldOpenBlockContextMenu(e.target)) return;
           e.preventDefault();
           openContextMenu(e.clientX, e.clientY, props.id);
         }}
@@ -738,6 +757,7 @@ function Rendered(props: {
   const body = (
     <Show when={annotation()} fallback={<AstBody raw={node().raw} blockId={props.id} format={fmt()} headingLevel={facets().headingLevel} />}>
       <AnnotationBody
+        highlightId={props.id}
         color={annotation()!.color}
         hlPage={annotation()!.hlPage}
         line={annotationLine()}
@@ -1047,6 +1067,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // transclusion the user is looking at.
   const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
+  const autocompleteLayerId = `block-completion-${createUniqueId()}`;
   // Caret/selection stashed when the *window* (not this block) loses focus, so
   // returning to Tine resumes editing exactly where you left off.
   let savedSel: { start: number; end: number } | null = null;
@@ -1210,6 +1231,24 @@ export function Editor(props: { id: string }): JSX.Element {
     setAcItems([]);
     setAcIndex(0);
   };
+  const sameAcTrigger = (left: Trigger | null, right: Trigger): boolean =>
+    left !== null &&
+    left.kind === right.kind &&
+    left.query === right.query &&
+    left.start === right.start &&
+    left.end === right.end;
+  // Page/block/tag/command/code completion is a real transient above its editor
+  // and, on mobile, above the drawer. One Escape peels only this popup.
+  createEffect(() => {
+    if (!ac() || !acItems().length) return;
+    const unregister = registerTransientLayer({
+      id: autocompleteLayerId,
+      root: () => acListRef ?? null,
+      trigger: () => ref ?? null,
+      dismiss: () => { closeAc(); ref?.focus(); return true; },
+    });
+    onCleanup(unregister);
+  });
 
   const updateAutocomplete = async () => {
     const t = detectTrigger(ref.value, ref.selectionStart);
@@ -1234,19 +1273,19 @@ export function Editor(props: { id: string }): JSX.Element {
       const q = t.query;
       const tmpls = await getTemplates();
       const cur = ac();
-      if (!cur || cur.start !== t.start) return; // trigger changed while awaiting
+      if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
       // Commands AND templates in one fuzzy-ranked list, so a strong template
       // match can outrank a weak command (and vice-versa). Empty query (bare `/`)
       // lists all commands in defined order, no templates. `idx` preserves the
       // defined order — commands before templates — as the stable tiebreaker.
       const showAllTemplates = !!q && "template".startsWith(q.toLowerCase()); // /t…/template lists them all
       const scored: { item: AcItem; s: number; idx: number }[] = [];
-      COMMANDS.forEach((c, i) => {
+      COMMANDS.forEach((c) => {
         // /drawio launches an external editor — desktop only (GH #38).
         if (c.action === "drawio" && isMobilePlatform) return;
         const s = q ? commandScore(q, c) : 1;
         if (s > 0)
-          scored.push({ item: { label: c.label, insert: c.insert, caret: c.caret, action: c.action }, s, idx: i });
+          scored.push({ item: { label: c.label, insert: c.insert, caret: c.caret, action: c.action }, s, idx: q ? c.matchTieOrder : c.bareOrder });
       });
       if (q) {
         tmpls.forEach((tp, j) => {
@@ -1265,7 +1304,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // the user types. Selecting inserts `((uuid))` (see selectAc).
       const groups = await backend().search(t.query, 8, "block-picker");
       const cur = ac();
-      if (!cur || cur.start !== t.start) return; // trigger changed while awaiting
+      if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
       const items: AcItem[] = [];
       for (const g of groups) {
         for (const b of g.blocks) {
@@ -1279,17 +1318,16 @@ export function Editor(props: { id: string }): JSX.Element {
       setAcItems(items);
       return;
     }
-    const pages = await backend().quickSwitch(t.query, 8);
-    const cur = ac();
-    if (!cur || cur.start !== t.start) return; // trigger changed while awaiting
-    // Default (first / Enter) item when the query is neither blank nor an exact
-    // existing page. OG behavior (linkFirstMatch OFF): "Create <typed>" leads, so
-    // a fresh #tag or [[page]] + Enter MAKES it — even when it prefix-/fuzzy-
-    // matches an existing page (e.g. #book → a "Books" page) — and the matches
-    // follow (arrow down to link instead). With linkFirstMatch ON: the first
-    // match leads (Enter LINKS) and "Create" goes to the end. Either way, no
-    // create option for a blank query or an exact match.
+    // OG leaves blank page/tag search active but renders no rows and does not
+    // ask the backend for its legacy all-pages result.
     const q = t.query.trim();
+    if (!q) {
+      setAcItems([]);
+      return;
+    }
+    const pages = await (cap ? cap.quickSwitch(t.query, 8) : backend().quickSwitch(t.query, 8));
+    const cur = ac();
+    if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
     const pageItem = (name: string): AcItem =>
       t.kind === "page"
         ? { label: name, insert: pageInsert(name) }
@@ -1298,11 +1336,11 @@ export function Editor(props: { id: string }): JSX.Element {
       t.kind === "page"
         ? { label: `Create "${q}"`, insert: pageInsert(q) }
         : { label: `Create #${q}`, insert: tagInsert(q) };
-    const matches = pages.map((p) => pageItem(p.name));
-    const exact = pages.some((p) => p.name.toLowerCase() === q.toLowerCase());
-    setAcItems(
-      orderAcItems(matches, createItem, { hasQuery: !!q, exact, linkFirst: linkFirstMatch() })
-    );
+    setAcItems(orderAcItems(
+      pages.map((page) => ({ name: page.name, item: pageItem(page.name) })),
+      { name: q, item: createItem },
+      { query: q, policy: linkAutocompletePolicy() },
+    ));
   };
 
   // Apply a pure text edit (format toggle / kill motion) to the textarea and
@@ -1326,7 +1364,7 @@ export function Editor(props: { id: string }): JSX.Element {
   const updateSel = () => setHasSel(ref.selectionStart !== ref.selectionEnd);
   const [selectionOverflowOpen, setSelectionOverflowOpen] = createSignal(false);
   const runSelectionAction = (action: SelectionAction) => {
-    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd));
+    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt()));
     setSelectionOverflowOpen(false);
     queueMicrotask(updateSel);
   };
@@ -1566,7 +1604,15 @@ export function Editor(props: { id: string }): JSX.Element {
       pushToast(`Couldn’t capture a photo (${String(err)})`, "error");
       return;
     }
-    if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), undefined, res.ext || "jpg");
+    if (res.status === "ok" && res.path) {
+      const candidate = captureAssetFileName(res.ext || "jpg");
+      try {
+        const stored = await trackAssetWrite(backend().importNativeCapture(res.path, candidate));
+        insertStoredAssets([{ stored }]);
+      } catch (err) {
+        pushToast(`Couldn’t import the photo (${String(err)})`, "error");
+      }
+    }
   };
 
   // Mobile: toggle voice-memo recording. First tap starts (prompts for mic
@@ -1581,7 +1627,15 @@ export function Editor(props: { id: string }): JSX.Element {
         pushToast(`Couldn’t save the recording (${String(err)})`, "error");
         return;
       }
-      if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), undefined, res.ext || "m4a");
+      if (res.status === "ok" && res.path) {
+        const candidate = captureAssetFileName(res.ext || "m4a");
+        try {
+          const stored = await trackAssetWrite(backend().importNativeCapture(res.path, candidate));
+          insertStoredAssets([{ stored }]);
+        } catch (err) {
+          pushToast(`Couldn’t import the recording (${String(err)})`, "error");
+        }
+      }
       return;
     }
     let res;
@@ -1597,61 +1651,32 @@ export function Editor(props: { id: string }): JSX.Element {
     }
   };
 
-  // Desktop voice memo (/record): the Android start_recording/stop_recording Tauri
-  // commands are stubbed to error on desktop, so record entirely in the WebView with
-  // getUserMedia + MediaRecorder, then reuse insertAssetBytes with the real ext.
-  // First /record starts; second stops and inserts.
-  let desktopRecorder: MediaRecorder | undefined;
-  let desktopRecorderStream: MediaStream | undefined;
-  let desktopRecorderChunks: Blob[] = [];
+  // Desktop voice memo (/record): one process-wide owner reserves the physical
+  // recorder before permission, bounds time/bytes, and is cancelled if this editor
+  // unmounts. This keeps the microphone reachable and prevents concurrent sessions.
+  const desktopRecordingOwner = Symbol(`voice-recording:${props.id}`);
+  onCleanup(() => cancelDesktopVoiceRecording(desktopRecordingOwner));
   const desktopVoiceMemoToggle = async () => {
-    if (isRecordingAudio() && desktopRecorder) {
-      // Second /record: stop; onstop (below) inserts the asset.
-      desktopRecorder.stop();
+    if (desktopVoiceRecordingActive()) {
+      stopDesktopVoiceRecording();
       return;
     }
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      pushToast("Mic capture isn’t available here", "error");
-      return;
-    }
-    let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const status = await startDesktopVoiceRecording(desktopRecordingOwner, {
+        complete: async (bytes, mime, limited) => {
+          if (limited) pushToast("Recording limit reached; saving the captured audio", "info");
+          await insertAssetBytes(bytes, undefined, recordingExt(mime));
+        },
+        error: (message) => pushToast(`Couldn’t save the recording (${message})`, "error"),
+      });
+      if (status === "busy") {
+        pushToast("Another voice recording is already active", "error");
+        return;
+      }
+      pushToast("Recording… run /record again to stop", "info");
     } catch (err) {
       pushToast(`Couldn’t access the microphone (${String(err)})`, "error");
-      return;
     }
-    let recorder: MediaRecorder;
-    try {
-      recorder = new MediaRecorder(stream);
-    } catch (err) {
-      stream.getTracks().forEach((t) => t.stop());
-      pushToast(`Couldn’t start recording (${String(err)})`, "error");
-      return;
-    }
-    desktopRecorder = recorder;
-    desktopRecorderStream = stream;
-    desktopRecorderChunks = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) desktopRecorderChunks.push(e.data);
-    };
-    recorder.onstop = () => {
-      const chunks = desktopRecorderChunks;
-      const mime = recorder.mimeType;
-      desktopRecorderStream?.getTracks().forEach((t) => t.stop());
-      desktopRecorder = undefined;
-      desktopRecorderStream = undefined;
-      desktopRecorderChunks = [];
-      setRecordingAudio(false);
-      void (async () => {
-        const blob = new Blob(chunks, { type: mime });
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        if (bytes.length) insertAssetBytes(bytes, undefined, recordingExt(mime));
-      })();
-    };
-    recorder.start();
-    setRecordingAudio(true);
-    pushToast("Recording… run /record again to stop", "info");
   };
 
   const uploadAsset = async () => {
@@ -1778,6 +1803,25 @@ export function Editor(props: { id: string }): JSX.Element {
       case "now-time":
         replaceTrigger(timeStamp());
         return;
+      case "page-reference":
+        // Page reference is a chained command: no GH #35 continuation space,
+        // then the ordinary trigger detector owns the blank page lifecycle.
+        replaceTrigger("[[]]", 2);
+        queueMicrotask(() => void updateAutocomplete());
+        return;
+      case "insert-link": {
+        const removed = applyCompletion(ref.value, t.start, t.end, "", 0);
+        const edit = insertLink(removed.raw, t.start, t.start, pageFmt());
+        commit(edit.text);
+        closeAc();
+        queueMicrotask(() => {
+          ref.value = edit.text;
+          ref.setSelectionRange(edit.start, edit.end);
+          ref.focus();
+          autosize();
+        });
+        return;
+      }
       case "query-builder": {
         // Insert an empty query, commit it, and drop straight to the rendered
         // view so the visual builder appears — then flag this block so the
@@ -1971,10 +2015,29 @@ export function Editor(props: { id: string }): JSX.Element {
     // Close the popup synchronously when the trigger ends (instant), but debounce
     // the page/template IPC fetch so holding down a key doesn't fire a backend
     // round-trip per character.
-    if (!detectTrigger(ref.value, ref.selectionStart)) {
+    const next = detectTrigger(ref.value, ref.selectionStart);
+    if (!next) {
       clearTimeout(acTimer);
       closeAc();
       return;
+    }
+    // Keep the replacement span in lockstep with the textarea even while the
+    // candidate fetch is debounced. Otherwise Enter can accept a still-visible
+    // row using the trigger range from an earlier character and leave the newly
+    // typed suffix behind (for example `[[P` -> `[[Parity Tar` becoming
+    // `[[Parity Target]]arity Tar`). Rows may remain visible while a SAME trigger
+    // is refined, but a different trigger family/location or a now-blank page/tag
+    // lifecycle must never expose an accept-able stale row.
+    const previous = ac();
+    setAc(next);
+    setAcIndex(0);
+    if (
+      !previous ||
+      previous.kind !== next.kind ||
+      previous.start !== next.start ||
+      ((next.kind === "page" || next.kind === "tag") && !next.query.trim())
+    ) {
+      setAcItems([]);
     }
     clearTimeout(acTimer);
     acTimer = setTimeout(() => void updateAutocomplete(), 90);
@@ -2041,7 +2104,7 @@ export function Editor(props: { id: string }): JSX.Element {
     e.preventDefault();
     const start = ref.selectionStart;
     commit(ref.value);
-    setBlockMoving(true);
+    setBlockMoving(true, doc.byId[props.id]?.page);
     startEditing(props.id, start);
     const move = outlineScope
       ? (moveItem(props.id, dir), Promise.resolve())
@@ -2127,7 +2190,7 @@ export function Editor(props: { id: string }): JSX.Element {
     "editor/italics": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "*")); return true; },
     "editor/strike-through": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "~~")); return true; },
     "editor/highlight": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "==")); return true; },
-    "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd)); return true; },
+    "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt())); return true; },
     "editor/clear-block": (e) => { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return true; },
     "editor/kill-line-before": (e) => { e.preventDefault(); applyEdit(killLineBefore(ref.value, ref.selectionStart)); return true; },
     "editor/kill-line-after": (e) => { e.preventDefault(); applyEdit(killLineAfter(ref.value, ref.selectionStart)); return true; },
@@ -2314,7 +2377,7 @@ export function Editor(props: { id: string }): JSX.Element {
       commitAndSelect();
       return true;
     }
-    if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "Tab" || e.code === "Tab")) {
+    if (isPermittedTabGesture(e)) {
       e.preventDefault();
       commitAndMove(e.shiftKey ? "tab-back" : "tab-forward");
       return true;
@@ -2366,6 +2429,11 @@ export function Editor(props: { id: string }): JSX.Element {
     const end = ref.selectionEnd;
     const raw = ref.value;
 
+    // IME owns Escape.  The global capture handler already declines it, and the
+    // textarea must not then close completion or leave editing on the target
+    // phase (notably Android/WebKit's legacy keyCode 229 path).
+    if (e.key === "Escape" && (e.isComposing || e.keyCode === 229)) return;
+
     // Ctrl/Cmd+Shift+V is Logseq's "paste as plain text" gesture: multiline
     // clipboard text stays inside this block instead of becoming an outline.
     // ClipboardEvent does not expose modifier keys, so remember the preceding
@@ -2395,7 +2463,7 @@ export function Editor(props: { id: string }): JSX.Element {
         setAcIndex((acIndex() - 1 + n) % n);
         return;
       }
-      if (e.key === "Enter" || e.code === "Tab") {
+      if (e.key === "Enter" || isPermittedTabGesture(e)) {
         e.preventDefault();
         selectAc(acItems()[acIndex()]);
         return;
@@ -2408,6 +2476,10 @@ export function Editor(props: { id: string }): JSX.Element {
     }
 
     if (handleSheetCellKey(e, start, end, raw)) return;
+
+    // Raw Control is not represented by `mod` on macOS. Decline every
+    // modified Tab before command lookup so it cannot become indent/outdent.
+    if (isTabLikeEvent(e) && !isPermittedTabGesture(e)) return;
 
     // Resolve configured editor commands before incidental literal-key behavior:
     // an explicit user binding (including Alt+[) must win over selection wrapping.

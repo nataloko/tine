@@ -211,6 +211,52 @@ textarea {
   position: relative;
 }
 
+.drawer-workspace {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+/* Drawer mode is deliberately driven by App's one reactive width classifier,
+   not by a second CSS media query or a platform/pointer heuristic. */
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar,
+.app-container[data-mobile-drawer-mode="true"] .right-sidebar {
+  position: fixed;
+  top: env(safe-area-inset-top);
+  bottom: env(safe-area-inset-bottom);
+  z-index: 90;
+  width: min(
+    var(--mobile-drawer-width, 320px),
+    calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right))
+  ) !important;
+  max-width: calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  flex: none !important;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .28);
+}
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar { left: env(safe-area-inset-left); right: auto; }
+.app-container[data-mobile-drawer-mode="true"] .right-sidebar { right: env(safe-area-inset-right); left: auto; }
+.app-container[data-mobile-drawer-mode="true"] .sidebar-resizer,
+.app-container[data-mobile-drawer-mode="true"] .rs-resizer,
+.app-container[data-mobile-drawer-mode="true"] .resize-grip { display: none; }
+.mobile-drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, .42);
+  touch-action: none;
+}
+.mobile-drawer-close {
+  display: block;
+  margin: 8px 10px 0 auto;
+}
+.drawer-floating-background { display: contents; }
+@media (prefers-reduced-motion: no-preference) {
+  .app-container[data-mobile-drawer-mode="true"] .left-sidebar,
+  .app-container[data-mobile-drawer-mode="true"] .right-sidebar { transition: transform 120ms ease-out; }
+}
+
 .topbar {
   height: var(--ls-headbar-height);
   flex: 0 0 var(--ls-headbar-height);
@@ -3516,6 +3562,12 @@ textarea {
     opacity: 0.62;
   }
 
+  /* Leaves retain the structural control placeholder for the shared bullet
+     column, but it must not sit invisibly over the last 44px of editable text. */
+  .collapse-toggle:not(.has-children) {
+    pointer-events: none;
+  }
+
   .ls-block:hover > .block-main > .block-controls > .collapse-toggle.has-children,
   .collapse-toggle.has-children:focus-visible {
     opacity: 1;
@@ -6545,16 +6597,25 @@ img.emoji {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 .query-search-hit,
 .query-search-page {
+  box-sizing: border-box;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .query-search-hit:hover,
 .query-search-hit:focus-visible,
@@ -7850,12 +7911,29 @@ img.emoji {
   position: fixed;
   z-index: 200;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
   padding: 6px 8px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.pdf-hl-action {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+}
+.pdf-hl-action:hover {
+  background: var(--bg-secondary);
 }
 
 .pdf-color-swatch {
@@ -8132,6 +8210,8 @@ img.emoji {
 }
 .query-workspace {
   width: min(100%, 1120px);
+  max-width: 100%;
+  min-width: 0;
   margin: 0 auto;
   padding: 26px clamp(16px, 3vw, 34px) 48px;
   box-sizing: border-box;
@@ -8299,7 +8379,18 @@ img.emoji {
 .query-results-search,
 .query-results-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   gap: 3px;
+}
+.query-results-search > [role="listitem"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 .query-result-row {
   box-sizing: border-box;
@@ -8310,6 +8401,7 @@ img.emoji {
   padding: 6px 9px;
   text-align: left;
   white-space: normal;
+  overflow-wrap: anywhere;
 }
 .query-results-list {
   margin: 0;

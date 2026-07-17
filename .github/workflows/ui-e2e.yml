@@ -7,6 +7,10 @@ on:
         description: Optional single Linux scenario for focused debugging
         required: false
         default: ""
+      windows_scenario:
+        description: Optional single Windows scenario for focused debugging
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -14,6 +18,7 @@ permissions:
 jobs:
   linux-release:
     name: Linux x64 real-app release suite
+    if: ${{ inputs.windows_scenario == '' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -24,7 +29,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev build-essential libssl-dev \
-            webkit2gtk-driver xvfb xauth xdotool openbox x11-utils
+            webkit2gtk-driver xvfb xauth xdotool openbox x11-utils weston
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -67,9 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario:
-          - windows-core
-          - pdf-logseq
+        scenario: ${{ fromJSON(inputs.windows_scenario != '' && format('["{0}"]', inputs.windows_scenario) || '["windows-core","og-parity-references","page-properties","page-trailing-block","pdf-logseq","print-security"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

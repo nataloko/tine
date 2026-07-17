@@ -12,6 +12,7 @@ import type {
   PageDto,
   PageEntry,
   RefGroup,
+  BlockPreview,
   TemplateDto,
   TrashStats,
   JournalConflict,
@@ -21,6 +22,8 @@ import type {
   PrintOpts,
   PdfState,
   QueryExecution,
+  QueryExportBatch,
+  QueryExportSpec,
 } from "./types";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
@@ -38,6 +41,41 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
   }
   return btoa(binary);
+}
+
+export const CLIPBOARD_IMAGE_MAX_PIXELS = 32 * 1024 * 1024;
+export const CLIPBOARD_IMAGE_MAX_RGBA_BYTES = 128 * 1024 * 1024;
+export const ASSET_INGRESS_MAX_BYTES = 64 * 1024 * 1024;
+
+type ClipboardImage = {
+  size(): Promise<{ width: number; height: number }>;
+  rgba(): Promise<Uint8Array>;
+};
+
+export async function clipboardImageToPng(img: ClipboardImage): Promise<Uint8Array | null> {
+  // Dimensions are metadata: validate them before asking the native plugin to
+  // materialize an attacker-controlled RGBA allocation on the WebView thread.
+  const { width, height } = await img.size();
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return null;
+  const pixels = width * height;
+  const rgbaBytes = pixels * 4;
+  if (!Number.isSafeInteger(pixels) || pixels > CLIPBOARD_IMAGE_MAX_PIXELS
+      || rgbaBytes > CLIPBOARD_IMAGE_MAX_RGBA_BYTES) {
+    return null;
+  }
+  const rgba = await img.rgba();
+  if (rgba.byteLength !== rgbaBytes) return null;
+  const clamped = new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, rgba.byteLength);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.putImageData(new ImageData(clamped, width, height), 0, 0);
+  const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob || blob.size > ASSET_INGRESS_MAX_BYTES) return null;
+  const encoded = await blob.arrayBuffer();
+  return encoded.byteLength <= ASSET_INGRESS_MAX_BYTES ? new Uint8Array(encoded) : null;
 }
 
 /** One raw graph file, as returned by `graphSourceFiles` — the input to the
@@ -65,12 +103,12 @@ export interface ClipboardFileList {
   truncated: boolean;
 }
 
-/** Result of an Android media-capture command (camera / voice memo). When
- *  `status === "ok"`, `data` is base64-encoded file bytes and `ext` its
- *  extension (no dot). Other statuses carry no data. */
+/** Result of an Android media-capture command. Successful photos and voice
+ *  memos return a bounded native cache-file `path` which Rust streams directly
+ *  into the graph. */
 export interface MediaCaptureResult {
   status: "ok" | "recording" | "cancelled";
-  data?: string | null;
+  path?: string | null;
   ext?: string | null;
 }
 
@@ -82,6 +120,10 @@ export interface KnownGraph {
 export type LoadGraphResult =
   | { kind: "loaded" | "already_current"; meta: GraphMeta; binding_generation: number }
   | { kind: "focused_existing"; window_label: string };
+
+export interface CaptureGraphBindingResult {
+  binding_generation: number;
+}
 
 export interface GraphAccessInspection {
   graph_root: string;
@@ -96,6 +138,9 @@ export interface Backend {
   openGraphWindow(path: string): Promise<LoadGraphResult>;
   startupGraphPath(): Promise<string | null>;
   captureTarget(): Promise<string>;
+  /** Lease the graph selected for this Quick Capture show before issuing
+   * graph-scoped reads from its independent WebView. */
+  bindCaptureGraph(): Promise<void>;
   listKnownGraphs(): Promise<KnownGraph[]>;
   forgetKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
@@ -117,7 +162,7 @@ export interface Backend {
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
   createGraph(dir: string): Promise<string>;
   listPages(): Promise<PageEntry[]>;
-  journalsDesc(limit: number, offset: number): Promise<PageDto[]>;
+  journalFeedPage(limit: number, beforeDay: number | null): Promise<import("./types").JournalFeedPage>;
   /** Journal date-keys (yyyymmdd) whose page has real content. */
   journalContentDays(): Promise<number[]>;
   getPage(name: string, kind: "journal" | "page"): Promise<PageDto | null>;
@@ -151,6 +196,8 @@ export interface Backend {
    *  the page doesn't exist. */
   pagePrintHtml(name: string, opts: PrintOpts): Promise<string>;
   runQuery(query: string): Promise<RefGroup[]>;
+  /** Resolve all Copy / Export query macros under one cumulative native budget. */
+  exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch>;
   /** Advanced (datalog-subset) query: maps the supported clauses onto the engine
    *  and reports what ran vs was ignored. `currentPage` resolves `:current-page`. */
   runAdvancedQuery(query: string, currentPage?: string): Promise<AdvancedQueryResult>;
@@ -253,9 +300,14 @@ export interface Backend {
     explain?: boolean
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
+  /** Capture-only page/tag completion capability. It is intentionally not the
+   * general graph command route used by the main WebView. */
+  captureQuickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   listTemplates(): Promise<TemplateDto[]>;
   resolveBlock(uuid: string): Promise<RefGroup | null>;
   resolveBlocks(uuids: string[]): Promise<(RefGroup | null)[]>;
+  /** Explicit bounded subtree; ordinary resolution is intentionally shallow. */
+  previewBlock(uuid: string, maxNodes: number): Promise<BlockPreview | null>;
   readAsset(name: string, maxBytes?: number): Promise<Uint8Array>;
   /** Native range-aware URL for audio/video. Unlike `readAsset`, this never
    *  copies the whole media file through IPC. */
@@ -275,6 +327,9 @@ export interface Backend {
   /** Copy a file (by absolute path) into assets/, returning the stored name.
    *  `name` (optional) is the desired stored filename (timestamped). */
   importAsset(path: string, name?: string): Promise<string>;
+  /** Stream a bounded native Android voice-memo temp into assets and retire the
+   *  temp only after the graph copy commits. */
+  importNativeCapture(path: string, name: string): Promise<string>;
   /** Paths explicitly copied in the OS file manager. Empty when the clipboard
    *  has no native file-list flavor or the platform cannot expose one. */
   clipboardFiles(): Promise<ClipboardFileList>;
@@ -300,7 +355,7 @@ export interface Backend {
   /** Android: start a voice-memo recording (prompts for mic permission on first
    *  use). `status: "recording"` on success. */
   startRecording(): Promise<MediaCaptureResult>;
-  /** Android: stop the active recording → base64 audio bytes + ext. */
+  /** Android: stop the active recording → native cache-file path + ext. */
   stopRecording(): Promise<MediaCaptureResult>;
   /** Android: discard an in-progress recording without inserting anything. */
   cancelRecording(): Promise<MediaCaptureResult>;
@@ -497,6 +552,10 @@ class TauriBackend implements Backend {
   captureTarget() {
     return this.call<string>("capture_target");
   }
+  async bindCaptureGraph() {
+    const result = await this.call<CaptureGraphBindingResult>("capture_graph_binding");
+    this.bindingGeneration = result.binding_generation;
+  }
   listKnownGraphs() {
     return this.call<KnownGraph[]>("list_known_graphs");
   }
@@ -527,8 +586,8 @@ class TauriBackend implements Backend {
   listPages() {
     return this.call<PageEntry[]>("list_pages");
   }
-  journalsDesc(limit: number, offset: number) {
-    return this.call<PageDto[]>("journals_desc", { limit, offset });
+  journalFeedPage(limit: number, beforeDay: number | null) {
+    return this.call<import("./types").JournalFeedPage>("journal_feed_page", { limit, beforeDay });
   }
   journalContentDays() {
     return this.call<number[]>("journal_content_days");
@@ -580,6 +639,9 @@ class TauriBackend implements Backend {
   }
   runQuery(query: string) {
     return this.call<RefGroup[]>("run_query", { query });
+  }
+  exportQuerySubtrees(specs: QueryExportSpec[]) {
+    return this.call<QueryExportBatch>("export_query_subtrees", { specs });
   }
   runAdvancedQuery(query: string, currentPage?: string) {
     return this.call<AdvancedQueryResult>("run_advanced_query", { query, currentPage });
@@ -647,6 +709,9 @@ class TauriBackend implements Backend {
   quickSwitch(query: string, limit: number) {
     return this.call<PageEntry[]>("quick_switch", { query, limit });
   }
+  captureQuickSwitch(query: string, limit: number) {
+    return this.call<PageEntry[]>("capture_quick_switch", { query, limit });
+  }
   listTemplates() {
     return this.call<TemplateDto[]>("list_templates");
   }
@@ -655,6 +720,9 @@ class TauriBackend implements Backend {
   }
   resolveBlocks(uuids: string[]) {
     return this.call<(RefGroup | null)[]>("resolve_blocks", { uuids });
+  }
+  previewBlock(uuid: string, maxNodes: number) {
+    return this.call<BlockPreview | null>("preview_block", { uuid, maxNodes });
   }
   async readAsset(name: string, maxBytes?: number) {
     // read_asset now returns raw bytes (tauri::ipc::Response) → an ArrayBuffer,
@@ -671,24 +739,14 @@ class TauriBackend implements Backend {
     return new Uint8Array(buf);
   }
   saveAsset(name: string, bytes: Uint8Array) {
+    if (bytes.byteLength > ASSET_INGRESS_MAX_BYTES) return Promise.reject(new Error("asset exceeds 64 MiB ingress limit"));
     return this.call<string>("save_asset", { name, bytesB64: bytesToBase64(bytes) });
   }
   async readClipboardImage(): Promise<Uint8Array | null> {
     try {
       const { readImage } = await import("@tauri-apps/plugin-clipboard-manager");
       const img = await readImage();
-      const rgba = await img.rgba();
-      const { width, height } = await img.size();
-      if (!width || !height || !rgba.length) return null;
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return null;
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
-      const blob: Blob | null = await new Promise((res) => canvas.toBlob(res, "image/png"));
-      if (!blob) return null;
-      return new Uint8Array(await blob.arrayBuffer());
+      return await clipboardImageToPng(img);
     } catch {
       return null; // no image in clipboard, or plugin unavailable
     }
@@ -754,6 +812,9 @@ class TauriBackend implements Backend {
   }
   importAsset(path: string, name?: string) {
     return this.call<string>("import_asset", { path, name });
+  }
+  importNativeCapture(path: string, name: string) {
+    return this.call<string>("import_native_capture", { path, name });
   }
   clipboardFiles() {
     return this.call<ClipboardFileList>("clipboard_files");
@@ -828,6 +889,7 @@ class TauriBackend implements Backend {
     await this.writeText(text);
   }
   copyImageToClipboard(bytes: Uint8Array): Promise<void> {
+    if (bytes.byteLength > ASSET_INGRESS_MAX_BYTES) return Promise.reject(new Error("image exceeds 64 MiB clipboard limit"));
     return this.call<void>("copy_image_to_clipboard", { bytesB64: bytesToBase64(bytes) });
   }
   readHighlights(pdf: string) {
@@ -843,6 +905,7 @@ class TauriBackend implements Backend {
     return this.call<void>("write_pdf_view_state", { pdf, page, scale });
   }
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array) {
+    if (bytes.byteLength > ASSET_INGRESS_MAX_BYTES) return Promise.reject(new Error("PDF area image exceeds 64 MiB ingress limit"));
     return this.call<string>("save_pdf_area_image", {
       pdf,
       page,

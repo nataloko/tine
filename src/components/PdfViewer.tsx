@@ -2,12 +2,13 @@ import { For, Show, createEffect, createSignal, on, onCleanup, onMount, type JSX
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
-import { closePdf, pushToast, isConflicted, activePane } from "../ui";
+import { closePdf, pushToast, isConflicted, activePane, requestBlockReferences, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
-import { openPage } from "../router";
+import { openPage, openPageAtBlock } from "../router";
 import { areaHighlightPosition, hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
 import { decideWheelZoomGesture, type WheelZoomGestureState } from "../zoom";
 import type { Highlight, Rect } from "../types";
+import { isMobilePlatform } from "../nativeChrome";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -30,7 +31,15 @@ const MAX_PDF_BYTES = 256 * 1024 * 1024;
 const MAX_PDF_PAGES = 5000;
 const MAX_PAGE_DIMENSION = 14_400; // PDF points: 200 inches at 72 dpi.
 const MAX_CANVAS_DIMENSION = 16_384;
-const MAX_CANVAS_PIXELS = 16_777_216; // 64 MiB for an RGBA backing store.
+const MAX_CANVAS_PIXELS = isMobilePlatform ? 8_388_608 : 16_777_216;
+// Canvas backing stores are normally 4-byte RGBA. Bound the aggregate rather
+// than counting pages: at high zoom one page can be far larger than 24 ordinary
+// fit-width pages. Mobile keeps at most ~64 MiB; desktop ~192 MiB.
+export const PDF_CANVAS_CACHE_PIXEL_BUDGET = isMobilePlatform ? 16_777_216 : 50_331_648;
+const PDF_CANVAS_CACHE_PAGE_CAP = isMobilePlatform ? 6 : 12;
+export const PDF_FIND_TEXT_CACHE_BYTES = isMobilePlatform ? 4 * 1024 * 1024 : 8 * 1024 * 1024;
+export const PDF_FIND_PAGE_TEXT_BYTES = 1024 * 1024;
+export const PDF_FIND_MATCH_CAP = 10_000;
 
 interface Pending {
   page: number;
@@ -39,7 +48,32 @@ interface Pending {
   text: string;
 }
 
-export function PdfViewer(props: { filename: string; label: string; page?: number }): JSX.Element {
+/**
+ * A PDF filename is a resource identity, not a navigation request. Key only on
+ * that identity: page/highlight changes within one asset stay reactive, while
+ * switching assets still tears down every document-local cache and pdf.js task.
+ */
+export function KeyedPdfViewer(props: { target: () => PdfTarget | null }): JSX.Element {
+  return (
+    <Show when={props.target()?.filename} keyed>
+      {(filename) => (
+        <PdfViewer
+          filename={filename}
+          label={props.target()?.label ?? filename}
+          page={props.target()?.page}
+          navigation={props.target}
+        />
+      )}
+    </Show>
+  );
+}
+
+export function PdfViewer(props: {
+  filename: string;
+  label: string;
+  page?: number;
+  navigation?: () => PdfTarget | null;
+}): JSX.Element {
   let scrollRef!: HTMLDivElement;
   const pageEls: Record<number, HTMLDivElement> = {};
   const textLayers: Record<number, HTMLDivElement> = {};
@@ -55,6 +89,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   let areaDrag: { page: number; wrap: HTMLElement; startX: number; startY: number; band: HTMLDivElement } | null =
     null;
   const [scale, setScale] = createSignal(1.4);
+  const [ready, setReady] = createSignal(false);
   const [loadError, setLoadError] = createSignal<string | null>(null);
   // Page indicator: total pages + the page currently filling the viewport, and a
   // separately-tracked editable field (so a scroll doesn't fight the user typing).
@@ -73,8 +108,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   const [findQuery, setFindQuery] = createSignal("");
   const [findCount, setFindCount] = createSignal(0);
   const [findCur, setFindCur] = createSignal(0);
+  const [findTruncated, setFindTruncated] = createSignal(false);
   let findMatches: { page: number }[] = [];
   const pageTextCache: Record<number, string> = {};
+  const pageTextLru: number[] = [];
+  let pageTextCacheBytes = 0;
   let findToken = 0;
   let findDebounce: number | undefined;
   let findInputEl: HTMLInputElement | undefined;
@@ -84,6 +122,9 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // preserving externally-added highlights.
   let baseIds: string[] = [];
   let pdfDoc: pdfjs.PDFDocumentProxy | null = null;
+  let disposed = false;
+  let navigationToken = 0;
+  let activeHighlightId: string | undefined;
 
   // Per-page unscaled dimensions (index 1..N), fetched once so we can size every
   // page wrapper up front — that gives correct scroll geometry without having to
@@ -98,12 +139,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // estimate until first render), so opening a long PDF doesn't parse every page
   // dict before first paint.
   const dimsKnown = new Set<number>();
-  // Rendered pages in recency order (LRU). A canvas + text layer is freed once we
-  // exceed CANVAS_CAP so a long PDF doesn't keep a bitmap for every page ever
-  // viewed; the wrapper stays (sized) and re-renders on scroll-back. Small papers
-  // never hit the cap, so they keep every canvas (instant scroll-back).
+  // Rendered pages in recency order (LRU). Admission is governed primarily by
+  // actual aggregate backing-store pixels, with a page count as a secondary
+  // guard. The wrapper stays sized and re-renders on scroll-back.
   const lru: number[] = [];
-  const CANVAS_CAP = 24;
+  const canvasPixels: Record<number, number> = {};
   // Actual backing-store scale used for each rendered page. This can be lower
   // than devicePixelRatio for an unusually large page, keeping canvas memory
   // bounded while preserving the requested CSS zoom level.
@@ -204,6 +244,24 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     await backend().writeText(`((${id}))`);
     pushToast("Copied highlight ref", "success");
   };
+  // An OG/externally-created sidecar can outlive or predate its annotation
+  // block. Reuse the paired guarded writer before exposing the id: it upserts
+  // the hls__ block while preserving notes and refuses conflicts/partial writes.
+  const ensureExistingHighlightRef = async (id: string): Promise<boolean> => {
+    if (!highlights().some((highlight) => highlight.id === id)) return false;
+    return persist();
+  };
+  const copyExistingHighlightRef = async (id: string) => {
+    setMenu(null);
+    if (!(await ensureExistingHighlightRef(id))) return;
+    await copyCreatedHighlightRef(id);
+  };
+  const openExistingHighlightReferences = async (id: string) => {
+    setMenu(null);
+    if (!(await ensureExistingHighlightRef(id))) return;
+    requestBlockReferences(id);
+    openPageAtBlock(hlsPageName(props.filename), "page", id);
+  };
   // Remove a highlight (and its annotation block on the hls page).
   const deleteHighlight = async (id: string) => {
     const prev = highlights();
@@ -252,6 +310,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     clearTimeout(zoomTimer);
     clearTimeout(textTimer);
     clearTimeout(findDebounce);
+    releaseAllCanvases();
     for (const k of Object.keys(tasks)) {
       tasks[Number(k)]?.cancel();
       delete tasks[Number(k)];
@@ -278,13 +337,14 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     return null;
   }
 
-  function safeCanvasSize(width: number, height: number) {
+  function safeCanvasSize(width: number, height: number, maxPixels = MAX_CANVAS_PIXELS) {
+    const pixelLimit = Math.max(1, Math.min(MAX_CANVAS_PIXELS, maxPixels));
     const requestedRatio = Math.min(window.devicePixelRatio || 1, 2);
     const ratio = Math.min(
       requestedRatio,
       MAX_CANVAS_DIMENSION / width,
       MAX_CANVAS_DIMENSION / height,
-      Math.sqrt(MAX_CANVAS_PIXELS / (width * height))
+      Math.sqrt(pixelLimit / (width * height))
     );
     if (!Number.isFinite(ratio) || ratio <= 0) return null;
     return {
@@ -299,12 +359,14 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // in as they scroll into view.
   function buildLayout() {
     if (!pdfDoc) return;
+    releaseAllCanvases();
     scrollRef.innerHTML = "";
     for (const k of Object.keys(pageEls)) delete pageEls[Number(k)];
     for (const k of Object.keys(textLayers)) delete textLayers[Number(k)];
     for (const k of Object.keys(hlLayers)) delete hlLayers[Number(k)];
     for (const k of Object.keys(renderedScale)) delete renderedScale[Number(k)];
     for (const k of Object.keys(renderedPixelRatio)) delete renderedPixelRatio[Number(k)];
+    for (const k of Object.keys(canvasPixels)) delete canvasPixels[Number(k)];
     for (const k of Object.keys(textScale)) delete textScale[Number(k)];
     for (const k of Object.keys(textLayerObjs)) delete textLayerObjs[Number(k)];
     pendingText.clear();
@@ -408,14 +470,23 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     // back down, so text is crisp on HiDPI displays. Cap the device-pixel factor
     // at 2 — beyond that the extra pixels aren't visible but the raster cost (and
     // zoom-in lag) grows quadratically.
-    const canvasSize = safeCanvasSize(viewport.width, viewport.height);
+    const otherVisiblePixels = [...visible]
+      .filter((pageNumber) => pageNumber !== n)
+      .reduce((total, pageNumber) => total + (canvasPixels[pageNumber] ?? 0), 0);
+    const availablePixels = Math.max(1, PDF_CANVAS_CACHE_PIXEL_BUDGET - otherVisiblePixels);
+    const canvasSize = safeCanvasSize(viewport.width, viewport.height, availablePixels);
     if (!canvasSize) {
       failPdf(`PDF page ${n} couldn't be sized safely for rendering.`);
       return;
     }
+    const nextPixels = canvasSize.width * canvasSize.height;
+    makeRoomForCanvas(n, nextPixels);
     const dpr = canvasSize.ratio;
     canvas.width = canvasSize.width;
     canvas.height = canvasSize.height;
+    // Reserve immediately, before pdf.js's async render, so concurrent visible
+    // page renders see the allocation and cannot all admit the full budget.
+    canvasPixels[n] = nextPixels;
     canvas.style.width = `${Math.floor(viewport.width)}px`;
     canvas.style.height = `${Math.floor(viewport.height)}px`;
     canvas.style.transform = "";
@@ -447,37 +518,111 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     evictCanvases();
   }
 
+  function currentNavigation(): PdfTarget {
+    const target = props.navigation?.();
+    return target?.filename === props.filename
+      ? target
+      : { filename: props.filename, label: props.label, page: props.page };
+  }
+
+  async function navigateToTarget(target: PdfTarget) {
+    const token = ++navigationToken;
+    const highlight = target.highlightId
+      ? highlights().find((candidate) => candidate.id === target.highlightId)
+      : undefined;
+    activeHighlightId = highlight?.id;
+    const requestedPage = highlight?.page ?? target.page ?? 1;
+    const page = pageEls[requestedPage] ? requestedPage : 1;
+    setCurPage(page);
+    setPageField(String(page));
+    pageEls[page]?.scrollIntoView({ block: "start" });
+
+    if (!highlight) {
+      for (const element of scrollRef.querySelectorAll(".pdf-hl-target")) {
+        element.classList.remove("pdf-hl-target");
+      }
+      return;
+    }
+
+    // OG carries the highlight entity through open-block-ref! and scrolls the
+    // finder to that exact highlight. Render the destination page first so the
+    // overlay exists even when it was outside the lazy viewport.
+    await renderPage(page);
+    if (disposed || token !== navigationToken) return;
+    const layer = hlLayers[page];
+    const exact = layer
+      ? Array.from(layer.querySelectorAll<HTMLElement>(".pdf-hl"))
+          .find((element) => element.dataset.highlightId === highlight.id)
+      : undefined;
+    for (const element of scrollRef.querySelectorAll(".pdf-hl-target")) {
+      element.classList.remove("pdf-hl-target");
+    }
+    exact?.classList.add("pdf-hl-target");
+    exact?.scrollIntoView({ block: "center", inline: "nearest" });
+  }
+
   // Record `n` as most-recently rendered.
   function touchLru(n: number) {
     const i = lru.indexOf(n);
     if (i >= 0) lru.splice(i, 1);
     lru.push(n);
   }
-  // Free canvases/text for the least-recently rendered OFF-SCREEN pages once we're
-  // over the cap. The wrapper (and its size) stays, so scroll geometry is intact
-  // and the page re-renders when scrolled back into view.
-  function evictCanvases() {
-    let i = 0;
-    while (lru.length > CANVAS_CAP && i < lru.length) {
-      const n = lru[i];
-      if (visible.has(n)) {
-        i++;
-        continue;
-      }
-      freePage(n);
-      lru.splice(i, 1);
+  function retainedCanvasPixels(except?: number) {
+    return Object.entries(canvasPixels).reduce(
+      (total, [page, pixels]) => Number(page) === except ? total : total + pixels,
+      0,
+    );
+  }
+  // Free least-recently rendered off-screen pages BEFORE allocating the next
+  // backing store. This prevents a valid high-zoom document from transiently
+  // building the old count-based 1.5 GiB cache.
+  function makeRoomForCanvas(n: number, incomingPixels: number) {
+    let total = retainedCanvasPixels(n);
+    let count = Object.keys(canvasPixels).filter((page) => Number(page) !== n).length;
+    const incomingCount = n >= 1 ? 1 : 0;
+    while (
+      total + incomingPixels > PDF_CANVAS_CACHE_PIXEL_BUDGET
+      || count + incomingCount > PDF_CANVAS_CACHE_PAGE_CAP
+    ) {
+      // Completed pages use true LRU order. Include an off-screen in-flight
+      // allocation as a fallback so rapid scrolling cannot outrun the LRU.
+      const candidate = lru.find((page) => page !== n && !visible.has(page))
+        ?? Object.keys(canvasPixels)
+          .map(Number)
+          .find((page) => page !== n && !visible.has(page));
+      if (candidate === undefined) break;
+      total -= canvasPixels[candidate] ?? 0;
+      count -= canvasPixels[candidate] === undefined ? 0 : 1;
+      freePage(candidate);
+      const lruIndex = lru.indexOf(candidate);
+      if (lruIndex >= 0) lru.splice(lruIndex, 1);
     }
+  }
+  function evictCanvases() {
+    makeRoomForCanvas(-1, 0);
   }
   function freePage(n: number) {
     tasks[n]?.cancel();
     delete tasks[n];
-    pageEls[n]?.querySelector("canvas")?.remove();
+    const canvas = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
+    if (canvas) {
+      // WebKit may defer freeing a detached canvas's backing store. Resizing to
+      // zero releases it synchronously before the DOM node is removed.
+      canvas.width = 0;
+      canvas.height = 0;
+      canvas.remove();
+    }
+    delete canvasPixels[n];
     delete renderedScale[n];
     delete renderedPixelRatio[n];
     if (textLayers[n]) textLayers[n].innerHTML = "";
     delete textLayerObjs[n];
     delete textScale[n];
     pendingText.delete(n);
+  }
+  function releaseAllCanvases() {
+    for (const page of Object.keys(canvasPixels)) freePage(Number(page));
+    lru.length = 0;
   }
 
   // Coalesced, deferred text-layer (re)build. Runs ~after the view settles, only
@@ -614,6 +759,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     let restoredScale: number | null = null;
     try {
       const state = await backend().openPdf(props.filename, props.label);
+      if (disposed) return;
       setHighlights(state.highlights);
       restoredPage = state.page;
       restoredScale = state.scale;
@@ -625,6 +771,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     let bytes: Uint8Array;
     try {
       bytes = await backend().readAsset(props.filename, MAX_PDF_BYTES);
+      if (disposed) return;
     } catch (err) {
       if (String(err).includes("asset exceeds"))
         failPdf("This PDF is larger than 256 MiB and can't be opened safely.");
@@ -640,7 +787,12 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       return;
     }
     try {
-      pdfDoc = await pdfjs.getDocument({ data: bytes }).promise;
+      const loaded = await pdfjs.getDocument({ data: bytes }).promise;
+      if (disposed) {
+        void loaded.destroy().catch(() => {});
+        return;
+      }
+      pdfDoc = loaded;
     } catch (err) {
       failPdf(errorMessage("Couldn't load this PDF", err));
       return;
@@ -657,6 +809,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     let p1: pdfjs.PDFPageProxy;
     try {
       p1 = await doc.getPage(1);
+      if (disposed) return;
     } catch (err) {
       failPdf(errorMessage("Couldn't read this PDF's first page", err));
       return;
@@ -674,24 +827,25 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     setScale(restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
     setNumPages(doc.numPages);
     buildLayout();
-    const requestedPage = props.page ?? restoredPage ?? 1;
-    const startPage = pageEls[requestedPage] ? requestedPage : 1;
-    setCurPage(startPage);
-    setPageField(String(startPage));
-    if (startPage > 1) {
-      pageEls[startPage].scrollIntoView({ block: "start" });
-    }
-    viewStateBaseline = { page: startPage, scale: scale() };
+    const navigation = currentNavigation();
+    const requestedPage = navigation.page ?? restoredPage ?? 1;
+    await navigateToTarget({ ...navigation, page: requestedPage });
+    if (disposed) return;
+    viewStateBaseline = { page: curPage(), scale: scale() };
     viewStateReady = true;
+    setReady(true);
   });
 
   onCleanup(() => {
+    disposed = true;
+    findToken++;
     io?.disconnect();
     clearTimeout(zoomTimer);
     clearTimeout(textTimer);
     clearTimeout(findDebounce);
     if (viewStateTimer !== undefined || pendingViewState) void flushViewState();
     if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
+    releaseAllCanvases();
     for (const k of Object.keys(tasks)) tasks[Number(k)]?.cancel();
     const doc = pdfDoc;
     pdfDoc = null;
@@ -711,12 +865,15 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   createEffect(on(highlights, () => {
     for (const n of Object.keys(renderedScale)) repaintPage(Number(n));
   }));
-  // Jump to a highlight's page when asked while the viewer is already open.
+  // A new intent within the same asset must navigate without remounting the
+  // PDF. Asset switches are handled by KeyedPdfViewer's filename key.
   createEffect(
     on(
-      () => props.page,
-      (p) => {
-        if (p && pageEls[p]) pageEls[p].scrollIntoView({ block: "start" });
+      () => props.navigation?.(),
+      (target) => {
+        if (viewStateReady && target?.filename === props.filename) {
+          void navigateToTarget(target);
+        }
       },
       { defer: true }
     )
@@ -728,6 +885,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     layer.innerHTML = "";
     const s = scale();
     const openEdit = (id: string) => (ev: MouseEvent) => {
+      ev.preventDefault();
       ev.stopPropagation();
       setMenu({ x: ev.clientX, y: ev.clientY, id }); // open the edit/remove popup
     };
@@ -741,6 +899,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         const rgb = COLOR_RGB[h.color] ?? COLOR_RGB.yellow;
         const div = document.createElement("div");
         div.className = "pdf-hl pdf-hl-area";
+        div.dataset.highlightId = h.id;
+        div.classList.toggle("pdf-hl-target", h.id === activeHighlightId);
         div.style.left = `${r.left * s}px`;
         div.style.top = `${r.top * s}px`;
         div.style.width = `${r.width * s}px`;
@@ -749,6 +909,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         div.style.background = `rgba(${rgb}, 0.18)`; // translucent fill over the captured region
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
+        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
         continue;
       }
@@ -756,6 +917,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         const r = rectInPageSpace(storedRect, dims[n]);
         const div = document.createElement("div");
         div.className = "pdf-hl";
+        div.dataset.highlightId = h.id;
+        div.classList.toggle("pdf-hl-target", h.id === activeHighlightId);
         div.style.left = `${r.left * s}px`;
         div.style.top = `${r.top * s}px`;
         div.style.width = `${r.width * s}px`;
@@ -763,6 +926,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         div.style.background = COLOR_RGBA[h.color] ?? COLOR_RGBA.yellow;
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
+        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
       }
     }
@@ -1032,13 +1196,43 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   });
 
   // --- find in document ----------------------------------------------------
-  async function pageText(n: number): Promise<string> {
-    if (pageTextCache[n] !== undefined) return pageTextCache[n];
+  function touchPageText(n: number) {
+    const index = pageTextLru.indexOf(n);
+    if (index >= 0) pageTextLru.splice(index, 1);
+    pageTextLru.push(n);
+  }
+  function admitPageText(n: number, text: string) {
+    const bytes = text.length * 2;
+    if (bytes > PDF_FIND_PAGE_TEXT_BYTES || bytes > PDF_FIND_TEXT_CACHE_BYTES) return;
+    while (pageTextCacheBytes + bytes > PDF_FIND_TEXT_CACHE_BYTES && pageTextLru.length) {
+      const evicted = pageTextLru.shift()!;
+      pageTextCacheBytes -= pageTextCache[evicted].length * 2;
+      delete pageTextCache[evicted];
+    }
+    pageTextCache[n] = text;
+    pageTextCacheBytes += bytes;
+    touchPageText(n);
+  }
+  async function pageText(n: number, token: number): Promise<string | null> {
+    if (pageTextCache[n] !== undefined) {
+      touchPageText(n);
+      return pageTextCache[n];
+    }
     if (!pdfDoc) return "";
     const page = await pdfDoc.getPage(n);
+    if (token !== findToken || disposed) return null;
     const tc = await page.getTextContent();
-    const s = (tc.items as any[]).map((it) => (typeof it.str === "string" ? it.str : "")).join("");
-    pageTextCache[n] = s;
+    if (token !== findToken || disposed) return null;
+    let s = "";
+    for (const item of tc.items as any[]) {
+      const part = typeof item.str === "string" ? item.str : "";
+      if ((s.length + part.length) * 2 > PDF_FIND_PAGE_TEXT_BYTES) {
+        setFindTruncated(true);
+        break;
+      }
+      s += part;
+    }
+    admitPageText(n, s);
     return s;
   }
   const scheduleFind = (q: string) => {
@@ -1053,19 +1247,28 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       findMatches = [];
       setFindCount(0);
       setFindCur(0);
+      setFindTruncated(false);
       window.getSelection()?.removeAllRanges();
       return;
     }
     const acc: { page: number }[] = [];
+    setFindTruncated(false);
     const np = pdfDoc.numPages;
     for (let n = 1; n <= np; n++) {
-      const text = (await pageText(n)).toLowerCase();
+      const loadedText = await pageText(n, token);
+      if (loadedText === null) return;
+      const text = loadedText.toLowerCase();
       if (token !== findToken) return; // a newer query superseded this run
       let i = text.indexOf(q);
       while (i >= 0) {
         acc.push({ page: n });
+        if (acc.length >= PDF_FIND_MATCH_CAP) {
+          setFindTruncated(true);
+          break;
+        }
         i = text.indexOf(q, i + q.length);
       }
+      if (acc.length >= PDF_FIND_MATCH_CAP) break;
     }
     if (token !== findToken) return;
     findMatches = acc;
@@ -1171,7 +1374,12 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   };
 
   return (
-    <div class="pdf-viewer">
+    <div
+      class="pdf-viewer"
+      data-pdf-filename={props.filename}
+      data-pdf-highlight-target={props.navigation?.()?.highlightId}
+      data-pdf-ready={ready() ? "true" : "false"}
+    >
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
         <div class="pdf-toolbar-actions">
@@ -1267,7 +1475,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
             }}
           />
           <span class="pdf-find-count">
-            {findCount() ? `${findCur()} / ${findCount()}` : findQuery().trim() ? "No results" : ""}
+            {findCount()
+              ? `${findCur()} / ${findCount()}${findTruncated() ? "+" : ""}`
+              : findQuery().trim()
+                ? findTruncated() ? "No results in scanned text+" : "No results"
+                : ""}
           </span>
           <button class="icon-btn" title="Previous match (Shift+Enter)" onClick={() => nextMatch(-1)}>
             ↑
@@ -1310,6 +1522,26 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
               />
             )}
           </For>
+          <Show when={menu()!.id && !isMobilePlatform}>
+            <button
+              class="pdf-hl-action"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void copyExistingHighlightRef(menu()!.id!);
+              }}
+            >
+              Copy ref
+            </button>
+            <button
+              class="pdf-hl-action"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void openExistingHighlightReferences(menu()!.id!);
+              }}
+            >
+              Linked references
+            </button>
+          </Show>
           <Show when={menu()!.id}>
             <button
               class="pdf-hl-remove"

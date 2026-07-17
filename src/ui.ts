@@ -7,6 +7,7 @@ import { route, focusBlock, scheduleSessionSave } from "./router";
 import { PaneContext } from "./paneContext";
 import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
+import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawerFocus, type DrawerSide } from "./mobileDrawers";
 
 const THEME_KEY = "logseq-claude.theme";
 function loadTheme(): "light" | "dark" {
@@ -268,6 +269,13 @@ export function installPaneTracker(): () => void {
     // mode goes stale — the ring lingers and, worse, its keyboard handler
     // would still be armed after the user clicks off to do something else.
     exitPaneSelect();
+    // Global chrome can still target the pane the user last focused. Back,
+    // Forward, Search, and Journals all call the focused-router facade; letting
+    // this capture-phase pointer event fall through would retarget to `main`
+    // before their click handler runs, making right-pane history look dead.
+    // Ordinary outside-pane clicks keep the deliberate main fallback below.
+    const target = e.target as Element | null;
+    if (target?.closest?.("[data-pane-focus-neutral]")) return;
     update(e);
   };
   window.addEventListener("pointerdown", pointerdown, true);
@@ -528,11 +536,20 @@ export function resetLeftSidebarSections() {
   setRecentSectionExpanded(true);
 }
 
-export function toggleSidebar() {
-  const v = !sidebarOpen();
+function persistLeftOpen(v: boolean) {
   setSidebarOpen(v);
   saveStr(SIDEBAR_OPEN_KEY, v ? null : "0");
   scheduleSessionSave(); // durable open/closed state (localStorage isn't kept)
+}
+export function setLeftSidebarOpen(v: boolean, trigger?: HTMLElement | null) {
+  if (v && mobileDrawerMode()) {
+    setRightSidebarOpen(false);
+    captureDrawerOpener(trigger);
+  }
+  persistLeftOpen(v);
+}
+export function toggleSidebar(trigger?: HTMLElement | null) {
+  setLeftSidebarOpen(!sidebarOpen(), trigger);
 }
 
 /** Apply sidebar open/closed + right-sidebar items restored from the persisted
@@ -548,10 +565,24 @@ export interface SidebarSessionState {
 
 export function applySidebarSession(s: SidebarSessionState) {
   if (typeof s.left === "boolean") setSidebarOpen(s.left);
-  if (Array.isArray(s.items)) setRightSidebarRaw(s.items.filter(validSidebarItem));
-  if (typeof s.right === "boolean") setRightSidebarOpenSig(s.right);
+  const items = Array.isArray(s.items) ? s.items.filter(validSidebarItem) : undefined;
+  // Session application can replace the mounted collection before it changes
+  // the open signal. Prepare the old surfaces first, while their textarea blur
+  // handlers and controller ownership are still live.
+  const collectionPrepared = !!items
+    && rightSidebarOpen()
+    && !sameSidebarItems(rightSidebar(), items)
+    && prepareRightSidebarMountedSurfaces();
+  if (items) setRightSidebarRaw(items);
+  // Session restoration is also a whole-panel close path, but must not schedule
+  // another session save. Keep it on the same visibility boundary as scrim,
+  // Escape, Back, toolbar, and explicit close instead of writing the signal.
+  if (typeof s.right === "boolean") {
+    setRightSidebarOpenState(s.right, { persist: false, prepared: collectionPrepared });
+  }
   setFavoritesSectionExpanded(s.favoritesExpanded ?? true);
   setRecentSectionExpanded(s.recentExpanded ?? true);
+  normalizeSidebarDrawers();
 }
 
 const SIDEBAR_W_KEY = "logseq-claude.sidebarWidth";
@@ -925,6 +956,18 @@ export function sidebarItemKey(item: SidebarItem): string {
     : `block:${item.uuid}`;
 }
 
+function sameSidebarItems(left: readonly SidebarItem[], right: readonly SidebarItem[]): boolean {
+  return left.length === right.length && left.every((item, index) => {
+    const other = right[index];
+    if (!other || item.kind !== other.kind || item.collapsed !== other.collapsed) return false;
+    if (item.kind === "page" && other.kind === "page") {
+      return item.name === other.name && item.pageKind === other.pageKind;
+    }
+    return item.kind === "block" && other.kind === "block"
+      && item.uuid === other.uuid && item.page === other.page && item.pageKind === other.pageKind;
+  });
+}
+
 // What's open in the right sidebar — persisted across restarts. Items are plain
 // JSON (page name / block uuid). Page items always restore; block items resolve
 // only if their block still carries a stable uuid (a ref target with `id::`) —
@@ -957,18 +1000,77 @@ export { rightSidebar };
 const RS_OPEN_KEY = "logseq-claude.rightSidebarOpen";
 // Open if explicitly persisted open, or (migration / first run) if items were
 // restored — so a populated sidebar shows even before the open-state was tracked.
-export const [rightSidebarOpen, setRightSidebarOpenSig] = createSignal(
+const [rightSidebarOpen, setRightSidebarOpenSignal] = createSignal(
   loadStr(RS_OPEN_KEY) === "1" || rightSidebar().length > 0
 );
-function setRightSidebarOpen(v: boolean) {
-  setRightSidebarOpenSig(v);
-  saveStr(RS_OPEN_KEY, v ? "1" : null);
-  scheduleSessionSave(); // durable open/closed state (localStorage isn't kept)
+export { rightSidebarOpen };
+let prepareRightSidebarClose: (() => void) | undefined;
+let preparingRightSidebarClose = false;
+/** RightSidebar installs its real editor/surface teardown here.  Every whole
+ * panel close (mobile scrim/Escape/Back and desktop toolbar) uses this seam. */
+export function registerRightSidebarClosePreparation(prepare: () => void): () => void {
+  prepareRightSidebarClose = prepare;
+  return () => { if (prepareRightSidebarClose === prepare) prepareRightSidebarClose = undefined; };
 }
-export function toggleRightSidebar() {
-  setRightSidebarOpen(!rightSidebarOpen());
+
+/** Invoke the mounted RightSidebar's real blur/controller teardown exactly
+ * before a visibility or collection transition can unmount its surfaces. */
+function prepareRightSidebarMountedSurfaces(): boolean {
+  const prepare = prepareRightSidebarClose;
+  if (!prepare || preparingRightSidebarClose) return false;
+  preparingRightSidebarClose = true;
+  try {
+    prepare();
+    return true;
+  } finally {
+    preparingRightSidebarClose = false;
+  }
+}
+
+export function activeDrawer(): DrawerSide | null {
+  if (!mobileDrawerMode()) return null;
+  if (rightSidebarOpen()) return "right";
+  return sidebarOpen() ? "left" : null;
+}
+
+function setRightSidebarOpenState(
+  v: boolean,
+  options: { trigger?: HTMLElement | null; persist?: boolean; prepared?: boolean } = {}
+): boolean {
+  if (rightSidebarOpen() === v) return false;
+  if (!v && !options.prepared) prepareRightSidebarMountedSurfaces();
+  if (v && mobileDrawerMode()) {
+    persistLeftOpen(false);
+    captureDrawerOpener(options.trigger);
+  }
+  setRightSidebarOpenSignal(v);
+  if (options.persist !== false) {
+    saveStr(RS_OPEN_KEY, v ? "1" : null);
+    scheduleSessionSave(); // durable open/closed state (localStorage isn't kept)
+  }
+  return true;
+}
+function setRightSidebarOpenRaw(v: boolean, trigger?: HTMLElement | null): boolean {
+  return setRightSidebarOpenState(v, { trigger });
+}
+export function setRightSidebarOpen(v: boolean, trigger?: HTMLElement | null) {
+  setRightSidebarOpenRaw(v, trigger);
+}
+/** Shared, idempotent whole-panel close boundary. */
+export function closeRightSidebarSafely() {
+  return setRightSidebarOpenRaw(false);
+}
+export function toggleRightSidebar(trigger?: HTMLElement | null) {
+  setRightSidebarOpenRaw(!rightSidebarOpen(), trigger);
 }
 export function setRightSidebar(items: SidebarItem[]) {
+  // Graph transitions and close-all clear the mounted collection without
+  // necessarily closing the panel. They share the same pre-unmount boundary;
+  // a preceding explicit preparation is harmless because editor teardown is
+  // idempotent and the second pass sees no live edit owner.
+  if (rightSidebarOpen() && rightSidebar().length > 0 && items.length === 0) {
+    prepareRightSidebarMountedSurfaces();
+  }
   setRightSidebarRaw(items);
   try {
     if (items.length) localStorage.setItem(RS_ITEMS_KEY, JSON.stringify(items));
@@ -997,6 +1099,40 @@ export function openBlockInSidebar(ref: { uuid: string; page: string; pageKind: 
     return;
   }
   setRightSidebar([{ kind: "block", ...ref }, ...rightSidebar()]);
+}
+
+/** Restored desktop state can contain both panels.  Entering drawer mode has a
+ * deliberate winner: the contextual right sidebar. */
+export function normalizeSidebarDrawers() {
+  if (!mobileDrawerMode()) {
+    // A compact opener must not survive a resize into persistent-sidebar mode
+    // and later steal focus after an unrelated programmatic drawer open.
+    clearDrawerOpener();
+    return;
+  }
+  if (rightSidebarOpen()) {
+    if (sidebarOpen()) persistLeftOpen(false);
+  }
+}
+
+export function dismissMobileDrawer(_reason: "explicit" | "scrim" | "escape" | "back" | "navigation"): boolean {
+  const active = activeDrawer();
+  if (!active) return false;
+  if (active === "right") setRightSidebarOpenRaw(false);
+  else persistLeftOpen(false);
+  return true;
+}
+
+/** The only completion boundary for ordinary in-window navigation originating
+ * in the left sidebar.  Sidebar rows call this after their destination has
+ * opened (and graph rows only after the awaited graph outcome proves success).
+ * At regular widths there is no active drawer, so navigation retains the
+ * persistent desktop sidebar and does not move focus. */
+export function completeActiveLeftNavigation(): boolean {
+  if (activeDrawer() !== "left") return false;
+  if (!dismissMobileDrawer("navigation")) return false;
+  restoreDrawerFocus("navigation");
+  return true;
 }
 export function setRightSidebarItemCollapsed(idx: number, collapsed: boolean) {
   setRightSidebar(rightSidebar().map((item, i) => i === idx ? { ...item, collapsed } : item));
@@ -1114,6 +1250,18 @@ export function openActionContextMenu(x: number, y: number, items: readonly Cont
 }
 export function closeContextMenu() {
   setContextMenu(null);
+}
+
+// A navigation surface can request that the ordinary per-block referrer panel
+// open when its target block mounts. The monotonically increasing token makes a
+// repeated request for the same block observable after the user closed it.
+let blockReferencesRequestToken = 0;
+export const [blockReferencesRequest, setBlockReferencesRequest] = createSignal<{
+  id: string;
+  token: number;
+} | null>(null);
+export function requestBlockReferences(id: string) {
+  setBlockReferencesRequest({ id, token: ++blockReferencesRequestToken });
 }
 
 export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "improve" | "shortcuts" | "about";
@@ -1238,15 +1386,23 @@ export function closePdfExport() {
   setPdfExportPage(null);
 }
 
-// The PDF currently open in the side pane (filename within assets/, + label,
-// + an optional page to scroll to).
-export const [pdfTarget, setPdfTarget] = createSignal<{
+// The PDF currently open in the side pane. `filename` is the stable resource
+// identity; page/highlightId are a navigation intent within that resource.
+// Keeping those concepts separate lets a second reference into the same PDF
+// scroll precisely without tearing down the loaded document.
+export interface PdfTarget {
   filename: string;
   label: string;
   page?: number;
-} | null>(null);
-export function openPdf(filename: string, label: string, page?: number) {
-  setPdfTarget({ filename, label, page });
+  highlightId?: string;
+}
+export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
+export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
+  // Logseq treats re-opening the current PDF resource without a page/highlight
+  // intent as a no-op. Preserve the reader's current location; explicit targets
+  // within the same file still publish a new reactive navigation intent.
+  if (pdfTarget()?.filename === filename && page == null && highlightId == null) return;
+  setPdfTarget({ filename, label, page, highlightId });
 }
 export function closePdf() {
   setPdfTarget(null);

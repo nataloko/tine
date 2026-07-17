@@ -3,12 +3,25 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult } from "./backend";
-import type { BlockDto, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, RefGroup } from "./types";
+import type { BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
 import { matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
+import { parseJournalWith } from "./journal";
+
+/** Mock feed membership must use a Logseq journal-title parser, never the
+ * host's permissive/non-portable Date string parser. Keep the same explicit
+ * patterns the fixture can emit so pagination remains deterministic in every
+ * browser/runtime. */
+function mockJournalDayKey(name: string): number | null {
+  for (const format of ["MMM do, yyyy", "EEEE, dd-MM-yyyy", "yyyy-MM-dd", "dd-MM-yyyy", "yyyy_MM_dd"]) {
+    const parsed = parseJournalWith(name, format);
+    if (parsed) return parsed.y * 10_000 + parsed.m * 100 + parsed.d;
+  }
+  return null;
+}
 
 function pageRefs(raw: string): string[] {
   const out: string[] = [];
@@ -663,6 +676,7 @@ export function mockBackend(): Backend {
     async captureTarget() {
       return "main";
     },
+    async bindCaptureGraph() {},
     async forgetKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       return "desktop";
@@ -683,8 +697,24 @@ export function mockBackend(): Backend {
     async listPages(): Promise<PageEntry[]> {
       return all.map(mockPageEntry);
     },
-    async journalsDesc(limit: number, offset: number): Promise<PageDto[]> {
-      return PAGES.slice(offset, offset + limit);
+    async journalFeedPage(limit: number, beforeDay: number | null) {
+      const now = new Date();
+      const as_of_day = now.getFullYear() * 10_000 + (now.getMonth() + 1) * 100 + now.getDate();
+      const candidates = PAGES
+        .filter((p) => p.kind === "journal")
+        .map((page) => ({ page, day: mockJournalDayKey(page.name) }))
+        .filter((row): row is { page: PageDto; day: number } =>
+          row.day !== null && row.day <= as_of_day && (beforeDay === null || row.day < beforeDay)
+        )
+        .sort((a, b) => b.day - a.day);
+      const rows = candidates.slice(0, limit);
+      const done = rows.length === candidates.length;
+      return {
+        pages: rows.map(({ page }) => page),
+        next_before_day: done || !rows.length ? null : rows[rows.length - 1].day,
+        done,
+        as_of_day,
+      };
     },
     async journalContentDays(): Promise<number[]> {
       return [];
@@ -832,6 +862,75 @@ export function mockBackend(): Backend {
         return collect((b) => pageRefs(b.raw).some((r) => r.toLowerCase() === n));
       }
       return [];
+    },
+    async exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch> {
+      let remainingRoots = 50;
+      let remainingNodes = 2_000;
+      let remainingBytes = 8 * 1024 * 1024;
+      const estimate = (block: BlockDto) => block.id.length + block.raw.length + 128;
+      const countTree = (root: BlockDto) => {
+        let count = 0;
+        const stack = [root];
+        while (stack.length) {
+          const block = stack.pop()!;
+          count++;
+          for (const child of block.children) stack.push(child);
+        }
+        return count;
+      };
+      const copyTree = (block: BlockDto): BlockDto | null => {
+        const bytes = estimate(block);
+        if (remainingNodes === 0 || bytes > remainingBytes) return null;
+        remainingNodes--;
+        remainingBytes -= bytes;
+        const children: BlockDto[] = [];
+        for (const child of block.children) {
+          const copied = copyTree(child);
+          if (!copied) break;
+          children.push(copied);
+        }
+        return { ...block, children };
+      };
+      const findBlock = (page: PageDto, id: string): BlockDto | null => {
+        const stack = [...page.blocks];
+        while (stack.length) {
+          const block = stack.pop()!;
+          if (block.id === id) return block;
+          for (const child of block.children) stack.push(child);
+        }
+        return null;
+      };
+      const results = [];
+      for (const spec of specs.slice(0, 64)) {
+        const groups = spec.advanced
+          ? (await this.runAdvancedQuery(spec.query)).groups
+          : await this.runQuery(spec.query);
+        const total = groups.reduce((sum, group) => sum + group.blocks.length, 0);
+        const hydrated: RefGroup[] = [];
+        let shown = 0;
+        let omittedNodes = 0;
+        for (const group of groups) {
+          const page = find(group.page);
+          if (!page) continue;
+          const blocks: BlockDto[] = [];
+          for (const shallow of group.blocks) {
+            if (remainingRoots === 0) break;
+            remainingRoots--;
+            const source = findBlock(page, shallow.id) ?? shallow;
+            const before = remainingNodes;
+            const copied = copyTree(source);
+            omittedNodes += Math.max(0, countTree(source) - (before - remainingNodes));
+            if (copied) {
+              blocks.push(copied);
+              shown++;
+            }
+          }
+          if (blocks.length) hydrated.push({ page: group.page, kind: group.kind, blocks });
+          if (remainingRoots === 0) break;
+        }
+        results.push({ key: spec.key, groups: hydrated, shown, total, omitted_nodes: omittedNodes });
+      }
+      return { results, omitted_queries: Math.max(0, specs.length - 64) };
     },
     async readCustomCss(): Promise<string> {
       return (globalThis as unknown as { __tineMockCustomCss?: string }).__tineMockCustomCss ?? "";
@@ -986,21 +1085,61 @@ export function mockBackend(): Backend {
         .slice(0, limit)
         .map(mockPageEntry);
     },
+    async captureQuickSwitch(query: string, limit: number): Promise<PageEntry[]> {
+      return this.quickSwitch(query, limit);
+    },
     async resolveBlock(uuid: string): Promise<RefGroup | null> {
+      const find = (blocks: BlockDto[]): BlockDto | null => {
+        for (const block of blocks) {
+          if (block.raw.includes(`id:: ${uuid}`)) return block;
+          const child = find(block.children);
+          if (child) return child;
+        }
+        return null;
+      };
       for (const p of all) {
-        let found: BlockDto | null = null;
-        const walk = (bs: BlockDto[]) =>
-          bs.forEach((b) => {
-            if (!found && b.raw.includes(`id:: ${uuid}`)) found = b;
-            walk(b.children);
-          });
-        walk(p.blocks);
-        if (found) return { page: p.name, kind: p.kind, blocks: [found] };
+        const found = find(p.blocks);
+        if (found) return { page: p.name, kind: p.kind, blocks: [{ ...found, children: [] }] };
       }
       return null;
     },
     async resolveBlocks(uuids: string[]): Promise<(RefGroup | null)[]> {
       return Promise.all(uuids.map((u) => this.resolveBlock(u)));
+    },
+    async previewBlock(uuid: string, maxNodes: number): Promise<BlockPreview | null> {
+      let group: RefGroup | null = null;
+      const find = (blocks: BlockDto[]): BlockDto | null => {
+        for (const block of blocks) {
+          if (block.id === uuid || block.raw.includes(`id:: ${uuid}`)) return block;
+          const child = find(block.children);
+          if (child) return child;
+        }
+        return null;
+      };
+      for (const page of all) {
+        const found = find(page.blocks);
+        if (found) {
+          group = { page: page.name, kind: page.kind, blocks: [found] };
+          break;
+        }
+      }
+      if (!group) return null;
+      let emitted = 0;
+      let truncated = 0;
+      const count = (blocks: BlockDto[]): number => blocks.reduce((n, b) => n + 1 + count(b.children), 0);
+      const copy = (blocks: BlockDto[]): BlockDto[] => {
+        const out: BlockDto[] = [];
+        for (const block of blocks) {
+          if (emitted >= Math.max(1, maxNodes)) {
+            truncated += count([block]);
+            continue;
+          }
+          emitted++;
+          out.push({ ...block, children: copy(block.children) });
+        }
+        return out;
+      };
+      return { group: { ...group, blocks: copy(group.blocks) }, truncated };
     },
     async readAsset(name: string, maxBytes?: number): Promise<Uint8Array> {
       void maxBytes;
@@ -1031,6 +1170,9 @@ export function mockBackend(): Backend {
     },
     async importAsset(path: string, name?: string): Promise<string> {
       return name ?? path.split("/").pop() ?? path;
+    },
+    async importNativeCapture(path: string, name: string): Promise<string> {
+      return name || path.split("/").pop() || path;
     },
     async clipboardFiles() {
       return { files: [], skipped: 0, truncated: false };

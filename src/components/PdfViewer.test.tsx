@@ -1,7 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
-import { PdfViewer } from "./PdfViewer";
+import {
+  KeyedPdfViewer,
+  PdfViewer,
+  PDF_CANVAS_CACHE_PIXEL_BUDGET,
+  PDF_FIND_MATCH_CAP,
+} from "./PdfViewer";
 
 const getDocumentMock = vi.hoisted(() => vi.fn());
 
@@ -45,6 +51,10 @@ class TestIntersectionObserver {
 
   show(element: Element) {
     this.callback([{ isIntersecting: true, target: element } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+  }
+
+  hide(element: Element) {
+    this.callback([{ isIntersecting: false, target: element } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
   }
 }
 
@@ -215,6 +225,41 @@ describe("PdfViewer resource safety", () => {
       dispose();
     }
   });
+
+  it("bounds all retained backing stores by pixels and zeroes each evicted canvas", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 4 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(window, "devicePixelRatio", "get").mockReturnValue(2);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const pdf = documentWithPages(Array.from({ length: 5 }, () => page(612, 792)));
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="long.pdf" label="Long PDF" />, host);
+    try {
+      await flush();
+      const pageElements = [...host.querySelectorAll<HTMLElement>(".pdf-page")];
+      const observer = TestIntersectionObserver.instances[0];
+      let firstCanvas: HTMLCanvasElement | null = null;
+      for (const element of pageElements) {
+        observer.show(element);
+        await flush();
+        firstCanvas ??= element.querySelector("canvas");
+        observer.hide(element);
+      }
+
+      const retained = [...host.querySelectorAll<HTMLCanvasElement>(".pdf-page canvas")];
+      const retainedPixels = retained.reduce((total, canvas) => total + canvas.width * canvas.height, 0);
+      expect(retainedPixels).toBeLessThanOrEqual(PDF_CANVAS_CACHE_PIXEL_BUDGET);
+      expect(retained.length).toBeLessThan(pageElements.length);
+      expect(firstCanvas?.isConnected).toBe(false);
+      expect(firstCanvas?.width).toBe(0);
+      expect(firstCanvas?.height).toBe(0);
+    } finally {
+      dispose();
+    }
+  });
 });
 
 describe("PdfViewer OG state and reference behavior", () => {
@@ -315,6 +360,236 @@ describe("PdfViewer OG state and reference behavior", () => {
 
       expect(writeHighlights).toHaveBeenCalledOnce();
       expect(writeText).toHaveBeenCalledWith("((11111111-1111-4111-8111-111111111111))");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("offers OG reference actions for existing text and area highlights", async () => {
+    const textId = "11111111-1111-4111-8111-111111111111";
+    const areaId = "22222222-2222-4222-8222-222222222222";
+    const rect = { top: 40, left: 20, width: 80, height: 12 };
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [
+        {
+          id: textId,
+          page: 1,
+          position: { page: 1, bounding: rect, rects: [rect] },
+          color: "yellow",
+          text: "existing text highlight",
+          image: null,
+        },
+        {
+          id: areaId,
+          page: 1,
+          position: { page: 1, bounding: { ...rect, top: 80 }, rects: [] },
+          color: "green",
+          text: null,
+          image: 1234,
+        },
+      ],
+      page: 1,
+      scale: 1,
+    });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const writeHighlights = vi.spyOn(backend(), "writeHighlights").mockResolvedValue(undefined);
+    const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue(undefined);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792)])) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="paper.pdf" label="Paper" />, host);
+    try {
+      await flush();
+      TestIntersectionObserver.instances[0].show(host.querySelector(".pdf-page")!);
+      await flush();
+      const textHighlight = host.querySelector(`[data-highlight-id="${textId}"]`) as HTMLElement;
+      expect(textHighlight).not.toBeNull();
+      textHighlight.click();
+      await flush();
+
+      const actionLabels = [...host.querySelectorAll<HTMLButtonElement>(".pdf-color-menu button")]
+        .map((button) => button.textContent?.trim())
+        .filter(Boolean);
+      expect(actionLabels).toEqual(expect.arrayContaining(["Copy ref", "Linked references"]));
+
+      const copy = [...host.querySelectorAll<HTMLButtonElement>(".pdf-color-menu button")]
+        .find((button) => button.textContent?.trim() === "Copy ref")!;
+      copy.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      await flush();
+      expect(writeHighlights).toHaveBeenCalledOnce();
+      expect(writeHighlights.mock.calls[0][2].map((highlight) => highlight.id)).toEqual([textId, areaId]);
+      expect(writeHighlights.mock.calls[0][3]).toEqual([textId, areaId]);
+      expect(writeText).toHaveBeenCalledWith(`((${textId}))`);
+
+      const areaHighlight = host.querySelector(`[data-highlight-id="${areaId}"]`) as HTMLElement;
+      const contextMenu = new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 30,
+        clientY: 90,
+      });
+      areaHighlight.dispatchEvent(contextMenu);
+      await flush();
+      expect(contextMenu.defaultPrevented).toBe(true);
+      const areaActionLabels = [...host.querySelectorAll<HTMLButtonElement>(".pdf-color-menu button")]
+        .map((button) => button.textContent?.trim())
+        .filter(Boolean);
+      expect(areaActionLabels).toEqual(expect.arrayContaining(["Copy ref", "Linked references"]));
+    } finally {
+      dispose();
+    }
+  });
+
+  it("tears down the complete document identity before opening another PDF", async () => {
+    const openPdf = vi.spyOn(backend() as any, "openPdf").mockImplementation(async (...args: unknown[]) => {
+      const filename = String(args[0]);
+      return {
+        highlights: [],
+        page: filename === "a.pdf" ? 2 : 1,
+        scale: filename === "a.pdf" ? 2 : 1,
+      };
+    });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const first = documentWithPages([page(612, 792), page(612, 792)]);
+    const second = documentWithPages([page(612, 792)]);
+    getDocumentMock
+      .mockReturnValueOnce({ promise: Promise.resolve(first) })
+      .mockReturnValueOnce({ promise: Promise.resolve(second) });
+    const [target, setTarget] = createSignal({ filename: "a.pdf", label: "A" });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <KeyedPdfViewer target={target} />, host);
+    try {
+      await flush();
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename")).toBe("a.pdf");
+
+      setTarget({ filename: "b.pdf", label: "B" });
+      await flush();
+
+      expect(openPdf.mock.calls.map(([filename]) => filename)).toEqual(["a.pdf", "b.pdf"]);
+      expect(first.destroy).toHaveBeenCalledOnce();
+      expect(host.querySelectorAll(".pdf-viewer")).toHaveLength(1);
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename")).toBe("b.pdf");
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready")).toBe("true");
+      expect((host.querySelector(".pdf-page-input") as HTMLInputElement).value).toBe("1");
+      expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("100%");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("destroys a late document load after its asset identity was replaced", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const stale = documentWithPages([page(612, 792)]);
+    const current = documentWithPages([page(612, 792)]);
+    let resolveStale!: (document: typeof stale) => void;
+    const staleLoad = new Promise<typeof stale>((resolve) => { resolveStale = resolve; });
+    getDocumentMock
+      .mockReturnValueOnce({ promise: staleLoad })
+      .mockReturnValueOnce({ promise: Promise.resolve(current) });
+    const [target, setTarget] = createSignal({ filename: "a.pdf", label: "A" });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <KeyedPdfViewer target={target} />, host);
+    try {
+      await flush();
+      setTarget({ filename: "b.pdf", label: "B" });
+      await flush();
+      resolveStale(stale);
+      await flush();
+
+      expect(stale.destroy).toHaveBeenCalledOnce();
+      expect(current.destroy).not.toHaveBeenCalled();
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename")).toBe("b.pdf");
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready")).toBe("true");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps one PDF mounted and scrolls repeated references to the exact highlight", async () => {
+    const firstId = "11111111-1111-4111-8111-111111111111";
+    const secondId = "22222222-2222-4222-8222-222222222222";
+    const rect = (top: number) => ({ top, left: 20, width: 80, height: 12 });
+    const openPdf = vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [
+        {
+          id: firstId,
+          page: 1,
+          position: { page: 1, bounding: rect(40), rects: [rect(40)] },
+          color: "yellow",
+          text: "first",
+          image: null,
+        },
+        {
+          id: secondId,
+          page: 1,
+          position: { page: 1, bounding: rect(500), rects: [rect(500)] },
+          color: "green",
+          text: "second",
+          image: null,
+        },
+      ],
+      page: 1,
+      scale: 1,
+    });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const pdf = documentWithPages([page(612, 792)]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+    const [target, setTarget] = createSignal({
+      filename: "paper.pdf",
+      label: "Paper",
+      page: 1,
+      highlightId: firstId,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <KeyedPdfViewer target={target} />, host);
+    try {
+      await flush();
+      const viewer = host.querySelector(".pdf-viewer");
+      expect(viewer?.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id")).toBe(firstId);
+
+      setTarget({ filename: "paper.pdf", label: "Paper", page: 1, highlightId: secondId });
+      await flush();
+
+      expect(openPdf).toHaveBeenCalledOnce();
+      expect(host.querySelector(".pdf-viewer")).toBe(viewer);
+      expect(pdf.destroy).not.toHaveBeenCalled();
+      expect(viewer?.getAttribute("data-pdf-highlight-target")).toBe(secondId);
+      expect(viewer?.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id")).toBe(secondId);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("caps PDF Find occurrences and labels the result as truncated", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const textPage = page(612, 792);
+    textPage.getTextContent.mockResolvedValue({ items: [{ str: "a".repeat(PDF_FIND_MATCH_CAP + 500) }] });
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([textPage])) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="search.pdf" label="Search" />, host);
+    try {
+      await flush();
+      (host.querySelector('button[title="Find in document (Ctrl+F)"]') as HTMLButtonElement).click();
+      const input = host.querySelector(".pdf-find-input") as HTMLInputElement;
+      input.value = "a";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await vi.advanceTimersByTimeAsync(180);
+      await flush();
+
+      expect(host.querySelector(".pdf-find-count")?.textContent).toBe(`1 / ${PDF_FIND_MATCH_CAP}+`);
     } finally {
       dispose();
     }

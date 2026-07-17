@@ -735,6 +735,18 @@ function scopedVisibleOrder(scope: OutlineScope): string[] {
   return order;
 }
 
+/** The only trailing-block reuse candidate for a rendered outline boundary.
+ * The caller must supply the actual page or zoom scope so journal days cannot
+ * cross-select each other. A collapsed parent and an opaque Sheet host remain
+ * visible terminal rows, but their storage children mean neither is a leaf. */
+export function trailingVisibleEmptyLeaf(scope: OutlineScope): string | null {
+  const id = scopedVisibleOrder(scope).at(-1);
+  if (!id) return null;
+  const node = doc.byId[id];
+  if (!node || node.children.length !== 0) return null;
+  return splitProps(node.raw, isBuiltinHidden, formatForBlock(id)).visible.trim() === "" ? id : null;
+}
+
 let activeSelectionScope: OutlineScope | null = null;
 
 /** Visible order to resolve a block SELECTION against. The journals feed lives in
@@ -2449,12 +2461,21 @@ export async function moveBlock(
 // During a block-move reorder the textarea momentarily blurs; this flag tells
 // the editor's onBlur to keep edit mode (the move handler refocuses + restores
 // the caret right after).
-let blockMoving = false;
-export function isBlockMoving(): boolean {
-  return blockMoving;
+// A reorder only keeps the editor transiently blurred for one animation frame.
+// Keep its page ownership: watcher/feed refreshes for another page must not be
+// held hostage by a sidebar or split-pane reorder.
+let blockMovingPage: string | null = null;
+// Feed refresh ownership observes the end of a page-scoped drag.  Keep the
+// inexpensive page check above, but make its lifecycle observable so a deferred
+// restart is released by the move itself rather than a coincidental later event.
+const [blockMoveRev, setBlockMoveRev] = createSignal(0);
+export function isBlockMoving(page?: string): boolean {
+  blockMoveRev();
+  return blockMovingPage !== null && (page === undefined || blockMovingPage === page);
 }
-export function setBlockMoving(v: boolean): void {
-  blockMoving = v;
+export function setBlockMoving(v: boolean, page?: string): void {
+  blockMovingPage = v ? (page ?? blockMovingPage ?? "") : null;
+  setBlockMoveRev((n) => n + 1);
 }
 
 export function moveItem(id: string, dir: 1 | -1) {

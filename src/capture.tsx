@@ -10,6 +10,7 @@
 import { render } from "solid-js/web";
 import { For, Show, createSignal, createEffect, onCleanup, onMount } from "solid-js";
 import { initParser } from "./render/parse";
+import { initLinkDefault } from "./editor/linkDefault";
 import { Block, CaptureCtx, type CaptureApi } from "./components/Block";
 import { DatePicker } from "./components/DatePicker";
 import { datePicker } from "./ui";
@@ -108,6 +109,21 @@ function Capture() {
     ta.focus();
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
+  };
+
+  // Moving focus to the title is a real editor blur: Block commits and exits
+  // editing, so its textarea is unmounted. Plain title Enter must therefore
+  // restart the real scratch-root editing lifecycle before refitting/focusing
+  // the textarea; querying for the old node after blur can never work.
+  const resumeScratchEditor = () => {
+    const root = roots()[0];
+    if (!root) return;
+    if (!document.querySelector(".capture-shell .page-blocks textarea")) {
+      startEditing(root, doc.byId[root]?.raw.length ?? 0, null);
+    }
+    // Solid mounts the real Editor synchronously from startEditing; defer the
+    // capture-specific fit/focus until that lifecycle has attached its textarea.
+    queueMicrotask(refit);
   };
 
   // --- auto-grow the window to fit its content + any open popup --------------
@@ -211,6 +227,20 @@ function Capture() {
   const resettleAndActivate = () => {
     resettle();
     activateWhenEditorReady();
+  };
+  // Quick Capture is a separate WebView, so its module-local completion-policy
+  // signal starts at the default and it has no graph binding. Do not acknowledge
+  // an activation until this WebView has read the persisted policy *and* leased
+  // the selected graph for quickSwitch; otherwise a fast first `[[…]]` can
+  // either use adaptive or issue its query without any graph candidates.
+  // A later show wins if refreshes overlap while the window is being hidden or
+  // re-shown, so stale reads cannot activate an older lifecycle.
+  let policyRefreshGeneration = 0;
+  const refreshPolicyThenResettleAndActivate = async () => {
+    const generation = ++policyRefreshGeneration;
+    await Promise.all([initLinkDefault(), backend().bindCaptureGraph()]);
+    if (generation !== policyRefreshGeneration) return;
+    resettleAndActivate();
   };
   const blurGate = createCaptureBlurGate();
   let fitRaf: number | undefined;
@@ -400,7 +430,13 @@ function Capture() {
     void hideWindow();
   };
 
-  const captureApi: CaptureApi = { submit, cancel, enterFiles, bulletHint };
+  const captureApi: CaptureApi = {
+    submit,
+    cancel,
+    enterFiles,
+    bulletHint,
+    quickSwitch: (query, limit) => backend().captureQuickSwitch(query, limit),
+  };
 
   // Grow/shrink the window whenever the rendered content changes: new/removed
   // blocks and popups (childList), or a textarea autosizing (inline `style`).
@@ -454,9 +490,9 @@ function Capture() {
         // while we were hidden.
         const unShown = await listen("capture-shown", () => {
           loadPref();
+          void refreshPolicyThenResettleAndActivate();
           void requestTheme();
           void requestShortcuts();
-          resettleAndActivate();
         });
         const unFocusEditor = await listen("capture-focus-editor", refit);
         // Cold `tine --capture` can show + emit before this asynchronously
@@ -465,7 +501,7 @@ function Capture() {
         // visible capture editor unfocused (GH #117). A later show still follows
         // the normal event path above.
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
-        await resettleIfVisible(getCurrentWindow(), resettleAndActivate);
+        await resettleIfVisible(getCurrentWindow(), refreshPolicyThenResettleAndActivate);
         onCleanup(() => {
           unTheme();
           unKeys();
@@ -518,6 +554,10 @@ function Capture() {
             placeholder="Page Title (optional, if empty → appended to Today)"
             onInput={(e) => setTitle(e.currentTarget.value)}
             onKeyDown={(e) => {
+              // The global capture dispatcher declines IME Escape, so the title
+              // target must do the same rather than falling through to submit,
+              // cancellation, or title-to-editor focus movement.
+              if (e.isComposing || e.keyCode === 229) return;
               const want = shortcuts()["editor/quick-capture-file"] || "mod+shift+enter";
               if (eventToBindingString(e) === want) {
                 e.preventDefault();
@@ -527,7 +567,7 @@ function Capture() {
                 cancel();
               } else if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
                 e.preventDefault();
-                document.querySelector<HTMLTextAreaElement>(".capture-shell .page-blocks textarea")?.focus();
+                resumeScratchEditor();
               }
             }}
           />
