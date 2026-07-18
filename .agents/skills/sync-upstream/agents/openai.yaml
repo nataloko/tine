@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Tine Upstream"
+  short_description: "Merge and ship an upstream Tine release"
+  default_prompt: "Use $sync-upstream to merge the latest upstream Tine release into mine and ship the personal build."
