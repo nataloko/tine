@@ -15,20 +15,61 @@ import { backend } from "./backend";
 import { renderedBlocks } from "./lazyObserve";
 import { navReuseTabs } from "./navSettings";
 import { isMobilePlatform } from "./nativeChrome";
+import type { PageKind } from "./types";
+
+/** One logical page plus its optional concrete graph-relative file owner. */
+export interface PageTarget {
+  name: string;
+  pageKind: PageKind;
+  /** Absent only for deliberately logical navigation. */
+  path?: string;
+}
+
+export interface BlockTarget extends PageTarget {
+  block: string;
+}
+
+export function pageTargetFromRoute(route: Route): PageTarget | null {
+  return route.kind === "page"
+    ? { name: route.name, pageKind: route.pageKind, ...(route.path ? { path: route.path } : {}) }
+    : null;
+}
+
+export function pageTargetFromFeedPage(page: { name: string; kind: PageKind; path?: string }): PageTarget {
+  return { name: page.name, pageKind: page.kind, ...(page.path ? { path: page.path } : {}) };
+}
+
+export function pageTargetFromEntry(entry: { name: string; kind: PageKind; path?: string }): PageTarget {
+  return { name: entry.name, pageKind: entry.kind, ...(entry.path ? { path: entry.path } : {}) };
+}
+
+export function pageTargetFromBlockRef(ref: {
+  page: string;
+  pageKind: PageKind;
+  path?: string;
+}): PageTarget {
+  return { name: ref.page, pageKind: ref.pageKind, ...(ref.path ? { path: ref.path } : {}) };
+}
+
+export function pageTargetMatchesLoaded(
+  target: PageTarget,
+  page: { name: string; kind: PageKind; path?: string } | null | undefined,
+): boolean {
+  if (!page || page.name !== target.name || page.kind !== target.pageKind) return false;
+  return target.path === undefined || page.path === target.path;
+}
 
 export type Route =
   | { kind: "journals" }
   | QueryRoute
-  | {
+  | (PageTarget & {
       kind: "page";
-      name: string;
-      pageKind: "journal" | "page";
       block?: string;
       /** Graph-root-relative file to pin this view to - set ONLY to reach a
        *  duplicate-day stray that shares a (kind,name) with the canonical file
        *  (#21). Absent for normal pages, which resolve by name. */
       path?: string;
-    };
+    });
 
 export type QueryPresentation = "search" | "list" | "table" | "board";
 
@@ -78,11 +119,15 @@ export interface PaneRouter {
   tabRoute(t: Tab): Route;
   route(): Route;
   restoreScrollFor(r: Route): void;
+  /** Record the currently displayed route as a real foreground activation.
+   *  Session restore/preload deliberately do not call this boundary. */
+  activateCurrentRoute(): void;
   openPage(
     name: string,
     pageKind?: "journal" | "page",
     opts?: { inPlace?: boolean }
   ): void;
+  openPageTarget(target: PageTarget, opts?: { inPlace?: boolean }): void;
   openJournals(opts?: { inPlace?: boolean }): void;
   openQueryInNewTab(source: string, presentation?: QueryPresentation, foreground?: boolean): QueryRoute;
   updateActiveQuery(patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>): void;
@@ -95,9 +140,13 @@ export interface PaneRouter {
     opts?: { inPlace?: boolean }
   ): void;
   focusBlock(id: string | null): void;
-  openPageAtBlock(name: string, pageKind: "journal" | "page", blockId: string): void;
+  openPageAtBlock(target: BlockTarget): void;
+  openPageAtBlock(name: string, pageKind: PageKind, blockId: string, path?: string): void;
   openInNewTab(r: Route, foreground?: boolean): void;
+  openPageTargetInNewTab(target: PageTarget, foreground?: boolean): void;
   openPageInNewTab(name: string, pageKind?: "journal" | "page", block?: string, foreground?: boolean): void;
+  rewritePageTarget(from: PageTarget, to: PageTarget): void;
+  removePageTarget(target: PageTarget): void;
   canGoBack(): boolean;
   canGoForward(): boolean;
   goBack(): void;
@@ -173,6 +222,12 @@ function isGuideRouteName(name: string): boolean {
   return name.startsWith(GUIDE_DISPLAY_PREFIX);
 }
 
+/** RECENT is a graph-global MRU of pages the user actually brought to the
+ *  foreground, not a log of route objects that happened to be constructed. */
+function promoteRecentRoute(r: Route): void {
+  if (r.kind === "page" && !isGuideRouteName(r.name)) pushRecent(pageTargetFromRoute(r)!);
+}
+
 /** Stable partition: all pinned tabs first (in their relative order), then the
  *  unpinned ones. Pinned tabs always sit to the left of the strip (matches the
  *  OG plugin), so a pinned tab can't be visually stranded among unpinned ones. */
@@ -214,8 +269,8 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
 
   // Start on a single journals tab. The saved session (if any) is loaded
   // asynchronously from the backend by restoreSession(), called once at startup
-  // before first paint - see main.tsx. (localStorage isn't durably persisted in
-  // this WebKitGTK app, so the session round-trips through a real backend file.)
+  // before first paint - see main.tsx. The structured session round-trips through
+  // an atomic backend file rather than being tied to one WebView's localStorage.
   const [tabs, setTabs] = createSignal<Tab[]>([
     { id: newId(), history: [{ kind: "journals" }], pos: 0, pinned: false },
   ]);
@@ -255,6 +310,10 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     return tabRoute(activeTab());
   }
 
+  function activateCurrentRoute(): void {
+    promoteRecentRoute(route());
+  }
+
   function mobileHistoryAvailable(): boolean {
     return (
       isMobilePlatform &&
@@ -285,6 +344,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
   function applyRouterBack() {
     rememberScroll(); // save this entry's scroll before stepping back
     setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos - 1 } : t)));
+    activateCurrentRoute();
     persist();
   }
 
@@ -407,6 +467,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
         return { ...t, history, pos: history.length - 1 };
       })
     );
+    activateCurrentRoute();
     persist();
     pushMobileHistoryEntry();
   }
@@ -416,10 +477,19 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     pageKind: "journal" | "page" = "page",
     opts: { inPlace?: boolean } = {}
   ) {
-    // Resolve aliases so the route + working-set key use the canonical page name.
-    if (pageKind === "page" && !isGuideRouteName(name)) name = resolveAlias(name);
-    navigate({ kind: "page", name, pageKind }, { sticky: !opts.inPlace });
-    if (!isGuideRouteName(name)) pushRecent(name, pageKind);
+    openPageTarget({ name, pageKind }, opts);
+  }
+
+  function openPageTarget(target: PageTarget, opts: { inPlace?: boolean } = {}) {
+    // An exact physical owner is authoritative. Alias resolution is only valid
+    // for deliberately logical targets.
+    const name = target.pageKind === "page" && !target.path && !isGuideRouteName(target.name)
+      ? resolveAlias(target.name)
+      : target.name;
+    navigate(
+      { kind: "page", name, pageKind: target.pageKind, ...(target.path ? { path: target.path } : {}) },
+      { sticky: !opts.inPlace },
+    );
   }
 
   function openJournals(opts: { inPlace?: boolean } = {}) {
@@ -434,6 +504,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
       history[tab.pos] = nextRoute;
       return { ...tab, history };
     }));
+    activateCurrentRoute();
     persist();
   }
 
@@ -485,8 +556,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     pageKind: "journal" | "page" = "journal",
     opts: { inPlace?: boolean } = {}
   ) {
-    navigate({ kind: "page", name, pageKind, path }, { sticky: !opts.inPlace });
-    pushRecent(name, pageKind);
+    openPageTarget({ name, pageKind, path }, opts);
   }
 
   /** Zoom the active tab into a block (or back out, when null). Zoom is part of the
@@ -502,26 +572,40 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     if (id === null) {
       // Zoom out: stay on the current page, drop the block. (No-op off a page.)
       const r = route();
-      if (r.kind === "page") navigate({ kind: "page", name: r.name, pageKind: r.pageKind });
+      if (r.kind === "page") {
+        const target = pageTargetFromRoute(r)!;
+        navigate({ kind: "page", ...target });
+      }
       return;
     }
     if (!doc.byId[id]) return; // block no longer loaded - nothing to zoom into
     const ref = persistentBlockRef(id);
-    navigate({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid });
+    navigate({ kind: "page", ...pageTargetFromBlockRef(ref), block: ref.uuid });
   }
 
   /** Open a page and scroll the given block into view (block search results jump
    *  to the specific block, not just the page top). */
-  function openPageAtBlock(name: string, pageKind: "journal" | "page", blockId: string) {
+  function openPageAtBlock(target: BlockTarget): void;
+  function openPageAtBlock(name: string, pageKind: PageKind, blockId: string, path?: string): void;
+  function openPageAtBlock(
+    targetOrName: BlockTarget | string,
+    pageKind?: PageKind,
+    blockId?: string,
+    path?: string,
+  ) {
+    const target: BlockTarget = typeof targetOrName === "string"
+      ? { name: targetOrName, pageKind: pageKind!, block: blockId!, ...(path ? { path } : {}) }
+      : targetOrName;
     // Pre-latch the target so its body renders eagerly (not as a deferred raw-text
     // placeholder) - a heavy target (table/image) then lands at its true height
     // instead of growing after the scroll. See AstBody / docs/adr (P1 lazy body).
-    renderedBlocks.add(blockId);
-    openPage(name, pageKind);
+    renderedBlocks.add(target.block);
+    openPageTarget(target);
     // Let the page render, then scroll + briefly highlight the target block.
     let tries = 0;
     const tick = () => {
-      const el = document.querySelector(`.ls-block[data-block-id="${blockId}"]`);
+      if (typeof document === "undefined") return;
+      const el = document.querySelector(`.ls-block[data-block-id="${target.block}"]`);
       if (el) {
         el.scrollIntoView({ block: "center", behavior: "smooth" });
         el.classList.add("block-flash");
@@ -541,8 +625,18 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     // appending keeps the pinned-left invariant (all pinned precede all unpinned).
     const id = newId();
     setTabs([...tabs(), { id, history: [r], pos: 0, pinned: false }]);
-    if (foreground) setActiveId(id);
+    if (foreground) {
+      setActiveId(id);
+      activateCurrentRoute();
+    }
     persist();
+  }
+
+  function openPageTargetInNewTab(target: PageTarget, foreground = false) {
+    const name = target.pageKind === "page" && !target.path && !isGuideRouteName(target.name)
+      ? resolveAlias(target.name)
+      : target.name;
+    openInNewTab({ kind: "page", name, pageKind: target.pageKind, ...(target.path ? { path: target.path } : {}) }, foreground);
   }
 
   function openPageInNewTab(
@@ -551,9 +645,43 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     block?: string,
     foreground = false
   ) {
-    if (pageKind === "page" && !isGuideRouteName(name)) name = resolveAlias(name);
-    openInNewTab({ kind: "page", name, pageKind, block }, foreground);
-    if (!isGuideRouteName(name)) pushRecent(name, pageKind);
+    const target: PageTarget = { name, pageKind };
+    if (block) openInNewTab({ kind: "page", ...target, block }, foreground);
+    else openPageTargetInNewTab(target, foreground);
+  }
+
+  const targetIdentityMatches = (route: Route, target: PageTarget) =>
+    route.kind === "page" && route.name === target.name && route.pageKind === target.pageKind
+      && (target.path !== undefined ? route.path === target.path : route.path === undefined);
+
+  function rewritePageTarget(from: PageTarget, to: PageTarget) {
+    const rewrite = (r: Route): Route => {
+      if (r.kind !== "page" || !targetIdentityMatches(r, from)) return r;
+      return { ...r, name: to.name, pageKind: to.pageKind, path: to.path };
+    };
+    setTabs(tabs().map((tab) => ({ ...tab, history: tab.history.map(rewrite) })));
+    for (const closed of closedTabs) closed.history = closed.history.map(rewrite);
+    persist();
+  }
+
+  function removePageTarget(target: PageTarget) {
+    const fallback: Route = { kind: "journals" };
+    setTabs(tabs().map((tab) => {
+      const oldCurrent = tabRoute(tab);
+      const history = tab.history.filter((r) => !targetIdentityMatches(r, target));
+      if (!history.length) return { ...tab, history: [fallback], pos: 0 };
+      const removedBefore = tab.history.slice(0, tab.pos + 1).filter((r) => targetIdentityMatches(r, target)).length;
+      const pos = Math.min(Math.max(0, tab.pos - removedBefore + (targetIdentityMatches(oldCurrent, target) ? 0 : 0)), history.length - 1);
+      return { ...tab, history, pos };
+    }));
+    for (let i = closedTabs.length - 1; i >= 0; i--) {
+      const closed = closedTabs[i];
+      closed.history = closed.history.filter((r) => !targetIdentityMatches(r, target));
+      if (!closed.history.length) closedTabs.splice(i, 1);
+      else closed.pos = Math.min(closed.pos, closed.history.length - 1);
+    }
+    activateCurrentRoute();
+    persist();
   }
 
   // ---- back / forward ----
@@ -577,15 +705,18 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     if (!canGoForward()) return;
     rememberScroll(); // save this entry's scroll before stepping forward
     setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos + 1 } : t)));
+    activateCurrentRoute();
     persist();
     pushMobileHistoryEntry();
   }
 
   function setActiveTab(id: string) {
     const next = tabs().find((t) => t.id === id);
-    if (next && navigationInterceptor(paneId, tabRoute(next), {})) return;
+    if (!next || next.id === activeId()) return;
+    if (navigationInterceptor(paneId, tabRoute(next), {})) return;
     rememberScroll(); // save the outgoing tab's scroll so switching back restores it
     setActiveId(id);
+    activateCurrentRoute();
     persist();
   }
 
@@ -620,7 +751,10 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
       if (closedTabs.length > CLOSED_CAP) closedTabs.shift();
     }
     setTabs(next);
-    if (activeId() === id) setActiveId(next[Math.max(0, idx - 1)].id);
+    if (activeId() === id) {
+      setActiveId(next[Math.max(0, idx - 1)].id);
+      activateCurrentRoute();
+    }
     persist();
   }
 
@@ -635,6 +769,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     // New tabs are unpinned, so appending preserves the pinned-left invariant.
     setTabs([...tabs(), { id, history: last.history, pos, pinned: false }]);
     setActiveId(id);
+    activateCurrentRoute();
     persist();
   }
 
@@ -731,7 +866,10 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     const to = typeof index === "number" ? Math.min(Math.max(0, index | 0), list.length) : list.length;
     list.splice(to, 0, adopted);
     setTabs(partitionPinned(list));
-    if (foreground) setActiveId(id);
+    if (foreground) {
+      setActiveId(id);
+      activateCurrentRoute();
+    }
     persist();
   }
 
@@ -804,7 +942,9 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     tabRoute,
     route,
     restoreScrollFor,
+    activateCurrentRoute,
     openPage,
+    openPageTarget,
     openJournals,
     openQueryInNewTab,
     updateActiveQuery,
@@ -814,7 +954,10 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     focusBlock,
     openPageAtBlock,
     openInNewTab,
+    openPageTargetInNewTab,
     openPageInNewTab,
+    rewritePageTarget,
+    removePageTarget,
     canGoBack,
     canGoForward,
     goBack,
@@ -885,6 +1028,10 @@ export function openPage(
   focusedRouterInstance().openPage(name, pageKind, opts);
 }
 
+export function openPageTarget(target: PageTarget, opts: { inPlace?: boolean } = {}) {
+  focusedRouterInstance().openPageTarget(target, opts);
+}
+
 export function openJournals(opts: { inPlace?: boolean } = {}) {
   focusedRouterInstance().openJournals(opts);
 }
@@ -924,12 +1071,26 @@ export function focusBlock(id: string | null) {
   focusedRouterInstance().focusBlock(id);
 }
 
-export function openPageAtBlock(name: string, pageKind: "journal" | "page", blockId: string) {
-  focusedRouterInstance().openPageAtBlock(name, pageKind, blockId);
+export function openPageAtBlock(target: BlockTarget): void;
+export function openPageAtBlock(name: string, pageKind: PageKind, blockId: string, path?: string): void;
+export function openPageAtBlock(
+  targetOrName: BlockTarget | string,
+  pageKind?: PageKind,
+  blockId?: string,
+  path?: string,
+) {
+  const target: BlockTarget = typeof targetOrName === "string"
+    ? { name: targetOrName, pageKind: pageKind!, block: blockId!, ...(path ? { path } : {}) }
+    : targetOrName;
+  focusedRouterInstance().openPageAtBlock(target);
 }
 
 export function openInNewTab(r: Route, foreground = false) {
   focusedRouterInstance().openInNewTab(r, foreground);
+}
+
+export function openPageTargetInNewTab(target: PageTarget, foreground = false) {
+  focusedRouterInstance().openPageTargetInNewTab(target, foreground);
 }
 
 export function openPageInNewTab(

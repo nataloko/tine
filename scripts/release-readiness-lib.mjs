@@ -48,16 +48,33 @@ export function validateDisposition(owner, value, problems) {
 }
 
 export function auditableSourceFingerprint(root) {
-  const roots = ["src", "src-tauri/src", "crates", "fixtures"];
+  const pluginRoots = ["plugin-sdk", "community-plugins"];
+  const roots = ["src", "src-tauri/src", "crates", "fixtures", ...pluginRoots];
   const individual = ["Cargo.toml", "Cargo.lock", "package.json", "package-lock.json", "src-tauri/tauri.conf.json"];
+  // These files attest to the signed native test journey; they are not inputs
+  // to the shipped application or to the production behavior audited by the
+  // v0.6.0 lanes. Keep the exemption explicit so real revocation fixtures and
+  // runtime/plugin sources still invalidate the audit fingerprint.
+  const auditEvidenceOnly = new Set([
+    "fixtures/plugin-revocation/README.md",
+    "fixtures/plugin-revocation/fixture.json",
+    "fixtures/plugin-revocation/revoked-index.json.sig",
+  ]);
   const files = [];
   const walk = (relative) => {
     const absolute = path.join(root, relative);
     if (!fs.existsSync(absolute)) return;
     const stat = fs.lstatSync(absolute);
     if (stat.isDirectory()) {
+      // Cargo build output is local evidence, never audited source. This applies
+      // both to community plugins and to Rust-backed fixtures; otherwise a
+      // warmed developer checkout hashes differently from a clean CI checkout.
+      if (path.basename(relative) === "target") return;
       for (const name of fs.readdirSync(absolute).sort()) walk(path.join(relative, name));
-    } else if (stat.isFile()) files.push(relative.replaceAll(path.sep, "/"));
+    } else if (stat.isFile()) {
+      const normalized = relative.replaceAll(path.sep, "/");
+      if (!auditEvidenceOnly.has(normalized)) files.push(normalized);
+    }
   };
   for (const relative of roots) walk(relative);
   for (const relative of individual) walk(relative);

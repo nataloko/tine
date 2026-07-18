@@ -71,6 +71,9 @@ see the project `CLAUDE.md`.
 | [0042](0042-one-query-plan-many-frontends.md) | One typed query plan serves friendly search, visual builders, DSL, and virtual query workspaces | Accepted |
 | [0043](0043-canonical-reference-evidence.md) | Canonical reference occurrences and evidence | Accepted |
 | [0044](0044-objective-launcher-ranking.md) | Objective search classes and bounded launcher frecency | Accepted |
+| [0045](0045-tine-native-plugin-platform.md) | Tine-native plugins run as capability-limited WebAssembly guests | Accepted |
+| [0046](0046-declarative-plugin-settings-and-themes.md) | Plugin settings and themes are separate declarative host contracts | Accepted |
+| [0047](0047-android-plugin-platform-at-launch.md) | Android joins the initial plugin-platform launch through explicit opt-in | Accepted |
 
-**Fork (`mine`) ADRs** — this fork's own extras keep a separate numbering track so upstream syncs
+**Fork (`mine`) ADRs** - this fork's own extras keep a separate numbering track so upstream syncs
 never collide: see [`mine/README.md`](mine/README.md).

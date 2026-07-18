@@ -16,12 +16,14 @@ import {
   fuzzyScore,
   type Trigger,
 } from "../editor/autocomplete";
+import { pluginManager } from "../plugins/manager";
+import { bindPluginBlockSnapshot, isPluginGraphOwnerCurrent } from "../plugins/ownership";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
-import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
+import { threadingEnabled, threadColorMode, THREAD_PALETTE } from "../bulletThreading";
 import {
   doc,
   pageByName,
@@ -36,6 +38,8 @@ import {
   prevVisible,
   nextVisible,
   nextVisibleOrExtend,
+  beginPageHeaderEdit,
+  finishPageHeaderEdit,
   insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
@@ -77,7 +81,7 @@ import {
 import { parseOutline } from "../editor/outline";
 import { structuredHtmlOutline } from "../editor/htmlPaste";
 import {
-  toggleWrap,
+  toggleInlineFormat,
   insertLink,
   wrapLink,
   isPasteableUrl,
@@ -89,6 +93,7 @@ import {
   killWordBackward,
   setPriority,
   type Edit,
+  type InlineFormat,
 } from "../editor/format";
 import {
   essentialSelectionActions,
@@ -115,7 +120,7 @@ import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest } from "../ui";
 import { seedAssetBlob } from "../assetCache";
-import { openPageInNewTab } from "../router";
+import { openInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
@@ -131,6 +136,7 @@ import {
   caretOffsetOnLastRow,
 } from "../editor/caretRows";
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, fencedCodeBlock } from "../editor/properties";
+import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
@@ -188,12 +194,11 @@ function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | 
   return { kind: m[1] as "query" | "embed", inner: `${m[1]}${m[2]}` };
 }
 
-// Any body LINE that is exactly a {{query …}} macro (same recognizer as
-// detectMacro, applied per line — the macro may share the block with a heading
-// or other text). Not fence-aware; a fenced {{query}} inside a block that ALSO
-// declares tine.view:: table/board is not a real case.
+// Any complete {{query …}} macro anywhere in the body. The shared scanner is
+// brace/string/page-ref aware and catches inline macros ("Tasks {{query …}}"),
+// not only macros occupying their own line.
 function bodyContainsQueryMacro(raw: string): boolean {
-  return raw.split("\n").some((l) => /^\{\{query\b[\s\S]*\}\}$/.test(l.trim()));
+  return queryMacroExtents(raw).length > 0;
 }
 
 // (Rendered-property hidden set lives in render/block.ts as RENDER_HIDDEN_PROPS /
@@ -385,17 +390,20 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => pageByName(node().page)?.readOnly ?? false;
-  // Bullet threading: this block's role in the active-path thread (elbow at a path
-  // node, or a spine segment on a preceding sibling). Reads threadRoles only while
-  // threading is on, so it stays zero-cost when the feature is off. The per-depth
-  // rainbow colour is handed to CSS via an inline --thread-color.
-  const threadRole = () => (threadingEnabled() ? threadRoles().get(props.id) : undefined);
+  // Upstream's declarative decoration is the single rendering path. The fork's
+  // persisted toggle remains a built-in activation fallback for existing users,
+  // and its visual preferences layer onto the same host-owned CSS.
+  const pluginThreadingEnabled = () => pluginManager.hasDeclarativeDecoration("thread-lines");
+  const threadDecorationEnabled = () => threadingEnabled() || pluginThreadingEnabled();
   const threadColor = () => {
-    const r = threadRole();
-    if (!r) return undefined;
-    // Accent mode: leave --thread-color unset so the CSS falls back to var(--accent).
-    if (threadColorMode() === "accent") return undefined;
-    return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
+    if (!threadingEnabled() || threadColorMode() === "accent") return undefined;
+    let depth = -1;
+    let parent = node().parent;
+    while (parent && depth < 1_000) {
+      depth++;
+      parent = doc.byId[parent]?.parent ?? null;
+    }
+    return THREAD_PALETTE[Math.max(0, depth) % THREAD_PALETTE.length];
   };
   // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
   // outline. Showing both this storage block's controls and the referenced root's
@@ -411,31 +419,14 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
       class="ls-block"
       classList={{
         collapsed: collapsed(),
-        "thread-elbow": threadRole()?.elbow !== undefined,
-        "thread-spine": threadRole()?.spine !== undefined,
         "block-embed-host": blockEmbedHost(),
+        "plugin-thread-lines": threadDecorationEnabled(),
+        "plugin-thread-lines-active": threadingEnabled() || pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
+        "plugin-thread-lines-standard": pluginManager.declarativeDecorationSetting("thread-lines", "intensity") === "standard",
       }}
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}
     >
-      {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
-          it reflows + scrolls locked to the block. Elbow = a path curving into this
-          bullet; spine = a straight line clipped to the block height (see app.css).
-          The .thread-animated class (app root) turns the stroke into flowing dashes. */}
-      <Show when={threadingEnabled() && threadRole()}>
-        <Show
-          when={threadRole()?.elbow !== undefined}
-          fallback={
-            <svg class="thread-svg thread-spine-svg" aria-hidden="true">
-              <line x1="8" y1="0" x2="8" y2="9999" />
-            </svg>
-          }
-        >
-          <svg class="thread-svg thread-elbow-svg" aria-hidden="true">
-            <path d="M -4 -18 V 4 Q -4 14 6 14 H 26" />
-          </svg>
-        </Show>
-      </Show>
       <div
         class="block-main"
         classList={{
@@ -493,7 +484,13 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
               e.preventDefault();
               e.stopPropagation();
               const ref = persistentBlockRef(props.id); // writes id:: so the tab survives a restart
-              openPageInNewTab(ref.page, ref.pageKind, ref.uuid);
+              openInNewTab({
+                kind: "page",
+                name: ref.page,
+                pageKind: ref.pageKind,
+                block: ref.uuid,
+                ...(ref.path ? { path: ref.path } : {}),
+              });
             }}
           >
             <Show when={orderMarker()} fallback={<span class="bullet" />}>
@@ -936,6 +933,7 @@ interface AcItem {
   insert?: string;
   caret?: number;
   action?: import("../editor/autocomplete").CommandAction;
+  plugin?: { pluginId: string; contributionId: string; insertText?: string };
   templateNodes?: import("../types").BlockDto[];
   /** A `((block reference))` candidate: insert `((uuid))` and persist id::. */
   blockRef?: { uuid: string; page: string; kind: import("../types").PageKind };
@@ -1067,7 +1065,14 @@ export function Editor(props: { id: string }): JSX.Element {
   // transclusion the user is looking at.
   const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
+  let pluginSlashInvocation = 0;
+  let editorMounted = true;
+  onCleanup(() => {
+    editorMounted = false;
+    pluginSlashInvocation++;
+  });
   const autocompleteLayerId = `block-completion-${createUniqueId()}`;
+  const selectionOverflowLayerId = `block-selection-overflow-${createUniqueId()}`;
   // Caret/selection stashed when the *window* (not this block) loses focus, so
   // returning to Tine resumes editing exactly where you left off.
   let savedSel: { start: number; end: number } | null = null;
@@ -1077,10 +1082,11 @@ export function Editor(props: { id: string }): JSX.Element {
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
   const isFirstPagePropertiesBlock = (raw: string) => {
     const page = pageByName(node().page);
+    const propertyDraft = isPropertiesOnly(raw)
+      || (raw.endsWith("\n") && isPropertiesOnly(raw.slice(0, -1)));
     return page?.format === "md"
-      && !page.preBlock
       && page.roots[0] === props.id
-      && isPropertiesOnly(raw);
+      && (node().originatedFromPageHeader || (!page.preBlock && propertyDraft));
   };
 
   // What the textarea shows. Annotation (PDF highlight) blocks expose only their
@@ -1287,11 +1293,29 @@ export function Editor(props: { id: string }): JSX.Element {
         if (s > 0)
           scored.push({ item: { label: c.label, insert: c.insert, caret: c.caret, action: c.action }, s, idx: q ? c.matchTieOrder : c.bareOrder });
       });
+      pluginManager.slashCommands().forEach(({ pluginId, contribution }, i) => {
+        const s = q ? fuzzyScore(q, contribution.title) : 1;
+        if (s > 0) {
+          scored.push({
+            item: {
+              label: contribution.title,
+              sub: "Plugin",
+              plugin: { pluginId, contributionId: contribution.id, insertText: contribution.insertText },
+            },
+            s,
+            idx: COMMANDS.length + i,
+          });
+        }
+      });
       if (q) {
         tmpls.forEach((tp, j) => {
           const s = showAllTemplates ? 1 : fuzzyScore(q, tp.name);
           if (s > 0)
-            scored.push({ item: { label: `Template: ${tp.name}`, templateNodes: tp.blocks }, s, idx: COMMANDS.length + j });
+            scored.push({
+              item: { label: `Template: ${tp.name}`, templateNodes: tp.blocks },
+              s,
+              idx: COMMANDS.length + pluginManager.slashCommands().length + j,
+            });
         });
       }
       scored.sort((a, b) => b.s - a.s || a.idx - b.idx);
@@ -1349,7 +1373,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ed.text);
     queueMicrotask(() => {
       ref.value = ed.text;
-      ref.setSelectionRange(ed.start, ed.end);
+      ref.setSelectionRange(ed.start, ed.end, ed.direction);
       ref.focus();
       autosize();
     });
@@ -1361,10 +1385,36 @@ export function Editor(props: { id: string }): JSX.Element {
   // Floating selection toolbar (bold/italic/highlight/link) — shown while a
   // non-empty selection exists in this block's editor.
   const [hasSel, setHasSel] = createSignal(false);
-  const updateSel = () => setHasSel(ref.selectionStart !== ref.selectionEnd);
   const [selectionOverflowOpen, setSelectionOverflowOpen] = createSignal(false);
+  let selectionOverflowRef: HTMLDivElement | undefined;
+  const updateSel = () => {
+    const selected = ref.selectionStart !== ref.selectionEnd;
+    setHasSel(selected);
+    if (!selected) setSelectionOverflowOpen(false);
+  };
+  createEffect(() => {
+    if (!selectionOverflowOpen() || !hasSel()) return;
+    const unregister = registerTransientLayer({
+      id: selectionOverflowLayerId,
+      root: () => selectionOverflowRef ?? null,
+      trigger: () => ref ?? null,
+      dismiss: () => {
+        const start = ref.selectionStart;
+        const end = ref.selectionEnd;
+        const direction = ref.selectionDirection;
+        setSelectionOverflowOpen(false);
+        queueMicrotask(() => {
+          if (!ref.isConnected) return;
+          ref.focus();
+          ref.setSelectionRange(start, end, direction);
+        });
+        return true;
+      },
+    });
+    onCleanup(unregister);
+  });
   const runSelectionAction = (action: SelectionAction) => {
-    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt()));
+    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt(), ref.selectionDirection));
     setSelectionOverflowOpen(false);
     queueMicrotask(updateSel);
   };
@@ -1758,6 +1808,95 @@ export function Editor(props: { id: string }): JSX.Element {
       const { uuid, page, kind } = item.blockRef;
       replaceTrigger(`((${uuid}))`);
       void persistBlockRefTarget(uuid, page, kind);
+      return;
+    }
+    if (item.plugin) {
+      const textarea = ref;
+      const before = textarea.value;
+      const selectionStart = textarea.selectionStart;
+      const selectionEnd = textarea.selectionEnd;
+      const node = doc.byId[props.id];
+      if (!node) return;
+      let depth = 0;
+      let parentId = node.parent;
+      while (parentId && doc.byId[parentId] && depth < 1_000) {
+        depth++;
+        parentId = doc.byId[parentId].parent;
+      }
+      const plugin = item.plugin;
+      const ownedBlock = bindPluginBlockSnapshot({
+        id: node.id,
+        raw: node.raw,
+        parentId: node.parent,
+        depth,
+        format: pageByName(node.page)?.format === "org" ? "org" : "md",
+      });
+      if (!ownedBlock) return;
+      const token = ++pluginSlashInvocation;
+      const capturedEditingId = editingId();
+      const capturedEditingOwner = editingOwner();
+      const capturedEditingSurface = editingSurface();
+      const capturedSurfaceKey = surfaceKey;
+      const trigger = { ...t };
+      const editorIsCurrent = () => {
+        const liveTrigger = detectTrigger(textarea.value, textarea.selectionStart);
+        const liveNode = doc.byId[props.id];
+        return editorMounted
+          && token === pluginSlashInvocation
+          && isPluginGraphOwnerCurrent(ownedBlock.owner)
+          && ref === textarea
+          && textarea.isConnected
+          && editingId() === capturedEditingId
+          && editingOwner() === capturedEditingOwner
+          && editingSurface() === capturedEditingSurface
+          && surfaceKey === capturedSurfaceKey
+          && textarea.value === before
+          && textarea.selectionStart === selectionStart
+          && textarea.selectionEnd === selectionEnd
+          && !!liveTrigger
+          && liveTrigger.kind === trigger.kind
+          && liveTrigger.start === trigger.start
+          && liveTrigger.end === trigger.end
+          && liveTrigger.query === trigger.query
+          && liveNode?.id === ownedBlock.block.id
+          && liveNode.raw === ownedBlock.block.raw;
+      };
+      closeAc();
+      void pluginManager
+        .invokeSlashCommand(plugin.pluginId, plugin.contributionId, ownedBlock)
+        .then((effects) => {
+          if (!editorIsCurrent()) {
+            if (isPluginGraphOwnerCurrent(ownedBlock.owner) && textarea.isConnected && textarea.value !== before) {
+              pushToast("Plugin result was not inserted because the block changed while it ran.", "info");
+            }
+            return;
+          }
+          if (textarea.value !== before) {
+            pushToast("Plugin result was not inserted because the block changed while it ran.", "info");
+            return;
+          }
+          const effect = effects.find((candidate) => candidate.kind === "insert-at-caret");
+          const text = effect?.kind === "insert-at-caret" ? effect.text : plugin.insertText;
+          if (text === undefined) return;
+          const result = applyCompletion(before, t.start, t.end, text);
+          commit(result.raw);
+          queueMicrotask(() => {
+            if (!editorMounted
+              || token !== pluginSlashInvocation
+              || !isPluginGraphOwnerCurrent(ownedBlock.owner)
+              || ref !== textarea
+              || !textarea.isConnected
+              || editingId() !== capturedEditingId
+              || editingOwner() !== capturedEditingOwner
+              || editingSurface() !== capturedEditingSurface
+              || textarea.value !== result.raw) return;
+            textarea.value = result.raw;
+            textarea.setSelectionRange(result.caret, result.caret);
+            textarea.focus();
+            autosize();
+          });
+        })
+        .catch((error) => pushToast(`Plugin slash command failed: ${String(error)}`, "error"));
       return;
     }
     if (item.templateNodes) {
@@ -2182,14 +2321,25 @@ export function Editor(props: { id: string }): JSX.Element {
     openDatePicker(props.id, "scheduled", r.left, r.bottom + 4);
   };
 
+  const applyInlineFormat = (kind: InlineFormat) => {
+    applyEdit(toggleInlineFormat(
+      ref.value,
+      ref.selectionStart,
+      ref.selectionEnd,
+      pageFmt(),
+      kind,
+      ref.selectionDirection,
+    ));
+  };
+
   // Editor command handlers keyed by command id (see keybindings.ts). Each does
   // its own preventDefault when it handles the event and returns whether it did
   // (false → fall through to native handling). Read ref fresh at call time.
   const runEditorCmd: Record<string, (e: KeyboardEvent) => boolean> = {
-    "editor/bold": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "**")); return true; },
-    "editor/italics": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "*")); return true; },
-    "editor/strike-through": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "~~")); return true; },
-    "editor/highlight": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "==")); return true; },
+    "editor/bold": (e) => { e.preventDefault(); applyInlineFormat("bold"); return true; },
+    "editor/italics": (e) => { e.preventDefault(); applyInlineFormat("italic"); return true; },
+    "editor/strike-through": (e) => { e.preventDefault(); applyInlineFormat("strikethrough"); return true; },
+    "editor/highlight": (e) => { e.preventDefault(); applyInlineFormat("highlight"); return true; },
     "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt())); return true; },
     "editor/clear-block": (e) => { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return true; },
     "editor/kill-line-before": (e) => { e.preventDefault(); applyEdit(killLineBefore(ref.value, ref.selectionStart)); return true; },
@@ -2703,7 +2853,18 @@ export function Editor(props: { id: string }): JSX.Element {
       // to the parent from the second visual row.)
       const before = raw.slice(0, start);
       if (!before.includes("\n") && caretAtFirstRow(ref, start)) {
-        const prev = prevVisible(props.id, outlineScope);
+        let prev = prevVisible(props.id, outlineScope);
+        // A canonical page header is not normally an outline node. Materialize
+        // its transient ordinary-editor representation only when the primary
+        // page/pane caret crosses the first-body boundary; reference, embed and
+        // right-sidebar copies must never synthesize it.
+        if (
+          !prev && !outlineScope
+          && (surfaceKey === "main" || surfaceKey.startsWith("pane:"))
+          && pageByName(node().page)?.roots[0] === props.id
+        ) {
+          prev = beginPageHeaderEdit(node().page);
+        }
         if (prev) {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
@@ -2776,6 +2937,7 @@ export function Editor(props: { id: string }): JSX.Element {
     // closing, so there is no caret to preserve.
     const calcExit = isCalc();
     commit(calcExit ? ref.value : normalizePlanning(ref.value, pageFmt()), calcExit ? { calc: true } : undefined);
+    finishPageHeaderEdit(props.id);
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) endEdit("blur");
   };
@@ -3029,7 +3191,7 @@ export function Editor(props: { id: string }): JSX.Element {
             onClick={() => setSelectionOverflowOpen((open) => !open)}
           >…</button>
           <Show when={selectionOverflowOpen()}>
-            <div class="sel-toolbar-overflow" role="menu" aria-label="More formatting">
+            <div ref={selectionOverflowRef} class="sel-toolbar-overflow" role="menu" aria-label="More formatting">
               <For each={secondarySelectionActions}>{(action) => (
                 <button
                   role="menuitem"

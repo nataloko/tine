@@ -1,11 +1,11 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, trailingVisibleEmptyLeaf, isBlockMoving, isDirty, isSaving, type FeedPage } from "../store";
-import { sameRoute, type PaneRouter } from "../router";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, trailingVisibleEmptyLeaf, isBlockMoving, isDirty, isSaving, type FeedPage } from "../store";
+import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
-  zoomedBlock, isFavorite, toggleFavorite, renamePageInNavigation,
+  isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
-  agendaQuery, openPageProps, dataRev, isConflicted,
+  agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
@@ -232,6 +232,20 @@ export function PageView(): JSX.Element {
             ? await backend().getPageByPath(r.path)
             : await backend().getPage(r.name, r.pageKind);
           if (epoch !== graphEpoch()) return; // graph switched mid-load — drop it
+          if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
+            throw new Error("The selected physical page is no longer available at that path.");
+          }
+          // Core page identity is Unicode-case-insensitive while display names
+          // preserve their original spelling. Alias-map warmup normally
+          // canonicalizes before navigation; this adoption also covers an early
+          // click or restored route that raced that map. Re-route once so the
+          // exact-keyed working set, tab history, Recent, and editor all own the
+          // backend's canonical display name instead of a phantom case variant.
+          if (dto && !r.path && r.pageKind === "page" && dto.name !== r.name) {
+            renamePageInNavigation(r.name, dto.name);
+            router.replaceActiveRoute({ ...r, name: dto.name });
+            return;
+          }
           // null = page doesn't exist yet → start a fresh empty page. A failed
           // read throws and is caught below, so we never overwrite a page whose
           // load errored with empty content.
@@ -376,12 +390,18 @@ export function PageView(): JSX.Element {
     if (r.kind === "journals") return mainPages();
     if (r.kind === "query") return [];
     const p = pageByName(r.name);
-    return p ? [p] : [];
+    const target = pageTargetFromRoute(r);
+    return p && target && pageTargetMatchesLoaded(target, p) ? [p] : [];
   };
   const zoomValid = () => {
     const r = currentRoute();
-    const z = r.kind === "page" ? r.block ?? null : zoomedBlock();
-    return z && doc.byId[z] ? z : null;
+    if (r.kind !== "page" || !r.block) return null;
+    const block = doc.byId[r.block];
+    const owner = block ? pageByName(block.page) : undefined;
+    const target = pageTargetFromRoute(r);
+    return block && owner && target && pageTargetMatchesLoaded(target, owner)
+      ? r.block
+      : null;
   };
   const contentReady = () => {
     const r = loadedRoute();
@@ -472,6 +492,10 @@ function ZoomedView(props: { id: string }): JSX.Element {
   };
   const pageName = () => doc.byId[props.id]?.page ?? "";
   const pageKind = () => doc.pages.find((p) => p.name === pageName())?.kind ?? "page";
+  const pageTarget = () => {
+    const owner = pageByName(pageName());
+    return owner ? pageTargetFromFeedPage(owner) : { name: pageName(), pageKind: pageKind() };
+  };
   const crumb = (id: string) => visibleBody(doc.byId[id].raw)[0] || "…";
   const editSurface = () => pane.paneId === "main" ? "main" : `pane:${pane.paneId}`;
   const focusTrailing = () => {
@@ -489,7 +513,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
       <div class="zoom-breadcrumb">
         <a
           class="crumb crumb-page"
-          onClick={() => router.openPage(pageName(), pageKind())}
+          onClick={() => router.openPageTarget(pageTarget())}
         >
           {pageName()}
         </a>
@@ -524,6 +548,16 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   const router = pane.router;
   const [renaming, setRenaming] = createSignal(false);
   const [newName, setNewName] = createSignal("");
+  let pageActionsTrigger: HTMLButtonElement | undefined;
+  const pageTarget = () => pageTargetFromFeedPage(props.page);
+  const pageActionsOpen = () => {
+    const menu = contextMenu();
+    return menu?.kind === "page"
+      && menu.name === props.page.name
+      && menu.pageKind === props.page.kind
+      && !!menu.fileActions
+      && menu.focusOwner === pageActionsTrigger;
+  };
   const firstPropertiesId = () => {
     if (props.page.format !== "md") return null;
     const id = props.page.roots[0];
@@ -535,6 +569,9 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   };
   const propertySource = () => {
     const first = firstPropertiesId();
+    if (first && doc.byId[first].originatedFromPageHeader) {
+      return doc.byId[first].raw + (props.page.preBlock ?? "");
+    }
     return [props.page.preBlock, first ? doc.byId[first].raw : null].filter(Boolean).join("\n") || null;
   };
   const rootsToRender = () => firstPropertiesId() ? props.page.roots.slice(1) : props.page.roots;
@@ -543,6 +580,11 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   const editPreamble = () => {
     const id = promotePagePreamble(props.page.name);
     if (id) startEditing(id, doc.byId[id].raw.length);
+  };
+  const editPageHeader = (event?: MouseEvent) => {
+    if (event?.target instanceof Element && event.target.closest("a, button")) return;
+    const id = beginPageHeaderEdit(props.page.name);
+    if (id) startEditing(id, doc.byId[id].raw.length, null, editSurface());
   };
   const focusTrailing = () => {
     const roots = rootsToRender();
@@ -585,15 +627,12 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         alert("Couldn't save pending edits — resolve the conflict before renaming.");
         return;
       }
-      await backend().renamePage(props.page.name, next);
-      // Sidebar favorites/recents key on the page NAME (config.edn `:favorites`
-      // stores names, and the backend rename doesn't touch it), so remap the old
-      // name → new so a starred/recent entry doesn't turn into a dead link.
-      renamePageInNavigation(props.page.name, next, props.page.kind);
+      if (props.page.path) await backend().renamePage(props.page.name, next, props.page.path);
+      else await backend().renamePage(props.page.name, next);
       // The backend rewrote refs across many pages via the self-write guard (no
       // watcher reload), so every in-memory page is now potentially stale; reset
       // + reload so a stale copy can't be saved back and revert the rename.
-      refreshAfterRename(props.page.name, next);
+      refreshAfterRename(props.page.name, next, pageTarget());
       router.openPage(next, "page");
     } catch (e) {
       alert(`Rename failed: ${String(e)}`);
@@ -627,13 +666,13 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             classList={{ "journal-title": props.page.kind === "journal" }}
             title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
             onClick={(e) => {
-              if (e.shiftKey && !props.page.guide) openPageInSidebar(props.page.name, props.page.kind);
-              else router.openPage(props.page.name, props.page.kind);
+              if (e.shiftKey && !props.page.guide) openPageInSidebar(pageTarget());
+              else router.openPageTarget(pageTarget());
             }}
             onAuxClick={(e) => {
               if (e.button === 1) {
                 e.preventDefault(); // middle-click → background tab, like a body link
-                router.openPageInNewTab(props.page.name, props.page.kind);
+                router.openPageTargetInNewTab(pageTarget());
               }
             }}
             onDblClick={startRename}
@@ -641,7 +680,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               if (props.page.guide) return;
               if (!shouldOpenTextContextMenu(e.target)) return;
               e.preventDefault();
-              openPageContextMenu(e.clientX, e.clientY, props.page.name, props.page.kind, true);
+              openPageContextMenu(e.clientX, e.clientY, pageTarget(), true);
             }}
           >
             <Show when={props.page.kind === "journal"}>
@@ -658,7 +697,14 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
                 ?.trim()}
             >
               {(icon) => (
-                <span class="page-icon page-title-icon">
+                <span
+                  class="page-icon page-title-icon"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    editPageHeader();
+                  }}
+                >
                   <EmojiText text={icon()} />
                 </span>
               )}
@@ -677,19 +723,26 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         </Show>
         <Show when={!props.page.guide}>
           <button
-            class="page-gear"
-            title="Page properties (alias, public, tags, icon, title)"
-            onClick={(e) => openPageProps(props.page.name, e.clientX, e.clientY)}
+            ref={pageActionsTrigger}
+            type="button"
+            class="page-actions-trigger"
+            data-page-actions-trigger
+            title="Page actions"
+            aria-label="Page actions"
+            aria-haspopup="menu"
+            aria-expanded={pageActionsOpen()}
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              openPageContextMenu(
+                rect.left,
+                rect.bottom + 4,
+                pageTarget(),
+                true,
+                e.currentTarget,
+              );
+            }}
           >
-            <svg viewBox="0 0 24 24" class="gear-icon" aria-hidden="true">
-              <path
-                d="M12 8.5a3.5 3.5 0 100 7 3.5 3.5 0 000-7z M19.4 12.9c.04-.3.06-.6.06-.9s-.02-.6-.06-.9l1.7-1.3a.5.5 0 00.12-.64l-1.6-2.8a.5.5 0 00-.6-.22l-2 .8a6 6 0 00-1.55-.9l-.3-2.13a.5.5 0 00-.5-.42h-3.2a.5.5 0 00-.5.42l-.3 2.13a6 6 0 00-1.55.9l-2-.8a.5.5 0 00-.6.22l-1.6 2.8a.5.5 0 00.12.64l1.7 1.3c-.04.3-.06.6-.06.9s.02.6.06.9l-1.7 1.3a.5.5 0 00-.12.64l1.6 2.8c.13.23.4.31.6.22l2-.8c.47.37 1 .67 1.55.9l.3 2.13c.04.24.25.42.5.42h3.2c.25 0 .46-.18.5-.42l.3-2.13a6 6 0 001.55-.9l2 .8c.2.09.47.01.6-.22l1.6-2.8a.5.5 0 00-.12-.64z"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linejoin="round"
-              />
-            </svg>
+            <span aria-hidden="true">⋯</span>
           </button>
           <button
             class="fav-star"
@@ -710,7 +763,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         </Show>
       </div>
       <Show when={aliasNames(propertySource(), props.page.format).length}>
-        <div class="page-aliases" title="Also known as — other names that link here">
+        <div class="page-aliases" title="Also known as — other names that link here" onClick={editPageHeader}>
           <span class="page-aliases-label">aka</span>
           <For each={aliasNames(propertySource(), props.page.format)}>
             {(a) => <span class="alias-chip"><PageRef name={a} alias={a} /></span>}
@@ -718,7 +771,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         </div>
       </Show>
       <Show when={pageProperties(propertySource(), props.page.format).filter(([k]) => !PAGE_PROPS_HIDDEN.has(k.toLowerCase())).length}>
-        <div class="page-properties">
+        <div class="page-properties" onClick={editPageHeader}>
           {/* `alias`/`icon` are surfaced elsewhere (chips / title icon) — see PAGE_PROPS_HIDDEN. */}
           <For each={pageProperties(propertySource(), props.page.format).filter(([k]) => !PAGE_PROPS_HIDDEN.has(k.toLowerCase()))}>
             {([key, value]) => (

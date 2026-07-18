@@ -2,13 +2,13 @@
 // outside Tauri (browser dev / Playwright screenshots). Mirrors the real
 // backend's shape so the UI behaves identically.
 
-import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult } from "./backend";
-import type { BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup } from "./types";
+import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult, InstalledPluginRecord, PluginRegistryCacheEnvelope } from "./backend";
+import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
-import { matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
+import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
 import { parseJournalWith } from "./journal";
 
 /** Mock feed membership must use a Logseq journal-title parser, never the
@@ -81,6 +81,9 @@ function propertyLines(raw: string): [string, string][] {
 
 let _id = 0;
 const nid = () => `mock-${_id++}`;
+const mockPlugins: InstalledPluginRecord[] = [];
+const mockPluginEntries = new Map<string, Uint8Array>();
+let mockPluginRegistryCache: PluginRegistryCacheEnvelope | null = null;
 
 function b(raw: string, children: BlockDto[] = [], collapsed = false, properties?: [string, string][]): BlockDto {
   // Mirror the real backend: a block carrying an `id::` property uses that uuid as
@@ -679,7 +682,84 @@ export function mockBackend(): Backend {
     async bindCaptureGraph() {},
     async forgetKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
+      const requested = new URLSearchParams(globalThis.location?.search ?? "").get("platform");
+      if (requested === "android" || requested === "ios") return requested;
       return "desktop";
+    },
+    async listInstalledPlugins() {
+      return mockPlugins.map((plugin) => ({ ...plugin }));
+    },
+    async installPlugin(manifestJson: string, wasm: Uint8Array) {
+      const manifest = JSON.parse(manifestJson) as { id: string; version: string };
+      const key = `${manifest.id}@${manifest.version}`;
+      mockPluginEntries.set(key, wasm.slice());
+      const record: InstalledPluginRecord = {
+        id: manifest.id,
+        version: manifest.version,
+        manifest_json: manifestJson,
+        sha256: "mock",
+        selected: false,
+        enabled: false,
+      };
+      mockPlugins.push(record);
+      return { ...record };
+    },
+    async uninstallPlugin(id: string, version: string) {
+      const index = mockPlugins.findIndex((record) => {
+        const manifest = JSON.parse(record.manifest_json) as { id: string; version: string };
+        return manifest.id === id && manifest.version === version;
+      });
+      if (index === -1) throw new Error("plugin version is not installed");
+      mockPlugins.splice(index, 1);
+      mockPluginEntries.delete(`${id}@${version}`);
+      if (!mockPlugins.some((record) => (JSON.parse(record.manifest_json) as { id: string }).id === id)) {
+        delete mockAppStrings[`plugin-settings:${id}`];
+      }
+    },
+    async readPluginEntry(id: string, version: string) {
+      const entry = mockPluginEntries.get(`${id}@${version}`);
+      if (!entry) throw new Error("plugin version is not installed");
+      return entry.slice();
+    },
+    async setPluginEnabled(id: string, version: string, enabled: boolean) {
+      for (const record of mockPlugins) {
+        const manifest = JSON.parse(record.manifest_json) as { id: string; version: string };
+        if (manifest.id === id) {
+          record.selected = manifest.version === version;
+          record.enabled = record.selected && enabled;
+        }
+      }
+    },
+    async verifyPluginRegistry() {
+      // Browser mock has no embedded native key. Registry tests mock this boundary.
+    },
+    async loadPluginRegistryCache() {
+      if (mockPluginRegistryCache) {
+        return { kind: "envelope" as const, envelope: { ...mockPluginRegistryCache } };
+      }
+      const hasIndex = Object.prototype.hasOwnProperty.call(mockAppStrings, "plugin-registry-index");
+      const hasSignature = Object.prototype.hasOwnProperty.call(mockAppStrings, "plugin-registry-signature");
+      if (!hasIndex && !hasSignature) return { kind: "absent" as const };
+      if (!hasIndex || !hasSignature || !mockAppStrings["plugin-registry-index"] || !mockAppStrings["plugin-registry-signature"]?.trim()) {
+        return { kind: "unsafe" as const, reason: "legacy registry cache is torn" };
+      }
+      return {
+        kind: "legacy" as const,
+        indexJson: mockAppStrings["plugin-registry-index"],
+        signature: mockAppStrings["plugin-registry-signature"],
+      };
+    },
+    async storePluginRegistryCache(indexJson, signature, expectedLegacy) {
+      if (expectedLegacy && (
+        mockPluginRegistryCache !== null
+        || mockAppStrings["plugin-registry-index"] !== expectedLegacy.indexJson
+        || mockAppStrings["plugin-registry-signature"] !== expectedLegacy.signature
+      )) {
+        throw new Error("legacy registry cache changed during migration");
+      }
+      mockPluginRegistryCache = { schemaVersion: 1, indexJson, signature: signature.trim() };
+      delete mockAppStrings["plugin-registry-index"];
+      delete mockAppStrings["plugin-registry-signature"];
     },
     async setSystemBarAppearance(): Promise<void> {},
     async quit(): Promise<void> {
@@ -776,6 +856,36 @@ export function mockBackend(): Backend {
     async getBacklinks(name: string): Promise<RefGroup[]> {
       const n = name.toLowerCase();
       return collect((b) => pageRefs(b.raw).some((r) => r.toLowerCase() === n), name);
+    },
+    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext> {
+      const excluded = name.trim().toLowerCase();
+      const wanted = new Map(targets.map((item) => [
+        `${item.kind}\0${item.page.toLowerCase()}\0${item.block_id}`,
+        item,
+      ]));
+      const entries: BacklinkFilterContext["entries"] = [];
+      const visit = (page: PageDto, block: BlockDto): void => {
+        const key = `${page.kind}\0${page.name.toLowerCase()}\0${block.id}`;
+        const target = wanted.get(key);
+        if (target) {
+          const text: string[] = [];
+          const facets = new Map<string, string>();
+          const subtree = (node: BlockDto) => {
+            text.push(node.raw);
+            for (const ref of pageRefs(node.raw)) {
+              const normalized = ref.trim().toLowerCase();
+              if (normalized && normalized !== excluded && !facets.has(normalized)) facets.set(normalized, ref);
+            }
+            if (node.marker) facets.set(node.marker.toLowerCase(), node.marker);
+            node.children.forEach(subtree);
+          };
+          subtree(block);
+          entries.push({ ...target, text: text.join("\n"), facets: [...facets.values()] });
+        }
+        block.children.forEach((child) => visit(page, child));
+      };
+      for (const page of all) page.blocks.forEach((block) => visit(page, block));
+      return { entries, truncated: entries.length < wanted.size };
     },
     async getUnlinkedRefs(name: string): Promise<RefGroup[]> {
       const n = name.toLowerCase();
@@ -993,17 +1103,17 @@ export function mockBackend(): Backend {
       return [...map.entries()].map(([k, vs]) => [k, [...vs].sort()] as [string, string[]]);
     },
     async search(query: string, limit: number): Promise<RefGroup[]> {
-      const q = query.trim().toLowerCase();
+      const q = canonicalFold(query.trim());
       if (!q) return [];
       let n = limit;
-      const groups = collect((b) => b.raw.toLowerCase().includes(q));
+      const groups = collect((b) => canonicalFold(b.raw).includes(q));
       for (const g of groups) {
         if (g.blocks.length > n) g.blocks = g.blocks.slice(0, n);
         n -= g.blocks.length;
       }
       return groups.filter((g) => g.blocks.length > 0);
     },
-    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false): Promise<QueryExecution> {
+    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false, scope?: import("./types").QueryPageScope): Promise<QueryExecution> {
       // Browser-preview approximation only (ADR 0016). Production matching,
       // diagnostics, and UTF-16 evidence come from Rust's QueryPlan evaluator.
       const matcher = parseSearchQuery(source);
@@ -1016,9 +1126,9 @@ export function mockBackend(): Backend {
         };
       }
       const bare = simpleTerm(matcher);
-      const pages = all
-        .map((page) => ({ page, score: bare ? fuzzyScore(bare, page.name) : 0 }))
-        .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, page.name.toLowerCase(), page.name))
+      const pages = scope ? [] : all
+        .map((page) => ({ page, score: bare ? fuzzyScore(bare, canonicalFold(page.name)) : 0 }))
+        .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, canonicalFold(page.name), page.name))
         .sort((a, b) => b.score - a.score)
         .slice(0, pageLimit)
         .map(({ page, score }) => ({
@@ -1033,15 +1143,32 @@ export function mockBackend(): Backend {
             score,
           }],
           score,
+          match_class: bare
+            ? canonicalFold(page.name) === bare ? "exact" as const
+              : canonicalFold(page.name).startsWith(bare) ? "prefix" as const
+              : canonicalFold(page.name).includes(bare) ? "substring" as const
+              : "fuzzy" as const
+            : undefined,
         }));
-      const blocks = collect((block) => matcherMatches(matcher, block.raw.toLowerCase(), block.raw))
+      const inScope = (group: RefGroup) => {
+        if (!scope) return true;
+        const page = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
+        if (!page) return false;
+        return scope.path
+          ? mockPagePath(page) === scope.path
+          : page.kind === scope.pageKind && canonicalFold(page.name) === canonicalFold(scope.name);
+      };
+      const blocks = collect((block) => matcherMatches(matcher, canonicalFold(block.raw), block.raw))
+        .filter(inScope)
         .flatMap((group) => group.blocks.map((block) => ({ group, block })))
         .slice(0, Math.max(0, blockLimit))
         .map(({ group, block }) => {
+          const owner = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
           return {
             entity: "block" as const,
             page: group.page,
             kind: group.kind,
+            path: owner ? mockPagePath(owner) : "",
             block,
             display_text: block.raw,
             evidence: [{
@@ -1079,9 +1206,9 @@ export function mockBackend(): Backend {
       ];
     },
     async quickSwitch(query: string, limit: number): Promise<PageEntry[]> {
-      const q = query.trim().toLowerCase();
+      const q = canonicalFold(query.trim());
       return all
-        .filter((p) => p.name.toLowerCase().includes(q))
+        .filter((p) => canonicalFold(p.name).includes(q))
         .slice(0, limit)
         .map(mockPageEntry);
     },

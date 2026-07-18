@@ -5,6 +5,7 @@ import {
   createMemo,
   createResource,
   createSignal,
+  createUniqueId,
   onCleanup,
   type JSX,
 } from "solid-js";
@@ -12,6 +13,8 @@ import { backend } from "../backend";
 import {
   parseQuery,
   toDsl,
+  clauseToAdvanced,
+  stashSimpleForm,
   clauseLabel,
   addChild,
   removeAt,
@@ -28,12 +31,13 @@ import {
   type SortPreset,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
-import { openFormulaEditor, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { openFormulaEditor, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 import { blockProperty, doc, formatForBlock, pageByName } from "../store";
 import { facetsOf } from "../render/facets";
 import { pageProperties } from "../render/block";
 import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import { decodeFormulaExpr } from "../sheet/formula";
+import { registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
 // The DSL text is the single source of truth — we parse it to a tree, apply an
@@ -46,6 +50,14 @@ const stop = (e: MouseEvent) => e.stopPropagation();
 const locKey = (l: number[]) => l.join(".");
 
 type ClauseKind = Clause["kind"];
+
+function registerVisiblePopover(open: () => boolean, layer: TransientLayer) {
+  createEffect(() => {
+    if (!open()) return;
+    const unregister = registerTransientLayer(layer);
+    onCleanup(unregister);
+  });
+}
 
 // Sort is query-GLOBAL (not a filter chip), so it's handled separately from the
 // clause tree: a single root-level `sortBy` child. These helpers read/replace it.
@@ -94,13 +106,23 @@ function withGroup(root: Clause, field: string | null): Clause {
 // The popover leads with one-click presets (the common cases — no typing, no
 // syntax to get wrong) and keeps a free-text row for sorting by any other
 // property. `SORT_PRESETS` is the single source of truth (see queryBuilder.ts).
-function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void }): JSX.Element {
+function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; parentTransientId?: string }): JSX.Element {
   const [open, setOpen] = createSignal(false);
   const cur = () => currentSort(props.tree());
   // The free-text escape hatch: sort by an arbitrary property name.
   const [field, setField] = createSignal("");
   const [dir, setDir] = createSignal<"asc" | "desc">("asc");
   let wrapEl: HTMLSpanElement | undefined;
+  let triggerEl: HTMLButtonElement | undefined;
+  let pickerEl: HTMLDivElement | undefined;
+  const layerId = `query-sort-${createUniqueId()}`;
+  registerVisiblePopover(open, {
+    id: layerId,
+    parentId: props.parentTransientId,
+    root: () => pickerEl ?? null,
+    trigger: () => triggerEl ?? null,
+    dismiss: () => { setOpen(false); return true; },
+  });
   // Dismiss the popover when clicking anywhere outside it (another chip, the bar
   // background, or off the block). Capture phase so it fires regardless of the
   // bar's stopPropagation; only active while open.
@@ -145,6 +167,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void }):
           value (the active sort shows as its own chip in the bar). It just gains
           an `active` highlight and opens the popover to change/clear. */}
       <button
+        ref={triggerEl}
         class="qb-sort"
         classList={{ active: !!cur() }}
         title={cur() ? `Sorted by ${clauseLabel({ kind: "sortBy", field: cur()!.field, dir: cur()!.dir })}. Click to change.` : "Sort results"}
@@ -153,7 +176,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void }):
         + sort
       </button>
       <Show when={open()}>
-        <div class="qb-picker qb-sort-picker" onClick={stop}>
+        <div ref={pickerEl} class="qb-picker qb-sort-picker" onClick={stop}>
           <div class="qb-picker-title">Sort by</div>
           {/* One click = applied. No typing for the common cases. */}
           <div class="qb-sort-presets">
@@ -201,7 +224,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void }):
 // independent (you can group by page AND count per group). The numbers are
 // computed in the frontend from the returned block list (Macro.tsx); this just
 // edits the DSL directive that rides along.
-function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void }): JSX.Element {
+function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; parentTransientId?: string }): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
   // pick a property to aggregate; "group" = pick a property to group by.
@@ -212,6 +235,16 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
   const group = () => currentGroup(props.tree());
   const active = () => !!agg() || !!group();
   let wrapEl: HTMLSpanElement | undefined;
+  let triggerEl: HTMLButtonElement | undefined;
+  let pickerEl: HTMLDivElement | undefined;
+  const layerId = `query-summarize-${createUniqueId()}`;
+  registerVisiblePopover(open, {
+    id: layerId,
+    parentId: props.parentTransientId,
+    root: () => pickerEl ?? null,
+    trigger: () => triggerEl ?? null,
+    dismiss: () => { setOpen(false); return true; },
+  });
   createEffect(() => {
     if (!open()) return;
     const onDown = (e: MouseEvent) => {
@@ -248,6 +281,7 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
   return (
     <span class="qb-add-wrap" ref={wrapEl}>
       <button
+        ref={triggerEl}
         class="qb-sort"
         classList={{ active: active() }}
         title={active() ? `Summary: ${label()}. Click to change.` : "Summarize results (count / sum / average / group)"}
@@ -256,7 +290,7 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
         {active() ? `∑ ${label()}` : "+ summarize"}
       </button>
       <Show when={open()}>
-        <div class="qb-picker" onClick={stop}>
+        <div ref={pickerEl} class="qb-picker" onClick={stop}>
           {/* Step: pick a property for sum / avg / group-by. */}
           <Show when={pick() != null} fallback={
             <>
@@ -311,17 +345,23 @@ function PropNameInput(props: { onCommit: (key: string) => void }): JSX.Element 
 // "which blocks" question and round-trips to Logseq; this button opens the Sheets
 // formula editor to *refine* those results with a readable boolean expression
 // (`priority == "A" && deadline < today()`), stored as `tine.query-filter::` — a
-// property Logseq ignores. It replaces the old "⚙ advanced" Datalog conversion,
-// which added no real power (see the query-filtering ADR).
+// property Logseq ignores. Upstream's Datalog conversion remains available beside
+// it for queries that need the advanced engine.
 const FILTER_TOOLTIP =
   'Refine results with a formula (e.g. priority == "A" && deadline < today()). ' +
   "Saved as tine.query-filter — evaluated in Tine, ignored by Logseq.";
 const BUILTIN_FILTER_FIELDS = ["state", "priority", "scheduled", "deadline", "tags", "page"];
+const ADVANCED_CHEATSHEET =
+  "Convert this query to an advanced (Datalog) [:find ...] form. Supported clauses: " +
+  '(task ?b "TODO" "DOING"), (priority ?b "A"), (page-ref ?b "Page"), (property ?b :key "v"), ' +
+  '(page-property ?b :key), (page-tags ?b "tag"), (scheduled ?b), (deadline ?b), (journal ?b), ' +
+  "and/or/not. Sort and summaries stay presentation-only and are omitted.";
 
 export function QueryBuilder(props: {
   dsl: () => string;
   onChange: (dsl: string) => void;
   blockId?: string;
+  parentTransientId?: string;
 }): JSX.Element {
   const tree = createMemo(() => parseQuery(props.dsl()));
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
@@ -376,9 +416,10 @@ export function QueryBuilder(props: {
   return (
     <div class="qb-bar" onClick={stop}>
       <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply}
-        openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding} />
-      <SortControl tree={tree} apply={apply} />
-      <SummarizeControl tree={tree} apply={apply} />
+        openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
+        parentTransientId={props.parentTransientId} />
+      <SortControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
+      <SummarizeControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
       <Show when={props.blockId}>
         <button
           class="qb-sort qb-advanced"
@@ -389,6 +430,27 @@ export function QueryBuilder(props: {
           ƒ filter
         </button>
       </Show>
+      <button
+        class="qb-sort qb-advanced"
+        title={ADVANCED_CHEATSHEET}
+        onClick={(e) => {
+          stop(e);
+          const conv = clauseToAdvanced(tree());
+          if (!conv.ok) {
+            pushToast(`Can't auto-convert to Datalog: ${conv.unsupported.join(", ")} has no advanced equivalent — write the [:find …] form by hand`);
+            return;
+          }
+          if (props.blockId) stashSimpleForm(props.blockId, props.dsl());
+          props.onChange(conv.dsl);
+          pushToast(
+            conv.dropped.length
+              ? `Converted to an advanced Datalog query (dropped: ${conv.dropped.join(", ")}) — undo restores the simple form`
+              : "Converted to an advanced Datalog query — undo restores the simple form"
+          );
+        }}
+      >
+        ⚙ advanced
+      </button>
     </div>
   );
 }
@@ -403,6 +465,7 @@ interface NodeCtx {
   setOpenMenu: (k: string | null) => void;
   adding: () => string | null;
   setAdding: (k: string | null) => void;
+  parentTransientId?: string;
 }
 
 function Node(props: NodeCtx): JSX.Element {
@@ -470,9 +533,11 @@ function OpGroup(props: NodeCtx): JSX.Element {
 // A leaf filter chip. Click opens an action menu (delete / wrap).
 function Chip(props: NodeCtx): JSX.Element {
   const key = () => `chip:${locKey(props.loc)}`;
+  let triggerEl: HTMLButtonElement | undefined;
   return (
     <span class="qb-chip-wrap">
       <button
+        ref={triggerEl}
         class="qb-chip"
         classList={{ "qb-chip-raw": props.clause.kind === "raw" }}
         title="Click: delete / wrap in AND·OR·NOT (to exclude or nest)"
@@ -483,14 +548,14 @@ function Chip(props: NodeCtx): JSX.Element {
       >
         {clauseLabel(props.clause)}
       </button>
-      <ChipMenu {...props} />
+      <ChipMenu {...props} trigger={() => triggerEl ?? null} />
     </span>
   );
 }
 
 // Per-clause action popover (delete, wrap in AND/OR/NOT, and for op nodes:
 // unwrap). Shown for both leaf chips and operator nodes.
-function ChipMenu(props: NodeCtx): JSX.Element {
+function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.Element {
   const isOpKey = () => props.clause.kind === "op";
   const key = () => `${isOpKey() ? "op" : "chip"}:${locKey(props.loc)}`;
   const open = () => props.openMenu() === key();
@@ -508,6 +573,15 @@ function ChipMenu(props: NodeCtx): JSX.Element {
     props.clause.kind === "groupBy";
 
   const [editing, setEditing] = createSignal(false);
+  let menuEl: HTMLDivElement | undefined;
+  const layerId = `query-clause-menu-${createUniqueId()}`;
+  registerVisiblePopover(open, {
+    id: layerId,
+    parentId: props.parentTransientId,
+    root: () => menuEl ?? null,
+    trigger: props.trigger,
+    dismiss: () => { props.setOpenMenu(null); return true; },
+  });
   // Nullary clauses (scheduled/deadline/journal), result-level directives, and
   // raw/op have nothing to edit here.
   const canEdit = () =>
@@ -519,7 +593,7 @@ function ChipMenu(props: NodeCtx): JSX.Element {
 
   return (
     <Show when={open()}>
-      <div class="qb-menu" onClick={stop}>
+      <div ref={menuEl} class="qb-menu" onClick={stop}>
         <Show when={editing()} fallback={
           <>
             <Show when={canEdit()}>
@@ -552,9 +626,20 @@ function ChipMenu(props: NodeCtx): JSX.Element {
 function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
   const key = () => `add:${locKey(props.loc)}`;
   const open = () => props.adding() === key();
+  let triggerEl: HTMLButtonElement | undefined;
+  let pickerEl: HTMLDivElement | undefined;
+  const layerId = `query-add-picker-${createUniqueId()}`;
+  registerVisiblePopover(open, {
+    id: layerId,
+    parentId: props.parentTransientId,
+    root: () => pickerEl ?? null,
+    trigger: () => triggerEl ?? null,
+    dismiss: () => { props.setAdding(null); return true; },
+  });
   return (
     <span class="qb-add-wrap">
       <button
+        ref={triggerEl}
         class="qb-add"
         classList={{ "qb-add-prominent": props.prominent }}
         title="Add filter"
@@ -567,6 +652,7 @@ function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
       </button>
       <Show when={open()}>
         <AddPicker
+          rootRef={(element) => { pickerEl = element; }}
           onCommit={(c) => props.apply(addChild(props.tree(), props.loc, c))}
           onSetOp={(op) => props.apply(setOp(props.tree(), props.loc, op))}
         />
@@ -598,6 +684,7 @@ const FILTER_TYPES: { kind: ClauseKind; label: string }[] = [
 function AddPicker(props: {
   onCommit: (c: Clause) => void;
   onSetOp: (op: "and" | "or") => void;
+  rootRef?: (element: HTMLDivElement) => void;
 }): JSX.Element {
   const [step, setStep] = createSignal<ClauseKind | "type">("type");
   // When armed, the next filter is added negated (wrapped in NOT).
@@ -610,7 +697,7 @@ function AddPicker(props: {
   const commit = (c: Clause) => props.onCommit(negate() ? { kind: "op", op: "not", children: [c] } : c);
 
   return (
-    <div class="qb-picker" onClick={stop}>
+    <div ref={props.rootRef} class="qb-picker" onClick={stop}>
       <Show when={step() === "type"}>
         {/* Connectives first (OG-style): AND/OR set how this group joins;
             NOT arms negation for the filter you pick next. */}

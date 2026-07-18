@@ -1,6 +1,6 @@
 {
   "name": "tine",
-  "version": "0.5.10",
+  "version": "0.6.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -27,8 +27,10 @@
     "e2e:wayland-app-id": "node scripts/e2e-wayland-app-id.mjs",
     "blog:check": "node scripts/check-reddit-blog.mjs",
     "blog:sync": "node scripts/sync-reddit-blog.mjs",
+    "blog:test": "node scripts/test-reddit-release-evidence.mjs",
     "e2e:caret": "CARET_LABEL=release-required CARET_MODE=agenda node scripts/e2e-caret.mjs",
     "e2e:multigraph": "node scripts/e2e-multigraph.mjs",
+    "e2e:plugins": "node scripts/e2e-plugins.mjs",
     "e2e:external-assets": "node scripts/e2e-external-assets.mjs",
     "e2e:outline-guide": "node scripts/e2e-outline-guide.mjs",
     "e2e:linux:smoke": "node scripts/run-e2e.mjs linux-smoke",
@@ -36,7 +38,17 @@
     "e2e:windows:smoke": "node scripts/run-e2e.mjs windows-smoke",
     "screenshot": "node scripts/screenshot.mjs",
     "bench": "node scripts/bench.mjs",
-    "bench:startup": "xvfb-run -a node scripts/bench-startup.mjs"
+    "bench:startup": "xvfb-run -a node scripts/bench-startup.mjs",
+    "plugin:check": "node scripts/tine-plugin.mjs check",
+    "plugin:revocation-fixture:build": "node scripts/build-plugin-revocation-fixture.mjs",
+    "plugin:revocation-fixture:check": "node scripts/check-plugin-revocation-fixtures.mjs",
+    "plugin:revocation-fixture:repro": "node scripts/test-plugin-revocation-reproducibility.mjs",
+    "plugin:template-check": "node scripts/test-plugin-template.mjs",
+    "plugin:launch-paths-check": "node scripts/test-docs-preview-paths.mjs",
+    "plugin:launch-e2e": "node scripts/shot-plugin-docs.mjs",
+    "plugin:launch-e2e:android": "TINE_PLUGIN_PLATFORM=android node scripts/shot-plugin-docs.mjs",
+    "theme:check": "node scripts/tine-theme.mjs check",
+    "theme:docs-screenshots": "node scripts/shot-theme-docs.mjs"
   },
   "dependencies": {
     "@fontsource-variable/noto-emoji": "^5.2.12",

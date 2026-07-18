@@ -8,6 +8,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  startWebdriverApplication,
+  stopWebdriverApplication,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine");
@@ -47,12 +53,15 @@ const env = {
   LIBGL_ALWAYS_SOFTWARE: "1",
   GDK_BACKEND: "x11",
 };
+const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
 const log = fs.openSync(path.join(TMP, "tauri-driver.log"), "w");
-const driverArgs = process.platform === "linux"
-  ? ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"]
-  : ["--port", String(DRIVER_PORT)];
+const driverArgs = webdriverServerArgs(
+  DRIVER_PORT,
+  NATIVE_PORT,
+  process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
+);
 const td = spawn(TD, driverArgs, {
-  env, stdio: ["ignore", log, log], detached: process.platform !== "win32",
+  env: webviewTarget.env, stdio: ["ignore", log, log], detached: process.platform !== "win32",
 });
 await sleep(2500);
 
@@ -61,7 +70,7 @@ try {
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/", logLevel: "error",
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-    capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+    capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
   await browser.$(".page-ref").waitForExist({ timeout: 20_000 });
   const routed = await browser.execute(() => {
@@ -136,5 +145,6 @@ try {
     if (process.platform === "win32") td.kill("SIGKILL");
     else process.kill(-td.pid, "SIGKILL");
   } catch {}
+  stopWebdriverApplication(webviewTarget);
   fs.closeSync(log);
 }

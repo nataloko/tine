@@ -27,6 +27,20 @@ const problems = [];
 if (!section) problems.push(`CHANGELOG.md has no released section for ${version}`);
 if (!fs.existsSync(impactPath)) problems.push(`missing docs/releases/v${version}-impact.json`);
 
+// F-Droid fastlane changelogs: one file per Android versionCode, hard 500-char
+// store limit (F-Droid reviewer request on the inclusion MR, 2026-07-15).
+const versionCode = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"))
+  .bundle?.android?.versionCode;
+const changelogsDir = path.join(root, "fastlane/metadata/android/en-US/changelogs");
+if (!Number.isInteger(versionCode)) problems.push("tauri.conf.json lacks bundle.android.versionCode");
+else if (!fs.existsSync(path.join(changelogsDir, `${versionCode}.txt`))) {
+  problems.push(`missing fastlane changelog changelogs/${versionCode}.txt for this release`);
+}
+for (const file of fs.existsSync(changelogsDir) ? fs.readdirSync(changelogsDir) : []) {
+  const length = fs.readFileSync(path.join(changelogsDir, file), "utf8").length;
+  if (length > 500) problems.push(`fastlane changelog ${file} is ${length} chars (F-Droid limit is 500)`);
+}
+
 if (section && fs.existsSync(impactPath)) {
   const impact = JSON.parse(fs.readFileSync(impactPath, "utf8"));
   if (impact.schemaVersion !== 1) problems.push("impact schemaVersion must be 1");
@@ -69,18 +83,6 @@ if (section && fs.existsSync(impactPath)) {
         else if (area.critical !== 0 || area.high !== 0 || !/^[0-9a-f]{64}$/.test(area.reportSha256 ?? "")) {
           problems.push(`audit area ${id} is not clean or lacks report digest`);
         }
-      }
-    }
-    const redditPath = path.join(root, `docs/releases/v${version}-reddit.json`);
-    if (!fs.existsSync(redditPath)) problems.push(`missing minor Reddit/blog evidence ${path.basename(redditPath)}`);
-    else {
-      const reddit = JSON.parse(fs.readFileSync(redditPath, "utf8"));
-      if (reddit.version !== version || reddit.schemaVersion !== 1) problems.push("Reddit/blog evidence version or schema mismatch");
-      if (reddit.author !== "al-Quaknaa") problems.push("Reddit/blog evidence has unexpected author");
-      if (!Array.isArray(reddit.unprocessed) || reddit.unprocessed.length) problems.push("Reddit/blog evidence has unprocessed author posts");
-      if (!Array.isArray(reddit.failedThreads) || reddit.failedThreads.length) problems.push("Reddit/blog evidence has discussion refresh failures");
-      if (!Array.isArray(reddit.threadSnapshots) || reddit.threadSnapshots.some((item) => !/^[0-9a-f]{64}$/.test(item.sha256 ?? ""))) {
-        problems.push("Reddit/blog evidence lacks valid discussion snapshots");
       }
     }
   }

@@ -205,6 +205,35 @@ pub struct RefGroup {
     pub evidence: Vec<ReferenceBlockEvidence>,
 }
 
+/// One backlink root whose visible subtree can be searched and whose OG-style
+/// co-reference facets came from the cached lsdoc projection. This is fetched
+/// only when the Linked References filter opens; ordinary backlink DTOs remain
+/// shallow so their lazy-loading and bridge cost do not change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinkFilterTarget {
+    pub page: String,
+    pub kind: PageKind,
+    pub block_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinkFilterEntry {
+    pub page: String,
+    pub kind: PageKind,
+    pub block_id: String,
+    pub text: String,
+    pub facets: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BacklinkFilterContext {
+    pub entries: Vec<BacklinkFilterEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
 /// Cache-friendly bounded result metadata. The groups stay behind one `Arc` so
 /// routine frontend refreshes can reuse the generation-scoped native result
 /// without a deep clone while preserving the construction ceiling's outcome.
@@ -410,10 +439,11 @@ pub struct Graph {
     // `Arc<Document>` so a cache snapshot or a save's scoped-invalidation copy is
     // an O(1) refcount bump, not a deep clone of the whole page (see cache_upsert).
     cache: RwLock<Option<Arc<Vec<(PageEntry, Arc<Document>)>>>>,
-    /// Companion index for `cache`: `(kind, page_key(name)) -> Vec slot`. The Vec
-    /// stays the source of truth for whole-graph iteration; this makes warm
-    /// by-name cache probes O(1). `None` means "rebuild from the Vec on next
-    /// lookup" and is preferred over risking a stale slot after broad mutations.
+    /// Companion indexes for `cache`: the logical `(kind, page_key(name)) -> Vec
+    /// slot` index preserves deterministic first-wins lookup, while the exact-path
+    /// index keeps cache ownership physical. The Vec stays the source of truth for
+    /// whole-graph iteration. `None` means "rebuild from the Vec on next lookup"
+    /// and is preferred over risking a stale slot after broad mutations.
     cache_index: RwLock<Option<PageCacheIndex>>,
     /// Bumped on every cache mutation (upsert/remove). The lock-free cache build
     /// captures this before reading disk and rebuilds if a mutation raced it
@@ -469,15 +499,15 @@ pub struct Graph {
     /// bytes we wrote and suppress that false positive (the parse-cache comparison
     /// alone races that window). See `write_page` / `sync_file_content`.
     recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
-    /// `key(kind,name) → content_rev` of the on-disk bytes the cached page's
+    /// `path → content_rev` of the on-disk bytes the cached page's
     /// `Document` was parsed from. Invariant: an entry exists IFF the page is in
-    /// the cache, and `disk_revs[key] == content_rev(current disk bytes)` ⟹ the
+    /// the cache, and `disk_revs[path] == content_rev(current disk bytes)` ⟹ the
     /// cached doc reflects disk (is fresh). Lets `sync_file_content` skip the
     /// parse→serialize→parse freshness comparison when a file is unchanged — the
     /// common case on every page navigation and most watcher polls. A missing or
     /// mismatched entry always falls through to the correct parse-compare path, so
     /// the worst a desync can cause is redundant work, never a stale serve.
-    disk_revs: RwLock<std::collections::HashMap<String, String>>,
+    disk_revs: RwLock<std::collections::HashMap<PathBuf, String>>,
     /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
     /// `tags::`/`alias::` property values — in their as-written display case,
     /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
@@ -502,14 +532,10 @@ pub struct Graph {
     >,
 }
 
-/// Cache key for `disk_revs` (and any other (kind,name)-keyed side table):
-/// case-insensitive name, scoped by kind so a page and a journal of the same
-/// title never collide.
-fn rev_key(kind: PageKind, name: &str) -> String {
-    format!("{kind:?}\u{1}{}", crate::refs::page_key(name))
+struct PageCacheIndex {
+    by_name: std::collections::HashMap<(PageKind, String), usize>,
+    by_path: std::collections::HashMap<PathBuf, usize>,
 }
-
-type PageCacheIndex = std::collections::HashMap<(PageKind, String), usize>;
 
 fn page_cache_key(kind: PageKind, name: &str) -> (PageKind, String) {
     (kind, crate::refs::page_key(name))
@@ -533,14 +559,16 @@ fn document_block_ref_counts(doc: &Document) -> std::collections::HashMap<String
 }
 
 fn build_page_cache_index(pages: &[(PageEntry, Arc<Document>)]) -> PageCacheIndex {
-    let mut index = std::collections::HashMap::with_capacity(pages.len());
+    let mut by_name = std::collections::HashMap::with_capacity(pages.len());
+    let mut by_path = std::collections::HashMap::with_capacity(pages.len());
     for (i, (entry, _)) in pages.iter().enumerate() {
         // Preserve Vec `.find` semantics if duplicates ever slip in: first wins.
-        index
+        by_name
             .entry(page_cache_key(entry.kind, &entry.name))
             .or_insert(i);
+        by_path.insert(entry.path.clone(), i);
     }
-    index
+    PageCacheIndex { by_name, by_path }
 }
 
 fn is_date_stem_entry(entry: &PageEntry) -> bool {
@@ -2322,24 +2350,20 @@ impl Graph {
         }
     }
 
-    /// Locate a page in the parsed-doc cache by logical `(kind, name)` without
-    /// scanning the Vec on warm paths. Callers must already hold either
-    /// `cache.read()` or `cache.write()`; this function only touches the companion
-    /// index, preserving the lock order cache -> cache_index.
-    fn cached_page_index(
+    /// Locate a page in the parsed-doc cache by its resolved physical path.
+    /// Callers must already hold either `cache.read()` or `cache.write()`; this
+    /// function only touches the companion index, preserving the lock order
+    /// cache -> cache_index.
+    fn cached_page_index_for_path(
         &self,
         pages: &[(PageEntry, Arc<Document>)],
-        kind: PageKind,
-        name: &str,
+        path: &Path,
     ) -> Option<usize> {
-        let key = page_cache_key(kind, name);
         {
             let guard = self.cache_index.read().unwrap();
             if let Some(index) = guard.as_ref() {
-                if let Some(&i) = index.get(&key) {
-                    if pages.get(i).is_some_and(|(e, _)| {
-                        e.kind == kind && crate::refs::same_page(&e.name, name)
-                    }) {
+                if let Some(&i) = index.by_path.get(path) {
+                    if pages.get(i).is_some_and(|(e, _)| e.path == path) {
                         return Some(i);
                     }
                     // A mismatched slot means a previous mutation dropped/shifted
@@ -2353,11 +2377,10 @@ impl Graph {
 
         let mut guard = self.cache_index.write().unwrap();
         let rebuild = match guard.as_ref() {
-            Some(index) => index.get(&key).is_some_and(|&i| {
-                !pages
-                    .get(i)
-                    .is_some_and(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
-            }),
+            Some(index) => index
+                .by_path
+                .get(path)
+                .is_some_and(|&i| !pages.get(i).is_some_and(|(e, _)| e.path == path)),
             None => true,
         };
         if rebuild {
@@ -2367,12 +2390,8 @@ impl Graph {
         }
         guard
             .as_ref()
-            .and_then(|index| index.get(&key).copied())
-            .filter(|&i| {
-                pages
-                    .get(i)
-                    .is_some_and(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
-            })
+            .and_then(|index| index.by_path.get(path).copied())
+            .filter(|&i| pages.get(i).is_some_and(|(e, _)| e.path == path))
     }
 
     /// A page DTO from the cache ONLY if the cache is already built — never
@@ -2381,7 +2400,7 @@ impl Graph {
     fn peek_cached_page(&self, entry: &PageEntry) -> Option<PageDto> {
         let guard = self.cache.read().unwrap();
         let pages = guard.as_ref()?;
-        let i = self.cached_page_index(pages, entry.kind, &entry.name)?;
+        let i = self.cached_page_index_for_path(pages, &entry.path)?;
         pages.get(i).map(|(e, d)| page_dto(e, d))
     }
 
@@ -2532,9 +2551,9 @@ impl Graph {
     /// into the cache, their on-disk revs into `disk_revs`. Cache set BEFORE
     /// disk_revs so a reader never observes a fresh rev paired with a stale cache.
     fn install_built(&self, built: Vec<(PageEntry, Document, String)>) {
-        let revs: std::collections::HashMap<String, String> = built
+        let revs: std::collections::HashMap<PathBuf, String> = built
             .iter()
-            .map(|(e, _, r)| (rev_key(e.kind, &e.name), r.clone()))
+            .map(|(e, _, r)| (e.path.clone(), r.clone()))
             .collect();
         let pages: Vec<(PageEntry, Arc<Document>)> = built
             .into_iter()
@@ -2716,7 +2735,7 @@ impl Graph {
         let new_block_refs = document_block_ref_counts(&doc);
         let mut block_refs_touched = false;
         let mut alias_touched = !new_aliases.is_empty();
-        let key = rev_key(entry.kind, &entry.name);
+        let path_key = entry.path.clone();
         let doc = Arc::new(doc);
         // Keep the new content + identity for the scoped derived-cache pass below
         // (the original is moved into the cache slot; this clone is a refcount bump).
@@ -2728,7 +2747,7 @@ impl Graph {
         let cache_built = guard.is_some();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
-            match self.cached_page_index(pages, entry.kind, &entry.name) {
+            match self.cached_page_index_for_path(pages, &entry.path) {
                 Some(i) => {
                     let slot = &mut pages[i];
                     alias_touched = new_aliases != crate::query::document_aliases(&slot.1);
@@ -2739,10 +2758,14 @@ impl Graph {
                 None => {
                     is_new_page = true;
                     block_refs_touched = !new_block_refs.is_empty();
-                    let index_key = page_cache_key(entry.kind, &entry.name);
+                    let name_key = page_cache_key(entry.kind, &entry.name);
                     pages.push((entry, doc));
                     if let Some(index) = self.cache_index.write().unwrap().as_mut() {
-                        index.entry(index_key).or_insert(pages.len() - 1);
+                        let slot = pages.len() - 1;
+                        index.by_path.insert(path_key.clone(), slot);
+                        // Exact-path additions must never repoint the stable
+                        // logical duplicate winner.
+                        index.by_name.entry(name_key).or_insert(slot);
                     }
                 }
             }
@@ -2755,7 +2778,7 @@ impl Graph {
             // always cache → disk_revs; readers never hold disk_revs while taking
             // the cache lock, so this nesting can't deadlock. Sets only when the
             // page is actually cached (preserves "entry exists IFF cached").
-            self.disk_revs.write().unwrap().insert(key, disk_rev);
+            self.disk_revs.write().unwrap().insert(path_key, disk_rev);
         }
         // Bump cache_gen AFTER publishing the new content (and disk_revs), still
         // under the cache write lock. A reader loads cache_gen (Acquire) then takes
@@ -2993,16 +3016,69 @@ impl Graph {
         let mut block_refs_touched = false;
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
-            if let Some(i) = self.cached_page_index(pages, kind, name) {
-                alias_touched = !crate::query::document_aliases(&pages[i].1).is_empty();
-                block_refs_touched = !document_block_ref_counts(&pages[i].1).is_empty();
-            }
+            let removed_paths = pages
+                .iter()
+                .filter(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
+                .map(|(e, doc)| {
+                    alias_touched |= !crate::query::document_aliases(doc).is_empty();
+                    block_refs_touched |= !document_block_ref_counts(doc).is_empty();
+                    e.path.clone()
+                })
+                .collect::<Vec<_>>();
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
-            // Drop the rev under the cache lock (same cache → disk_revs order as
+            // Drop all exact revisions removed by this ambiguity-validated logical
+            // delete under the cache lock (same cache → disk_revs order as
             // cache_upsert) so the two never diverge.
-            self.disk_revs.write().unwrap().remove(&rev_key(kind, name));
+            let mut revs = self.disk_revs.write().unwrap();
+            for path in removed_paths {
+                revs.remove(&path);
+            }
         }
         *self.cache_index.write().unwrap() = None;
+        // Bump AFTER the removal is published (under the cache lock), so a reader
+        // that loads the new gen is guaranteed to see the page gone — see the
+        // gen-after-content note in cache_upsert.
+        let newgen = self
+            .cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            + 1;
+        drop(guard);
+        {
+            let mut counts = self.block_ref_count_cache.write().unwrap();
+            if block_refs_touched {
+                *counts = None;
+            } else if let Some((generation, _)) = counts.as_mut() {
+                *generation = newgen;
+            }
+        }
+        if alias_touched {
+            *self.alias_cache.write().unwrap() = None;
+        }
+    }
+
+    /// Drop one physical page from the cache after its file disappears. Unlike
+    /// `cache_remove`, this preserves same-name siblings and rebuilds the logical
+    /// first-wins index from the surviving entries.
+    fn cache_remove_path(&self, entry: &PageEntry) {
+        // A page delete is a page-set change (affects namespaces, exists-by-ref,
+        // every backlink/query) — drop the whole derived cache.
+        *self.derived_cache.write().unwrap() = None;
+        *self.advanced_cache.write().unwrap() = None;
+        let mut guard = self.cache.write().unwrap();
+        let mut alias_touched = false;
+        let mut block_refs_touched = false;
+        if let Some(pages) = guard.as_mut() {
+            let pages = Arc::make_mut(pages);
+            if let Some(i) = self.cached_page_index_for_path(pages, &entry.path) {
+                alias_touched = !crate::query::document_aliases(&pages[i].1).is_empty();
+                block_refs_touched = !document_block_ref_counts(&pages[i].1).is_empty();
+                pages.remove(i);
+                // Drop the rev under the cache lock (same cache → disk_revs order
+                // as cache_upsert) so the two never diverge.
+                self.disk_revs.write().unwrap().remove(&entry.path);
+            }
+            *self.cache_index.write().unwrap() = Some(build_page_cache_index(pages));
+        }
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
@@ -3384,6 +3460,15 @@ impl Graph {
     /// and rolls back every write on any failure. Aborts (no change) if a target
     /// name already exists or a touched file changed under us.
     pub fn rename_page(&self, old: &str, new: &str) -> io::Result<()> {
+        self.rename_page_expected(old, new, None)
+    }
+
+    pub fn rename_page_expected(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+    ) -> io::Result<()> {
         let old = old.trim();
         let new = new.trim();
         if new.is_empty() {
@@ -3392,6 +3477,7 @@ impl Graph {
         if old.is_empty() || crate::refs::same_page(old, new) {
             return Ok(()); // nothing to do (case-only rename is intentionally a no-op)
         }
+        self.validate_page_mutation_target(old, PageKind::Page, expected_path)?;
         // M1: refuse to rename an ambiguous page (both .md and .org on disk) — which
         // twin moves, and which content is authoritative, is undecidable here.
         if self.has_twin(old, PageKind::Page) || self.has_twin(new, PageKind::Page) {
@@ -3684,6 +3770,15 @@ impl Graph {
     /// simple misclick, is recoverable. If the trash move fails, the live file is
     /// left in place and the error is returned.
     pub fn delete_page(&self, name: &str, kind: PageKind) -> io::Result<()> {
+        self.delete_page_expected(name, kind, None)
+    }
+
+    pub fn delete_page_expected(
+        &self,
+        name: &str,
+        kind: PageKind,
+        expected_path: Option<&str>,
+    ) -> io::Result<()> {
         // M1: with both a .md and a .org twin, "which file?" is ambiguous — refuse
         // rather than trash an arbitrary one.
         if self.has_twin(name, kind) {
@@ -3700,6 +3795,7 @@ impl Graph {
                 "multiple files share this page identity; delete by name is ambiguous",
             ));
         }
+        self.validate_page_mutation_target(name, kind, expected_path)?;
         if let Some(entry) = matching.into_iter().next() {
             let trash = typed_trash_dir(
                 &self.root,
@@ -3721,6 +3817,41 @@ impl Graph {
         Ok(())
     }
 
+    /// Validate the snapshot captured by a page menu/title before any mutation.
+    /// Even an exact path does not authorize choosing one logical duplicate: the
+    /// semantics of rewriting `[[page]]` references remain ambiguous.
+    fn validate_page_mutation_target(
+        &self,
+        name: &str,
+        kind: PageKind,
+        expected_path: Option<&str>,
+    ) -> io::Result<()> {
+        let matching: Vec<_> = self
+            .list_pages()
+            .into_iter()
+            .filter(|entry| entry.kind == kind && crate::refs::same_page(&entry.name, name))
+            .collect();
+        if matching.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "multiple files share this page identity; mutation is ambiguous",
+            ));
+        }
+        let Some(expected) = expected_path.filter(|path| !path.trim().is_empty()) else {
+            return Ok(());
+        };
+        let expected_abs = self.resolve_rel(expected).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid expected page path")
+        })?;
+        let Some(entry) = matching.first() else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "stale page target"));
+        };
+        if entry.path != expected_abs {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "stale page target"));
+        }
+        Ok(())
+    }
+
     /// Full-text search across all blocks.
     pub fn search(&self, query: &str, limit: usize) -> Vec<RefGroup> {
         crate::query::search(self, query, limit)
@@ -3736,8 +3867,24 @@ impl Graph {
         block_limit: usize,
         explain: bool,
     ) -> crate::query_plan::QueryExecution {
-        crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit)
-            .execute_with_explain(self, || false, explain)
+        self.run_graph_search_scoped(source, page_limit, block_limit, None, explain)
+    }
+
+    pub fn run_graph_search_scoped(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+    ) -> crate::query_plan::QueryExecution {
+        match scope {
+            Some(scope) => {
+                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
+            }
+            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
+        }
+        .execute_with_explain(self, || false, explain)
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
@@ -3769,6 +3916,18 @@ impl Graph {
         block_limit: usize,
         explain: bool,
     ) -> crate::query_plan::QueryExecution {
+        self.run_graph_search_latest_scoped(lane, source, page_limit, block_limit, None, explain)
+    }
+
+    pub fn run_graph_search_latest_scoped(
+        &self,
+        lane: &str,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+    ) -> crate::query_plan::QueryExecution {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -3778,8 +3937,13 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit)
-            .execute_with_explain(self, || epoch.load(Ordering::Acquire) != mine, explain)
+        match scope {
+            Some(scope) => {
+                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
+            }
+            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
+        }
+        .execute_with_explain(self, || epoch.load(Ordering::Acquire) != mine, explain)
     }
 
     /// Fuzzy page-name matches for the quick switcher.
@@ -4902,7 +5066,7 @@ impl Graph {
                 .disk_revs
                 .read()
                 .unwrap()
-                .get(&rev_key(entry.kind, &entry.name))
+                .get(path)
                 .is_some_and(|r| *r == disk_rev)
             {
                 return None;
@@ -4925,7 +5089,7 @@ impl Graph {
                 *self.cache_index.write().unwrap() = None;
                 return None;
             };
-            if let Some(i) = self.cached_page_index(cache, entry.kind, &entry.name) {
+            if let Some(i) = self.cached_page_index_for_path(cache, path) {
                 let cached = &cache[i].1;
                 // Compare CONTENT, not the in-memory uuids: cached blocks carry
                 // generated uuids (assigned at cache build / upsert), while a
@@ -4961,9 +5125,9 @@ impl Graph {
             let guard = self.cache.read().unwrap();
             guard
                 .as_ref()
-                .is_some_and(|c| self.cached_page_index(c, entry.kind, &entry.name).is_some())
+                .is_some_and(|c| self.cached_page_index_for_path(c, &entry.path).is_some())
         };
-        self.cache_remove(&entry.name, entry.kind);
+        self.cache_remove_path(&entry);
         was_cached.then_some(entry)
     }
 
@@ -5087,7 +5251,7 @@ impl Graph {
         // `:journal/file-name-format` — so custom-format graphs create the correct
         // file for the day instead of a misplaced default-named duplicate.)
         let dto_is_org = matches!(Format::from_path(path), Format::Org);
-        let doc = Document {
+        let mut doc = Document {
             pre_block: page.pre_block.clone(),
             roots: page
                 .blocks
@@ -5105,12 +5269,44 @@ impl Graph {
         // outline; promotion keeps property lines in the pre-block.  Refuse both
         // normal and force writes that do so, leaving the original bytes intact.
         if let Some(existing) = existing {
-            if let Some(line) = moved_page_property_line(existing, &doc) {
+            // A nonempty disk preamble is authoritative. If a contradictory DTO
+            // drops it while presenting a first-root header candidate, refusing
+            // the save is safer than either overwriting the preamble or silently
+            // keeping the candidate as a bullet. This also protects force-save.
+            let existing_doc = doc::parse(existing);
+            if existing_doc
+                .pre_block
+                .as_deref()
+                .is_some_and(|pre| !pre.is_empty())
+                && doc.pre_block.as_deref().unwrap_or("").is_empty()
+                && first_root_is_promotable_page_header(&doc)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "refusing to drop an existing page preamble while authoring page-header properties",
+                ));
+            }
+            if let Some(line) = newly_reclassified_page_property_line(existing, &doc) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("refusing to move page-header property into outline content: {line}"),
                 ));
             }
+        }
+        // Match OG's pre-block serialization decision at one native boundary:
+        // a genuinely headerless Markdown page may author a qualifying first
+        // root through the ordinary editor, but the persisted/cache shape is an
+        // unbulleted page header. Existing nonempty preambles were rejected above.
+        if !dto_is_org
+            && page.pre_block.as_deref().unwrap_or("").is_empty()
+            && existing
+                .map(doc::parse)
+                .and_then(|parsed| parsed.pre_block)
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            promote_first_root_page_header(&mut doc);
         }
         // Own the caller's resolved+locked path (M2: never re-resolve path_for here).
         let path = path.to_path_buf();
@@ -5185,7 +5381,7 @@ impl Graph {
             && (changed || {
                 let guard = self.cache.read().unwrap();
                 guard.as_ref().is_some_and(|pages| {
-                    self.cached_page_index(pages, page.kind, &page.name)
+                    self.cached_page_index_for_path(pages, &path)
                         .is_none()
                 })
             });
@@ -5193,7 +5389,7 @@ impl Graph {
             // For a brand-new journal, derive its date_key from the name so it's
             // recognized as a dated journal by `journals_desc` (which reads this
             // cache) — otherwise today's freshly-created page would be missing.
-            let entry = self.find_entry(&page.name, page.kind).unwrap_or_else(|| {
+            let entry = self.entry_for_path(&path).unwrap_or_else(|| {
                 let date_key = if page.kind == PageKind::Journal {
                     crate::date::JournalDate::from_title(&page.name).map(|d| d.ordinal_key())
                 } else {
@@ -5240,12 +5436,77 @@ impl Graph {
     }
 }
 
-/// Return the first existing page-header property line that a proposed DTO has
-/// removed from the pre-block and reproduced verbatim inside an outline block.
-/// There is deliberately no implicit "repair" here: once the frontend has sent
-/// contradictory structure, retaining the original file and surfacing an error
-/// is safer than guessing which representation the user intended.
-fn moved_page_property_line(existing: &str, proposed: &Document) -> Option<String> {
+/// Canonical Markdown page-header property grammar mirrored from
+/// `src/editor/properties.ts`. It is deliberately narrower than OG's historical
+/// "first line contains `:: `" serializer heuristic, so ordinary prose/fences
+/// can never be promoted accidentally.
+fn page_header_property_line(line: &str) -> Option<(&str, &str)> {
+    static KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let (key, value) = line.split_once("::")?;
+    if key.is_empty() || key.starts_with('#') {
+        return None;
+    }
+    let valid = KEY
+        .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{M}\p{N}_./-]+$").unwrap())
+        .is_match(key);
+    valid.then_some((key, value))
+}
+
+fn page_header_properties_only(raw: &str) -> bool {
+    if raw.is_empty() || raw.starts_with('\n') || raw.ends_with('\n') {
+        return false;
+    }
+    let mut saw_property = false;
+    for line in raw.split('\n') {
+        if line.is_empty() {
+            if !saw_property {
+                return false;
+            }
+            continue;
+        }
+        if page_header_property_line(line).is_none() {
+            return false;
+        }
+        saw_property = true;
+    }
+    saw_property
+}
+
+fn first_root_is_promotable_page_header(doc: &Document) -> bool {
+    let Some(first) = doc.roots.first() else {
+        return false;
+    };
+    first.children.is_empty()
+        && page_header_properties_only(&first.raw)
+        && !first.raw.split('\n').any(|line| {
+            page_header_property_line(line)
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("id"))
+        })
+}
+
+fn promote_first_root_page_header(doc: &mut Document) {
+    if !first_root_is_promotable_page_header(doc) {
+        return;
+    }
+    let first = doc.roots.remove(0);
+    doc.pre_block = Some(first.raw);
+}
+
+/// Return the first property-shaped outline line that has no outline provenance
+/// on disk while the proposal also loses page-header property slots.
+///
+/// The firewall is deliberately structural rather than an exact-string test:
+/// a broken DTO must not evade it by editing the moved line's key/value. At the
+/// same time, a property-shaped outline block that genuinely existed on disk is
+/// allowed to stay, move, or be edited. We therefore treat existing outline
+/// property lines as provenance slots: exact multiset matches consume their
+/// original slots first, and remaining slots cover ordinary edits. Only an
+/// excess proposed outline line is newly unproven. There is no implicit repair;
+/// contradictory structure is rejected before bytes or cache can change.
+fn newly_reclassified_page_property_line(
+    existing: &str,
+    proposed: &Document,
+) -> Option<String> {
     // The general data-preservation guard is intentionally a little broader
     // than Tine's editable property grammar: Logseq graphs can contain Unicode
     // or plugin-defined keys that Tine does not expose in its settings panel,
@@ -5258,37 +5519,63 @@ fn moved_page_property_line(existing: &str, proposed: &Document) -> Option<Strin
         !key.is_empty() && key.chars().all(|ch| !ch.is_whitespace() && ch != ':')
     }
 
+    fn pre_property_lines(raw: Option<&str>) -> Vec<&str> {
+        raw.unwrap_or("")
+            .split('\n')
+            .filter(|line| page_header_property(line))
+            .collect()
+    }
+
+    fn outline_property_lines<'a>(blocks: &'a [DocBlock], out: &mut Vec<&'a str>) {
+        for block in blocks {
+            out.extend(
+                block
+                    .raw
+                    .split('\n')
+                    .filter(|line| page_header_property(line)),
+            );
+            outline_property_lines(&block.children, out);
+        }
+    }
+
     let existing_doc = doc::parse(existing);
-    let proposed_pre: std::collections::HashSet<&str> = proposed
-        .pre_block
-        .as_deref()
-        .unwrap_or("")
-        .split('\n')
-        .collect();
-    let moved: std::collections::HashSet<&str> = existing_doc
-        .pre_block
-        .as_deref()
-        .unwrap_or("")
-        .split('\n')
-        .filter(|line| page_header_property(line))
-        .filter(|line| !proposed_pre.contains(line))
-        .collect();
-    if moved.is_empty() {
+    let existing_pre = pre_property_lines(existing_doc.pre_block.as_deref());
+    let proposed_pre = pre_property_lines(proposed.pre_block.as_deref());
+    if proposed_pre.len() >= existing_pre.len() {
         return None;
     }
 
-    fn find(blocks: &[DocBlock], moved: &std::collections::HashSet<&str>) -> Option<String> {
-        for block in blocks {
-            if let Some(line) = block.raw.split('\n').find(|line| moved.contains(line)) {
-                return Some(line.to_string());
-            }
-            if let Some(line) = find(&block.children, moved) {
-                return Some(line);
-            }
-        }
-        None
+    let mut existing_outline = Vec::new();
+    outline_property_lines(&existing_doc.roots, &mut existing_outline);
+    let mut proposed_outline = Vec::new();
+    outline_property_lines(&proposed.roots, &mut proposed_outline);
+    if proposed_outline.len() <= existing_outline.len() {
+        return None;
     }
-    find(&proposed.roots, &moved)
+
+    // Cancel exact matches as a multiset so the diagnostic identifies a truly
+    // excess proposal line even in the presence of duplicates. Any remaining
+    // existing slots then cover changed/reordered pre-existing outline lines.
+    let mut exact_slots: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for line in &existing_outline {
+        *exact_slots.entry(*line).or_default() += 1;
+    }
+    let mut unmatched = Vec::new();
+    let mut exact_matches = 0usize;
+    for line in proposed_outline {
+        match exact_slots.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                exact_matches += 1;
+            }
+            _ => unmatched.push(line),
+        }
+    }
+    let edited_provenance_slots = existing_outline.len() - exact_matches;
+    unmatched
+        .get(edited_provenance_slots)
+        .map(|line| (*line).to_string())
 }
 
 /// Atomically reserve a unique filename in `assets/` for `name`, de-duplicating
@@ -6748,7 +7035,7 @@ mod tests {
         g.save_page(&books, books.rev.as_deref()).unwrap();
 
         let disk = fs::read_to_string(dir.join("pages").join("books.md")).unwrap();
-        assert_eq!(disk, "- alias:: book\n- I like reading\n");
+        assert_eq!(disk, "alias:: book\n\n- I like reading\n");
         assert_eq!(
             g.load_named("book", PageKind::Page).unwrap().unwrap().name,
             "books"
@@ -8247,6 +8534,123 @@ mod tests {
     }
 
     #[test]
+    fn save_refuses_changed_page_header_properties_reclassified_as_outline() {
+        // H7: the preservation firewall is structural, not an exact-text check.
+        // A stale/buggy DTO must not evade it by changing the moved property's
+        // value or key while reclassifying it as outline content. Exercise both
+        // ordinary and force-save paths from a warm cache and prove neither the
+        // bytes nor cached document move on validation failure.
+        for (shape, original, kept, moved, childful) in [
+            (
+                "partial-value",
+                "A:: old\nB:: old\n",
+                Some("A:: old"),
+                "B:: changed",
+                false,
+            ),
+            (
+                "partial-key",
+                "A:: old\nB:: old\n",
+                Some("A:: old"),
+                "Renamed:: old",
+                false,
+            ),
+            (
+                "whole-key-value",
+                "A:: old\nB:: old\n",
+                None,
+                "Renamed:: changed\nC:: newer",
+                true,
+            ),
+            (
+                "crlf",
+                "A:: old\r\nB:: old\r\n",
+                Some("A:: old"),
+                "B:: changed",
+                false,
+            ),
+            (
+                "unicode-plugin",
+                "A:: old\n插件/键:: old\n",
+                Some("A:: old"),
+                "插件/新:: changed",
+                false,
+            ),
+        ] {
+            for forced in [false, true] {
+                let dir = scratch(&format!(
+                    "page-property-firewall-changed-{shape}-{forced}"
+                ));
+                let path = dir.join("pages").join("Property.md");
+                fs::write(&path, original).unwrap();
+                let g = Graph::open(&dir);
+                g.warm_cache();
+                let mut dto = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+                let cached_before = dto.clone();
+                let generation_before = g.cache_generation();
+                dto.pre_block = kept.map(str::to_string);
+                dto.blocks = vec![BlockDto {
+                    id: "reclassified-header".into(),
+                    raw: moved.into(),
+                    children: childful
+                        .then(|| BlockDto {
+                            id: "body".into(),
+                            raw: "Body".into(),
+                            ..Default::default()
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }];
+
+                let err = if forced {
+                    g.force_save_page(&dto).unwrap_err()
+                } else {
+                    g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
+                };
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+                assert_eq!(g.cache_generation(), generation_before);
+                let cached_after = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+                assert_eq!(cached_after.pre_block, cached_before.pre_block);
+                assert_eq!(cached_after.blocks.len(), cached_before.blocks.len());
+                assert_eq!(cached_after.rev, cached_before.rev);
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    #[test]
+    fn existing_outline_property_root_remains_editable_beside_page_header() {
+        // An outline block that already had page-property-shaped syntax is not a
+        // reclassified header. Its structural provenance permits a duplicate
+        // header line to be deleted without blaming the already-existing root,
+        // and the root remains ordinarily editable afterwards.
+        let dir = scratch("page-property-existing-outline-provenance");
+        let path = dir.join("pages").join("Property.md");
+        fs::write(&path, "A:: header\nB:: shared\n\n- B:: shared\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let mut dto = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+        dto.pre_block = Some("A:: edited header".into());
+        g.save_page(&dto, dto.rev.as_deref()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "A:: edited header\n\n- B:: shared\n"
+        );
+        let mut warm = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+        assert_eq!(warm.pre_block.as_deref(), Some("A:: edited header"));
+        assert_eq!(warm.blocks[0].raw, "B:: shared");
+        warm.blocks[0].raw = "Renamed:: edited outline".into();
+        g.save_page(&warm, warm.rev.as_deref()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "A:: edited header\n\n- Renamed:: edited outline\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn page_header_property_save_reopens_as_metadata_with_original_line_endings() {
         // Complements the real gear-panel E2E: drive the native save and a fresh
         // Graph/parser instance so success cannot come from the just-written
@@ -8282,6 +8686,204 @@ mod tests {
                 Some("icon:: ★\nA:: XX\nB:: XX\nC:: XX")
             );
             assert!(reopened.blocks.is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn new_property_only_first_root_becomes_canonical_page_header() {
+        let dir = scratch("page-property-authoring");
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let page = PageDto {
+            name: "Property Authoring".into(),
+            kind: PageKind::Page,
+            title: "Property Authoring".into(),
+            pre_block: None,
+            blocks: vec![
+                BlockDto {
+                    id: "transient-header".into(),
+                    raw: "alias:: book\n\nklíč:: hodnota".into(),
+                    ..Default::default()
+                },
+                BlockDto {
+                    id: "body".into(),
+                    raw: "Reading list".into(),
+                    ..Default::default()
+                },
+            ],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        };
+        g.save_page(&page, None).unwrap();
+        let path = dir.join("pages").join("Property Authoring.md");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alias:: book\n\nklíč:: hodnota\n\n- Reading list\n"
+        );
+
+        let warm = g
+            .load_named("Property Authoring", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm.pre_block.as_deref(), Some("alias:: book\n\nklíč:: hodnota"));
+        assert_eq!(warm.blocks.len(), 1);
+        assert_eq!(warm.blocks[0].raw, "Reading list");
+        assert_eq!(warm.blocks[0].id, "body", "normalization changed the body root identity");
+        drop(g);
+        let cold = Graph::open(&dir)
+            .load_named("Property Authoring", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.pre_block, warm.pre_block);
+        assert_eq!(cold.blocks.len(), warm.blocks.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_header_authoring_is_bounded_and_preserves_existing_preambles() {
+        assert!(page_header_properties_only("alias:: book\n\ne\u{301}/plugin.key::value"));
+        for invalid in [
+            " alias:: x",
+            "#alias:: x",
+            "alias key:: x",
+            "alias:: x\nprose",
+            "```\nalias:: x\n```",
+            "alias:: x\n",
+        ] {
+            assert!(!page_header_properties_only(invalid), "accepted {invalid:?}");
+        }
+
+        // A headerless CRLF page can add a canonical header; both the warm cache
+        // and a fresh parser expose exactly the normalized document shape.
+        let dir = scratch("page-property-existing-headerless");
+        let path = dir.join("pages").join("Existing.md");
+        fs::write(&path, "- Body\r\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let mut dto = g.load_named("Existing", PageKind::Page).unwrap().unwrap();
+        dto.blocks.insert(
+            0,
+            BlockDto {
+                id: "transient-header".into(),
+                raw: "custom/key:: exact value".into(),
+                ..Default::default()
+            },
+        );
+        g.save_page(&dto, dto.rev.as_deref()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "custom/key:: exact value\r\n\r\n- Body\r\n"
+        );
+        let warm = g.load_named("Existing", PageKind::Page).unwrap().unwrap();
+        assert_eq!(warm.pre_block.as_deref(), Some("custom/key:: exact value"));
+        assert_eq!(warm.blocks.len(), 1);
+        drop(g);
+        let cold = Graph::open(&dir)
+            .load_named("Existing", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.pre_block, warm.pre_block);
+        assert_eq!(cold.blocks.len(), warm.blocks.len());
+        let _ = fs::remove_dir_all(&dir);
+
+        // A non-property preamble may only move through GH #85's explicit prose
+        // promotion. A property candidate cannot make that preamble disappear,
+        // even through force-save, and the warm cache stays on the disk version.
+        let dir = scratch("page-property-preamble-loss");
+        let path = dir.join("pages").join("Imported.md");
+        let original = "Intro before outline\n\n- Body\n";
+        fs::write(&path, original).unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let mut dto = g.load_named("Imported", PageKind::Page).unwrap().unwrap();
+        dto.pre_block = None;
+        dto.blocks.insert(
+            0,
+            BlockDto {
+                id: "candidate".into(),
+                raw: "alias:: book".into(),
+                ..Default::default()
+            },
+        );
+        for forced in [false, true] {
+            let err = if forced {
+                g.force_save_page(&dto).unwrap_err()
+            } else {
+                g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("existing page preamble"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            let cached = g.load_named("Imported", PageKind::Page).unwrap().unwrap();
+            assert_eq!(cached.pre_block.as_deref(), Some("Intro before outline"));
+            assert_eq!(cached.blocks.len(), 1);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_header_authoring_never_promotes_unsafe_or_nonfirst_roots() {
+        let cases: Vec<(&str, Format, Vec<BlockDto>)> = vec![
+            (
+                "later",
+                Format::Md,
+                vec![
+                    BlockDto { id: "body".into(), raw: "Body".into(), ..Default::default() },
+                    BlockDto { id: "prop".into(), raw: "alias:: book".into(), ..Default::default() },
+                ],
+            ),
+            ("mixed", Format::Md, vec![BlockDto { id: "mixed".into(), raw: "alias:: book\nprose".into(), ..Default::default() }]),
+            ("fenced", Format::Md, vec![BlockDto { id: "fenced".into(), raw: "```\nalias:: book\n```".into(), ..Default::default() }]),
+            ("empty", Format::Md, vec![BlockDto { id: "empty".into(), raw: "".into(), ..Default::default() }]),
+            (
+                "childful",
+                Format::Md,
+                vec![BlockDto {
+                    id: "parent".into(),
+                    raw: "alias:: book".into(),
+                    children: vec![BlockDto { id: "child".into(), raw: "Child".into(), ..Default::default() }],
+                    ..Default::default()
+                }],
+            ),
+            ("id-bearing", Format::Md, vec![BlockDto { id: "durable".into(), raw: "id:: 11111111-1111-4111-8111-111111111111".into(), ..Default::default() }]),
+            ("org", Format::Org, vec![BlockDto { id: "org".into(), raw: "alias:: book".into(), ..Default::default() }]),
+        ];
+        for (label, format, blocks) in cases {
+            let dir = scratch(&format!("page-property-negative-{label}"));
+            if format == Format::Org {
+                fs::create_dir_all(dir.join("logseq")).unwrap();
+                fs::write(dir.join("logseq").join("config.edn"), "{:preferred-format \"Org\"}\n").unwrap();
+            }
+            let g = Graph::open(&dir);
+            let page = PageDto {
+                name: format!("Negative {label}"),
+                kind: PageKind::Page,
+                title: format!("Negative {label}"),
+                pre_block: None,
+                blocks: blocks.clone(),
+                rev: None,
+                format,
+                read_only: false,
+                path: String::new(),
+                guide: false,
+            };
+            g.save_page(&page, None).unwrap();
+            let reopened = g
+                .load_named(&page.name, PageKind::Page)
+                .unwrap()
+                .unwrap();
+            assert!(reopened.pre_block.is_none(), "promoted unsafe case {label}");
+            assert_eq!(reopened.blocks.len(), blocks.len(), "changed root count for {label}");
+            if label == "id-bearing" {
+                assert!(
+                    g.resolve_block("11111111-1111-4111-8111-111111111111").is_some(),
+                    "ID-bearing root lost addressability"
+                );
+            }
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -9951,6 +10553,149 @@ mod tests {
     }
 
     #[test]
+    fn warmed_duplicate_name_cache_keeps_physical_owners_distinct() {
+        let dir = scratch("warmed-duplicate-name-owners");
+        fs::create_dir_all(dir.join("pages/duplicates")).unwrap();
+        let flat = dir.join("pages/Exact Storage Twin.md");
+        let nested = dir.join("pages/duplicates/Exact Storage Twin.md");
+        fs::write(&flat, "- flat original sentinel\n").unwrap();
+        fs::write(&nested, "- nested original sentinel\n").unwrap();
+
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let logical_winner = g
+            .find_entry("Exact Storage Twin", PageKind::Page)
+            .expect("one duplicate is the stable name winner");
+        let non_winner_path = if logical_winner.path == flat { &nested } else { &flat };
+        let non_winner_entry = g
+            .entry_for_path(non_winner_path)
+            .expect("non-winning duplicate is addressable by path");
+        let winner_original = fs::read_to_string(&logical_winner.path).unwrap();
+
+        // Save through the duplicate's captured physical path after both entries
+        // have been warmed. The name winner must remain stable while the other
+        // physical owner receives its own cached document and revision.
+        let mut non_winner = g
+            .load_by_path(&non_winner_entry.rel_path)
+            .unwrap()
+            .expect("non-winning duplicate loads by path");
+        non_winner.blocks[0].raw = "nested saved sentinel".into();
+        g.save_page(&non_winner, non_winner.rev.as_deref()).unwrap();
+
+        assert_eq!(
+            g.find_entry("Exact Storage Twin", PageKind::Page)
+                .expect("name winner remains present")
+                .path,
+            logical_winner.path,
+            "path-addressed save must not repoint the logical first winner"
+        );
+
+        let winner_loaded = g.load_page(&logical_winner).unwrap();
+        assert_eq!(
+            winner_loaded.blocks[0].raw,
+            winner_original.trim_start_matches("- ").trim_end(),
+            "the name winner retains its own warmed bytes"
+        );
+        let non_winner_loaded = g.load_page(&non_winner_entry).unwrap();
+        assert_eq!(non_winner_loaded.blocks[0].raw, "nested saved sentinel");
+        assert_eq!(non_winner_loaded.path, non_winner_entry.rel_path);
+
+        let cached = g.with_pages(|pages| {
+            pages
+                .iter()
+                .filter(|(entry, _)| entry.name == "Exact Storage Twin")
+                .map(|(entry, doc)| (entry.path.clone(), doc.roots[0].raw.clone()))
+                .collect::<Vec<_>>()
+        });
+        assert!(cached.iter().any(|(path, raw)| {
+            *path == logical_winner.path
+                && raw == winner_original.trim_start_matches("- ").trim_end()
+        }));
+        assert!(cached
+            .iter()
+            .any(|(path, raw)| *path == *non_winner_path && raw == "nested saved sentinel"));
+
+        for (needle, path) in [
+            (
+                winner_original.trim_start_matches("- ").trim_end(),
+                logical_winner.rel_path.as_str(),
+            ),
+            ("nested saved sentinel", non_winner_entry.rel_path.as_str()),
+        ] {
+            assert!(
+                g.run_graph_search(needle, 0, 8, false).hits.iter().any(|hit| matches!(
+                    hit,
+                    crate::query_plan::QueryHit::Block { path: hit_path, .. } if hit_path == path
+                )),
+                "search hit for {needle:?} must retain its physical owner {path:?}"
+            );
+        }
+
+        // Give the winner the non-winner's current bytes. A name-keyed revision
+        // map incorrectly treats that as already fresh and suppresses its reload.
+        fs::write(&logical_winner.path, "- nested saved sentinel\n").unwrap();
+        assert!(
+            g.sync_file(&logical_winner.path)
+                .is_some_and(|entry| entry.path == logical_winner.path),
+            "one duplicate's revision must not mark the other duplicate fresh"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_file_evicts_only_the_deleted_duplicate_path() {
+        let dir = scratch("forget-duplicate-path");
+        fs::create_dir_all(dir.join("pages/duplicates")).unwrap();
+        let flat = dir.join("pages/Exact Storage Twin.md");
+        let nested = dir.join("pages/duplicates/Exact Storage Twin.md");
+        fs::write(&flat, "- flat survives if not removed\n").unwrap();
+        fs::write(&nested, "- nested survives if not removed\n").unwrap();
+
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let removed = g
+            .find_entry("Exact Storage Twin", PageKind::Page)
+            .expect("one duplicate is the initial logical winner");
+        let survivor_path = if removed.path == flat { &nested } else { &flat };
+        let survivor = g
+            .entry_for_path(survivor_path)
+            .expect("the other duplicate is a physical cache owner");
+
+        fs::remove_file(&removed.path).unwrap();
+        assert_eq!(
+            g.forget_file(&removed.path)
+                .expect("the deleted path had a cache entry")
+                .path,
+            removed.path
+        );
+        assert_eq!(
+            g.find_entry("Exact Storage Twin", PageKind::Page)
+                .expect("surviving duplicate is the new name winner")
+                .path,
+            survivor.path
+        );
+        assert_eq!(
+            g.with_pages(|pages| {
+                pages
+                    .iter()
+                    .filter(|(entry, _)| entry.name == "Exact Storage Twin")
+                    .map(|(entry, _)| entry.path.clone())
+                    .collect::<Vec<_>>()
+            }),
+            vec![survivor.path.clone()],
+            "forgetting one physical duplicate leaves the other cached"
+        );
+        assert_eq!(
+            g.load_page(&survivor).unwrap().blocks[0].raw,
+            fs::read_to_string(&survivor.path)
+                .unwrap()
+                .trim_start_matches("- ")
+                .trim_end()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rename_refuses_colliding_nested_page_identities_without_losing_either() {
         let dir = scratch("nested-collision-rename");
         fs::create_dir_all(dir.join("pages/client-a")).unwrap();
@@ -9986,6 +10731,34 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&a).unwrap(), "- body a\n");
         assert_eq!(fs::read_to_string(&b).unwrap(), "- body b\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_mutations_require_the_captured_exact_owner_and_still_refuse_duplicates() {
+        let dir = scratch("expected-page-owner");
+        fs::create_dir_all(dir.join("pages/client-a")).unwrap();
+        fs::create_dir_all(dir.join("pages/client-b")).unwrap();
+        let a = dir.join("pages/client-a/Twin.md");
+        let b = dir.join("pages/client-b/Twin.md");
+        fs::write(&a, "- client a\n").unwrap();
+        let g = Graph::open(&dir);
+
+        let stale = g
+            .delete_page_expected("Twin", PageKind::Page, Some("pages/client-b/Twin.md"))
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "- client a\n");
+
+        fs::write(&b, "- client b\n").unwrap();
+        let g = Graph::open(&dir);
+        let ambiguous = g
+            .rename_page_expected("Twin", "Renamed", Some("pages/client-b/Twin.md"))
+            .unwrap_err();
+        assert_eq!(ambiguous.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "- client a\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "- client b\n");
+        assert!(!dir.join("pages/Renamed.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

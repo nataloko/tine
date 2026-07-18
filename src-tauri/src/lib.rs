@@ -15,6 +15,7 @@ mod linux_window_identity;
 mod migrate_identifier;
 mod media_protocol;
 mod platform;
+mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
@@ -24,15 +25,15 @@ use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
     asset_trash_stats, block_ref_counts, block_referrers, capture_quick_switch, close_graph_window,
     copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
-    empty_asset_trash, export_query_subtrees, get_backlinks, get_page, get_page_by_path,
-    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
-    journal_content_days, journal_feed_page, list_journal_conflicts, list_orphan_assets, list_pages,
-    list_sync_conflicts, list_templates, merge_pages, open_asset, open_page_file, open_pdf,
-    page_aliases, page_icons, page_print_html, preview_block, publish_html, query_facets,
-    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
-    read_local_image, read_text_file, rename_file_to_page, rename_page, resolve_block,
-    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search, run_query,
-    save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
+    empty_asset_trash, export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page,
+    get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages, import_asset,
+    import_native_capture, journal_content_days, journal_feed_page, list_journal_conflicts,
+    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, merge_pages, open_asset,
+    open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
+    publish_html, query_facets, quick_switch, read_asset, read_custom_css, read_highlights,
+    read_journal_file, read_local_image, read_text_file, rename_file_to_page, rename_page,
+    resolve_block, resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search,
+    run_query, save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
     set_favorites, set_guide_announced, set_journal_title_format, set_preferred_format,
     set_preferred_workflow, set_start_of_week, set_timetracking_enabled, stream_asset_path,
     sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset, trash_journal_file,
@@ -49,6 +50,10 @@ use graph::{
     inspect_graph_access, load_graph, open_graph_window, resolve_root, startup_graph_path, warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
+use plugins::{
+    install_plugin, list_installed_plugins, load_plugin_registry_cache, read_plugin_entry,
+    set_plugin_enabled, store_plugin_registry_cache, uninstall_plugin, verify_plugin_registry,
+};
 use settings::{
     forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
     get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, save_session,
@@ -91,6 +96,59 @@ fn apply_mobile_drawer_e2e_window_policy(
     } else {
         false
     }
+}
+
+// Wry normally supplies these arguments itself. Once a window config provides
+// `additional_browser_args`, it replaces that default rather than extending it.
+#[cfg(any(target_os = "windows", test))]
+const WRY_WINDOWS_DEFAULT_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+
+#[cfg(any(target_os = "windows", test))]
+fn merged_windows_webdriver_args(
+    configured: Option<&str>,
+    automation_enabled: bool,
+    inherited: Option<&str>,
+) -> Option<String> {
+    let inherited = inherited.map(str::trim).filter(|value| !value.is_empty())?;
+    if !automation_enabled {
+        return None;
+    }
+    Some(format!(
+        "{} {inherited}",
+        configured.unwrap_or(WRY_WINDOWS_DEFAULT_BROWSER_ARGS)
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn apply_windows_webdriver_window_policy(
+    windows: &mut [tauri::utils::config::WindowConfig],
+    automation_enabled: bool,
+    inherited: Option<&str>,
+) -> usize {
+    let mut changed = 0;
+    for window in windows {
+        if let Some(arguments) = merged_windows_webdriver_args(
+            window.additional_browser_args.as_deref(),
+            automation_enabled,
+            inherited,
+        ) {
+            window.additional_browser_args = Some(arguments);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_webdriver_args_from_env(configured: Option<&str>) -> Option<String> {
+    merged_windows_webdriver_args(
+        configured,
+        std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true"),
+        std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Xlib's thread mode is process-global and must be selected before the first
@@ -425,6 +483,17 @@ pub fn run() {
     let native_frame_active = settings::init_native_frame_active();
     let force_mobile_drawers = force_mobile_drawers_e2e();
     let mut context = tauri::generate_context!();
+    #[cfg(target_os = "windows")]
+    {
+        let automation_enabled =
+            std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true");
+        let inherited = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
+        apply_windows_webdriver_window_policy(
+            &mut context.config_mut().app.windows,
+            automation_enabled,
+            inherited.as_deref(),
+        );
+    }
     let deny_main_window_state_restore = apply_mobile_drawer_e2e_window_policy(
         &mut context.config_mut().app.windows,
         force_mobile_drawers,
@@ -673,6 +742,7 @@ pub fn run() {
             save_page,
             guide_pages,
             copy_guide_into_graph,
+            get_backlink_filter_context,
             get_backlinks,
             get_unlinked_refs,
             warm_done,
@@ -753,6 +823,14 @@ pub fn run() {
             save_session,
             list_known_graphs,
             forget_known_graph,
+            install_plugin,
+            uninstall_plugin,
+            list_installed_plugins,
+            read_plugin_entry,
+            set_plugin_enabled,
+            verify_plugin_registry,
+            load_plugin_registry_cache,
+            store_plugin_registry_cache,
             migrate_identifier::take_identifier_migration_notice,
             gpu_env,
             get_smooth_scroll,
@@ -782,7 +860,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod mobile_drawer_policy_tests {
-    use super::apply_mobile_drawer_e2e_window_policy;
+    use super::{
+        apply_mobile_drawer_e2e_window_policy, apply_windows_webdriver_window_policy,
+        merged_windows_webdriver_args, WRY_WINDOWS_DEFAULT_BROWSER_ARGS,
+    };
 
     #[test]
     fn production_policy_does_not_mutate_the_real_window_config() {
@@ -832,5 +913,52 @@ mod mobile_drawer_policy_tests {
             windows.iter().find(|window| window.label == "neighbor"),
             Some(&neighbor)
         );
+    }
+
+    #[test]
+    fn webdriver_arguments_are_inert_without_explicit_automation() {
+        assert_eq!(
+            merged_windows_webdriver_args(None, false, Some("--remote-debugging-port=9222")),
+            None
+        );
+        assert_eq!(merged_windows_webdriver_args(None, true, Some("  ")), None);
+    }
+
+    #[test]
+    fn webdriver_arguments_preserve_wry_defaults_and_configured_values() {
+        assert_eq!(
+            merged_windows_webdriver_args(None, true, Some("--remote-debugging-port=9222")),
+            Some(format!(
+                "{WRY_WINDOWS_DEFAULT_BROWSER_ARGS} --remote-debugging-port=9222"
+            ))
+        );
+        assert_eq!(
+            merged_windows_webdriver_args(
+                Some("--disable-gpu"),
+                true,
+                Some("--remote-debugging-port=9222")
+            ),
+            Some("--disable-gpu --remote-debugging-port=9222".into())
+        );
+    }
+
+    #[test]
+    fn webdriver_policy_updates_every_configured_window_only_in_automation() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let windows = &mut context.config_mut().app.windows;
+        assert!(windows.len() >= 2);
+        let window_count = windows.len();
+        assert_eq!(
+            apply_windows_webdriver_window_policy(
+                windows,
+                true,
+                Some("--remote-debugging-port=9222")
+            ),
+            window_count
+        );
+        assert!(windows.iter().all(|window| window
+            .additional_browser_args
+            .as_deref()
+            .is_some_and(|args| args.contains("--remote-debugging-port=9222"))));
     }
 }

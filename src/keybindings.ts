@@ -55,8 +55,9 @@ import {
   clearSelection,
   selectedIds,
   blockIsGridView,
+  doc,
 } from "./store";
-import { startEditing } from "./editorController";
+import { editingId, startEditing } from "./editorController";
 import { copyOutline } from "./clipboard";
 import { openInPageFind } from "./inpageFind";
 import { cellSel, enterGridSelection, handleCellSelectionKey, handleSheetPasteEvent, outlinedGridSelectionId } from "./sheet/selection";
@@ -84,6 +85,27 @@ import {
   type PaneDirection,
 } from "./paneSelect";
 import { openGuide } from "./guide";
+import { pluginManager } from "./plugins/manager";
+import { bindPluginBlockSnapshot, capturePluginGraphOwner, isPluginGraphOwnerCurrent, type OwnedPluginBlockSnapshot } from "./plugins/ownership";
+
+function pluginFocusedBlock(): OwnedPluginBlockSnapshot | undefined {
+  const owner = capturePluginGraphOwner();
+  if (!owner) return undefined;
+  const id = editingId();
+  const node = id ? doc.byId[id] : undefined;
+  if (!node) return undefined;
+  let depth = 0;
+  let parentId = node.parent;
+  while (parentId && doc.byId[parentId] && depth < 1_000) {
+    depth++;
+    parentId = doc.byId[parentId].parent;
+  }
+  const format = doc.pages.find((page) => page.name === node.page)?.format === "org" ? "org" : "md";
+  if (!isPluginGraphOwnerCurrent(owner)) return undefined;
+  const owned = bindPluginBlockSnapshot({ id: node.id, raw: node.raw, parentId: node.parent, depth, format });
+  if (!owned || owned.owner.graphRoot !== owner.graphRoot || owned.owner.generation !== owner.generation) return undefined;
+  return owned;
+}
 
 interface Chord {
   mod: boolean;
@@ -215,10 +237,11 @@ export function handlePaneSelectKey(e: KeyboardEvent): boolean {
 
 // Default command table. Editor command ids mirror OG Logseq where practical.
 const COMMANDS: CommandDef[] = [
-  { id: "go/search", binding: "mod+k", label: "Search / quick switch", scope: "global", run: openSwitcher, global: true },
+  { id: "go/search", binding: "mod+k", label: "Search / quick switch", scope: "global", run: () => openSwitcher({ pluginBlock: pluginFocusedBlock() ?? null }), global: true },
+  { id: "go/search-current-page", binding: "mod+shift+k", label: "Search blocks in current page", scope: "global", run: () => openSwitcher({ mode: "current-page", pluginBlock: pluginFocusedBlock() ?? null }), global: true },
   { id: "guide/open", binding: "", label: "Open Guide", scope: "global", run: () => void openGuide(), global: true },
   { id: "go/find-in-page", binding: "mod+f", label: "Find in page", scope: "global", run: openInPageFind, global: true },
-  { id: "command-palette/toggle", binding: "mod+shift+p", label: "Command palette", scope: "global", run: openCommandPalette, global: true },
+  { id: "command-palette/toggle", binding: "mod+shift+p", label: "Command palette", scope: "global", run: () => openCommandPalette(pluginFocusedBlock() ?? null), global: true },
   // Toggle the WebKit Web Inspector for theme/CSS debugging (GH #31). The usual
   // Ctrl+Shift+I / F12 / Ctrl+Shift+C are all swallowed by WebKitGTK itself (its
   // built-in inspector keys, handled in the web process below where the app can
@@ -486,6 +509,21 @@ function shortcutScope(c: CommandDef): ShortcutScope {
   return "global";
 }
 
+function pluginCommandDefs(): CommandDef[] {
+  return pluginManager.commands().map(({ pluginId, contribution }) => ({
+    id: `plugin:${pluginId}:${contribution.id}`,
+    binding: contribution.defaultBinding ?? "",
+    label: `Plugin: ${contribution.title}`,
+    scope: "global",
+    global: true,
+    run: () => {
+      void pluginManager
+        .invokeCommand(pluginId, contribution.id, pluginFocusedBlock())
+        .catch((error) => pushToast(`Plugin command failed: ${String(error)}`, "error"));
+    },
+  }));
+}
+
 function normKey(k: string): string {
   switch (k) {
     case "arrowup": return "up";
@@ -610,8 +648,10 @@ export function editorCommandFor(e: KeyboardEvent): string | null {
 /** Runnable global commands for the command palette / Ctrl-K Commands group:
  *  every global command with a run handler, with its effective binding. The
  *  switcher itself is excluded (no point launching the launcher). */
-export function paletteCommands(): { id: string; label: string; binding: string; run: () => void }[] {
-  return COMMANDS.filter((c) => c.scope === "global" && c.run && c.id !== "go/search")
+export function paletteCommands(
+  focusedPluginBlock: OwnedPluginBlockSnapshot | null = pluginFocusedBlock() ?? null
+): { id: string; label: string; binding: string; run: () => void }[] {
+  const builtIn = COMMANDS.filter((c) => c.scope === "global" && c.run && c.id !== "go/search")
     .map((c) => ({
       id: c.id,
       label: c.label,
@@ -619,6 +659,17 @@ export function paletteCommands(): { id: string; label: string; binding: string;
       run: c.run!,
     }))
     .filter((c) => c.binding !== "false");
+  const plugins = pluginManager.commands().map(({ pluginId, contribution }) => ({
+    id: `plugin:${pluginId}:${contribution.id}`,
+    label: contribution.title,
+    binding: overridesApplied[`plugin:${pluginId}:${contribution.id}`] ?? contribution.defaultBinding ?? "",
+    run: () => {
+      void pluginManager
+        .invokeCommand(pluginId, contribution.id, focusedPluginBlock ?? undefined)
+        .catch((error) => pushToast(`Plugin command failed: ${String(error)}`, "error"));
+    },
+  }));
+  return [...builtIn, ...plugins];
 }
 
 export function runGlobalCommand(id: string): boolean {
@@ -630,7 +681,7 @@ export function runGlobalCommand(id: string): boolean {
 
 /** Merged shortcuts for the Settings reference. */
 export function currentShortcuts(): { id: string; label: string; binding: string; scope: ShortcutScope }[] {
-  return COMMANDS.map((c) => ({
+  return [...COMMANDS, ...pluginCommandDefs()].map((c) => ({
     id: c.id,
     label: c.label,
     binding: overridesApplied[c.id] ?? c.binding,
@@ -642,7 +693,7 @@ export function currentShortcuts(): { id: string; label: string; binding: string
  *  remap UI, which computes the effective binding reactively from these plus
  *  config.edn and the user's local overrides. */
 export function commandDefaults(): { id: string; label: string; binding: string; scope: ShortcutScope }[] {
-  return COMMANDS.map((c) => ({ id: c.id, label: c.label, binding: c.binding, scope: shortcutScope(c) }));
+  return [...COMMANDS, ...pluginCommandDefs()].map((c) => ({ id: c.id, label: c.label, binding: c.binding, scope: shortcutScope(c) }));
 }
 
 /** Turn a keyboard event into a binding string like "mod+shift+down". Returns
@@ -738,13 +789,14 @@ export interface Command {
 export function installKeybindings(overrides: Record<string, string> = {}): () => void {
   overridesApplied = overrides;
   bindings = {};
-  for (const c of COMMANDS) {
+  const allCommands = [...COMMANDS, ...pluginCommandDefs()];
+  for (const c of allCommands) {
     const b = overrides[c.id] ?? c.binding;
     if (b !== "false") bindings[c.id] = parseBinding(b);
   }
 
   // Global dispatch list (sequences + global chords).
-  const commands = COMMANDS.filter((c) => c.scope === "global" && c.run)
+  const commands = allCommands.filter((c) => c.scope === "global" && c.run)
     .map((c) => ({ ...c, chords: bindings[c.id] }))
     .filter((c) => c.chords);
 

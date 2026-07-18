@@ -12,6 +12,8 @@ import {
   setDoc,
   extendFeedForScroll,
   flushPage,
+  isDirty,
+  pageToDto,
   setBlockMoving,
   undo,
   type FeedPage,
@@ -22,8 +24,8 @@ import { journalTitle } from "../journal";
 import type { JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
-import { focusBlock, mainPaneRouter, resetTabsToJournals } from "../router";
-import { clearConflict, graphEpoch, markConflict } from "../ui";
+import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
+import { clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setRightSidebar } from "../ui";
 
 beforeAll(async () => {
   await initParser();
@@ -37,6 +39,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   endEdit("blur");
+  closeContextMenu();
   resetStore();
   document.body.innerHTML = "";
   resetTabsToJournals();
@@ -619,7 +622,241 @@ describe("trailing page block target", () => {
   });
 });
 
+describe("page actions entry point", () => {
+  it("keeps a path-bearing title owner through sidebar, new-tab, and menu gestures", async () => {
+    const path = "pages/client-b/Twin.md";
+    const dto: PageDto = {
+      name: "Twin", kind: "page", title: "Twin", pre_block: null, path,
+      blocks: [{ id: "twin-b", raw: "Client B", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "twin-b": node("twin-b", "Client B", "Twin") },
+      pages: [{ ...page("Twin", "page", ["twin-b"]), path }], feed: [], loaded: true,
+    });
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    mainPaneRouter.openFile(path, "Twin", "page", { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick(); await tick();
+      const title = root.querySelector<HTMLElement>(".page-title")!;
+      title.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true }));
+      expect(rightSidebar()[0]).toMatchObject({ kind: "page", name: "Twin", path });
+
+      title.dispatchEvent(new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+      expect(mainPaneRouter.tabs().some((tab) => {
+        const route = tabRoute(tab);
+        return route.kind === "page" && route.name === "Twin" && route.path === path;
+      })).toBe(true);
+
+      title.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      expect(contextMenu()).toMatchObject({ kind: "page", name: "Twin", pageKind: "page", path });
+    } finally {
+      setRightSidebar([]);
+      dispose();
+    }
+  });
+
+  it("exposes expanded state only on the trigger that owns the open page menu", async () => {
+    const dto: PageDto = {
+      name: "Duplicate actions",
+      kind: "page",
+      title: "Duplicate actions",
+      pre_block: null,
+      blocks: [{ id: "duplicate-actions-root", raw: "Body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "duplicate-actions-root": node("duplicate-actions-root", "Body", dto.name) },
+      pages: [page(dto.name, "page", ["duplicate-actions-root"])],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <><PageView /><PageView /></>);
+    try {
+      await tick();
+      await tick();
+      const triggers = [...root.querySelectorAll<HTMLButtonElement>("[data-page-actions-trigger]")];
+      expect(triggers).toHaveLength(2);
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
+
+      triggers[0].click();
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["true", "false"]);
+
+      triggers[1].click();
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "true"]);
+
+      closeContextMenu();
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
+      const titles = [...root.querySelectorAll<HTMLElement>(".page-title")];
+      titles[0].dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 10,
+        clientY: 10,
+      }));
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("exposes a named page actions ellipsis as a real menu button", async () => {
+    const dto: PageDto = {
+      name: "Actions",
+      kind: "page",
+      title: "Actions",
+      pre_block: null,
+      blocks: [{ id: "actions-root", raw: "Body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "actions-root": node("actions-root", "Body", dto.name) },
+      pages: [page(dto.name, "page", ["actions-root"])],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      await tick();
+      const trigger = root.querySelector<HTMLButtonElement>("[data-page-actions-trigger]");
+      expect(trigger).not.toBeNull();
+      expect(trigger?.textContent?.trim()).toBe("⋯");
+      expect(trigger?.getAttribute("aria-label")).toBe("Page actions");
+      expect(trigger?.getAttribute("aria-haspopup")).toBe("menu");
+      expect(trigger?.getAttribute("aria-expanded")).toBe("false");
+      trigger!.click();
+      await tick();
+      expect(trigger?.getAttribute("aria-expanded")).toBe("true");
+      closeContextMenu();
+      await tick();
+      expect(trigger?.getAttribute("aria-expanded")).toBe("false");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the trigger on read-only pages and journals but excludes bundled Guides", async () => {
+    const dto: PageDto = {
+      name: "Action matrix",
+      kind: "page",
+      title: "Action matrix",
+      pre_block: null,
+      blocks: [{ id: "matrix-root", raw: "Body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "matrix-root": node("matrix-root", "Body", dto.name) },
+      pages: [{ ...page(dto.name, "page", ["matrix-root"]), readOnly: true }],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      await tick();
+      expect(root.querySelector("[data-page-actions-trigger]")).not.toBeNull();
+
+      setDoc("pages", 0, "kind", "journal");
+      mainPaneRouter.openPage(dto.name, "journal", { inPlace: true });
+      await tick();
+      expect(root.querySelector("[data-page-actions-trigger]")).not.toBeNull();
+
+      setDoc("pages", 0, "guide", true);
+      await tick();
+      expect(root.querySelector("[data-page-actions-trigger]")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+});
+
 describe("page route loading", () => {
+  it("fails closed when a shared zoom UUID is loaded from a different exact owner", async () => {
+    const sharedId = "77777777-7777-4777-8777-777777777777";
+    const sharedRaw = "Same copied UUID and content";
+    const pathA = "pages/client-a/Twin.md";
+    const pathB = "pages/client-b/Twin.md";
+    const dto: PageDto = {
+      name: "Twin",
+      kind: "page",
+      title: "Twin",
+      path: pathB,
+      pre_block: null,
+      blocks: [{ id: sharedId, raw: sharedRaw, collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [sharedId]: node(sharedId, sharedRaw, dto.name) },
+      pages: [{ ...page(dto.name, "page", [sharedId]), path: pathB }],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    mainPaneRouter.openFile(pathB, dto.name, dto.kind, { inPlace: true });
+    focusBlock(sharedId);
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      await tick();
+      expect(root.querySelector(".zoomed-page")).not.toBeNull();
+      expect(root.textContent).toContain(sharedRaw);
+
+      // The name-keyed working-set slot is replaced by A. Its copied UUID/raw
+      // must not satisfy a zoom route that still claims exact owner B.
+      setDoc({
+        byId: { [sharedId]: node(sharedId, sharedRaw, dto.name) },
+        pages: [{ ...page(dto.name, "page", [sharedId]), path: pathA }],
+        feed: [],
+        loaded: true,
+      });
+      await tick();
+
+      expect(root.querySelector(".zoomed-page")).toBeNull();
+      expect(root.querySelector(".zoom-breadcrumb")).toBeNull();
+      expect(root.querySelector(".block-content")).toBeNull();
+      expect(root.textContent).not.toContain(sharedRaw);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("adopts the existing page's canonical case for a mixed-case page route", async () => {
+    clearRecent();
+    const dto: PageDto = {
+      name: "page1",
+      kind: "page",
+      title: "page1",
+      pre_block: null,
+      blocks: [{ id: "canonical-page", raw: "canonical page content", collapsed: false, children: [] }],
+    };
+    const api = vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage("Page1", "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(api).toHaveBeenNthCalledWith(1, "Page1", "page");
+      expect(mainPaneRouter.route()).toEqual({ kind: "page", name: "page1", pageKind: "page" });
+      expect(recentPages()[0]).toMatchObject({ name: "page1", kind: "page" });
+      expect(root.textContent).toContain("canonical page content");
+      expect(root.querySelector(".page-trailing-block-target")).not.toBeNull();
+    } finally {
+      dispose();
+      clearRecent();
+    }
+  });
+
   it("ignores an obsolete load failure after a newer route has loaded", async () => {
     const fastId = "11111111-1111-4111-8111-111111111111";
     const fast = {
@@ -907,6 +1144,48 @@ describe("page properties", () => {
 });
 
 describe("Markdown preamble content", () => {
+  it("opens canonical page-header properties in the ordinary editor without dirtying on entry", async () => {
+    const bodyId = "33333333-3333-4333-8333-333333333333";
+    const dto = {
+      name: "Header",
+      kind: "page" as const,
+      title: "Header",
+      pre_block: "klíč:: hodnota\n\nalias:: Book",
+      blocks: [{ id: bodyId, raw: "First body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [bodyId]: node(bodyId, "First body", dto.name) },
+      pages: [page(dto.name, "page", [bodyId], dto.pre_block)],
+      feed: [], loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick(); await tick();
+      (root.querySelector(".page-properties .prop-row") as HTMLElement).click();
+      await tick();
+      const headerId = pageByName(dto.name)!.roots[0];
+      const editor = root.querySelector(`[data-block-id="${headerId}"] textarea`) as HTMLTextAreaElement;
+      expect(editor.value).toBe(dto.pre_block);
+      expect(doc.byId[headerId].originatedFromPageHeader).toBe(true);
+      expect(isDirty(dto.name)).toBe(false);
+      expect(pageToDto(dto.name)?.pre_block).toBe(dto.pre_block);
+
+      editor.value = "klíč:: změněno\n\nalias:: Book";
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      expect(isDirty(dto.name)).toBe(true);
+      expect(pageToDto(dto.name)?.pre_block).toBe("klíč:: změněno\n\nalias:: Book");
+      expect(pageToDto(dto.name)?.blocks.map((block) => block.raw)).toEqual(["First body"]);
+      endEdit("blur");
+      await tick();
+      expect(root.querySelector(".page-properties")?.textContent).toContain("změněno");
+      expect(root.querySelector(`[data-block-id="${headerId}"] textarea`)).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("renders text before the first bullet and promotes it only when edited (GH #85)", async () => {
     const bodyId = "22222222-2222-4222-8222-222222222222";
     const dto = {

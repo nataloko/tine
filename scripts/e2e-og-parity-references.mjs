@@ -10,6 +10,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  startWebdriverApplication,
+  stopWebdriverApplication,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, "target/release", process.platform === "win32" ? "tine.exe" : "tine");
@@ -154,14 +160,19 @@ const ensureParityPage = async (browser) => {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   const current = await browser.$("h1.page-title").getText().catch(() => "");
   if (current.trim() !== "OG Parity References") {
-    await browser.keys(["Control", "k"]);
+    // WebView2 attach does not itself transfer native focus to the WebView.
+    // Fixture navigation is not a shortcut assertion, so enter the same
+    // switcher through its visible application control.
+    const search = await browser.$('button[title^="Search (Ctrl+K)"]');
+    await search.waitForExist({ timeout: 5000 });
+    await search.click();
     const input = await browser.$(".switcher-input");
     await input.waitForExist({ timeout: 5000 });
     await input.setValue("OG Parity References");
     await browser.waitUntil(() => browser.execute((wanted) => [...document.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
       .some((node) => node.textContent?.trim() === wanted), "OG Parity References"), {
       timeout: 10_000,
-      timeoutMsg: "named parity page was absent from Ctrl-K after restart",
+      timeoutMsg: "named parity page was absent from the switcher after restart",
     });
     const clicked = await browser.execute((wanted) => {
       const name = [...document.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
@@ -220,11 +231,14 @@ if (process.env.OG_PARITY_NORMAL_COMPOSITING !== "1") {
   env.WEBKIT_DISABLE_COMPOSITING_MODE = "1";
 }
 const log = fs.openSync(`${ARTIFACTS}/tauri-driver.log`, "w");
-const driverArgs = process.platform === "linux"
-  ? ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"]
-  : ["--port", String(DRIVER_PORT)];
+const driverArgs = webdriverServerArgs(
+  DRIVER_PORT,
+  NATIVE_PORT,
+  process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
+);
+let webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT, "initial");
 let td = spawn(TD, driverArgs, {
-  env,
+  env: webviewTarget.env,
   stdio: ["ignore", log, log],
   detached: process.platform !== "win32",
 });
@@ -233,6 +247,16 @@ const killDriverTree = () => {
     if (process.platform === "win32") td.kill("SIGKILL");
     else process.kill(-td.pid, "SIGKILL");
   } catch {}
+  stopWebdriverApplication(webviewTarget);
+};
+const startDriverTree = async (session) => {
+  webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT, session);
+  td = spawn(TD, driverArgs, {
+    env: webviewTarget.env,
+    stdio: ["ignore", log, log],
+    detached: process.platform !== "win32",
+  });
+  await sleep(2500);
 };
 await sleep(2500);
 
@@ -261,61 +285,17 @@ try {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "initial", process.platform, webviewTarget.debuggerAddress),
   });
+  // EdgeDriver's WebView2 attach can complete while the target still exposes
+  // its transient pre-navigation document.  Wait for Tine's document before
+  // querying the Tauri bridge, just as the other real-app scenarios do.
+  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   receipt.appIdentity.version = await browser.execute(() => window.__TAURI_INTERNALS__.invoke("plugin:app|version"));
   if (receipt.appIdentity.version !== receipt.appIdentity.declaredVersion) {
     throw new Error(`running app version ${receipt.appIdentity.version} disagrees with checkout declaration ${receipt.appIdentity.declaredVersion}`);
   }
-  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
-  let opened = false;
-  for (const selector of ["a.page-ref=OG Parity References", "span.page-ref=OG Parity References", "*=OG Parity References"]) {
-    const pageLink = await browser.$(selector);
-    if (await pageLink.isExisting()) {
-      await pageLink.click();
-      opened = true;
-      break;
-    }
-  }
-  if (!opened) {
-    await browser.keys(["Control", "k"]);
-    const switcher = await browser.$(".switcher-input");
-    await switcher.waitForExist({ timeout: 5000 });
-    await switcher.setValue("OG Parity References");
-    // The Create row appears synchronously, before the debounced graph search.
-    // Wait for the exact graph-backed Pages result; selecting the first row can
-    // silently create a page or choose a block hit instead of opening fixture.
-    try {
-      await browser.waitUntil(() => browser.execute((wanted) => [...document.querySelectorAll(".switcher-section")].some((section) =>
-        section.querySelector(".switcher-group-header > span:first-child")?.textContent?.trim() === "Pages"
-        && [...section.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
-          .some((element) => element.textContent?.trim() === wanted)
-      ), "OG Parity References"), { timeout: 10_000, interval: 100 });
-    } catch (error) {
-      const dump = await browser.$(".switcher").getText().catch(() => "<switcher absent>");
-      throw new Error(`exact Pages result did not resolve; switcher was ${dump.slice(0, 2400)}`, { cause: error });
-    }
-    const selected = await browser.execute((wanted) => {
-      const section = [...document.querySelectorAll(".switcher-section")].find((candidate) =>
-        candidate.querySelector(".switcher-group-header > span:first-child")?.textContent?.trim() === "Pages"
-      );
-      const name = [...(section?.querySelectorAll(".switcher-row:not(.block-result) .switcher-name") ?? [])]
-        .find((candidate) => candidate.textContent?.trim() === wanted);
-      const row = name?.closest(".switcher-row");
-      if (!row) return false;
-      row.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-      return true;
-    }, "OG Parity References");
-    if (!selected) throw new Error("exact Pages result disappeared before selection");
-  }
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "OG Parity References", {
-    timeout: 10_000,
-    timeoutMsg: "OG parity reference page did not open",
-  });
+  await ensureParityPage(browser);
 
   const content = await browser.$(`[data-block-id="${EDITOR}"] .block-content`);
   await content.click();
@@ -592,8 +572,7 @@ try {
   browser = undefined;
   killDriverTree();
   await sleep(800);
-  td = spawn(TD, driverArgs, { env, stdio: ["ignore", log, log], detached: process.platform !== "win32" });
-  await sleep(2500);
+  await startDriverTree("typed-restart");
   browser = await remote({
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
@@ -601,11 +580,7 @@ try {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "typed-restart", process.platform, webviewTarget.debuggerAddress),
   });
   await ensureParityPage(browser);
   const restartedSlashContent = await browser.$(`[data-block-id="${SLASH_EDITOR}"] .block-content`);
@@ -671,12 +646,11 @@ try {
   browser = undefined;
   killDriverTree();
   await sleep(800);
-  td = spawn(TD, driverArgs, { env, stdio: ["ignore", log, log], detached: process.platform !== "win32" });
-  await sleep(2500);
+  await startDriverTree("committed-reload");
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/", logLevel: "error",
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-    capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+    capabilities: tauriCapabilities(APP, "committed-reload", process.platform, webviewTarget.debuggerAddress),
   });
   await ensureParityPage(browser);
   const reloadedRef = await browser.$(`[data-block-id="${SLASH_EDITOR}"] .page-ref`);

@@ -1,13 +1,15 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createSignal, useContext } from "solid-js";
 import type { GraphMeta, JournalConflict, SyncConflict, PageKind } from "./types";
+import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
-import { route, focusBlock, scheduleSessionSave } from "./router";
+import { route, focusBlock, scheduleSessionSave, type PageTarget } from "./router";
 import { PaneContext } from "./paneContext";
 import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
 import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawerFocus, type DrawerSide } from "./mobileDrawers";
+import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 
 const THEME_KEY = "logseq-claude.theme";
 function loadTheme(): "light" | "dark" {
@@ -500,6 +502,13 @@ export const [dataRev, setDataRev] = createSignal(0);
 export function bumpDataRev() {
   setDataRev((n) => n + 1);
 }
+// Page-name inventory changes are much rarer than ordinary content saves. Keep
+// their invalidation separate so navigation can refresh canonical names after a
+// create/delete without turning every keystroke save into a whole-page-list IPC.
+export const [pageInventoryRev, setPageInventoryRev] = createSignal(0);
+export function bumpPageInventoryRev() {
+  setPageInventoryRev((n) => n + 1);
+}
 export function toggleTheme() {
   const next = theme() === "light" ? "dark" : "light";
   setTheme(next);
@@ -675,102 +684,132 @@ export function toggleFavorite(name: string, kind: "page" | "journal" = "page") 
   setFavorites(next);
   persistFavorites(next);
 }
-export function removeDeletedPageFromNavigation(name: string, kind: PageKind) {
+export function removeDeletedPageFromNavigation(target: PageTarget): void;
+export function removeDeletedPageFromNavigation(name: string, kind: PageKind): void;
+export function removeDeletedPageFromNavigation(targetOrName: PageTarget | string, kind?: PageKind) {
+  const target: PageTarget = typeof targetOrName === "string"
+    ? { name: targetOrName, pageKind: kind! }
+    : targetOrName;
+  const name = target.name;
+  kind = target.pageKind;
   const nextFavs = favorites().filter((f) => f.name !== name);
   if (nextFavs.length !== favorites().length) {
     setFavorites(nextFavs);
     persistFavorites(nextFavs);
   }
 
-  const nextRecents = recentPages().filter((r) => !(r.name === name && r.kind === kind));
+  const nextRecents = recentPages().filter((r) => !(
+    r.name === name && r.kind === kind && (target.path === undefined || r.path === target.path)
+  ));
   if (nextRecents.length !== recentPages().length) {
     setRecentPages(nextRecents);
-    try {
-      if (nextRecents.length) localStorage.setItem(RECENT_KEY, JSON.stringify(nextRecents));
-      else localStorage.removeItem(RECENT_KEY);
-    } catch {
-      // ignore
-    }
+    scheduleSessionSave();
   }
 
-  const nextSidebar = rightSidebar().filter((item) =>
-    item.kind === "page" ? item.name !== name : item.page !== name
-  );
+  const nextSidebar = rightSidebar().filter((item) => {
+    const sameLogical = item.kind === "page"
+      ? item.name === name && item.pageKind === kind
+      : item.page === name && item.pageKind === kind;
+    return !sameLogical || (target.path !== undefined && item.path !== target.path);
+  });
   if (nextSidebar.length !== rightSidebar().length) setRightSidebar(nextSidebar);
 }
-/** Re-key sidebar navigation state after the backend has atomically renamed a
- *  page `old` → `next`, so a starred or recent entry keeps pointing at the live
- *  page instead of a dead old name (config.edn `:favorites` stores names, and the
- *  backend rename doesn't touch it). Matches the backend rename's set: the exact
- *  page PLUS any `old/…` namespace descendant (which the rename also moves), with
- *  case-insensitive comparison to mirror the backend's normalized matching. After
- *  remapping, collapses any duplicate the rename produces (e.g. `old`→`next` where
- *  `next` already exists), keeping the first entry and a stable order — then
- *  persists favorites to config.edn (the source of truth) and recents to
- *  localStorage. `kind` scopes the match to that page kind (defaults to "page",
- *  which is what the 2-arg callers rename). */
-export function renamePageInNavigation(old: string, next: string, kind: PageKind = "page") {
-  const from = old.trim();
-  const to = next.trim();
-  if (!from || !to) return;
-  const fromKey = from.toLowerCase();
-  const prefix = `${fromKey}/`;
-  // Exact page → new name; namespace child `old/x` → `new/x` (prefix length is the
-  // same in either case, so slicing by `from.length` preserves the child's casing).
-  const remapName = (name: string): string | null => {
+/** Re-key navigation state after the backend has atomically renamed a page.
+ * PageTarget calls affect one physical owner; string calls represent a logical
+ * rename and also remap case-insensitive namespace descendants. */
+export function renamePageInNavigation(from: PageTarget, to: PageTarget): void;
+export function renamePageInNavigation(from: string, to: string, kind?: PageKind): void;
+export function renamePageInNavigation(
+  fromOrName: PageTarget | string,
+  toOrName: PageTarget | string,
+  kind: PageKind = "page",
+) {
+  const exactTarget = typeof fromOrName !== "string";
+  const from: PageTarget = typeof fromOrName === "string"
+    ? { name: fromOrName.trim(), pageKind: kind }
+    : fromOrName;
+  const to: PageTarget = typeof toOrName === "string"
+    ? { name: toOrName.trim(), pageKind: from.pageKind }
+    : toOrName;
+  if (!from.name || !to.name) return;
+  const fromKey = from.name.toLowerCase();
+  const namespacePrefix = `${fromKey}/`;
+
+  const remapName = (
+    name: string,
+    itemKind: PageKind,
+    path: string | undefined,
+    pathAware: boolean,
+  ): string | null => {
+    if (itemKind !== from.pageKind) return null;
+    if (exactTarget) {
+      if (name !== from.name) return null;
+      if (pathAware && from.path !== undefined && path !== from.path) return null;
+      return to.name;
+    }
     const key = name.toLowerCase();
-    if (key === fromKey) return to;
-    if (key.startsWith(prefix)) return to + name.slice(from.length);
+    if (key === fromKey) return to.name;
+    if (key.startsWith(namespacePrefix)) return to.name + name.slice(from.name.length);
     return null;
   };
-  // Remap matching entries of this kind, then dedupe by kind+name — a rename can
-  // fold an entry onto an existing destination (keep the first, drop later ones).
-  const rekey = (items: FavItem[]): { items: FavItem[]; changed: boolean } => {
-    const seen = new Set<string>();
-    const out: FavItem[] = [];
-    let changed = false;
-    for (const item of items) {
-      const mapped = item.kind === kind ? remapName(item.name) : null;
-      const nextItem = mapped === null ? item : { ...item, name: mapped };
-      if (mapped !== null) changed = true;
-      const key = `${nextItem.kind}\0${nextItem.name}`;
-      if (seen.has(key)) {
-        changed = true; // collapsed a duplicate
-        continue;
-      }
-      seen.add(key);
-      out.push(nextItem);
-    }
-    return { items: out, changed };
-  };
 
-  const favResult = rekey(favorites());
-  if (favResult.changed) {
-    setFavorites(favResult.items);
-    persistFavorites(favResult.items);
+  const nextFavorites: FavItem[] = [];
+  let favoritesChanged = false;
+  for (const item of favorites()) {
+    const mapped = remapName(item.name, item.kind, undefined, false);
+    const nextItem = mapped === null ? item : { ...item, name: mapped };
+    if (mapped !== null) favoritesChanged = true;
+    const key = `${nextItem.kind}\0${nextItem.name}`;
+    if (nextFavorites.some((seen) => `${seen.kind}\0${seen.name}` === key)) {
+      favoritesChanged = true;
+      continue;
+    }
+    nextFavorites.push(nextItem);
+  }
+  if (favoritesChanged) {
+    setFavorites(nextFavorites);
+    persistFavorites(nextFavorites);
   }
 
-  const recResult = rekey(recentPages());
-  if (recResult.changed) {
-    setRecentPages(recResult.items);
-    try {
-      if (recResult.items.length) localStorage.setItem(RECENT_KEY, JSON.stringify(recResult.items));
-      else localStorage.removeItem(RECENT_KEY);
-    } catch {
-      // ignore
+  const nextRecents: RecentItem[] = [];
+  let recentsChanged = false;
+  for (const item of recentPages()) {
+    const mapped = remapName(item.name, item.kind, item.path, true);
+    const nextItem: RecentItem = mapped === null
+      ? item
+      : { name: mapped, kind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
+    if (mapped !== null) recentsChanged = true;
+    const key = `${nextItem.kind}\0${nextItem.name}`;
+    if (nextRecents.some((seen) => `${seen.kind}\0${seen.name}` === key)) {
+      recentsChanged = true;
+      continue;
     }
+    nextRecents.push(nextItem);
+  }
+  if (recentsChanged) {
+    setRecentPages(nextRecents);
+    scheduleSessionSave();
   }
 
   const seenSidebar = new Set<string>();
   const nextSidebar: SidebarItem[] = [];
   for (const item of rightSidebar()) {
-    const next: SidebarItem = item.kind === "page"
-      ? (item.name === from ? { ...item, name: to } : item)
-      : (item.page === from ? { ...item, page: to } : item);
-    const key = sidebarItemKey(next);
+    const name = item.kind === "page" ? item.name : item.page;
+    const mapped = remapName(name, item.pageKind, item.path, true);
+    let nextItem: SidebarItem = item;
+    if (mapped !== null) {
+      if (item.kind === "page") {
+        const { path: _path, ...rest } = item;
+        nextItem = { ...rest, name: mapped, pageKind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
+      } else {
+        const { path: _path, ...rest } = item;
+        nextItem = { ...rest, page: mapped, pageKind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
+      }
+    }
+    const key = sidebarItemKey(nextItem);
     if (seenSidebar.has(key)) continue;
     seenSidebar.add(key);
-    nextSidebar.push(next);
+    nextSidebar.push(nextItem);
   }
   if (nextSidebar.some((item, i) => item !== rightSidebar()[i]) || nextSidebar.length !== rightSidebar().length) {
     setRightSidebar(nextSidebar);
@@ -788,38 +827,61 @@ export function seedFavorites(names: string[]) {
   );
 }
 
-// Recently-visited pages (navigation history), newest first. This is the right
-// signal for the sidebar's "recent" list — file mtime is unreliable (a restored
-// backup makes every file look freshly modified). Persisted locally.
+// Recently-visited pages (navigation history), newest first. Unlike Favorites,
+// Recent is graph-scoped session state and may retain one exact physical owner.
 const RECENT_KEY = "logseq-claude.recent";
-function loadRecent(): FavItem[] {
+export interface RecentItem {
+  name: string;
+  kind: PageKind;
+  path?: string;
+}
+function sanitizeRecent(value: unknown): RecentItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): RecentItem[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const item = entry as Record<string, unknown>;
+    if (typeof item.name !== "string" || item.name.length > 4096) return [];
+    if (item.kind !== "page" && item.kind !== "journal") return [];
+    if (item.path !== undefined && (typeof item.path !== "string" || item.path.length > 4096)) return [];
+    return [{ name: item.name, kind: item.kind, ...(item.path ? { path: item.path } : {}) }];
+  }).slice(0, 20);
+}
+function loadLegacyRecent(): RecentItem[] {
   try {
-    const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
-    return Array.isArray(v) ? v : [];
+    return sanitizeRecent(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]"));
   } catch {
     return [];
   }
 }
-export const [recentPages, setRecentPages] = createSignal<FavItem[]>(loadRecent());
+let legacyRecent = loadLegacyRecent();
+export const [recentPages, setRecentPages] = createSignal<RecentItem[]>([]);
+export function legacyRecentPages(): RecentItem[] {
+  return legacyRecent.map((item) => ({ ...item }));
+}
+export function clearLegacyRecentSource() {
+  legacyRecent = [];
+  try { localStorage.removeItem(RECENT_KEY); } catch { /* ignore */ }
+}
+export { sanitizeRecent };
 /** Drop the recent-pages list. Called on a graph SWITCH so the previous graph's
  *  pages don't linger in quick-switch (Ctrl-K) / the sidebar "recent" list. */
 export function clearRecent() {
   setRecentPages([]);
-  try {
-    localStorage.removeItem(RECENT_KEY);
-  } catch {
-    // ignore
-  }
 }
-export function pushRecent(name: string, kind: "page" | "journal" = "page") {
-  const cur = recentPages().filter((r) => !(r.name === name && r.kind === kind));
-  const next = [{ name, kind }, ...cur].slice(0, 20);
+export function pushRecent(target: PageTarget): void;
+export function pushRecent(name: string, kind?: PageKind): void;
+export function pushRecent(targetOrName: PageTarget | string, kind: PageKind = "page") {
+  const target: RecentItem = typeof targetOrName === "string"
+    ? { name: targetOrName, kind }
+    : { name: targetOrName.name, kind: targetOrName.pageKind, ...(targetOrName.path ? { path: targetOrName.path } : {}) };
+  const first = recentPages()[0];
+  if (first?.name === target.name && first.kind === target.kind && first.path === target.path) return;
+  // One visually indistinguishable same-name row: the latest selected physical
+  // owner replaces the previous one rather than leaving duplicate labels.
+  const cur = recentPages().filter((r) => !(r.name === target.name && r.kind === target.kind));
+  const next = [target, ...cur].slice(0, 20);
   setRecentPages(next);
-  try {
-    localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-  } catch {
-    // ignore
-  }
+  scheduleSessionSave();
 }
 
 // User keyboard-shortcut overrides set from the Settings modal. Persisted
@@ -936,6 +998,8 @@ export interface SidebarPage {
   kind: "page";
   name: string;
   pageKind: "journal" | "page";
+  /** Exact graph-relative owner. Absent on legacy entries, which resolve by name. */
+  path?: string;
   collapsed?: boolean;
 }
 export interface SidebarBlock {
@@ -943,6 +1007,8 @@ export interface SidebarBlock {
   uuid: string; // stable block id — the live handle into the store
   page: string; // the page it lives on (loaded on demand)
   pageKind: "journal" | "page";
+  /** Exact graph-relative owner. Absent on legacy entries, which resolve by name. */
+  path?: string;
   collapsed?: boolean;
 }
 export type SidebarItem = SidebarPage | SidebarBlock;
@@ -961,10 +1027,11 @@ function sameSidebarItems(left: readonly SidebarItem[], right: readonly SidebarI
     const other = right[index];
     if (!other || item.kind !== other.kind || item.collapsed !== other.collapsed) return false;
     if (item.kind === "page" && other.kind === "page") {
-      return item.name === other.name && item.pageKind === other.pageKind;
+      return item.name === other.name && item.pageKind === other.pageKind && item.path === other.path;
     }
     return item.kind === "block" && other.kind === "block"
-      && item.uuid === other.uuid && item.page === other.page && item.pageKind === other.pageKind;
+      && item.uuid === other.uuid && item.page === other.page && item.pageKind === other.pageKind
+      && item.path === other.path;
   });
 }
 
@@ -978,15 +1045,22 @@ function validSidebarItem(i: unknown): i is SidebarItem {
   if (!i || typeof i !== "object") return false;
   const o = i as Record<string, unknown>;
   if (o.collapsed !== undefined && typeof o.collapsed !== "boolean") return false;
+  if (o.path !== undefined && typeof o.path !== "string") return false;
   if (o.kind === "page") return typeof o.name === "string";
   if (o.kind === "block") return typeof o.uuid === "string" && typeof o.page === "string";
   return false;
 }
-function loadRsItems(): SidebarItem[] {
+export function parseStoredSidebarItems(raw: string | null): SidebarItem[] {
   try {
-    const raw = localStorage.getItem(RS_ITEMS_KEY);
     const arr = raw ? JSON.parse(raw) : [];
     return Array.isArray(arr) ? arr.filter(validSidebarItem) : [];
+  } catch {
+    return [];
+  }
+}
+function loadRsItems(): SidebarItem[] {
+  try {
+    return parseStoredSidebarItems(localStorage.getItem(RS_ITEMS_KEY));
   } catch {
     return [];
   }
@@ -1081,24 +1155,80 @@ export function setRightSidebar(items: SidebarItem[]) {
   scheduleSessionSave(); // durable right-sidebar items (localStorage isn't kept)
 }
 
-export function openPageInSidebar(name: string, pageKind: "journal" | "page" = "page") {
-  if (pageKind === "page") name = resolveAlias(name);
+export function openPageInSidebar(target: PageTarget): void;
+export function openPageInSidebar(name: string, pageKind?: PageKind, path?: string): void;
+export function openPageInSidebar(
+  targetOrName: PageTarget | string,
+  pageKind: PageKind = "page",
+  path?: string,
+) {
+  let { name, pageKind: kind, path: targetPath } = typeof targetOrName === "string"
+    ? { name: targetOrName, pageKind, path }
+    : targetOrName;
+  pageKind = kind;
+  path = targetPath;
+  if (pageKind === "page" && !path) name = resolveAlias(name);
   setRightSidebarOpen(true);
-  const existing = rightSidebar().findIndex((i) => i.kind === "page" && i.name === name);
+  // The working set is intentionally name-keyed. A duplicate physical file with
+  // the same logical page name therefore replaces that one live sidebar slot;
+  // retaining both would render/save one of them through the other's identity.
+  const existing = rightSidebar().findIndex((i) =>
+    i.kind === "page" && i.name === name && i.pageKind === pageKind
+  );
   if (existing >= 0) {
-    setRightSidebar(rightSidebar().map((item, i) => i === existing ? { ...item, collapsed: false } : item));
+    const replaced = rightSidebar().map((item, i) =>
+      i === existing ? { ...item, name, pageKind, path, collapsed: false } : item
+    );
+    setRightSidebar(replaced.filter((item, i) => {
+      if (i === existing) return true;
+      const sameOwnerName = item.kind === "page"
+        ? item.name === name && item.pageKind === pageKind
+        : item.page === name && item.pageKind === pageKind;
+      return !sameOwnerName || item.path === path;
+    }));
     return;
   }
-  setRightSidebar([{ kind: "page", name, pageKind }, ...rightSidebar()]);
+  const compatible = rightSidebar().filter((item) => {
+    const sameOwnerName = item.kind === "page"
+      ? item.name === name && item.pageKind === pageKind
+      : item.page === name && item.pageKind === pageKind;
+    return !sameOwnerName || item.path === path;
+  });
+  setRightSidebar([{ kind: "page", name, pageKind, path }, ...compatible]);
 }
-export function openBlockInSidebar(ref: { uuid: string; page: string; pageKind: "journal" | "page" }) {
+export function openBlockInSidebar(ref: {
+  uuid: string;
+  page: string;
+  pageKind: "journal" | "page";
+  path?: string;
+}) {
   setRightSidebarOpen(true);
   const existing = rightSidebar().findIndex((i) => i.kind === "block" && i.uuid === ref.uuid);
   if (existing >= 0) {
-    setRightSidebar(rightSidebar().map((item, i) => i === existing ? { ...item, collapsed: false } : item));
+    const updated = rightSidebar().map((item, i) =>
+      i === existing ? { ...item, ...ref, collapsed: false } : item
+    );
+    setRightSidebar(updated.filter((item, i) => {
+      if (i === existing) return true;
+      const sameOwnerName = item.kind === "page"
+        ? item.name === ref.page && item.pageKind === ref.pageKind
+        : item.page === ref.page && item.pageKind === ref.pageKind;
+      return !sameOwnerName || item.path === ref.path;
+    }));
     return;
   }
-  setRightSidebar([{ kind: "block", ...ref }, ...rightSidebar()]);
+  // A pathful duplicate selection must evict incompatible same-name items. The
+  // shared store can retain one physical owner for a logical page name, so stale
+  // siblings would otherwise become misleading missing/wrong-file block views.
+  const compatible = rightSidebar().filter((item) => {
+    const sameOwnerName = item.kind === "page"
+      ? item.name === ref.page && item.pageKind === ref.pageKind
+      : item.page === ref.page && item.pageKind === ref.pageKind;
+    if (!sameOwnerName) return true;
+    const itemPath = item.path;
+    return itemPath === ref.path;
+  });
+  setRightSidebar([{ kind: "block", ...ref }, ...compatible]);
 }
 
 /** Restored desktop state can contain both panels.  Entering drawer mode has a
@@ -1180,8 +1310,16 @@ export type SheetCellRemoveCtx = { rowId?: string; gridId?: string; col?: number
 
 export type CtxTarget =
   | { kind: "block"; blockId: string }
-  | { kind: "page"; name: string; pageKind: "journal" | "page"; fileActions?: boolean }
-  | { kind: "blockref"; uuid: string; page: string; pageKind: "journal" | "page" }
+  | {
+      kind: "page";
+      name: string;
+      pageKind: "journal" | "page";
+      path?: string;
+      fileActions?: boolean;
+      /** Exact title-row owner for focus restoration after menu dismissal. */
+      focusOwner?: HTMLElement;
+    }
+  | { kind: "blockref"; uuid: string; page: string; pageKind: "journal" | "page"; path?: string }
   | { kind: "sheet-cell"; blockId: string; remove?: SheetCellRemoveCtx }
   | {
       kind: "sheet";
@@ -1211,20 +1349,46 @@ export function openContextMenu(x: number, y: number, blockId: string) {
 export function openPageContextMenu(
   x: number,
   y: number,
+  target: PageTarget,
+  fileActions?: boolean,
+  focusOwner?: HTMLElement,
+): void;
+export function openPageContextMenu(
+  x: number,
+  y: number,
   name: string,
-  pageKind: "journal" | "page" = "page",
-  fileActions = false,
+  pageKind?: "journal" | "page",
+  fileActions?: boolean,
+  focusOwner?: HTMLElement,
+): void;
+export function openPageContextMenu(
+  x: number,
+  y: number,
+  targetOrName: PageTarget | string,
+  pageKindOrFileActions: PageKind | boolean = "page",
+  fileActionsOrFocus?: boolean | HTMLElement,
+  focusOwner?: HTMLElement,
 ) {
-  setContextMenu({ x, y, kind: "page", name, pageKind, fileActions });
+  const target: PageTarget = typeof targetOrName === "string"
+    ? { name: targetOrName, pageKind: pageKindOrFileActions as PageKind }
+    : targetOrName;
+  const fileActions = typeof targetOrName === "string"
+    ? (typeof fileActionsOrFocus === "boolean" ? fileActionsOrFocus : false)
+    : (typeof pageKindOrFileActions === "boolean" ? pageKindOrFileActions : false);
+  const owner = typeof targetOrName === "string"
+    ? focusOwner
+    : (fileActionsOrFocus instanceof HTMLElement ? fileActionsOrFocus : undefined);
+  setContextMenu({ x, y, kind: "page", ...target, fileActions, focusOwner: owner });
 }
 export function openBlockRefContextMenu(
   x: number,
   y: number,
   uuid: string,
   page: string,
-  pageKind: "journal" | "page" = "page"
+  pageKind: "journal" | "page" = "page",
+  path?: string,
 ) {
-  setContextMenu({ x, y, kind: "blockref", uuid, page, pageKind });
+  setContextMenu({ x, y, kind: "blockref", uuid, page, pageKind, path });
 }
 export function openSheetCellContextMenu(x: number, y: number, blockId: string, remove?: SheetCellRemoveCtx) {
   setContextMenu({ x, y, kind: "sheet-cell", blockId, remove });
@@ -1264,7 +1428,7 @@ export function requestBlockReferences(id: string) {
   setBlockReferencesRequest({ id, token: ++blockReferencesRequestToken });
 }
 
-export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "improve" | "shortcuts" | "about";
+export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "plugins" | "improve" | "shortcuts" | "about";
 
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 
@@ -1340,20 +1504,27 @@ export const [audioPlayer, setAudioPlayer] =
 
 // Page aliases (alias:: → canonical), keyed by normalized alias; loaded per graph.
 export const [aliasMap, setAliasMap] = createSignal<Record<string, string>>({});
+/** Mirror core `refs::page_key`: trim, then Unicode string lowercase. String
+ *  lowercasing is intentionally contextual (for example `ΟΣ` → `ος`). */
+export function pageIdentityKey(name: string): string {
+  return name.trim().toLowerCase();
+}
 /** Resolve a page name through `alias::` to its canonical page (else unchanged). */
 export function resolveAlias(name: string): string {
-  return aliasMap()[name.trim().toLowerCase()] ?? name;
+  return aliasMap()[pageIdentityKey(name)] ?? name;
 }
 
 export const [switcherOpen, setSwitcherOpen] = createSignal(false);
+export const [switcherPluginBlock, setSwitcherPluginBlock] = createSignal<OwnedPluginBlockSnapshot | null>(null);
 // "all" = full Ctrl-K (pages/create/commands/blocks); "commands" = command
 // palette (⌘⇧P), commands only.
-export type SwitcherMode = "all" | "commands";
+export type SwitcherMode = "all" | "commands" | "current-page";
 export const [switcherMode, setSwitcherMode] = createSignal<SwitcherMode>("all");
 export const [switcherEmbryo, setSwitcherEmbryo] =
   createSignal<{ paneId: string; prefill: string } | null>(null);
-export function openSwitcher(opts?: { mode?: "embryo"; paneId?: string; prefill?: string }) {
-  setSwitcherMode("all");
+export function openSwitcher(opts?: { mode?: "embryo" | "current-page"; paneId?: string; prefill?: string; pluginBlock?: OwnedPluginBlockSnapshot | null }) {
+  setSwitcherMode(opts?.mode === "current-page" ? "current-page" : "all");
+  setSwitcherPluginBlock(opts?.pluginBlock ?? null);
   setSwitcherEmbryo(opts?.mode === "embryo" && opts.paneId
     ? { paneId: opts.paneId, prefill: opts.prefill ?? "" }
     : null);
@@ -1365,14 +1536,16 @@ export function openSwitcher(opts?: { mode?: "embryo"; paneId?: string; prefill?
 export function openDevtools() {
   void backend().openDevtools();
 }
-export function openCommandPalette() {
+export function openCommandPalette(pluginBlock: OwnedPluginBlockSnapshot | null = null) {
   setSwitcherMode("commands");
   setSwitcherEmbryo(null);
+  setSwitcherPluginBlock(pluginBlock);
   setSwitcherOpen(true);
 }
 export function closeSwitcher() {
   setSwitcherOpen(false);
   setSwitcherEmbryo(null);
+  setSwitcherPluginBlock(null);
 }
 
 // PDF export: the page whose export-options dialog is open (null = closed). Set by
@@ -1393,16 +1566,21 @@ export function closePdfExport() {
 export interface PdfTarget {
   filename: string;
   label: string;
+  owner: PdfOwnership;
   page?: number;
   highlightId?: string;
 }
 export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
 export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
+  const owner = currentPdfOwnership();
+  if (!owner) return;
   // Logseq treats re-opening the current PDF resource without a page/highlight
   // intent as a no-op. Preserve the reader's current location; explicit targets
   // within the same file still publish a new reactive navigation intent.
-  if (pdfTarget()?.filename === filename && page == null && highlightId == null) return;
-  setPdfTarget({ filename, label, page, highlightId });
+  const current = pdfTarget();
+  if (current?.filename === filename && current.owner.generation === owner.generation &&
+      page == null && highlightId == null) return;
+  setPdfTarget({ filename, label, owner, page, highlightId });
 }
 export function closePdf() {
   setPdfTarget(null);

@@ -4,6 +4,8 @@
 
 import type {
   AdvancedQueryResult,
+  BacklinkFilterContext,
+  BacklinkFilterTarget,
   AssetInfo,
   GraphMeta,
   GuideCopyResult,
@@ -22,6 +24,7 @@ import type {
   PrintOpts,
   PdfState,
   QueryExecution,
+  QueryPageScope,
   QueryExportBatch,
   QueryExportSpec,
 } from "./types";
@@ -117,6 +120,32 @@ export interface KnownGraph {
   name: string;
 }
 
+export interface InstalledPluginRecord {
+  id: string;
+  version: string;
+  manifest_json: string;
+  sha256: string;
+  selected: boolean;
+  enabled: boolean;
+}
+
+export interface PluginRegistryCacheEnvelope {
+  schemaVersion: 1;
+  indexJson: string;
+  signature: string;
+}
+
+export interface LegacyPluginRegistryCache {
+  indexJson: string;
+  signature: string;
+}
+
+export type PluginRegistryCacheLoad =
+  | { kind: "absent" }
+  | { kind: "envelope"; envelope: PluginRegistryCacheEnvelope }
+  | { kind: "legacy"; indexJson: string; signature: string }
+  | { kind: "unsafe"; reason: string };
+
 export type LoadGraphResult =
   | { kind: "loaded" | "already_current"; meta: GraphMeta; binding_generation: number }
   | { kind: "focused_existing"; window_label: string };
@@ -144,6 +173,21 @@ export interface Backend {
   listKnownGraphs(): Promise<KnownGraph[]>;
   forgetKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
+  /** Immutable, app-local plugin packages. Installation stores bytes but never
+   * executes them; enabling is an explicit second step after host validation. */
+  listInstalledPlugins(): Promise<InstalledPluginRecord[]>;
+  installPlugin(manifestJson: string, wasm: Uint8Array): Promise<InstalledPluginRecord>;
+  /** Remove one immutable local plugin package. This never touches graph data. */
+  uninstallPlugin(id: string, version: string): Promise<void>;
+  readPluginEntry(id: string, version: string): Promise<Uint8Array>;
+  setPluginEnabled(id: string, version: string, enabled: boolean): Promise<void>;
+  verifyPluginRegistry(indexJson: string, signatureB64: string): Promise<void>;
+  loadPluginRegistryCache(): Promise<PluginRegistryCacheLoad>;
+  storePluginRegistryCache(
+    indexJson: string,
+    signature: string,
+    expectedLegacy?: LegacyPluginRegistryCache
+  ): Promise<void>;
   /** Keep Android's edge-to-edge status/navigation icon appearance readable
    *  against Tine's explicit in-app theme. Other platforms are a no-op. */
   setSystemBarAppearance(dark: boolean): Promise<void>;
@@ -180,6 +224,9 @@ export interface Backend {
   /** Persist the graph-local one-time Guide announcement flag. */
   setGuideAnnounced(announced: boolean): Promise<void>;
   getBacklinks(name: string): Promise<RefGroup[]>;
+  /** Parser-owned visible-subtree/facet index for only the roots in an open
+   *  Linked References filter. Ordinary backlink DTOs stay shallow. */
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext>;
   getUnlinkedRefs(name: string): Promise<RefGroup[]>;
   /** True once the background whole-graph warm has built derived graph-open caches. */
   warmDone(): Promise<boolean>;
@@ -187,9 +234,9 @@ export interface Backend {
   getBlockRefCounts(): Promise<Record<string, number>>;
   /** Blocks that reference block `uuid`, grouped by page (the referrers panel). */
   getBlockReferrers(uuid: string): Promise<RefGroup[]>;
-  deletePage(name: string, kind: "journal" | "page"): Promise<void>;
+  deletePage(name: string, kind: "journal" | "page", expectedPath?: string): Promise<void>;
   /** Rename a page and update all [[refs]]/#tags across the graph. */
-  renamePage(old: string, next: string): Promise<void>;
+  renamePage(old: string, next: string, expectedPath?: string): Promise<void>;
   publishHtml(): Promise<[string, number]>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
@@ -297,7 +344,8 @@ export interface Backend {
     pageLimit: number,
     blockLimit: number,
     lane?: string,
-    explain?: boolean
+    explain?: boolean,
+    scope?: QueryPageScope
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   /** Capture-only page/tag completion capability. It is intentionally not the
@@ -398,8 +446,8 @@ export interface Backend {
    *  state first). Destructive — confirm before calling. */
   restoreBackup(stamp: string): Promise<void>;
   /** Load the persisted UI session JSON (open tabs / active tab / zoom), or null.
-   *  Stored in a real file by the backend — WebKitGTK localStorage isn't durably
-   *  persisted for this app. */
+   *  Stored atomically in a backend file so structured session state is independent
+   *  of a particular WebView/origin and can be shared across windows. */
   loadSession(): Promise<string | null>;
   /** Persist the UI session JSON. */
   saveSession(data: string): Promise<void>;
@@ -504,6 +552,7 @@ export interface BackupInfo {
 export interface GraphChange {
   name: string;
   kind: "journal" | "page";
+  created: boolean;
   removed: boolean;
 }
 
@@ -565,6 +614,42 @@ class TauriBackend implements Backend {
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
   }
+  listInstalledPlugins() {
+    return this.call<InstalledPluginRecord[]>("list_installed_plugins");
+  }
+  installPlugin(manifestJson: string, wasm: Uint8Array) {
+    return this.call<InstalledPluginRecord>("install_plugin", {
+      manifestJson,
+      wasmB64: bytesToBase64(wasm),
+    });
+  }
+  uninstallPlugin(id: string, version: string) {
+    return this.call<void>("uninstall_plugin", { id, version });
+  }
+  async readPluginEntry(id: string, version: string) {
+    const buffer = await this.call<ArrayBuffer>("read_plugin_entry", { id, version });
+    return new Uint8Array(buffer);
+  }
+  setPluginEnabled(id: string, version: string, enabled: boolean) {
+    return this.call<void>("set_plugin_enabled", { id, version, enabled });
+  }
+  verifyPluginRegistry(indexJson: string, signatureB64: string) {
+    return this.call<void>("verify_plugin_registry", { indexJson, signatureB64 });
+  }
+  loadPluginRegistryCache() {
+    return this.call<PluginRegistryCacheLoad>("load_plugin_registry_cache");
+  }
+  storePluginRegistryCache(
+    indexJson: string,
+    signature: string,
+    expectedLegacy?: LegacyPluginRegistryCache
+  ) {
+    return this.call<void>("store_plugin_registry_cache", {
+      indexJson,
+      signature,
+      expectedLegacy: expectedLegacy ?? null,
+    });
+  }
   setSystemBarAppearance(dark: boolean) {
     return this.call<void>("set_system_bar_appearance", { dark });
   }
@@ -613,6 +698,9 @@ class TauriBackend implements Backend {
   getBacklinks(name: string) {
     return this.call<RefGroup[]>("get_backlinks", { name });
   }
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]) {
+    return this.call<BacklinkFilterContext>("get_backlink_filter_context", { name, targets });
+  }
   getUnlinkedRefs(name: string) {
     return this.call<RefGroup[]>("get_unlinked_refs", { name });
   }
@@ -625,11 +713,11 @@ class TauriBackend implements Backend {
   getBlockReferrers(uuid: string) {
     return this.call<RefGroup[]>("block_referrers", { uuid });
   }
-  deletePage(name: string, kind: "journal" | "page") {
-    return this.call<void>("delete_page", { name, kind });
+  deletePage(name: string, kind: "journal" | "page", expectedPath?: string) {
+    return this.call<void>("delete_page", { name, kind, expectedPath });
   }
-  renamePage(old: string, next: string) {
-    return this.call<void>("rename_page", { old, new: next });
+  renamePage(old: string, next: string, expectedPath?: string) {
+    return this.call<void>("rename_page", { old, new: next, expectedPath });
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");
@@ -703,8 +791,8 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false) {
-    return this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain });
+  runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope) {
+    return this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain, scope: scope ?? null });
   }
   quickSwitch(query: string, limit: number) {
     return this.call<PageEntry[]>("quick_switch", { query, limit });

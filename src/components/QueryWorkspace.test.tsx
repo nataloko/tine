@@ -4,13 +4,20 @@ import { render } from "solid-js/web";
 import type { PaneRouter, QueryRoute } from "../router";
 import type { PageDto, QueryExecution } from "../types";
 import {
+  clearTransientLayersForTest,
+  dismissTopTransient,
+  registerTransientLayer,
+} from "../transientLayers";
+import {
   QueryWorkspace,
   materializeQueryWorkspace,
   type MaterializeQueryDependencies,
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
+import { pageInventoryRev } from "../ui";
 
 afterEach(() => {
+  clearTransientLayersForTest();
   document.body.innerHTML = "";
 });
 
@@ -66,6 +73,7 @@ describe("materializeQueryWorkspace", () => {
   });
   it("creates one canonical friendly query block through the guarded no-baseline save", async () => {
     const deps = materializeDeps();
+    const beforeInventory = pageInventoryRev();
     const result = await materializeQueryWorkspace({
       title: "  Project dashboard  ",
       sourceKind: "search",
@@ -91,6 +99,7 @@ describe("materializeQueryWorkspace", () => {
     expect(deps.getPage).toHaveBeenCalledWith("Project dashboard", "page");
     expect(deps.savePage).toHaveBeenCalledTimes(1);
     expect(deps.savePage).toHaveBeenCalledWith(result.page, null, false);
+    expect(pageInventoryRev()).toBeGreaterThan(beforeInventory);
   });
 
   it("preserves canonical raw DSL and writes a presentation property only when needed", async () => {
@@ -161,6 +170,7 @@ function routerMock(activeRoute: QueryRoute = { kind: "query", id: "query-mock",
     updateActiveQuery: vi.fn(),
     replaceActiveRoute: vi.fn(),
     openPage: vi.fn(),
+    openPageTarget: vi.fn(),
     openPageAtBlock: vi.fn(),
   } as unknown as PaneRouter;
 }
@@ -185,6 +195,7 @@ function executionFixture(explained: boolean): QueryExecution {
         entity: "block",
         page: "Research",
         kind: "page",
+        path: "pages/client-b/Research.md",
         block: {
           id: "block-1",
           raw: "An alpha result",
@@ -230,6 +241,48 @@ async function waitFor(check: () => void): Promise<void> {
 }
 
 describe("QueryWorkspace", () => {
+  it("peels a QueryBuilder child before its Advanced parent and preserves the draft", async () => {
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-transient-ladder",
+      sourceKind: "dsl",
+      source: "(and (task TODO))",
+      presentation: "list",
+    };
+    const lower = vi.fn(() => true);
+    const unregisterLower = registerTransientLayer({ id: "query-workspace-lower", dismiss: lower });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={workspaceDeps()} />, root);
+    try {
+      const toggle = root.querySelector<HTMLButtonElement>(".query-advanced-toggle")!;
+      toggle.click();
+      await Promise.resolve();
+      const dialog = root.querySelector<HTMLElement>(".query-advanced-modal")!;
+      expect(dialog).not.toBeNull();
+
+      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
+      expect(root.querySelector(".qb-menu")).not.toBeNull();
+      dialog.querySelector(".query-advanced-header")!
+        .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+
+      expect(dismissTopTransient("escape")).toBe(true);
+      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
+      expect(root.querySelector<HTMLTextAreaElement>(".query-dsl-editor textarea")?.value).toBe(route.source);
+      expect(lower).not.toHaveBeenCalled();
+
+      expect(dismissTopTransient("back")).toBe(true);
+      await Promise.resolve();
+      expect(root.querySelector(".query-advanced-modal")).toBeNull();
+      expect(document.activeElement).toBe(toggle);
+      expect(lower).not.toHaveBeenCalled();
+    } finally {
+      unregisterLower();
+      dispose();
+    }
+  });
+
   it("keeps empty workspaces local, neutral, and query-free", async () => {
     const route: QueryRoute = { kind: "query", id: "query-empty", sourceKind: "search", source: "", presentation: "search" };
     const deps = workspaceDeps();
@@ -314,6 +367,15 @@ describe("QueryWorkspace", () => {
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["Alpha", "alpha"]);
     expect(root.querySelector(".search-result-context")?.textContent).toContain("Page");
     expect(root.querySelectorAll(".query-result-row")).toHaveLength(2);
+    const resultRows = [...root.querySelectorAll<HTMLButtonElement>(".query-result-row")];
+    resultRows[0].click();
+    expect(router.openPageTarget).toHaveBeenCalledWith({
+      name: "Alpha notes", pageKind: "page", path: "pages/alpha.md",
+    });
+    resultRows[1].click();
+    expect(router.openPageAtBlock).toHaveBeenCalledWith({
+      name: "Research", pageKind: "page", path: "pages/client-b/Research.md", block: "block-1",
+    });
 
     for (const [label, selector] of [
       ["List", ".query-results-list"],

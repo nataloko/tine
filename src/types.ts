@@ -210,8 +210,27 @@ export type MergeDecision = "mine" | "theirs" | "both";
 export interface RefGroup {
   page: string;
   kind: PageKind;
+  /** Exact owner for path-bearing search presentations; absent for legacy DSL results. */
+  path?: string;
   blocks: BlockDto[];
   evidence?: ReferenceBlockEvidence[];
+}
+
+export interface BacklinkFilterTarget {
+  page: string;
+  kind: PageKind;
+  block_id: string;
+}
+
+export interface BacklinkFilterEntry extends BacklinkFilterTarget {
+  text: string;
+  facets: string[];
+  truncated?: boolean;
+}
+
+export interface BacklinkFilterContext {
+  entries: BacklinkFilterEntry[];
+  truncated?: boolean;
 }
 
 export type ReferenceKind = "explicit" | "plain";
@@ -272,6 +291,8 @@ export type QueryHit =
       entity: "block";
       page: string;
       kind: PageKind;
+      /** Exact graph-root-relative file that physically owns this block hit. */
+      path?: string;
       block: BlockDto;
       display_text: string;
       evidence: MatchEvidence[];
@@ -283,6 +304,14 @@ export interface QueryExecution {
   diagnostics: QueryDiagnostic[];
   explanation: { branches: QueryExplainNode[] };
   cancelled: boolean;
+}
+
+/** A single routed page used to scope block search. When present, `path` is the
+ * authoritative file identity; otherwise kind plus canonical page name is used. */
+export interface QueryPageScope {
+  name: string;
+  pageKind: PageKind;
+  path?: string;
 }
 
 /** Result of an advanced (datalog) query: matched groups + which clause heads

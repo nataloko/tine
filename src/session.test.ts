@@ -7,6 +7,11 @@ import {
   favoritesSectionExpanded,
   recentSectionExpanded,
   rightSidebar,
+  parseStoredSidebarItems,
+  openBlockInSidebar,
+  openPageInSidebar,
+  recentPages,
+  setRecentPages,
   setRightSidebar,
   setFavoritesSectionExpanded,
   setRecentSectionExpanded,
@@ -30,6 +35,26 @@ beforeEach(() => {
 });
 
 describe("persisted split session", () => {
+  it("copies only bounded route fields while retaining exact page ownership", () => {
+    const path = "pages/client-b/Twin.md";
+    const raw = JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "page", name: "Twin", pageKind: "page", path,
+          block: "11111111-1111-4111-8111-111111111111", injected: { unsafe: true },
+        }],
+        pos: 0,
+        pinned: false,
+      }],
+      activeIndex: 0,
+    });
+
+    expect(parsePersistedSession(raw)?.snapshots.get("main")?.tabs[0].history[0]).toEqual({
+      kind: "page", name: "Twin", pageKind: "page", path,
+      block: "11111111-1111-4111-8111-111111111111",
+    });
+  });
+
   it("round-trips a two-pane layout with pane tabs and scrolls", () => {
     const root: LayoutNode = {
       kind: "split" as const,
@@ -121,18 +146,22 @@ describe("persisted split session", () => {
   });
 
   it("round-trips graph-scoped Favorites and Recent disclosure state and defaults legacy sessions open", () => {
+    setRecentPages([{ name: "Twin", kind: "page", path: "pages/client-b/Twin.md" }]);
     setFavoritesSectionExpanded(false);
     setRecentSectionExpanded(true);
     const persisted = buildPersistedSession();
     expect(persisted.favoritesSectionExpanded).toBe(false);
     expect(persisted.recentSectionExpanded).toBe(true);
+    expect(persisted.recentPages).toEqual([{ name: "Twin", kind: "page", path: "pages/client-b/Twin.md" }]);
 
     const parsed = parsePersistedSession(JSON.stringify(persisted))!;
     setFavoritesSectionExpanded(true);
     setRecentSectionExpanded(false);
     applySidebarSession(parsed.sidebar);
+    setRecentPages(parsed.recent);
     expect(favoritesSectionExpanded()).toBe(false);
     expect(recentSectionExpanded()).toBe(true);
+    expect(recentPages()).toEqual([{ name: "Twin", kind: "page", path: "pages/client-b/Twin.md" }]);
 
     applySidebarSession({});
     expect(favoritesSectionExpanded()).toBe(true);
@@ -141,8 +170,8 @@ describe("persisted split session", () => {
 
   it("round-trips each right-sidebar item's graph-local disclosure state", () => {
     setRightSidebar([
-      { kind: "page", name: "Expanded", pageKind: "page", collapsed: false },
-      { kind: "block", uuid: "stable-block", page: "Source", pageKind: "page", collapsed: true },
+      { kind: "page", name: "Expanded", pageKind: "page", path: "pages/duplicates/Expanded.md", collapsed: false },
+      { kind: "block", uuid: "stable-block", page: "Source", pageKind: "page", path: "pages/duplicates/Source.md", collapsed: true },
     ]);
     const persisted = buildPersistedSession();
     expect(persisted.rightSidebarItems?.map((item) => item.collapsed)).toEqual([false, true]);
@@ -154,6 +183,71 @@ describe("persisted split session", () => {
 
     applySidebarSession({ items: [{ kind: "page", name: "Legacy", pageKind: "page" }] });
     expect(rightSidebar()[0].collapsed).toBeUndefined();
+  });
+
+  it("accepts legacy pathless localStorage items and round-trips new exact paths", () => {
+    expect(parseStoredSidebarItems(JSON.stringify([
+      { kind: "page", name: "Legacy", pageKind: "page" },
+      { kind: "block", uuid: "legacy-id", page: "Legacy", pageKind: "page" },
+    ]))).toEqual([
+      { kind: "page", name: "Legacy", pageKind: "page" },
+      { kind: "block", uuid: "legacy-id", page: "Legacy", pageKind: "page" },
+    ]);
+
+    const pathful = [
+      { kind: "page" as const, name: "Twin", pageKind: "page" as const, path: "pages/noncanonical/Twin.md" },
+      { kind: "block" as const, uuid: "twin-id", page: "Twin", pageKind: "page" as const, path: "pages/noncanonical/Twin.md" },
+    ];
+    expect(parseStoredSidebarItems(JSON.stringify(pathful))).toEqual(pathful);
+  });
+
+  it("replaces an incompatible same-name physical sidebar owner", () => {
+    setRightSidebar([
+      { kind: "page", name: "Twin", pageKind: "page", path: "pages/Twin.md" },
+      { kind: "block", uuid: "canonical-block", page: "Twin", pageKind: "page", path: "pages/Twin.md" },
+    ]);
+
+    openPageInSidebar("Twin", "page", "pages/duplicates/Twin.md");
+    expect(rightSidebar()).toEqual([
+      { kind: "page", name: "Twin", pageKind: "page", path: "pages/duplicates/Twin.md", collapsed: false },
+    ]);
+
+    openBlockInSidebar({
+      uuid: "third-owner-block",
+      page: "Twin",
+      pageKind: "page",
+      path: "pages/third/Twin.md",
+    });
+    expect(rightSidebar()).toEqual([{
+      kind: "block",
+      uuid: "third-owner-block",
+      page: "Twin",
+      pageKind: "page",
+      path: "pages/third/Twin.md",
+    }]);
+  });
+
+  it("evicts an old same-name owner when an existing block UUID moves to an exact path", () => {
+    setRightSidebar([
+      { kind: "page", name: "Twin", pageKind: "page", path: "pages/Twin.md" },
+      { kind: "block", uuid: "shared-block", page: "Twin", pageKind: "page", path: "pages/Twin.md" },
+    ]);
+
+    openBlockInSidebar({
+      uuid: "shared-block",
+      page: "Twin",
+      pageKind: "page",
+      path: "pages/duplicates/Twin.md",
+    });
+
+    expect(rightSidebar()).toEqual([{
+      kind: "block",
+      uuid: "shared-block",
+      page: "Twin",
+      pageKind: "page",
+      path: "pages/duplicates/Twin.md",
+      collapsed: false,
+    }]);
   });
 
   it("rewrites duplicate restored journals panes to a previous page route", () => {

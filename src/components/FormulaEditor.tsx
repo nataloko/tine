@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import {
   closeFormulaEditor,
   formulaEditor,
@@ -617,6 +617,23 @@ function ValueFace(props: {
   }
 
   const [open, setOpen] = createSignal(false);
+  const transientId = `formula-picker-${createUniqueId()}`;
+  let pickerRoot: HTMLDivElement | undefined;
+  let trigger: HTMLButtonElement | undefined;
+  createEffect(() => {
+    if (!open()) return;
+    const unregister = registerTransientLayer({
+      id: transientId,
+      parentId: "formula-editor",
+      root: () => pickerRoot ?? null,
+      trigger: () => trigger ?? null,
+      dismiss: () => {
+        setOpen(false);
+        return true;
+      },
+    });
+    onCleanup(unregister);
+  });
   const commit = (next: Ast) => {
     props.onChange(next);
     setOpen(false);
@@ -625,6 +642,9 @@ function ValueFace(props: {
   return (
     <span class="qb-add-wrap formula-builder-value-wrap">
       <button
+        ref={(element) => {
+          trigger = element;
+        }}
         type="button"
         class="qb-chip formula-builder-value-face"
         title="Edit formula value"
@@ -640,6 +660,9 @@ function ValueFace(props: {
           ast={props.ast}
           fields={props.fields}
           formulas={props.formulas}
+          rootRef={(element) => {
+            pickerRoot = element;
+          }}
           onCommit={commit}
         />
       </Show>
@@ -651,10 +674,11 @@ function ValuePicker(props: {
   ast: Ast;
   fields: readonly string[];
   formulas: readonly [string, string][];
+  rootRef: (element: HTMLDivElement) => void;
   onCommit: (ast: Ast) => void;
 }): JSX.Element {
   return (
-    <div class="qb-picker formula-builder-picker" onClick={(e) => e.stopPropagation()}>
+    <div ref={props.rootRef} class="qb-picker formula-builder-picker" onClick={(e) => e.stopPropagation()}>
       <div class="qb-picker-title">Field</div>
       <For each={props.fields}>
         {(field) => (

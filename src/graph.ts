@@ -2,11 +2,11 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections } from "./ui";
+import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
-import { resetTabsToJournals, openPage, restoreSession, flushSession } from "./router";
-import { resetPaneLayoutToSingle } from "./panes";
+import { resetTabsToJournals, openPage, restoreSession, flushSession, type PageTarget } from "./router";
+import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars } from "./editor/templateVars";
 import { waitForWarmCache } from "./warmCache";
@@ -16,6 +16,7 @@ import { isMobile, platformKind } from "./platform";
 import type { BlockDto } from "./types";
 import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
+import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
 
 const GRAPH_KEY = "tine.graphPath";
 
@@ -83,6 +84,7 @@ export async function loadGraphPath(
   // discard that edit — gated on whether a graph is actually loaded now, NOT on
   // the persisted path (which is empty on a TINE_GRAPH/CLI launch).
   const hadGraph = !!graphMeta();
+  const rebindsPdfOwner = hadGraph && (switching || options.forceRefresh === true);
   const flushed = await flushAll();
   if (hadGraph && !flushed) {
     pushToast("Some pages couldn't be saved — resolve conflicts before switching graphs.", "error");
@@ -90,13 +92,39 @@ export async function loadGraphPath(
   }
   if (hadGraph) await flushSession();
   if (!(await authorizeGraphAccess(path))) return { kind: "aborted" };
-  const result = await backend().loadGraph(path);
-  if (result.kind === "focused_existing") return { kind: "focused_existing" };
+  // This is the last await before the backend graph binding can change.  Flush
+  // delayed view state plus complete highlight/area mutations under A; only a
+  // successful drain permits us to invalidate that authority and unmount it.
+  if (rebindsPdfOwner && !(await drainPdfWork())) {
+    pushToast("PDF changes couldn't be saved — the current graph is still open.", "error");
+    return { kind: "aborted" };
+  }
+  if (rebindsPdfOwner) {
+    retirePdfOwnership();
+    closePdf();
+  }
+
+  let result;
+  try {
+    result = await backend().loadGraph(path);
+  } catch (error) {
+    // load_graph failed before installing a replacement binding.  Publish a new
+    // local generation for the still-bound old graph; the retired viewer stays
+    // closed, so no callback can regain its former authority.
+    if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    throw error;
+  }
+  if (result.kind === "focused_existing") {
+    if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    return { kind: "focused_existing" };
+  }
   const meta = result.meta;
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };
   }
+  if (!hadGraph || rebindsPdfOwner) activatePdfOwnership(meta.root);
   resetStore();
+  resetNavigationIndex();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one
   if (switching) {
     // A graph switch is a full workspace reset (OG opens one graph at a time):
@@ -154,25 +182,73 @@ export async function loadGraphPath(
   }
 }
 
-/** Load the graph's alias:: index so link/navigation can resolve aliases.
- *  Guarded by the graph epoch so a slow response after a graph switch can't
- *  install the old graph's aliases. Exposed as `refreshAliases` so it can be
- *  re-run after edits (an alias:: change would otherwise leave nav stale). */
+let navigationEpoch = -1;
+let aliasEntries: Record<string, string> = {};
+let pageIdentities: Record<string, string> = {};
+let aliasRequest = 0;
+let pageIdentityRequest = 0;
+
+function resetNavigationIndex(): void {
+  navigationEpoch = -1;
+  aliasEntries = {};
+  pageIdentities = {};
+  aliasRequest++;
+  pageIdentityRequest++;
+  setAliasMap({});
+}
+
+function bindNavigationIndex(epoch: number): void {
+  if (navigationEpoch === epoch) return;
+  navigationEpoch = epoch;
+  aliasEntries = {};
+  pageIdentities = {};
+  aliasRequest++;
+  pageIdentityRequest++;
+  setAliasMap({});
+}
+
+function commitNavigationIndex(): void {
+  // Existing files win a colliding alias, matching core `load_named`.
+  setAliasMap({ ...aliasEntries, ...pageIdentities });
+}
+
+/** Refresh semantic aliases after content saves. Request sequencing prevents an
+ *  older same-epoch response from overwriting a newer alias edit. */
 export async function refreshAliases(): Promise<void> {
   const epoch = graphEpoch();
-  try {
-    const pairs = await backend().pageAliases();
-    if (epoch !== graphEpoch()) return;
-    setAliasMap(Object.fromEntries(pairs));
-  } catch {
-    if (epoch === graphEpoch()) setAliasMap({});
-  }
+  bindNavigationIndex(epoch);
+  const request = ++aliasRequest;
+  const result = await Promise.allSettled([backend().pageAliases()]);
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== aliasRequest) return;
+  aliasEntries = result[0].status === "fulfilled"
+    ? Object.fromEntries(result[0].value)
+    : {};
+  commitNavigationIndex();
+}
+
+/** Refresh the real-page identity inventory only after graph bind, create,
+ *  delete, or rename. Ordinary content saves refresh aliases but never pay for
+ *  this whole-page-list IPC. Real pages override colliding semantic aliases. */
+export async function refreshPageIdentities(): Promise<void> {
+  const epoch = graphEpoch();
+  bindNavigationIndex(epoch);
+  const request = ++pageIdentityRequest;
+  const result = await Promise.allSettled([backend().listPages()]);
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== pageIdentityRequest) return;
+  pageIdentities = result[0].status === "fulfilled"
+    ? Object.fromEntries(
+        result[0].value
+          .filter((entry) => entry.kind === "page")
+          .map((entry) => [pageIdentityKey(entry.name), entry.name])
+      )
+    : {};
+  commitNavigationIndex();
 }
 async function loadAliases(): Promise<void> {
   const epoch = graphEpoch();
   if (!(await waitForWarmCache(epoch))) return;
   if (epoch !== graphEpoch()) return;
-  await refreshAliases();
+  await Promise.all([refreshAliases(), refreshPageIdentities()]);
 }
 
 /** Refresh frontend state after a successful page rename. The backend rename
@@ -185,11 +261,17 @@ async function loadAliases(): Promise<void> {
  *  References to refetch from the now-correct backend). Aliases may have moved with
  *  the renamed file, so refresh those too. Caller must have run flushAll() first
  *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
-export function refreshAfterRename(from: string, to: string): void {
-  renamePageInNavigation(from, to);
+export function refreshAfterRename(from: string, to: string, exactTarget?: PageTarget): void {
+  if (exactTarget) {
+    removePageTargetAcrossPanes(exactTarget);
+    renamePageInNavigation(exactTarget, { name: to, pageKind: exactTarget.pageKind });
+  } else {
+    renamePageInNavigation(from, to);
+  }
   resetStore();
+  resetNavigationIndex();
   bumpGraphEpoch();
-  void refreshAliases();
+  void Promise.all([refreshAliases(), refreshPageIdentities()]);
 }
 
 // If config.edn sets :default-templates {:journals "X"}, create today's journal

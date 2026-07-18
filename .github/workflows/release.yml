@@ -4,7 +4,8 @@
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # …or run it manually from the Actions tab (workflow_dispatch) to smoke-test the
-# build matrix WITHOUT cutting a release.
+# build matrix WITHOUT cutting a release. Both paths fail before packaging unless
+# the exact candidate SHA already has a successful manually dispatched full CI.
 #
 # Publication is atomic at the workflow level: every expensive build writes only
 # an immutable workflow artifact; one assembler creates latest.json; and one
@@ -23,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -42,6 +44,12 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - name: Require exact-SHA full CI evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_EVIDENCE_SHA: ${{ github.sha }}
+          CI_EVIDENCE_REPOSITORY: ${{ github.repository }}
+        run: node scripts/check-ci-evidence.mjs
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
@@ -68,7 +76,9 @@ jobs:
       - name: lsdoc oracle bytes and cross-platform EOL policy are current
         run: node scripts/check-lsdoc-oracle-sync.mjs
       - name: Release pipeline contract fixtures
-        run: node scripts/test-release-pipeline.mjs
+        run: |
+          node scripts/test-release-pipeline.mjs
+          node scripts/test-env-toolchain-fallback.mjs
 
   # Reuse the actual privileged, network-disabled Flatpak bundle build. It runs
   # in parallel with the platform packages but is a hard publication dependency.
@@ -156,6 +166,14 @@ jobs:
         if: matrix.lane == 'linux-x64'
         run: npx playwright install --with-deps chromium
 
+      - name: Snapshot Linux E2E candidate inputs
+        if: matrix.lane == 'linux-x64'
+        run: node scripts/build-e2e-receipt.mjs before --snapshot target/release/tine.build.before.json
+
+      - name: Snapshot Windows E2E candidate inputs
+        if: matrix.lane == 'windows-x64'
+        run: node scripts/build-e2e-receipt.mjs before --tauri-manifest-normalization --snapshot target/release/tine.exe.build.before.json
+
       - name: Build signed Tauri bundles
         env:
           # Updater signing (minisign) — the app-update root of trust, SEPARATE from
@@ -176,6 +194,14 @@ jobs:
           #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
           #   APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID.
         run: npm run tauri build -- ${{ matrix.args }}
+
+      - name: Write Linux E2E candidate receipt
+        if: matrix.lane == 'linux-x64'
+        run: node scripts/build-e2e-receipt.mjs after --snapshot target/release/tine.build.before.json --app target/release/tine
+
+      - name: Write Windows E2E candidate receipt
+        if: matrix.lane == 'windows-x64'
+        run: node scripts/build-e2e-receipt.mjs after --snapshot target/release/tine.exe.build.before.json --app target/release/tine.exe
 
       # Portable Windows build: the compiled Tauri exe is already self-contained
       # (frontend + lsdoc-wasm are embedded; WebView2Loader is statically linked),
@@ -211,7 +237,12 @@ jobs:
         if: matrix.lane == 'linux-x64'
         env:
           E2E_ALLOW_SYNTHETIC_FOCUS: "1"
+          TINE_E2E_MODE: release
         run: npm run e2e:linux:release
+
+      - name: Gate Linux x64 on the signed plugin catalogue lifecycle
+        if: matrix.lane == 'linux-x64'
+        run: npm run e2e:plugins
 
       - name: Upload release E2E evidence
         if: always() && matrix.lane == 'linux-x64'
@@ -221,6 +252,27 @@ jobs:
           path: test-results/e2e
           if-no-files-found: warn
           retention-days: 14
+
+      # The staged Windows smoke jobs verify that the downloaded portable exe
+      # embeds this exact production frontend.  Preserve the already-built dist
+      # once instead of rebuilding it independently in every advisory job.
+      - name: Upload exact Windows x64 frontend proof
+        if: matrix.lane == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-e2e-frontend-windows-x64
+          path: dist
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload exact Windows x64 E2E receipt
+        if: matrix.lane == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-e2e-receipt-windows-x64
+          path: target/release/tine.exe.build.json
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Stage immutable release artifact
         run: node scripts/stage-release-lane.mjs "${{ matrix.lane }}" release-candidate "${{ github.sha }}"
@@ -241,6 +293,10 @@ jobs:
   # scenario's real failure visible instead of turning one 0/N step green.
   windows-smoke:
     needs: [preflight, build]
+    # A failure in another build-matrix lane (for example the hard Linux E2E
+    # gate) must not suppress evidence from an already-staged Windows x64 app.
+    # If x64 itself failed, the artifact download below fails visibly instead.
+    if: ${{ always() && needs.preflight.result == 'success' && needs.build.result != 'cancelled' }}
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -252,6 +308,7 @@ jobs:
           - page-trailing-block
           - pdf-logseq
           - print-security
+          - tab-overflow
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -265,6 +322,16 @@ jobs:
         with:
           name: release-windows-x64
           path: release-windows-x64
+      - name: Download the exact embedded frontend proof
+        uses: actions/download-artifact@v4
+        with:
+          name: release-e2e-frontend-windows-x64
+          path: dist
+      - name: Download the exact Windows x64 E2E receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: release-e2e-receipt-windows-x64
+          path: ${{ runner.temp }}/tine-receipt
       - name: Extract the exact staged portable app
         shell: pwsh
         run: |
@@ -274,8 +341,7 @@ jobs:
           $exe = Get-ChildItem "$env:RUNNER_TEMP\tine-portable" -Filter '*.exe' | Select-Object -First 1
           if (-not $exe) { throw "portable Tine executable is missing" }
           "TINE_APP=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Install Tauri WebDriver bridge
-        run: cargo install tauri-driver --locked
+          "TINE_E2E_BUILD_RECEIPT=$env:RUNNER_TEMP\tine-receipt\tine.exe.build.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install Edge WebDriver matching the hosted browser
         shell: pwsh
         run: |
@@ -289,6 +355,8 @@ jobs:
           $driverDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$driverDir\msedgedriver.exe" --version
       - name: Run advisory Windows x64 real-app scenario
+        env:
+          TINE_E2E_MODE: release
         run: npm run e2e:windows:smoke -- --scenario=${{ matrix.scenario }}
       - name: Upload Windows E2E evidence
         if: always()

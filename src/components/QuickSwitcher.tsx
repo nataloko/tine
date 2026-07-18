@@ -1,6 +1,6 @@
 import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, recentPages, graphMeta, isFavorite, pushToast } from "../ui";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
@@ -11,13 +11,15 @@ import { SearchResultRow } from "./SearchResultRow";
 import type { MatchSpan, ObjectiveMatchClass, PageKind } from "../types";
 import { rankLauncherItems, recordLauncherActivation } from "../launcherRanking";
 import { dismissTopTransient, registerTransientLayer } from "../transientLayers";
+import { persistBlockRefTarget } from "../store";
+import type { QueryPageScope } from "../types";
 
 // One selectable result row.
 type Item =
   | { t: "page"; name: string; pageKind: PageKind; path?: string; spans?: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean }
   | { t: "create"; name: string }
   | { t: "command"; label: string; binding: string; run: () => void }
-  | { t: "block"; page: string; pageKind: PageKind; blockId: string; text: string; crumb: string[]; spans: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean };
+  | { t: "block"; page: string; pageKind: PageKind; path?: string; blockId: string; text: string; crumb: string[]; spans: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean };
 
 interface Section {
   header: string;
@@ -54,6 +56,7 @@ export function QuickSwitcher(): JSX.Element {
   let inputRef: HTMLInputElement | undefined;
   let resultsRef: HTMLDivElement | undefined;
   let originPaneId: string | null = null;
+  const [currentPageScope, setCurrentPageScope] = createSignal<QueryPageScope | null>(null);
   let wasOpen = false;
   // X11/WebKitGTK pastes the PRIMARY selection into the focused input on ANY
   // middle-click (not cancelable from the row's mousedown). We want that paste
@@ -69,6 +72,7 @@ export function QuickSwitcher(): JSX.Element {
   });
 
   const commandsOnly = () => switcherMode() === "commands";
+  const currentPageOnly = () => currentPageScope() !== null;
   // The backend search/quick-switch IPC keys off a debounced query so holding
   // keys doesn't fire a whole-graph scan per character; local sections (recents,
   // commands, create-option) still react to `query()` instantly.
@@ -84,13 +88,27 @@ export function QuickSwitcher(): JSX.Element {
   // graph. The +1 row is never displayed. Re-fetches when the query OR the
   // (Load-more-grown) limit changes; the early-stop scan keeps each fetch cheap.
   const [graphResults] = createResource(
-    () => (commandsOnly() ? null : { q: debouncedQuery(), pages: pageLimit(), blocks: blockLimit() }),
+    () => (commandsOnly() ? null : {
+      q: debouncedQuery(),
+      pages: currentPageOnly() ? 0 : pageLimit(),
+      blocks: blockLimit(),
+      scope: currentPageScope(),
+    }),
     (s) => s && s.q.trim()
-      ? backend().runGraphSearch(s.q, s.pages + 1, s.blocks + 1, "quick-switch", false)
+      ? backend().runGraphSearch(
+          s.q,
+          s.pages + (s.scope ? 0 : 1),
+          s.blocks + 1,
+          s.scope ? "quick-switch:current-page" : "quick-switch",
+          false,
+          s.scope ?? undefined,
+        )
       : Promise.resolve({ hits: [], diagnostics: [], explanation: { branches: [] }, cancelled: false })
   );
 
   const currentPageName = () => {
+    const scope = currentPageScope();
+    if (scope) return scope.name;
     const r = route();
     return r.kind === "page" ? r.name : null;
   };
@@ -100,8 +118,8 @@ export function QuickSwitcher(): JSX.Element {
     // Rank the command palette with the same fuzzy score as the slash menu
     // (empty query → all, in defined order); a stable sort keeps ties ordered.
     const ranked = !ql
-      ? paletteCommands()
-      : paletteCommands()
+      ? paletteCommands(switcherPluginBlock())
+      : paletteCommands(switcherPluginBlock())
           .map((c) => ({ c, s: fuzzyScore(ql, c.label) }))
           .filter((x) => x.s > 0)
           .sort((a, b) => b.s - a.s)
@@ -121,22 +139,23 @@ export function QuickSwitcher(): JSX.Element {
 
     // Empty query → recents.
     if (!q) {
+      if (currentPageOnly()) return out;
       const recents: Item[] = recentPages().map((r) => ({
         t: "page",
         name: r.name,
         pageKind: r.kind,
+        path: r.path,
         adaptiveClass: "exact",
-        adaptiveIdentity: `page:${r.kind}:${r.name.toLocaleLowerCase()}`,
+        adaptiveIdentity: `page:${r.kind}:${r.path || r.name.toLocaleLowerCase()}`,
         adaptiveFavorite: isFavorite(r.name),
       }));
       if (recents.length) out.push({ header: "Recent", items: recents });
       return out;
     }
 
-    const ql = q.toLowerCase();
     // Page and block membership, diagnostics, and match evidence now come from
     // one Rust QueryPlan execution. Commands/create remain launcher providers.
-    const allPages: Item[] = (graphResults()?.hits ?? [])
+    const allPages: Item[] = currentPageOnly() ? [] : (graphResults()?.hits ?? [])
       .filter((hit) => hit.entity === "page")
       .map((hit) => ({
         t: "page",
@@ -164,11 +183,11 @@ export function QuickSwitcher(): JSX.Element {
       });
 
     // Create page (when no exact match exists).
-    const exact = pageItems.some((p) => p.t === "page" && p.name.toLowerCase() === ql);
-    if (!exact) out.push({ header: "Create", items: [{ t: "create", name: q }] });
+    const exact = pageItems.some((p) => p.t === "page" && p.adaptiveClass === "exact");
+    if (!currentPageOnly() && !exact) out.push({ header: "Create", items: [{ t: "create", name: q }] });
 
     // Commands matching the query.
-    const cmds = embryoPane ? [] : commandItems(q);
+    const cmds = embryoPane || currentPageOnly() ? [] : commandItems(q);
     if (cmds.length) out.push({ header: "Commands", items: cmds });
 
     // Blocks. Gather every match (backend order), then page the whole set so a
@@ -182,15 +201,16 @@ export function QuickSwitcher(): JSX.Element {
           t: "block",
           page: hit.page,
           pageKind: hit.kind,
+          path: hit.path || undefined,
           blockId: hit.block.id,
           text: hit.display_text,
           crumb: hit.block.breadcrumb ?? [],
           spans: hit.evidence.flatMap((evidence) => evidence.spans),
           adaptiveClass: hit.match_class ?? "body_evidence",
-          adaptiveIdentity: `block:${hit.kind}:${hit.page.toLocaleLowerCase()}:${hit.block.id}`,
+          adaptiveIdentity: `block:${hit.kind}:${hit.path || hit.page.toLocaleLowerCase()}:${hit.block.id}`,
           adaptiveFavorite: isFavorite(hit.page),
         },
-        onCur: !!(cur && hit.page === cur),
+        onCur: currentPageOnly() || !!(cur && hit.page === cur),
       });
     }
     // We asked for blockLimit + 1; getting past the limit means more remain.
@@ -235,7 +255,14 @@ export function QuickSwitcher(): JSX.Element {
   createEffect(() => {
     const open = switcherOpen();
     if (open && !wasOpen) {
-      originPaneId = switcherEmbryo()?.paneId ?? focusedRouter().paneId;
+      const origin = focusedRouter();
+      originPaneId = switcherEmbryo()?.paneId ?? origin.paneId;
+      const originRoute = origin.route();
+      setCurrentPageScope(
+        switcherMode() === "current-page" && originRoute.kind === "page"
+          ? { name: originRoute.name, pageKind: originRoute.pageKind, path: originRoute.path }
+          : null,
+      );
       setQuery(switcherEmbryo()?.prefill ?? "");
       setSel(0);
       setSyntaxOpen(false);
@@ -268,7 +295,7 @@ export function QuickSwitcher(): JSX.Element {
         it.run();
         return;
       case "block":
-        openPageAtBlock(it.page, it.pageKind, it.blockId);
+        openPageAtBlock(it.page, it.pageKind, it.blockId, it.path);
         break;
     }
     closeSwitcher();
@@ -291,7 +318,7 @@ export function QuickSwitcher(): JSX.Element {
         router.openPage(it.name, "page");
         break;
       case "block":
-        router.openPageAtBlock(it.page, it.pageKind, it.blockId);
+        router.openPageAtBlock(it.page, it.pageKind, it.blockId, it.path);
         break;
       case "command":
         it.run();
@@ -315,8 +342,22 @@ export function QuickSwitcher(): JSX.Element {
         it.run();
         break;
       case "block":
-        openRouteInOtherPane({ kind: "page", name: it.page, pageKind: it.pageKind, block: it.blockId });
+        openRouteInOtherPane({ kind: "page", name: it.page, pageKind: it.pageKind, block: it.blockId, path: it.path });
         break;
+    }
+    closeSwitcher();
+  };
+
+  const chooseSidebar = (it: Extract<Item, { t: "page" | "block" }>) => {
+    recordChoice(it);
+    if (it.t === "page") {
+      openPageInSidebar(it.name, it.pageKind, it.path);
+    } else {
+      // Search results can target a page that is not loaded in the frontend.
+      // Stamp its id:: through the guarded ordinary page-save path before the
+      // durable sidebar item outlives this search session.
+      void persistBlockRefTarget(it.blockId, it.page, it.pageKind, it.path);
+      openBlockInSidebar({ uuid: it.blockId, page: it.page, pageKind: it.pageKind, path: it.path });
     }
     closeSwitcher();
   };
@@ -331,7 +372,9 @@ export function QuickSwitcher(): JSX.Element {
       it.path
         ? openInNewTab({ kind: "page", name: it.name, pageKind: it.pageKind, path: it.path })
         : openPageInNewTab(it.name, it.pageKind);
-    else if (it.t === "block") openPageInNewTab(it.page, it.pageKind, it.blockId);
+    else if (it.t === "block") openInNewTab({
+      kind: "page", name: it.page, pageKind: it.pageKind, block: it.blockId, path: it.path,
+    });
   };
 
   const createPageFile = async (name: string) => {
@@ -341,6 +384,7 @@ export function QuickSwitcher(): JSX.Element {
         null, // brand-new page — no baseline
         false
       );
+      bumpPageInventoryRev();
     } catch {
       // ignore — still navigate; the page will be created on first edit
     }
@@ -368,7 +412,9 @@ export function QuickSwitcher(): JSX.Element {
       e.preventDefault();
       const it = flat()[sel()];
       if (it) {
-        if (e.altKey && !switcherEmbryo()) void chooseOther(it);
+        const shiftOnly = e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+        if (shiftOnly && !switcherEmbryo() && (it.t === "page" || it.t === "block")) chooseSidebar(it);
+        else if (e.altKey && !switcherEmbryo()) void chooseOther(it);
         else choose(it);
       }
     } else if (e.key === "Escape") {
@@ -413,7 +459,7 @@ export function QuickSwitcher(): JSX.Element {
             ref={inputRef}
             class="switcher-input"
             type="text"
-            placeholder={commandsOnly() ? "Run a command…" : "Jump to page, search, or run a command…"}
+            placeholder={commandsOnly() ? "Run a command…" : currentPageOnly() ? "Search blocks in current page…" : "Jump to page, search, or run a command…"}
             value={query()}
             role="combobox"
             aria-autocomplete="list"
@@ -513,6 +559,7 @@ export function QuickSwitcher(): JSX.Element {
             <span><kbd>↵</kbd> open</span>
             <span><kbd>⌘⇧P</kbd> commands</span>
             <Show when={!commandsOnly()}>
+              <Show when={!currentPageOnly()}>
               <button
                 type="button"
                 class="switcher-syntax-toggle"
@@ -539,6 +586,7 @@ export function QuickSwitcher(): JSX.Element {
               >
                 Open search tab
               </button>
+              </Show>
             </Show>
           </div>
         </div>

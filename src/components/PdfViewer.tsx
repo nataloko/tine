@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, on, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
@@ -8,7 +8,15 @@ import { openPage, openPageAtBlock } from "../router";
 import { areaHighlightPosition, hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
 import { decideWheelZoomGesture, type WheelZoomGestureState } from "../zoom";
 import type { Highlight, Rect } from "../types";
-import { isMobilePlatform } from "../nativeChrome";
+import { isMac, isMobilePlatform } from "../nativeChrome";
+import { registerTransientLayer } from "../transientLayers";
+import {
+  isPdfOwnershipCurrent,
+  pdfOwnershipKey,
+  registerPdfParticipant,
+  trackPdfMutation,
+  type PdfOwnership,
+} from "../pdfOwnership";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -23,6 +31,103 @@ const COLOR_RGB: Record<string, string> = {
 const COLOR_RGBA: Record<string, string> = Object.fromEntries(
   Object.entries(COLOR_RGB).map(([k, v]) => [k, `rgba(${v}, 0.4)`])
 );
+const PDF_THEME_KEY = "ls-pdf-viewer-theme";
+const PDF_THEMES = ["light", "warm", "dark"] as const;
+type PdfTheme = (typeof PDF_THEMES)[number];
+
+interface PdfOutlineItem {
+  id: string;
+  label: string;
+  destination: string | unknown[] | null;
+  children: PdfOutlineItem[];
+}
+
+function storedPdfTheme(): PdfTheme {
+  try {
+    const stored = window.localStorage.getItem(PDF_THEME_KEY);
+    return PDF_THEMES.includes(stored as PdfTheme) ? stored as PdfTheme : "light";
+  } catch {
+    return "light";
+  }
+}
+
+function sanitizeOutlineItems(value: unknown, parentId = "outline"): PdfOutlineItem[] {
+  if (!Array.isArray(value)) return [];
+  const sanitized: PdfOutlineItem[] = [];
+  value.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== "object") return;
+    const raw = candidate as Record<string, unknown>;
+    const id = `${parentId}-${index}`;
+    const label = typeof raw.title === "string" && raw.title.trim() ? raw.title : "Untitled";
+    const destination = typeof raw.dest === "string" || Array.isArray(raw.dest) ? raw.dest : null;
+    sanitized.push({
+      id,
+      label,
+      destination,
+      children: sanitizeOutlineItems(raw.items, id),
+    });
+  });
+  return sanitized;
+}
+
+function isPdfPageRef(value: unknown): value is { num: number; gen: number } {
+  if (!value || typeof value !== "object") return false;
+  const ref = value as { num?: unknown; gen?: unknown };
+  return Number.isSafeInteger(ref.num) && Number(ref.num) >= 0 &&
+    Number.isSafeInteger(ref.gen) && Number(ref.gen) >= 0;
+}
+
+function PdfOutlineTree(props: {
+  items: PdfOutlineItem[];
+  nested?: boolean;
+  expanded: (id: string) => boolean;
+  toggle: (id: string) => void;
+  activate: (item: PdfOutlineItem) => void;
+}): JSX.Element {
+  return (
+    <ul class={props.nested ? "pdf-outline-children" : "pdf-outline-list"}>
+      <For each={props.items}>
+        {(item) => (
+          <li class="pdf-outline-item">
+            <div class="pdf-outline-row">
+              <Show
+                when={item.children.length}
+                fallback={<span class="pdf-outline-disclosure-spacer" aria-hidden="true" />}
+              >
+                <button
+                  type="button"
+                  class="pdf-outline-disclosure"
+                  aria-label={`${props.expanded(item.id) ? "Collapse" : "Expand"} ${item.label}`}
+                  aria-expanded={props.expanded(item.id)}
+                  onClick={() => props.toggle(item.id)}
+                >
+                  {props.expanded(item.id) ? "▾" : "▸"}
+                </button>
+              </Show>
+              <button
+                type="button"
+                class="pdf-outline-label"
+                disabled={item.destination === null}
+                onClick={() => props.activate(item)}
+              >
+                {item.label}
+              </button>
+            </div>
+            <Show when={item.children.length && props.expanded(item.id)}>
+              <PdfOutlineTree
+                items={item.children}
+                nested
+                expanded={props.expanded}
+                toggle={props.toggle}
+                activate={props.activate}
+              />
+            </Show>
+          </li>
+        )}
+      </For>
+    </ul>
+  );
+}
 
 // Resource ceilings are deliberately generous for books, scanned documents, and
 // architectural drawings, but bounded below the point where pdf.js/WebView canvas
@@ -41,11 +146,24 @@ export const PDF_FIND_TEXT_CACHE_BYTES = isMobilePlatform ? 4 * 1024 * 1024 : 8 
 export const PDF_FIND_PAGE_TEXT_BYTES = 1024 * 1024;
 export const PDF_FIND_MATCH_CAP = 10_000;
 
+export function isPdfAreaModifier(
+  event: Pick<MouseEvent, "metaKey" | "shiftKey">,
+  mac: boolean
+): boolean {
+  return mac ? event.metaKey : event.shiftKey;
+}
+
 interface Pending {
   page: number;
   rects: Rect[];
   bounding: Rect;
   text: string;
+}
+
+interface PendingArea {
+  page: number;
+  wrap: HTMLElement;
+  rect: Rect;
 }
 
 /**
@@ -54,16 +172,24 @@ interface Pending {
  * switching assets still tears down every document-local cache and pdf.js task.
  */
 export function KeyedPdfViewer(props: { target: () => PdfTarget | null }): JSX.Element {
+  const resourceKey = () => {
+    const target = props.target();
+    return target ? `${pdfOwnershipKey(target.owner)}:${target.filename}` : null;
+  };
   return (
-    <Show when={props.target()?.filename} keyed>
-      {(filename) => (
-        <PdfViewer
-          filename={filename}
-          label={props.target()?.label ?? filename}
-          page={props.target()?.page}
-          navigation={props.target}
-        />
-      )}
+    <Show when={resourceKey()} keyed>
+      {(_key) => {
+        const target = props.target()!;
+        return (
+          <PdfViewer
+            filename={target.filename}
+            label={props.target()?.label ?? target.filename}
+            owner={target.owner}
+            page={props.target()?.page}
+            navigation={props.target}
+          />
+        );
+      }}
     </Show>
   );
 }
@@ -71,10 +197,24 @@ export function KeyedPdfViewer(props: { target: () => PdfTarget | null }): JSX.E
 export function PdfViewer(props: {
   filename: string;
   label: string;
+  owner: PdfOwnership;
   page?: number;
   navigation?: () => PdfTarget | null;
 }): JSX.Element {
+  const owner = props.owner;
+  const instanceStem = `pdf-viewer-${createUniqueId()}`;
+  const findLayerId = `${instanceStem}-find`;
+  const highlightMenuLayerId = `${instanceStem}-highlight-menu`;
+  const settingsLayerId = `${instanceStem}-settings`;
+  const outlineLayerId = `${instanceStem}-outline`;
   let scrollRef!: HTMLDivElement;
+  let findTriggerEl: HTMLButtonElement | undefined;
+  let findRootEl: HTMLDivElement | undefined;
+  let highlightMenuRootEl: HTMLDivElement | undefined;
+  let settingsTriggerEl: HTMLButtonElement | undefined;
+  let settingsRootEl: HTMLDivElement | undefined;
+  let outlineTriggerEl: HTMLButtonElement | undefined;
+  let outlineRootEl: HTMLDivElement | undefined;
   const pageEls: Record<number, HTMLDivElement> = {};
   const textLayers: Record<number, HTMLDivElement> = {};
   const hlLayers: Record<number, HTMLDivElement> = {};
@@ -109,6 +249,12 @@ export function PdfViewer(props: {
   const [findCount, setFindCount] = createSignal(0);
   const [findCur, setFindCur] = createSignal(0);
   const [findTruncated, setFindTruncated] = createSignal(false);
+  const [theme, setTheme] = createSignal<PdfTheme>(storedPdfTheme());
+  const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [outlineOpen, setOutlineOpen] = createSignal(false);
+  const [outlineReady, setOutlineReady] = createSignal(false);
+  const [outlineItems, setOutlineItems] = createSignal<PdfOutlineItem[]>([]);
+  const [expandedOutlineIds, setExpandedOutlineIds] = createSignal<Set<string>>(new Set());
   let findMatches: { page: number }[] = [];
   const pageTextCache: Record<number, string> = {};
   const pageTextLru: number[] = [];
@@ -117,6 +263,7 @@ export function PdfViewer(props: {
   let findDebounce: number | undefined;
   let findInputEl: HTMLInputElement | undefined;
   let pending: Pending | null = null;
+  let pendingArea: PendingArea | null = null;
   // The highlight ids last synced to disk (load baseline, refreshed after each
   // successful write) — sent so the backend's 3-way merge honors deletions while
   // preserving externally-added highlights.
@@ -125,6 +272,39 @@ export function PdfViewer(props: {
   let disposed = false;
   let navigationToken = 0;
   let activeHighlightId: string | undefined;
+
+  const chooseTheme = (next: PdfTheme) => {
+    setTheme(next);
+    try {
+      window.localStorage.setItem(PDF_THEME_KEY, next);
+    } catch {
+      // The current mount still changes presentation when storage is unavailable.
+    }
+  };
+
+  const toggleOutlineItem = (id: string) => {
+    setExpandedOutlineIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  async function loadOutline(doc: pdfjs.PDFDocumentProxy) {
+    setOutlineReady(false);
+    setOutlineItems([]);
+    setExpandedOutlineIds(new Set<string>());
+    let loaded: unknown = [];
+    try {
+      loaded = await doc.getOutline();
+    } catch {
+      loaded = [];
+    }
+    if (disposed || pdfDoc !== doc) return;
+    setOutlineItems(sanitizeOutlineItems(loaded));
+    setOutlineReady(true);
+  }
 
   // Per-page unscaled dimensions (index 1..N), fetched once so we can size every
   // page wrapper up front — that gives correct scroll geometry without having to
@@ -208,7 +388,7 @@ export function PdfViewer(props: {
   // Persist the current highlight set to disk. Returns false (and toasts) without
   // mutating the on-disk baseline if anything failed, so the caller can revert the
   // optimistic UI change rather than show a highlight that didn't actually save.
-  const persist = async (): Promise<boolean> => {
+  const persistOwned = async (): Promise<boolean> => {
     const hlsName = hlsPageName(props.filename);
     // If the notes (hls__) page is open with unsaved edits, get them onto disk
     // FIRST so the backend merges against them. Otherwise this write reads a disk
@@ -240,6 +420,16 @@ export function PdfViewer(props: {
     return true;
   };
 
+  const persist = async (): Promise<boolean> => {
+    try {
+      return await trackPdfMutation(owner, persistOwned);
+    } catch {
+      // A retired owner is an expected cancellation path.  The graph switch
+      // already drained before retirement; never retry against a later binding.
+      return false;
+    }
+  };
+
   const copyCreatedHighlightRef = async (id: string) => {
     await backend().writeText(`((${id}))`);
     pushToast("Copied highlight ref", "success");
@@ -252,12 +442,12 @@ export function PdfViewer(props: {
     return persist();
   };
   const copyExistingHighlightRef = async (id: string) => {
-    setMenu(null);
+    closeHighlightMenu();
     if (!(await ensureExistingHighlightRef(id))) return;
     await copyCreatedHighlightRef(id);
   };
   const openExistingHighlightReferences = async (id: string) => {
-    setMenu(null);
+    closeHighlightMenu();
     if (!(await ensureExistingHighlightRef(id))) return;
     requestBlockReferences(id);
     openPageAtBlock(hlsPageName(props.filename), "page", id);
@@ -266,41 +456,58 @@ export function PdfViewer(props: {
   const deleteHighlight = async (id: string) => {
     const prev = highlights();
     setHighlights(highlights().filter((h) => h.id !== id));
-    setMenu(null);
+    closeHighlightMenu();
     if (!(await persist())) setHighlights(prev); // restore — it's still on disk
   };
   const recolorHighlight = async (id: string, color: string) => {
     const prev = highlights();
     setHighlights(highlights().map((h) => (h.id === id ? { ...h, color } : h)));
-    setMenu(null);
+    closeHighlightMenu();
     if (!(await persist())) setHighlights(prev); // restore the previous color
   };
+
+  function closeHighlightMenu() {
+    pendingArea = null;
+    setMenu(null);
+  }
   const clampScale = (s: number) => Math.min(4, Math.max(0.2, s));
   const fitWidthScale = () => (dims[1] ? clampScale((scrollRef.clientWidth - 32) / dims[1].w) : 1);
   const fitHeightScale = () => (dims[1] ? clampScale((scrollRef.clientHeight - 24) / dims[1].h) : 1);
 
-  const flushViewState = async () => {
+  const flushViewState = async (): Promise<boolean> => {
     if (viewStateTimer !== undefined) {
       clearTimeout(viewStateTimer);
       viewStateTimer = undefined;
     }
     const next = pendingViewState;
-    pendingViewState = null;
-    if (!next || (viewStateBaseline?.page === next.page && viewStateBaseline?.scale === next.scale)) return;
+    if (!next || (viewStateBaseline?.page === next.page && viewStateBaseline?.scale === next.scale)) {
+      pendingViewState = null;
+      return true;
+    }
     try {
-      await trackAssetWrite(backend().writePdfViewState(props.filename, next.page, next.scale));
+      await trackPdfMutation(owner, () =>
+        trackAssetWrite(backend().writePdfViewState(props.filename, next.page, next.scale))
+      );
       viewStateBaseline = next;
+      if (pendingViewState === next) pendingViewState = null;
+      return true;
     } catch (error) {
-      pushToast(`Couldn't save PDF view position. (${String(error)})`, "error");
+      if (isPdfOwnershipCurrent(owner)) {
+        pushToast(`Couldn't save PDF view position. (${String(error)})`, "error");
+      }
+      return false;
     }
   };
 
   const scheduleViewState = (page: number, nextScale: number) => {
+    if (!isPdfOwnershipCurrent(owner)) return;
     if (!viewStateReady || !Number.isFinite(nextScale) || nextScale <= 0) return;
     if (viewStateBaseline?.page === page && viewStateBaseline?.scale === nextScale) return;
     pendingViewState = { page, scale: nextScale };
     if (viewStateTimer !== undefined) clearTimeout(viewStateTimer);
-    viewStateTimer = window.setTimeout(() => void flushViewState(), 4000);
+    viewStateTimer = window.setTimeout(() => {
+      if (isPdfOwnershipCurrent(owner)) void flushViewState();
+    }, 4000);
   };
 
   function failPdf(message: string) {
@@ -522,7 +729,7 @@ export function PdfViewer(props: {
     const target = props.navigation?.();
     return target?.filename === props.filename
       ? target
-      : { filename: props.filename, label: props.label, page: props.page };
+      : { filename: props.filename, label: props.label, owner, page: props.page };
   }
 
   async function navigateToTarget(target: PdfTarget) {
@@ -753,6 +960,32 @@ export function PdfViewer(props: {
     for (const n of visible) void renderPage(n);
   }
 
+  function cancelOwnedWork() {
+    disposed = true;
+    findToken++;
+    navigationToken++;
+    io?.disconnect();
+    io = null;
+    clearTimeout(zoomTimer);
+    clearTimeout(textTimer);
+    clearTimeout(findDebounce);
+    if (viewStateTimer !== undefined) {
+      clearTimeout(viewStateTimer);
+      viewStateTimer = undefined;
+    }
+    if (scrollRaf !== undefined) {
+      cancelAnimationFrame(scrollRaf);
+      scrollRaf = undefined;
+    }
+    for (const k of Object.keys(tasks)) tasks[Number(k)]?.cancel();
+    window.removeEventListener("mousemove", onAreaMove);
+    window.removeEventListener("mouseup", onAreaUp);
+    areaDrag?.band.remove();
+    areaDrag = null;
+  }
+
+  let unregisterPdfParticipant = () => {};
+
   onMount(async () => {
     setLoadError(null);
     let restoredPage: number | null = null;
@@ -801,6 +1034,9 @@ export function PdfViewer(props: {
       failPdf(`This PDF reports an unsafe page count (${pdfDoc.numPages}); at most ${MAX_PDF_PAGES} pages can be displayed.`);
       return;
     }
+    // Outline parsing can be slow on large PDFs. Start it once per document,
+    // but never await it on the page-one/layout path that controls first paint.
+    void loadOutline(pdfDoc);
     // Measure ONLY page 1 up front (for fit-width + as the size estimate for the
     // rest). Every other page is sized from that estimate and corrected to its
     // real size the first time it renders — so first paint doesn't wait on N
@@ -837,21 +1073,21 @@ export function PdfViewer(props: {
   });
 
   onCleanup(() => {
-    disposed = true;
-    findToken++;
-    io?.disconnect();
-    clearTimeout(zoomTimer);
-    clearTimeout(textTimer);
-    clearTimeout(findDebounce);
-    if (viewStateTimer !== undefined || pendingViewState) void flushViewState();
-    if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
+    // Ordinary viewer close remains in the same graph and must persist its last
+    // location. Graph switch retired the owner first, so this branch is skipped
+    // there after the explicit awaited drain.
+    if (isPdfOwnershipCurrent(owner) && pendingViewState) void flushViewState();
+    unregisterPdfParticipant();
+    cancelOwnedWork();
+    setOutlineOpen(false);
+    setSettingsOpen(false);
+    setOutlineItems([]);
+    setOutlineReady(false);
+    setExpandedOutlineIds(new Set<string>());
     releaseAllCanvases();
-    for (const k of Object.keys(tasks)) tasks[Number(k)]?.cancel();
     const doc = pdfDoc;
     pdfDoc = null;
     if (doc) void doc.destroy().catch(() => {});
-    window.removeEventListener("mousemove", onAreaMove);
-    window.removeEventListener("mouseup", onAreaUp);
   });
 
   // Zoom changes: relayout + lazy re-raster of visible pages only.
@@ -976,10 +1212,11 @@ export function PdfViewer(props: {
   });
 
   const onMouseUp = (e: MouseEvent) => {
-    // An area drag (toggle or Ctrl/⌘) owns the mouse; don't also make a text
+    // An area drag (toggle or platform modifier) owns the mouse; don't also make a text
     // highlight. `areaDrag` is still set here — onMouseUp (on .pdf-scroll) runs
     // before the window-level onAreaUp that clears it.
     if (areaMode() || areaDrag) return;
+    pendingArea = null;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.toString().trim()) {
       setMenu(null);
@@ -1039,7 +1276,7 @@ export function PdfViewer(props: {
     const prev = highlights();
     setHighlights([...highlights(), h]);
     window.getSelection()?.removeAllRanges();
-    setMenu(null);
+    closeHighlightMenu();
     pending = null;
     if (!(await persist())) setHighlights(prev); // revert the optimistic add on failure
     else await copyCreatedHighlightRef(h.id);
@@ -1049,28 +1286,34 @@ export function PdfViewer(props: {
   // Rubber-band a rectangle over a single page; on release, crop that region of
   // the page canvas to a PNG (saved in OG's `assets/<key>/<page>_<id>_<stamp>.png`
   // layout) and create an area highlight (`text: null`, `image: <stamp>`).
-  // Area capture starts when the toolbar toggle is on OR the user holds
-  // Ctrl/⌘ while dragging (a quick modifier alternative to the button).
-  const areaModifier = (e: MouseEvent) => e.ctrlKey || e.metaKey;
+  // Area capture starts when the toolbar toggle is on OR the user holds the OG
+  // platform modifier: Command on macOS, Shift elsewhere.
+  const areaModifier = (e: MouseEvent) => isPdfAreaModifier(e, isMac);
+  const areaPoint = (wrap: HTMLElement, e: MouseEvent) => {
+    const base = wrap.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(base.width, e.clientX - base.left)),
+      y: Math.max(0, Math.min(base.height, e.clientY - base.top)),
+    };
+  };
   const onAreaDown = (e: MouseEvent) => {
     if ((!areaMode() && !areaModifier(e)) || e.button !== 0) return;
     const wrap = (e.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
     if (!wrap) return;
     e.preventDefault();
-    setMenu(null);
-    const base = wrap.getBoundingClientRect();
+    pending = null;
+    closeHighlightMenu();
+    const start = areaPoint(wrap, e);
     const band = document.createElement("div");
     band.className = "pdf-area-band";
     wrap.appendChild(band);
-    areaDrag = { page: Number(wrap.dataset.page), wrap, startX: e.clientX - base.left, startY: e.clientY - base.top, band };
+    areaDrag = { page: Number(wrap.dataset.page), wrap, startX: start.x, startY: start.y, band };
     window.addEventListener("mousemove", onAreaMove);
     window.addEventListener("mouseup", onAreaUp, { once: true });
   };
   const onAreaMove = (e: MouseEvent) => {
     if (!areaDrag) return;
-    const base = areaDrag.wrap.getBoundingClientRect();
-    const x = e.clientX - base.left;
-    const y = e.clientY - base.top;
+    const { x, y } = areaPoint(areaDrag.wrap, e);
     Object.assign(areaDrag.band.style, {
       left: `${Math.min(x, areaDrag.startX)}px`,
       top: `${Math.min(y, areaDrag.startY)}px`,
@@ -1084,10 +1327,11 @@ export function PdfViewer(props: {
     areaDrag = null;
     if (!drag) return;
     drag.band.remove();
-    const base = drag.wrap.getBoundingClientRect();
+    const { x, y } = areaPoint(drag.wrap, e);
+    const cssWidth = Math.abs(x - drag.startX);
+    const cssHeight = Math.abs(y - drag.startY);
+    if (cssWidth <= 10 || cssHeight <= 10) return;
     const s = scale();
-    const x = e.clientX - base.left;
-    const y = e.clientY - base.top;
     // Rect in unscaled PDF coordinates (the same space highlight rects are stored in).
     const rect: Rect = {
       left: Math.min(x, drag.startX) / s,
@@ -1097,8 +1341,9 @@ export function PdfViewer(props: {
       source_width: dims[drag.page].w,
       source_height: dims[drag.page].h,
     };
-    if (rect.width < 4 || rect.height < 4) return; // ignore a tiny/accidental drag
-    void createAreaHighlight(drag.page, drag.wrap, rect);
+    pendingArea = { page: drag.page, wrap: drag.wrap, rect };
+    setMenu({ x: e.clientX, y: e.clientY });
+    setAreaMode(false);
   };
 
   // Crop the page canvas to `rect` (unscaled coords) → PNG bytes.
@@ -1129,11 +1374,16 @@ export function PdfViewer(props: {
     return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
   }
 
-  const createAreaHighlight = async (page: number, wrap: HTMLElement, rect: Rect) => {
+  const createAreaHighlightOwned = async (color: string): Promise<boolean> => {
+    const area = pendingArea;
+    if (!area) return true;
+    pendingArea = null;
+    setMenu(null);
+    const { page, wrap, rect } = area;
     const bytes = await cropArea(page, wrap, rect);
     if (!bytes) {
       pushToast("Couldn't capture that region — try again.", "error");
-      return;
+      return false;
     }
     const id = crypto.randomUUID();
     const stamp = Date.now();
@@ -1144,20 +1394,33 @@ export function PdfViewer(props: {
       );
     } catch (e) {
       pushToast(`Couldn't save the area image — try again. (${String(e)})`, "error");
-      return;
+      return false;
     }
     const h: Highlight = {
       id,
       page,
       position: areaHighlightPosition(page, rect),
-      color: "yellow",
+      color,
       text: null,
       image: stamp,
     };
     const prev = highlights();
     setHighlights([...prev, h]);
-    if (!(await persist())) setHighlights(prev); // revert the optimistic add on failure
-    else await copyCreatedHighlightRef(h.id);
+    if (!(await persistOwned())) {
+      setHighlights(prev); // revert the optimistic add on failure
+      return false;
+    }
+    await copyCreatedHighlightRef(h.id);
+    return true;
+  };
+
+  const createAreaHighlight = async (color: string) => {
+    try {
+      await trackPdfMutation(owner, () => createAreaHighlightOwned(color));
+    } catch {
+      // Ownership retirement cancels a not-yet-started area mutation.  It must
+      // not be retried after another graph is bound.
+    }
   };
 
   // --- page navigation -----------------------------------------------------
@@ -1165,6 +1428,31 @@ export function PdfViewer(props: {
     const np = numPages() || 1;
     const p = Math.max(1, Math.min(np, Math.floor(n) || 1));
     if (pageEls[p]) scrollRef.scrollTop = pageEls[p].offsetTop;
+  };
+  const activateOutlineItem = async (item: PdfOutlineItem) => {
+    const doc = pdfDoc;
+    if (!doc || item.destination === null) return;
+    let destination: unknown = item.destination;
+    if (typeof destination === "string") {
+      try {
+        destination = await doc.getDestination(destination);
+      } catch {
+        return;
+      }
+    }
+    if (disposed || pdfDoc !== doc || !Array.isArray(destination) || !destination.length) return;
+    const target = destination[0];
+    if (Number.isSafeInteger(target) && Number(target) >= 0) {
+      scrollToPage(Number(target) + 1);
+      return;
+    }
+    if (!isPdfPageRef(target)) return;
+    try {
+      const index = await doc.getPageIndex(target);
+      if (!disposed && pdfDoc === doc && Number.isSafeInteger(index) && index >= 0) scrollToPage(index + 1);
+    } catch {
+      // A broken outline destination is ignored without activating its URL.
+    }
   };
   const commitPageField = () => {
     const v = parseInt(pageField(), 10);
@@ -1372,10 +1660,98 @@ export function PdfViewer(props: {
     setFindOpen(false);
     window.getSelection()?.removeAllRanges();
   };
+  createEffect(() => {
+    if (!findOpen()) return;
+    const unregister = registerTransientLayer({
+      id: findLayerId,
+      root: () => findRootEl ?? null,
+      trigger: () => findTriggerEl ?? null,
+      dismiss: () => {
+        closeFind();
+        return true;
+      },
+    });
+    onCleanup(unregister);
+  });
+  createEffect(() => {
+    if (!settingsOpen()) return;
+    const unregister = registerTransientLayer({
+      id: settingsLayerId,
+      root: () => settingsRootEl ?? null,
+      trigger: () => settingsTriggerEl ?? null,
+      dismiss: () => {
+        setSettingsOpen(false);
+        return true;
+      },
+    });
+    // The shared registry orders Escape/Back and pointer activation; individual
+    // anchored popups still own their outside-pointer dismissal.
+    const dismissOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !settingsRootEl?.contains(target) && !settingsTriggerEl?.contains(target)) {
+        setSettingsOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", dismissOnOutsidePointer, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", dismissOnOutsidePointer, true);
+      unregister();
+    });
+  });
+  createEffect(() => {
+    if (!outlineOpen()) return;
+    const unregister = registerTransientLayer({
+      id: outlineLayerId,
+      root: () => outlineRootEl ?? null,
+      trigger: () => outlineTriggerEl ?? null,
+      dismiss: () => {
+        setOutlineOpen(false);
+        return true;
+      },
+    });
+    // See the settings popup above: outside-click is intentionally local while
+    // the registry remains the single Escape/Back ordering authority.
+    const dismissOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !outlineRootEl?.contains(target) && !outlineTriggerEl?.contains(target)) {
+        setOutlineOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", dismissOnOutsidePointer, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", dismissOnOutsidePointer, true);
+      unregister();
+    });
+  });
+  createEffect(() => {
+    if (!menu()) return;
+    const unregister = registerTransientLayer({
+      id: highlightMenuLayerId,
+      root: () => highlightMenuRootEl ?? null,
+      dismiss: () => {
+        closeHighlightMenu();
+        return true;
+      },
+    });
+    const dismissPendingAreaOnOutsidePointer = (event: PointerEvent) => {
+      if (pendingArea && !highlightMenuRootEl?.contains(event.target as Node)) closeHighlightMenu();
+    };
+    document.addEventListener("pointerdown", dismissPendingAreaOnOutsidePointer, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", dismissPendingAreaOnOutsidePointer, true);
+      unregister();
+    });
+  });
+
+  unregisterPdfParticipant = registerPdfParticipant(owner, {
+    flush: flushViewState,
+    cancel: cancelOwnedWork,
+  });
 
   return (
     <div
       class="pdf-viewer"
+      data-theme={theme()}
       data-pdf-filename={props.filename}
       data-pdf-highlight-target={props.navigation?.()?.highlightId}
       data-pdf-ready={ready() ? "true" : "false"}
@@ -1414,6 +1790,7 @@ export function PdfViewer(props: {
             </button>
           </div>
           <button
+            ref={(el) => (findTriggerEl = el)}
             class="icon-btn"
             classList={{ active: findOpen() }}
             title="Find in document (Ctrl+F)"
@@ -1439,7 +1816,7 @@ export function PdfViewer(props: {
           <button
             class="icon-btn"
             classList={{ active: areaMode() }}
-            title="Area highlight — drag a rectangle to capture a region as an image"
+            title={`Area highlight (${isMac ? "⌘" : "Shift"}) — drag a rectangle to capture a region as an image`}
             onClick={() => setAreaMode((v) => !v)}
           >
             ▭
@@ -1451,13 +1828,82 @@ export function PdfViewer(props: {
           >
             Notes
           </button>
+          <button
+            ref={(el) => (outlineTriggerEl = el)}
+            type="button"
+            class="icon-btn"
+            classList={{ active: outlineOpen() }}
+            title="Outline"
+            aria-label="Outline"
+            aria-expanded={outlineOpen()}
+            onClick={() => {
+              setSettingsOpen(false);
+              setOutlineOpen((open) => !open);
+            }}
+          >
+            ☷
+          </button>
+          <button
+            ref={(el) => (settingsTriggerEl = el)}
+            type="button"
+            class="icon-btn"
+            classList={{ active: settingsOpen() }}
+            title="More settings"
+            aria-label="More settings"
+            aria-expanded={settingsOpen()}
+            onClick={() => {
+              setOutlineOpen(false);
+              setSettingsOpen((open) => !open);
+            }}
+          >
+            ⋯
+          </button>
           <button class="icon-btn" title="Close PDF" onClick={closePdf}>
             ✕
           </button>
         </div>
       </div>
+      <Show when={settingsOpen()}>
+        <div ref={(el) => (settingsRootEl = el)} class="pdf-settings-menu" role="dialog" aria-label="PDF settings">
+          <div class="pdf-settings-heading">Theme</div>
+          <div class="pdf-theme-choices" role="group" aria-label="PDF theme">
+            <For each={PDF_THEMES}>
+              {(choice) => {
+                const label = `${choice[0].toUpperCase()}${choice.slice(1)}`;
+                return (
+                  <button
+                    type="button"
+                    class="pdf-theme-choice"
+                    classList={{ active: theme() === choice }}
+                    aria-label={`${label} PDF theme`}
+                    aria-pressed={theme() === choice}
+                    onClick={() => chooseTheme(choice)}
+                  >
+                    {label}
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+        </div>
+      </Show>
+      <Show when={outlineOpen()}>
+        <div ref={(el) => (outlineRootEl = el)} class="pdf-outline-panel" role="dialog" aria-label="Document outline">
+          <div class="pdf-outline-heading">Outline</div>
+          <Show when={outlineReady()} fallback={<div class="pdf-outline-loading">Loading outline…</div>}>
+            <Show when={outlineItems().length} fallback={<div class="pdf-outline-empty">No outlines</div>}>
+              <PdfOutlineTree
+                items={outlineItems()}
+                expanded={(id) => expandedOutlineIds().has(id)}
+                toggle={toggleOutlineItem}
+                activate={(item) => void activateOutlineItem(item)}
+              />
+            </Show>
+          </Show>
+        </div>
+      </Show>
       <Show when={findOpen()}>
-        <div class="pdf-find-bar">
+        <div ref={(el) => (findRootEl = el)} class="pdf-find-bar">
           <input
             ref={(el) => (findInputEl = el)}
             class="pdf-find-input"
@@ -1468,9 +1914,6 @@ export function PdfViewer(props: {
               if (e.key === "Enter") {
                 e.preventDefault();
                 nextMatch(e.shiftKey ? -1 : 1);
-              } else if (e.key === "Escape") {
-                e.preventDefault();
-                closeFind();
               }
             }}
           />
@@ -1507,7 +1950,11 @@ export function PdfViewer(props: {
         />
       </Show>
       <Show when={menu()}>
-        <div class="pdf-color-menu" style={{ left: `${menu()!.x}px`, top: `${menu()!.y + 8}px` }}>
+        <div
+          ref={(el) => (highlightMenuRootEl = el)}
+          class="pdf-color-menu"
+          style={{ left: `${menu()!.x}px`, top: `${menu()!.y + 8}px` }}
+        >
           <For each={COLORS}>
             {(c) => (
               <button
@@ -1517,6 +1964,7 @@ export function PdfViewer(props: {
                   e.preventDefault();
                   const m = menu()!;
                   if (m.id) void recolorHighlight(m.id, c); // recolor existing
+                  else if (pendingArea) void createAreaHighlight(c); // create area after explicit color choice
                   else void createHighlight(c); // create new
                 }}
               />

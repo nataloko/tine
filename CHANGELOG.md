@@ -8,6 +8,155 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-17
+
+### Added
+
+- Begin an experimental Tine-native plugin platform: capability-limited WebAssembly
+  guests, host-owned contribution points, explicit desktop/mobile declarations, and
+  a public-registry safety model. This is not Logseq or Obsidian API compatibility.
+- Add disabled-by-default local and signed-community installation, explicit
+  capability review and enable/disable controls, registry revocations, immutable
+  manifest/WASM/report digests, expandable safety findings, automatic-versus-manual
+  publication labels, and desktop/mobile plugin catalogue layouts.
+- Publish the first AI-primary examples (bullet threading, query-filter shortcuts,
+  and a Logseq heading-shortcut behavioral port), a Rust guest SDK/template,
+  deterministic package checker, and developer/security documentation.
+- Add a credential-separated local registry auditor: rootless hostile builds,
+  no-tools Codex source review, quarantine/manual approval, signed catalogue
+  publishing, and symlink/path/digest fail-closed checks.
+- Add per-version plugin uninstall controls that remove only app-local packages
+  and clear plugin settings after the last installed version.
+- Add plugin API 0.2 declarative settings: bounded host-rendered controls,
+  device-local validated persistence, live settings-change events, reset behavior,
+  nested plugin detail pages, and immutable behavioral-port provenance.
+- Add a separate theme API 0.1 with inert token-only packages, strict literal-color
+  validation, local and signed-catalogue installation, immutable provenance, and
+  Appearance-owned selection that remains subordinate to graph `custom.css`.
+- Add a machine-checkable port-gap report and a current popular-plugin compatibility
+  matrix so AI-assisted ports must distinguish faithful subsets, reusable host API
+  requests, core features, and inherently privileged integrations.
+- Let host-rendered decoration plugins respond live to their declarative settings,
+  and let command plugins declare ordinary remappable default shortcuts without
+  receiving keyboard, DOM, or global-input authority.
+- **Search can now stay on the current page or send a result to the sidebar.**
+  Ctrl/Cmd-Shift-K searches only blocks owned by the focused routed page,
+  including collapsed descendants, while Shift-Enter in Ctrl-K opens a page or
+  block result in the right sidebar without navigating away.
+- **Page titles now expose a discoverable, accessible actions menu.** The
+  ellipsis opens the same file, navigation, copy, export, properties, rename,
+  carry, and delete actions as title right-click; keyboard navigation, touch
+  geometry, and focus restoration are built in. This is the bounded first page
+  menu phase of GH #182.
+- **Children-backed Sheet fields can now be renamed in place.** Right-click a
+  column header or double-click its name to update the local schema and its
+  dependent filter, grouping, aggregate, and formula configuration as one
+  undoable, persistence-safe edit. Ambiguous or colliding renames are rejected.
+  (GH #175)
+- **Linked References can now be filtered without loading complete subtrees.**
+  The panel combines bounded content search with page, tag, property, and task
+  facets while preserving reference counts and lazy result expansion. (GH #173)
+
+### Changed
+
+- **Broad CI now runs once for a frozen release candidate instead of after each
+  merge.** Pull requests retain a lightweight Linux validation path, while
+  Windows, Android, performance, UI E2E, and Flatpak proofs remain manually
+  dispatchable between releases. Release packaging fails closed unless all full
+  CI jobs succeeded on the exact candidate commit.
+- **F-Droid builds now meet the store's no-runtime-code-download policy.** They
+  omit the network-backed community plugin and theme catalogue. The
+  capability-limited plugin host, local plugin/theme package installation,
+  already-installed plugins, and built-in themes remain available; other Tine
+  distribution builds retain the signed community catalogue.
+
+### Fixed
+
+- **Explicitly selected pages and blocks now keep their exact physical file
+  owner through follow-on actions.** Ctrl-K, page titles, block zoom, sidebar,
+  tabs, Recent, friendly query results, menus, and session restore preserve the
+  selected graph-relative path. Stale or ambiguous rename/delete targets fail
+  closed instead of touching a same-name sibling, while older logical/pathless
+  links, Favorites, and sessions remain compatible.
+- **Signed plugin registry cache updates are now failure-atomic and revocations
+  remain durable.** The verified index and signature share one native envelope,
+  legacy split keys migrate through a guarded transaction, torn or unreadable
+  cache state holds guest activation, and cached/live revocations clear the
+  installed enable bit before any guest bytes or runtime can be used.
+- **Delayed plugin results now stay with the graph and editor that invoked them.**
+  Switching or refreshing a graph while a command or slash completion is pending
+  drops the stale result, even when the new graph contains the same block UUID
+  and text, without disabling the healthy plugin worker.
+- **Plugin launch verification now works from a standalone Tine checkout.**
+  Documentation launchers use the checkout's own Vite and bundled community
+  plugins instead of depending on an untracked sibling development repository.
+- **Cached signed plugin and theme revocations now take effect before startup
+  activation.** A stalled catalogue refresh is abort-bounded, one broken plugin
+  no longer blocks the rest, and a newer verified revocation immediately stops
+  an affected active plugin without restoring older cached state afterward.
+- **Pending PDF work now stays with the graph that owns it during graph changes.**
+  In-place graph switches and safe close drain the old graph's PDF work first,
+  stale callbacks cannot write into the new graph, and drain failures abort the
+  transition with the old graph still open.
+- **PDF area selection now follows Logseq's platform gesture and confirmation
+  flow.** Shift-drag on Linux and Windows, or Command-drag on macOS, must exceed
+  10 pixels in both dimensions and opens the color chooser before anything is
+  written; dismissing the chooser leaves the graph unchanged.
+- **The PDF reader now has persistent Light, Warm, and Dark themes plus document
+  outlines.** Nested outline entries expand independently and navigate through
+  both named and explicit PDF destinations, while theme preference remains
+  application-local rather than entering graph or annotation files.
+- **Search now treats canonically equivalent Unicode spellings as identical.**
+  Composed and decomposed page names, aliases, and block text share membership,
+  exact-page detection, ranking identity, and source-accurate highlights without
+  adding accent folding or transliteration.
+- **Markdown page-header properties are now directly editable and stay
+  unbulleted on disk.** Clicking an existing header, or crossing into it with
+  the arrow keys, uses the ordinary block editor; newly authored custom and
+  Unicode properties reopen as canonical Logseq page metadata without changing
+  body blocks or unsafe preambles. (GH #163)
+- **Linked References and list-query results now keep deep matches concise and
+  understandable.** Each hit shows its final ancestor context, while deeper
+  descendant branches start folded in a view-local copy that never changes the
+  source block's collapse state.
+- **Mixed-case page links now open the existing canonical page.** Wiki links,
+  tags, aliases, tabs, and sidebar navigation share the same case-insensitive
+  page identity instead of opening a blank, non-editable case variant. (GH #179)
+- **Bare `tags`, `alias`, and `aliases` property values now create Linked
+  References.** Page and block properties use the same canonical reference
+  evidence as wrapped page links and hashtags, including after an in-place edit.
+  (GH #180)
+- **Selection formatting no longer wraps selected outer spaces.** Bold, italic,
+  strike, and highlight actions keep leading and trailing selected whitespace
+  outside their Markdown or Org delimiters, whether invoked from the keyboard
+  or toolbar. (GH #178)
+- **Nested WebView scroll regions no longer overscroll the Tine window.** Scroll
+  gestures stop at the viewport boundary while panes, sidebars, and drawers
+  retain their own scrolling. (GH #177)
+- **Every foreground page activation now updates graph-global Recent pages.**
+  Opening or focusing a page through the main pane, split panes, sidebar, or
+  history uses the same RECENT ordering instead of tracking only some routes.
+  (GH #170)
+- **Simple queries now match Logseq's membership and journal-date semantics.**
+  Bare page references include inherited page membership, date bounds are
+  inclusive and order-independent, and Search preserves the same result
+  identities as List, Table, and Board for supported simple queries.
+- **Line-leading inline code containing `::` remains visible code.** It is no
+  longer misclassified as a property drawer, while actual properties and
+  references outside the code span keep their existing behavior.
+- **Escape and Android Back now close every visible popup before the surface
+  beneath it.** Calendar Jump, selection formatting overflow, PDF Find and
+  highlight actions, QueryBuilder menus, and formula value pickers all join the
+  shared one-gesture/one-layer dismissal order without losing selections,
+  drafts, or reader state. (post-GH #161 follow-up)
+- **Tab close buttons work on Windows again.** The visible X keeps its native
+  pointer action instead of handing the pointer to the parent tab-drag capture
+  session, while ordinary tab activation and drag-to-reorder stay unchanged.
+  (GH #174)
+- **Table cell values now commit before Tab advances to the next cell.** Typing
+  the next value no longer overtypes the cell that was just saved, and formula
+  columns react to the preserved inputs as expected. (GH #176)
+
 ## [0.5.10] - 2026-07-16
 
 ### Added
@@ -1982,7 +2131,12 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
+[0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
+[0.5.9]: https://github.com/martinkoutecky/tine/compare/v0.5.8...v0.5.9
+[0.5.8]: https://github.com/martinkoutecky/tine/compare/v0.5.7...v0.5.8
+[0.5.7]: https://github.com/martinkoutecky/tine/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/martinkoutecky/tine/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/martinkoutecky/tine/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/martinkoutecky/tine/compare/v0.5.3...v0.5.4

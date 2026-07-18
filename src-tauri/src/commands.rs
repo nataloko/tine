@@ -9,7 +9,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{State, WebviewWindow};
 use tine_core::date::JournalDate;
-use tine_core::model::{PageDto, PageEntry, PageKind, RefGroup};
+use tine_core::model::{
+    BacklinkFilterContext, BacklinkFilterTarget, PageDto, PageEntry, PageKind, RefGroup,
+};
 
 const RESULT_BRIDGE_MAX_ROWS: usize = 20_000;
 const RESULT_BRIDGE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -541,6 +543,25 @@ pub(crate) fn get_backlinks(
 }
 
 #[tauri::command]
+pub(crate) fn get_backlink_filter_context(
+    name: String,
+    targets: Vec<BacklinkFilterTarget>,
+    state: GraphContext<'_>,
+) -> Result<BacklinkFilterContext, String> {
+    if targets.len() > RESULT_BRIDGE_MAX_ROWS {
+        return Err(format!(
+            "too many backlink filter roots: {} (limit: {RESULT_BRIDGE_MAX_ROWS})",
+            targets.len()
+        ));
+    }
+    with_graph(&state, |graph| {
+        Ok(tine_core::query::backlink_filter_context(
+            graph, &name, &targets,
+        ))
+    })
+}
+
+#[tauri::command]
 pub(crate) fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
@@ -587,17 +608,25 @@ pub(crate) fn block_referrers(
 pub(crate) fn delete_page(
     name: String,
     kind: PageKind,
+    expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
     with_graph(&state, |g| {
-        g.delete_page(&name, kind).map_err(|e| e.to_string())
+        g.delete_page_expected(&name, kind, expected_path.as_deref())
+            .map_err(|e| e.to_string())
     })
 }
 
 #[tauri::command]
-pub(crate) fn rename_page(old: String, new: String, state: GraphContext<'_>) -> Result<(), String> {
+pub(crate) fn rename_page(
+    old: String,
+    new: String,
+    expected_path: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
     with_graph(&state, |g| {
-        g.rename_page(&old, &new).map_err(|e| e.to_string())
+        g.rename_page_expected(&old, &new, expected_path.as_deref())
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -703,16 +732,22 @@ pub(crate) async fn run_graph_search(
     block_limit: usize,
     lane: Option<String>,
     explain: bool,
+    scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
     let graph = Arc::clone(&slot_for_context(&state)?.graph);
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     let execution = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
-        Some(lane) => {
-            graph.run_graph_search_latest(lane, &source, page_limit, block_limit, explain)
-        }
-        None => graph.run_graph_search(&source, page_limit, block_limit, explain),
+        Some(lane) => graph.run_graph_search_latest_scoped(
+            lane,
+            &source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+        ),
+        None => graph.run_graph_search_scoped(&source, page_limit, block_limit, scope, explain),
     })
     .await
     .map_err(|e| e.to_string())?;

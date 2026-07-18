@@ -26,10 +26,11 @@ import {
   removeDeletedPageFromNavigation,
   removeDeletedBlocksFromSidebar,
   bumpDataRev,
+  bumpPageInventoryRev,
 } from "./ui";
 import { seedFacets, facetsFromDto, clearSeededFacets, facetsOf } from "./render/facets";
 import { journalTitle } from "./journal";
-import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden, isPropertiesOnly, splitPagePreamble } from "./editor/properties";
+import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden, isPropertiesOnly, isPageHeaderPropertiesOnly, splitPagePreamble } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
 import { OPEN_MARKERS, MARKER_RE } from "./markers";
@@ -68,6 +69,10 @@ export interface Node {
   parent: string | null; // null = a root of its page
   page: string; // owning page name
   children: string[];
+  /** Frontend-only editing provenance for an existing unbulleted Markdown page
+   * header. Spread-based undo snapshots retain it; DTO serialization consumes
+   * it and never sends it over the wire. */
+  originatedFromPageHeader?: boolean;
 }
 
 export interface FeedPage {
@@ -358,8 +363,9 @@ export function forgetPage(name: string) {
  *  and feed, then delete on disk. Routing deletion through the store — rather than
  *  calling the backend directly — is what prevents a queued baseRev=null save from
  *  resurrecting a just-typed, never-saved page. Returns backend success. */
-export async function deletePage(name: string, kind: PageKind): Promise<boolean> {
+export async function deletePage(name: string, kind: PageKind, expectedPath?: string): Promise<boolean> {
   const loaded = pageByName(name);
+  if (expectedPath && loaded?.path !== expectedPath) return false;
   if (loaded?.readOnly || loaded?.guide) return false;
   // Capture the current (possibly unsaved) content first, so the recoverable trash
   // copy is the LATEST version — not the stale bytes on disk. A CONFLICTED page can
@@ -375,19 +381,21 @@ export async function deletePage(name: string, kind: PageKind): Promise<boolean>
   // delete fails, the page (and its unsaved edits) must survive.
   tombstone(name);
   try {
-    await backend().deletePage(name, kind);
+    if (expectedPath) await backend().deletePage(name, kind, expectedPath);
+    else await backend().deletePage(name, kind);
   } catch {
     untombstone(name); // delete failed — lift the tombstone; page + edits stay intact
     return false;
   }
   forgetPage(name); // success — now drop it from the working set + feed
-  removeDeletedPageFromNavigation(name, kind);
+  removeDeletedPageFromNavigation({ name, pageKind: kind, ...(expectedPath ? { path: expectedPath } : {}) });
   // A page delete changes every live query / backlink result (the backend already
   // dropped its derived cache + bumped cache_gen in delete_page). Nudge dataRev so
   // open {{query}} panels re-run and drop the deleted page's rows — otherwise they
   // keep showing the stale cached result (only the block whose node was purged from
   // byId visibly disappears, leaving the rest of the deleted page's rows behind).
   bumpDataRev();
+  bumpPageInventoryRev();
   return true;
 }
 
@@ -581,7 +589,21 @@ function toDto(id: string): BlockDto {
 export function pageToDto(pageName: string): PageDto | null {
   const p = doc.pages.find((x) => x.name === pageName);
   if (!p) return null;
-  let blocks = p.roots.map(toDto);
+  let rootIds = p.roots;
+  let preBlock = p.preBlock;
+  const first = doc.byId[rootIds[0]];
+  if (first?.originatedFromPageHeader) {
+    if (first.children.length > 0 || (first.raw !== "" && !isPageHeaderPropertiesOnly(first.raw))) {
+      pushToast("Page-header properties must contain only valid key:: value lines before they can be saved.", "error");
+      return null;
+    }
+    // Exact raw is authoritative here: ordinary toDto trimming must never eat a
+    // page-header value or its separator trivia. An empty draft deletes the
+    // header and emits no stray outline bullet.
+    preBlock = first.raw ? first.raw + (p.preBlock ?? "") : p.preBlock;
+    rootIds = rootIds.slice(1);
+  }
+  let blocks = rootIds.map(toDto);
   // Don't persist a lone placeholder block. A page that exists only for its
   // properties is loaded with one empty editable bullet (toLoadable); saving it
   // — e.g. after a page-property edit — must NOT write that bullet back as a
@@ -594,7 +616,7 @@ export function pageToDto(pageName: string): PageDto | null {
     name: p.name,
     kind: p.kind,
     title: p.title,
-    pre_block: p.preBlock,
+    pre_block: preBlock,
     blocks,
     format: p.format,
     // Pin the save to the exact file this page came from (#21). Absent for a
@@ -827,6 +849,11 @@ interface RawEntry {
   id: string;
   raw: string; // the block's text to restore
   page: string;
+  /** A transient page-header node can legitimately disappear when its text is
+   * deleted. Carry the structural shell on its normal O(1) typing undo entry so
+   * Undo can restore it and Redo can remove it again without an extra step. */
+  headerRoot?: { node: Node; rootIndex: number };
+  removeHeaderOnApply?: boolean;
 }
 type UndoEntry = SnapEntry | RawEntry;
 const undoStack: UndoEntry[] = [];
@@ -928,7 +955,17 @@ function pushRawUndo(id: string, prevRaw: string) {
   if (undoSuppressionDepth > 0) return;
   const tag = `type:${id}`;
   if (tag === lastUndoTag) return; // mid-burst: keep the first (pre-burst) raw
-  undoStack.push({ kind: "raw", id, raw: prevRaw, page: doc.byId[id].page });
+  const node = doc.byId[id];
+  const rootIndex = node.originatedFromPageHeader
+    ? (pageByName(node.page)?.roots.indexOf(id) ?? -1)
+    : -1;
+  undoStack.push({
+    kind: "raw",
+    id,
+    raw: prevRaw,
+    page: node.page,
+    ...(rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
+  });
   if (undoStack.length > 200) undoStack.shift();
   redoStack = [];
   lastUndoTag = tag;
@@ -938,9 +975,37 @@ function pushRawUndo(id: string, prevRaw: string) {
 function applyEntry(e: UndoEntry): UndoEntry {
   if (e.kind === "raw") {
     const node = doc.byId[e.id];
-    const inverse: RawEntry = { kind: "raw", id: e.id, raw: node ? node.raw : "", page: e.page };
+    const rootIndex = node?.originatedFromPageHeader
+      ? (pageByName(node.page)?.roots.indexOf(e.id) ?? -1)
+      : -1;
+    const inverse: RawEntry = {
+      kind: "raw",
+      id: e.id,
+      raw: node ? node.raw : "",
+      page: e.page,
+      ...(node && rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
+    };
     if (node) {
-      setDoc("byId", e.id, "raw", e.raw);
+      if (e.removeHeaderOnApply && node.originatedFromPageHeader) {
+        setDoc(produce((s) => {
+          const page = s.pages.find((p) => p.name === node.page);
+          if (page) page.roots = page.roots.filter((id) => id !== e.id);
+          delete s.byId[e.id];
+        }));
+        inverse.headerRoot = { node: cloneNode(node), rootIndex: Math.max(0, rootIndex) };
+      } else {
+        setDoc("byId", e.id, "raw", e.raw);
+      }
+      addDirty(e.page);
+    } else if (e.headerRoot) {
+      const restored = { ...cloneNode(e.headerRoot.node), raw: e.raw };
+      setDoc(produce((s) => {
+        s.byId[e.id] = restored;
+        const page = s.pages.find((p) => p.name === e.page);
+        if (page) page.roots.splice(Math.min(e.headerRoot!.rootIndex, page.roots.length), 0, e.id);
+      }));
+      inverse.headerRoot = { node: cloneNode(restored), rootIndex: e.headerRoot.rootIndex };
+      inverse.removeHeaderOnApply = true;
       addDirty(e.page);
     }
     return inverse;
@@ -1545,15 +1610,73 @@ export function setPageProperty(pageName: string, key: string, value: string | n
   pushUndo(`pageprop:${pageName}:${key}`, [pageName]);
   const page = doc.pages[idx];
   const first = page.format === "md" ? doc.byId[page.roots[0]] : null;
-  // A properties-only first bullet is OG's editable page-properties block. Keep
-  // its on-disk form instead of silently duplicating the property in preBlock.
-  if (!page.preBlock && first && isPropertiesOnly(first.raw)) {
-    setDoc("byId", first.id, "raw", upsertPropertyLine(first.raw, key, value) ?? "");
+  // A properties-only first root is the same editable source as the rendered
+  // header. Do not silently duplicate its property into preBlock; pageToDto or
+  // the native new-header boundary canonicalizes its persisted form.
+  if (first && (first.originatedFromPageHeader || (!page.preBlock && isPropertiesOnly(first.raw)))) {
+    const next = upsertPropertyLine(first.raw, key, value) ?? "";
+    if (first.originatedFromPageHeader && next === "") {
+      setDoc(produce((s) => {
+        const target = s.pages.find((p) => p.name === pageName);
+        if (target?.roots[0] === first.id) target.roots.shift();
+        delete s.byId[first.id];
+      }));
+    } else {
+      setDoc("byId", first.id, "raw", next);
+    }
     markDirty(pageName);
     return;
   }
   setDoc("pages", idx, "preBlock", upsertPropertyLine(doc.pages[idx].preBlock, key, value));
   markDirty(pageName);
+}
+
+/** Materialize an existing canonical Markdown page header as Tine's ordinary
+ * first-root editor. This is representation-only: no undo entry, dirty flag or
+ * save is created until the user actually changes the node. */
+export function beginPageHeaderEdit(pageName: string): string | null {
+  const page = pageByName(pageName);
+  if (!page || page.format !== "md" || !pageWritable(pageName)) return null;
+  const first = doc.byId[page.roots[0]];
+  if (first && (first.originatedFromPageHeader || (!page.preBlock && isPropertiesOnly(first.raw)))) {
+    return first.id;
+  }
+
+  const split = splitPagePreamble(page.preBlock);
+  if (!split.properties || !isPageHeaderPropertiesOnly(split.properties)) return null;
+  const id = freshId();
+  setDoc(
+    produce((s) => {
+      const index = s.pages.findIndex((p) => p.name === pageName);
+      s.pages[index].preBlock = split.remainder;
+      s.byId[id] = {
+        id,
+        raw: split.properties!,
+        collapsed: false,
+        parent: null,
+        page: pageName,
+        children: [],
+        originatedFromPageHeader: true,
+      };
+      s.pages[index].roots.unshift(id);
+    })
+  );
+  return id;
+}
+
+/** Remove a deleted transient header root after its editor exits. Invalid
+ * drafts intentionally remain present and editable; pageToDto keeps them from
+ * reaching native persistence. */
+export function finishPageHeaderEdit(id: string): void {
+  const node = doc.byId[id];
+  if (!node?.originatedFromPageHeader || node.raw !== "" || node.children.length > 0) return;
+  setDoc(
+    produce((s) => {
+      const page = s.pages.find((p) => p.name === node.page);
+      if (page?.roots[0] === id) page.roots.shift();
+      delete s.byId[id];
+    })
+  );
 }
 
 /** Turn ordinary text before the first Markdown bullet into a real first block
@@ -1571,7 +1694,8 @@ export function promotePagePreamble(pageName: string): string | null {
       const index = s.pages.findIndex((p) => p.name === pageName);
       s.pages[index].preBlock = properties;
       s.byId[id] = { id, raw: content, collapsed: false, parent: null, page: pageName, children: [] };
-      s.pages[index].roots.unshift(id);
+      const markedHeader = s.byId[s.pages[index].roots[0]]?.originatedFromPageHeader;
+      s.pages[index].roots.splice(markedHeader ? 1 : 0, 0, id);
     })
   );
   markDirty(pageName);
@@ -1930,9 +2054,15 @@ export async function ensureBlockId(id: string): Promise<string | null> {
 /** A live reference to a loaded block — its stable uuid + the page it lives on
  *  (so a satellite surface can load that page and render the same editable
  *  node). The uuid IS the store key, so no snapshot is needed. */
-export function blockRef(id: string): { uuid: string; page: string; pageKind: PageKind } {
+export function blockRef(id: string): { uuid: string; page: string; pageKind: PageKind; path?: string } {
   const n = doc.byId[id];
-  return { uuid: n.id, page: n.page, pageKind: pageByName(n.page)?.kind ?? "page" };
+  const owner = pageByName(n.page);
+  return {
+    uuid: n.id,
+    page: n.page,
+    pageKind: owner?.kind ?? "page",
+    ...(owner?.path ? { path: owner.path } : {}),
+  };
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1960,7 +2090,7 @@ export function ensureStableBlockId(id: string): void {
  *  a new tab, and zoom all stamp `id::` so the spot survives a relaunch (Martin's
  *  call — he wants these to persist; the `id::` is harmless in the file and is
  *  stripped from clipboard copies anyway, see `blockSubtreeMarkdown`). */
-export function persistentBlockRef(id: string): { uuid: string; page: string; pageKind: PageKind } {
+export function persistentBlockRef(id: string): { uuid: string; page: string; pageKind: PageKind; path?: string } {
   ensureStableBlockId(id);
   return blockRef(id);
 }
@@ -1974,16 +2104,24 @@ export function persistentBlockRef(id: string): { uuid: string; page: string; pa
 export async function persistBlockRefTarget(
   uuid: string,
   page: string,
-  kind: PageKind
+  kind: PageKind,
+  path?: string,
 ): Promise<void> {
-  if (!doc.byId[uuid]) {
-    const dto = await backend().getPage(page, kind);
+  const loadedOwner = pageByName(page);
+  const exactOwnerLoaded = !!loadedOwner && (!path || loadedOwner.path === path);
+  const loadedNode = doc.byId[uuid];
+  if (!loadedNode || !exactOwnerLoaded || loadedNode.page !== page) {
+    const dto = path
+      ? await backend().getPageByPath(path)
+      : await backend().getPage(page, kind);
     if (dto) ensurePageLoaded(dto);
   }
   // Re-check: a concurrent navigation may have loaded the page meanwhile, or the
   // cache may have been rebuilt (external change) and reassigned the block a new
   // uuid — in which case there's nothing safe to stamp.
-  if (doc.byId[uuid]) ensureStableBlockId(uuid);
+  const owner = pageByName(page);
+  const node = doc.byId[uuid];
+  if (node?.page === page && owner && (!path || owner.path === path)) ensureStableBlockId(uuid);
 }
 
 /** Serialize a block (and, normally, its subtree) to Logseq markdown.
