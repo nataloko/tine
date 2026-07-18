@@ -23,7 +23,7 @@ import { typoTypeReplace } from "../render/typography";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
-import { threadingEnabled, threadColorMode, THREAD_PALETTE } from "../bulletThreading";
+import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
 import {
   doc,
   pageByName,
@@ -390,21 +390,22 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => pageByName(node().page)?.readOnly ?? false;
-  // Upstream's declarative decoration is the single rendering path. The fork's
-  // persisted toggle remains a built-in activation fallback for existing users,
-  // and its visual preferences layer onto the same host-owned CSS.
-  const pluginThreadingEnabled = () => pluginManager.hasDeclarativeDecoration("thread-lines");
-  const threadDecorationEnabled = () => threadingEnabled() || pluginThreadingEnabled();
+  // Bullet threading: this block's role in the active-path thread (elbow at a path
+  // node, or a spine segment on a preceding sibling). Reads threadRoles only while
+  // threading is on, so it stays zero-cost when the feature is off. The per-depth
+  // rainbow colour is handed to CSS via an inline --thread-color.
+  const threadRole = () => (threadingEnabled() ? threadRoles().get(props.id) : undefined);
   const threadColor = () => {
-    if (!threadingEnabled() || threadColorMode() === "accent") return undefined;
-    let depth = -1;
-    let parent = node().parent;
-    while (parent && depth < 1_000) {
-      depth++;
-      parent = doc.byId[parent]?.parent ?? null;
-    }
-    return THREAD_PALETTE[Math.max(0, depth) % THREAD_PALETTE.length];
+    const r = threadRole();
+    if (!r) return undefined;
+    // Accent mode: leave --thread-color unset so the CSS falls back to var(--accent).
+    if (threadColorMode() === "accent") return undefined;
+    return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
   };
+  // Upstream's WASM bullet-threading plugin renders through host-owned CSS
+  // decorations; keep that path for anyone who installs it. The built-in toggle
+  // draws the fork's own SVG threads (below) instead, so the two never overlap.
+  const pluginThreadingEnabled = () => pluginManager.hasDeclarativeDecoration("thread-lines");
   // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
   // outline. Showing both this storage block's controls and the referenced root's
   // controls produces two consecutive bullets. Keep the referenced root controls
@@ -419,14 +420,35 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
       class="ls-block"
       classList={{
         collapsed: collapsed(),
+        "thread-elbow": threadRole()?.elbow !== undefined,
+        "thread-spine": threadRole()?.spine !== undefined,
         "block-embed-host": blockEmbedHost(),
-        "plugin-thread-lines": threadDecorationEnabled(),
-        "plugin-thread-lines-active": threadingEnabled() || pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
+        // Upstream plugin decoration path — active only when an actual plugin
+        // declares it; the fork toggle draws its own SVG so these never both apply.
+        "plugin-thread-lines": pluginThreadingEnabled(),
+        "plugin-thread-lines-active": pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
         "plugin-thread-lines-standard": pluginManager.declarativeDecorationSetting("thread-lines", "intensity") === "standard",
       }}
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}
     >
+      {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
+          it reflows + scrolls locked to the block. Elbow = a path curving into this
+          bullet; spine = a straight line clipped to the block height (see app.css). */}
+      <Show when={threadingEnabled() && threadRole()}>
+        <Show
+          when={threadRole()?.elbow !== undefined}
+          fallback={
+            <svg class="thread-svg thread-spine-svg" aria-hidden="true">
+              <line x1="8" y1="0" x2="8" y2="9999" />
+            </svg>
+          }
+        >
+          <svg class="thread-svg thread-elbow-svg" aria-hidden="true">
+            <path d="M -4 -18 V 4 Q -4 14 6 14 H 26" />
+          </svg>
+        </Show>
+      </Show>
       <div
         class="block-main"
         classList={{

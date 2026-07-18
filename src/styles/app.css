@@ -3711,49 +3711,96 @@ textarea {
   border-bottom-color: var(--guide-color);
 }
 
-/* Fork extras use the same host decoration rather than a second renderer. The
-   legacy toggle activates active-branch mode and layers its persisted colour,
-   weight, and motion preferences onto upstream's thread-lines vocabulary. */
-.thread-enabled .plugin-thread-lines > .block-children-container > .block-children {
-  border-left-color: var(--thread-color, var(--accent));
-  border-left-width: var(--thread-thickness, 3px);
+/* Fork bullet threading (opt-in, Settings → mine (extras) → Bullet threading) — see
+   src/bulletThreading.ts. A rounded elbow thread traces the active path (the block
+   you're editing + each ancestor): every level curves the thread into its bullet,
+   coloured per depth. Drawn as an SVG stroke on reactively-marked blocks (an
+   absolute child of the .ls-block, so it reflows + scrolls locked to the block and
+   can never desync) — SVG rather than CSS borders because a vector stroke lands
+   exactly on the bullet on every renderer AND lets the dashes flow around the corner
+   when animated. This is the fork's own renderer; upstream's plugin `thread-lines`
+   decoration (the .plugin-thread-lines rules above) stays for installed plugins, and
+   the two never apply to the same block. Geometry is measured to Tine's bullet
+   column: a block's bullet centre is 26px right / 14px down from its .ls-block
+   top-left; a child .ls-block is one 30px indent in, so the PARENT bullet sits 4px
+   LEFT and ~18px ABOVE. --thread-color is set inline per marked block (per-depth
+   colour); --thread-thickness on .app-container.
+     · .thread-elbow  — a path node: vertical up to the parent bullet + a rounded turn
+                        into this block's bullet. A fixed-size overflowing <svg> + <path>.
+     · .thread-spine  — a preceding sibling of a path node: a straight vertical that
+                        keeps the guide continuous. A <line> clipped (overflow:hidden)
+                        to the block's own height via top/bottom — NOT an SVG percentage,
+                        which mis-resolves and runs off the page. */
+.thread-enabled .ls-block > .thread-svg {
+  position: absolute;
+  pointer-events: none;
+}
+.thread-enabled .ls-block > .thread-svg path,
+.thread-enabled .ls-block > .thread-svg line {
+  fill: none;
+  stroke: var(--thread-color, var(--accent));
+  stroke-width: var(--thread-thickness, 3px);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* Elbow: origin at the block top-left (1 unit = 1px), overflowing up/left so the
+   stroke can reach the parent bullet (-4,-18) and curve into this bullet (26,14). */
+.thread-enabled .ls-block > .thread-svg.thread-elbow-svg {
+  left: 0;
+  top: 0;
+  width: 40px;
+  height: 20px;
+  overflow: visible;
+}
+/* Spine: box spans this block's own height (top:-18 → bottom:0) and CLIPS a long
+   vertical line to it, so the guide reaches the next sibling but never overshoots.
+   Origin is offset (-12,-18) so the line at block x=-4 is internal x=8, y=0=-18. */
+.thread-enabled .ls-block > .thread-svg.thread-spine-svg {
+  left: -12px;
+  top: -18px;
+  /* An abspos <svg> ignores top+bottom stretch (it falls back to its intrinsic
+     150px), so size it explicitly: 100% of the .ls-block (this block's full height,
+     incl. children) + the 18px upward overlap. overflow:hidden then clips the long
+     line to exactly this block's extent. */
+  height: calc(100% + 18px);
+  width: 24px;
+  overflow: hidden;
 }
 
-.thread-enabled .plugin-thread-lines > .block-children-container > .block-children > .ls-block > .block-main::before {
-  border-bottom-color: var(--thread-color, var(--accent));
-  border-bottom-width: var(--thread-thickness, 3px);
-}
-
-.thread-anim-flow .plugin-thread-lines > .block-children-container > .block-children {
-  border-left-style: dashed;
-}
-
-.thread-anim-flow .plugin-thread-lines > .block-children-container > .block-children > .ls-block > .block-main::before {
-  border-bottom-color: transparent;
-  background: repeating-linear-gradient(
-    90deg,
-    var(--thread-color, var(--accent)) 0 6px,
-    transparent 6px 12px
-  ) 0 bottom / 12px var(--thread-thickness, 3px) repeat-x;
+/* Animation "flow" (opt-in): turn the stroke into dashes that flow toward the path
+   end — down the spine, around the corner, into the bullet (a top-to-bottom
+   conveyor). -12px = one dash+gap period, so the loop is seamless. */
+.thread-anim-flow .ls-block > .thread-svg path,
+.thread-anim-flow .ls-block > .thread-svg line {
+  stroke-dasharray: 6 6;
   animation: thread-flow 0.8s linear infinite;
 }
-
 @keyframes thread-flow {
-  to { background-position-x: 12px; }
+  to {
+    stroke-dashoffset: -12px;
+  }
 }
-
-.thread-anim-beat .plugin-thread-lines > .block-children-container > .block-children > .ls-block > .block-main::before {
+/* Animation "beat" (opt-in): a slow pulse — the solid thread breathes between dim
+   and full. Opacity only (centred stroke), so alignment is untouched. */
+.thread-anim-beat .ls-block > .thread-svg path,
+.thread-anim-beat .ls-block > .thread-svg line {
   animation: thread-beat 2.6s ease-in-out infinite;
 }
-
 @keyframes thread-beat {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 1; }
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
 }
-
+/* Respect the OS "reduce motion" setting: hold the thread static (no flow, no beat). */
 @media (prefers-reduced-motion: reduce) {
-  .thread-anim-flow .plugin-thread-lines > .block-children-container > .block-children > .ls-block > .block-main::before,
-  .thread-anim-beat .plugin-thread-lines > .block-children-container > .block-children > .ls-block > .block-main::before {
+  .thread-anim-flow .ls-block > .thread-svg path,
+  .thread-anim-flow .ls-block > .thread-svg line,
+  .thread-anim-beat .ls-block > .thread-svg path,
+  .thread-anim-beat .ls-block > .thread-svg line {
     animation: none;
   }
 }
