@@ -56,6 +56,9 @@ import {
   selectedIds,
   blockIsGridView,
   doc,
+  pageVisibleOrder,
+  selectBlock,
+  visibleOrder,
 } from "./store";
 import { editingId, startEditing } from "./editorController";
 import { copyOutline } from "./clipboard";
@@ -70,6 +73,7 @@ import {
   layoutPaneIds,
   layoutRoot,
   moveActiveTabToPane,
+  paneRouter,
   splitPane,
   splitPaneAtSeam,
   splitRootAtEdge,
@@ -82,6 +86,8 @@ import {
   paneSel,
   previousPaneSelectionTarget,
   readingOrderPanes,
+  rememberBlockSelectionForPaneReturn,
+  takeBlockSelectionForPaneReturn,
   type PaneDirection,
 } from "./paneSelect";
 import { openGuide } from "./guide";
@@ -159,6 +165,19 @@ function enterPaneSelectFromFocus() {
   enterPaneSelect(ids.includes(focused) ? focused : ids[0] ?? "main");
 }
 
+function firstVisibleBlockInFocusedPane(): string | null {
+  const currentRoute = paneRouter(focusedPaneId()).route();
+  return currentRoute.kind === "page"
+    ? pageVisibleOrder(currentRoute.name)[0] ?? null
+    : visibleOrder()[0] ?? null;
+}
+
+function restoreBlockSelectionAfterPaneReturn(previous: string | null) {
+  if (hasSelection()) return;
+  const target = previous && doc.byId[previous] ? previous : firstVisibleBlockInFocusedPane();
+  if (target) selectBlock(target);
+}
+
 // Materialize a split at the selected seam/edge. Two flavors (Martin's Jul 8
 // ruling): Enter = a plain MIRROR split (the new pane keeps the duplicated
 // content, no dialog — the quick "same thing side by side"); typing = an
@@ -215,12 +234,16 @@ export function handlePaneSelectKey(e: KeyboardEvent): boolean {
       return true;
     }
     case "dismiss":
+      const previous = takeBlockSelectionForPaneReturn();
       exitPaneSelect();
+      restoreBlockSelectionAfterPaneReturn(previous);
       return true;
     case "activate":
       if (target.kind === "pane") {
+        const previous = takeBlockSelectionForPaneReturn();
         exitPaneSelect();
         focusPane(target.paneId);
+        restoreBlockSelectionAfterPaneReturn(previous);
       } else {
         materializePaneSelection(null); // Enter on a seam/edge = mirror split
       }
@@ -848,6 +871,8 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
         return;
       }
       if (hasSelection()) {
+        const previous = selectedIds().at(-1) ?? null;
+        if (!focusMode()) rememberBlockSelectionForPaneReturn(previous);
         clearSelection();
         // Martin's 2-rung ladder (Jul 8): block-select climbs STRAIGHT to
         // pane-select — the old "cleared but nothing selected" state between
@@ -962,17 +987,71 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     if (!cellSel()) return;
     if (handleSheetPasteEvent(e)) e.preventDefault();
   };
+  type MouseHistoryDirection = "back" | "forward";
+  type MouseHistorySource = "dom" | "native";
+  let lastMouseHistory: { direction: MouseHistoryDirection; source: MouseHistorySource; at: number } | undefined;
+  const navigateMouseHistory = (direction: MouseHistoryDirection, source: MouseHistorySource) => {
+    const now = performance.now();
+    // A platform that exposes both its native command and DOM auxclick must not
+    // advance twice for one physical release. Repeated events from the same
+    // source remain distinct clicks and are never collapsed.
+    if (lastMouseHistory?.direction === direction && lastMouseHistory.source !== source && now - lastMouseHistory.at < 100) {
+      return;
+    }
+    lastMouseHistory = { direction, source, at: now };
+    if (direction === "back") goBack();
+    else goForward();
+  };
+  // Mouse side buttons: X1 (DOM button 3) navigates back, X2 (button 4) forward,
+  // reusing the same history ops as Alt+Left / Alt+Right (GH #156). `auxclick`
+  // fires once per non-primary button release, so a single listener never
+  // double-navigates; preventDefault suppresses any webview built-in nav.
+  // Middle-click (button 1) is left untouched for new-tab handlers.
+  const mouseNav = (e: MouseEvent) => {
+    if (e.button === 3) {
+      e.preventDefault();
+      navigateMouseHistory("back", "dom");
+    } else if (e.button === 4) {
+      e.preventDefault();
+      navigateMouseHistory("forward", "dom");
+    }
+  };
+
+  let disposed = false;
+  let unlistenNativeMouseHistory = () => {};
+  if ("__TAURI_INTERNALS__" in window) {
+    void Promise.all([import("@tauri-apps/api/event"), import("@tauri-apps/api/window")]).then(
+      async ([{ listen }, { getCurrentWindow }]) => {
+        const target = getCurrentWindow().label;
+        const unlisten = await listen<{ direction: MouseHistoryDirection; target: string }>(
+          "history-navigate",
+          (e) => {
+            if (e.payload?.target !== target) return;
+            if (e.payload.direction === "back" || e.payload.direction === "forward") {
+              navigateMouseHistory(e.payload.direction, "native");
+            }
+          },
+        );
+        if (disposed) unlisten();
+        else unlistenNativeMouseHistory = unlisten;
+      },
+    );
+  }
 
   window.addEventListener("keydown", handler, true);
   window.addEventListener("paste", pasteHandler, true);
   window.addEventListener("keydown", superTracker, true);
   window.addEventListener("keyup", superTracker, true);
   window.addEventListener("blur", clearSuper);
+  window.addEventListener("auxclick", mouseNav, true);
   return () => {
+    disposed = true;
+    unlistenNativeMouseHistory();
     window.removeEventListener("keydown", handler, true);
     window.removeEventListener("paste", pasteHandler, true);
     window.removeEventListener("keydown", superTracker, true);
     window.removeEventListener("keyup", superTracker, true);
     window.removeEventListener("blur", clearSuper);
+    window.removeEventListener("auxclick", mouseNav, true);
   };
 }
