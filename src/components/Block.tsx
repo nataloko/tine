@@ -4,6 +4,7 @@ import { backend } from "../backend";
 import {
   detectTrigger,
   applyCompletion,
+  refCompletionEnd,
   withRefCompletionSpace,
   autoPairEdit,
   fullWidthRefReplace,
@@ -100,7 +101,7 @@ import {
   secondarySelectionActions,
   type SelectionAction,
 } from "../editor/selectionActions";
-import { isRenderHiddenProp, isPropertyLine } from "../render/block";
+import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
 import { codeHlEnabled } from "../codeHighlightSettings";
@@ -874,7 +875,7 @@ function Rendered(props: {
           <For each={displayProps()}>
             {([k, v]) => (
               <span class="prop">
-                <span class="prop-key">{k}</span>
+                <span class="prop-key">{propertyKeyNorm(k)}</span>
                 {/* Render the value through the inline parser so a `[[wiki]]`/`#tag`
                     property value becomes a clickable link, matching OG and the
                     page-property path (Page.tsx). Issue #10. */}
@@ -1348,7 +1349,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // `((` → full-text search for a block to reference, grouped by page. An
       // empty query (bare `((`) returns nothing — the popup stays hidden until
       // the user types. Selecting inserts `((uuid))` (see selectAc).
-      const groups = await backend().search(t.query, 8, "block-picker");
+      const groups = await backend().search(t.query, 20, "block-picker");
       const cur = ac();
       if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
       const items: AcItem[] = [];
@@ -1371,7 +1372,7 @@ export function Editor(props: { id: string }): JSX.Element {
       setAcItems([]);
       return;
     }
-    const pages = await (cap ? cap.quickSwitch(t.query, 8) : backend().quickSwitch(t.query, 8));
+    const pages = await (cap ? cap.quickSwitch(t.query, 100) : backend().quickSwitch(t.query, 100));
     const cur = ac();
     if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
     const pageItem = (name: string): AcItem =>
@@ -1456,18 +1457,13 @@ export function Editor(props: { id: string }): JSX.Element {
 
   // Insert `text` in place of the active trigger and restore the caret. If the
   // completion ends with a closing pair (`]]`/`))`/`}}`) and the same pair
-  // already sits right after the caret (e.g. from a `[[ ]]` autopair or editing
-  // inside an existing ref), swallow it so we don't end up with `[[name]]]]`.
+  // sits at or later on this line after the caret (e.g. from a `[[ ]]` autopair
+  // or editing inside an existing ref), swallow it so we don't end up with stray
+  // ref text or `[[name]]]]`.
   const replaceTrigger = (text: string, caret?: number) => {
     const t = ac();
     if (!t) return;
-    let end = t.end;
-    for (const pair of ["]]", "))", "}}"]) {
-      if (text.endsWith(pair) && ref.value.slice(t.end, t.end + 2) === pair) {
-        end = t.end + 2;
-        break;
-      }
-    }
+    const end = refCompletionEnd(ref.value, t.end, text);
     const r = applyCompletion(ref.value, t.start, end, text, caret);
     // GH #35: after a page/block-ref completion whose caret lands at the natural end
     // (right after the closing `]]`/`))`), optionally insert a trailing space so the

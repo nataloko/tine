@@ -16,6 +16,7 @@ const META: GraphMeta = {
   preferred_format: "md",
   macros: {},
   enable_timetracking: true,
+  show_brackets: true,
   logbook_with_second_support: true,
   logbook_enabled_in_timestamped_blocks: false,
   logbook_enabled_in_all_blocks: false,
@@ -74,7 +75,14 @@ async function loadHarness(
     setWorkflow: vi.fn(),
     setRightSidebar: vi.fn(),
     setAliasMap,
-    pageIdentityKey: (name: string) => name.trim().toLowerCase(),
+    pageIdentityKey: (name: string) => {
+      const lowered = name.trim().toLowerCase();
+      const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
+      const withoutBoundaries = withoutLeading.endsWith("/")
+        ? withoutLeading.slice(0, -1)
+        : withoutLeading;
+      return withoutBoundaries.normalize("NFC");
+    },
     seedFavorites: vi.fn(),
     pruneSidebarBlocks: vi.fn(),
     pushToast: vi.fn(),
@@ -162,6 +170,17 @@ describe("default journal template graph bind", () => {
       "new page": "New Page",
       page1: "page1",
     });
+  });
+
+  it("folds NFD alias keys before real-page precedence is applied", async () => {
+    const { loadGraphPath, api, setAliasMap } = await loadHarness(null, undefined, true, true);
+    api.pageAliases.mockResolvedValue([["Cafe\u{301}", "Alias owner"]]);
+    api.listPages.mockResolvedValue([
+      { name: "Café", kind: "page" as const, date_key: null, path: "pages/Café.md" },
+    ]);
+
+    await loadGraphPath(META.root);
+    await vi.waitFor(() => expect(setAliasMap).toHaveBeenLastCalledWith({ café: "Café" }));
   });
 
   it("discards an older same-epoch page-inventory response", async () => {

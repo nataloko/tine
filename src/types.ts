@@ -247,6 +247,9 @@ export interface ReferenceOccurrence {
 export interface ReferenceBlockEvidence {
   block_id: string;
   occurrences: ReferenceOccurrence[];
+  /** Total matches in the block before the bounded jump-target list is capped. */
+  total?: number;
+  truncated?: boolean;
 }
 
 export interface MatchSpan {
@@ -296,6 +299,7 @@ export type QueryHit =
       block: BlockDto;
       display_text: string;
       evidence: MatchEvidence[];
+      score?: number;
       match_class?: ObjectiveMatchClass;
     };
 
@@ -338,6 +342,7 @@ export interface GraphMeta {
   preferred_format: Format; // :preferred-format — new pages/journals ("md" | "org")
   macros: Record<string, string>; // :macros — user text-substitution macros ($1..$N)
   enable_timetracking: boolean; // :feature/enable-timetracking?, default true
+  show_brackets: boolean; // :ui/show-brackets?, default true
   logbook_with_second_support: boolean; // :logbook/settings :with-second-support?, default true
   logbook_enabled_in_timestamped_blocks: boolean;
   logbook_enabled_in_all_blocks: boolean;

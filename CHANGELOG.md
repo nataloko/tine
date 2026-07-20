@@ -8,6 +8,76 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-19
+
+### Added
+
+- Named workspaces can save and switch the complete window context in place,
+  persist per graph across restarts, and leave graph files untouched (GH #104).
+- Show brackets around page references can now be toggled in Appearance settings
+  or with `mod+c mod+b`, with the OG-compatible value saved to the graph's
+  `logseq/config.edn`.
+
+### Changed
+
+- Linked/Unlinked/query reference groups prune their per-group collapse state
+  only when the result set actually changes, instead of re-walking the entire
+  reference subtree on every structural edit anywhere inside it. Collapse
+  behavior is unchanged; large reference sections do less bookkeeping work while
+  you edit (GH #185).
+
+### Fixed
+
+- Property names now fold to lowercase with spaces and underscores shown and
+  matched as `-`, matching Logseq while preserving the file's original bytes.
+- `#+BEGIN_QUOTE`/`#+BEGIN_EXAMPLE` (and other org container) blocks whose body contains a `- ` list were split into separate blocks — corrupting the block structure on save and leaking the raw delimiters in rendering; they now stay one block.
+- Pages whose page-header properties came from an older version (e.g. a page that
+  is only `title::`/`tags::` metadata) no longer get stuck with a repeating
+  "Couldn't save … — will retry. (refusing to drop an existing page preamble
+  while authoring page-header properties)" error. The data-preservation firewall
+  was misfiring on the legitimate save of such a page once its properties had been
+  canonicalized to disk; the page now saves normally with no change to the file on
+  disk. Restarting is no longer needed to clear the error (GH #198).
+- The page-bottom "+ Add block" target now always adds a new writable block, even
+  when the page already ends in an empty bullet. Previously it re-focused the
+  existing trailing empty block, so if that block was indented you could never get
+  a fresh unindented block below it and clicking appeared to do nothing. Stacking
+  empty last blocks is now allowed (GH #158).
+- Editing inside an existing `[[page]]` or `((block))` reference — for example
+  inserting a word in front of the current text — and accepting a completion now
+  rewrites the whole reference instead of leaving a stray `]]`/`))`, matching
+  Logseq (GH #199).
+- Linked References no longer show a redundant "1 mention" label and jump button
+  on a block that mentions the page only once; the occurrence count and
+  jump-to-occurrence controls now appear only when a block mentions the page more
+  than once, matching Logseq (GH #200).
+- Clicking a Markdown external link on Linux now opens the browser with a
+  browser-appropriate environment instead of failing with a KIOExec file error;
+  only bundle/loader environment variables are scrubbed, desktop/session state is
+  preserved (GH #195).
+- Android versions below 11 (API < 30) no longer crash on launch with an
+  `UnsatisfiedLinkError` for `renameat2` (GH #192).
+- Linked and Unlinked References now match Logseq: Unicode-canonical (NFC) page
+  and alias identity, plain (unbracketed) property text counted as an unlinked
+  mention, same-named pages from different folders merged into one reference
+  group, and a real page title no longer shadowed by another page's alias
+  (GH #137).
+- Reference panels now show result truncation ("showing N of M") and a bounded
+  error state instead of an empty panel when limits are exceeded (GH #137).
+- Linked and Unlinked References now use the complete transitive, bidirectional
+  alias component, including every owner of a duplicate alias (GH #137).
+- Per-block reference labels now report the true mention total while keeping
+  the occurrence jump-target list bounded (GH #137).
+- Autocomplete and Ctrl+K search now rank all matching blocks globally before
+  applying result caps, so a strong block match is no longer omitted because of
+  where the block sits in the graph; inline and Ctrl+K pools match Logseq's
+  sizes, and autocomplete ordering uses the same Unicode (NFC) identity as the
+  rest of search (GH #186).
+- Settings now scroll on narrow and mobile viewports, so lower settings are
+  reachable instead of being clipped by the modal.
+- The mobile sidebar drawer can now be closed by swiping it toward its edge, in
+  addition to the existing back gesture/button and close button.
+
 ## [0.6.1] - 2026-07-18
 
 ### Fixed

@@ -54,6 +54,17 @@ export function changeTimetrackingEnabled(enabled: boolean) {
   void backend().setTimetrackingEnabled(enabled).catch(() => {});
 }
 
+export function showBrackets(): boolean {
+  return graphMeta()?.show_brackets ?? true;
+}
+
+export function changeShowBrackets(on: boolean) {
+  const m = graphMeta();
+  if (m && m.show_brackets === on) return;
+  if (m) setGraphMeta({ ...m, show_brackets: on });
+  void backend().setShowBrackets(on).catch(() => {});
+}
+
 // --- appearance: accent color, wide mode, document mode (all persisted) ---
 function loadStr(key: string): string | null {
   try {
@@ -1504,10 +1515,15 @@ export const [audioPlayer, setAudioPlayer] =
 
 // Page aliases (alias:: → canonical), keyed by normalized alias; loaded per graph.
 export const [aliasMap, setAliasMap] = createSignal<Record<string, string>>({});
-/** Mirror core `refs::page_key`: trim, then Unicode string lowercase. String
- *  lowercasing is intentionally contextual (for example `ΟΣ` → `ος`). */
+/** Mirror core `refs::page_key`: trim, Unicode lowercase, remove one boundary
+ *  slash at each side, then NFC. Lowercasing is contextual (`ΟΣ` → `ος`). */
 export function pageIdentityKey(name: string): string {
-  return name.trim().toLowerCase();
+  const lowered = name.trim().toLowerCase();
+  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
+  const withoutBoundaries = withoutLeading.endsWith("/")
+    ? withoutLeading.slice(0, -1)
+    : withoutLeading;
+  return withoutBoundaries.normalize("NFC");
 }
 /** Resolve a page name through `alias::` to its canonical page (else unchanged). */
 export function resolveAlias(name: string): string {
