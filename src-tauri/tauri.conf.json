@@ -44,6 +44,11 @@
     "active": true,
     "targets": ["appimage", "deb", "rpm", "nsis", "dmg"],
     "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "template": "nsis/installer.nsi"
+      }
+    },
     "android": {
       "versionCode": 6002
     },
