@@ -188,11 +188,22 @@ pub enum QueryHit {
     },
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryHasMore {
+    #[serde(default)]
+    pub pages: bool,
+    #[serde(default)]
+    pub blocks: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryExecution {
     pub hits: Vec<QueryHit>,
     pub diagnostics: Vec<QueryDiagnostic>,
     pub explanation: QueryExplanation,
+    /// Per-category top-k truncation, detected during the existing candidate scan.
+    #[serde(default)]
+    pub has_more: QueryHasMore,
     /// A cancelled latest-wins lane returns no partial results.
     pub cancelled: bool,
 }
@@ -340,46 +351,40 @@ impl QueryPlan {
         }
     }
 
-    /// Legacy quick-switch backend candidates.  Empty/pure-negative input keeps
-    /// the old "all pages" candidate behavior; the authoritative friendly plan
-    /// intentionally treats those inputs as no graph search.
-    pub fn legacy_page_search(query: &str, limit: usize) -> Self {
-        let matcher = Matcher::parse(query);
-        if matches!(matcher, Matcher::InvalidRegex(_)) {
-            return Self {
-                branches: Vec::new(),
-                diagnostics: Vec::new(),
-                page_scope: None,
-                page_exact: None,
-                regexes: HashMap::new(),
-            };
-        }
-        if matches!(matcher, Matcher::Empty) {
-            return Self::page_name_fuzzy("", limit);
-        }
-        let mut next_id = 1;
-        let mut regexes = HashMap::new();
-        let predicate = if let Some(term) = matcher.simple_term() {
-            QueryExpr::Text(TextPredicate {
-                clause_id: take_id(&mut next_id),
-                field: TextField::PageName,
-                mode: TextMatchMode::Fuzzy,
-                value: term.to_string(),
-            })
+    /// Literal block autocomplete for the `((` picker. OG rev 6e7afa8eb's
+    /// `search.cljs:block-search`/`fuzzy-search` normalizes the whole query as
+    /// one literal term. Blank input has no candidates.
+    pub fn block_search_literal(query: &str, limit: usize) -> Self {
+        let branches = if query.is_empty() {
+            Vec::new()
         } else {
-            expr_from_matcher(&matcher, TextField::PageName, &mut next_id, &mut regexes)
+            vec![QueryBranch {
+                target: QueryTarget::Blocks,
+                predicate: QueryExpr::Text(TextPredicate {
+                    clause_id: 1,
+                    field: TextField::VisibleContent,
+                    mode: TextMatchMode::Fuzzy,
+                    value: canonical_fold(query),
+                }),
+                limit,
+            }]
         };
         Self {
-            branches: vec![QueryBranch {
-                target: QueryTarget::Pages,
-                predicate,
-                limit,
-            }],
+            branches,
             diagnostics: Vec::new(),
             page_scope: None,
-            page_exact: (!query.trim().is_empty()).then(|| canonical_fold(query.trim())),
-            regexes,
+            page_exact: None,
+            regexes: HashMap::new(),
         }
+    }
+
+    /// Literal autocomplete for `#`/`[[`. OG rev 6e7afa8eb routes
+    /// `handler/editor.cljs:get-matched-pages` through
+    /// `search.cljs:page-search`/`exact-matched?`; the whole normalized query is
+    /// one ordered-subsequence term, not Ctrl-K's AND/OR/negation/regex DSL.
+    /// Blank input therefore keeps the established all-pages candidate listing.
+    pub fn legacy_page_search(query: &str, limit: usize) -> Self {
+        Self::page_name_fuzzy(query, limit)
     }
 
     pub fn explanation(&self) -> QueryExplanation {
@@ -423,10 +428,12 @@ impl QueryPlan {
                 hits: Vec::new(),
                 diagnostics: self.diagnostics.clone(),
                 explanation,
+                has_more: QueryHasMore::default(),
                 cancelled: false,
             };
         }
         let mut hits = Vec::new();
+        let mut has_more = QueryHasMore::default();
         for branch in &self.branches {
             if cancelled() {
                 return cancelled_execution(self, explanation);
@@ -435,15 +442,20 @@ impl QueryPlan {
                 QueryTarget::Pages => execute_pages(self, graph, branch, &cancelled),
                 QueryTarget::Blocks => execute_blocks(self, graph, branch, &cancelled),
             };
-            let Some(mut branch_hits) = branch_hits else {
+            let Some((mut branch_hits, branch_has_more)) = branch_hits else {
                 return cancelled_execution(self, explanation);
             };
+            match branch.target {
+                QueryTarget::Pages => has_more.pages |= branch_has_more,
+                QueryTarget::Blocks => has_more.blocks |= branch_has_more,
+            }
             hits.append(&mut branch_hits);
         }
         QueryExecution {
             hits,
             diagnostics: self.diagnostics.clone(),
             explanation,
+            has_more,
             cancelled: false,
         }
     }
@@ -454,6 +466,7 @@ fn cancelled_execution(plan: &QueryPlan, explanation: QueryExplanation) -> Query
         hits: Vec::new(),
         diagnostics: plan.diagnostics.clone(),
         explanation,
+        has_more: QueryHasMore::default(),
         cancelled: true,
     }
 }
@@ -815,7 +828,7 @@ struct ScoredPage {
     match_class: ObjectiveMatchClass,
     matched_text: String,
     matched_alias: Option<String>,
-    index: usize,
+    tie_key: String,
     candidate: PageCandidate,
 }
 
@@ -824,7 +837,7 @@ impl ScoredPage {
         self.match_class.rank() > other.match_class.rank()
             || (self.match_class == other.match_class
                 && (self.score > other.score
-                    || (self.score == other.score && self.index < other.index)))
+                    || (self.score == other.score && self.tie_key < other.tie_key)))
     }
 }
 
@@ -832,7 +845,7 @@ impl PartialEq for ScoredPage {
     fn eq(&self, other: &Self) -> bool {
         self.match_class == other.match_class
             && self.score == other.score
-            && self.index == other.index
+            && self.tie_key == other.tie_key
     }
 }
 impl Eq for ScoredPage {}
@@ -849,7 +862,7 @@ impl Ord for ScoredPage {
             .rank()
             .cmp(&self.match_class.rank())
             .then_with(|| other.score.cmp(&self.score))
-            .then_with(|| self.index.cmp(&other.index))
+            .then_with(|| self.tie_key.cmp(&other.tie_key))
     }
 }
 
@@ -1264,30 +1277,32 @@ fn execute_pages(
     graph: &Graph,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
-) -> Option<Vec<QueryHit>> {
+) -> Option<(Vec<QueryHit>, bool)> {
     if branch.limit == 0 {
-        return Some(Vec::new());
+        return Some((Vec::new(), false));
     }
     let file_pages = graph.list_pages();
-    let mut aliases_by_page: HashMap<String, Vec<String>> = HashMap::new();
-    for (alias, canonical) in graph.page_aliases() {
-        aliases_by_page
-            .entry(canonical_fold(&canonical))
+    let mut aliases_by_owner: HashMap<String, Vec<String>> = HashMap::new();
+    for (alias, _, owner_rel_path) in graph.page_aliases_with_owners() {
+        aliases_by_owner
+            .entry(owner_rel_path)
             .or_default()
             .push(alias);
     }
     let mut heap = BinaryHeap::new();
+    let mut has_more = false;
     for (index, page) in file_pages.iter().enumerate() {
         if cancelled() {
             return None;
         }
-        let aliases = aliases_by_page
-            .get(&canonical_fold(&page.name))
+        let aliases = aliases_by_owner
+            .get(&page.rel_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         if let Some((base_score, match_class, matched_text, matched_alias)) =
             best_page_match(plan, &branch.predicate, &page.name, aliases)
         {
+            has_more |= heap.len() >= branch.limit;
             push_page(
                 &mut heap,
                 branch.limit,
@@ -1296,7 +1311,7 @@ fn execute_pages(
                     match_class,
                     matched_text,
                     matched_alias,
-                    index,
+                    tie_key: page.rel_path.clone(),
                     candidate: PageCandidate::File(index),
                 },
             );
@@ -1306,7 +1321,7 @@ fn execute_pages(
         .iter()
         .map(|page| canonical_fold(&page.name))
         .collect();
-    for (offset, name) in graph.referenced_page_names().into_iter().enumerate() {
+    for name in graph.referenced_page_names() {
         if cancelled() {
             return None;
         }
@@ -1314,13 +1329,10 @@ fn execute_pages(
         if have.contains(&key) {
             continue;
         }
-        let aliases = aliases_by_page
-            .get(&canonical_fold(&name))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
         if let Some((base_score, match_class, matched_text, matched_alias)) =
-            best_page_match(plan, &branch.predicate, &name, aliases)
+            best_page_match(plan, &branch.predicate, &name, &[])
         {
+            has_more |= heap.len() >= branch.limit;
             let score = base_score - name.len() as i32;
             push_page(
                 &mut heap,
@@ -1330,7 +1342,7 @@ fn execute_pages(
                     match_class,
                     matched_text,
                     matched_alias,
-                    index: file_pages.len() + offset,
+                    tie_key: crate::refs::page_key(&name),
                     candidate: PageCandidate::Referenced(PageEntry {
                         name,
                         kind: PageKind::Page,
@@ -1348,9 +1360,9 @@ fn execute_pages(
             .rank()
             .cmp(&a.match_class.rank())
             .then_with(|| b.score.cmp(&a.score))
-            .then_with(|| a.index.cmp(&b.index))
+            .then_with(|| a.tie_key.cmp(&b.tie_key))
     });
-    Some(
+    Some((
         winners
             .into_iter()
             .map(|winner| {
@@ -1376,7 +1388,8 @@ fn execute_pages(
                 }
             })
             .collect(),
-    )
+        has_more,
+    ))
 }
 
 fn crumb_line(block: &DocBlock) -> String {
@@ -1418,12 +1431,13 @@ fn execute_blocks(
     graph: &Graph,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
-) -> Option<Vec<QueryHit>> {
+) -> Option<(Vec<QueryHit>, bool)> {
     if branch.limit == 0 {
-        return Some(Vec::new());
+        return Some((Vec::new(), false));
     }
     graph.with_pages(|pages| {
         let mut heap = BinaryHeap::new();
+        let mut has_more = false;
         let mut index = 0usize;
         for (entry, doc) in pages {
             if cancelled() {
@@ -1452,6 +1466,7 @@ fn execute_blocks(
                 if let Some(relevance) =
                     block_relevance(plan, &branch.predicate, visible, &projection.visible_lower)
                 {
+                    has_more |= heap.len() >= branch.limit;
                     let retain = heap.len() < branch.limit
                         || heap.peek().is_some_and(|worst: &ScoredBlock<'_>| {
                             relevance.cmp_quality(&worst.relevance) == Ordering::Greater
@@ -1491,7 +1506,7 @@ fn execute_blocks(
                         .cmp(&(b.page.rel_path.as_str(), b.index))
                 })
         });
-        Some(
+        Some((
             winners
                 .into_iter()
                 .map(|winner| {
@@ -1520,7 +1535,8 @@ fn execute_blocks(
                     }
                 })
                 .collect(),
-        )
+            has_more,
+        ))
     })
 }
 
@@ -1622,17 +1638,21 @@ mod tests {
             .collect()
     }
 
-    fn reference_search(graph: &Graph, query: &str, limit: usize) -> Vec<(String, String)> {
-        let matcher = Matcher::parse(query);
-        if limit == 0 || matches!(matcher, Matcher::Empty | Matcher::InvalidRegex(_)) {
+    fn reference_literal_search(
+        graph: &Graph,
+        query: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
+        if limit == 0 || query.is_empty() {
             return Vec::new();
         }
+        let query = canonical_fold(query);
         graph.with_pages(|pages| {
             let mut out = Vec::new();
             fn visit(
                 page: &str,
                 blocks: &[DocBlock],
-                matcher: &Matcher,
+                query: &str,
                 remaining: &mut usize,
                 out: &mut Vec<(String, String)>,
             ) {
@@ -1641,11 +1661,11 @@ mod tests {
                         return;
                     }
                     let projection = block.projection();
-                    if matcher.matches(&projection.visible_lower, &projection.visible) {
+                    if fuzzy_name_score(&projection.visible_lower, query).is_some() {
                         out.push((page.to_string(), block.raw.clone()));
                         *remaining -= 1;
                     }
-                    visit(page, &block.children, matcher, remaining, out);
+                    visit(page, &block.children, query, remaining, out);
                 }
             }
             let mut remaining = limit;
@@ -1653,7 +1673,7 @@ mod tests {
                 visit(
                     &entry.name,
                     &document.roots,
-                    &matcher,
+                    &query,
                     &mut remaining,
                     &mut out,
                 );
@@ -1686,6 +1706,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn graph_search_reports_per_category_truncation() {
+        let (dir, graph) = fixture();
+
+        let page_truncated = graph.run_graph_search("opdf", 2, 1, false);
+        assert!(page_truncated.has_more.pages);
+        assert!(!page_truncated.has_more.blocks);
+
+        let block_truncated = graph.run_graph_search("foo", 10, 1, false);
+        assert!(!block_truncated.has_more.pages);
+        assert!(block_truncated.has_more.blocks);
+
+        let complete = graph.run_graph_search("foo", 10, 10, false);
+        assert!(!complete.has_more.pages);
+        assert!(!complete.has_more.blocks);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1885,6 +1924,94 @@ mod tests {
                 if display_text == "Re\u{301}sume\u{301}"
                     && evidence[0].spans == vec![MatchSpan { start: 0, end: 8 }]
         ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn page_alias_search_is_scoped_to_its_physical_owner() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-alias-owner-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages").join("sub")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("pages").join("Foo.md"),
+            "alias:: bar\n\n- declaring page\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("sub").join("Foo.md"),
+            "- same-named sibling\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Unique.md"),
+            "alias:: quux\n\n- unique alias owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let alias_hits = graph
+            .run_graph_search("bar", 10, 0, false)
+            .hits
+            .into_iter()
+            .filter_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    match_class,
+                    matched_alias,
+                    ..
+                } if !page.rel_path.is_empty() => {
+                    Some((page.rel_path, match_class, matched_alias))
+                }
+                QueryHit::Page { .. } => None,
+                QueryHit::Block { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alias_hits,
+            vec![(
+                "pages/Foo.md".to_string(),
+                ObjectiveMatchClass::Exact,
+                Some("bar".to_string()),
+            )],
+            "a duplicate-named sibling must not inherit another file's alias"
+        );
+
+        let unique_hits = graph
+            .run_graph_search("quux", 10, 0, false)
+            .hits
+            .into_iter()
+            .filter_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    match_class,
+                    matched_alias,
+                    ..
+                } if !page.rel_path.is_empty() => {
+                    Some((page.rel_path, match_class, matched_alias))
+                }
+                QueryHit::Page { .. } => None,
+                QueryHit::Block { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unique_hits,
+            vec![(
+                "pages/Unique.md".to_string(),
+                ObjectiveMatchClass::Exact,
+                Some("quux".to_string()),
+            )],
+            "a unique page name must retain ordinary alias matching"
+        );
+
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2100,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_block_search_adapter_preserves_matcher_membership_and_ranked_topk() {
+    fn literal_block_search_adapter_preserves_fuzzy_membership_and_ranked_topk() {
         let (dir, graph) = fixture();
         for query in [
             "",
@@ -2116,7 +2243,7 @@ mod tests {
             let full = block_fingerprint(crate::query::search(&graph, query, usize::MAX));
             let mut full_membership = full.clone();
             full_membership.sort();
-            let mut reference = reference_search(&graph, query, usize::MAX);
+            let mut reference = reference_literal_search(&graph, query, usize::MAX);
             reference.sort();
             assert_eq!(full_membership, reference, "query={query:?}");
             for limit in [0, 1, 2, 20] {

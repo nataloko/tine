@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
@@ -16,7 +16,7 @@ import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
-import { pageProperties, aliasNames, isImplicitPageRefProperty, isQuotedPagePropertyValue, normalizeImplicitPageName, visibleBody } from "../render/block";
+import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
 import { journalTitle } from "../journal";
@@ -26,6 +26,7 @@ import { tagRef } from "../tags";
 import { copyGuideIntoGraph, ensureGuidePagesLoaded, isGuidePageName } from "../guide";
 import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
+import { PagePropertyValue } from "./PagePropertyValue";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -112,29 +113,6 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
 // (OG hides it too). Other internal/metadata page props could be added here.
 const PAGE_PROPS_HIDDEN = new Set(["alias", "icon", "tine.tag-table"]);
 const TAG_TABLE_PROP = "tine.tag-table";
-
-/** Render Logseq's implicit page-reference properties without changing the
- * stored text. Bare alias/aliases/tags values become navigable, while explicit
- * inline markup, separators, spacing, custom properties, and quoted values keep
- * their authored representation. */
-function PagePropertyValue(props: { propertyKey: string; value: string; format: "md" | "org" }): JSX.Element {
-  if (!isImplicitPageRefProperty(props.propertyKey) || isQuotedPagePropertyValue(props.value)) {
-    return <InlineText text={props.value} format={props.format} />;
-  }
-  return (
-    <For each={props.value.split(/([,，])/g)}>
-      {(part) => {
-        if (part === "," || part === "，") return part;
-        const leading = part.match(/^\s*/)?.[0] ?? "";
-        const trailing = part.match(/\s*$/)?.[0] ?? "";
-        const value = part.slice(leading.length, part.length - trailing.length);
-        if (!value) return part;
-        const name = normalizeImplicitPageName(value);
-        return <>{leading}<PageRef name={name} alias={name} />{trailing}</>;
-      }}
-    </For>
-  );
-}
 
 function paneContextFromContext() {
   const ctx = useContext(PaneContext);
@@ -396,12 +374,12 @@ export function PageView(): JSX.Element {
   const zoomValid = () => {
     const r = currentRoute();
     if (r.kind !== "page" || !r.block) return null;
-    const block = doc.byId[r.block];
-    const owner = block ? pageByName(block.page) : undefined;
-    const target = pageTargetFromRoute(r);
-    return block && owner && target && pageTargetMatchesLoaded(target, owner)
-      ? r.block
-      : null;
+    return resolveBlockRef({
+      uuid: r.block,
+      page: r.name,
+      pageKind: r.pageKind,
+      ...(r.path ? { path: r.path } : {}),
+    });
   };
   const contentReady = () => {
     const r = loadedRoute();
@@ -548,6 +526,9 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   const router = pane.router;
   const [renaming, setRenaming] = createSignal(false);
   const [newName, setNewName] = createSignal("");
+  let renameInFlight = false;
+  let renameSubmitted = false;
+  let renameCancelled = false;
   let pageActionsTrigger: HTMLButtonElement | undefined;
   const pageTarget = () => pageTargetFromFeedPage(props.page);
   const pageActionsOpen = () => {
@@ -610,15 +591,21 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
     }
   });
   const startRename = () => {
+    if (renameInFlight) return;
     if (props.page.guide || props.page.readOnly) return;
     if (props.page.kind !== "page") return; // journals are named by their date
+    renameSubmitted = false;
+    renameCancelled = false;
     setNewName(props.page.name);
     setRenaming(true);
   };
   const commitRename = async () => {
+    if (renameSubmitted || renameCancelled || renameInFlight) return;
     const next = newName().trim();
+    renameSubmitted = true;
     setRenaming(false);
     if (!next || next === props.page.name) return;
+    renameInFlight = true;
     try {
       // Flush ALL unsaved edits before the file is moved on disk — the rename
       // transaction reads every referencing page from disk to rewrite its
@@ -637,6 +624,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       router.openPage(next, "page");
     } catch (e) {
       alert(`Rename failed: ${String(e)}`);
+    } finally {
+      renameInFlight = false;
     }
   };
 
@@ -656,9 +645,12 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               onInput={(e) => setNewName(e.currentTarget.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void commitRename();
-                else if (e.key === "Escape") setRenaming(false);
+                else if (e.key === "Escape") {
+                  renameCancelled = true;
+                  setRenaming(false);
+                }
               }}
-              onBlur={() => setRenaming(false)}
+              onBlur={() => void commitRename()}
             />
           }
         >

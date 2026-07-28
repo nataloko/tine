@@ -21,6 +21,8 @@ import {
   reloadDisposition,
   setBlockMoving,
   splitBlock,
+  insertOutlineAfter,
+  replaceEmptyBlockWithOutline,
   indentBlock,
   outdentBlock,
   mergeWithPrev,
@@ -66,6 +68,9 @@ import {
   setPageProperty,
   beginPageHeaderEdit,
   finishPageHeaderEdit,
+  ensureBlockId,
+  persistentBlockRef,
+  resolveBlockRef,
 } from "./store";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -87,6 +92,7 @@ import {
   dataRev,
   pageInventoryRev,
   setWorkflow,
+  setGraphMeta,
 } from "./ui";
 import { journalTitle } from "./journal";
 import type { BlockDto, PageDto } from "./types";
@@ -148,6 +154,36 @@ describe("properties-only first block", () => {
     const dto = pageToDto("Test")!;
     expect(dto.pre_block).toBe("tags:: books");
     expect(dto.blocks).toEqual([]);
+  });
+
+  it.each([
+    ["tags", "blah"],
+    ["icon", "📚"],
+    ["myrandomkey", "anything"],
+  ])("saves a marked %s page-header draft while Enter's trailing newline remains in the editor (GH #210)", (key, value) => {
+    loadSingle({
+      name: "Test", kind: "page", title: "Test", pre_block: `${key}:: ${value}`,
+      blocks: [blk("Body")], format: "md",
+    });
+    const id = beginPageHeaderEdit("Test")!;
+    setRaw(id, `${key}:: ${value}\n`);
+
+    expect(pageToDto("Test")).toMatchObject({
+      pre_block: `${key}:: ${value}`,
+      blocks: [{ raw: "Body" }],
+    });
+    expect(doc.byId[id].raw).toBe(`${key}:: ${value}\n`);
+  });
+
+  it("promotes a fresh properties-only first root while Enter's trailing newline remains in the editor (GH #210)", () => {
+    const properties = blk("foo:: bar\n");
+    load([properties, blk("Body")]);
+
+    expect(pageToDto("Test")).toMatchObject({
+      pre_block: "foo:: bar",
+      blocks: [{ raw: "Body" }],
+    });
+    expect(doc.byId[properties.id].raw).toBe("foo:: bar\n");
   });
 
   it("does NOT fold a properties-only first bullet that carries an id:: (real referenced block) (GH #198)", () => {
@@ -269,6 +305,7 @@ beforeEach(() => {
   counter = 0;
   resetStore();
   setWorkflow("now");
+  setGraphMeta(null);
   resetPaneLayoutToSingle({
     tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
     activeIndex: 0,
@@ -305,6 +342,74 @@ describe("ordered list (logseq.order-list-type)", () => {
     const newId = doc.pages[0].roots[1];
     expect(blockProperty(newId, "logseq.order-list-type")).toBe("number");
     expect(orderedListMarker(newId)).toBe("2");
+  });
+
+  it("drag-inherits the drop target's ordered property in memory and the serialized DTO", async () => {
+    const dto = load([blk("source"), blk("untouched bytes"), blk(`target\n${ORD}`)]);
+    const [source, untouched, target] = dto.blocks.map((block) => block.id);
+    const untouchedBefore = pageToDto("Test")!.blocks.find((block) => block.id === untouched)!.raw;
+
+    await (moveBlock as (...args: unknown[]) => Promise<void>)(source, null, 3, "Test", target);
+
+    expect(blockProperty(source, "logseq.order-list-type")).toBe("number");
+    expect(doc.byId[source].raw).toBe(`source\n${ORD}`);
+    expect(pageToDto("Test")!.blocks.find((block) => block.id === source)!.raw).toBe(`source\n${ORD}`);
+    expect(pageToDto("Test")!.blocks.find((block) => block.id === untouched)!.raw).toBe(untouchedBefore);
+  });
+
+  it("dragging a numbered source onto a plain target preserves its own property", async () => {
+    const dto = load([blk(`source\n${ORD}`), blk("plain target"), blk("untouched bytes")]);
+    const [source, target, untouched] = dto.blocks.map((block) => block.id);
+    const untouchedBefore = doc.byId[untouched].raw;
+
+    await (moveBlock as (...args: unknown[]) => Promise<void>)(source, null, 2, "Test", target);
+
+    expect(blockProperty(source, "logseq.order-list-type")).toBe("number");
+    expect(doc.byId[source].raw).toBe(`source\n${ORD}`);
+    expect(doc.byId[untouched].raw).toBe(untouchedBefore);
+  });
+
+  it("structural paste after a numbered target uses the same inheritance rule", () => {
+    const dto = load([blk(`target\n${ORD}`), blk("untouched bytes")]);
+    const [target, untouched] = dto.blocks.map((block) => block.id);
+    const untouchedBefore = pageToDto("Test")!.blocks[1].raw;
+
+    const pasted = insertOutlineAfter(target, [{ raw: "pasted", children: [] }]);
+
+    expect(blockProperty(pasted, "logseq.order-list-type")).toBe("number");
+    expect(pageToDto("Test")!.blocks.find((block) => block.id === pasted)!.raw).toBe(`pasted\n${ORD}`);
+    expect(pageToDto("Test")!.blocks.find((block) => block.id === untouched)!.raw).toBe(untouchedBefore);
+  });
+
+  it("empty-target structural paste inherits numbering for every untyped root", () => {
+    const dto = load([blk(ORD), blk("untouched bytes")]);
+    const [target, untouched] = dto.blocks.map((block) => block.id);
+    const untouchedBefore = doc.byId[untouched].raw;
+
+    const last = replaceEmptyBlockWithOutline(target, [
+      { raw: "first", children: [] },
+      { raw: "second", children: [] },
+    ]);
+
+    expect(blockProperty(target, "logseq.order-list-type")).toBe("number");
+    expect(blockProperty(last, "logseq.order-list-type")).toBe("number");
+    expect(doc.byId[untouched].raw).toBe(untouchedBefore);
+  });
+
+  it("uses Org drawers for drag and paste inheritance without touching siblings", async () => {
+    const ORG_ORD = ":PROPERTIES:\n:logseq.order-list-type: number\n:END:";
+    const dto = load([blk("move me"), blk(`target\n${ORG_ORD}`), blk("untouched bytes")], "org");
+    const [source, target, untouched] = dto.blocks.map((block) => block.id);
+    const untouchedBefore = pageToDto("Test")!.blocks.find((block) => block.id === untouched)!.raw;
+
+    await (moveBlock as (...args: unknown[]) => Promise<void>)(source, null, 2, "Test", target);
+    const pasted = insertOutlineAfter(target, [{ raw: "pasted", children: [] }]);
+
+    expect(doc.byId[source].raw).toBe(`move me\n${ORG_ORD}`);
+    expect(doc.byId[pasted].raw).toBe(`pasted\n${ORG_ORD}`);
+    expect(doc.byId[source].raw).not.toContain("logseq.order-list-type::");
+    expect(doc.byId[pasted].raw).not.toContain("logseq.order-list-type::");
+    expect(pageToDto("Test")!.blocks.find((block) => block.id === untouched)!.raw).toBe(untouchedBefore);
   });
 });
 
@@ -438,6 +543,20 @@ describe("outdent (Shift+Tab)", () => {
     outdentBlock(a, 0);
     // a moves out after p, and b,c become a's children
     expect(shape()).toEqual([["p"], ["a", [["b"], ["c"]]]]);
+  });
+
+  it("keeps following siblings in place when logical outdenting is enabled", () => {
+    setGraphMeta({ logical_outdenting: true } as never);
+    const dto = load([blk("p", [blk("a"), blk("b"), blk("c")])]);
+    const a = dto.blocks[0].children[0].id;
+    // b and c are not moved by logical outdenting, so their serialized DTO bytes
+    // are preserved exactly while a becomes p's following sibling.
+    const untouchedChildren = JSON.stringify(pageToDto("Test")!.blocks[0].children.slice(1));
+
+    outdentBlock(a, 0);
+
+    expect(shape()).toEqual([["p", [["b"], ["c"]]], ["a"]]);
+    expect(JSON.stringify(pageToDto("Test")!.blocks[0].children)).toBe(untouchedChildren);
   });
 });
 
@@ -737,8 +856,8 @@ describe("undo history is graph-local", () => {
 });
 
 describe("cross-page duplicate id::", () => {
-  const page = (name: string, blocks: BlockDto[]): PageDto => ({
-    name, kind: "page", title: name, pre_block: null, blocks,
+  const page = (name: string, blocks: BlockDto[], path?: string): PageDto => ({
+    name, kind: "page", title: name, pre_block: null, blocks, path,
   });
 
   it("re-keys a duplicate id:: on a second page so the two blocks stay distinct", () => {
@@ -759,6 +878,37 @@ describe("cross-page duplicate id::", () => {
     expect(doc.byId[aRoot].raw).toContain("alpha");
     expect(doc.byId[aRoot].page).toBe("A");
     expect(doc.byId[bRoot].page).toBe("B");
+  });
+
+  it("resolves a durable UUID only within its declared page, kind, and path", () => {
+    const uuid = "12345678-1234-4234-8234-123456789abc";
+    ensurePageLoaded(page("A", [{ id: uuid, raw: `alpha\nid:: ${uuid}`, collapsed: false, children: [] }]));
+    ensurePageLoaded(page(
+      "B",
+      [{ id: uuid, raw: `beta\nid:: ${uuid}`, collapsed: false, children: [] }],
+      "pages/client-b/B.md",
+    ));
+    const bRoot = pageByName("B")!.roots[0];
+    expect(bRoot).not.toBe(uuid);
+
+    expect(resolveBlockRef({
+      uuid,
+      page: "B",
+      pageKind: "page",
+      path: "pages/client-b/B.md",
+    })).toBe(bRoot);
+    expect(resolveBlockRef({
+      uuid,
+      page: "B",
+      pageKind: "journal",
+      path: "pages/client-b/B.md",
+    })).toBeNull();
+    expect(resolveBlockRef({
+      uuid,
+      page: "B",
+      pageKind: "page",
+      path: "pages/client-a/B.md",
+    })).toBeNull();
   });
 });
 
@@ -1447,6 +1597,45 @@ describe("save engine (persistence)", () => {
     expect(saveSpy.mock.calls[1][1]).toBe("rev2");
   });
 
+  it("gives a fresh Markdown block one durable identity for persistent references and Copy block ref", async () => {
+    const uuid = "12345678-1234-4234-8234-123456789abc";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(uuid);
+    load([blk("Fresh target")]);
+    const storeKey = doc.pages[0].roots[0];
+
+    const ref = persistentBlockRef(storeKey);
+
+    expect(ref).toMatchObject({ uuid, page: "Test", pageKind: "page" });
+    expect(ref.uuid).not.toBe(storeKey);
+    expect(doc.byId[storeKey].raw).toBe(`Fresh target\nid:: ${uuid}`);
+    expect(await ensureBlockId(storeKey)).toBe(uuid);
+    expect(doc.byId[storeKey].raw.match(/(?:^|\n)id::/g)).toHaveLength(1);
+  });
+
+  it("derives a fresh Org journal's persistent identity from its format-aware drawer", async () => {
+    const uuid = "87654321-4321-4321-8321-cba987654321";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(uuid);
+    const target = blk("Fresh journal target\nSCHEDULED: <2026-07-22 Wed>");
+    loadSingle({
+      name: "2026-07-22",
+      kind: "journal",
+      title: "Wednesday, 22 July 2026",
+      pre_block: null,
+      format: "org",
+      blocks: [target],
+    });
+
+    const ref = persistentBlockRef(target.id);
+
+    expect(ref).toMatchObject({ uuid, page: "2026-07-22", pageKind: "journal" });
+    expect(ref.uuid).not.toBe(target.id);
+    expect(doc.byId[target.id].raw).toBe(
+      `Fresh journal target\nSCHEDULED: <2026-07-22 Wed>\n:PROPERTIES:\n:id: ${uuid}\n:END:`,
+    );
+    expect(await ensureBlockId(target.id)).toBe(uuid);
+    expect(doc.byId[target.id].raw.match(/(?:^|\n):id:/gi)).toHaveLength(1);
+  });
+
   it("refreshes page inventory only when a save creates a new file", async () => {
     const before = pageInventoryRev();
     load([blk("new")]);
@@ -1755,10 +1944,12 @@ describe("setBlockProperty placement & fence safety", () => {
   });
 
   it("replaces an existing head property in place", () => {
+    // In place means the line KEEPS its position — the old writer moved the
+    // edited key to the end, which reordered field-table columns (GH #216).
     const b = blk("Title\na:: 1\nb:: 2\nbody");
     load([b]);
     setBlockProperty(b.id, "a", "9");
-    expect(doc.byId[b.id].raw).toBe("Title\nb:: 2\na:: 9\nbody");
+    expect(doc.byId[b.id].raw).toBe("Title\na:: 9\nb:: 2\nbody");
   });
 
   it("NEVER touches property-looking lines inside a code fence", () => {
@@ -1821,6 +2012,13 @@ describe("setSchedule fence safety (review fix)", () => {
     setSchedule(b.id, "scheduled", null);
     expect(doc.byId[b.id].raw).toBe(raw);
   });
+
+  it("preserves trailing body text when re-picking a glued planning line", () => {
+    const b = blk("Task\nDEADLINE: <2026-07-07 Tue>tail");
+    load([b]);
+    setSchedule(b.id, "deadline", { y: 2026, m: 6, d: 30 });
+    expect(doc.byId[b.id].raw).toBe("Task\nDEADLINE: <2026-07-30 Thu>\ntail");
+  });
 });
 
 describe("blockProperty via the one recognizer (review fix)", () => {
@@ -1829,6 +2027,33 @@ describe("blockProperty via the one recognizer (review fix)", () => {
     load([b]);
     expect(blockProperty(b.id, "tine.col-widths")).toBe(null);
     expect(blockProperty(b.id, "tine.view")).toBe("grid");
+  });
+});
+
+describe("setBlockProperty preserves property order on update (GH #216)", () => {
+  it("updating an existing md property keeps its line position (not moved to end)", () => {
+    // Field-table columns are ordered by property-discovery order; if editing a
+    // cell re-appended the edited key, its column jumped to the last position.
+    const b = blk("row\nfirst:: 23\nsecond:: 46\nthird:: 69");
+    load([b]);
+    setBlockProperty(b.id, "second", "90");
+    expect(doc.byId[b.id].raw).toBe("row\nfirst:: 23\nsecond:: 90\nthird:: 69");
+  });
+
+  it("adding a NEW md property still appends after the existing ones", () => {
+    const b = blk("row\nfirst:: 23\nsecond:: 46");
+    load([b]);
+    setBlockProperty(b.id, "third", "69");
+    expect(doc.byId[b.id].raw).toBe("row\nfirst:: 23\nsecond:: 46\nthird:: 69");
+  });
+
+  it("updating an existing org drawer property keeps its position", () => {
+    const b = blk("row\n:PROPERTIES:\n:first: 23\n:second: 46\n:third: 69\n:END:");
+    load([b], "org");
+    setBlockProperty(b.id, "second", "90");
+    expect(doc.byId[b.id].raw).toBe(
+      "row\n:PROPERTIES:\n:first: 23\n:second: 90\n:third: 69\n:END:",
+    );
   });
 });
 

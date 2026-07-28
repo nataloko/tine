@@ -2382,8 +2382,8 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lsdoc"
-version = "0.5.3"
-source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.3#96e909634ce247bd261851c04a837096b4ccef7f"
+version = "0.5.4"
+source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.4#70976ac896849d7c3985f7542fc7edee834d39a0"
 dependencies = [
  "memchr",
  "phf 0.11.3",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.2"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -4743,7 +4743,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.2"
+version = "0.6.5"
 dependencies = [
  "ammonia",
  "cap-std",
@@ -4755,6 +4755,7 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
+ "sha2",
  "slotmap",
  "unicode-normalization",
  "unicode-segmentation",

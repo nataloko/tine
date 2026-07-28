@@ -79,6 +79,39 @@ function propertyLines(raw: string): [string, string][] {
   return out;
 }
 
+function mockReferencedPageNames(pages: PageDto[]): string[] {
+  const seen = new Map<string, string>();
+  const add = (name: string) => {
+    const trimmed = name.trim();
+    if (trimmed) seen.set(trimmed.toLowerCase(), seen.get(trimmed.toLowerCase()) ?? trimmed);
+  };
+  const addPropertyRefs = (raw: string | null) => {
+    if (!raw) return;
+    for (const [key, value] of propertyLines(raw)) {
+      if (!/^(tags|alias|aliases)$/i.test(key)) continue;
+      const quoted = value.trim();
+      if (quoted.length >= 2 && quoted.startsWith('"') && quoted.endsWith('"')) continue;
+      for (const valuePart of value.split(/[,，]/)) {
+        const bare = valuePart.trim().replace(/^#/, "");
+        const name = bare.startsWith("[[") && bare.endsWith("]]")
+          ? bare.slice(2, -2).trim()
+          : bare;
+        add(name);
+      }
+    }
+  };
+  const visit = (blocks: BlockDto[]) => blocks.forEach((block) => {
+    pageRefs(block.raw).forEach(add);
+    addPropertyRefs(block.raw);
+    visit(block.children);
+  });
+  for (const page of pages) {
+    addPropertyRefs(page.pre_block);
+    visit(page.blocks);
+  }
+  return [...seen.values()];
+}
+
 let _id = 0;
 const nid = () => `mock-${_id++}`;
 const mockPlugins: InstalledPluginRecord[] = [];
@@ -653,6 +686,8 @@ export function mockBackend(): Backend {
         preferred_format: "md",
         enable_timetracking: true,
         show_brackets: true,
+        doc_mode_enter_for_new_block: false,
+        logical_outdenting: false,
         logbook_with_second_support: true,
         logbook_enabled_in_timestamped_blocks: true,
         logbook_enabled_in_all_blocks: false,
@@ -775,6 +810,9 @@ export function mockBackend(): Backend {
     },
     async defaultGraphParent(): Promise<string> {
       return "/mock";
+    },
+    async referencedPageNames(): Promise<string[]> {
+      return mockReferencedPageNames(all);
     },
     async listPages(): Promise<PageEntry[]> {
       return all.map(mockPageEntry);
@@ -1070,6 +1108,12 @@ export function mockBackend(): Backend {
     async setShowBrackets(): Promise<void> {
       // no-op in the browser mock
     },
+    async setDocModeEnterForNewBlock(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async setLogicalOutdenting(): Promise<void> {
+      // no-op in the browser mock
+    },
     async setPreferredFormat(): Promise<void> {
       // no-op in the browser mock
     },
@@ -1131,10 +1175,11 @@ export function mockBackend(): Backend {
         };
       }
       const bare = simpleTerm(matcher);
-      const pages = scope ? [] : all
+      const pageMatches = scope ? [] : all
         .map((page) => ({ page, score: bare ? fuzzyScore(bare, canonicalFold(page.name)) : 0 }))
         .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, canonicalFold(page.name), page.name))
-        .sort((a, b) => b.score - a.score)
+        .sort((a, b) => b.score - a.score);
+      const pages = pageMatches
         .slice(0, pageLimit)
         .map(({ page, score }) => ({
           entity: "page" as const,
@@ -1163,9 +1208,10 @@ export function mockBackend(): Backend {
           ? mockPagePath(page) === scope.path
           : page.kind === scope.pageKind && canonicalFold(page.name) === canonicalFold(scope.name);
       };
-      const blocks = collect((block) => matcherMatches(matcher, canonicalFold(block.raw), block.raw))
+      const blockMatches = collect((block) => matcherMatches(matcher, canonicalFold(block.raw), block.raw))
         .filter(inScope)
-        .flatMap((group) => group.blocks.map((block) => ({ group, block })))
+        .flatMap((group) => group.blocks.map((block) => ({ group, block })));
+      const blocks = blockMatches
         .slice(0, Math.max(0, blockLimit))
         .map(({ group, block }) => {
           const owner = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
@@ -1187,6 +1233,10 @@ export function mockBackend(): Backend {
       return {
         hits: [...pages, ...blocks],
         diagnostics: [],
+        has_more: {
+          pages: pageLimit > 0 && pageMatches.length > pageLimit,
+          blocks: blockLimit > 0 && blockMatches.length > blockLimit,
+        },
         explanation: {
           branches: explain ? [
             { description: bare ? `Page names fuzzily match “${source}”` : `Page names match “${source}”`, children: [] },

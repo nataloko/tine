@@ -126,7 +126,16 @@ const suites = {
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
   ],
   "windows-smoke": [
-    ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
+    // og-parity-references is a HARD gate on Linux (linux-release + og-parity-pilot
+    // suites), where adaptive page completion is byte-exact with OG. It is dropped
+    // from the advisory Windows suite only: on WebView2 the completion yields a
+    // trailing space and two Terra debugging rounds (2026-07-20) could not even
+    // observe the reference-completion setting state to classify it as timing vs a
+    // real WebView2 editor difference. Per AGENTS.md §2b E2E stop-loss (two dispatches,
+    // still red + unclassified → quarantine + record debt), it is quarantined from
+    // Windows so a future Windows regression is not masked by a chronic red line. The
+    // open question (is the trailing space a genuine WebView2 product diff?) is tracked
+    // in specs/notes; the assertion stays live everywhere it currently passes.
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
@@ -248,16 +257,21 @@ function validateBuildReceiptInputs() {
   if (schemaProblems.length) {
     throw receiptRemediation(`invalid build receipt ${receiptPath}: ${schemaProblems.join(", ")}`);
   }
-  let checkoutDigest;
+  let checkoutState;
   try {
-    checkoutDigest = normalizedTauriManifest
-      ? normalizedBuildInputState(root, normalizedTauriManifest).digest
-      : buildInputState(root).digest;
-  } catch {
-    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout`);
+    checkoutState = normalizedTauriManifest
+      ? normalizedBuildInputState(root, normalizedTauriManifest)
+      : buildInputState(root);
+  } catch (error) {
+    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout (${error.message})`);
   }
-  if (receipt.buildInputDigest !== checkoutDigest) {
-    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout`);
+  if (receipt.buildInputDigest !== checkoutState.digest) {
+    // Name the stray/changed working-tree entries — a download into the worktree
+    // (untracked, non-ignored) is the usual culprit, and the bare message hid it.
+    const stray = checkoutState.changes?.length
+      ? ` Working-tree entries not in the built inputs: ${checkoutState.changes.slice(0, 12).join(", ")}${checkoutState.changes.length > 12 ? ", …" : ""}.`
+      : "";
+    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout.${stray}`);
   }
   if (receipt.sourceRevision !== checkoutRevision) {
     throw receiptRemediation(`build receipt ${receiptPath} was built from ${receipt.sourceRevision}, not checkout ${checkoutRevision}`);

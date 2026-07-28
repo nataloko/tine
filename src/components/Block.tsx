@@ -1,6 +1,7 @@
 import { Show, Switch, Match, For, createMemo, createSignal, createResource, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
-import { backend } from "../backend";
+import { autocompleteFacets, backend } from "../backend";
+import { clearClipboardSlot, normalize, peekClipboardSlot, writeClipboardText } from "../clipboard";
 import {
   detectTrigger,
   applyCompletion,
@@ -12,9 +13,12 @@ import {
   tagInsert,
   orderAcItems,
   COMMANDS,
+  advancedBlockInsertion,
+  filterAdvancedBlockCommands,
   commandScore,
   codeLanguageItems,
   fuzzyScore,
+  propertyKeyFold,
   type Trigger,
 } from "../editor/autocomplete";
 import { pluginManager } from "../plugins/manager";
@@ -30,6 +34,9 @@ import {
   pageByName,
   setRaw,
   setBlockProperty,
+  makeOwnNumberedList,
+  removeOwnNumberedList,
+  stopOwnNumberedListOnEmptyEnter,
   splitBlock,
   indentBlock,
   outdentBlock,
@@ -45,6 +52,7 @@ import {
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
   insertOutlineChildren,
+  pasteClipboardPayload,
   deleteBlock,
   moveBlock,
   moveBlockFeed,
@@ -64,8 +72,11 @@ import {
   blockIsGridView,
   trackAssetWrite,
   formatForBlock,
+  depthOf,
+  setHeading,
   collapsibleDescendantIds,
   setCollapsedDescendants,
+  blockExternalId,
   type OutlineScope,
 } from "../store";
 import {
@@ -76,16 +87,19 @@ import {
   endEdit,
   focusSurfaceFor,
   noteSurfaceFocused,
+  registerHistoryEditorTarget,
   startEditing,
   takeCaretFor,
+  takeHistoryEditorSelectionFor,
 } from "../editorController";
-import { parseOutline } from "../editor/outline";
+import { parseOutline, type OutlineNode } from "../editor/outline";
 import { structuredHtmlOutline } from "../editor/htmlPaste";
 import {
   toggleInlineFormat,
   insertLink,
   wrapLink,
   isPasteableUrl,
+  videoPasteMacro,
   killLineBefore,
   killLineAfter,
   wordForward,
@@ -102,7 +116,7 @@ import {
   type SelectionAction,
 } from "../editor/selectionActions";
 import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/block";
-import { facetsOf } from "../render/facets";
+import { effectiveHeadingLevel, facetsOf } from "../render/facets";
 import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
 import { codeHlEnabled } from "../codeHighlightSettings";
 import { InlineText } from "../render/inline";
@@ -117,19 +131,21 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
+import { journalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
-import { QueryMacro, EmbedMacro } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest } from "../ui";
+import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
+import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
 import { openInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
 import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
+import { setMarker } from "../editor/marker";
 import { registerTransientLayer } from "../transientLayers";
 
 import { taskCheckboxState } from "../markers";
-import { applyTemplateVars } from "../editor/templateVars";
+import { applyTemplateVars, prepareTemplateVars } from "../editor/templateVars";
 import {
   caretAtFirstRow,
   caretAtLastRow,
@@ -162,6 +178,7 @@ import { SheetGrid } from "./SheetGrid";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { blockBackgroundColor } from "../blockColors";
+import { blockDtoExternalId } from "../blockIdentity";
 import { SheetContainer } from "./SheetContainer";
 import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
 
@@ -260,7 +277,7 @@ function beginDrag(id: string, e: MouseEvent) {
       }
       // Pass the target's page so a root-to-root drop across pages (e.g. between
       // journal days) lands on the page it was dropped onto, not the source page.
-      if (ok) void moveBlock(id, tgt.parent, siblingIndex(ind.id) + (ind.before ? 0 : 1), tgt.page);
+      if (ok) void moveBlock(id, tgt.parent, siblingIndex(ind.id) + (ind.before ? 0 : 1), tgt.page, ind.id);
     }
     setDragId(null);
     setDropInd(null);
@@ -372,7 +389,10 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   });
   // Heading level of THIS block's first line, so the bullet column can match the
   // (taller) heading line box and the bullet stays centered on it.
-  const headingLevel = createMemo(() => blockFacets()?.headingLevel ?? null);
+  const headingLevel = createMemo(() => {
+    const facets = blockFacets();
+    return facets ? effectiveHeadingLevel(facets, depthOf(props.id)) : null;
+  });
   const editorVisibleValue = createMemo(() => {
     const n = node();
     if (!n) return "";
@@ -383,7 +403,8 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // Block-level "linked references" panel toggled by the reference-count badge.
   const [showRefs, setShowRefs] = createSignal(false);
   createEffect(() => {
-    if (blockReferencesRequest()?.id === props.id) setShowRefs(true);
+    const requested = blockReferencesRequest()?.id;
+    if (requested === props.id || requested === blockExternalId(props.id)) setShowRefs(true);
   });
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
   // not its children); null for a normal bullet.
@@ -432,6 +453,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
       }}
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}
+      data-block-ref={blockExternalId(props.id) ?? props.id}
     >
       {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
           it reflows + scrolls locked to the block. Elbow = a path curving into this
@@ -711,6 +733,7 @@ function Rendered(props: {
   // ONE lsdoc parse — read from the cache the store seeded from the backend DTO (no
   // parse on load), recomputed from a single wasm parse only for the edited block.
   const facets = createMemo(() => facetsOf(node().raw, fmt()));
+  const headingLevel = createMemo(() => effectiveHeadingLevel(facets(), depthOf(props.id)));
   const clock = createMemo((): LogbookInfo | null => {
     if (!timetrackingEnabled()) return null;
     const marker = facets().marker;
@@ -775,9 +798,9 @@ function Rendered(props: {
   };
 
   const body = (
-    <Show when={annotation()} fallback={<AstBody raw={node().raw} blockId={props.id} format={fmt()} headingLevel={facets().headingLevel} />}>
+    <Show when={annotation()} fallback={<AstBody raw={node().raw} blockId={props.id} format={fmt()} headingLevel={headingLevel()} />}>
       <AnnotationBody
-        highlightId={props.id}
+        highlightId={blockExternalId(props.id) ?? props.id}
         color={annotation()!.color}
         hlPage={annotation()!.hlPage}
         line={annotationLine()}
@@ -796,7 +819,7 @@ function Rendered(props: {
               <QueryMacro body={macro()!.inner} blockId={props.id} />
             </Match>
             <Match when={macro()!.kind === "embed"}>
-              <EmbedMacro body={macro()!.inner} />
+              <EmbedMacro body={macro()!.inner} blockId={props.id} />
             </Match>
           </Switch>
         </div>
@@ -805,7 +828,7 @@ function Rendered(props: {
     <div
       ref={contentRef}
       class="block-content"
-      classList={{ done: facets().done, "has-bg": !!bgColor(), [`heading h${facets().headingLevel ?? ""}`]: facets().headingLevel != null }}
+      classList={{ done: facets().done, "has-bg": !!bgColor(), [`heading h${headingLevel() ?? ""}`]: headingLevel() != null }}
       style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
     >
@@ -956,10 +979,15 @@ interface AcItem {
   insert?: string;
   caret?: number;
   action?: import("../editor/autocomplete").CommandAction;
+  taskMarker?: string;
   plugin?: { pluginId: string; contributionId: string; insertText?: string };
   templateNodes?: import("../types").BlockDto[];
-  /** A `((block reference))` candidate: insert `((uuid))` and persist id::. */
-  blockRef?: { uuid: string; page: string; kind: import("../types").PageKind };
+  /** A `((block reference))` candidate. `uuid` finds the target; `externalId` is persisted. */
+  blockRef?: { uuid: string; externalId: string; page: string; kind: import("../types").PageKind };
+  /** Canonical property-name candidate, or a newly folded typed key. */
+  propertyName?: string;
+  /** Existing or newly typed value for the active canonical property. */
+  propertyValue?: string;
 }
 
 /** Nearest ancestor that actually scrolls vertically — used to pin the scroll
@@ -1020,26 +1048,6 @@ function CalGlyph(): JSX.Element {
 function timeStamp(d = new Date()): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
-// Today's journal page name in the default "MMM do, yyyy" title format the app
-// uses (matches logseq-core's JournalDate::title), so [[Today]] resolves.
-function todayJournalName(d = new Date()): string {
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const n = d.getDate();
-  const a = n % 10;
-  const b = n % 100;
-  const suffix =
-    (a === 1 && b === 11) || (a === 2 && b === 12) || (a === 3 && b === 13)
-      ? "th"
-      : a === 1
-        ? "st"
-        : a === 2
-          ? "nd"
-          : a === 3
-            ? "rd"
-            : "th";
-  return `${months[d.getMonth()]} ${n}${suffix}, ${d.getFullYear()}`;
-}
-
 // Template support: session-cached list of templates, dynamic-var substitution,
 // and DTO→outline conversion for insertion.
 let templateCache: import("../types").TemplateDto[] | null = null;
@@ -1052,6 +1060,7 @@ async function getTemplates(): Promise<import("../types").TemplateDto[]> {
   try {
     templateCache = await backend().listTemplates();
     templateCacheRev = rev;
+    if (templateCache.length) await prepareTemplateVars();
   } catch {
     templateCache = [];
   }
@@ -1124,7 +1133,7 @@ export function Editor(props: { id: string }): JSX.Element {
   const editorHeadingLevel = createMemo(() => {
     const visible = editorValue();
     if (visible.includes("\n")) return null;
-    return facetsOf(visible, pageFmt()).headingLevel;
+    return effectiveHeadingLevel(facetsOf(visible, pageFmt()), depthOf(props.id));
   });
   // Live calc preview: when this editor opened on a ```calc fence, show the SAME
   // results panel as the rendered view, recomputed on every keystroke (onInput
@@ -1210,6 +1219,8 @@ export function Editor(props: { id: string }): JSX.Element {
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
   const [acIndex, setAcIndex] = createSignal(0);
+  const [propertyValueKey, setPropertyValueKey] = createSignal<string | null>(null);
+  let propertyFacets: [string, string[]][] = [];
   let acListRef: HTMLDivElement | undefined;
   // Keep the highlighted autocomplete item scrolled into view during arrow nav.
   createEffect(() => {
@@ -1259,13 +1270,33 @@ export function Editor(props: { id: string }): JSX.Element {
     setAc(null);
     setAcItems([]);
     setAcIndex(0);
+    setPropertyValueKey(null);
   };
   const sameAcTrigger = (left: Trigger | null, right: Trigger): boolean =>
     left !== null &&
     left.kind === right.kind &&
     left.query === right.query &&
     left.start === right.start &&
-    left.end === right.end;
+    left.end === right.end &&
+    left.property === right.property;
+  const detectEditorTrigger = (value = ref.value, caret = ref.selectionStart): Trigger | null =>
+    isCalc() || isAnnot() || !!sheetCell
+      ? null
+      : detectTrigger(value, caret, propertyValueKey());
+  const propertyValueItems = (key: string, query: string): AcItem[] => {
+    const values = propertyFacets.find(([candidate]) => candidate === key)?.[1] ?? [];
+    const q = query.trim();
+    const ranked = values
+      .map((value, index) => ({ value, index, score: q ? fuzzyScore(q, value) : 1 }))
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .slice(0, 100)
+      .map(({ value }) => ({ label: value, propertyValue: value }));
+    if (q && !values.some((value) => value.toLowerCase() === q.toLowerCase())) {
+      ranked.push({ label: `Create "${q}"`, propertyValue: q });
+    }
+    return ranked;
+  };
   // Page/block/tag/command/code completion is a real transient above its editor
   // and, on mobile, above the drawer. One Escape peels only this popup.
   createEffect(() => {
@@ -1280,13 +1311,36 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   const updateAutocomplete = async () => {
-    const t = detectTrigger(ref.value, ref.selectionStart);
+    const t = detectEditorTrigger();
     if (!t) {
       closeAc();
       return;
     }
     setAc(t);
     setAcIndex(0);
+    if (t.kind === "property-name") {
+      const facets = await autocompleteFacets();
+      const cur = ac();
+      if (!sameAcTrigger(cur, t)) return;
+      propertyFacets = facets;
+      const q = t.query.trim();
+      const ranked = facets
+        .map(([key], index) => ({ key, index, score: q ? fuzzyScore(q, key) : 1 }))
+        .filter(({ score }) => score > 0)
+        .sort((left, right) => right.score - left.score || left.index - right.index)
+        .slice(0, 100)
+        .map(({ key }) => ({ label: key, propertyName: key }));
+      const created = propertyKeyFold(t.query);
+      if (created && !facets.some(([key]) => key === created)) {
+        ranked.push({ label: `Create "${created}"`, propertyName: created });
+      }
+      setAcItems(ranked);
+      return;
+    }
+    if (t.kind === "property-value") {
+      setAcItems(propertyValueItems(t.property!, t.query));
+      return;
+    }
     if (t.kind === "code-language") {
       setAcItems(codeLanguageItems(t.query).map((language) => ({
         label: language.label,
@@ -1296,6 +1350,14 @@ export function Editor(props: { id: string }): JSX.Element {
         // a hand-typed one-line fence stays at the end and Enter behaves normally.
         caret: language.id.length + (ref.value[t.end] === "\n" ? 1 : 0),
       })));
+      return;
+    }
+    if (t.kind === "advanced-command") {
+      const fmt = formatForBlockId(props.id);
+      setAcItems(filterAdvancedBlockCommands(t.query).map((command) => {
+        const insertion = advancedBlockInsertion(command, fmt);
+        return { label: command.label, insert: insertion.insert, caret: insertion.caret };
+      }));
       return;
     }
     if (t.kind === "command") {
@@ -1314,7 +1376,7 @@ export function Editor(props: { id: string }): JSX.Element {
         if (c.action === "drawio" && isMobilePlatform) return;
         const s = q ? commandScore(q, c) : 1;
         if (s > 0)
-          scored.push({ item: { label: c.label, insert: c.insert, caret: c.caret, action: c.action }, s, idx: q ? c.matchTieOrder : c.bareOrder });
+          scored.push({ item: { label: c.label, insert: c.insert, caret: c.caret, action: c.action, taskMarker: c.taskMarker }, s, idx: q ? c.matchTieOrder : c.bareOrder });
       });
       pluginManager.slashCommands().forEach(({ pluginId, contribution }, i) => {
         const s = q ? fuzzyScore(q, contribution.title) : 1;
@@ -1348,7 +1410,7 @@ export function Editor(props: { id: string }): JSX.Element {
     if (t.kind === "block") {
       // `((` → full-text search for a block to reference, grouped by page. An
       // empty query (bare `((`) returns nothing — the popup stays hidden until
-      // the user types. Selecting inserts `((uuid))` (see selectAc).
+      // the user types. Selecting inserts the target's durable external ID (see selectAc).
       const groups = await backend().search(t.query, 20, "block-picker");
       const cur = ac();
       if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
@@ -1358,7 +1420,7 @@ export function Editor(props: { id: string }): JSX.Element {
           items.push({
             label: blockFirstLine(b.raw) || g.page,
             sub: g.page,
-            blockRef: { uuid: b.id, page: g.page, kind: g.kind },
+            blockRef: { uuid: b.id, externalId: blockDtoExternalId(b), page: g.page, kind: g.kind },
           });
         }
       }
@@ -1559,18 +1621,42 @@ export function Editor(props: { id: string }): JSX.Element {
 
   const MAX_BYTE_CLIPBOARD_FILE = 64 * 1024 * 1024;
   const MAX_CLIPBOARD_FILES = 32;
-  let pasteMultilineInline = false;
-  let pasteMultilineInlineToken = 0;
-  let pasteMultilineInlineTimer: number | undefined;
-  const clearPasteMultilineInline = () => {
-    pasteMultilineInline = false;
-    pasteMultilineInlineToken += 1;
-    if (pasteMultilineInlineTimer !== undefined) {
-      window.clearTimeout(pasteMultilineInlineTimer);
-      pasteMultilineInlineTimer = undefined;
+  let pasteRaw = false;
+  let pasteRawToken = 0;
+  let pasteRawTimer: number | undefined;
+  const clearPasteRaw = () => {
+    pasteRaw = false;
+    pasteRawToken += 1;
+    if (pasteRawTimer !== undefined) {
+      window.clearTimeout(pasteRawTimer);
+      pasteRawTimer = undefined;
     }
   };
-  onCleanup(clearPasteMultilineInline);
+  onCleanup(clearPasteRaw);
+
+  const pasteLiteralText = (text: string) => {
+    const start = ref.selectionStart;
+    const newRaw = ref.value.slice(0, start) + text + ref.value.slice(ref.selectionEnd);
+    commit(newRaw);
+    const pos = start + text.length;
+    queueMicrotask(() => {
+      ref.value = newRaw;
+      ref.setSelectionRange(pos, pos);
+      autosize();
+    });
+  };
+
+  // Transcribed from OG 6e7afa8eb src/main/frontend/handler/paste.cljs:101-107:
+  // Markdown recognizes only -, +, *, and ATX headings; Org recognizes stars.
+  const plainTextLooksLikeBlocks = (text: string) =>
+    pageFmt() === "org"
+      ? /^\s*\*+\s+/m.test(text)
+      : /^\s*(?:[-+*]|#+)\s+/m.test(text);
+
+  // OG 6e7afa8eb src/main/frontend/handler/paste.cljs:34-47,173-174 splits on
+  // two-or-more newlines and trims each whole paragraph before block parsing.
+  const segmentedPlainText = (text: string): OutlineNode[] =>
+    text.split(/(?:\r?\n){2,}/).map((paragraph) => ({ raw: paragraph.trim(), children: [] }));
 
   /** Import file-manager paths without materializing their bytes in the WebView.
    * If a platform exposes only browser File objects, save those sequentially so
@@ -1820,11 +1906,39 @@ export function Editor(props: { id: string }): JSX.Element {
   const selectAc = (item: AcItem) => {
     const t = ac();
     if (!t) return;
+    if (item.propertyName) {
+      const key = propertyKeyFold(item.propertyName);
+      const inserted = `${key}:: `;
+      const result = applyCompletion(ref.value, t.start, t.end, inserted);
+      const valueTrigger: Trigger = {
+        kind: "property-value",
+        query: "",
+        start: result.caret,
+        end: result.caret,
+        property: key,
+      };
+      commit(result.raw);
+      setPropertyValueKey(key);
+      setAc(valueTrigger);
+      setAcIndex(0);
+      setAcItems(propertyValueItems(key, ""));
+      queueMicrotask(() => {
+        ref.value = result.raw;
+        ref.setSelectionRange(result.caret, result.caret);
+        ref.focus();
+        autosize();
+      });
+      return;
+    }
+    if (item.propertyValue !== undefined) {
+      replaceTrigger(item.propertyValue);
+      return;
+    }
     if (item.blockRef) {
-      // Insert `((uuid))` now (resolves in-session via the in-memory uuid), then
-      // durably stamp the target's id:: in the background so it survives restart.
-      const { uuid, page, kind } = item.blockRef;
-      replaceTrigger(`((${uuid}))`);
+      // Insert the target's authored ID (or its runtime fallback), while using the
+      // runtime ID to find an id-less target that still needs an `id::` stamped.
+      const { uuid, externalId, page, kind } = item.blockRef;
+      replaceTrigger(`((${externalId}))`);
       void persistBlockRefTarget(uuid, page, kind);
       return;
     }
@@ -1857,7 +1971,7 @@ export function Editor(props: { id: string }): JSX.Element {
       const capturedSurfaceKey = surfaceKey;
       const trigger = { ...t };
       const editorIsCurrent = () => {
-        const liveTrigger = detectTrigger(textarea.value, textarea.selectionStart);
+        const liveTrigger = detectTrigger(textarea.value, textarea.selectionStart, propertyValueKey());
         const liveNode = doc.byId[props.id];
         return editorMounted
           && token === pluginSlashInvocation
@@ -1948,6 +2062,48 @@ export function Editor(props: { id: string }): JSX.Element {
         });
         return;
       }
+      case "task-marker": {
+        if (!item.taskMarker) return;
+        // OG clears the slash query, sets/replaces the leading task marker, and
+        // then moves to the end. Treat this as one semantic edit: literal
+        // insertion leaves the old marker intact when invoked mid-block (GH
+        // #225) and also bypasses the shared marker grammar.
+        const removed = applyCompletion(ref.value, t.start, t.end, "");
+        const next = setMarker(removed.raw, item.taskMarker);
+        commit(next);
+        closeAc();
+        queueMicrotask(() => {
+          ref.value = next;
+          ref.setSelectionRange(next.length, next.length);
+          ref.focus();
+          autosize();
+        });
+        return;
+      }
+      case "heading-auto":
+      case "heading-1":
+      case "heading-2":
+      case "heading-3":
+      case "heading-4": {
+        const state = item.action === "heading-auto"
+          ? true
+          : Number(item.action.slice("heading-".length)) as 1 | 2 | 3 | 4;
+        const removed = applyCompletion(ref.value, t.start, t.end, "");
+        withUndoUnit(`heading:${props.id}`, [node().page], () => {
+          commit(removed.raw);
+          setHeading(props.id, state);
+        });
+        closeAc();
+        queueMicrotask(() => {
+          const visible = splitProps(node().raw, hideFn(), pageFmt()).visible;
+          ref.value = visible;
+          const caret = Math.min(visible.length, removed.caret + (state === true ? 0 : state + 1));
+          ref.setSelectionRange(caret, caret);
+          ref.focus();
+          autosize();
+        });
+        return;
+      }
       case "scheduled":
       case "deadline": {
         // Drop the "/scheduled" trigger text, then open the calendar popup
@@ -1960,6 +2116,13 @@ export function Editor(props: { id: string }): JSX.Element {
       case "now-time":
         replaceTrigger(timeStamp());
         return;
+      case "youtube-timestamp": {
+        // OG inserts nothing when no player is registered/ready
+        // (youtube.cljs:113-122) — the slash text is still consumed.
+        const macro = youtubeTimestampMacroFor(ref);
+        replaceTrigger(macro ?? "");
+        return;
+      }
       case "page-reference":
         // Page reference is a chained command: no GH #35 continuation space,
         // then the ordinary trigger detector owns the blank page lifecycle.
@@ -2036,7 +2199,9 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       case "today":
-        replaceTrigger(pageInsert(todayJournalName()));
+        // GH #220: the link must use the graph's configured journal title
+        // format, or it points at a page that isn't the journal day.
+        replaceTrigger(pageInsert(journalTitle(new Date())));
         return;
       case "upload-asset":
         replaceTrigger(""); // drop the "/upload" trigger text
@@ -2110,9 +2275,16 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const focusNow = () => {
+    const historySelection = takeHistoryEditorSelectionFor(props.id, surfaceKey);
     const want = takeCaretFor(props.id);
     ref.focus();
     const v = ref.value;
+    if (historySelection) {
+      const end = Math.min(historySelection.end, v.length);
+      const start = Math.min(historySelection.start, end);
+      ref.setSelectionRange(start, end);
+      return;
+    }
     let offset: number;
     if (want == null) {
       offset = editorValue().length;
@@ -2139,6 +2311,14 @@ export function Editor(props: { id: string }): JSX.Element {
     ref.setSelectionRange(o, o);
   };
   onMount(() => {
+    const unregisterHistoryTarget = registerHistoryEditorTarget({
+      blockId: props.id,
+      owner: editingOwner(),
+      surface: surfaceKey,
+      selection: () => ({ start: ref.selectionStart, end: ref.selectionEnd }),
+      focused: () => typeof document !== "undefined" && document.activeElement === ref,
+    });
+    onCleanup(unregisterHistoryTarget);
     // If this block is rendered in several surfaces at once (main pane + sidebar),
     // an unscoped edit (split / keyboard nav) mounts an editor in each. Only the
     // surface that was stamped (the one that had the caret) focuses; the others
@@ -2165,6 +2345,21 @@ export function Editor(props: { id: string }): JSX.Element {
       });
     }
     resizeNow();
+    // A split can change the editor's wrapping width after this mount-time
+    // measurement. Observe width only so the height write in `resizeNow` cannot
+    // feed an observer loop; `autosize` keeps repeated layout changes to one
+    // measurement per animation frame.
+    if (typeof ResizeObserver !== "undefined") {
+      let observedWidth = ref.clientWidth;
+      const resizeObserver = new ResizeObserver(() => {
+        const width = ref.clientWidth;
+        if (width === observedWidth) return;
+        observedWidth = width;
+        autosize();
+      });
+      resizeObserver.observe(ref);
+      onCleanup(() => resizeObserver.disconnect());
+    }
   });
 
   let acTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2172,7 +2367,7 @@ export function Editor(props: { id: string }): JSX.Element {
     // Close the popup synchronously when the trigger ends (instant), but debounce
     // the page/template IPC fetch so holding down a key doesn't fire a backend
     // round-trip per character.
-    const next = detectTrigger(ref.value, ref.selectionStart);
+    const next = detectEditorTrigger();
     if (!next) {
       clearTimeout(acTimer);
       closeAc();
@@ -2206,7 +2401,28 @@ export function Editor(props: { id: string }): JSX.Element {
     ref.setSelectionRange(paired.caret, paired.caret);
     return true;
   };
+  // IMEs replace the textarea's transient composition range many times before
+  // committing. Keep that range DOM-local: every setRaw() also dirties the page
+  // and starts its save/reparse work. The finalized value has one canonical
+  // commit at compositionend instead.
+  let compositionActive = false;
+  let compositionEndValue: string | null = null;
+  const onCompositionStart = () => {
+    setComposing(true);
+    compositionActive = true;
+    compositionEndValue = null;
+    clearTimeout(acTimer);
+  };
   const onInput = (e: InputEvent) => {
+    if (compositionActive || e.isComposing) return;
+    // Chromium-family engines can emit one ordinary input after compositionend.
+    // Its DOM value has already committed above; suppress only that duplicate,
+    // never a subsequent real edit with different text.
+    if (compositionEndValue === ref.value) {
+      compositionEndValue = null;
+      return;
+    }
+    compositionEndValue = null;
     // Editor keystroke post-processing on a single inserted char (not paste/IME/
     // delete). All branches edit ref.value BEFORE commit so the store sees it.
     if (e.inputType === "insertText" && e.data && e.data.length === 1 && !e.isComposing) {
@@ -2242,6 +2458,16 @@ export function Editor(props: { id: string }): JSX.Element {
           ref.setSelectionRange(r.caret, r.caret);
         }
       }
+      // OG's typing trigger is exact: only the complete visible editor value
+      // `1. ` becomes own numbered-list state, then the trigger text disappears
+      // (`src/main/frontend/handler/editor.cljs:1888-1892`, 6e7afa8eb).
+      if (ch === " " && ref.value === "1. " && makeOwnNumberedList(props.id, "")) {
+        ref.value = "";
+        ref.setSelectionRange(0, 0);
+        autosize();
+        refreshAutocompleteAfterInput();
+        return;
+      }
     }
     commit(ref.value);
     autosize();
@@ -2249,7 +2475,9 @@ export function Editor(props: { id: string }): JSX.Element {
   };
   const onCompositionEnd = () => {
     setComposing(false);
-    if (!applyFullWidthRefReplace()) return;
+    compositionActive = false;
+    applyFullWidthRefReplace();
+    compositionEndValue = ref.value;
     commit(ref.value);
     autosize();
     refreshAutocompleteAfterInput();
@@ -2593,30 +2821,27 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
+    // IME owns its key events until compositionend commits the finalized value.
+    if (compositionActive || e.isComposing || e.keyCode === 229) return;
+
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
     const raw = ref.value;
 
-    // IME owns Escape.  The global capture handler already declines it, and the
-    // textarea must not then close completion or leave editing on the target
-    // phase (notably Android/WebKit's legacy keyCode 229 path).
-    if (e.key === "Escape" && (e.isComposing || e.keyCode === 229)) return;
-
-    // Ctrl/Cmd+Shift+V is Logseq's "paste as plain text" gesture: multiline
-    // clipboard text stays inside this block instead of becoming an outline.
+    // Ctrl/Cmd+Shift+V is Logseq's universal raw-paste gesture.
     // ClipboardEvent does not expose modifier keys, so remember the preceding
     // keydown briefly and consume it in onPaste. Do not preventDefault: the
     // platform still has to perform the native clipboard read and dispatch paste.
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "v") {
-      clearPasteMultilineInline();
-      pasteMultilineInline = true;
-      const token = ++pasteMultilineInlineToken;
-      pasteMultilineInlineTimer = window.setTimeout(() => {
-        if (pasteMultilineInlineToken === token) clearPasteMultilineInline();
+      clearPasteRaw();
+      pasteRaw = true;
+      const token = ++pasteRawToken;
+      pasteRawTimer = window.setTimeout(() => {
+        if (pasteRawToken === token) clearPasteRaw();
       }, 1_000);
       return;
     }
-    if (pasteMultilineInline) clearPasteMultilineInline();
+    if (pasteRaw) clearPasteRaw();
 
     // Autocomplete popup takes priority for navigation/selection keys.
     if (ac() && acItems().length) {
@@ -2701,7 +2926,7 @@ export function Editor(props: { id: string }): JSX.Element {
       commit(raw);
       void ensureBlockId(props.id).then((uuid) => {
         if (uuid) {
-          void backend().writeText(`((${uuid}))`);
+          void writeClipboardText(`((${uuid}))`);
           pushToast("Copied block ref", "success");
         } else {
           pushToast("Couldn't save the block id — reference not copied.", "error");
@@ -2749,13 +2974,27 @@ export function Editor(props: { id: string }): JSX.Element {
       }
     }
 
-    if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // OG maps document-mode Enter to newline and Shift+Enter to new-block before
+    // it reaches the existing new-block handler, unless its escape hatch is set
+    // (`src/main/frontend/handler/editor.cljs:2521-2533`,
+    // `src/main/frontend/state.cljs:714-717` at `6e7afa8eb`).
+    // Select between the existing mutation paths here; the structural branch
+    // below intentionally retains every current code-fence/list/etc. exception.
+    const docModeEnterForNewLine = documentMode() && !docModeEnterForNewBlock();
+    const mappedToSoftNewline =
+      e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.altKey && (
+        (!docModeEnterForNewLine && e.shiftKey) || (docModeEnterForNewLine && !e.shiftKey)
+      );
+    if (mappedToSoftNewline) {
       e.preventDefault();
       softNewlineCmd();
       return;
     }
 
-    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    if (
+      e.key === "Enter" && !e.ctrlKey && !e.metaKey &&
+      (!e.shiftKey || (docModeEnterForNewLine && !e.altKey))
+    ) {
       const inFence = !isAnnot() && caretInFence(raw, start);
       const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
       // Double-Enter escape: the first Enter creates a trailing blank line; the
@@ -2798,6 +3037,11 @@ export function Editor(props: { id: string }): JSX.Element {
       // so Enter on the closing fence still exits the block.
       if (!isAnnot() && (inFence || caretOnOpeningFence(raw, start))) {
         softNewlineCmd();
+        return;
+      }
+      if (!isAnnot() && stopOwnNumberedListOnEmptyEnter(props.id, raw)) {
+        ref.setSelectionRange(0, 0);
+        autosize();
         return;
       }
       // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
@@ -2851,6 +3095,15 @@ export function Editor(props: { id: string }): JSX.Element {
       if (start === 0) {
         // Never merge a highlight or calc block away (their structure must stay).
         if (isAnnot() || isCalc()) return;
+        // Own-numbered state is a block property, never an in-block `1.` marker.
+        // At offset zero OG removes only that property and preserves the text
+        // (`src/main/frontend/handler/editor.cljs:2752-2764`, 6e7afa8eb).
+        if (removeOwnNumberedList(props.id)) {
+          e.preventDefault();
+          ref.setSelectionRange(0, 0);
+          autosize();
+          return;
+        }
         commit(raw);
         if (mergeWithPrev(props.id, outlineScope, editSurface())) {
           e.preventDefault();
@@ -2924,7 +3177,7 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const onBlur = () => {
-    clearPasteMultilineInline();
+    clearPasteRaw();
     unregisterFocusedEditor();
     if (sheetCanceling) return;
     // A block-move reorder blurs us momentarily — stay in edit mode (the move
@@ -2983,9 +3236,20 @@ export function Editor(props: { id: string }): JSX.Element {
   const onPaste = (e: ClipboardEvent) => {
     // Consume the modifier latch on EVERY paste, including file/image pastes.
     // Otherwise an intercepted shortcut could affect a later context-menu paste.
-    const inlineMultiline = pasteMultilineInline;
-    clearPasteMultilineInline();
+    const rawPaste = pasteRaw;
+    clearPasteRaw();
     const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (rawPaste) {
+      e.preventDefault();
+      // Empty text explicitly claims the gesture but leaves the block untouched;
+      // never fall through to an HTML/file flavor.
+      if (!text) return;
+      // OG 6e7afa8eb src/main/frontend/handler/paste.cljs:262-271 deletes the
+      // selection and inserts exactly the clipboard text, bypassing every
+      // formatted/file/block branch.
+      pasteLiteralText(text);
+      return;
+    }
     const html = e.clipboardData?.getData("text/html") ?? "";
     // File managers commonly include path text alongside the real file-list
     // clipboard flavor. Claim the paste synchronously so those paths never land
@@ -3006,19 +3270,27 @@ export function Editor(props: { id: string }): JSX.Element {
       void pasteClipboardFiles(eventFiles);
       return;
     }
-    if (inlineMultiline && text.includes("\n")) {
-      e.preventDefault();
-      const start = ref.selectionStart;
-      const newRaw = ref.value.slice(0, start) + text + ref.value.slice(ref.selectionEnd);
-      commit(newRaw);
-      const pos = start + text.length;
-      queueMicrotask(() => {
-        ref.value = newRaw;
-        ref.setSelectionRange(pos, pos);
-        autosize();
-      });
-      return;
+    const start = ref.selectionStart;
+    const syntaxSensitive = sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start);
+    const slot = peekClipboardSlot();
+    if (!syntaxSensitive) {
+      if (slot && text !== "" && normalize(text) === normalize(slot.text)) {
+        e.preventDefault();
+        // Association is intentionally text-only and can replay the user's last
+        // private block copy when a foreign clipboard happens to contain equal
+        // normalized text. Identity remains separately one-shot and validated.
+        void pasteClipboardPayload(props.id, slot)
+          .then((lastId) => {
+            if (lastId && doc.byId[lastId]) startEditing(lastId, doc.byId[lastId].raw.length);
+          })
+          .catch(() => {}); // association failure is a quiet feature miss
+        return;
+      }
     }
+    // A non-empty observed replacement makes stale private data unusable even
+    // if a later external clipboard happens to restore the old text. Matching
+    // text in a syntax-sensitive surface is only a bypass, not a replacement.
+    if (slot && text !== "" && normalize(text) !== normalize(slot.text)) clearClipboardSlot();
     // A structural sheet copy (multiple grid cells) pasted into a block editor
     // rebuilds an actual subgrid nested here, rather than dumping the flat TSV
     // text (Martin's nit). Only fires when the clipboard is exactly our own
@@ -3034,9 +3306,7 @@ export function Editor(props: { id: string }): JSX.Element {
     // Shift-paste above remains the literal/plain escape hatch, and editor
     // surfaces whose contents are syntax-sensitive retain their native text
     // insertion semantics.
-    const start = ref.selectionStart;
-    const syntaxSensitive = sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start);
-    const htmlNodes = syntaxSensitive ? null : structuredHtmlOutline(html, text);
+    const htmlNodes = syntaxSensitive ? null : structuredHtmlOutline(html, text, pageFmt());
     if (htmlNodes) {
       e.preventDefault();
       const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
@@ -3049,22 +3319,22 @@ export function Editor(props: { id: string }): JSX.Element {
       startEditing(lastId, doc.byId[lastId].raw.length);
       return;
     }
-    // Multiline text pastes as a block outline (Logseq behavior).
+    // OG 6e7afa8eb src/main/frontend/handler/paste.cljs:168-177 parses only
+    // block-looking text, segments blank-line-separated prose, and otherwise
+    // replaces the selection literally inside the current block.
     if (text.includes("\n")) {
       e.preventDefault();
-      const end = ref.selectionEnd;
       if (syntaxSensitive) {
-        const newRaw = ref.value.slice(0, start) + text + ref.value.slice(end);
-        commit(newRaw);
-        const pos = start + text.length;
-        queueMicrotask(() => {
-          ref.value = newRaw;
-          ref.setSelectionRange(pos, pos);
-          autosize();
-        });
+        pasteLiteralText(text);
         return;
       }
-      const nodes = parseOutline(text);
+      if (!plainTextLooksLikeBlocks(text) && !/(?:\r?\n){2,}/.test(text)) {
+        pasteLiteralText(text);
+        return;
+      }
+      const nodes = plainTextLooksLikeBlocks(text)
+        ? parseOutline(text)
+        : segmentedPlainText(text);
       if (!nodes.length) return;
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
@@ -3098,6 +3368,20 @@ export function Editor(props: { id: string }): JSX.Element {
         queueMicrotask(updateSel);
         return;
       }
+    }
+    // OG 6e7afa8eb src/main/frontend/handler/paste.cljs:49-57,164-166 wraps
+    // recognized bare video URLs only after selected-URL handling has declined.
+    const videoMacro = videoPasteMacro(text);
+    if (videoMacro && ref.selectionStart === ref.selectionEnd) {
+      e.preventDefault();
+      const start = ref.selectionStart;
+      applyEdit({
+        text: ref.value.slice(0, start) + videoMacro + ref.value.slice(ref.selectionEnd),
+        start: start + videoMacro.length,
+        end: start + videoMacro.length,
+      });
+      queueMicrotask(updateSel);
+      return;
     }
     // Single-line/no text: maybe an image on the OS clipboard. Two paths:
     //   1) The paste event's OWN image data (a DataTransferItem of kind "file",
@@ -3152,11 +3436,11 @@ export function Editor(props: { id: string }): JSX.Element {
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
-        onCompositionStart={() => setComposing(true)}
+        onCompositionStart={onCompositionStart}
         onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
         onKeyUp={(e) => {
-          if (e.key.toLowerCase() === "v") clearPasteMultilineInline();
+          if (e.key.toLowerCase() === "v") clearPasteRaw();
         }}
         onFocus={() => {
           noteSurfaceFocused(surfaceKey);

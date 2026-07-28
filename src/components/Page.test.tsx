@@ -446,6 +446,45 @@ describe("tag-page table", () => {
 });
 
 describe("zoomed block view", () => {
+  it("resolves a durable zoom route to the current transient live node", async () => {
+    const uuid = "12345678-1234-4234-8234-123456789abc";
+    const transient = "bfresh-zoom";
+    const raw = `Fresh zoom target\nid:: ${uuid}`;
+    const dto = {
+      name: "Fresh zoom",
+      kind: "page" as const,
+      title: "Fresh zoom",
+      pre_block: null,
+      path: "pages/Fresh zoom.md",
+      blocks: [{ id: uuid, raw, collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [transient]: node(transient, raw, dto.name) },
+      pages: [{ ...page(dto.name, "page", [transient]), path: dto.path }],
+      feed: [dto.name],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    mainPaneRouter.replaceActiveRoute({
+      kind: "page",
+      name: dto.name,
+      pageKind: dto.kind,
+      path: dto.path,
+      block: uuid,
+    });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      await tick();
+      expect(root.querySelector(".zoomed-page")).not.toBeNull();
+      expect(root.querySelector(`[data-block-id="${transient}"]`)).not.toBeNull();
+      expect(root.textContent).toContain("Fresh zoom target");
+    } finally {
+      dispose();
+    }
+  });
+
   it("reveals a collapsed root's children without changing its stored collapse state", async () => {
     const parent = "11111111-1111-4111-8111-111111111111";
     const child = "22222222-2222-4222-8222-222222222222";
@@ -667,6 +706,66 @@ describe("trailing page block target", () => {
 });
 
 describe("page actions entry point", () => {
+  it("commits title rename once from blur or Enter and lets Escape cancel (GH #233)", async () => {
+    const dto: PageDto = {
+      name: "Rename me",
+      kind: "page",
+      title: "Rename me",
+      pre_block: null,
+      path: "pages/Rename me.md",
+      blocks: [{ id: "rename-root", raw: "Body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "rename-root": node("rename-root", "Body", dto.name) },
+      pages: [{ ...page(dto.name, "page", ["rename-root"]), path: dto.path }],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
+    vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
+    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue();
+    mainPaneRouter.openFile(dto.path!, dto.name, "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    const begin = async (next: string) => {
+      await tick();
+      await tick();
+      root.querySelector<HTMLElement>(".page-title")!.dispatchEvent(
+        new MouseEvent("dblclick", { bubbles: true })
+      );
+      await tick();
+      const input = root.querySelector<HTMLInputElement>(".page-title-input")!;
+      input.value = next;
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      return input;
+    };
+
+    try {
+      const blurred = await begin("Blurred name");
+      blurred.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+      await flushMicrotasks();
+      expect(rename).toHaveBeenCalledTimes(1);
+      expect(rename).toHaveBeenLastCalledWith("Rename me", "Blurred name", dto.path);
+
+      rename.mockClear();
+      const entered = await begin("Entered name");
+      entered.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      entered.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+      await flushMicrotasks();
+      expect(rename).toHaveBeenCalledTimes(1);
+
+      rename.mockClear();
+      const escaped = await begin("Cancelled name");
+      escaped.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      escaped.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+      await flushMicrotasks();
+      expect(rename).not.toHaveBeenCalled();
+    } finally {
+      dispose();
+    }
+  });
+
   it("keeps a path-bearing title owner through sidebar, new-tab, and menu gestures", async () => {
     const path = "pages/client-b/Twin.md";
     const dto: PageDto = {

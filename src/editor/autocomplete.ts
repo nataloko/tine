@@ -1,10 +1,19 @@
-// Pure autocomplete logic for the block editor: detect a `[[`, `#`, or `/`
+// Pure autocomplete logic for the block editor: detect a `[[`, `#`, `/`, `<`, or property
 // trigger at the caret, and apply a chosen completion. No DOM — unit-testable.
 
 import { TEMPLATE_VARS } from "./templateVars";
 import { isBareTagPrefix, tagRef } from "../tags";
+import { propertyKeyNorm } from "../render/block";
 
-export type TriggerKind = "page" | "tag" | "command" | "block" | "code-language";
+export type TriggerKind =
+  | "page"
+  | "tag"
+  | "command"
+  | "advanced-command"
+  | "block"
+  | "code-language"
+  | "property-name"
+  | "property-value";
 
 export interface CodeLanguageItem {
   /** Canonical highlight.js/common identifier written to the fence. */
@@ -63,7 +72,12 @@ export interface Trigger {
   start: number;
   /** Index in `raw` where the query ends (the caret). */
   end: number;
+  /** Canonical key owning a property-value query. */
+  property?: string;
 }
+
+/** Existing canonical property identity, re-exported for editor authoring. */
+export const propertyKeyFold = propertyKeyNorm;
 
 /** True when the current line starts inside a preceding Markdown fence. A
  * fence-looking line inside code is content/closing syntax, never an opening
@@ -85,14 +99,60 @@ function insideFenceBefore(raw: string, lineStart: number): boolean {
 }
 
 /** Detect an active completion trigger immediately before `caret`. */
-export function detectTrigger(raw: string, caret: number): Trigger | null {
-  // No trigger spans a newline: the `[[` inner forbids it, and `#tag`/`/command`
-  // are anchored at line start or after whitespace. So only the CURRENT line's
+export function detectTrigger(
+  raw: string,
+  caret: number,
+  propertyValueKey?: string | null,
+): Trigger | null {
+  // No trigger spans a newline: the `[[` inner forbids it, `#tag`/`/command`
+  // are anchored at line start or after whitespace, and `<command` starts its
+  // own logical line. So only the CURRENT line's
   // prefix can matter — slicing just that (not the whole `raw[0..caret]`) avoids
   // an O(block length) allocation per keystroke on long blocks. Returned indices
   // are offset back into `raw` by `lineStart`, so callers see absolute positions.
   const lineStart = raw.lastIndexOf("\n", caret - 1) + 1;
   const before = raw.slice(lineStart, caret);
+
+  // Property completion is line syntax, never inline prose/reference/fence
+  // syntax. A value lifecycle exists only after this editor selected its key;
+  // merely moving into an existing `key:: value` line must not pop a menu.
+  // OG parity: handler/editor.cljs:1907-1924 (name trigger) and :2211-2226
+  // (chosen key immediately transitions to value search), checkout 6e7afa8eb.
+  if (!insideFenceBefore(raw, lineStart)) {
+    if (propertyValueKey) {
+      const delimiter = before.indexOf("::");
+      if (delimiter > 0) {
+        const sourceKey = before.slice(0, delimiter);
+        if (
+          /^[A-Za-z0-9_./-]+$/.test(sourceKey) &&
+          propertyKeyFold(sourceKey) === propertyKeyFold(propertyValueKey)
+        ) {
+          const afterDelimiter = delimiter + 2;
+          const valueOffset = afterDelimiter + (before[afterDelimiter] === " " ? 1 : 0);
+          const query = before.slice(valueOffset);
+          return {
+            kind: "property-value",
+            query,
+            start: lineStart + valueOffset,
+            end: caret,
+            property: propertyKeyFold(propertyValueKey),
+          };
+        }
+      }
+    }
+
+    // Match the persisted parser's property-key alphabet. In particular, a
+    // whitespace-separated prose phrase ending in `::` is not property syntax.
+    const propertyName = /^([A-Za-z0-9_./-]*)::$/.exec(before);
+    if (propertyName) {
+      return {
+        kind: "property-name",
+        query: propertyName[1],
+        start: lineStart,
+        end: caret,
+      };
+    }
+  }
 
   // Opening Markdown fence language. Do not pop a menu for a bare fence typed
   // by hand (Enter keeps its established behavior); one language character is
@@ -139,6 +199,15 @@ export function detectTrigger(raw: string, caret: number): Trigger | null {
   if (cmd) {
     const start = lineStart + before.length - cmd[2].length - 1;
     return { kind: "command", query: cmd[2], start, end: caret };
+  }
+
+  // Advanced BEGIN/END sections — Tine intentionally requires a logical line
+  // start, so ordinary prose such as `word<quote` remains literal. OG opens its
+  // block-command action when `<` is typed (og/src/main/frontend/handler/editor.cljs:1901-1905,
+  // checkout 6e7afa8eb); this narrower boundary is the frozen Tine contract.
+  const advanced = /^<([\w-]*)$/.exec(before);
+  if (advanced) {
+    return { kind: "advanced-command", query: advanced[1], start: lineStart, end: caret };
   }
 
   return null;
@@ -290,6 +359,7 @@ export function orderAcItems<T>(
 export type CommandAction =
   | "code-block"
   | "calc-block"
+  | "task-marker"
   | "scheduled"
   | "deadline"
   | "upload-asset"
@@ -306,7 +376,13 @@ export type CommandAction =
   | "priority-b"
   | "priority-c"
   | "page-reference"
-  | "insert-link";
+  | "insert-link"
+  | "heading-auto"
+  | "heading-1"
+  | "heading-2"
+  | "heading-3"
+  | "heading-4"
+  | "youtube-timestamp";
 
 export interface Command {
   label: string;
@@ -316,6 +392,8 @@ export interface Command {
   caret?: number;
   /** A runtime action resolved by the editor instead of a literal insert. */
   action?: CommandAction;
+  /** Marker payload for the semantic task-marker action. */
+  taskMarker?: string;
   /** Optional short match alias scored in ADDITION to the label, so a one-letter
    *  query surfaces this command first (mirrors OG, whose priority commands are
    *  literally named "A"/"B"/"C" — a full-length exact match that outranks longer
@@ -332,15 +410,15 @@ export interface Command {
 type CommandDefinition = Omit<Command, "matchTieOrder" | "bareOrder">;
 
 const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
-  { label: "TODO", insert: "TODO " },
-  { label: "DOING", insert: "DOING " },
-  { label: "LATER", insert: "LATER " },
-  { label: "NOW", insert: "NOW " },
-  { label: "DONE", insert: "DONE " },
-  { label: "WAITING", insert: "WAITING " },
-  { label: "WAIT", insert: "WAIT " },
-  { label: "IN-PROGRESS", insert: "IN-PROGRESS " },
-  { label: "CANCELED", insert: "CANCELED " },
+  { label: "TODO", action: "task-marker", taskMarker: "TODO" },
+  { label: "DOING", action: "task-marker", taskMarker: "DOING" },
+  { label: "LATER", action: "task-marker", taskMarker: "LATER" },
+  { label: "NOW", action: "task-marker", taskMarker: "NOW" },
+  { label: "DONE", action: "task-marker", taskMarker: "DONE" },
+  { label: "WAITING", action: "task-marker", taskMarker: "WAITING" },
+  { label: "WAIT", action: "task-marker", taskMarker: "WAIT" },
+  { label: "IN-PROGRESS", action: "task-marker", taskMarker: "IN-PROGRESS" },
+  { label: "CANCELED", action: "task-marker", taskMarker: "CANCELED" },
   { label: "Priority A", action: "priority-a", key: "A" },
   { label: "Priority B", action: "priority-b", key: "B" },
   { label: "Priority C", action: "priority-c", key: "C" },
@@ -351,10 +429,11 @@ const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   // "Kanban" alias: the fuzzy matcher scores label + key, so /kanban (and /kan)
   // surfaces the Board command even though its display name stays "Board".
   { label: "Board", action: "sheet-board", key: "Kanban" },
-  { label: "Heading 1", insert: "# " },
-  { label: "Heading 2", insert: "## " },
-  { label: "Heading 3", insert: "### " },
-  { label: "Heading 4", insert: "#### " },
+  { label: "Heading (Auto)", action: "heading-auto" },
+  { label: "Heading 1", action: "heading-1" },
+  { label: "Heading 2", action: "heading-2" },
+  { label: "Heading 3", action: "heading-3" },
+  { label: "Heading 4", action: "heading-4" },
   { label: "Page reference", action: "page-reference" },
   { label: "Link", action: "insert-link" },
   { label: "Upload an asset", action: "upload-asset" },
@@ -374,6 +453,9 @@ const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   { label: "Query", insert: "{{query }}", caret: 8 },
   { label: "Query (visual builder)", action: "query-builder" },
   { label: "Embed", insert: "{{embed }}", caret: 8 },
+  // OG's slash entry is named "Embed Youtube timestamp" (og-1.0.0
+  // 6e7afa8eb, commands.cljs:294-300).
+  { label: "Embed Youtube timestamp", action: "youtube-timestamp" },
   { label: "Math block", insert: "$$$$", caret: 2 },
   { label: "Current time", action: "now-time" },
   { label: "Today", action: "today" },
@@ -386,14 +468,14 @@ const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
 
 const BARE_ORDER = new Map<string, number>([
   "Page reference", "Link", "Upload an asset", "Voice recording", "Draw.io diagram",
-  "Heading 1", "Heading 2", "Heading 3", "Heading 4",
+  "Heading (Auto)", "Heading 1", "Heading 2", "Heading 3", "Heading 4",
   "Today", "Current time",
   "TODO", "DOING", "LATER", "NOW", "DONE", "WAITING", "WAIT", "IN-PROGRESS", "CANCELED", "Scheduled", "Deadline",
   "Priority A", "Priority B", "Priority C",
   "Grid", "Table", "Board",
   "Code block", "Calculator", "Quote",
   "Admonition: note", "Admonition: tip", "Admonition: important", "Admonition: warning", "Admonition: caution",
-  "Divider", "Query", "Query (visual builder)", "Embed", "Math block", "Page properties",
+  "Divider", "Query", "Query (visual builder)", "Embed", "Embed Youtube timestamp", "Math block", "Page properties",
 ].map((label, index) => [label, index]));
 
 /** One registry drives rendering, matching, selection and tests. The old
@@ -491,4 +573,79 @@ export function filterCommands(query: string): Command[] {
     .filter((x) => x.s > 0)
     .sort((a, b) => b.s - a.s || a.c.matchTieOrder - b.c.matchTieOrder)
     .map((x) => x.c);
+}
+
+export interface AdvancedBlockCommand {
+  label: string;
+  /** Paired Org section text replacing the active `<query` span. */
+  insert: string;
+  /** Caret position on the deliberately blank middle line. */
+  caret: number;
+  readonly matchTieOrder: number;
+}
+
+type AdvancedBlockDefinition = {
+  label: string;
+  type: string;
+  optional?: string;
+};
+
+function advancedBlockDefinition({ label, type, optional }: AdvancedBlockDefinition): Omit<AdvancedBlockCommand, "matchTieOrder"> {
+  const suffix = optional ? ` ${optional}` : "";
+  const opening = `#+BEGIN_${type}${suffix}\n`;
+  // OG ->block (commands.cljs:175-177): for Src the caret lands at the END of
+  // the opening line (to type the language); every other type lands on the
+  // blank middle line.
+  const caret = type === "SRC" ? opening.length - 1 : opening.length;
+  return { label, insert: `${opening}\n#+END_${type}`, caret };
+}
+
+/** OG ->block (commands.cljs:159-177): on a MARKDOWN page the Src command
+ *  inserts a fenced code block instead of the org-style section; caret after
+ *  the opening fence, ready for the language. All other commands and the org
+ *  format keep the paired BEGIN/END text. */
+export function advancedBlockInsertion(
+  command: AdvancedBlockCommand,
+  format: "md" | "org",
+): { insert: string; caret: number } {
+  if (format === "md" && command.label === "Src") {
+    return { insert: "```\n\n```", caret: 3 };
+  }
+  return { insert: command.insert, caret: command.caret };
+}
+
+// OG parity: og/src/main/frontend/commands.cljs:155-180 builds paired BEGIN/END
+// syntax, and :188-218 defines this exact section-command set at 6e7afa8eb.
+// `Properties` is intentionally absent: OG's org-only row invokes ->properties,
+// not ->block, so it is not a BEGIN/END advanced section.
+export const ADVANCED_BLOCK_COMMANDS: readonly AdvancedBlockCommand[] = Object.freeze([
+  { label: "Quote", type: "QUOTE" },
+  { label: "Src", type: "SRC" },
+  { label: "Query", type: "QUERY" },
+  { label: "Latex export", type: "EXPORT", optional: "latex" },
+  { label: "Note", type: "NOTE" },
+  { label: "Tip", type: "TIP" },
+  { label: "Important", type: "IMPORTANT" },
+  { label: "Caution", type: "CAUTION" },
+  { label: "Pinned", type: "PINNED" },
+  { label: "Warning", type: "WARNING" },
+  { label: "Example", type: "EXAMPLE" },
+  { label: "Export", type: "EXPORT" },
+  { label: "Verse", type: "VERSE" },
+  { label: "Ascii", type: "EXPORT", optional: "ascii" },
+  { label: "Center", type: "CENTER" },
+  { label: "Comment", type: "COMMENT" },
+].map((definition, matchTieOrder) => Object.freeze({
+  ...advancedBlockDefinition(definition),
+  matchTieOrder,
+})));
+
+/** Fuzzy `<` menu matching uses the same OG-style scorer as slash commands. */
+export function filterAdvancedBlockCommands(query: string): AdvancedBlockCommand[] {
+  if (!query) return ADVANCED_BLOCK_COMMANDS.slice();
+  return ADVANCED_BLOCK_COMMANDS
+    .map((command) => ({ command, score: fuzzyScore(query, command.label) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || a.command.matchTieOrder - b.command.matchTieOrder)
+    .map(({ command }) => command);
 }

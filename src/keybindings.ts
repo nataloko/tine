@@ -61,9 +61,11 @@ import {
   pageVisibleOrder,
   selectBlock,
   visibleOrder,
+  toggleUndoRedoMode,
+  buildClipboardPayload,
 } from "./store";
 import { editingId, startEditing } from "./editorController";
-import { copyOutline } from "./clipboard";
+import { copyBlockOutline } from "./clipboard";
 import { openInPageFind } from "./inpageFind";
 import { cellSel, enterGridSelection, handleCellSelectionKey, handleSheetPasteEvent, outlinedGridSelectionId } from "./sheet/selection";
 import { decodeNavIntent } from "./navProtocol";
@@ -345,6 +347,17 @@ const COMMANDS: CommandDef[] = [
   { id: "task/carry-n", binding: "", label: "Carry unfinished tasks: last N days (Settings)", scope: "global", run: () => void carryDaysBack(carryDays()) },
   { id: "editor/undo", binding: "mod+z", label: "Undo", scope: "global", run: undo, global: true },
   { id: "editor/redo", binding: "mod+shift+z", label: "Redo", scope: "global", run: redo, global: true },
+  // Palette-only, matching OG's empty binding and mode report at
+  // `src/main/frontend/modules/shortcut/config.cljs:355-356` and
+  // `src/main/frontend/modules/editor/undo_redo.cljs:232-237`
+  // (OG commit 6e7afa8eb).
+  {
+    id: "editor/toggle-undo-redo-mode",
+    binding: "",
+    label: "Toggle undo/redo mode",
+    scope: "global",
+    run: () => pushToast(`Undo/redo mode: ${toggleUndoRedoMode()}`),
+  },
   // Editor commands (resolved in Block.tsx / selection handler).
   { id: "editor/indent", binding: "tab", label: "Indent block", scope: "editor" },
   { id: "editor/outdent", binding: "shift+tab", label: "Outdent block", scope: "editor" },
@@ -400,14 +413,14 @@ export const BUILTIN_KEYS: BuiltinKeyDef[] = [
     id: "builtin/editor/enter",
     scope: "editor",
     binding: "enter",
-    label: "New block or continue list",
-    details: "Splits the current block, continues an in-block list, or adds a sibling note under PDF annotations.",
+    label: "New block (or newline in Document mode)",
+    details: "Normally splits the current block, continues an in-block list, or adds a sibling note under PDF annotations. In Document mode it inserts a newline unless the Document-mode Enter setting keeps this structural behavior.",
   },
   {
     id: "builtin/editor/soft-newline",
     scope: "editor",
     binding: "shift+enter",
-    label: "Insert a newline inside the block",
+    label: "Insert a newline inside the block (or new block in Document mode)",
   },
   {
     id: "builtin/editor/escape",
@@ -788,9 +801,16 @@ function handleSelectionKey(e: KeyboardEvent): boolean {
   if (e.key === "ArrowUp") return moveSelection(-1, e.shiftKey), true;
   if (e.key === "Backspace" || e.key === "Delete") return deleteSelection(), true;
   const mod = isMac ? e.metaKey : e.ctrlKey;
-  if (mod && e.key.toLowerCase() === "c") return void copyOutline(selectionMarkdown()), true;
+  if (mod && e.key.toLowerCase() === "c") {
+    const ids = selectedIds();
+    const text = selectionMarkdown();
+    void copyBlockOutline("copy", text, buildClipboardPayload(ids));
+    return true;
+  }
   if (mod && e.key.toLowerCase() === "x") {
-    void copyOutline(selectionMarkdown());
+    const ids = selectedIds();
+    const text = selectionMarkdown();
+    void copyBlockOutline("cut", text, buildClipboardPayload(ids));
     deleteSelection();
     return true;
   }

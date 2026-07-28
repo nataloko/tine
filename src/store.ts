@@ -9,6 +9,12 @@
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
 import type { BlockDto, Format, PageDto, PageKind, RefGroup } from "./types";
+import type { ClipboardBlock, ClipboardPayloadData, ClipboardPayloadSlot, ClipboardSourcePage } from "./clipboard";
+import {
+  CLIPBOARD_PAYLOAD_MAX_BLOCKS,
+  CLIPBOARD_PAYLOAD_MAX_RAW_BYTES,
+  consumeCutGrant,
+} from "./clipboard";
 import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
@@ -20,21 +26,34 @@ import {
   conflicts,
   pushToast,
   graphMeta,
+  graphEpoch,
+  graphTransitioning,
   workflow,
   timetrackingEnabled,
   logbookWithSecondSupport,
+  logicalOutdenting,
   removeDeletedPageFromNavigation,
   removeDeletedBlocksFromSidebar,
   bumpDataRev,
   bumpPageInventoryRev,
+  captureHistorySidebarContext,
+  restoreHistorySidebarContext,
+  type HistorySidebarContext,
 } from "./ui";
 import { seedFacets, facetsFromDto, clearSeededFacets, facetsOf } from "./render/facets";
 import { journalTitle } from "./journal";
-import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden, isPropertiesOnly, isPageHeaderPropertiesOnly, parsePageHeaderPropertyLine, splitPagePreamble } from "./editor/properties";
+import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden, hideAll, isPropertiesOnly, isPageHeaderPropertiesOnly, parsePageHeaderPropertyLine, splitPagePreamble } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
 import { OPEN_MARKERS, MARKER_RE } from "./markers";
-import { editingId, endEdit, startEditing } from "./editorController";
+import {
+  editingId,
+  endEdit,
+  startEditing,
+  captureHistoryEditorContext,
+  restoreHistoryEditorContext,
+  type HistoryEditorContext,
+} from "./editorController";
 import { notifyModeReset, notifyOutlineSelectionStarted } from "./modeHooks";
 import { sheetConfigFromRaw } from "./sheet/config";
 import { clearMatrixDimensionCache, invalidateAllMatrixDimensions } from "./sheet/matrix";
@@ -57,6 +76,8 @@ import {
   isSaving,
   holdSourcesForDest,
   trackAssetWrite,
+  flushCutSourcePages,
+  cutSourcePagesRetired,
 } from "./persistence";
 // The debounced persistence engine lives in persistence.ts; re-exported here so
 // the rest of the app keeps importing the save API from the store.
@@ -110,6 +131,47 @@ interface DocState {
 }
 
 export const [doc, setDoc] = createStore<DocState>({ byId: {}, pages: [], feed: [], loaded: false });
+
+function docHasBlockIdentity(id: string): boolean {
+  if (doc.byId[id]) return true;
+  const normalized = id.toLowerCase();
+  if (Object.keys(doc.byId).some((key) => key.toLowerCase() === normalized && !!doc.byId[key])) return true;
+  // setRaw updates a loaded node's raw synchronously without re-keying by a
+  // newly typed/pasted id property. Treat either Markdown or Org id syntax as
+  // live ownership so the final paste/redo checks fail closed in that window.
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rawIdentity = new RegExp(
+    `(?:^|\\r?\\n)[ \\t]*(?:id[ \\t]*::|:id:)[ \\t]*${escaped}(?=[ \\t]*(?:\\r?\\n|$))`,
+    "i",
+  );
+  return Object.values(doc.byId).some((node) => rawIdentity.test(node.raw));
+}
+
+// A generation identifies one exact loaded page instance. It is deliberately
+// frontend-only and monotonic across resets: a later page with the same name and
+// path must never satisfy a cut payload captured from an evicted/deleted/rebound
+// instance. Stage B uses this at its durable-retirement boundary.
+let pageInstanceClock = 0;
+const pageInstanceGenerations = new Map<string, number>();
+
+function activatePageInstance(name: string): number {
+  const generation = ++pageInstanceClock;
+  pageInstanceGenerations.set(name, generation);
+  return generation;
+}
+
+function retirePageInstance(name: string): void {
+  ++pageInstanceClock;
+  pageInstanceGenerations.delete(name);
+}
+
+/** Current exact loaded-page generation, or null when that page is absent. */
+export function pageInstanceGeneration(name: string): number | null {
+  if (!pageByName(name)) return null;
+  // Direct setDoc page seeding is supported by model tests and small embedded
+  // surfaces; lazily bind it to the same invariant as loader-created pages.
+  return pageInstanceGenerations.get(name) ?? activatePageInstance(name);
+}
 
 // name → index into `doc.pages`, rebuilt only when the working set's membership
 // changes (add / remove / rename / evict), NOT on a keystroke. Turns the O(pages)
@@ -285,6 +347,7 @@ function upsertPage(dto: PageDto) {
       else s.pages.push(fp);
     })
   );
+  activatePageInstance(dto.name);
   invalidateAllMatrixDimensions();
   if (replacing) invalidateUndoForPage(dto.name);
 }
@@ -355,6 +418,7 @@ export function forgetPage(name: string) {
       if (fi >= 0) s.feed.splice(fi, 1);
     })
   );
+  retirePageInstance(name);
   invalidateAllMatrixDimensions();
 }
 
@@ -444,6 +508,7 @@ export async function reloadHlsIfLoaded(name: string): Promise<void> {
 function evictIfNeeded() {
   if (doc.pages.length <= WORKING_SET_CAP) return;
   const pin = pinnedPages();
+  const evicted: string[] = [];
   setDoc(
     produce((s) => {
       // Oldest first (insertion order); stop once at the cap or only pinned left.
@@ -455,9 +520,11 @@ function evictIfNeeded() {
         }
         purgePageNodes(s, name);
         s.pages.splice(i, 1);
+        evicted.push(name);
       }
     })
   );
+  for (const name of evicted) retirePageInstance(name);
   invalidateAllMatrixDimensions();
 }
 
@@ -478,6 +545,7 @@ export function resetStore() {
   // across the switch (audit P2).
   clearSeededFacets();
   clearMatrixDimensionCache();
+  for (const name of pageInstanceGenerations.keys()) retirePageInstance(name);
   setDoc({ byId: {}, pages: [], feed: [], loaded: false });
   endEdit("graph-switch");
   notifyModeReset();
@@ -591,10 +659,11 @@ function toDto(id: string): BlockDto {
  *  no `id::` line (an id-bearing block is a real referenced outline block, not a
  *  header, and the Rust promote branch/firewall both leave it as a bullet). */
 function isPromotablePageHeaderRoot(node: Node): boolean {
+  const canonicalRaw = node.raw.replace(/\n+$/, "");
   return (
     node.children.length === 0 &&
-    isPageHeaderPropertiesOnly(node.raw) &&
-    !node.raw.split("\n").some((line) => parsePageHeaderPropertyLine(line)?.key.toLowerCase() === "id")
+    isPageHeaderPropertiesOnly(canonicalRaw) &&
+    !canonicalRaw.split("\n").some((line) => parsePageHeaderPropertyLine(line)?.key.toLowerCase() === "id")
   );
 }
 
@@ -605,14 +674,18 @@ export function pageToDto(pageName: string): PageDto | null {
   let preBlock = p.preBlock;
   const first = doc.byId[rootIds[0]];
   if (first?.originatedFromPageHeader) {
-    if (first.children.length > 0 || (first.raw !== "" && !isPageHeaderPropertiesOnly(first.raw))) {
+    // Enter temporarily leaves one or more trailing newlines in the live
+    // page-header editor. Tolerate only that authoring artifact at the disk
+    // firewall; keep the strict shared display predicate and live raw intact.
+    const canonicalRaw = first.raw.replace(/\n+$/, "");
+    if (first.children.length > 0 || (first.raw !== "" && !isPageHeaderPropertiesOnly(canonicalRaw))) {
       pushToast("Page-header properties must contain only valid key:: value lines before they can be saved.", "error");
       return null;
     }
     // Exact raw is authoritative here: ordinary toDto trimming must never eat a
     // page-header value or its separator trivia. An empty draft deletes the
     // header and emits no stray outline bullet.
-    preBlock = first.raw ? first.raw + (p.preBlock ?? "") : p.preBlock;
+    preBlock = canonicalRaw ? canonicalRaw + (p.preBlock ?? "") : p.preBlock;
     rootIds = rootIds.slice(1);
   } else if (first && !p.preBlock && isPromotablePageHeaderRoot(first)) {
     // GH #198: a flagless "properties-only first bullet" (empty preBlock) IS the
@@ -624,7 +697,7 @@ export function pageToDto(pageName: string): PageDto | null {
     // "will retry" toast forever. Folding here emits pre_block=properties, so
     // the firewall precondition (empty pre_block) is false and the save writes
     // the identical canonical preamble. Mirrors Rust's promotability rule.
-    preBlock = first.raw;
+    preBlock = first.raw.replace(/\n+$/, "");
     rootIds = rootIds.slice(1);
   }
   let blocks = rootIds.map(toDto);
@@ -867,6 +940,9 @@ interface SnapEntry {
   pageObjs: FeedPage[]; // snapshot of those pages' FeedPage objects
   nodes: Record<string, Node>; // snapshot of nodes living on those pages
   dirty: string[]; // pages to re-save on undo/redo
+  context: HistoryContext;
+  /** Identity-bearing clipboard paste whose redo must fail on a live conflict. */
+  preservedIds?: string[];
 }
 interface RawEntry {
   kind: "raw";
@@ -878,12 +954,65 @@ interface RawEntry {
    * Undo can restore it and Redo can remove it again without an extra step. */
   headerRoot?: { node: Node; rootIndex: number };
   removeHeaderOnApply?: boolean;
+  context: HistoryContext;
+  preservedIds?: string[];
 }
 type UndoEntry = SnapEntry | RawEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
 let undoSuppressionDepth = 0;
+
+// Session-scoped and global by default, matching OG's transient app-state flag
+// at `src/main/frontend/state.cljs:304-306` (OG commit 6e7afa8eb).
+let pageOnlyHistoryMode = false;
+
+export function historyPageOnlyMode(): boolean {
+  return pageOnlyHistoryMode;
+}
+
+export function toggleUndoRedoMode(): "Page only" | "Global" {
+  pageOnlyHistoryMode = !pageOnlyHistoryMode;
+  return pageOnlyHistoryMode ? "Page only" : "Global";
+}
+
+export interface HistoryRouteContext {
+  paneId: string;
+  route: Route;
+}
+
+let historyRouteContextAdapter: {
+  capture: () => HistoryRouteContext | null;
+  restore: (context: HistoryRouteContext) => boolean;
+} = {
+  capture: () => null,
+  restore: () => false,
+};
+
+/** Router-owned adapter: keeps store.ts from adding a runtime import back to
+ * router.ts (router already imports the store). */
+export function installHistoryRouteContextAdapter(adapter: typeof historyRouteContextAdapter) {
+  historyRouteContextAdapter = adapter;
+}
+
+interface HistoryContext {
+  route: HistoryRouteContext | null;
+  sidebar: HistorySidebarContext;
+  editor: HistoryEditorContext | null;
+}
+
+/** Capture UI state at the same pre-mutation boundary as the data inverse. OG
+ * stores app state on each history entity and cursor state by transaction at
+ * `src/main/frontend/modules/editor/undo_redo.cljs:261-272` and
+ * `src/main/frontend/modules/outliner/datascript.cljc:152-162`
+ * (OG commit 6e7afa8eb). */
+function captureHistoryContext(): HistoryContext {
+  return {
+    route: historyRouteContextAdapter.capture(),
+    sidebar: captureHistorySidebarContext(),
+    editor: captureHistoryEditorContext(),
+  };
+}
 
 /** Discard all undo/redo history. Called on graph switch/reset so old-graph
  *  snapshots can't be replayed into a different graph. */
@@ -900,6 +1029,35 @@ export function clearUndoHistory() {
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
   return e.pages === null || e.pages.includes(name);
+}
+
+/** The page owning the active editor wins over the focused pane's route. This is
+ * OG's current/editing-page precedence at
+ * `src/main/frontend/util/page.cljs:14-29` (OG commit 6e7afa8eb). */
+function activeHistoryPage(): string | null {
+  const id = editingId();
+  const edited = id ? doc.byId[id] : undefined;
+  if (edited) return edited.page;
+  const route = historyRouteContextAdapter.capture()?.route;
+  return route?.kind === "page" ? route.name : null;
+}
+
+/** Remove the newest matching entry in place while retaining every other entry
+ * in its original order. This transcribes OG's filtered stack removal at
+ * `src/main/frontend/modules/editor/undo_redo.cljs:81-106,132-156`
+ * (OG commit 6e7afa8eb). */
+function popNewestEntryForPage(stack: UndoEntry[], page: string): UndoEntry | undefined {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (entryTouchesPage(stack[i], page)) return stack.splice(i, 1)[0];
+  }
+  return undefined;
+}
+
+function popHistoryEntry(stack: UndoEntry[]): UndoEntry | undefined {
+  if (!stack.length) return undefined;
+  if (!pageOnlyHistoryMode) return stack.pop();
+  const page = activeHistoryPage();
+  return page ? popNewestEntryForPage(stack, page) : stack.pop();
 }
 
 /** Drop undo/redo entries that reference `name`. Called when a page's on-disk
@@ -933,7 +1091,8 @@ function cloneNode(n: Node): Node {
 function clonePages(src: FeedPage[]): FeedPage[] {
   return src.map((p) => ({ ...p, roots: p.roots.slice() }));
 }
-function snapEntry(affected?: string[] | null): SnapEntry {
+function snapEntry(affected?: string[] | null, preservedIds?: readonly string[]): SnapEntry {
+  const context = captureHistoryContext();
   // null/omitted → snapshot the whole working set (safe fallback). Otherwise just
   // the named pages: their FeedPage objects + every node living on them.
   const names = affected ?? doc.pages.map((p) => p.name);
@@ -956,7 +1115,15 @@ function snapEntry(affected?: string[] | null): SnapEntry {
     if (nameSet.has(p.name)) for (const r of p.roots) visit(r);
   }
   const pageObjs = clonePages(pages.filter((p) => nameSet.has(p.name)));
-  return { kind: "snap", pages: affected ?? null, pageObjs, nodes, dirty: names };
+  return {
+    kind: "snap",
+    pages: affected ?? null,
+    pageObjs,
+    nodes,
+    dirty: names,
+    context,
+    ...(preservedIds?.length ? { preservedIds: [...preservedIds] } : {}),
+  };
 }
 
 /** Snapshot before a STRUCTURAL op. Pass the affected page name(s) so both the
@@ -965,9 +1132,9 @@ function snapEntry(affected?: string[] | null): SnapEntry {
  *  but O(loaded pages)). The affected set MUST include every page whose nodes the
  *  op changes, including a cross-page move's source AND destination, or undo
  *  would miss a page. `tag` resets the typing-coalesce marker. */
-function pushUndo(tag: string, affected?: string[]) {
+function pushUndo(tag: string, affected?: string[], preservedIds?: readonly string[]) {
   if (undoSuppressionDepth > 0) return;
-  undoStack.push(snapEntry(affected));
+  undoStack.push(snapEntry(affected, preservedIds));
   if (undoStack.length > 200) undoStack.shift();
   redoStack = [];
   lastUndoTag = tag;
@@ -988,6 +1155,7 @@ function pushRawUndo(id: string, prevRaw: string) {
     id,
     raw: prevRaw,
     page: node.page,
+    context: captureHistoryContext(),
     ...(rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
   });
   if (undoStack.length > 200) undoStack.shift();
@@ -1007,7 +1175,9 @@ function applyEntry(e: UndoEntry): UndoEntry {
       id: e.id,
       raw: node ? node.raw : "",
       page: e.page,
+      context: captureHistoryContext(),
       ...(node && rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
+      ...(e.preservedIds?.length ? { preservedIds: [...e.preservedIds] } : {}),
     };
     if (node) {
       if (e.removeHeaderOnApply && node.originatedFromPageHeader) {
@@ -1035,7 +1205,7 @@ function applyEntry(e: UndoEntry): UndoEntry {
     return inverse;
   }
   // Capture the CURRENT state of the same page scope as the inverse (for redo).
-  const inverse = snapEntry(e.pages);
+  const inverse = snapEntry(e.pages, e.preservedIds);
   if (e.pages === null) {
     // Whole-working-set snapshot (fallback): replace byId + pages wholesale so the
     // store is always internally consistent. (A page loaded AFTER the snapshot is
@@ -1101,19 +1271,61 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
 }
 
 export function undo() {
-  if (!undoStack.length) return;
-  redoStack.push(applyEntry(undoStack.pop()!));
+  const entry = popHistoryEntry(undoStack);
+  if (!entry) return;
+  redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
   scheduleSave();
+  restoreEntryContext(entry.context);
 }
 
 export function redo() {
-  if (!redoStack.length) return;
-  undoStack.push(applyEntry(redoStack.pop()!));
+  const entry = popHistoryEntry(redoStack);
+  if (!entry) return;
+  if (entry.preservedIds?.some(docHasBlockIdentity)) {
+    // The selected prerequisite is already popped. A later redo snapshot cannot
+    // remain valid without it, including in page-only mode where the tagged
+    // entry may have been selected from the middle of the global stack.
+    redoStack = [];
+    pushToast("Redo skipped: a block with the same id now exists", "error");
+    return;
+  }
+  undoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("redo");
   scheduleSave();
+  restoreEntryContext(entry.context);
+}
+
+/** Data replay and opposite-stack insertion are complete before this function is
+ * reached. Each UI step is isolated and best-effort, so a missing pane, route,
+ * sidebar surface, or block cannot undo/reorder the already-applied inverse.
+ * OG's restore order and global-mode app-state gate are at
+ * `src/main/frontend/handler/history.cljs:10-60` (OG commit 6e7afa8eb). */
+function restoreEntryContext(context: HistoryContext) {
+  if (!pageOnlyHistoryMode) {
+    if (context.route) {
+      try {
+        historyRouteContextAdapter.restore(context.route);
+      } catch {
+        // Route restoration is best-effort; content replay has already completed.
+      }
+    }
+    try {
+      restoreHistorySidebarContext(context.sidebar);
+    } catch {
+      // Sidebar restoration is best-effort; content replay has already completed.
+    }
+  }
+  if (context.editor) {
+    try {
+      const node = doc.byId[context.editor.blockId];
+      restoreHistoryEditorContext(context.editor, node ? node.raw.length : null);
+    } catch {
+      // Focus/caret restoration is best-effort; content replay has already completed.
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,12 +1405,20 @@ export function insertOutlineChildren(parentId: string, nodes: OutlineNode[]): s
   const pageName = parent.page;
   let lastId: string | null = null;
   pushUndo("paste-children", [pageName]);
+  const format = formatForPage(pageName);
   setDoc(
     produce((s) => {
       const create = (n: OutlineNode, par: string): string => {
         const id = freshId();
         const childIds = n.children.map((c) => create(c, id));
-        s.byId[id] = { id, raw: n.raw, collapsed: false, parent: par, page: pageName, children: childIds };
+        s.byId[id] = {
+          id,
+          raw: rawWithInheritedOrderListType(n.raw, format, parentId),
+          collapsed: false,
+          parent: par,
+          page: pageName,
+          children: childIds,
+        };
         return id;
       };
       const created = nodes.map((n) => create(n, parentId));
@@ -1233,8 +1453,7 @@ export function splitBlock(
   // Ordered-list items propagate: a block split off an ordered item is itself
   // ordered (OG inherits `:logseq.order-list-type`), toggleable per-block later.
   const ordered = isOrdered(id);
-  const withOrdered = (raw: string) =>
-    joinProps(raw, fmt === "org" ? `:${ORDER_KEY}: number` : `${ORDER_KEY}:: number`, fmt);
+  const withOrdered = (raw: string) => rawWithOrderListType(raw, "number", fmt);
   const orderedAfter = ordered ? withOrdered(after) : after;
   const orderedEmpty = ordered ? withOrdered("") : "";
 
@@ -1339,10 +1558,18 @@ export function outdentBlock(id: string, caretOffset: number) {
     produce((s) => {
       const parent = s.byId[parentId];
       const idx = parent.children.indexOf(id);
-      const following = parent.children.splice(idx);
-      following.shift(); // drop id
-      for (const f of following) s.byId[f].parent = id;
-      s.byId[id].children.push(...following);
+      // OG only reparents the following siblings for traditional outdenting;
+      // logical outdenting stops after moving this block (`src/main/frontend/modules/outliner/core.cljs:835-852`
+      // at `6e7afa8eb`). Keep this decision inside the shared store operation so
+      // keyboard, mobile, and any future caller all use the same mode.
+      if (logicalOutdenting()) {
+        parent.children.splice(idx, 1);
+      } else {
+        const following = parent.children.splice(idx);
+        following.shift(); // drop id
+        for (const f of following) s.byId[f].parent = id;
+        s.byId[id].children.push(...following);
+      }
       s.byId[id].parent = grandParent;
       const gArr = grandParent === null
         ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
@@ -1416,13 +1643,21 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
   pushUndo("paste", [doc.byId[afterId].page]);
   const parent = doc.byId[afterId].parent;
   const pageName = doc.byId[afterId].page;
+  const format = formatForPage(pageName);
   let lastId = afterId;
   setDoc(
     produce((s) => {
       const create = (n: OutlineNode, par: string | null): string => {
         const id = freshId();
         const childIds = n.children.map((c) => create(c, id));
-        s.byId[id] = { id, raw: n.raw, collapsed: false, parent: par, page: pageName, children: childIds };
+        s.byId[id] = {
+          id,
+          raw: rawWithInheritedOrderListType(n.raw, format, afterId),
+          collapsed: false,
+          parent: par,
+          page: pageName,
+          children: childIds,
+        };
         return id;
       };
       const created = nodes.map((n) => create(n, parent));
@@ -1453,7 +1688,8 @@ export function replaceEmptyBlockWithOutline(id: string, nodes: OutlineNode[]): 
     const create = (outline: OutlineNode, parent: string | null, reuseId?: string): string => {
       const created = reuseId ?? freshId();
       const children = outline.children.map((child) => create(child, created));
-      const raw = reuseId ? joinProps(outline.raw, split.hidden, format) : outline.raw;
+      const sourceRaw = reuseId ? joinProps(outline.raw, split.hidden, format) : outline.raw;
+      const raw = rawWithInheritedOrderListType(sourceRaw, format, id);
       state.byId[created] = { id: created, raw, collapsed: false, parent, page: current.page, children };
       return created;
     };
@@ -1468,6 +1704,212 @@ export function replaceEmptyBlockWithOutline(id: string, nodes: OutlineNode[]): 
   }));
   markDirty(current.page);
   return lastId;
+}
+
+type ClipboardProperty = { key: string; value: string };
+
+function clipboardProperties(raw: string, format: Format): ClipboardProperty[] {
+  const hidden = splitProps(raw, hideAll, format).hidden;
+  if (!hidden) return [];
+  const properties: ClipboardProperty[] = [];
+  for (const line of hidden.split("\n")) {
+    const match = format === "org"
+      ? /^\s*:([A-Za-z0-9_@./-]+):\s*(.*)$/.exec(line)
+      : /^\s*([A-Za-z0-9_./-]+)::\s*(.*)$/.exec(line);
+    if (match) properties.push({ key: match[1], value: match[2] });
+  }
+  return properties;
+}
+
+function clipboardIdsForBlock(block: ClipboardBlock): string[] {
+  return clipboardProperties(block.raw, block.sourceFormat)
+    .filter((property) => property.key.toLowerCase() === "id")
+    .map((property) => property.value.trim());
+}
+
+function clipboardRawForTarget(
+  block: ClipboardBlock,
+  targetFormat: Format,
+  preserveIds: boolean,
+): string {
+  if (block.sourceFormat === targetFormat) {
+    return preserveIds
+      ? block.raw
+      : splitProps(block.raw, (key) => key.toLowerCase() === "id", block.sourceFormat).visible;
+  }
+
+  // splitProps/joinProps classify metadata but deliberately do not translate
+  // syntax. Map the ordered key/value stream explicitly so every property keeps
+  // its relative order across Markdown `key:: value` and Org drawer forms.
+  const visible = splitProps(block.raw, hideAll, block.sourceFormat).visible;
+  const properties = clipboardProperties(block.raw, block.sourceFormat)
+    .filter((property) => preserveIds || property.key.toLowerCase() !== "id");
+  const translated = properties.map(({ key, value }) =>
+    targetFormat === "org" ? `:${key}: ${value}` : `${key}:: ${value}`
+  ).join("\n");
+  return joinProps(visible, translated, targetFormat);
+}
+
+function clipboardCollapsed(block: ClipboardBlock): boolean {
+  return clipboardProperties(block.raw, block.sourceFormat)
+    .some(({ key, value }) => key.toLowerCase() === "collapsed" && value.trim().toLowerCase() === "true");
+}
+
+function liveDocReferences(id: string): boolean {
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const reference = new RegExp(`\\(\\(${escaped}\\)\\)`, "i");
+  return Object.values(doc.byId).some((node) => reference.test(node.raw));
+}
+
+interface ClipboardPasteAuthority {
+  epoch: number;
+  root: string;
+  targetId: string;
+  targetNode: Node;
+  targetPage: string;
+  targetGeneration: number;
+}
+
+function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthority | null {
+  const target = doc.byId[targetId];
+  if (!target || graphTransitioning()) return null;
+  const targetGeneration = pageInstanceGeneration(target.page);
+  if (targetGeneration === null) return null;
+  return {
+    epoch: graphEpoch(),
+    root: graphMeta()?.root ?? "",
+    targetId,
+    targetNode: unwrap(target),
+    targetPage: target.page,
+    targetGeneration,
+  };
+}
+
+function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boolean {
+  const target = doc.byId[authority.targetId];
+  return !graphTransitioning()
+    && graphEpoch() === authority.epoch
+    && (graphMeta()?.root ?? "") === authority.root
+    && !!target
+    && unwrap(target) === authority.targetNode
+    && target.page === authority.targetPage
+    && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
+}
+
+function insertClipboardBlocksSync(
+  targetId: string,
+  blocks: readonly ClipboardBlock[],
+  preserveIds: boolean,
+  preservedIds: readonly string[],
+): string | null {
+  const target = doc.byId[targetId];
+  if (!blocks.length || !target || !blockWritable(targetId)) return null;
+  const targetFormat = formatForPage(target.page);
+  const prepared = blocks.map(function prepare(block): {
+    id: string;
+    raw: string;
+    collapsed: boolean;
+    children: ReturnType<typeof prepare>[];
+  } {
+    const sourceIds = clipboardIdsForBlock(block);
+    return {
+      id: preserveIds && sourceIds.length === 1 ? sourceIds[0].toLowerCase() : freshId(),
+      raw: clipboardRawForTarget(block, targetFormat, preserveIds),
+      collapsed: clipboardCollapsed(block),
+      children: block.children.map(prepare),
+    };
+  });
+  const visible = splitProps(target.raw, isBuiltinHidden, targetFormat).visible;
+  const replaceHost = target.children.length === 0
+    && visible.trim() === ""
+    && existingBlockId(target.raw, targetFormat) === null
+    && !liveDocReferences(targetId);
+  const parent = target.parent;
+  const pageName = target.page;
+  let lastId: string | null = null;
+
+  pushUndo("clipboard-paste", [pageName], preserveIds ? preservedIds : []);
+  setDoc(produce((state) => {
+    const create = (block: typeof prepared[number], blockParent: string | null): string => {
+      const children = block.children.map((child) => create(child, block.id));
+      state.byId[block.id] = {
+        id: block.id,
+        raw: block.raw,
+        collapsed: block.collapsed,
+        parent: blockParent,
+        page: pageName,
+        children,
+      };
+      return block.id;
+    };
+    const created = prepared.map((block) => create(block, parent));
+    const siblings = parent === null
+      ? state.pages[state.pages.findIndex((page) => page.name === pageName)].roots
+      : state.byId[parent].children;
+    const at = siblings.indexOf(targetId);
+    if (replaceHost) {
+      siblings.splice(at, 1, ...created);
+      delete state.byId[targetId];
+    } else {
+      siblings.splice(at + 1, 0, ...created);
+    }
+    lastId = created[created.length - 1] ?? null;
+  }));
+  markDirty(pageName);
+  return lastId;
+}
+
+/** Associate an already-captured private clipboard slot with one target. The
+ * wrapper is intentionally non-async: a cut grant is consumed synchronously,
+ * before the returned continuation can reach retirement or any other await. */
+export function pasteClipboardPayload(
+  targetId: string,
+  slot: ClipboardPayloadSlot,
+): Promise<string | null> {
+  const authority = captureClipboardPasteAuthority(targetId);
+  const grant = slot.op === "cut" ? consumeCutGrant(slot.generation) : null;
+  if (!authority) return Promise.resolve(null);
+
+  const idLists: string[][] = [];
+  const visit = (block: ClipboardBlock) => {
+    idLists.push(clipboardIdsForBlock(block));
+    block.children.forEach(visit);
+  };
+  slot.blocks.forEach(visit);
+  const ids = idLists.flat();
+  const normalizedIds = ids.map((id) => id.toLowerCase());
+  const idsValid = idLists.every((blockIds) => blockIds.length <= 1)
+    && ids.every((id) => UUID_RE.test(id))
+    && new Set(normalizedIds).size === normalizedIds.length;
+
+  return (async () => {
+    let preserveIds = !!grant
+      && ids.length > 0
+      && idsValid
+      && slot.graph === authority.root;
+
+    if (preserveIds) {
+      preserveIds = await flushCutSourcePages(grant!.sourcePages);
+      if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
+    }
+    if (preserveIds) {
+      try {
+        const resolved = await backend().resolveBlocks(normalizedIds);
+        preserveIds = resolved.length === normalizedIds.length && resolved.every((block) => block === null);
+      } catch {
+        preserveIds = false;
+      }
+    }
+
+    // Final JS-single-thread section: every authority and retirement check is
+    // synchronous and insertion follows immediately with no await boundary.
+    if (!clipboardPasteAuthorityCurrent(authority)) return null;
+    if (preserveIds) {
+      preserveIds = cutSourcePagesRetired(grant!.sourcePages)
+        && normalizedIds.every((id) => !docHasBlockIdentity(id));
+    }
+    return insertClipboardBlocksSync(targetId, slot.blocks, preserveIds, preserveIds ? normalizedIds : []);
+  })();
 }
 
 /** Append a quick-capture (Logseq outline markdown, as produced by the capture
@@ -1534,6 +1976,40 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
 
 const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
+/** Pure Markdown property rewrite for one compound store mutation. It scans only
+ * the canonical head (title, planning, contiguous properties) plus the legacy
+ * trailing property block, so a `key::` lookalike in body text or a code fence is
+ * never touched or reordered. Existing property order is retained. */
+function markdownRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const first = lines[0] ?? "";
+  const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*</;
+  let i = 1;
+  while (i < lines.length && PLANNING_LINE.test(lines[i])) i++;
+  const planningEnd = i;
+  while (i < lines.length && PROP_LINE.test(lines[i])) i++;
+  const propsEnd = i;
+  let j = lines.length;
+  while (j > propsEnd && PROP_LINE.test(lines[j - 1] ?? "")) j--;
+  const notKey = (l: string) => PROP_LINE.exec(l)?.[1] !== key;
+  const props = lines.slice(planningEnd, propsEnd);
+  const at = props.findIndex((l) => PROP_LINE.exec(l)?.[1] === key);
+  if (value !== null) {
+    const line = `${key}:: ${value}`;
+    if (at >= 0) props[at] = line;
+    else props.push(line);
+  } else if (at >= 0) {
+    props.splice(at, 1);
+  }
+  return [
+    first,
+    ...lines.slice(1, planningEnd),
+    ...props,
+    ...lines.slice(propsEnd, j),
+    ...lines.slice(j).filter(notKey),
+  ].join("\n");
+}
+
 /** Current value of a block property, read through the ONE lsdoc-backed
  *  recognizer (facetsOf) — a raw line scan here returned property-lookalikes
  *  from code fences/body text and silently suppressed real config writes
@@ -1585,32 +2061,10 @@ export function setBlockProperty(id: string, key: string, value: string | null) 
     markDirty(node.page);
     return;
   }
-  const lines = node.raw.split("\n");
-  const first = lines[0] ?? "";
-  // Canonical block shape: first line, planning lines, property lines, body.
-  // Scan ONLY the canonical head region (stop at the first body line) plus the
-  // legacy trailing property block (the old writer appended at the end), so a
-  // `key::`-looking line inside body text or a code fence is never touched or
-  // reordered — this regex is fence-unaware and must not reach into the body.
-  const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*</;
-  let i = 1;
-  while (i < lines.length && PLANNING_LINE.test(lines[i])) i++;
-  const planningEnd = i;
-  while (i < lines.length && PROP_LINE.test(lines[i])) i++;
-  const propsEnd = i;
-  let j = lines.length;
-  while (j > propsEnd && PROP_LINE.test(lines[j - 1] ?? "")) j--;
-  const notKey = (l: string) => PROP_LINE.exec(l)?.[1] !== key;
-  const props = lines.slice(planningEnd, propsEnd).filter(notKey);
-  if (value !== null) props.push(`${key}:: ${value}`);
-  const out = [
-    first,
-    ...lines.slice(1, planningEnd), // planning stays before properties (OG order)
-    ...props,
-    ...lines.slice(propsEnd, j), // body untouched
-    ...lines.slice(j).filter(notKey), // legacy trailing props: only the key is removed
-  ];
-  setDoc("byId", id, "raw", out.join("\n"));
+  // Canonical head-region placement plus legacy trailing-property cleanup lives
+  // in the shared pure writer so compound mutations (heading transitions) can
+  // remain one undo-safe raw rewrite.
+  setDoc("byId", id, "raw", markdownRawWithProperty(node.raw, key, value));
   markDirty(node.page);
 }
 
@@ -1735,6 +2189,73 @@ const ORDER_KEY = "logseq.order-list-type";
 function isOrdered(id: string | null | undefined): boolean {
   return !!id && blockProperty(id, ORDER_KEY) === "number";
 }
+
+function orderListTypeFromRaw(raw: string, format: Format): string | null {
+  for (const [key, value] of facetsOf(raw, format).properties) {
+    if (key.toLowerCase() === ORDER_KEY) return value.trim();
+  }
+  return null;
+}
+
+/** The one format-aware raw transform for the block-level list property.
+ * `splitProps`/`joinProps` are the audited metadata path: they preserve visible
+ * body bytes, ignore property lookalikes inside fences, and emit Org drawers.
+ * OG writes both the in-memory property and serialized content at
+ * `src/main/frontend/modules/outliner/core.cljs:420-433` (6e7afa8eb). */
+function rawWithOrderListType(raw: string, value: string | null, format: Format): string {
+  const { visible } = splitProps(raw, (key) => key.toLowerCase() === ORDER_KEY, format);
+  if (value === null) return visible;
+  const property = format === "org" ? `:${ORDER_KEY}: ${value}` : `${ORDER_KEY}:: ${value}`;
+  return joinProps(visible, property, format);
+}
+
+/** Preserve a source's explicit list type; otherwise inherit the target's.
+ * This is OG's common move/insert rule (`outliner/core.cljs:420-433,536-555`
+ * at 6e7afa8eb), shared by drag and every structural outline insertion below. */
+function rawWithInheritedOrderListType(raw: string, format: Format, targetId: string | null | undefined): string {
+  if (orderListTypeFromRaw(raw, format) !== null) return raw;
+  const targetType = targetId ? blockProperty(targetId, ORDER_KEY) : null;
+  return targetType === null ? raw : rawWithOrderListType(raw, targetType, format);
+}
+
+function setOwnNumberedList(id: string, enabled: boolean, visibleText?: string): boolean {
+  const node = doc.byId[id];
+  if (!node || !blockWritable(id)) return false;
+  const format = formatForBlock(id);
+  const base = visibleText === undefined
+    ? node.raw
+    : joinProps(visibleText, splitProps(node.raw, isBuiltinHidden, format).hidden, format);
+  const next = rawWithOrderListType(base, enabled ? "number" : null, format);
+  if (next === node.raw) return false;
+  pushUndo(`own-numbered:${id}`, [node.page]);
+  setDoc("byId", id, "raw", next);
+  markDirty(node.page);
+  return true;
+}
+
+/** Make this block an own numbered-list item. When `visibleText` is supplied,
+ * replacing the editor trigger and writing the property are one store mutation. */
+export function makeOwnNumberedList(id: string, visibleText?: string): boolean {
+  return setOwnNumberedList(id, true, visibleText);
+}
+
+export function removeOwnNumberedList(id: string): boolean {
+  if (!isOrdered(id)) return false;
+  return setOwnNumberedList(id, false);
+}
+
+export function toggleOwnNumberedList(id: string): boolean {
+  return setOwnNumberedList(id, !isOrdered(id));
+}
+
+/** Empty Enter stops only a non-nested own list: an ordered parent keeps the
+ * ordinary insert/inherit path. Transcribed from OG
+ * `src/main/frontend/handler/editor.cljs:2498-2502` (6e7afa8eb). */
+export function stopOwnNumberedListOnEmptyEnter(id: string, visibleText: string): boolean {
+  const node = doc.byId[id];
+  if (!node || visibleText.trim() !== "" || !isOrdered(id) || isOrdered(node.parent)) return false;
+  return removeOwnNumberedList(id);
+}
 function toLetters(n: number): string {
   let s = "";
   while (n > 0) {
@@ -1801,16 +2322,41 @@ export function toggleListItemAtIndex(id: string, lineIndex: number) {
   markDirty(node.page);
 }
 
-/** Set the block's heading level via the markdown `#` prefix (null clears it). */
-export function setHeading(id: string, level: number | null) {
+export type HeadingState = number | true | null;
+
+const MARKDOWN_HEADING = /^#+\s+/;
+const clearMarkdownHeading = (raw: string): string => raw.replace(MARKDOWN_HEADING, "");
+const setMarkdownHeading = (raw: string, level: number): string => {
+  const prefix = `${"#".repeat(level)} `;
+  return MARKDOWN_HEADING.test(raw)
+    ? raw.replace(MARKDOWN_HEADING, prefix)
+    : prefix + raw.trimStart();
+};
+
+/** Switch between boolean automatic headings and explicit numeric headings.
+ * Markdown writes ATX prefixes for numeric state and `heading:: true` for auto;
+ * Org writes both states through its property drawer. Each transition clears the
+ * incompatible representation. OG parity:
+ * `src/main/frontend/handler/editor.cljs:3822-3862` and
+ * `src/main/frontend/commands.cljs:623-638` at `6e7afa8eb`; the format-aware
+ * property writer is `handler/editor.cljs:888-904` at the same commit. */
+export function setHeading(id: string, state: HeadingState) {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return;
+  const level = typeof state === "number" && state >= 1 && state <= 6 ? state : null;
+  let next: string;
+  if (formatForBlock(id) === "org") {
+    next = orgRawWithProperty(node.raw, "heading", state === true ? "true" : level === null ? null : String(level));
+  } else if (state === true) {
+    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", "true");
+  } else if (level !== null) {
+    next = setMarkdownHeading(markdownRawWithProperty(node.raw, "heading", null), level);
+  } else {
+    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", null);
+  }
+  if (next === node.raw) return;
   pushUndo(`heading:${id}`, [node.page]);
-  const lines = node.raw.split("\n");
-  let first = (lines[0] ?? "").replace(/^#{1,6} /, "");
-  if (level && level >= 1 && level <= 6) first = `${"#".repeat(level)} ${first}`;
-  lines[0] = first;
-  setDoc("byId", id, "raw", lines.join("\n"));
+  setDoc("byId", id, "raw", next);
   markDirty(node.page);
 }
 
@@ -1872,10 +2418,22 @@ export function setSchedule(
   const isHeadLine = (l: string) => /^\s*(SCHEDULED|DEADLINE):/.test(l) || PROP_LINE.test(l);
   let headEnd = 1;
   while (headEnd < all.length && isHeadLine(all[headEnd])) headEnd++;
-  const lines = [
-    ...all.slice(0, headEnd).filter((l, i) => i === 0 || !new RegExp(`^${tag}:`).test(l.trim())),
-    ...all.slice(headEnd),
-  ];
+  const targetLine = new RegExp(`^\\s*${tag}:`);
+  const targetTimestamp = new RegExp(`^\\s*${tag}:\\s*<[^>]+>(.*)$`);
+  const keptHead: string[] = [];
+  const trailingBody: string[] = [];
+  for (const line of all.slice(1, headEnd)) {
+    if (!targetLine.test(line)) {
+      keptHead.push(line);
+      continue;
+    }
+    const match = targetTimestamp.exec(line);
+    if (match?.[1].trim()) trailingBody.push(match[1]);
+  }
+  // A glued suffix is user body content, not part of the replaced timestamp.
+  // Keep the canonical planning/property head contiguous and split that suffix
+  // into body lines immediately after it instead of dropping bytes.
+  const lines = [all[0], ...keptHead, ...trailingBody, ...all.slice(headEnd)];
   if (date) {
     const wd = WEEKDAYS[new Date(date.y, date.m, date.d).getDay()];
     const hhmm = time ? normalizeHHmm(time) : null;
@@ -1983,6 +2541,54 @@ export function existingBlockId(raw: string, format: Format): string | null {
   return m ? m[1] : null;
 }
 
+/** The identity other blocks and persisted UI state must use for a loaded node.
+ * A freshly-created node keeps its transient `b…` store key for the whole live
+ * session even after Copy block ref writes a UUID property into `raw`; external
+ * references must follow that property while render/edit paths keep the key. */
+export function blockExternalId(id: string): string | null {
+  const node = doc.byId[id];
+  if (!node) return null;
+  return existingBlockId(node.raw, formatForBlock(id)) ?? node.id;
+}
+
+export interface LoadedBlockRef {
+  uuid: string;
+  page: string;
+  pageKind: PageKind;
+  path?: string;
+}
+
+/** Resolve a durable external UUID back to the current live store key. The page
+ * descriptor is part of the identity: even a direct `byId[uuid]` hit is rejected
+ * when it belongs to another page kind or physical path. */
+export function resolveBlockRef(ref: LoadedBlockRef): string | null {
+  const owner = pageByName(ref.page);
+  if (
+    !owner
+    || owner.kind !== ref.pageKind
+    || (ref.path !== undefined && owner.path !== ref.path)
+  ) return null;
+
+  const matches = (id: string): boolean => {
+    const node = doc.byId[id];
+    return !!node && node.page === ref.page && blockExternalId(id) === ref.uuid;
+  };
+  if (matches(ref.uuid)) return ref.uuid;
+
+  const stack = [...owner.roots];
+  const seen = new Set<string>();
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = doc.byId[id];
+    if (!node || node.page !== ref.page) continue;
+    if (matches(id)) return id;
+    stack.push(...node.children);
+  }
+  return null;
+}
+
 /** `raw` with a durable `id` property added in the page's on-disk format.
  *  Markdown appends an `id:: <uuid>` trailer. ORG inserts/extends a
  *  `:PROPERTIES:`/`:id:`/`:END:` drawer at OG's canonical position — right after
@@ -2026,8 +2632,17 @@ function orgRawWithProperty(raw: string, key: string, value: string | null): str
     start >= 0 ? lines.findIndex((l, i) => i > start && l.trim().toUpperCase() === ":END:") : -1;
   const keyRe = new RegExp(`^:${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*`, "i");
   if (start >= 0 && end > start) {
-    const inner = lines.slice(start + 1, end).filter((l) => !keyRe.test(l.trim()));
-    if (value !== null) inner.push(`:${key}: ${value}`);
+    // Update in place so an existing drawer key keeps its position (GH #216);
+    // only a new key appends.
+    const inner = lines.slice(start + 1, end);
+    const at = inner.findIndex((l) => keyRe.test(l.trim()));
+    if (value !== null) {
+      const line = `:${key}: ${value}`;
+      if (at >= 0) inner[at] = line;
+      else inner.push(line);
+    } else if (at >= 0) {
+      inner.splice(at, 1);
+    }
     if (inner.length === 0) {
       // Drawer emptied: drop it entirely.
       return [...lines.slice(0, start), ...lines.slice(end + 1)].join("\n");
@@ -2075,14 +2690,13 @@ export async function ensureBlockId(id: string): Promise<string | null> {
   return ok ? uuid : null;
 }
 
-/** A live reference to a loaded block — its stable uuid + the page it lives on
- *  (so a satellite surface can load that page and render the same editable
- *  node). The uuid IS the store key, so no snapshot is needed. */
-export function blockRef(id: string): { uuid: string; page: string; pageKind: PageKind; path?: string } {
+/** A live reference to a loaded block: its durable external UUID plus its exact
+ * owner. The UUID can differ from the live store key until the page is reloaded. */
+export function blockRef(id: string): LoadedBlockRef {
   const n = doc.byId[id];
   const owner = pageByName(n.page);
   return {
-    uuid: n.id,
+    uuid: blockExternalId(id) ?? n.id,
     page: n.page,
     pageKind: owner?.kind ?? "page",
     ...(owner?.path ? { path: owner.path } : {}),
@@ -2091,22 +2705,22 @@ export function blockRef(id: string): { uuid: string; page: string; pageKind: Pa
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Persist a block's `id::` equal to its current uuid, so its in-memory key and
- *  on-disk identity match — making a reference to it survive an app restart.
- *  No-op if it already has an id::. Only writes when the uuid is a real UUID
- *  (always true for blocks loaded from the graph); a freshly-created,
- *  not-yet-reloaded block is skipped rather than writing a non-UUID id::. */
-export function ensureStableBlockId(id: string): void {
+/** Ensure a block has a durable external UUID synchronously, while deliberately
+ * leaving its live store key unchanged. Existing ids win; otherwise a fresh
+ * transient key receives a UUID in the page's Markdown/Org property syntax. */
+export function ensureStableBlockId(id: string): string | null {
   const node = doc.byId[id];
-  if (!node || !blockWritable(id)) return;
+  if (!node || !blockWritable(id)) return null;
   const fmt = formatForBlock(id);
-  if (existingBlockId(node.raw, fmt)) return;
-  if (!UUID_RE.test(id)) return;
-  setDoc("byId", id, "raw", rawWithBlockId(node.raw, id, fmt));
+  const existing = existingBlockId(node.raw, fmt);
+  if (existing) return existing;
+  const uuid = UUID_RE.test(id) ? id : crypto.randomUUID();
+  setDoc("byId", id, "raw", rawWithBlockId(node.raw, uuid, fmt));
   markDirty(node.page);
   // Persist now, not on the 400ms debounce: the user may quit right after
   // parking the block, and a pending timer is lost when the webview closes.
   void flushPage(node.page);
+  return uuid;
 }
 
 /** Like `blockRef`, but first persists the block's `id::` so the reference
@@ -2114,7 +2728,7 @@ export function ensureStableBlockId(id: string): void {
  *  a new tab, and zoom all stamp `id::` so the spot survives a relaunch (Martin's
  *  call — he wants these to persist; the `id::` is harmless in the file and is
  *  stripped from clipboard copies anyway, see `blockSubtreeMarkdown`). */
-export function persistentBlockRef(id: string): { uuid: string; page: string; pageKind: PageKind; path?: string } {
+export function persistentBlockRef(id: string): LoadedBlockRef {
   ensureStableBlockId(id);
   return blockRef(id);
 }
@@ -2131,10 +2745,8 @@ export async function persistBlockRefTarget(
   kind: PageKind,
   path?: string,
 ): Promise<void> {
-  const loadedOwner = pageByName(page);
-  const exactOwnerLoaded = !!loadedOwner && (!path || loadedOwner.path === path);
-  const loadedNode = doc.byId[uuid];
-  if (!loadedNode || !exactOwnerLoaded || loadedNode.page !== page) {
+  const ref: LoadedBlockRef = { uuid, page, pageKind: kind, ...(path ? { path } : {}) };
+  if (!resolveBlockRef(ref)) {
     const dto = path
       ? await backend().getPageByPath(path)
       : await backend().getPage(page, kind);
@@ -2143,9 +2755,8 @@ export async function persistBlockRefTarget(
   // Re-check: a concurrent navigation may have loaded the page meanwhile, or the
   // cache may have been rebuilt (external change) and reassigned the block a new
   // uuid — in which case there's nothing safe to stamp.
-  const owner = pageByName(page);
-  const node = doc.byId[uuid];
-  if (node?.page === page && owner && (!path || owner.path === path)) ensureStableBlockId(uuid);
+  const id = resolveBlockRef(ref);
+  if (id) ensureStableBlockId(id);
 }
 
 /** Serialize a block (and, normally, its subtree) to Logseq markdown.
@@ -2187,6 +2798,67 @@ export function blockSubtreeMarkdown(
     out.push(blockSubtreeMarkdown(c, level + 1, stripId, stripCollapsed, onlySelected));
   }
   return out.join("\n");
+}
+
+/**
+ * Build the private clipboard forest from selection roots. Unlike the public
+ * text flavor this always includes the complete subtree and exact raw strings,
+ * including id::/collapsed:: and hidden properties. Returns null (without
+ * affecting the public copy) when the bounded in-memory payload is too large.
+ */
+export function buildClipboardPayload(ids: string[]): ClipboardPayloadData | null {
+  const selected = new Set(ids.filter((id) => !!doc.byId[id]));
+  const hasSelectedAncestor = (id: string): boolean => {
+    let parent = doc.byId[id]?.parent ?? null;
+    while (parent !== null) {
+      if (selected.has(parent)) return true;
+      parent = doc.byId[parent]?.parent ?? null;
+    }
+    return false;
+  };
+  const roots = [...selected].filter((id) => !hasSelectedAncestor(id));
+  if (roots.length === 0) return null;
+
+  let blockCount = 0;
+  let rawBytes = 0;
+  const encoder = new TextEncoder();
+  const pages = new Map<string, ClipboardSourcePage>();
+
+  const build = (id: string): ClipboardBlock | null => {
+    const node = doc.byId[id];
+    if (!node) return null;
+    blockCount++;
+    rawBytes += encoder.encode(node.raw).byteLength;
+    if (blockCount > CLIPBOARD_PAYLOAD_MAX_BLOCKS || rawBytes > CLIPBOARD_PAYLOAD_MAX_RAW_BYTES) return null;
+
+    const page = pageByName(node.page);
+    const generation = pageInstanceGeneration(node.page);
+    if (!page || generation === null) return null;
+    if (!pages.has(page.name)) {
+      pages.set(page.name, {
+        name: page.name,
+        kind: page.kind,
+        ...(page.path ? { path: page.path } : {}),
+        generation,
+      });
+    }
+
+    const children: ClipboardBlock[] = [];
+    for (const child of node.children) {
+      const built = build(child);
+      if (!built) return null;
+      children.push(built);
+    }
+    return { raw: node.raw, children, sourceFormat: page.format };
+  };
+
+  const blocks: ClipboardBlock[] = [];
+  for (const id of roots) {
+    const built = build(id);
+    if (!built) return null;
+    blocks.push(built);
+  }
+  return { blocks, sourcePages: [...pages.values()] };
 }
 
 /** Build an ExportNode forest (raw + children) for the given block ids and their
@@ -2572,7 +3244,8 @@ export async function moveBlock(
   id: string,
   newParent: string | null,
   index: number,
-  targetPage?: string
+  targetPage?: string,
+  dropTargetId?: string,
 ) {
   const node = doc.byId[id];
   if (!node) return;
@@ -2596,6 +3269,14 @@ export async function moveBlock(
     return;
   }
   if (!doc.byId[id]) return; // block vanished during the async flush
+  const sourceFormat = formatForBlock(id);
+  const destinationFormat = formatForPage(newPage);
+  const inheritanceTarget = dropTargetId ?? newParent;
+  // A cross-format move already preserves the source raw verbatim; only a newly
+  // inherited property is emitted in the destination page's syntax.
+  const movedRaw = orderListTypeFromRaw(doc.byId[id].raw, sourceFormat) !== null
+    ? doc.byId[id].raw
+    : rawWithInheritedOrderListType(doc.byId[id].raw, destinationFormat, inheritanceTarget);
   // Drag-move can cross pages → snapshot both source and destination.
   pushUndo("move", [...new Set([oldPage, newPage])]);
   setDoc(
@@ -2607,6 +3288,7 @@ export async function moveBlock(
       const from = oldArr.indexOf(id);
       oldArr.splice(from, 1);
       s.byId[id].parent = newParent;
+      s.byId[id].raw = movedRaw;
       const newArr =
         newParent === null
           ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots

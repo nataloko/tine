@@ -95,9 +95,7 @@ impl ConstructionBudget {
 
     fn admit_estimated(&mut self, page: &str, payload_bytes: usize) -> bool {
         self.total = self.total.saturating_add(1);
-        let bytes = payload_bytes
-            .saturating_add(page.len())
-            .saturating_add(256);
+        let bytes = payload_bytes.saturating_add(page.len()).saturating_add(256);
         if self.exceeded
             || self.rows >= self.max_rows
             || self.bytes.saturating_add(bytes) > self.max_bytes
@@ -275,7 +273,11 @@ fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
 
 fn shallow_dto_estimated_bytes(block: &DocBlock, ancestors: &[&DocBlock]) -> usize {
     let projection = block.projection();
-    let id_bytes = if block.uuid.is_empty() { 36 } else { block.uuid.len() };
+    let id_bytes = if block.uuid.is_empty() {
+        36
+    } else {
+        block.uuid.len()
+    };
     id_bytes
         .saturating_add(block.raw.len())
         .saturating_add(
@@ -399,14 +401,16 @@ fn collect_bounded(
                         budget.deny_match();
                         return None;
                     }
-                    if !budget.admit_estimated(
-                        &entry.name,
-                        shallow_dto_estimated_bytes(block, ancestors),
-                    ) {
+                    if !budget
+                        .admit_estimated(&entry.name, shallow_dto_estimated_bytes(block, ancestors))
+                    {
                         return None;
                     }
                     let mut dto = result_dto(block);
-                    dto.breadcrumb = ancestors.iter().map(|ancestor| crumb_line(ancestor)).collect();
+                    dto.breadcrumb = ancestors
+                        .iter()
+                        .map(|ancestor| crumb_line(ancestor))
+                        .collect();
                     Some(dto)
                 },
                 &mut matched,
@@ -533,10 +537,33 @@ pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     })
 }
 
-pub(crate) type RealPageNames =
-    std::collections::HashMap<String, (std::path::PathBuf, String)>;
+pub(crate) fn page_aliases_with_owners(graph: &Graph) -> Vec<(String, String, String)> {
+    graph.with_pages(|pages| {
+        let mut owned = Vec::new();
+        for (entry, doc) in pages {
+            for alias in document_aliases(doc) {
+                owned.push((
+                    entry.path.clone(),
+                    alias,
+                    entry.name.clone(),
+                    entry.rel_path.clone(),
+                ));
+            }
+        }
+        owned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        owned
+            .into_iter()
+            .map(|(_, alias, owner, owner_rel_path)| (alias, owner, owner_rel_path))
+            .collect()
+    })
+}
+
+pub(crate) type RealPageNames = std::collections::HashMap<String, (std::path::PathBuf, String)>;
 
 pub(crate) fn real_page_names(graph: &Graph) -> RealPageNames {
+    if let Some(indexed) = graph.reference_real_page_names() {
+        return indexed;
+    }
     graph.with_pages(|pages| {
         let mut real = RealPageNames::new();
         for (entry, _) in pages {
@@ -672,11 +699,55 @@ fn page_property_block(entry: &PageEntry, pre: &str) -> Option<DocBlock> {
     Some(block)
 }
 
+/// Parser-owned explicit page-reference targets contributed by one physical
+/// cached page. This is the projection used by the reconstructible candidate
+/// index; query-time occurrence verification still uses the full evidence
+/// engine below and remains authoritative.
+pub(crate) fn document_explicit_reference_names(
+    entry: &PageEntry,
+    doc: &Document,
+) -> Vec<String> {
+    fn collect(blocks: &[DocBlock], names: &mut Vec<String>) {
+        for block in blocks {
+            names.extend(
+                block
+                    .projection()
+                    .reference_source
+                    .explicit
+                    .iter()
+                    .map(|reference| refs::page_key(&reference.name)),
+            );
+            collect(&block.children, names);
+        }
+    }
+
+    let mut names = Vec::new();
+    if let Some(block) = doc
+        .pre_block
+        .as_deref()
+        .and_then(|pre| page_property_block(entry, pre))
+    {
+        names.extend(
+            block
+                .projection()
+                .reference_source
+                .explicit
+                .iter()
+                .map(|reference| refs::page_key(&reference.name)),
+        );
+    }
+    collect(&doc.roots, &mut names);
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 fn block_reference_evidence(
     block: &DocBlock,
     canonical: &str,
     names_norm: &[String],
     kind: ReferenceKind,
+    config: &crate::config::Config,
 ) -> Option<ReferenceBlockEvidence> {
     let result = crate::reference_evidence::occurrences_of_kind_bounded(
         &block.raw,
@@ -684,6 +755,7 @@ fn block_reference_evidence(
         canonical,
         names_norm,
         kind,
+        config,
     );
     (!result.occurrences.is_empty()).then(|| ReferenceBlockEvidence {
         block_id: block.uuid.clone(),
@@ -697,12 +769,14 @@ fn block_has_reference(
     block: &DocBlock,
     names_norm: &[String],
     kind: ReferenceKind,
+    config: &crate::config::Config,
 ) -> bool {
     crate::reference_evidence::has_occurrence_kind(
         &block.raw,
         &block.projection().reference_source,
         names_norm,
         kind,
+        config,
     )
 }
 
@@ -736,7 +810,9 @@ fn collect_reference_occurrences_bounded(
 ) -> BoundedGroups {
     let exclude = refs::page_key(self_page);
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
-    let groups = graph.with_pages(|pages| {
+    let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
+    let groups = {
+        let pages = candidate_pages.pages.as_slice();
         let mut groups: Vec<(Option<i64>, RefGroup)> = Vec::new();
         let mut by_name = std::collections::HashMap::<String, usize>::new();
         let mut sources = pages.iter().collect::<Vec<_>>();
@@ -753,11 +829,11 @@ fn collect_reference_occurrences_bounded(
                 .and_then(|pre| page_property_block(entry, pre))
             {
                 if budget.closed() {
-                    if block_has_reference(&block, names_norm, kind) {
+                    if block_has_reference(&block, names_norm, kind, &graph.config) {
                         budget.deny_match();
                     }
                 } else if let Some(hit) =
-                    block_reference_evidence(&block, canonical, names_norm, kind)
+                    block_reference_evidence(&block, canonical, names_norm, kind, &graph.config)
                 {
                     let mut dto = block_to_shallow_dto(&block);
                     dto.page_property = true;
@@ -778,9 +854,10 @@ fn collect_reference_occurrences_bounded(
                 &mut path,
                 &mut |block, _| {
                     if construction_closed.get() {
-                        block_has_reference(block, names_norm, kind).then_some(None)
+                        block_has_reference(block, names_norm, kind, &graph.config).then_some(None)
                     } else {
-                        block_reference_evidence(block, canonical, names_norm, kind).map(Some)
+                        block_reference_evidence(block, canonical, names_norm, kind, &graph.config)
+                            .map(Some)
                     }
                 },
                 &mut |block, ancestors, hit| {
@@ -840,7 +917,7 @@ fn collect_reference_occurrences_bounded(
                 .then_with(|| a.1.page.cmp(&b.1.page))
         });
         groups.into_iter().map(|(_, group)| group).collect()
-    });
+    };
     BoundedGroups {
         groups,
         total: budget.total,
@@ -850,8 +927,7 @@ fn collect_reference_occurrences_bounded(
 
 pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm, self_page) =
-        graph_equivalent_page_names(graph, &aliases, target);
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(
         graph,
         &canonical,
@@ -868,8 +944,7 @@ pub fn backlinks_bounded(
     max_bytes: usize,
 ) -> BoundedGroups {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm, self_page) =
-        graph_equivalent_page_names(graph, &aliases, target);
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences_bounded(
         graph,
         &canonical,
@@ -977,7 +1052,13 @@ fn backlink_filter_entry(
     }
 
     let mut text_truncated = false;
-    visit(block, &mut text, max_text, &mut add_facet, &mut text_truncated);
+    visit(
+        block,
+        &mut text,
+        max_text,
+        &mut add_facet,
+        &mut text_truncated,
+    );
     BacklinkFilterEntry {
         page: page.to_string(),
         kind,
@@ -999,11 +1080,11 @@ pub fn backlink_filter_context(
 ) -> BacklinkFilterContext {
     let aliases = graph.page_aliases();
     let (_, names_norm, _) = graph_equivalent_page_names(graph, &aliases, target);
-    let excluded_refs = names_norm.into_iter().collect::<std::collections::HashSet<_>>();
-    let mut requested = std::collections::HashMap::<
-        (PageKind, String),
-        std::collections::HashSet<String>,
-    >::new();
+    let excluded_refs = names_norm
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut requested =
+        std::collections::HashMap::<(PageKind, String), std::collections::HashSet<String>>::new();
     for item in targets {
         requested
             .entry((item.kind, refs::normalize(&item.page)))
@@ -1143,8 +1224,7 @@ pub fn block_referrers_bounded(
 /// with the corresponding occurrence evidence.
 pub fn unlinked_refs(graph: &Graph, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm, self_page) =
-        graph_equivalent_page_names(graph, &aliases, target);
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(
         graph,
         &canonical,
@@ -1161,8 +1241,7 @@ pub fn unlinked_refs_bounded(
     max_bytes: usize,
 ) -> BoundedGroups {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm, self_page) =
-        graph_equivalent_page_names(graph, &aliases, target);
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences_bounded(
         graph,
         &canonical,
@@ -1179,8 +1258,7 @@ pub fn unlinked_refs_bounded(
 /// projection-cache drift visible. No launcher history is read or returned.
 pub fn reference_diagnostics(graph: &Graph, target: &str) -> ReferenceDiagnostics {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm, self_page) =
-        graph_equivalent_page_names(graph, &aliases, target);
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let excluded_page = refs::page_key(&self_page);
     let mut traces = graph.with_pages(|pages| {
         let mut traces = Vec::new();
@@ -1192,6 +1270,7 @@ pub fn reference_diagnostics(graph: &Graph, target: &str) -> ReferenceDiagnostic
                     block.is_org,
                     &canonical,
                     &names_norm,
+                    &graph.config,
                 );
                 let raw_lower = block.raw.to_lowercase();
                 let textual_candidate = names_norm.iter().any(|name| raw_lower.contains(name));
@@ -1345,10 +1424,8 @@ fn run_pred_bounded(
                         budget.deny_match();
                         return None;
                     }
-                    if !budget.admit_estimated(
-                        &entry.name,
-                        shallow_dto_estimated_bytes(block, &[]),
-                    ) {
+                    if !budget.admit_estimated(&entry.name, shallow_dto_estimated_bytes(block, &[]))
+                    {
                         return None;
                     }
                     Some(result_dto(block))
@@ -1510,10 +1587,20 @@ pub(crate) fn page_affects_backlinks(
     doc: &Document,
 ) -> bool {
     let (canonical, names_norm, _) = equivalent_page_names(real_pages, aliases, target);
+    // Scoped invalidation has no Graph/config parameter. Default-enabled matching
+    // is conservative for disabled/excluded property pages (it may evict an
+    // unaffected cache entry, but cannot retain a stale one).
+    let config = crate::config::Config::default();
     if doc.pre_block.as_deref().is_some_and(|pre| {
         page_property_block(entry, pre).is_some_and(|block| {
-            block_reference_evidence(&block, &canonical, &names_norm, ReferenceKind::Explicit)
-                .is_some()
+            block_reference_evidence(
+                &block,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Explicit,
+                &config,
+            )
+            .is_some()
         })
     }) {
         return true;
@@ -1521,8 +1608,14 @@ pub(crate) fn page_affects_backlinks(
     let mut hit = false;
     walk(&doc.roots, &mut |b| {
         if !hit
-            && block_reference_evidence(b, &canonical, &names_norm, ReferenceKind::Explicit)
-                .is_some()
+            && block_reference_evidence(
+                b,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Explicit,
+                &config,
+            )
+            .is_some()
         {
             hit = true;
         }
@@ -1540,10 +1633,17 @@ pub(crate) fn page_affects_unlinked(
     doc: &Document,
 ) -> bool {
     let (canonical, names_norm, _) = equivalent_page_names(real_pages, aliases, target);
+    let config = crate::config::Config::default();
     if doc.pre_block.as_deref().is_some_and(|pre| {
         page_property_block(entry, pre).is_some_and(|block| {
-            block_reference_evidence(&block, &canonical, &names_norm, ReferenceKind::Plain)
-                .is_some()
+            block_reference_evidence(
+                &block,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Plain,
+                &config,
+            )
+            .is_some()
         })
     }) {
         return true;
@@ -1551,7 +1651,8 @@ pub(crate) fn page_affects_unlinked(
     let mut hit = false;
     walk(&doc.roots, &mut |b| {
         if !hit
-            && block_reference_evidence(b, &canonical, &names_norm, ReferenceKind::Plain).is_some()
+            && block_reference_evidence(b, &canonical, &names_norm, ReferenceKind::Plain, &config)
+                .is_some()
         {
             hit = true;
         }
@@ -1568,7 +1669,13 @@ pub(crate) fn page_affects_block_referrers(uuid: &str, doc: &Document) -> bool {
     }
     let mut hit = false;
     walk(&doc.roots, &mut |block| {
-        if !hit && block.projection().block_refs.iter().any(|reference| reference == uuid) {
+        if !hit
+            && block
+                .projection()
+                .block_refs
+                .iter()
+                .any(|reference| reference == uuid)
+        {
             hit = true;
         }
     });
@@ -1653,18 +1760,10 @@ pub fn run_advanced_query_bounded(
     max_bytes: usize,
 ) -> (AdvancedResult, bool, usize) {
     if !query_source_within_limit(query_src) {
-        return (
-            rejected_advanced_query("query-too-large"),
-            false,
-            0,
-        );
+        return (rejected_advanced_query("query-too-large"), false, 0);
     }
     if !query_nesting_within_limit(query_src) {
-        return (
-            rejected_advanced_query("query-nesting-too-deep"),
-            false,
-            0,
-        );
+        return (rejected_advanced_query("query-nesting-too-deep"), false, 0);
     }
     let today = JournalDate::today();
     let (pred, ran, ignored) = advanced_pred(query_src, current_page, today);
@@ -1701,18 +1800,26 @@ fn advanced_pred(
     today: JournalDate,
 ) -> (Option<Pred>, Vec<String>, Vec<String>) {
     if !query_nesting_within_limit(query_src) {
-        return (
-            None,
-            Vec::new(),
-            vec!["query-nesting-too-deep".to_string()],
-        );
+        return (None, Vec::new(), vec!["query-nesting-too-deep".to_string()]);
     }
     let inputs = resolve_inputs(query_src, current_page, today);
     let mut ran = Vec::new();
     let mut ignored = Vec::new();
-    let preds: Vec<Pred> = where_groups(query_src)
+    let groups = where_groups(query_src);
+    let (lowered_page_properties, consumed_patterns) = lower_page_property_patterns(&groups);
+    let preds: Vec<Pred> = groups
         .iter()
-        .filter_map(|g| parse_adv_group(g, &inputs, today, &mut ran, &mut ignored, 0))
+        .enumerate()
+        .filter_map(|(index, group)| {
+            if let Some(pred) = lowered_page_properties.get(&index) {
+                ran.push("page-property".into());
+                return Some(pred.clone());
+            }
+            if consumed_patterns.contains(&index) {
+                return None;
+            }
+            parse_adv_group(group, &inputs, today, &mut ran, &mut ignored, 0)
+        })
         .collect();
     if ignored.iter().any(|item| item == "query-nesting-too-deep") {
         return (None, Vec::new(), ignored);
@@ -1726,6 +1833,65 @@ fn advanced_pred(
         Pred::And(preds)
     };
     (Some(pred), ran, ignored)
+}
+
+/// Conservatively lower only the exact DataScript relationship used by the
+/// released BEGIN_QUERY page-property form. The entity/property-map pattern and
+/// `(get ...)` predicate must share the literal `?props` binding; every other
+/// bracket form remains visible as an unsupported `pattern` in `parse_adv_group`.
+fn lower_page_property_patterns(
+    groups: &[String],
+) -> (
+    std::collections::HashMap<usize, Pred>,
+    std::collections::HashSet<usize>,
+) {
+    let relations = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, group)| {
+            let inner = group.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+            (inner.split_whitespace().collect::<Vec<_>>() == ["?p", ":block/properties", "?props"])
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if relations.len() != 1 {
+        return Default::default();
+    }
+
+    let mut lowered = std::collections::HashMap::new();
+    let mut consumed = std::collections::HashSet::new();
+    for (index, group) in groups.iter().enumerate() {
+        let Some(inner) = group
+            .trim()
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let Some(call) = inner
+            .trim()
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let tokens = call.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() != 3 || tokens[0] != "get" || tokens[1] != "?props" {
+            continue;
+        }
+        let Some(key) = tokens[2].strip_prefix(':').filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        if key
+            .chars()
+            .any(|c| c.is_whitespace() || "()[]{}".contains(c))
+        {
+            continue;
+        }
+        lowered.insert(index, Pred::PageProperty(key.to_string(), None));
+        consumed.insert(relations[0]);
+    }
+    (lowered, consumed)
 }
 
 /// Collect balanced `(...)`/`[...]` groups at the top level of `s` (string-aware),
@@ -2091,9 +2257,9 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
     }
 }
 
-/// Full-text search: blocks whose visible text matches `query` under the Ctrl-K
-/// search dialect (whitespace=AND, `OR`, `-exclude`, `"phrase"`, `/regex/`; see
-/// [`crate::search_query`]), grouped by page, capped at `limit` total blocks.
+/// Literal fuzzy full-text autocomplete for the `((` block picker, grouped by
+/// page and capped at `limit` total blocks. Ctrl-K uses `run_graph_search*` and
+/// retains the shared search dialect through `QueryPlan::friendly*`.
 pub fn search(graph: &Graph, query: &str, limit: usize) -> Vec<RefGroup> {
     search_cancellable(graph, query, limit, || false)
 }
@@ -2107,7 +2273,7 @@ pub fn search_cancellable(
     limit: usize,
     cancelled: impl Fn() -> bool,
 ) -> Vec<RefGroup> {
-    let plan = crate::query_plan::QueryPlan::block_search(query, limit);
+    let plan = crate::query_plan::QueryPlan::block_search_literal(query, limit);
     let execution = plan.execute(graph, cancelled);
     if execution.cancelled {
         Vec::new()
@@ -2240,6 +2406,117 @@ pub fn property_facets_bounded(
         }
         map.into_iter()
             .map(|(k, vs)| (k, vs.into_iter().collect()))
+            .collect()
+    });
+    (facets, exceeded)
+}
+
+/// OG-visible property names and their distinct values for editor completion.
+/// Unlike query-builder facets, this includes page preambles and editable
+/// built-ins such as `template`/`title`, while applying graph-configured hidden
+/// keys. OG sources: db/model.cljs:1394-1405,1422-1443; search.cljs:184-215;
+/// util/property.cljs:18-24 at checkout 6e7afa8eb.
+const OG_AUTOCOMPLETE_HIDDEN_PROPS: &[&str] = &[
+    "id",
+    "custom-id",
+    "background-color",
+    "background_color",
+    "heading",
+    "collapsed",
+    "created-at",
+    "updated-at",
+    "last-modified-at",
+    "created_at",
+    "last_modified_at",
+    "query-table",
+    "query-properties",
+    "query-sort-by",
+    "query-sort-desc",
+    "ls-type",
+    "hl-type",
+    "hl-page",
+    "hl-stamp",
+    "hl-color",
+    "logseq.macro-name",
+    "logseq.macro-arguments",
+    "logseq.order-list-type",
+    "logseq.tldraw.page",
+    "logseq.tldraw.shape",
+    "todo",
+    "doing",
+    "now",
+    "later",
+    "done",
+];
+
+pub fn autocomplete_property_facets_bounded(
+    graph: &Graph,
+    max_items: usize,
+    max_bytes: usize,
+) -> (Vec<(String, Vec<String>)>, bool) {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    let hidden: HashSet<String> = OG_AUTOCOMPLETE_HIDDEN_PROPS
+        .iter()
+        .map(|key| property_key_norm(key))
+        .chain(
+            graph
+                .config
+                .block_hidden_properties
+                .iter()
+                .map(|key| property_key_norm(key.trim_start_matches(':'))),
+        )
+        .collect();
+    let mut items = 0usize;
+    let mut bytes = 0usize;
+    let mut exceeded = false;
+
+    let facets = graph.with_pages(|pages| {
+        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut offer = |source_key: String, source_value: String| {
+            let key = property_key_norm(&source_key);
+            if key.is_empty() || hidden.contains(&key) {
+                return;
+            }
+
+            if !map.contains_key(&key) {
+                let key_bytes = key.len().saturating_add(64);
+                if items >= max_items || bytes.saturating_add(key_bytes) > max_bytes {
+                    exceeded = true;
+                    return;
+                }
+                items += 1;
+                bytes = bytes.saturating_add(key_bytes);
+                map.insert(key.clone(), BTreeSet::new());
+            }
+
+            let value = source_value.trim();
+            if value.is_empty() || map.get(&key).is_some_and(|values| values.contains(value)) {
+                return;
+            }
+            let value_bytes = value.len().saturating_add(64);
+            if items >= max_items || bytes.saturating_add(value_bytes) > max_bytes {
+                exceeded = true;
+                return;
+            }
+            items += 1;
+            bytes = bytes.saturating_add(value_bytes);
+            map.entry(key).or_default().insert(value.to_string());
+        };
+
+        for (_entry, doc) in pages {
+            for (key, value) in page_facets(doc.pre_block.as_deref()).0 {
+                offer(key, value);
+            }
+            walk(&doc.roots, &mut |block| {
+                for (key, value) in block.properties() {
+                    offer(key, value);
+                }
+            });
+        }
+
+        map.into_iter()
+            .map(|(key, values)| (key, values.into_iter().collect()))
             .collect()
     });
     (facets, exceeded)
@@ -2440,10 +2717,7 @@ pub fn resolve_blocks_bounded(
             let group = resolved.get(u.as_str())?;
             let block = group.blocks.first()?;
             output_budget
-                .admit_estimated(
-                    &group.page,
-                    crate::model::block_dto_estimated_bytes(block),
-                )
+                .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(block))
                 .then(|| group.clone())
         })
         .collect();
@@ -3053,10 +3327,7 @@ fn block_date_ordinals(raw: &str, only: Option<&str>) -> Vec<i64> {
 
 impl Pred {
     fn parse(src: &str, today: JournalDate) -> Option<Pred> {
-        if is_advanced(src)
-            || !query_source_within_limit(src)
-            || !query_nesting_within_limit(src)
-        {
+        if is_advanced(src) || !query_source_within_limit(src) || !query_nesting_within_limit(src) {
             return None;
         }
         let tokens = tokenize(src);
@@ -3117,9 +3388,10 @@ impl Pred {
                 .unwrap_or(false),
             Pred::Property(key, val) => {
                 let key = property_key_norm(key);
-                block.properties().iter().any(|(k, v)| {
-                    property_key_norm(k) == key && value_matches(v, val.as_deref())
-                })
+                block
+                    .properties()
+                    .iter()
+                    .any(|(k, v)| property_key_norm(k) == key && value_matches(v, val.as_deref()))
             }
             Pred::Scheduled => block.raw.contains("SCHEDULED:"),
             Pred::Deadline => block.raw.contains("DEADLINE:"),
@@ -3150,9 +3422,9 @@ impl Pred {
             }
             Pred::PageProperty(key, val) => {
                 let key = property_key_norm(key);
-                ctx.page_props.iter().any(|(k, v)| {
-                    property_key_norm(k) == key && value_matches(v, val.as_deref())
-                })
+                ctx.page_props
+                    .iter()
+                    .any(|(k, v)| property_key_norm(k) == key && value_matches(v, val.as_deref()))
             }
             Pred::PageTags(tags) => tags
                 .iter()
@@ -3340,12 +3612,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
     toks
 }
 
-fn parse_expr(
-    toks: &[Tok],
-    pos: &mut usize,
-    today: JournalDate,
-    depth: usize,
-) -> Option<Pred> {
+fn parse_expr(toks: &[Tok], pos: &mut usize, today: JournalDate, depth: usize) -> Option<Pred> {
     if depth > QUERY_NESTING_MAX {
         return None;
     }
@@ -3505,12 +3772,7 @@ fn parse_expr(
     }
 }
 
-fn parse_list(
-    toks: &[Tok],
-    pos: &mut usize,
-    today: JournalDate,
-    depth: usize,
-) -> Vec<Pred> {
+fn parse_list(toks: &[Tok], pos: &mut usize, today: JournalDate, depth: usize) -> Vec<Pred> {
     let mut out = Vec::new();
     while let Some(t) = toks.get(*pos) {
         if *t == Tok::RParen {
@@ -3629,14 +3891,13 @@ mod tests {
             nested_boolean("and", QUERY_NESTING_MAX - 1, "(task ?b #{\"TODO\"})")
         );
         let (accepted, _, rejected) = advanced_pred(&advanced_at_limit, None, TODAY);
-        assert!(accepted.is_some(), "unexpected ignored clauses: {rejected:?}");
+        assert!(
+            accepted.is_some(),
+            "unexpected ignored clauses: {rejected:?}"
+        );
         let advanced_too_deep = format!(
             "[:find (pull ?b [*]) :where {}]",
-            nested_boolean(
-                "and",
-                QUERY_NESTING_MAX,
-                "(task ?b #{\"TODO\"})"
-            )
+            nested_boolean("and", QUERY_NESTING_MAX, "(task ?b #{\"TODO\"})")
         );
         let (rejected, ran, ignored) = advanced_pred(&advanced_too_deep, None, TODAY);
         assert!(rejected.is_none());
@@ -3686,6 +3947,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        let runtime_id = graph.backlinks("Target")[0].blocks[0].id.clone();
         let context = backlink_filter_context(
             &graph,
             "Target",
@@ -3693,14 +3955,14 @@ mod tests {
                 BacklinkFilterTarget {
                     page: "Source".into(),
                     kind: PageKind::Page,
-                    block_id: ROOT.into(),
+                    block_id: runtime_id.clone(),
                 },
                 // Defensive duplicate input must not make a complete response
                 // look truncated or duplicate its payload.
                 BacklinkFilterTarget {
                     page: "Source".into(),
                     kind: PageKind::Page,
-                    block_id: ROOT.into(),
+                    block_id: runtime_id,
                 },
             ],
         );
@@ -3709,17 +3971,27 @@ mod tests {
         assert_eq!(context.entries.len(), 1);
         let entry = &context.entries[0];
         assert!(entry.text.contains("exact needle"), "{:?}", entry.text);
-        assert!(!entry.text.contains("id::"), "properties are not visible text");
+        assert!(
+            !entry.text.contains("id::"),
+            "properties are not visible text"
+        );
         let facets = entry
             .facets
             .iter()
             .map(|facet| refs::normalize(facet))
             .collect::<std::collections::HashSet<_>>();
         for expected in ["other", "tag", "team", "todo"] {
-            assert!(facets.contains(expected), "missing {expected}: {:?}", entry.facets);
+            assert!(
+                facets.contains(expected),
+                "missing {expected}: {:?}",
+                entry.facets
+            );
         }
         assert!(!facets.contains("target"));
-        assert!(!facets.contains("codeonly"), "code-fence text is not a reference facet");
+        assert!(
+            !facets.contains("codeonly"),
+            "code-fence text is not a reference facet"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3943,6 +4215,32 @@ mod tests {
     }
 
     #[test]
+    fn advanced_exact_page_property_pair_matches_page_property_predicate() {
+        let source = r#"[:find (pull ?p [*])
+                         :where
+                         [?p :block/properties ?props]
+                         [(get ?props :class)]]"#;
+        let (lowered, ran, ignored) = advanced_pred(source, None, TODAY);
+
+        assert_eq!(lowered, Some(pred("(page-property :class)")));
+        assert_eq!(ran, vec!["page-property"]);
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn advanced_unrelated_bracket_pattern_stays_unsupported() {
+        let source = r#"[:find (pull ?p [*])
+                         :where
+                         [?p :block/name ?name]
+                         [(get ?name :class)]]"#;
+        let (lowered, ran, ignored) = advanced_pred(source, None, TODAY);
+
+        assert_eq!(lowered, None);
+        assert!(ran.is_empty());
+        assert_eq!(ignored, vec!["pattern", "pattern"]);
+    }
+
+    #[test]
     fn eval_against_blocks() {
         let none = ctx_named();
         let task = DocBlock::new("TODO buy milk for [[Home]]");
@@ -3969,8 +4267,9 @@ mod tests {
         assert!(!q.eval(&b, &on_2019));
         let sched = DocBlock::new("TODO x\nSCHEDULED: <2022-03-03 Thu>");
         assert!(!q.eval(&sched, &ctx_named()));
-        assert!(pred("(between any [[Jan 1st, 2021]] [[Jan 1st, 2100]])")
-            .eval(&sched, &ctx_named()));
+        assert!(
+            pred("(between any [[Jan 1st, 2021]] [[Jan 1st, 2100]])").eval(&sched, &ctx_named())
+        );
     }
 
     /// The unqualified two-bound form is OG's journal-page range. Scheduled and
@@ -3995,43 +4294,32 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::write(
             dir.join("journals/2020_12_05.md"),
-            format!(
-                "- first in range\n  id:: {DEC_5_A}\n- second in range\n  id:: {DEC_5_B}\n"
-            ),
+            format!("- first in range\n  id:: {DEC_5_A}\n- second in range\n  id:: {DEC_5_B}\n"),
         )
         .unwrap();
         fs::write(
             dir.join("journals/2020_12_07.md"),
-            format!(
-                "- third in range\n  id:: {DEC_7_A}\n- fourth in range\n  id:: {DEC_7_B}\n"
-            ),
+            format!("- third in range\n  id:: {DEC_7_A}\n- fourth in range\n  id:: {DEC_7_B}\n"),
         )
         .unwrap();
         // Both rows have an in-range planning timestamp but live outside the
         // requested journal-page interval. The old Any default leaked them.
         fs::write(
             dir.join("journals/2021_07_01.md"),
-            format!(
-                "- outside journal\n  SCHEDULED: <2020-12-06 Sun>\n  id:: {OUTSIDE_JOURNAL}\n"
-            ),
+            format!("- outside journal\n  SCHEDULED: <2020-12-06 Sun>\n  id:: {OUTSIDE_JOURNAL}\n"),
         )
         .unwrap();
         fs::write(
             dir.join("pages/Named.md"),
-            format!(
-                "- named scheduled\n  DEADLINE: <2020-12-06 Sun>\n  id:: {NAMED_SCHEDULED}\n"
-            ),
+            format!("- named scheduled\n  DEADLINE: <2020-12-06 Sun>\n  id:: {NAMED_SCHEDULED}\n"),
         )
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let ids = run_query(
-            &graph,
-            "(between [[Dec 5th, 2020]] [[Dec 7th, 2020]])",
-        )
-        .into_iter()
-        .flat_map(|group| group.blocks.into_iter().map(|block| block.id))
-        .collect::<Vec<_>>();
+        let ids = run_query(&graph, "(between [[Dec 5th, 2020]] [[Dec 7th, 2020]])")
+            .into_iter()
+            .flat_map(|group| group.blocks.into_iter().map(persisted_dto_id))
+            .collect::<Vec<_>>();
         assert_eq!(
             ids,
             vec![
@@ -4043,23 +4331,17 @@ mod tests {
         );
 
         // Reversed bounds are normalized by OG's build-between-two-arg.
-        let reversed = run_query(
-            &graph,
-            "(between [[Dec 7th, 2020]] [[Dec 5th, 2020]])",
-        );
+        let reversed = run_query(&graph, "(between [[Dec 7th, 2020]] [[Dec 5th, 2020]])");
         assert_eq!(
-            reversed.iter().map(|group| group.blocks.len()).sum::<usize>(),
+            reversed
+                .iter()
+                .map(|group| group.blocks.len())
+                .sum::<usize>(),
             4
         );
         // Tine's union remains explicitly requestable.
-        let any = run_query(
-            &graph,
-            "(between any [[Dec 5th, 2020]] [[Dec 7th, 2020]])",
-        );
-        assert_eq!(
-            any.iter().map(|group| group.blocks.len()).sum::<usize>(),
-            6
-        );
+        let any = run_query(&graph, "(between any [[Dec 5th, 2020]] [[Dec 7th, 2020]])");
+        assert_eq!(any.iter().map(|group| group.blocks.len()).sum::<usize>(), 6);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4247,6 +4529,50 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_property_facets_follow_og_visibility_sources_and_budget() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-property-autocomplete-facets-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:block-hidden-properties #{:hidden_config}}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Properties.md"),
+            "Page_Only:: preamble\nTitle:: Page title\nhidden_config:: secret\n\n- first\n  alpha:: one\n  Alpha_Value:: two\n  template:: My template\n  id:: hidden\n  background_color:: hidden too\n  hidden_config:: block secret\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        assert_eq!(
+            autocomplete_property_facets_bounded(&graph, usize::MAX, usize::MAX),
+            (
+                vec![
+                    ("alpha".to_string(), vec!["one".to_string()]),
+                    ("alpha-value".to_string(), vec!["two".to_string()]),
+                    ("page-only".to_string(), vec!["preamble".to_string()]),
+                    ("template".to_string(), vec!["My template".to_string()]),
+                    ("title".to_string(), vec!["Page title".to_string()]),
+                ],
+                false,
+            )
+        );
+
+        let (bounded, exceeded) = autocomplete_property_facets_bounded(&graph, 3, usize::MAX);
+        assert!(exceeded);
+        assert!(bounded.len() + bounded.iter().map(|(_, values)| values.len()).sum::<usize>() <= 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn content_predicate_uses_canonical_unicode_without_accent_folding() {
         let none = ctx_named();
         let block = DocBlock::new("Re\u{301}sume\u{301}");
@@ -4296,6 +4622,189 @@ mod tests {
             .into_iter()
             .map(|e| (e.name, e.kind, e.rel_path))
             .collect()
+    }
+
+    fn graph_from_page_snapshot(pages: &[(&str, &str, &str)]) -> Graph {
+        let pages = pages
+            .iter()
+            .map(|(name, rel_path, source)| {
+                (
+                    PageEntry {
+                        name: (*name).into(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: (*rel_path).into(),
+                        path: (*rel_path).into(),
+                    },
+                    std::sync::Arc::new(crate::doc::parse(source)),
+                )
+            })
+            .collect();
+        Graph::from_page_snapshot("", pages)
+    }
+
+    fn persisted_dto_id(block: BlockDto) -> String {
+        block
+            .properties
+            .into_iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("id"))
+            .map(|(_, value)| value)
+            .expect("fixture block has persisted id::")
+    }
+
+    fn search_block_texts(graph: &Graph, query: &str, limit: usize) -> Vec<String> {
+        search(graph, query, limit)
+            .into_iter()
+            .flat_map(|group| group.blocks.into_iter().map(|block| block.raw))
+            .collect()
+    }
+
+    fn graph_search_block_texts(execution: crate::query_plan::QueryExecution) -> Vec<String> {
+        execution
+            .hits
+            .into_iter()
+            .filter_map(|hit| match hit {
+                crate::query_plan::QueryHit::Block { display_text, .. } => Some(display_text),
+                crate::query_plan::QueryHit::Page { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn autocomplete_page_or_token_is_literal() {
+        let graph = graph_from_page_snapshot(&[
+            ("A", "pages/a.md", "- filler\n"),
+            ("B", "pages/b.md", "- filler\n"),
+            ("ORbit", "pages/orbit.md", "- target\n"),
+            (
+                "a OR b notes",
+                "pages/a-or-b.md",
+                "- literal multi-word target\n",
+            ),
+        ]);
+
+        assert_eq!(
+            quick_switch(&graph, "OR", 1)
+                .into_iter()
+                .map(|page| page.name)
+                .collect::<Vec<_>>(),
+            ["ORbit"]
+        );
+        assert_eq!(quick_switch(&graph, "a OR b", 1)[0].name, "a OR b notes");
+    }
+
+    #[test]
+    fn autocomplete_block_or_token_is_literal() {
+        let graph = graph_from_page_snapshot(&[(
+            "Logic",
+            "pages/logic.md",
+            "- logic OR gate\n- unrelated\n",
+        )]);
+
+        assert_eq!(search_block_texts(&graph, "OR", 8), ["logic OR gate"]);
+    }
+
+    #[test]
+    fn autocomplete_negation_token_is_literal() {
+        let graph = graph_from_page_snapshot(&[
+            ("A", "pages/a.md", "- filler\n"),
+            (
+                "-foo page",
+                "pages/minus-foo.md",
+                "- block contains -foo literally\n",
+            ),
+        ]);
+
+        assert_eq!(
+            quick_switch(&graph, "-foo", 1)
+                .into_iter()
+                .map(|page| page.name)
+                .collect::<Vec<_>>(),
+            ["-foo page"]
+        );
+        assert_eq!(
+            search_block_texts(&graph, "-foo", 8),
+            ["block contains -foo literally"]
+        );
+    }
+
+    #[test]
+    fn autocomplete_no_present_absent_present_ladder() {
+        let graph = graph_from_page_snapshot(&[
+            ("A", "pages/a.md", "- filler\n"),
+            ("B", "pages/b.md", "- filler\n"),
+            ("ORbit", "pages/orbit.md", "- target\n"),
+        ]);
+
+        for query in ["O", "OR", "ORb"] {
+            assert!(
+                quick_switch(&graph, query, 1)
+                    .iter()
+                    .any(|page| page.name == "ORbit"),
+                "ORbit disappeared for autocomplete query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrlk_dsl_still_active() {
+        let graph = graph_from_page_snapshot(&[(
+            "Search",
+            "pages/search.md",
+            "- foo safe\n- foo x excluded\n- bar safe\n- unrelated\n",
+        )]);
+
+        let or_hits = graph_search_block_texts(graph.run_graph_search("foo OR bar", 8, 8, false));
+        assert!(or_hits.iter().any(|text| text == "foo safe"));
+        assert!(or_hits.iter().any(|text| text == "bar safe"));
+        assert!(!or_hits.iter().any(|text| text == "unrelated"));
+
+        let excluded = graph_search_block_texts(graph.run_graph_search("foo -x", 8, 8, false));
+        assert_eq!(excluded, ["foo safe"]);
+        assert!(graph.run_graph_search("-x", 8, 8, false).hits.is_empty());
+
+        let scoped = graph_search_block_texts(graph.run_graph_search_latest_scoped(
+            "ctrlk-dsl-current-page",
+            "foo -x",
+            8,
+            8,
+            Some(crate::query_plan::QueryPageScope {
+                name: "Search".into(),
+                page_kind: PageKind::Page,
+                path: Some("pages/search.md".into()),
+            }),
+            false,
+        ));
+        assert_eq!(scoped, ["foo safe"]);
+    }
+
+    #[test]
+    fn page_topk_ties_are_input_order_independent() {
+        let file_forward = graph_from_page_snapshot(&[
+            ("alx", "pages/alx.md", "- file page\n"),
+            ("aly", "pages/aly.md", "- file page\n"),
+        ]);
+        let file_reversed = graph_from_page_snapshot(&[
+            ("aly", "pages/aly.md", "- file page\n"),
+            ("alx", "pages/alx.md", "- file page\n"),
+        ]);
+        for graph in [&file_forward, &file_reversed] {
+            assert_eq!(quick_switch(graph, "al", 1)[0].name, "alx");
+        }
+
+        let refs_forward =
+            graph_from_page_snapshot(&[("Source", "pages/source.md", "- [[alx]] [[aly]]\n")]);
+        let refs_reversed =
+            graph_from_page_snapshot(&[("Source", "pages/source.md", "- [[aly]] [[alx]]\n")]);
+        for graph in [&refs_forward, &refs_reversed] {
+            let result = quick_switch(graph, "al", 1);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].name, "alx");
+            assert!(
+                result[0].rel_path.is_empty(),
+                "winner must be reference-only"
+            );
+        }
     }
 
     fn quick_switch_reference_full_sort(
@@ -4500,10 +5009,8 @@ mod tests {
         const ON_PAGE: &str = "11111111-1111-4111-8111-111111111111";
         const EXPLICIT_REF: &str = "22222222-2222-4222-8222-222222222222";
         const UNRELATED: &str = "33333333-3333-4333-8333-333333333333";
-        let dir = std::env::temp_dir().join(format!(
-            "tine-og-bare-page-union-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tine-og-bare-page-union-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("pages")).unwrap();
         fs::create_dir_all(dir.join("journals")).unwrap();
@@ -4527,7 +5034,7 @@ mod tests {
         let ids = |query: &str| {
             run_query(&graph, query)
                 .into_iter()
-                .flat_map(|group| group.blocks.into_iter().map(|block| block.id))
+                .flat_map(|group| group.blocks.into_iter().map(persisted_dto_id))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -4587,7 +5094,7 @@ mod tests {
         let ids = |query: &str| {
             run_query(&graph, query)
                 .into_iter()
-                .flat_map(|group| group.blocks.into_iter().map(|block| block.id))
+                .flat_map(|group| group.blocks.into_iter().map(persisted_dto_id))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -4602,10 +5109,7 @@ mod tests {
         // OG query presentation suppresses a matching block only when its
         // immediate parent also matched, so the matching grandchild is not a
         // second top-level result.
-        assert!(
-            !ids("(and (task TODO) [[Target]])")
-                .contains(&INHERITED_GRANDCHILD.to_string())
-        );
+        assert!(!ids("(and (task TODO) [[Target]])").contains(&INHERITED_GRANDCHILD.to_string()));
         assert_eq!(
             ids("(and (task TODO) (not [[Target]]))"),
             vec![UNRELATED_CHILD.to_string()]
@@ -4649,16 +5153,16 @@ mod tests {
         let parsed = pred("(and (task DONE) changelog)");
         assert_eq!(
             parsed,
-            Pred::And(vec![Pred::Task(vec!["DONE".into()]), Pred::Content("changelog".into())])
+            Pred::And(vec![
+                Pred::Task(vec!["DONE".into()]),
+                Pred::Content("changelog".into())
+            ])
         );
         assert!(parsed.eval(
             &DocBlock::new("DONE Write changelog for v0.0.9"),
             &ctx_named()
         ));
-        assert!(!parsed.eval(
-            &DocBlock::new("DONE Publish release notes"),
-            &ctx_named()
-        ));
+        assert!(!parsed.eval(&DocBlock::new("DONE Publish release notes"), &ctx_named()));
     }
 
     #[test]
@@ -4834,20 +5338,177 @@ mod tests {
     }
 
     #[test]
+    fn property_keys_create_backlink_membership_with_key_evidence() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-property-key-backlinks-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(
+            dir.join("pages/url.md"),
+            "url:: https://self.example\n\n- target\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Key Referrer.md"),
+            "url:: https://referrer.example\n\n- body\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Block Referrer.md"),
+            "- body\n  url:: https://block.example\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Value Referrer.md"),
+            "author:: [[url]]\n\n- body\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let refs = backlinks_bounded(&graph, "url", 100, usize::MAX);
+        let pages = refs
+            .groups
+            .iter()
+            .map(|group| group.page.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(pages.contains("Key Referrer"), "{pages:?}");
+        assert!(pages.contains("Block Referrer"), "{pages:?}");
+        assert!(pages.contains("Value Referrer"), "{pages:?}");
+        assert!(!pages.contains("url"), "self page must remain excluded");
+
+        let key_group = refs
+            .groups
+            .iter()
+            .find(|group| group.page == "Key Referrer")
+            .unwrap();
+        let occurrence = &key_group.evidence[0].occurrences[0];
+        assert_eq!(occurrence.rule, "explicit_property_key");
+        assert_eq!(
+            occurrence.span,
+            crate::model::ReferenceSpan { start: 0, end: 3 }
+        );
+        assert_eq!(
+            &key_group.blocks[0].raw[occurrence.span.start..occurrence.span.end],
+            "url"
+        );
+        let block_group = refs
+            .groups
+            .iter()
+            .find(|group| group.page == "Block Referrer")
+            .unwrap();
+        let block_occurrence = block_group.evidence[0]
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.rule == "explicit_property_key")
+            .unwrap();
+        assert_eq!(
+            &block_group.blocks[0].raw[block_occurrence.span.start..block_occurrence.span.end],
+            "url"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn property_key_membership_uses_canonical_key_fold_and_og_eligibility() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-property-key-eligibility-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:property-pages/excludelist #{:private_key}}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- keys\n  Done_At:: today\n  id:: not-a-reference\n  background-color:: red\n  private-key:: hidden\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        assert_eq!(backlinks(&graph, "done-at")[0].page, "Source");
+        assert!(backlinks(&graph, "id").is_empty());
+        assert!(backlinks(&graph, "background-color").is_empty());
+        assert!(backlinks(&graph, "private-key").is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_property_pages_suppress_only_key_membership() {
+        use std::fs;
+
+        let dir =
+            std::env::temp_dir().join(format!("tine-property-key-disabled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:property-pages/enabled? false}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Key Referrer.md"),
+            "url:: https://referrer.example\n\n- body\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Value Referrer.md"),
+            "author:: [[url]]\n\n- body\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let refs = backlinks(&graph, "url");
+        assert_eq!(
+            refs.iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Value Referrer"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn og_page_identity_and_reference_grouping_use_nfc_without_accent_folding() {
         use std::fs;
         let dir = std::env::temp_dir().join(format!("tine-ref-nfc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("pages")).unwrap();
         fs::write(dir.join("pages/Café.md"), "- target\n").unwrap();
-        fs::write(dir.join("pages/Source.md"), "- [[Cafe\u{301}]] and plain Cafe\u{301}\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- [[Cafe\u{301}]] and plain Cafe\u{301}\n",
+        )
+        .unwrap();
         fs::write(dir.join("pages/Ascii.md"), "- [[cafe]]\n").unwrap();
         let graph = Graph::open(&dir);
         let linked = backlinks(&graph, "Café");
-        assert_eq!(linked.iter().filter(|group| group.page == "Source").count(), 1);
+        assert_eq!(
+            linked.iter().filter(|group| group.page == "Source").count(),
+            1
+        );
         assert!(!linked.iter().any(|group| group.page == "Ascii"));
         let unlinked = unlinked_refs(&graph, "Café");
-        assert_eq!(unlinked.iter().filter(|group| group.page == "Source").count(), 1);
+        assert_eq!(
+            unlinked
+                .iter()
+                .filter(|group| group.page == "Source")
+                .count(),
+            1
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4863,11 +5524,33 @@ mod tests {
         let graph = Graph::open(&dir);
         let groups = unlinked_refs(&graph, "Target");
         for page in ["PageProps", "BlockProps"] {
-            assert_eq!(groups.iter().find(|group| group.page == page).unwrap().blocks.len(), 1);
+            assert_eq!(
+                groups
+                    .iter()
+                    .find(|group| group.page == page)
+                    .unwrap()
+                    .blocks
+                    .len(),
+                1
+            );
         }
-        assert!(groups.iter().find(|group| group.page == "PageProps").unwrap().blocks[0].page_property);
+        assert!(
+            groups
+                .iter()
+                .find(|group| group.page == "PageProps")
+                .unwrap()
+                .blocks[0]
+                .page_property
+        );
         let diagnostics = reference_diagnostics(&graph, "Target");
-        assert!(diagnostics.traces.iter().find(|trace| trace.page == "PageProps").unwrap().included_unlinked);
+        assert!(
+            diagnostics
+                .traces
+                .iter()
+                .find(|trace| trace.page == "PageProps")
+                .unwrap()
+                .included_unlinked
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4939,9 +5622,7 @@ mod tests {
         fs::write(dir.join("pages/X.md"), "- real title\n").unwrap();
         fs::write(dir.join("pages/Y.md"), "alias:: X\n\n- [[X]]\n").unwrap();
         let graph = Graph::open(&dir);
-        assert!(backlinks(&graph, "X")
-            .iter()
-            .any(|group| group.page == "Y"));
+        assert!(backlinks(&graph, "X").iter().any(|group| group.page == "Y"));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -197,10 +197,28 @@ async function waitNoDrawer(browser) {
   { timeout: 8_000, timeoutMsg: "drawer/scrim did not close" });
 }
 
+// #205 responsive top bar: on narrow viewports the lower-priority toolbar actions
+// (e.g. Toggle right sidebar) are not rendered as visible `.icon-btn`s but collapse
+// into the "…" overflow menu. Reach them there when the direct button is hidden.
+const OVERFLOW_ACTION_BY_TITLE = {
+  "Toggle right sidebar": "right-sidebar",
+  "Toggle theme": "theme",
+};
 async function clickToolbar(browser, title) {
   const button = await browser.$(`.icon-btn[title^='${title}']`);
   await button.waitForExist({ timeout: 5_000 });
-  await button.click();
+  if (await button.isDisplayed()) {
+    await button.click();
+    return;
+  }
+  const action = OVERFLOW_ACTION_BY_TITLE[title];
+  assert(action, `toolbar action "${title}" is hidden but has no overflow-menu mapping`);
+  const more = await browser.$(".icon-btn[title='More toolbar actions']");
+  await more.waitForClickable({ timeout: 5_000 });
+  await more.click();
+  const item = await browser.$(`.topbar-overflow-menu [data-topbar-overflow-action='${action}']`);
+  await item.waitForClickable({ timeout: 5_000 });
+  await item.click();
 }
 
 async function shiftClick(browser, element) {
@@ -279,7 +297,7 @@ await withApp(0, true, async (browser) => {
   // gesture, then verify overlay geometry and inert focus containment.
   await shiftClick(browser, await browser.$("h1.page-title"));
   await waitDrawer(browser, "right");
-  await browser.$(`[data-sidebar-surface] [data-block-id='${EDIT_ID}']`).waitForExist({ timeout: 10_000 });
+  await browser.$(`[data-sidebar-surface] [data-block-ref='${EDIT_ID}']`).waitForExist({ timeout: 10_000 });
   const right = await snapshot(browser);
   assert(Math.abs(right.main.x - closed.main.x) <= 1 && Math.abs(right.main.width - closed.main.width) <= 1,
     "right drawer squeezed or shifted the main workspace", { closed: closed.main, open: right.main });
@@ -337,17 +355,20 @@ await withApp(0, true, async (browser) => {
   await browser.keys(["Escape"]);
   await waitNoDrawer(browser);
   const drawerEscaped = await snapshot(browser);
-  assert(drawerEscaped.active?.title?.startsWith("Toggle right sidebar") && drawerEscaped.title === "Drawer target",
-    "second Escape did not restore the drawer opener without navigation", drawerEscaped);
+  // The right sidebar was opened from the "···" overflow menu (#205 collapses the
+  // Toggle right sidebar action there at this width), so the opener focus restores
+  // to that overflow trigger rather than a directly-visible toolbar button.
+  assert(drawerEscaped.active?.title === "More toolbar actions" && drawerEscaped.title === "Drawer target",
+    "second Escape did not restore the overflow opener without navigation", drawerEscaped);
 
   // Literal right-sidebar editor: native completion gets the first Escape,
   // synthetic composition Escape is ignored, then plain Escape closes the
   // whole drawer, commits, and never enters block/pane selection.
   await clickToolbar(browser, "Toggle right sidebar");
   await waitDrawer(browser, "right");
-  const contentSelector = `.right-sidebar [data-block-id='${EDIT_ID}'] .block-content`;
+  const contentSelector = `.right-sidebar [data-block-ref='${EDIT_ID}'] .block-content`;
   await browser.$(contentSelector).click();
-  const editor = await browser.$(`.right-sidebar [data-block-id='${EDIT_ID}'] textarea.block-editor`);
+  const editor = await browser.$(`.right-sidebar [data-block-ref='${EDIT_ID}'] textarea.block-editor`);
   await editor.waitForExist({ timeout: 5_000 });
   await editor.setValue("Native plain [[Comp");
   await browser.$(".autocomplete .ac-item").waitForExist({ timeout: 10_000 });
@@ -385,7 +406,7 @@ await withApp(0, true, async (browser) => {
 
   await clickToolbar(browser, "Toggle right sidebar");
   await waitDrawer(browser, "right");
-  const reopenedText = await browser.$(`.right-sidebar [data-block-id='${EDIT_ID}'] .block-content`).getText();
+  const reopenedText = await browser.$(`.right-sidebar [data-block-ref='${EDIT_ID}'] .block-content`).getText();
   assert(reopenedText.includes("Native saved") && reopenedText.includes("中文"), "saved edit did not survive drawer reopen", reopenedText);
 
   // Real shortcuts must preserve one-panel/one-scrim exclusivity in both
@@ -437,7 +458,7 @@ await withApp(1, true, async (browser) => {
   await navigate(browser, "Drawer target");
   await clickToolbar(browser, "Toggle right sidebar");
   await waitDrawer(browser, "right");
-  const item = await browser.$(`.right-sidebar [data-block-id='${EDIT_ID}'] .block-content`);
+  const item = await browser.$(`.right-sidebar [data-block-ref='${EDIT_ID}'] .block-content`);
   await item.waitForExist({ timeout: 10_000 });
   const text = await item.getText();
   assert(text.includes("Native saved") && text.includes("中文"), "disk edit/right-sidebar item did not survive native restart", text);

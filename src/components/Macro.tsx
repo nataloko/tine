@@ -1,7 +1,7 @@
-import { For, Show, Switch, Match, createMemo, createResource, createSignal, type JSX } from "solid-js";
+import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
-import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta } from "../ui";
+import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
@@ -32,6 +32,8 @@ import type { PageKind, RefGroup } from "../types";
 import { sharedQueryResult } from "../queryResultCache";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
+import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
+import { blockDtoExternalId } from "../blockIdentity";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
 type QueryView = "search" | "list" | "table" | "board";
@@ -103,12 +105,23 @@ export function QueryMacro(props: {
   body: string;
   blockId?: string;
   title?: string;
+  /** Read-only query surfaces can supply page context without a blockId, which
+   * would incorrectly enable editing controls. */
+  currentPage?: string;
+  /** BEGIN_QUERY must never execute a partially understood query or expose its
+   * authored payload in an error. The ordinary {{query}} path keeps its existing
+   * partial-query diagnostics unless these read-only options are requested. */
+  strictAdvanced?: boolean;
+  unsupportedLabel?: string;
   // When set, render nothing at all if the query has no results (used for the
   // app-inserted journal agenda, which should disappear once vacated — unlike a
   // user-authored {{query}} block, which keeps showing "No results" so it stays
   // editable).
   hideWhenEmpty?: boolean;
 }): JSX.Element {
+  const linkDepth = useContext(LinkDepthContext);
+  if (linkDepth > MAX_DEPTH_OF_LINKS) return <LinkDepthWarning />;
+
   const arg = () => props.body.replace(/^query\s*/i, "").trim();
   // Split a trailing front-matter options map ({:title … :collapsed? … :table-view? …})
   // off the query form, so builder/engine see only the form and the options drive
@@ -227,7 +240,7 @@ export function QueryMacro(props: {
       </button>
     </span>
   );
-  const currentPage = () => (props.blockId ? doc.byId[props.blockId]?.page : undefined);
+  const currentPage = () => props.currentPage ?? (props.blockId ? doc.byId[props.blockId]?.page : undefined);
   const [advInfo, setAdvInfo] = createSignal<{ ran: string[]; ignored: string[]; supported: boolean } | null>(
     null
   );
@@ -463,15 +476,23 @@ export function QueryMacro(props: {
   // Hide the whole block when asked and there's nothing to show (advanced
   // queries still render their "unsupported" notice).
   const hidden = () => props.hideWhenEmpty && !ADVANCED_RE.test(arg()) && total() === 0;
+  const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
+    !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
+  );
 
   return (
     <Show when={!hidden()}>
       <div class="query-block" classList={{ "query-sheet-block": sheetFace() }}>
         <Switch>
-          <Match when={isAdvanced() && advInfo() && !advInfo()!.supported}>
-            <div class="query-unsupported">
+          <Match when={unsupportedAdvanced()}>
+            <div class="query-unsupported" role={props.unsupportedLabel ? "alert" : undefined}>
               <Show when={props.blockId}>{simpleBackButton()}</Show>
-              Advanced (datalog) query: no supported clauses. <code>{`{{${props.body}}}`}</code>
+              <Show
+                when={props.unsupportedLabel}
+                fallback={<>Advanced (datalog) query: no supported clauses. <code>{`{{${props.body}}}`}</code></>}
+              >
+                {(label) => <>{label()}: query contains unsupported clauses.</>}
+              </Show>
             </div>
           </Match>
           <Match when={true}>
@@ -621,7 +642,7 @@ export function QueryMacro(props: {
                                     onClick={() => openPageAtBlock({
                                       name: blockHit().page,
                                       pageKind: blockHit().kind,
-                                      block: blockHit().block.id,
+                                      block: blockDtoExternalId(blockHit().block),
                                       ...(blockHit().path ? { path: blockHit().path } : {}),
                                     })}
                                   >
@@ -826,12 +847,91 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
   );
 }
 
+interface YoutubePlayer {
+  seekTo(seconds: number, allowSeekAhead: boolean): void;
+  getCurrentTime(): number;
+  destroy?(): void;
+}
+
+interface YoutubeApi {
+  Player: new (iframeId: string, options: { events?: { onReady?: () => void } }) => YoutubePlayer;
+}
+
+type YoutubeWindow = Window & {
+  YT?: YoutubeApi;
+  onYouTubeIframeAPIReady?: () => void;
+};
+
+const youtubePlayers = new Map<string, YoutubePlayer>();
+let youtubeApiLoading: Promise<YoutubeApi | null> | null = null;
+const YOUTUBE_API_SCRIPT_ID = "tine-youtube-iframe-api";
+
+// The API is intentionally fetched only from a mounted YouTube embed. OG does
+// the same mount-time load/register sequence (og-1.0.0 6e7afa8eb,
+// extensions/video/youtube.cljs:20-27, :45-53).
+function loadYoutubeApi(): Promise<YoutubeApi | null> {
+  if (typeof window === "undefined" || typeof document === "undefined") return Promise.resolve(null);
+  const ytWindow = window as YoutubeWindow;
+  if (ytWindow.YT?.Player) return Promise.resolve(ytWindow.YT);
+  if (youtubeApiLoading) return youtubeApiLoading;
+
+  youtubeApiLoading = new Promise((resolve) => {
+    let settled = false;
+    const settle = (api: YoutubeApi | undefined) => {
+      if (settled) return;
+      settled = true;
+      resolve(api?.Player ? api : null);
+    };
+    const priorReady = ytWindow.onYouTubeIframeAPIReady;
+    ytWindow.onYouTubeIframeAPIReady = () => {
+      try {
+        priorReady?.();
+      } finally {
+        settle(ytWindow.YT);
+      }
+    };
+    let script = document.getElementById(YOUTUBE_API_SCRIPT_ID) as HTMLScriptElement | null;
+    if (!script) {
+      script = document.createElement("script");
+      script.id = YOUTUBE_API_SCRIPT_ID;
+      script.async = true;
+      script.src = "https://www.youtube.com/iframe_api";
+      document.head.appendChild(script);
+    }
+    script.addEventListener("error", () => settle(undefined), { once: true });
+  });
+  return youtubeApiLoading;
+}
+
+// OG's get-player selects the last YouTube iframe whose DOM position precedes
+// the target (compareDocumentPosition(..., target) has FOLLOWING set), then
+// looks up that iframe's registered handle (og-1.0.0 6e7afa8eb,
+// extensions/video/youtube.cljs:85-101).
+export function youtubePlayerForTarget(target: Node): YoutubePlayer | undefined {
+  if (typeof document === "undefined" || typeof Node === "undefined") return undefined;
+  const iframe = Array.from(document.getElementsByTagName("iframe"))
+    .filter((node) => node.src.includes("youtube.com"))
+    .filter((node) => (node.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0)
+    .at(-1);
+  return iframe ? youtubePlayers.get(iframe.id) : undefined;
+}
+
+// The OG generator floors getCurrentTime before it formats the macro; with no
+// registered/ready player it produces NOTHING — the command is a no-op, no
+// macro is inserted (og-1.0.0 6e7afa8eb, extensions/video/youtube.cljs:113-122).
+export function youtubeTimestampMacroFor(target: Node): string | null {
+  const seconds = youtubePlayerForTarget(target)?.getCurrentTime();
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
+  return `{{youtube-timestamp ${Math.max(0, Math.floor(seconds))}}}`;
+}
+
 // A {{video}} / {{youtube}} / {{vimeo}} / {{bilibili}} macro: embeds YouTube,
 // Vimeo or Bilibili as an iframe and direct media files as a <video>. Each of the
 // provider-named macros also accepts a bare id (e.g. `{{vimeo 12345}}`), matching
 // OG; the generic `{{video URL}}` sniffs the provider from the URL. Falls back to a
 // link. (`youtube-timestamp` is a SEPARATE macro — handled before this one.)
 export function VideoMacro(props: { body: string }): JSX.Element {
+  const iframeId = `youtube-player-${createUniqueId()}`;
   const parsed = () => {
     const m = /^(\w+)\s*([\s\S]*)$/.exec(props.body.trim());
     const name = (m?.[1] ?? "video").toLowerCase();
@@ -841,9 +941,12 @@ export function VideoMacro(props: { body: string }): JSX.Element {
   const url = () => parsed().arg;
   const embed = () => {
     const { name, arg } = parsed();
+    // `?enablejsapi=1` matches OG (youtube.cljs:58) and, together with the
+    // referrerpolicy below, is what makes the embed play under WebKitGTK — a bare
+    // src with no referrer is rejected by YouTube's player as error 153.
     const yt = /(?:youtube\.com\/(?:watch\?v=|embed\/)|youtu\.be\/)([\w-]{11})/.exec(arg);
-    if (yt) return `https://www.youtube.com/embed/${yt[1]}`;
-    if (name === "youtube" && /^[\w-]{11}$/.test(arg)) return `https://www.youtube.com/embed/${arg}`;
+    if (yt) return `https://www.youtube.com/embed/${yt[1]}?enablejsapi=1`;
+    if (name === "youtube" && /^[\w-]{11}$/.test(arg)) return `https://www.youtube.com/embed/${arg}?enablejsapi=1`;
     const vimeo = /vimeo\.com\/(\d+)/.exec(arg);
     if (vimeo) return `https://player.vimeo.com/video/${vimeo[1]}`;
     if (name === "vimeo" && /^\d+$/.test(arg)) return `https://player.vimeo.com/video/${arg}`;
@@ -852,6 +955,48 @@ export function VideoMacro(props: { body: string }): JSX.Element {
     if (bvid) return `https://player.bilibili.com/player.html?bvid=${bvid}&high_quality=1`;
     return null;
   };
+  // OG parity (og-1.0.0 6e7afa8eb): the embed iframe's `allow`/`referrerpolicy`.
+  // YouTube (youtube.cljs:54-70) sends a `strict-origin-when-cross-origin`
+  // referrer so the app origin reaches YouTube — without a referrer the player
+  // fails with error 153. Vimeo (block.cljs:1290-1305) gets the same `allow` list
+  // minus picture-in-picture/web-share and NO referrerpolicy; bilibili sets
+  // neither (the `.embed-iframe` class already removes the border).
+  const embedAttrs = (): Record<string, string> => {
+    const src = embed() ?? "";
+    if (/(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtube-nocookie\.com)\/embed\//.test(src))
+      return {
+        allow: "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share",
+        referrerpolicy: "strict-origin-when-cross-origin",
+      };
+    if (src.includes("player.vimeo.com"))
+      return { allow: "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope" };
+    return {};
+  };
+  const isYoutubeEmbed = () => /(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtube-nocookie\.com)\/embed\//.test(embed() ?? "");
+  let player: YoutubePlayer | undefined;
+  onMount(() => {
+    if (!isYoutubeEmbed()) return;
+    let mounted = true;
+    void loadYoutubeApi().then((api) => {
+      if (!mounted || !api) return;
+      try {
+        const registered = new api.Player(iframeId, { events: { onReady: () => undefined } });
+        if (!mounted) {
+          registered.destroy?.();
+          return;
+        }
+        player = registered;
+        youtubePlayers.set(iframeId, registered);
+      } catch {
+        // Offline, blocked, or malformed API responses leave the timestamp label usable.
+      }
+    });
+    onCleanup(() => {
+      mounted = false;
+      if (youtubePlayers.get(iframeId) === player) youtubePlayers.delete(iframeId);
+      player?.destroy?.();
+    });
+  });
   return (
     <Show
       when={embed()}
@@ -865,7 +1010,7 @@ export function VideoMacro(props: { body: string }): JSX.Element {
       }
     >
       <div class="embed-iframe-wrap">
-        <iframe class="embed-iframe" src={embed()!} allowfullscreen title="video" />
+        <iframe id={isYoutubeEmbed() ? iframeId : undefined} class="embed-iframe" src={embed()!} allowfullscreen title="video" {...embedAttrs()} />
       </div>
     </Show>
   );
@@ -882,10 +1027,7 @@ export function TweetMacro(props: { body: string }): JSX.Element {
   );
 }
 
-// `{{youtube-timestamp <seconds>}}` — OG makes this seek a sibling on-page YouTube
-// player via the IFrame Player API. Tine embeds YouTube as a bare <iframe> with no
-// player handle, so there's nothing to drive; we degrade to a styled, formatted
-// timestamp label (m:ss / h:mm:ss). Flagged as a known parity gap.
+// `{{youtube-timestamp <seconds>}}` seeks the OG-selected on-page YouTube player.
 export function YoutubeTimestamp(props: { body: string }): JSX.Element {
   const secs = () => {
     const raw = props.body.replace(/^youtube-timestamp\s*/i, "").trim();
@@ -901,9 +1043,20 @@ export function YoutubeTimestamp(props: { body: string }): JSX.Element {
     return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
   };
   return (
-    <span class="youtube-ts" title="YouTube-player seeking isn't supported yet (the embed is a bare iframe)">
+    <a
+      class="youtube-ts"
+      title="Seek the preceding YouTube video"
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // OG timestamp click stops the event and calls seekTo(seconds, true)
+        // on get-player's result (og-1.0.0 6e7afa8eb,
+        // extensions/video/youtube.cljs:103-111).
+        youtubePlayerForTarget(event.currentTarget)?.seekTo(secs(), true);
+      }}
+    >
       ⏱ {label()}
-    </span>
+    </a>
   );
 }
 
@@ -945,11 +1098,23 @@ export function ZoteroMacro(props: { body: string }): JSX.Element {
 }
 
 // A {{embed ((uuid))}} or {{embed [[Page]]}} block.
-export function EmbedMacro(props: { body: string }): JSX.Element {
+export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Element {
+  const linkDepth = useContext(LinkDepthContext);
+  if (linkDepth > MAX_DEPTH_OF_LINKS) return <LinkDepthWarning />;
+
   const target = () => props.body.replace(/^embed\s*/i, "").trim();
+  const pageTarget = () => /^\[\[([^\]]+)\]\]$/.exec(target())?.[1];
+  const selfPageEmbed = () => {
+    const sourcePage = props.blockId ? doc.byId[props.blockId]?.page : undefined;
+    const targetPage = pageTarget();
+    return !!sourcePage
+      && pageByName(sourcePage)?.kind === "page"
+      && !!targetPage
+      && pageIdentityKey(sourcePage) === pageIdentityKey(targetPage);
+  };
 
   const [data] = createResource(
-    () => `${target()} ${graphEpoch()} ${dataRev()}`,
+    () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`,
     async () => {
     const t = target();
     const blockRef = /^\(\(([^)]+)\)\)$/.exec(t);
@@ -971,8 +1136,10 @@ export function EmbedMacro(props: { body: string }): JSX.Element {
 
   return (
     <div class="embed-block">
-      <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
-        <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
+      <Show when={!selfPageEmbed()}>
+        <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
+          <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
+        </Show>
       </Show>
     </div>
   );

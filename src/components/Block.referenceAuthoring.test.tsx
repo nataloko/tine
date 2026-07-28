@@ -49,6 +49,36 @@ function accept(textarea: HTMLTextAreaElement, key: "Enter" | "Tab" = "Enter") {
 }
 
 describe("reference authoring", () => {
+  it("renders PDF annotation navigation with the authored highlight id", () => {
+    const authoredId = "7b6704f8-a337-4336-a711-2ba6bc14fbf2";
+    loadSingle({
+      name: "hls__paper",
+      kind: "page",
+      title: "hls__paper",
+      pre_block: "file-path:: ../assets/paper.pdf",
+      blocks: [{
+        id: "runtime-annotation-id",
+        raw: `Highlighted text\nid:: ${authoredId}\nls-type:: annotation\nhl-page:: 2\nhl-color:: yellow`,
+        collapsed: false,
+        children: [],
+        properties: [
+          ["id", authoredId],
+          ["ls-type", "annotation"],
+          ["hl-page", "2"],
+          ["hl-color", "yellow"],
+        ],
+      }],
+    });
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("hls__paper")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+    try {
+      expect(root.querySelector(".hl-prefix")?.getAttribute("data-highlight-id")).toBe(authoredId);
+    } finally {
+      dispose();
+    }
+  });
+
   it("makes Page reference the active bare slash command and chains into a blank page lifecycle", async () => {
     loadSingle(page("/"));
     startEditing("reference-authoring", 1);
@@ -113,6 +143,40 @@ describe("reference authoring", () => {
       inputAt(textarea, "((needle))", 8);
       await vi.waitFor(() => expect(search).toHaveBeenCalled());
       expect(search).toHaveBeenLastCalledWith("needle", 20, "block-picker");
+    } finally {
+      dispose();
+    }
+  });
+
+  const blockReferenceCases: Array<[string, [string, string][] | undefined, string]> = [
+    ["authored id", [["id", "11111111-1111-4111-8111-111111111111"]], "11111111-1111-4111-8111-111111111111"],
+    ["id-less fallback", undefined, "f8358fac-56bd-8bb1-ba45-bd7fd1ba2add"],
+  ];
+
+  it.each(blockReferenceCases)("inserts the %s for an accepted block-reference suggestion", async (_case, properties, expectedId) => {
+    vi.spyOn(backend(), "search").mockResolvedValue([{
+      page: "Source",
+      kind: "page",
+      blocks: [{
+        id: "f8358fac-56bd-8bb1-ba45-bd7fd1ba2add",
+        raw: "test",
+        collapsed: false,
+        children: [],
+        ...(properties ? { properties } : {}),
+      }],
+      evidence: [],
+    }]);
+    loadSingle(page("((test"));
+    startEditing("reference-authoring", 6);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Reference authoring")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+    try {
+      const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
+      inputAt(textarea, "((test", 6);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("test"));
+      accept(textarea);
+      await vi.waitFor(() => expect(doc.byId["reference-authoring"].raw).toBe(`((${expectedId})) `));
     } finally {
       dispose();
     }

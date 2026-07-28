@@ -6,6 +6,7 @@ import { ContextMenu } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { backend } from "../backend";
 import { blockProperty, doc, resetStore, setDoc, undo, type FeedPage, type Node as StoreNode } from "../store";
+import { route } from "../router";
 import { clearSimpleForm, getSimpleForm, stashSimpleForm } from "../editor/queryBuilder";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import type { QueryExecution, RefGroup } from "../types";
@@ -252,7 +253,14 @@ describe("QueryMacro sheet integration", () => {
         entity: "block",
         page: "Sheet",
         kind: "page",
-        block: { id: "todo", raw: "TODO From query", collapsed: false, children: [], breadcrumb: [] },
+        block: {
+          id: "todo",
+          raw: "TODO From query\nid:: todo-authored",
+          collapsed: false,
+          children: [],
+          breadcrumb: [],
+          properties: [["id", "todo-authored"]],
+        },
         display_text: "alpha and beta",
         evidence: [{
           clause_id: 1,
@@ -275,6 +283,8 @@ describe("QueryMacro sheet integration", () => {
     expect(root.querySelector(".qb-chip-raw")).toBeNull();
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["alpha", "beta"]);
     expect(graphSearch).toHaveBeenCalledWith("alpha beta", 500, 5_000, "inline-query:query", false);
+    root.querySelector<HTMLButtonElement>(".query-search-hit")!.click();
+    expect(route()).toMatchObject({ kind: "page", name: "Sheet", pageKind: "page" });
 
     dispose();
   });

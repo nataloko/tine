@@ -261,13 +261,21 @@ textarea {
 }
 
 .topbar {
+  position: relative;
+  /* Keep topbar popovers above the content plane, below transient overlays. */
+  z-index: 45;
   height: var(--ls-headbar-height);
   flex: 0 0 var(--ls-headbar-height);
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 0 14px;
   border-bottom: 1px solid var(--border-color);
+  /* Toolbar density follows the actual available inline width, including
+     browser zoom and fractional-DPI window sizes, not user-agent guesses. */
+  container-type: inline-size;
+  container-name: topbar;
 }
 .topbar-left,
 .topbar-right {
@@ -326,6 +334,10 @@ textarea {
   font-size: 12px;
 }
 .workspace-switcher-caret { flex: none; font-size: 9px; opacity: .7; }
+.workspace-switcher-compact .workspace-switcher-btn {
+  gap: 3px;
+  padding-inline: 5px;
+}
 .workspace-quick-menu,
 .workspace-menu {
   position: absolute;
@@ -427,6 +439,95 @@ textarea {
   align-self: stretch;
   margin: 6px 6px;
   background: var(--border-color);
+}
+
+/* Lower-priority toolbar actions collapse into a registry-owned popover when
+   the toolbar's REAL inline space is tight. Essentials stay inline: left
+   sidebar toggle, search, Settings, and (when shown) native window controls. */
+.topbar-overflow {
+  position: relative;
+  display: none;
+}
+.topbar-overflow-trigger {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  line-height: 1;
+}
+.topbar-overflow-menu {
+  position: absolute;
+  z-index: 70;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 174px;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-primary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+}
+.topbar-overflow-menu button {
+  display: block;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+.topbar-overflow-menu button:hover:not(:disabled),
+.topbar-overflow-menu button:focus-visible {
+  background: var(--bg-tertiary);
+}
+.topbar-overflow-menu button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+.topbar-overflow-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border-color);
+}
+
+@container topbar (max-width: 460px) {
+  /* The tab strip is the flexible middle (.tab-bar flex:1 1 auto, min-width:0;
+     .tab-strip-scroll overflow-x:auto) — it shrinks and scrolls, so it never
+     clips the fixed clusters and must stay reachable on a narrow desktop window.
+     Only the fixed-width low-priority action buttons overflow into the "…" menu.
+     (Real mobile already hides tabs via the isMobilePlatform Show + spacer.) */
+  .topbar .topbar-optional-action {
+    display: none;
+  }
+  .topbar .topbar-right {
+    margin-left: auto;
+  }
+  .topbar .topbar-overflow {
+    display: block;
+  }
+  /* Back/Forward remain inline through the first tier, so do not duplicate
+     them in the overflow menu. The four optional actions keep it non-empty. */
+  .topbar .topbar-overflow [data-topbar-overflow-action="back"],
+  .topbar .topbar-overflow [data-topbar-overflow-action="forward"],
+  .topbar .topbar-overflow .topbar-overflow-sep {
+    display: none;
+  }
+}
+
+/* At this floor the ~76px Back/Forward pair no longer has reliable room beside
+   the fixed toolbar controls. At 390px, the measured budget retains ~75px of
+   slack after the pair, so phones keep navigation as the higher priority. */
+@container topbar (max-width: 300px) {
+  .topbar .topbar-navigation-action {
+    display: none;
+  }
+  .topbar .topbar-overflow [data-topbar-overflow-action="back"],
+  .topbar .topbar-overflow [data-topbar-overflow-action="forward"],
+  .topbar .topbar-overflow .topbar-overflow-sep {
+    display: block;
+  }
 }
 
 /* Tabs live inline in the topbar (between nav arrows and the action icons) to
@@ -1097,6 +1198,16 @@ textarea {
 
 .sidebar-header {
   padding: 4px 8px 10px;
+}
+
+/* Window-level workspaces belong with the other low-frequency sidebar context
+   controls, above the graph switcher and navigation tree. */
+.workspace-sidebar-header {
+  padding: 12px 16px 2px;
+}
+.workspace-sidebar-header .workspace-switcher,
+.workspace-sidebar-header .workspace-switcher-btn {
+  width: 100%;
 }
 
 .app-logo {
@@ -5806,6 +5917,20 @@ body.file-drop-active::after {
   cursor: pointer;
   user-select: none;
 }
+.sheet-field-header.sheet-header-draggable {
+  cursor: grab;
+  touch-action: none;
+}
+.sheet-field-header.sheet-header-dragging {
+  cursor: grabbing;
+  opacity: 0.58;
+}
+.sheet-field-header.sheet-header-drop-before {
+  box-shadow: inset 3px 0 0 var(--accent, #4c8bf5);
+}
+.sheet-field-header.sheet-header-drop-after {
+  box-shadow: inset -3px 0 0 var(--accent, #4c8bf5);
+}
 /* The Block/title column's 180px floor used to come from its minmax() track; the
    track is now fit-content()-capped (to wrap long block text), so keep the floor on
    the cells themselves. */
@@ -6438,6 +6563,16 @@ ol.md-list { list-style: decimal; }
   text-transform: capitalize;
   color: var(--callout-accent, var(--text-secondary));
   margin-bottom: 2px;
+}
+.admonition-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 0.35em;
+  vertical-align: -0.1em;
+}
+.admonition-icon img.emoji {
+  width: 1em;
+  height: 1em;
 }
 .callout-body {
   color: var(--text-primary);
@@ -7507,6 +7642,11 @@ img.emoji {
   font-size: 13px;
   color: var(--text-muted);
 }
+.link-depth-warning {
+  margin: 2px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
 .query-adv-note {
   font-size: 11px;
   color: var(--text-muted);
@@ -7823,6 +7963,13 @@ img.emoji {
 .switcher-more:hover {
   background: var(--bg-tertiary);
 }
+.switcher-truncated {
+  margin: 3px 12px 6px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-muted);
+  font-size: 11px;
+}
 .switcher-kind.create { color: #10b981; }
 .switcher-kind.cmd { color: var(--link-color); }
 .switcher-shortcut {
@@ -8128,11 +8275,25 @@ img.emoji {
 .pdf-pane {
   position: relative;
   flex: 0 0 auto;
+  max-width: 100%;
   border-left: 1px solid var(--border-color);
   background: var(--bg-secondary);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Android/iOS presents a PDF as a deliberate full-width takeover instead of
+   shrinking the notes pane beside an over-wide fixed reader. */
+.pdf-pane-mobile {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  border-left: 0;
+}
+
+.pdf-pane-mobile .pdf-pane-resizer {
+  display: none;
 }
 
 .pdf-pane-resizer {
@@ -8224,9 +8385,13 @@ img.emoji {
   padding: 0 12px;
   border-bottom: 1px solid var(--border-color);
   background: var(--pdf-toolbar-bg);
+  container-type: inline-size;
+  container-name: pdftoolbar;
 }
 
 .pdf-title {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
   color: color-mix(in srgb, var(--pdf-local-text) 78%, transparent);
@@ -8239,6 +8404,13 @@ img.emoji {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* Close leads the fixed control cluster, so a constrained reader can never
+   clip its only escape action from the far edge. */
+.pdf-close-btn {
   flex: 0 0 auto;
 }
 
@@ -8347,6 +8519,18 @@ img.emoji {
   background: color-mix(in srgb, var(--link-color) 13%, transparent);
 }
 
+/* The reader follows the topbar's container-query overflow pattern: the
+   lower-priority tools remain available from the existing More menu while the
+   pager, Find, zoom +/- and Close stay in the toolbar. */
+@container pdftoolbar (max-width: 520px) {
+  .pdf-toolbar .pdf-overflow-action {
+    display: none;
+  }
+  .pdf-toolbar .pdf-settings-overflow {
+    display: grid;
+  }
+}
+
 .pdf-settings-menu,
 .pdf-outline-panel {
   position: absolute;
@@ -8363,6 +8547,33 @@ img.emoji {
 .pdf-settings-menu {
   min-width: 210px;
   padding: 10px;
+}
+
+.pdf-settings-overflow {
+  /* Only a collapsed toolbar needs these in the menu; a roomy toolbar shows
+     the same actions inline, so listing them twice would be noise. */
+  display: none;
+  gap: 4px;
+  margin: -2px -2px 10px;
+  padding: 0 2px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.pdf-settings-overflow button {
+  min-height: 30px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pdf-settings-overflow button:hover,
+.pdf-settings-overflow button[aria-pressed="true"] {
+  border-color: var(--link-color);
+  background: color-mix(in srgb, var(--link-color) 13%, transparent);
 }
 
 .pdf-settings-heading,

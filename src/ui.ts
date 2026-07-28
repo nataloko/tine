@@ -65,6 +65,34 @@ export function changeShowBrackets(on: boolean) {
   void backend().setShowBrackets(on).catch(() => {});
 }
 
+/** In document mode, should plain Enter retain the ordinary structural split?
+ *  The default false follows OG's `:shortcut/doc-mode-enter-for-new-block?`
+ *  switch (`src/main/frontend/state.cljs:714-717` at `6e7afa8eb`). */
+export function docModeEnterForNewBlock(): boolean {
+  return graphMeta()?.doc_mode_enter_for_new_block ?? false;
+}
+
+export function changeDocModeEnterForNewBlock(on: boolean) {
+  const m = graphMeta();
+  if (m && m.doc_mode_enter_for_new_block === on) return;
+  if (m) setGraphMeta({ ...m, doc_mode_enter_for_new_block: on });
+  void backend().setDocModeEnterForNewBlock(on).catch(() => {});
+}
+
+/** Logical (Roam-like) outdenting leaves following siblings under their current
+ *  parent. OG uses `:editor/logical-outdenting?` for this (`src/main/frontend/modules/outliner/core.cljs:835-852`
+ *  at `6e7afa8eb`). */
+export function logicalOutdenting(): boolean {
+  return graphMeta()?.logical_outdenting ?? false;
+}
+
+export function changeLogicalOutdenting(on: boolean) {
+  const m = graphMeta();
+  if (m && m.logical_outdenting === on) return;
+  if (m) setGraphMeta({ ...m, logical_outdenting: on });
+  void backend().setLogicalOutdenting(on).catch(() => {});
+}
+
 // --- appearance: accent color, wide mode, document mode (all persisted) ---
 function loadStr(key: string): string | null {
   try {
@@ -1024,6 +1052,11 @@ export interface SidebarBlock {
 }
 export type SidebarItem = SidebarPage | SidebarBlock;
 
+export interface HistorySidebarContext {
+  open: boolean;
+  items: SidebarItem[];
+}
+
 /** Stable presentation identity for one sidebar collection item. Unlike an
  * array index, it survives closing a neighbor and page renames are re-keyed by
  * renamePageInNavigation. */
@@ -1164,6 +1197,19 @@ export function setRightSidebar(items: SidebarItem[]) {
     // ignore
   }
   scheduleSessionSave(); // durable right-sidebar items (localStorage isn't kept)
+}
+
+/** History captures the same sidebar-open/item app state as OG does at
+ * `src/main/frontend/modules/editor/undo_redo.cljs:261-272`
+ * (OG commit 6e7afa8eb). */
+export function captureHistorySidebarContext(): HistorySidebarContext {
+  return { open: rightSidebarOpen(), items: rightSidebar().map((item) => ({ ...item })) };
+}
+
+export function restoreHistorySidebarContext(context: HistorySidebarContext) {
+  const items = context.items.filter(validSidebarItem).map((item) => ({ ...item }));
+  setRightSidebar(items);
+  setRightSidebarOpen(context.open);
 }
 
 export function openPageInSidebar(target: PageTarget): void;

@@ -307,6 +307,8 @@ export interface QueryExecution {
   hits: QueryHit[];
   diagnostics: QueryDiagnostic[];
   explanation: { branches: QueryExplainNode[] };
+  /** Absent only when talking to an older backend or using an older test fixture. */
+  has_more?: { pages: boolean; blocks: boolean };
   cancelled: boolean;
 }
 
@@ -343,6 +345,10 @@ export interface GraphMeta {
   macros: Record<string, string>; // :macros — user text-substitution macros ($1..$N)
   enable_timetracking: boolean; // :feature/enable-timetracking?, default true
   show_brackets: boolean; // :ui/show-brackets?, default true
+  /** :shortcut/doc-mode-enter-for-new-block?, false when absent / older backend. */
+  doc_mode_enter_for_new_block?: boolean;
+  /** :editor/logical-outdenting?, false when absent / older backend. */
+  logical_outdenting?: boolean;
   logbook_with_second_support: boolean; // :logbook/settings :with-second-support?, default true
   logbook_enabled_in_timestamped_blocks: boolean;
   logbook_enabled_in_all_blocks: boolean;

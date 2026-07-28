@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import { render } from "solid-js/web";
 import { renderInlines, InlineText, expandTemplate, expansionIsBlockLevel } from "./inline";
-import { renderBlocks } from "./body";
+import { AstBody, renderBlocks } from "./body";
 import { initParser, parseBlock } from "./parse";
 import { setGraphMeta } from "../ui";
 import type { JSX } from "solid-js";
@@ -85,6 +85,53 @@ describe("renderInlines", () => {
     expect(h).toContain("alias");
   });
 
+  it("renders an Org local-image Page_ref through AssetImage in Block/AstBody, RefBlocks/InlineText, and SheetGrid/AstBody", async () => {
+    // Block and SheetGrid both use AstBody; RefBlocks uses InlineText. Exercise the
+    // format-aware shared renderer rather than duplicating those caller surfaces.
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1, 2, 3]));
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:org-page-ref-image"),
+      revokeObjectURL: vi.fn(),
+    });
+    const host = document.createElement("div");
+    const dispose = render(() => (
+      <>
+        <AstBody raw="[[../assets/visible.png]]" format="org" />
+        <InlineText text="[[../assets/visible.png]]" format="org" />
+        <AstBody raw="[[../assets/visible.png]]" format="org" />
+      </>
+    ), host);
+    try {
+      await vi.waitFor(() => expect(host.querySelectorAll("img.inline-image")).toHaveLength(3));
+      expect(host.querySelector(".page-ref")).toBeNull();
+    } finally {
+      dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("control: Markdown local-image Page_ref remains a PageRef", () => {
+    const h = html(() => <AstBody raw="[[../assets/visible.png]]" format="md" />);
+    expect(h).toContain('class="page-ref"');
+    expect(h).not.toContain("inline-image");
+  });
+
+  it("keeps an ordinary Org Page_ref as a PageRef", () => {
+    const h = html(() => <AstBody raw="[[Some Page]]" format="org" />);
+    expect(h).toContain('class="page-ref"');
+    expect(h).not.toContain("inline-image");
+  });
+
+  it.each(["../assets/clip.mp4", "../assets/paper.pdf"])(
+    "keeps Org Page_ref %s on the non-image route",
+    (target) => {
+      const h = html(() => <AstBody raw={`[[${target}]]`} format="org" />);
+      expect(h).toContain('class="page-ref"');
+      expect(h).not.toContain("inline-image");
+    },
+  );
+
   it("tag renders #name", () => {
     const h = inl([{ k: "tag", children: [{ k: "plain", text: "project" }] }]);
     expect(h).toContain('class="tag"');
@@ -100,6 +147,48 @@ describe("renderInlines", () => {
   it("image flag → inline-image-wrap (external)", () => {
     const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "x.com/a.png" }, full: "![](…)", image: true, label: [{ k: "plain", text: "alt" }] }]);
     expect(h).toContain("inline-image");
+  });
+
+  it("bare_remote_image_url_renders_img", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/pic.jpg" }, full: "https://host/pic.jpg", image: false }]);
+    expect(h).toContain("<img");
+    expect(h).not.toContain('class="external-link"');
+  });
+
+  it("bare_remote_image_url_with_query_renders_img", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/pic.png?w=200#x" }, full: "https://host/pic.png?w=200#x", image: false }]);
+    expect(h).toContain("<img");
+    expect(h).not.toContain('class="external-link"');
+  });
+
+  it("bare_remote_video_url_renders_player", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/clip.mp4" }, full: "https://host/clip.mp4", image: false }]);
+    expect(h).toContain("<video");
+    expect(h).not.toContain('class="external-link"');
+  });
+
+  it("bare_remote_audio_url_renders_player", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/song.mp3" }, full: "https://host/song.mp3", image: false }]);
+    expect(h).toContain("<audio");
+    expect(h).not.toContain('class="external-link"');
+  });
+
+  it("labeled_media_link_stays_a_link", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/pic.jpg" }, full: "[click](https://host/pic.jpg)", image: false, label: [{ k: "plain", text: "click" }] }]);
+    expect(h).toContain('class="external-link"');
+    expect(h).toContain("click");
+    expect(h).not.toContain("<img");
+  });
+
+  it("markdown_image_still_renders", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "host/pic.jpg" }, full: "![](https://host/pic.jpg)", image: true }]);
+    expect(h).toContain("<img");
+  });
+
+  it("plain_nonmedia_link_stays_a_link", () => {
+    const h = inl([{ k: "link", url: { type: "complex", protocol: "https", link: "example.com/page" }, full: "https://example.com/page", image: false }]);
+    expect(h).toContain('class="external-link"');
+    expect(h).not.toContain("<img");
   });
 
   it("releases a pending local-image lease when unmounted before the read finishes", async () => {
@@ -205,9 +294,23 @@ describe("renderInlines", () => {
     expect(inl([{ k: "fnref", name: "1" }])).toContain('class="footnote-ref"');
   });
 
-  // lsdoc v0.1.4: inline Clojure-hiccup renders its raw bracket text literally.
-  it("inline hiccup renders raw text literally", () => {
-    expect(inl([{ k: "hiccup", v: "[:span \"y\"]" }])).toContain("[:span");
+  it.each(["md", "org"] as const)("direct inline hiccup renders an element in %s", (format) => {
+    const h = html(() => renderInlines(
+      [{ k: "hiccup", v: '[:span.parity-hiccup "inline"]' }],
+      undefined,
+      true,
+      false,
+      format,
+    ));
+    expect(h).toContain('<span class="parity-hiccup">inline</span>');
+    expect(h).not.toContain("[:span.parity-hiccup");
+  });
+
+  it.each(["md", "org"] as const)("invalid direct inline hiccup stays literal in %s", (format) => {
+    const source = '[:span "unterminated"';
+    const h = html(() => renderInlines([{ k: "hiccup", v: source }], undefined, true, false, format));
+    expect(h).toContain(source);
+    expect(h).not.toContain("<span>unterminated</span>");
   });
 
   it("uses iframe width and height from attrs or style", () => {
@@ -227,6 +330,63 @@ describe("renderInlines", () => {
       expect(styleEmbed.wrap.style.aspectRatio).toBe("auto");
     } finally {
       styleEmbed.dispose();
+    }
+  });
+
+  // Catalog UI-YOUTUBE-EMBED-153-001 / og-parity youtube-embed-playback.
+  // A YouTube embed iframe that loads with no referrer is rejected by YouTube's
+  // player as error 153; OG (youtube.cljs:54-70) sends the app origin via
+  // referrerpolicy + the allow list + ?enablejsapi=1.
+  const mountIframeEl = (node: () => JSX.Element): { iframe: HTMLIFrameElement; dispose: () => void } => {
+    const div = document.createElement("div");
+    const dispose = render(node, div);
+    const iframe = div.querySelector("iframe");
+    if (!iframe) {
+      dispose();
+      throw new Error(`expected iframe in ${div.innerHTML}`);
+    }
+    return { iframe, dispose };
+  };
+
+  it("youtube macro embed sends a referrer + enablejsapi (no error 153)", () => {
+    const { iframe, dispose } = mountIframeEl(() => renderInlines([{ k: "macro", name: "youtube", args: ["dQw4w9WgXcQ"] }]));
+    try {
+      expect(iframe.getAttribute("src")).toBe("https://www.youtube.com/embed/dQw4w9WgXcQ?enablejsapi=1");
+      expect(iframe.getAttribute("referrerpolicy")).toBe("strict-origin-when-cross-origin");
+      expect(iframe.getAttribute("allow")).toContain("encrypted-media");
+      expect(iframe.getAttribute("allow")).toContain("picture-in-picture");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("vimeo macro embed gets the OG allow list and no referrerpolicy", () => {
+    const { iframe, dispose } = mountIframeEl(() => renderInlines([{ k: "macro", name: "vimeo", args: ["123456789"] }]));
+    try {
+      expect(iframe.getAttribute("src")).toBe("https://player.vimeo.com/video/123456789");
+      expect(iframe.getAttribute("allow")).toContain("encrypted-media");
+      expect(iframe.getAttribute("allow")).not.toContain("web-share");
+      expect(iframe.getAttribute("referrerpolicy")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("raw-HTML youtube iframe sends the app origin as referrer, not no-referrer", () => {
+    const { wrap, dispose } = mountedIframeWrap('<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>');
+    try {
+      expect(wrap.querySelector("iframe")!.getAttribute("referrerpolicy")).toBe("strict-origin-when-cross-origin");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("raw-HTML non-video iframe keeps no-referrer (privacy preserved)", () => {
+    const { wrap, dispose } = mountedIframeWrap('<iframe src="https://example.com/widget"></iframe>');
+    try {
+      expect(wrap.querySelector("iframe")!.getAttribute("referrerpolicy")).toBe("no-referrer");
+    } finally {
+      dispose();
     }
   });
 });
@@ -279,6 +439,45 @@ describe("renderBlocks", () => {
     expect(h).toContain("callout-tip");
   });
 
+  it("preserves a verse custom block's semantic wrapper and children", () => {
+    const h = blk([{ kind: "custom", name: "VERSE", children: [{ kind: "paragraph", inline: [{ k: "plain", text: "a measured line" }] }] }]);
+    expect(h).toContain('class="verse"');
+    expect(h).toContain("a measured line");
+  });
+
+  it("gives every Org admonition an accessible, type-specific icon hook", () => {
+    const icons = {
+      note: "📝",
+      tip: "💡",
+      important: "❗",
+      caution: "⚠️",
+      warning: "🚨",
+      pinned: "📌",
+    };
+    for (const [type, icon] of Object.entries(icons)) {
+      const h = blk([{ kind: "custom", name: type.toUpperCase(), children: [] }]);
+      expect(h).toContain(`class="admonition-icon admonition-icon-${type}"`);
+      expect(h).toContain(`aria-label="${type} icon"`);
+      expect(h).toContain(`alt="${icon}"`);
+    }
+  });
+
+  it("preserves an unknown custom block's lowercased semantic wrapper", () => {
+    const h = html(() => <AstBody raw={"#+BEGIN_FOO\nkept body\n#+END_FOO"} format="org" />);
+    expect(h).toContain('class="foo"');
+    expect(h).toContain("kept body");
+  });
+
+  it("keeps comment hidden, Example code, and NOTE body rendering unchanged", () => {
+    expect(blk([{ kind: "comment", text: "do not render" }])).toBe("");
+    const example = blk([{ kind: "example", code: "const example = true;" }]);
+    expect(example).toContain('class="code-block"');
+    expect(example).toContain("const example = true;");
+    const note = blk([{ kind: "custom", name: "NOTE", children: [{ kind: "paragraph", inline: [{ k: "plain", text: "note body" }] }] }]);
+    expect(note).toContain('class="callout-body"');
+    expect(note).toContain("note body");
+  });
+
   it("properties block filters id::, shows user props", () => {
     const h = blk([{ kind: "properties", props: [["id", "x"], ["author", "Martin"]] }]);
     expect(h).toContain("author");
@@ -293,11 +492,66 @@ describe("renderBlocks", () => {
     expect(blk([{ kind: "comment", text: "c" }])).not.toContain("c");
   });
 
-  // lsdoc v0.1.4: Clojure-hiccup blocks render their raw bracket text literally.
-  it("hiccup block renders raw text literally", () => {
-    const h = blk([{ kind: "hiccup", v: "[:div.note \"hi\"]" }]);
-    expect(h).toContain("ast-hiccup");
-    expect(h).toContain("[:div.note");
+  it.each(["md", "org"] as const)("direct block hiccup renders an element in %s", (format) => {
+    const h = html(() => renderBlocks(
+      [{ kind: "hiccup", v: '[:div.parity-hiccup "block"]' }],
+      undefined,
+      undefined,
+      false,
+      format,
+    ));
+    expect(h).toContain('<div class="parity-hiccup">block</div>');
+    expect(h).not.toContain("[:div.parity-hiccup");
+  });
+
+  it.each(["md", "org"] as const)("invalid direct block hiccup stays literal in %s", (format) => {
+    const source = '[:div "unterminated"';
+    const h = html(() => renderBlocks(
+      [{ kind: "hiccup", v: source }],
+      undefined,
+      undefined,
+      false,
+      format,
+    ));
+    expect(h).toContain(source);
+    expect(h).not.toContain("<div>unterminated</div>");
+  });
+
+  it("raw block HTML preserves native audio and video elements", () => {
+    const root = document.createElement("div");
+    const dispose = render(() => renderBlocks([
+      { kind: "raw_html", text: '<audio controls src="https://media.example/audio.ogg"></audio>' },
+      { kind: "raw_html", text: '<video controls src="https://media.example/video.mp4"></video>' },
+    ]), root);
+    try {
+      const audio = root.querySelector("audio");
+      const video = root.querySelector("video");
+      expect(audio).not.toBeNull();
+      expect(audio?.hasAttribute("controls")).toBe(true);
+      expect(audio?.getAttribute("src")).toBe("https://media.example/audio.ogg");
+      expect(video).not.toBeNull();
+      expect(video?.hasAttribute("controls")).toBe(true);
+      expect(video?.getAttribute("src")).toBe("https://media.example/video.mp4");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("sanitizes hostile direct Hiccup through the shared insertion path", () => {
+    const root = document.createElement("div");
+    const dispose = render(() => renderBlocks([{
+      kind: "hiccup",
+      v: '[:div [:script "bad"] [:img {:src "javascript:bad()" :onerror "bad()"}] [:iframe {:src "https://evil.example"}]]',
+    }]), root);
+    try {
+      expect(root.querySelector("script")).toBeNull();
+      expect(root.querySelector("iframe")).toBeNull();
+      expect(root.querySelector("[onerror]")).toBeNull();
+      expect(root.innerHTML).not.toContain("javascript:");
+      expect(root.innerHTML).not.toContain("bad()");
+    } finally {
+      dispose();
+    }
   });
 
   // A `# heading` block's size applies ONLY to its first (heading) line — a `> quote`
@@ -321,6 +575,149 @@ describe("renderBlocks", () => {
 });
 
 describe("user macro helpers", () => {
+  it("renders configured Hiccup as rich output through the main AstBody path", () => {
+    setGraphMeta({ macros: { rich: '[:span {:class "lane-rich"} "Rich macro"]' } } as never);
+    const h = html(() => <AstBody raw="{{rich}}" />);
+    expect(h).toContain('class="lane-rich"');
+    expect(h).toContain("Rich macro");
+    expect(h).not.toContain("[:span");
+  });
+
+  it("threads macro Hiccup mode through block and nested quote rendering", () => {
+    setGraphMeta({
+      macros: {
+        blocks: 'Intro\n[:div.block-rich "Block macro"]',
+        quoted: '> [:span.quote-rich "Quote macro"]',
+      },
+    } as never);
+    const h = html(() => <div><AstBody raw="{{blocks}}" /><AstBody raw="{{quoted}}" /></div>);
+    expect(h).toContain('class="block-rich"');
+    expect(h).toContain('class="quote-rich"');
+    expect(h).toContain("Block macro");
+    expect(h).toContain("Quote macro");
+    expect(h).not.toContain("[:div.block-rich");
+    expect(h).not.toContain("[:span.quote-rich");
+
+    const nestedInline = html(() => renderInlines([{
+      k: "emphasis",
+      emph: "Bold",
+      children: [{ k: "hiccup", v: '[:span.emph-rich "Emphasis macro"]' }],
+    }], undefined, true, true));
+    expect(nestedInline).toContain('class="emph-rich"');
+    expect(nestedInline).not.toContain("[:span.emph-rich");
+  });
+
+  it("renders adjacent macro, direct inline, and direct block Hiccup through the shared path", () => {
+    setGraphMeta({ macros: { rich: '[:span.macro-rich "Macro rich"]' } } as never);
+    const h = html(() => (
+      <div>
+        {renderInlines([
+          { k: "macro", name: "rich", args: [] },
+          { k: "plain", text: " / " },
+          { k: "hiccup", v: '[:span.direct-inline "Direct inline"]' },
+        ])}
+        <AstBody raw={'Intro\n[:div.direct-block "Direct block"]'} />
+      </div>
+    ));
+    expect(h).toContain('class="macro-rich"');
+    expect(h).toContain('class="direct-inline"');
+    expect(h).toContain('class="direct-block"');
+    expect(h).not.toContain("[:span.direct-inline");
+    expect(h).not.toContain("[:div.direct-block");
+  });
+
+  it("keeps raw-HTML macro output sanitized", () => {
+    setGraphMeta({
+      macros: { raw: '<span class="raw-rich" onclick="alert(1)">Raw macro</span><script>bad()</script>' },
+    } as never);
+    const h = html(() => <AstBody raw="{{raw}}" />);
+    expect(h).toContain('class="raw-rich"');
+    expect(h).toContain("Raw macro");
+    expect(h).not.toContain("onclick");
+    expect(h).not.toContain("<script");
+  });
+
+  it("sanitizes hostile top-level and nested Hiccup without using the iframe fast-path", () => {
+    setGraphMeta({
+      macros: {
+        script: '[:script "x"]',
+        image: '[:img {:src "https://example.com/x.png" :onerror "x"}]',
+        link: '[:a {:href "javascript:alert(1)"} "link"]',
+        hostile: '[:div [:iframe {:src "https://example.com"} "nested frame"] [:span "<b>literal</b>"]]',
+        frame: '[:iframe {:src "https://example.com"} "top frame"]',
+        breakout: '[:span {:title "x\\" data-breakout=\\"yes><img src=\\"x"} "safe"]',
+      },
+    } as never);
+    const root = document.createElement("div");
+    const dispose = render(() => (
+      <div>
+        <AstBody raw="{{script}}" />
+        <AstBody raw="{{image}}" />
+        <AstBody raw="{{link}}" />
+        <AstBody raw="{{hostile}}" />
+        <AstBody raw="{{frame}}" />
+        <AstBody raw="{{breakout}}" />
+      </div>
+    ), root);
+    try {
+      expect(root.querySelector("script")).toBeNull();
+      expect(root.querySelector("iframe")).toBeNull();
+      expect(root.querySelector("b")).toBeNull();
+      expect(root.querySelector("[data-breakout]")).toBeNull();
+      expect(root.querySelectorAll("img")).toHaveLength(1);
+      expect(root.querySelector("[onerror]")).toBeNull();
+      expect(root.querySelector("a")?.getAttribute("href")).toBeNull();
+      expect(root.textContent).toContain("<b>literal</b>");
+    } finally {
+      dispose();
+    }
+  });
+
+  it.each([
+    '[:span',
+    '(fn [] "x")',
+    '[:span symbol]',
+    '[:span #{"set"}]',
+    '[:span #thing "tagged"]',
+    '[:sp@n "bad"]',
+  ])("falls back to literal macro text without crashing: %s", (source) => {
+    setGraphMeta({ macros: { bad: source } } as never);
+    const root = document.createElement("div");
+    const dispose = render(() => <AstBody raw="{{bad}}" />, root);
+    try {
+      expect(root.textContent).toContain(source);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("still dispatches a query nested in a configured macro", async () => {
+    vi.spyOn(backend(), "runQuery").mockResolvedValue([]);
+    setGraphMeta({ root: "/test", macros: { outer: "{{query (task TODO)}}" } } as never);
+    const root = document.createElement("div");
+    const dispose = render(() => <AstBody raw="{{outer}}" />, root);
+    try {
+      await vi.waitFor(() => expect(backend().runQuery).toHaveBeenCalledWith("(task TODO)"));
+    } finally {
+      dispose();
+    }
+  });
+
+  it("still renders nested configured macros and retains the recursion cap", () => {
+    setGraphMeta({
+      macros: {
+        outer: "{{inner}}",
+        inner: '[:strong.nested-rich "Nested macro"]',
+        loop: "{{loop}}",
+      },
+    } as never);
+    const nested = html(() => <AstBody raw="{{outer}}" />);
+    expect(nested).toContain('class="nested-rich"');
+    expect(nested).toContain("Nested macro");
+    expect(() => html(() => <AstBody raw="{{loop}}" />)).not.toThrow();
+    expect(html(() => <AstBody raw="{{loop}}" />)).toContain("{{loop}}");
+  });
+
   it("leaves unfilled placeholders literal", () => {
     expect(expandTemplate("$1 and $5", ["a", "b"])).toBe("a and $5");
   });

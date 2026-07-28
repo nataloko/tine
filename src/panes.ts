@@ -5,6 +5,7 @@ import {
   installPaneRouterRegistry,
   installLastTabCloseHandler,
   installNavigationInterceptor,
+  historyRouteContextAdapter,
   mainPaneRouter,
   tabRoute,
   type AdoptedTab,
@@ -15,10 +16,16 @@ import {
 } from "./router";
 import { registerPaneFocusSetter } from "./ui";
 import { setCellSel } from "./sheet/selection";
-import { clearSelection, doc, pageByName, registerPaneRouteProvider } from "./store";
+import {
+  clearSelection,
+  doc,
+  pageByName,
+  registerPaneRouteProvider,
+  installHistoryRouteContextAdapter,
+} from "./store";
 import { journalTitle } from "./journal";
 import { isMobilePlatform } from "./nativeChrome";
-import { nearestPane } from "./paneSelect";
+import { nearestPane, takeBlockSelectionForPaneReturn } from "./paneSelect";
 
 export type LayoutNode =
   | {
@@ -175,16 +182,12 @@ export function closeLayoutPane(
   return { node, focusedPaneId: firstPaneId(node) ?? "main", closed: false };
 }
 
-function routeForJournalsDuplicate(source: PaneSnapshot): Route {
-  const active = source.tabs[Math.min(Math.max(0, source.activeIndex | 0), source.tabs.length - 1)];
-  for (let i = active.pos - 1; i >= 0; i--) {
-    const r = active.history[i];
-    if (r?.kind === "page") return r;
-  }
-  for (const r of active.history) {
-    if (r?.kind === "page") return r;
-  }
-  const name = doc.feed[0] ?? journalTitle(new Date());
+function routeForJournalsDuplicate(anchor: string | null): Route {
+  const selectedDay = anchor ? doc.byId[anchor]?.page : undefined;
+  const today = journalTitle(new Date());
+  const name =
+    (selectedDay && doc.feed.includes(selectedDay) ? selectedDay : undefined) ??
+    (doc.feed.includes(today) ? today : doc.feed[0] ?? today);
   return { kind: "page", name, pageKind: pageByName(name)?.kind ?? "journal" };
 }
 
@@ -192,8 +195,9 @@ function splitSnapshotForNewPane(source: PaneRouter): PaneSnapshot {
   const snap = source.duplicateActiveSnapshot();
   const active = snap.tabs[0];
   if (active && tabRoute({ id: "snapshot", history: active.history, pos: active.pos, pinned: active.pinned }).kind === "journals") {
-    active.history = [routeForJournalsDuplicate(snap)];
+    active.history = [routeForJournalsDuplicate(takeBlockSelectionForPaneReturn())];
     active.pos = 0;
+    active.pinned = false;
   }
   return snap;
 }
@@ -472,7 +476,17 @@ export function restorePaneLayout(
   setFocusedPaneId(ids.includes(focused) ? focused : ids[0] ?? "main");
 }
 
-installPaneRouterRegistry({ focusedRouter, mainRouter });
+installPaneRouterRegistry({
+  focusedRouter,
+  mainRouter,
+  routerForPane: (paneId) => routers.get(paneId),
+  activatePane: (paneId) => {
+    if (!layoutPaneIds().includes(paneId) || !routers.has(paneId)) return false;
+    setFocusedPaneId(paneId);
+    return true;
+  },
+});
+installHistoryRouteContextAdapter(historyRouteContextAdapter);
 installLastTabCloseHandler((paneId) => closePane(paneId));
 installNavigationInterceptor((paneId, r) => {
   if (r.kind !== "journals") return false;

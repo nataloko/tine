@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import hljs from "highlight.js/lib/common";
 import {
   COMMANDS,
+  ADVANCED_BLOCK_COMMANDS,
+  advancedBlockInsertion,
   commandScore,
   detectTrigger,
   applyCompletion,
@@ -12,10 +14,12 @@ import {
   pageInsert,
   tagInsert,
   filterCommands,
+  filterAdvancedBlockCommands,
   fuzzyScore,
   orderAcItems,
   codeLanguageItems,
   COMMON_CODE_LANGUAGES,
+  propertyKeyFold,
 } from "./autocomplete";
 import slashFixtureManifest from "./fixtures/slash-ranking-prefix-base-15bbddc/manifest.json";
 import slashFixturePart1 from "./fixtures/slash-ranking-prefix-base-15bbddc/part-1.json";
@@ -123,6 +127,57 @@ describe("orderAcItems (autocomplete default action)", () => {
 });
 
 describe("detectTrigger", () => {
+  it("detects a line-start < advanced-section trigger and rejects mid-word <", () => {
+    expect(detectTrigger("<qu", 3)).toEqual({
+      kind: "advanced-command", query: "qu", start: 0, end: 3,
+    });
+    expect(detectTrigger("prose<qu", 8)).toBeNull();
+  });
+
+  it("advanced Src follows OG ->block: md fence, org section, caret on the opening line", () => {
+    const src = ADVANCED_BLOCK_COMMANDS.find((c) => c.label === "Src")!;
+    // OG commands.cljs:159-177 @ 6e7afa8eb: markdown Src becomes a fence.
+    expect(advancedBlockInsertion(src, "md")).toEqual({ insert: "```\n\n```", caret: 3 });
+    const org = advancedBlockInsertion(src, "org");
+    expect(org.insert).toBe("#+BEGIN_SRC\n\n#+END_SRC");
+    expect(org.caret).toBe("#+BEGIN_SRC".length); // end of opening line, not middle
+    const quote = ADVANCED_BLOCK_COMMANDS.find((c) => c.label === "Quote")!;
+    expect(advancedBlockInsertion(quote, "md")).toEqual({
+      insert: quote.insert, caret: "#+BEGIN_QUOTE\n".length, // blank middle line
+    });
+  });
+
+  it("keeps the existing command, fence, ref, and tag trigger families unchanged", () => {
+    expect(detectTrigger("/que", 4)).toEqual({ kind: "command", query: "que", start: 0, end: 4 });
+    expect(detectTrigger("```js", 5)).toEqual({ kind: "code-language", query: "js", start: 3, end: 5 });
+    expect(detectTrigger("see [[log", 9)).toEqual({ kind: "page", query: "log", start: 4, end: 9 });
+    expect(detectTrigger("a #pro", 6)).toEqual({ kind: "tag", query: "pro", start: 2, end: 6 });
+  });
+
+  it("opens property-name completion only for a fresh logical property line", () => {
+    expect(detectTrigger("::", 2)).toEqual({
+      kind: "property-name", query: "", start: 0, end: 2,
+    });
+    expect(detectTrigger("before\nAlpha_value::", 20)).toEqual({
+      kind: "property-name", query: "Alpha_value", start: 7, end: 20,
+    });
+
+    expect(detectTrigger("ordinary prose ::", 17)).toBeNull();
+    expect(detectTrigger("[[reference]]::", 15)).toBeNull();
+    expect(detectTrigger("```\n::", 6)).toBeNull();
+  });
+
+  it("keeps a chosen canonical property's value span separate from its key and delimiter", () => {
+    expect(detectTrigger("alpha:: ", 8, "alpha")).toEqual({
+      kind: "property-value", query: "", start: 8, end: 8, property: "alpha",
+    });
+    expect(detectTrigger("alpha:: one", 11, "alpha")).toEqual({
+      kind: "property-value", query: "one", start: 8, end: 11, property: "alpha",
+    });
+    expect(detectTrigger("other:: one", 11, "alpha")).toBeNull();
+    expect(detectTrigger("alpha:: one", 11)).toBeNull();
+  });
+
   it("detects language text only on opening backtick and tilde fences", () => {
     expect(detectTrigger("```j", 4)).toEqual({ kind: "code-language", query: "j", start: 3, end: 4 });
     expect(detectTrigger("~~~~py", 6)).toEqual({ kind: "code-language", query: "py", start: 4, end: 6 });
@@ -222,6 +277,12 @@ describe("detectTrigger", () => {
   });
 });
 
+describe("propertyKeyFold", () => {
+  it("uses the established property identity for new keys", () => {
+    expect(propertyKeyFold("  Alpha value_name  ")).toBe("alpha-value-name");
+  });
+});
+
 describe("codeLanguageItems", () => {
   it("stays in lockstep with the languages and aliases bundled for rendering", () => {
     expect(new Set(COMMON_CODE_LANGUAGES.map((item) => item.id))).toEqual(new Set(hljs.listLanguages()));
@@ -317,7 +378,9 @@ describe("filterCommands", () => {
   const mergedRanking = (query: string): string[] => {
     const showAllTemplates = !!query && "template".startsWith(query.toLowerCase());
     return [
-      ...COMMANDS.map((command) => ({
+      // The fixture predates this deliberately additive command; keep using it
+      // to freeze all of the old command/template rankings.
+      ...COMMANDS.filter((command) => command.label !== "Heading (Auto)" && command.label !== "Embed Youtube timestamp").map((command) => ({
         label: command.label,
         score: commandScore(query, command),
         index: command.matchTieOrder,
@@ -346,12 +409,20 @@ describe("filterCommands", () => {
       "Heading 2",
       "Heading 3",
       "Heading 4",
+      "Heading (Auto)",
     ]);
     // Exact/shorter "Query" ranks ahead of the longer "Query (visual builder)".
     expect(filterCommands("query").map((c) => c.label)).toEqual(["Query", "Query (visual builder)"]);
     // Action commands surface too.
     expect(filterCommands("scheduled").map((c) => c.label)).toEqual(["Scheduled"]);
     expect(filterCommands("upload").map((c) => c.label)).toEqual(["Upload an asset"]);
+    expect(filterCommands("youtube").map((c) => c.label)).toEqual(["Embed Youtube timestamp"]);
+  });
+
+  it("routes automatic and explicit heading slash commands through heading actions", () => {
+    expect(COMMANDS.find((command) => command.label === "Heading (Auto)")?.action).toBe("heading-auto");
+    expect(COMMANDS.find((command) => command.label === "Heading 1")?.action).toBe("heading-1");
+    expect(COMMANDS.find((command) => command.label === "Heading 1")?.insert).toBeUndefined();
   });
 
   it("ranks best matches first (OG-style); /A surfaces Priority A", () => {
@@ -376,13 +447,20 @@ describe("filterCommands", () => {
     const all = filterCommands("");
     expect(all.map((command) => command.label)).toEqual([
       "Page reference", "Link", "Upload an asset", "Voice recording", "Draw.io diagram",
-      "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Today", "Current time",
+      "Heading (Auto)", "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Today", "Current time",
       "TODO", "DOING", "LATER", "NOW", "DONE", "WAITING", "WAIT", "IN-PROGRESS", "CANCELED", "Scheduled", "Deadline",
       "Priority A", "Priority B", "Priority C", "Grid", "Table", "Board", "Code block", "Calculator", "Quote",
       "Admonition: note", "Admonition: tip", "Admonition: important", "Admonition: warning", "Admonition: caution",
-      "Divider", "Query", "Query (visual builder)", "Embed", "Math block", "Page properties",
+      "Divider", "Query", "Query (visual builder)", "Embed", "Embed Youtube timestamp", "Math block", "Page properties",
       "Template var: today", "Template var: yesterday", "Template var: tomorrow", "Template var: current page", "Template var: time", "Template var: date…",
     ]);
+  });
+});
+
+describe("filterAdvancedBlockCommands", () => {
+  it("keeps OG's Quote and Query matches for <qu", () => {
+    expect(filterAdvancedBlockCommands("qu").map((command) => command.label)).toEqual(["Quote", "Query"]);
+    expect(ADVANCED_BLOCK_COMMANDS.map((command) => command.label)).toContain("Comment");
   });
 });
 

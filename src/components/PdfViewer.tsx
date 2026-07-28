@@ -2,6 +2,7 @@ import { For, Show, createEffect, createSignal, createUniqueId, on, onCleanup, o
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
+import { writeClipboardText } from "../clipboard";
 import { closePdf, pushToast, isConflicted, activePane, requestBlockReferences, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
 import { openPage, openPageAtBlock } from "../router";
@@ -207,6 +208,7 @@ export function PdfViewer(props: {
   const highlightMenuLayerId = `${instanceStem}-highlight-menu`;
   const settingsLayerId = `${instanceStem}-settings`;
   const outlineLayerId = `${instanceStem}-outline`;
+  let viewerRootEl: HTMLDivElement | undefined;
   let scrollRef!: HTMLDivElement;
   let findTriggerEl: HTMLButtonElement | undefined;
   let findRootEl: HTMLDivElement | undefined;
@@ -431,7 +433,7 @@ export function PdfViewer(props: {
   };
 
   const copyCreatedHighlightRef = async (id: string) => {
-    await backend().writeText(`((${id}))`);
+    await writeClipboardText(`((${id}))`);
     pushToast("Copied highlight ref", "success");
   };
   // An OG/externally-created sidecar can outlive or predate its annotation
@@ -1660,10 +1662,26 @@ export function PdfViewer(props: {
     setFindOpen(false);
     window.getSelection()?.removeAllRanges();
   };
+  // Mobile renders this viewer as the full-width PDF takeover. It is a parent
+  // transient so Find, settings, outline, and highlight popovers still peel
+  // first; once they are gone, either Android Back or Escape closes the pane.
+  createEffect(() => {
+    if (!isMobilePlatform) return;
+    const unregister = registerTransientLayer({
+      id: "pdf-pane",
+      root: () => viewerRootEl ?? null,
+      dismiss: () => {
+        closePdf();
+        return true;
+      },
+    });
+    onCleanup(unregister);
+  });
   createEffect(() => {
     if (!findOpen()) return;
     const unregister = registerTransientLayer({
       id: findLayerId,
+      parentId: "pdf-pane",
       root: () => findRootEl ?? null,
       trigger: () => findTriggerEl ?? null,
       dismiss: () => {
@@ -1677,6 +1695,7 @@ export function PdfViewer(props: {
     if (!settingsOpen()) return;
     const unregister = registerTransientLayer({
       id: settingsLayerId,
+      parentId: "pdf-pane",
       root: () => settingsRootEl ?? null,
       trigger: () => settingsTriggerEl ?? null,
       dismiss: () => {
@@ -1702,6 +1721,7 @@ export function PdfViewer(props: {
     if (!outlineOpen()) return;
     const unregister = registerTransientLayer({
       id: outlineLayerId,
+      parentId: "pdf-pane",
       root: () => outlineRootEl ?? null,
       trigger: () => outlineTriggerEl ?? null,
       dismiss: () => {
@@ -1727,6 +1747,7 @@ export function PdfViewer(props: {
     if (!menu()) return;
     const unregister = registerTransientLayer({
       id: highlightMenuLayerId,
+      parentId: "pdf-pane",
       root: () => highlightMenuRootEl ?? null,
       dismiss: () => {
         closeHighlightMenu();
@@ -1750,6 +1771,7 @@ export function PdfViewer(props: {
 
   return (
     <div
+      ref={(el) => (viewerRootEl = el)}
       class="pdf-viewer"
       data-theme={theme()}
       data-pdf-filename={props.filename}
@@ -1759,6 +1781,9 @@ export function PdfViewer(props: {
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
         <div class="pdf-toolbar-actions">
+          <button class="icon-btn pdf-close-btn" title="Close PDF" onClick={closePdf}>
+            ✕
+          </button>
           <div class="pdf-pager">
             <button class="icon-btn" title="Previous page" onClick={() => scrollToPage(curPage() - 1)}>
               ‹
@@ -1806,15 +1831,15 @@ export function PdfViewer(props: {
             <button class="icon-btn" title="Zoom in" onClick={() => zoomBy(1.1)}>
               +
             </button>
-            <button class="icon-btn" title="Fit width" onClick={() => setScale(fitWidthScale())}>
+            <button class="icon-btn pdf-overflow-action" title="Fit width" onClick={() => setScale(fitWidthScale())}>
               ↔
             </button>
-            <button class="icon-btn" title="Fit height" onClick={() => setScale(fitHeightScale())}>
+            <button class="icon-btn pdf-overflow-action" title="Fit height" onClick={() => setScale(fitHeightScale())}>
               ↕
             </button>
           </div>
           <button
-            class="icon-btn"
+            class="icon-btn pdf-overflow-action"
             classList={{ active: areaMode() }}
             title={`Area highlight (${isMac ? "⌘" : "Shift"}) — drag a rectangle to capture a region as an image`}
             onClick={() => setAreaMode((v) => !v)}
@@ -1822,7 +1847,7 @@ export function PdfViewer(props: {
             ▭
           </button>
           <button
-            class="pdf-notes-btn"
+            class="pdf-notes-btn pdf-overflow-action"
             title="Open highlights & notes page"
             onClick={() => openPage(hlsPageName(props.filename), "page")}
           >
@@ -1831,7 +1856,7 @@ export function PdfViewer(props: {
           <button
             ref={(el) => (outlineTriggerEl = el)}
             type="button"
-            class="icon-btn"
+            class="icon-btn pdf-overflow-action"
             classList={{ active: outlineOpen() }}
             title="Outline"
             aria-label="Outline"
@@ -1858,13 +1883,23 @@ export function PdfViewer(props: {
           >
             ⋯
           </button>
-          <button class="icon-btn" title="Close PDF" onClick={closePdf}>
-            ✕
-          </button>
         </div>
       </div>
       <Show when={settingsOpen()}>
         <div ref={(el) => (settingsRootEl = el)} class="pdf-settings-menu" role="dialog" aria-label="PDF settings">
+          <div class="pdf-settings-overflow" aria-label="Reader tools">
+            <button type="button" onClick={() => { setScale(fitWidthScale()); setSettingsOpen(false); }}>Fit width</button>
+            <button type="button" onClick={() => { setScale(fitHeightScale()); setSettingsOpen(false); }}>Fit height</button>
+            <button
+              type="button"
+              aria-pressed={areaMode()}
+              onClick={() => { setAreaMode((v) => !v); setSettingsOpen(false); }}
+            >
+              Area highlight
+            </button>
+            <button type="button" onClick={() => { openPage(hlsPageName(props.filename), "page"); setSettingsOpen(false); }}>Notes</button>
+            <button type="button" onClick={() => { setSettingsOpen(false); setOutlineOpen(true); }}>Outline</button>
+          </div>
           <div class="pdf-settings-heading">Theme</div>
           <div class="pdf-theme-choices" role="group" aria-label="PDF theme">
             <For each={PDF_THEMES}>

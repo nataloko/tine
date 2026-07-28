@@ -32,6 +32,8 @@ pub(crate) fn save_workspaces(
 
 const RESULT_BRIDGE_MAX_ROWS: usize = 20_000;
 const RESULT_BRIDGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const AUTOCOMPLETE_FACET_MAX_ITEMS: usize = 2_000;
+const AUTOCOMPLETE_FACET_MAX_BYTES: usize = 2 * 1024 * 1024;
 const QUERY_EXPORT_MAX_QUERIES: usize = 64;
 const QUERY_EXPORT_REQUEST_MAX_QUERIES: usize = 1_024;
 const QUERY_EXPORT_MAX_QUERY_BYTES: usize = 64 * 1024;
@@ -228,6 +230,11 @@ mod asset_ingress_tests {
 #[tauri::command]
 pub(crate) fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
     with_graph(&state, |g| Ok(g.list_pages()))
+}
+
+#[tauri::command]
+pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
+    with_graph(&state, |g| Ok(g.referenced_page_names()))
 }
 
 #[derive(Serialize)]
@@ -546,21 +553,24 @@ pub(crate) fn copy_guide_into_graph(
 }
 
 #[tauri::command]
-pub(crate) fn get_backlinks(
+pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_graph(&state, |g| {
-        bounded_groups_or_error(g.backlinks_bounded(
+    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    tauri::async_runtime::spawn_blocking(move || {
+        bounded_groups_or_error(graph.backlinks_bounded(
             &name,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
         ))
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn get_backlink_filter_context(
+pub(crate) async fn get_backlink_filter_context(
     name: String,
     targets: Vec<BacklinkFilterTarget>,
     state: GraphContext<'_>,
@@ -571,25 +581,31 @@ pub(crate) fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    with_graph(&state, |graph| {
+    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    tauri::async_runtime::spawn_blocking(move || {
         Ok(tine_core::query::backlink_filter_context(
-            graph, &name, &targets,
+            &graph, &name, &targets,
         ))
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn get_unlinked_refs(
+pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_graph(&state, |g| {
-        bounded_groups_or_error(g.unlinked_refs_bounded(
+    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    tauri::async_runtime::spawn_blocking(move || {
+        bounded_groups_or_error(graph.unlinked_refs_bounded(
             &name,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
         ))
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// `block uuid → # of referrers` over the whole graph (drives the per-block
@@ -635,16 +651,40 @@ pub(crate) fn delete_page(
 }
 
 #[tauri::command]
-pub(crate) fn rename_page(
+pub(crate) async fn rename_page(
     old: String,
     new: String,
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.rename_page_expected(&old, &new, expected_path.as_deref())
+    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    tauri::async_runtime::spawn_blocking(move || {
+        graph
+            .rename_page_expected(&old, &new, expected_path.as_deref())
             .map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod graph_wide_command_boundary_tests {
+    #[test]
+    fn expensive_reference_and_rename_commands_cross_the_blocking_pool() {
+        let source = include_str!("commands.rs");
+        for name in ["get_backlinks", "get_unlinked_refs", "rename_page"] {
+            let signature = format!("pub(crate) async fn {name}(");
+            let start = source.find(&signature).expect("command stays async");
+            let tail = &source[start..];
+            let end = tail
+                .find("\n#[tauri::command]")
+                .unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("tauri::async_runtime::spawn_blocking"),
+                "{name} must not run graph-wide work on the command/UI thread"
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -755,6 +795,8 @@ pub(crate) async fn run_graph_search(
     let graph = Arc::clone(&slot_for_context(&state)?.graph);
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
+    // QueryExecution carries backward-defaulted per-category `has_more` bits;
+    // returning it directly preserves those bits on the Tauri wire.
     let execution = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
         Some(lane) => graph.run_graph_search_latest_scoped(
             lane,
@@ -796,8 +838,22 @@ pub(crate) fn run_advanced_query(
 }
 
 #[tauri::command]
-pub(crate) fn query_facets(state: GraphContext<'_>) -> Result<Vec<(String, Vec<String>)>, String> {
+pub(crate) fn query_facets(
+    state: GraphContext<'_>,
+    autocomplete: Option<bool>,
+) -> Result<Vec<(String, Vec<String>)>, String> {
     with_graph(&state, |g| {
+        if autocomplete.unwrap_or(false) {
+            // The editor's OG policy intentionally differs from query-builder
+            // facets; use a separately bounded collector without changing the
+            // default command behavior.
+            return Ok(tine_core::query::autocomplete_property_facets_bounded(
+                g,
+                AUTOCOMPLETE_FACET_MAX_ITEMS,
+                AUTOCOMPLETE_FACET_MAX_BYTES,
+            )
+            .0);
+        }
         let (facets, exceeded) = tine_core::query::property_facets_bounded(
             g,
             RESULT_BRIDGE_MAX_ROWS,
@@ -862,6 +918,32 @@ pub(crate) fn set_show_brackets(
 ) -> Result<(), String> {
     with_graph(&state, |g| {
         g.set_show_brackets(enabled).map_err(|e| e.to_string())
+    })?;
+    refresh_graph(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn set_doc_mode_enter_for_new_block(
+    enabled: bool,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    with_graph(&state, |g| {
+        g.set_doc_mode_enter_for_new_block(enabled)
+            .map_err(|e| e.to_string())
+    })?;
+    refresh_graph(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn set_logical_outdenting(
+    enabled: bool,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    with_graph(&state, |g| {
+        g.set_logical_outdenting(enabled)
+            .map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
     Ok(())

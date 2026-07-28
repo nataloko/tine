@@ -205,6 +205,8 @@ export interface Backend {
    *  the created graph's root path to then `loadGraph`. Creates the graph in
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
   createGraph(dir: string): Promise<string>;
+  /** Page names that exist only through references in the warmed graph cache. */
+  referencedPageNames(): Promise<string[]>;
   listPages(): Promise<PageEntry[]>;
   journalFeedPage(limit: number, beforeDay: number | null): Promise<import("./types").JournalFeedPage>;
   /** Journal date-keys (yyyymmdd) whose page has real content. */
@@ -250,7 +252,7 @@ export interface Backend {
   runAdvancedQuery(query: string, currentPage?: string): Promise<AdvancedQueryResult>;
   /** Property keys (each with their distinct values) for query-builder
    *  autocomplete. */
-  queryFacets(): Promise<[string, string[]][]>;
+  queryFacets(autocomplete?: boolean): Promise<[string, string[]][]>;
   /** `alias::` → canonical page name pairs. */
   pageAliases(): Promise<[string, string][]>;
   /** `icon::` property for each named page that has one (page-name → icon). */
@@ -263,6 +265,10 @@ export interface Backend {
   setTimetrackingEnabled(enabled: boolean): Promise<void>;
   /** Persist `:ui/show-brackets?` (default on when absent). */
   setShowBrackets(enabled: boolean): Promise<void>;
+  /** Persist document-mode Enter's structural escape hatch to config.edn. */
+  setDocModeEnterForNewBlock(enabled: boolean): Promise<void>;
+  /** Persist `:editor/logical-outdenting?` (default off when absent). */
+  setLogicalOutdenting(enabled: boolean): Promise<void>;
   /** Persist the format new pages/journals are created in to config.edn
    *  `:preferred-format` ("md" | "org"). */
   setPreferredFormat(format: "md" | "org"): Promise<void>;
@@ -674,6 +680,9 @@ class TauriBackend implements Backend {
   createGraph(dir: string) {
     return this.call<string>("create_graph", { dir });
   }
+  referencedPageNames() {
+    return this.call<string[]>("referenced_page_names");
+  }
   listPages() {
     return this.call<PageEntry[]>("list_pages");
   }
@@ -740,8 +749,11 @@ class TauriBackend implements Backend {
   runAdvancedQuery(query: string, currentPage?: string) {
     return this.call<AdvancedQueryResult>("run_advanced_query", { query, currentPage });
   }
-  queryFacets() {
-    return this.call<[string, string[]][]>("query_facets");
+  queryFacets(autocomplete = false) {
+    return this.call<[string, string[]][]>(
+      "query_facets",
+      autocomplete ? { autocomplete: true } : undefined,
+    );
   }
   pageAliases() {
     return this.call<[string, string][]>("page_aliases");
@@ -760,6 +772,12 @@ class TauriBackend implements Backend {
   }
   setShowBrackets(enabled: boolean) {
     return this.call<void>("set_show_brackets", { enabled });
+  }
+  setDocModeEnterForNewBlock(enabled: boolean) {
+    return this.call<void>("set_doc_mode_enter_for_new_block", { enabled });
+  }
+  setLogicalOutdenting(enabled: boolean) {
+    return this.call<void>("set_logical_outdenting", { enabled });
   }
   setPreferredFormat(format: "md" | "org") {
     return this.call<void>("set_preferred_format", { format });
@@ -800,8 +818,12 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope) {
-    return this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain, scope: scope ?? null });
+  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope) {
+    const execution = await this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain, scope: scope ?? null });
+    return {
+      ...execution,
+      has_more: execution.has_more ?? { pages: false, blocks: false },
+    };
   }
   quickSwitch(query: string, limit: number) {
     return this.call<PageEntry[]>("quick_switch", { query, limit });
@@ -1123,4 +1145,10 @@ export function backend(): Backend {
     _backend = isTauri() ? new TauriBackend() : mockBackend();
   }
   return _backend;
+}
+
+/** OG-visible graph property keys/values for the block editor. Kept separate
+ * from query-builder facets even though both share the registered IPC command. */
+export function autocompleteFacets(): Promise<[string, string[]][]> {
+  return backend().queryFacets(true);
 }

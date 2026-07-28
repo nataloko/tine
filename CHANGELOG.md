@@ -8,6 +8,287 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-07-22
+
+### Added
+
+- **AppImage builds now carry update information** (GH #222), so
+  `appimageupdatetool` (and AppImageUpdate) can update Tine in place. Each
+  release also publishes the matching `.zsync` file. Delta updates work from
+  one release that has this metadata to the next, so the first usable update
+  is the one after this release.
+
+### Fixed
+
+- **Large graphs no longer do reference and rename work on the UI thread**
+  (GH #233, #235, #236). Page-title blur now commits the same conflict-safe
+  rename as Enter, repeated commits are suppressed, and reference lookups use a
+  reconstructible in-memory candidate index with exact verification and a safe
+  full-scan fallback. Linked References use Logseq-compatible disclosure
+  defaults; Unlinked References precompute in the background while remaining
+  collapsed.
+- **Opening Backups no longer hashes every saved snapshot** (GH #234). The list
+  reads cheap manifest metadata in a blocking worker, while restoring still
+  verifies the selected snapshot before changing graph files. The panel now
+  exposes loading and retryable error states.
+- **File-backed block rows now keep stable runtime identity** (GH #232) across cold loads, cache rebuilds, references, merges, and publish snapshots without adding synthetic `id::` properties.
+- **IME composition now commits finalized block text once** (GH #237), avoiding
+  intermediate graph writes and duplicate trailing-input commits.
+- **Template date expressions now understand natural language** (GH #226), so
+  `<% next monday %>`, `in 5 days`, and similar English expressions expand to
+  journal links using the graph's configured journal-title format. Unknown
+  placeholders remain intact.
+- **Reference-only page names now contribute namespace descendants** (GH #229),
+  so the namespace sidebar, `{{namespace}}`, and a page's Hierarchy section show
+  linked child paths even when no child file exists. All Pages remains file-only.
+- **Android 9 can load Tine's native library** (GH #192). The earlier fix
+  covered the backup path but missed a second `renameat2` call in the trash
+  path, so v0.6.4 could still fail before launch. Both paths now use the
+  API-compatible syscall entry point, and release CI checks the final APK for
+  this class of loader regression.
+- **Ctrl+F no longer reselects the query after every typed character**
+  (GH #224). The field still selects its contents when Ctrl+F is invoked again,
+  but ordinary debounced search updates leave the caret and selection alone.
+- **Task slash commands replace the block's task marker** (GH #225), rather
+  than appending literal text such as `DONE` after an existing `TODO`. The
+  shared marker operation preserves priority and block properties.
+
+## [0.6.4] - 2026-07-21
+
+### Added
+
+- **Drag table columns into the order you want** (GH #217): grab a property
+  column's header in a table view and drop it where it belongs. The order is
+  stored with the sheet, so it survives a restart. Computed formula columns
+  stay pinned at the end.
+- **Cut & paste keeps block identity, and copy & paste is block-exact**, like
+  Logseq: cutting blocks (Ctrl/Cmd+X or the context menu) and pasting them
+  back now preserves their `id::`, so `((...))` block references and embeds
+  pointing at them keep working. Pasting your own copied blocks inside Tine
+  is now a true block-level paste — exact text, hidden properties like
+  `collapsed::`, and the full subtree survive — while plain-text pastes into
+  other apps are unchanged. Copy-paste never duplicates block ids, nothing
+  about block identity is written to the OS clipboard, and pasting can never
+  create two blocks with the same id.
+- **Full calculator language in ` ```calc ` blocks**, like Logseq: hex/octal/
+  binary numbers in and out (`:hex`, `:oct`, `:bin`, `:decimal`), scientific
+  and mixed-number literals (`3 1/2`), inverse trig and factorial, output
+  format directives (`:format fix/sci/normal/fractions/improper`), exact
+  decimal arithmetic (`0.1 + 0.2 = 0.3`), and Logseq's error-to-`last`
+  behavior. Tine's `floor`/`ceil`/`round` keep working as an extension.
+- **Org image links render as images**, like Logseq: in Org pages, a page
+  reference pointing at a local image asset (e.g. `[[../assets/pic.png]]`)
+  now shows the image instead of a page link.
+- **Direct Hiccup and raw media render**, like Logseq: a Hiccup form typed
+  directly in a block (e.g. `[:span.highlight "text"]`) now renders as real
+  (sanitized) HTML instead of literal source, and raw HTML `<audio controls>`
+  / `<video controls>` play natively. Scripts, iframes, event handlers, and
+  autoplay remain stripped; base64 `data:` images keep working, matching
+  Logseq's sanitizer exactly.
+- **Admonition icons and custom-block styling**, like Logseq: NOTE, TIP,
+  IMPORTANT, CAUTION, WARNING, and PINNED admonitions now show a per-type
+  icon, and other `#+BEGIN_X` blocks (like VERSE) keep a wrapper with their
+  name as a CSS class so themes can style them.
+- **Table v2**, like Logseq: a table in a block with
+  `logseq.table.version:: 2` renders Logseq's grid presentation with compact
+  mode and header transforms, and the `logseq.table.*` configuration
+  properties no longer show as visible text.
+- **YouTube timestamps**, like Logseq: `{{youtube-timestamp}}` stamps are now
+  clickable and seek the embedded YouTube video, and a new "Embed Youtube
+  timestamp" slash command inserts the current playback time. Works offline
+  too — without a player the stamp stays a plain label.
+- **`<` advanced commands**, like Logseq: typing `<` at the start of a line
+  opens the advanced-section menu (Quote, Src, Query, Note, Tip, Warning,
+  Example, Verse, Center, Export variants, Comment…); picking one inserts the
+  paired `#+BEGIN_…/#+END_…` section with the caret ready to type — and on
+  Markdown pages, Src inserts a ``` code fence, exactly as Logseq does.
+
+### Fixed
+
+- **On phones, a PDF can always be closed again.** The reader took over the
+  screen with a toolbar that pushed its own Close button off the edge, and the
+  Android back gesture ignored it — leaving no way out. The reader now fills
+  the screen deliberately, Close sits at the front of the toolbar, the
+  secondary tools move into the "⋯" menu when space is tight, and both the
+  back gesture and Escape close the reader (any open find bar, settings or
+  outline panel closes first).
+- **Splitting a pane from the journals feed no longer opens a random other
+  day's bullet.** Because a second journals pane isn't allowed, the new pane
+  was filled with the last page you had visited in that tab — reusing its
+  zoom and its pinned state, which is why an unrelated day's bullet could
+  appear zoomed and pinned. It now opens the day page of the bullet you had
+  selected, plainly.
+- Editors re-measure their height when a pane split changes their width, so a
+  multiline block clicked in a freshly created pane is no longer clipped.
+- **Typing at the end of a block that ends with a `SCHEDULED:`/`DEADLINE:`
+  line no longer breaks the date.** Clicking at the visual end of such a block
+  puts the caret after the planning line, and the text you typed there used to
+  turn the deadline into ordinary text. The date now keeps working as long as
+  the timestamp starts its line — matching Logseq, which accepts the same
+  shape — and your text stays exactly where you typed it; nothing rewrites the
+  block. Re-picking a date from the calendar also keeps that trailing text
+  instead of deleting it.
+- A page containing a malformed HTML fragment (for example `- <div </div><`)
+  no longer breaks the parser or disappears from search — it loads and stays
+  searchable (GH #221, via the lsdoc 0.5.4 update).
+- The `/Today` command now inserts the date in the journal date format your
+  graph is configured with (`:journal/page-title-format`) instead of always
+  `MMM do, yyyy`, so the link points at the actual journal page (GH #220).
+- PDF annotation files written by Tine now match Logseq's exact field shape
+  (text highlights omit the empty `:image` key; area highlights write
+  Logseq's `"[:span]"` text sentinel), so a graph annotated in Tine looks
+  byte-familiar to Logseq and vice versa. Deleting an area highlight now
+  also moves its cropped image to the graph's recoverable trash (Logseq
+  deletes it outright; Tine previously left it orphaned) — only after the
+  annotation save fully commits, and never when another highlight still
+  references the image.
+- **Automatic headings**, like Logseq: a new "Auto" option (context menu and
+  `/Heading (Auto)`) sizes the heading by the block's nesting depth and updates
+  live on indent/outdent; explicit H1–H6 still win, and switching between the
+  two cleans up the other representation in both Markdown and Org.
+- **Paste parity with Logseq**: Ctrl/Cmd+Shift+V now pastes the literal
+  clipboard text for every payload (not just multiline) — rich HTML and URLs
+  included, with no formatting applied; formatted paste keeps HTML images
+  (`![alt](src)`, org equivalent, unsafe `data:` URLs declined safely); and
+  pasting a bare YouTube/Loom/Vimeo/Bilibili link inserts a playable
+  `{{video}}` embed.
+- **Numbered lists work like Logseq's**: typing `1. ` in an empty block turns
+  it into a numbered-list block; Enter continues the numbering into the new
+  sibling and Enter on an empty item stops the list; Backspace at the start
+  removes just the numbering; and blocks dragged or pasted into a numbered
+  list pick up the numbering automatically (already-numbered blocks keep
+  theirs).
+- **Document-mode Enter**, like Logseq: with Document mode on, plain Enter now
+  inserts a line break and Shift+Enter creates a new block (the reverse of
+  outline mode), with a config switch
+  (`:shortcut/doc-mode-enter-for-new-block?`) to keep the outline mapping.
+- **Logical outdenting**, like Logseq: a new Editor setting; when on, Shift+Tab
+  moves a block out one level and leaves its following siblings where they are
+  (Roam-style) instead of nesting them under it. Both settings live in the
+  graph's `config.edn`, so they travel with the graph.
+- **Undo/redo modes and context restore**, like Logseq: a new palette command
+  "Toggle undo/redo mode" switches between the default Global history and
+  Page-only history (undo/redo affects only the current page's latest change).
+  Undo/redo now also restores where you were — the route/pane, right-sidebar
+  state, and the editing cursor position — instead of just the text.
+- **Property autocomplete**, like Logseq: typing `::` at the start of a line
+  (or a typed key ending in `::`) opens a picker of the property names already
+  used in your graph; picking one inserts the canonical `key:: ` and
+  immediately offers that property's known values. `::` inside ordinary prose,
+  references, or code fences never triggers it.
+- The Copy/export modal gained Logseq's **maximum-depth control** (`Level ≤`
+  all/1..9): descendants deeper than the selected level are omitted from the
+  exported text, in both Rendered and Source modes.
+- **OPML and HTML export**, like Logseq: the Copy/export modal now offers
+  Text/OPML/HTML for a block selection, and the **page menu gained
+  "Copy / export as…"** opening the same dialog for the whole page. Each format
+  shows Logseq's option set (cleanup + max depth for OPML/HTML; the full set
+  for Text); OPML/HTML always omit property lines.
+
+### Changed
+
+- **The back and forward buttons now stay on the top bar on phones.** The bar
+  used to move them into the "…" menu at the same width as the calendar,
+  journals, theme and right-sidebar buttons; navigation now keeps its place and
+  only collapses on extremely narrow windows (GH #205).
+- **Multiline plain-text paste now matches Logseq**: pasted text only becomes
+  multiple blocks when it looks like an outline (`-`/`+`/`*`/`#` lines, org
+  stars) or contains blank-line-separated paragraphs; ordinary prose —
+  addresses, log excerpts, indented text — stays in one block, replacing the
+  selection literally. (Previously every multiline paste was split into
+  blocks.)
+- Parser updated to **lsdoc v0.5.4**: correctness, panic, and performance
+  fixes from the GH #209 audit (split-title math chains, latex-env tails,
+  raw-HTML scanning, 32-bit cookie/timestamp bounds, refs-indexing parity).
+
+### Fixed
+
+- **Property keys now create backlinks**, like Logseq: a page or block with
+  `author:: something` shows up in the `author` page's Linked References even
+  when the value contains no `[[reference]]`. Built-in/hidden properties and
+  the `:property-pages/excludelist` are exempt, and
+  `:property-pages/enabled? false` turns it off — matching Logseq's rules.
+- **Exported HTML sites now run `#+BEGIN_QUERY` blocks** the same way they
+  already run `{{query}}` — showing the authored title and results, restricted
+  to public pages; when matches on non-public pages were filtered out, the
+  query notes how many were omitted instead of silently under-reporting.
+- **Custom macros with rich output now render it**, like Logseq: a `:macros`
+  entry whose body is a Hiccup form (e.g. `[:span {:class "x"} "text"]`) shows
+  the styled result instead of the literal bracket source — on the page, in
+  linked references, and in reference previews. Output goes through the same
+  HTML sanitizer as pasted raw HTML; Hiccup typed directly in a note (outside a
+  macro) still renders literally.
+- **`#+BEGIN_QUERY` advanced query blocks now render** their authored title and
+  a bounded result table — on the page, in Linked References, and in reference
+  previews — instead of showing the raw `#+BEGIN_QUERY … #+END_QUERY` source,
+  like Logseq. The common page-property Datalog form
+  (`[?p :block/properties ?props]` + `[(get ?props :key)]`) is understood;
+  malformed or unsupported queries show a clear "Unsupported BEGIN_QUERY"
+  notice rather than a guessed partial result.
+- **YouTube (and Vimeo) embeds now play** instead of failing with the player's
+  "error 153". A `{{youtube …}}`/`{{video …}}` embed — and a pasted raw
+  `<iframe>` pointing at a video host — now sends the app origin as its referrer
+  (`referrerpolicy="strict-origin-when-cross-origin"`) and the standard media
+  `allow` permissions, matching Logseq; YouTube rejects an embed that arrives
+  with no referrer. Raw `<iframe>`s to any other host keep `no-referrer`, so an
+  arbitrary embed still can't see where it was opened from.
+- A bare remote media URL now **renders inline**, like Logseq: a plain
+  `https://…/photo.jpg` (or `.png`/`.gif`/`.webp`/…) shows the image, and a bare
+  `.mp4`/`.webm`/`.mp3`/… URL shows a video/audio player, instead of a raw link.
+  Labeled links (`[text](…)`) and non-media links are unchanged.
+- `[[`, `#`, and `((` autocomplete now match what you type **literally**, like
+  Logseq. Previously the in-progress text was run through the Ctrl+K search query
+  language, so typing a bare `OR`, a leading `-`, a quote, or a `/…/` was read as
+  a boolean/negation/regex operator and made valid pages or blocks silently
+  disappear (the "works at 1 char, vanishes at 2, returns at 3" effect). Ctrl+K
+  keeps its full query language (GH #186).
+- Made equal-ranked page autocomplete results **deterministic**: ties now break
+  on a stable key (file path / canonical name) instead of filesystem/enumeration
+  order, so the same query on the same graph always returns the same set and
+  order (GH #186).
+- On Windows, clicking an external `http(s)`/`mailto` link now opens your default
+  browser/mail client instead of a File Explorer window. The opener no longer
+  hands the URL to `explorer.exe` (which treats it as a shell item); it uses the
+  system URL handler, the same path already used on mobile (GH #215).
+- The top bar no longer collapses its calendar/journals/theme/right-sidebar and
+  history actions into the "…" overflow menu while there is plenty of room for
+  them; the collapse threshold now reflects the actual space the buttons need
+  (GH #205 follow-up).
+- The top bar "…" overflow menu now closes when you click anywhere outside it
+  (GH #205 follow-up).
+- Editing a cell in a field table (`/table`) no longer reorders the columns.
+  Updating a block property now keeps the property on its original line instead
+  of moving it to the end, so the edited column stays put and the saved file
+  keeps a stable property order (GH #216).
+
+## [0.6.3] - 2026-07-20
+
+### Fixed
+
+- Ctrl+K search now tells you when more matches exist beyond its bounded result
+  window and prompts you to narrow the query, instead of presenting a truncated
+  list as if it were complete (GH #209).
+- Page aliases are now scoped to the physical file that declares them, so an
+  exact alias search cannot return a same-named sibling file (GH #209).
+- One page containing unsupported search-index syntax can no longer make its
+  whole cache worker shard disappear silently; other pages remain searchable and
+  the skipped page is reported as an indexing failure (GH #209).
+- The mobile/narrow top bar no longer pushes action buttons off-screen: the
+  workspace switcher now lives in the left-sidebar header (with a compact one-tap
+  fallback in the toolbar when the sidebar is closed), and lower-priority toolbar
+  actions collapse into a "…" overflow menu when the bar is narrow — driven by the
+  toolbar's real width (zoom/DPI-aware), so narrow desktop windows adapt too
+  (GH #205).
+- Page-property backlinks (e.g. `tags:: blah`) now render their linkified value in
+  Linked References through the same renderer used in-page, instead of showing raw
+  `key:: value` markdown (GH #212).
+- Recursive and deeply nested block/page embeds and queries now stop with an
+  "Embed depth is too deep" notice (OG's depth-5 guard) instead of expanding
+  forever; a page can no longer embed itself (GH #206).
+- Pressing Enter while typing page-header properties no longer shows a validation
+  error or jams later saves for that page; the transient trailing newline remains
+  in the editor while the persisted header stays canonical (GH #210).
+
 ## [0.6.2] - 2026-07-19
 
 ### Added
@@ -385,6 +666,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   page links, block references, reference panels, namespaces, embeds, and query
   results; the bullet remains the explicit mobile block-action target.
   (GH #162)
+- **Fresh block references use their durable identity immediately.** Copy block
+  ref now gives a new target one UUID shared by counts, referrer panels, routes,
+  and the sidebar before reload, with Markdown and Org persistence. (GH #154)
 - **Inline block-reference text follows every landed source transaction.** Loaded
   targets update immediately through their reactive editor node; visible UUIDs
   whose source was never loaded are batch-refreshed after external edits and
@@ -2212,7 +2496,7 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.4...HEAD
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/martinkoutecky/tine/compare/v0.5.8...v0.5.9

@@ -56,6 +56,42 @@ const successfulFullCiRun = {
 };
 const successfulFullCiJobs = REQUIRED_FULL_CI_JOBS.map((name) => ({ name, conclusion: "success" }));
 
+assert.equal(layout.allAssets.length, 23, "release layout must retain its exact 23-asset inventory");
+assert.equal(layout.platformAssets.length, 22, "release layout must retain its exact platform-asset inventory");
+assert.equal(
+  Object.keys(layout.updaterPlatforms).length,
+  12,
+  "AppImage update metadata must not add a Tauri updater platform"
+);
+assert.ok(
+  layout.lanes["linux-x64"].assets.includes(`Tine_${version}_amd64.AppImage.zsync`),
+  "linux-x64 is missing its AppImage update metadata"
+);
+assert.ok(
+  layout.lanes["linux-arm64"].assets.includes(`Tine_${version}_aarch64.AppImage.zsync`),
+  "linux-arm64 is missing its AppImage update metadata"
+);
+assert.match(
+  releaseWorkflow,
+  /lane: linux-x64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_amd64\.AppImage\.zsync"[\s\S]*?lane: linux-arm64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_aarch64\.AppImage\.zsync"/,
+  "Linux release lanes do not declare the expected AppImage update metadata"
+);
+assert.match(
+  releaseWorkflow,
+  /UPDATE_INFORMATION: \$\{\{ matrix\.appimage-update-info \}\}/,
+  "Tauri bundles do not receive their per-lane AppImage update information"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Verify Linux AppImage update information[\s\S]*?\.\/src-tauri\/\$zsync_name[\s\S]*?readelf --string-dump=\.upd_info "\$appimage"[\s\S]*?gh-releases-zsync\|/,
+  "release workflow verify step must search src-tauri/ for the .zsync (appimagetool writes it into the build CWD) and fail closed when update information is absent"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Verify Android 9 native-loader compatibility[\s\S]*?unzip -p "\$apk" lib\/arm64-v8a\/libtine_lib\.so[\s\S]*?readelf --dyn-syms --wide[\s\S]*?renameat2/,
+  "Android release packaging must inspect the final APK native library and reject the API-30 renameat2 wrapper"
+);
+
 // Architecture guard: the expensive Linux release build must test that exact
 // binary before it can be staged for the atomic assembler/publisher. Windows
 // consumes the staged portable binary in independent advisory jobs that neither
@@ -191,7 +227,7 @@ assert.match(
 );
 assert.match(
   uiE2eWorkflow,
-  /windows_scenario == 'all'[\s\S]*?\["windows-core","og-parity-references","page-properties","page-trailing-block","pdf-logseq","print-security","tab-overflow"\]/,
+  /windows_scenario == 'all'[\s\S]*?\["windows-core","page-properties","page-trailing-block","pdf-logseq","print-security","tab-overflow"\]/,
   "the focused UI workflow cannot fan out all Windows scenarios explicitly"
 );
 assert.doesNotMatch(

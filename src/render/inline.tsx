@@ -4,7 +4,7 @@
 
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, useContext, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
-import { mediaKind } from "../media";
+import { extOf, mediaKind } from "../media";
 import { openPage, openPageInNewTab, openPageAtBlock, focusBlock } from "../router";
 import { refClickZoom } from "../copySettings";
 import { isJournalTitle } from "../journal";
@@ -24,6 +24,7 @@ import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
 import { AstBody } from "./body";
 import { backend } from "../backend";
+import { writeClipboardText } from "../clipboard";
 import { acquireAssetBlob, acquireLocalImageBlob, assetVersion } from "../assetCache";
 import { mediaEditorForAsset } from "../mediaEditors";
 import { acquireMediaBlobFallback, type MediaBlobLease } from "../mediaBlobFallback";
@@ -39,6 +40,7 @@ import { guideTargetForLink, isGuidePageName } from "../guide";
 import { PeekPopup, PeekContext, capBlockTree } from "./PeekPopup";
 import { annotationInfoForBlock, pdfFileFromPreBlock } from "../editor/annotation";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
+import { hiccupToHtml } from "./hiccup";
 
 
 // ===========================================================================
@@ -53,7 +55,7 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 function renderMacroBody(raw: string, blockId?: string, userArgs?: string[]): JSX.Element {
   const body = raw.trimStart();
   if (/^query\b/i.test(body)) return <QueryMacro body={body} blockId={blockId} />;
-  if (/^embed\b/i.test(body)) return <EmbedMacro body={body} />;
+  if (/^embed\b/i.test(body)) return <EmbedMacro body={body} blockId={blockId} />;
   if (/^youtube-timestamp\b/i.test(body)) return <YoutubeTimestamp body={body} />;
   if (/^(video|youtube|vimeo|bilibili)\b/i.test(body)) return <VideoMacro body={body} />;
   if (/^(tweet|twitter)\b/i.test(body)) return <TweetMacro body={body} />;
@@ -73,12 +75,33 @@ function renderMacroBody(raw: string, blockId?: string, userArgs?: string[]): JS
   return <span class="macro">{`{{${raw}}}`}</span>;
 }
 
-/** Render a parsed inline run (lsdoc `Inline[]`) to interactive DOM. */
-export function renderInlines(inlines: Inline[], blockId?: string, spanMode = true): JSX.Element {
-  return <For each={inlines}>{(s) => renderInline(s, blockId, spanMode)}</For>;
+// OG @ 6e7afa8eb: `show-link?` accepts Org local assets (`^[./]*assets`) or a
+// media extension (components/block.cljs:989-1011; graph_parser/config.cljs:18-21;
+// graph_parser/config.cljs:66-68; frontend/config.cljs:116-127). Its Page_ref
+// branch deliberately keeps only pdf/mp4/ogg/webm out of image-link
+// (components/block.cljs:1135-1159). Keep the original extension sets and the
+// query/fragment-at-end rule instead of treating every Page_ref as an image.
+const OG_ORG_PAGE_REF_MEDIA_SUFFIX = /\.(?:gif|svg|jpeg|ico|png|jpg|bmp|webp|mp3|ogg|mpeg|wav|m4a|flac|wma|aac|mp4|webm|mov|flv|avi|mkv)(?:\?[^#]*)?(?:#.*)?$/i;
+const OG_ORG_PAGE_REF_IMAGE_EXCLUSIONS = new Set(["pdf", "mp4", "ogg", "webm"]);
+
+function isOgOrgPageRefImageTarget(target: string): boolean {
+  const isLocalAsset = /^[./]*assets/.test(target);
+  return (isLocalAsset || OG_ORG_PAGE_REF_MEDIA_SUFFIX.test(target))
+    && !OG_ORG_PAGE_REF_IMAGE_EXCLUSIONS.has(extOf(target));
 }
 
-function renderInline(s: Inline, blockId?: string, spanMode = true): JSX.Element {
+/** Render a parsed inline run (lsdoc `Inline[]`) to interactive DOM. */
+export function renderInlines(
+  inlines: Inline[],
+  blockId?: string,
+  spanMode = true,
+  macroExpansion = false,
+  format?: Format,
+): JSX.Element {
+  return <For each={inlines}>{(s) => renderInline(s, blockId, spanMode, macroExpansion, format)}</For>;
+}
+
+function renderInline(s: Inline, blockId?: string, spanMode = true, macroExpansion = false, format?: Format): JSX.Element {
   switch (s.k) {
     case "plain": {
       // Render-time typographic replacement (`->`→`→`, `--`→`–`, …) is a Tine
@@ -106,7 +129,7 @@ function renderInline(s: Inline, blockId?: string, spanMode = true): JSX.Element
       // and a soft `break` is exactly such an in-block newline — match that look.
       return <br {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})} />;
     case "emphasis": {
-      const inner = renderInlines(s.children, blockId, spanMode);
+      const inner = renderInlines(s.children, blockId, spanMode, macroExpansion, format);
       const attrs = (spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {};
       switch (s.emph) {
         case "Bold": return <strong {...attrs}>{inner}</strong>;
@@ -118,11 +141,11 @@ function renderInline(s: Inline, blockId?: string, spanMode = true): JSX.Element
       return inner;
     }
     case "subscript":
-      return <sub {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})}>{renderInlines(s.children, blockId, spanMode)}</sub>;
+      return <sub {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})}>{renderInlines(s.children, blockId, spanMode, macroExpansion, format)}</sub>;
     case "superscript":
-      return <sup {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})}>{renderInlines(s.children, blockId, spanMode)}</sup>;
+      return <sup {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})}>{renderInlines(s.children, blockId, spanMode, macroExpansion, format)}</sup>;
     case "link":
-      return renderLink(s, blockId, spanMode);
+      return renderLink(s, blockId, spanMode, macroExpansion, format);
     case "nested_link":
       // Logseq `[[a [[b]] c]]` — best-effort: route the whole inner as a page ref.
       return <PageRef name={s.content} blockId={blockId} spanAttrs={spanMode ? coarseSpanAttrs(s.span) : undefined} />;
@@ -145,7 +168,13 @@ function renderInline(s: Inline, blockId?: string, spanMode = true): JSX.Element
     case "entity":
       return spanMode && s.span ? <span {...(coarseSpanAttrs(s.span) ?? {})}>{s.unicode}</span> : <>{s.unicode}</>;
     case "hiccup":
-      // Inline Clojure-hiccup `[:tag …]` — literal text for now (see ast.ts). Edge case.
+      // OG 6e7afa8eb inserts direct inline Hiccup only after safe-read,
+      // serialization, and sanitization
+      // (src/main/frontend/components/block.cljs:1554-1562 and
+      // src/main/frontend/components/block.cljs:1617-1621). Tine's bounded
+      // transcriber is the safe-read equivalent.
+      const html = hiccupToHtml(s.v);
+      if (html !== null) return renderSanitizedHtml(html, spanMode ? coarseSpanAttrs(s.span) : undefined);
       return spanMode && s.span ? <span {...(coarseSpanAttrs(s.span) ?? {})}>{s.v}</span> : <>{s.v}</>;
   }
 }
@@ -340,8 +369,7 @@ export function CopyButton(props: { text: string; title: string; class?: string 
   const onCopy = (e: MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    void backend()
-      .writeText(props.text)
+    void writeClipboardText(props.text)
       .then(() => pushToast("Copied to clipboard", "success"))
       .catch(() => pushToast("Couldn’t copy to clipboard", "error"));
   };
@@ -360,11 +388,20 @@ export function CopyButton(props: { text: string; title: string; class?: string 
   );
 }
 
-function renderLink(s: Extract<Inline, { k: "link" }>, blockId?: string, spanMode = true): JSX.Element {
+function renderLink(
+  s: Extract<Inline, { k: "link" }>,
+  blockId?: string,
+  spanMode = true,
+  macroExpansion = false,
+  format?: Format,
+): JSX.Element {
   const url = s.url;
   const spanAttrs = spanMode ? coarseSpanAttrs(s.span) : undefined;
   if (url.type === "page_ref") {
-    const alias = s.label && s.label.length ? renderInlines(s.label, blockId, spanMode) : undefined;
+    if (format === "org" && isOgOrgPageRefImageTarget(url.v)) {
+      return <AssetImage url={url.v} alt="" blockId={blockId} spanAttrs={spanAttrs} />;
+    }
+    const alias = s.label && s.label.length ? renderInlines(s.label, blockId, spanMode, macroExpansion, format) : undefined;
     return <PageRef name={url.v} alias={alias} blockId={blockId} spanAttrs={spanAttrs} />;
   }
   if (url.type === "block_ref") {
@@ -385,6 +422,17 @@ function renderLink(s: Extract<Inline, { k: "link" }>, blockId?: string, spanMod
     const labelStr = s.label && s.label.length ? astText(s.label) : pdfFilenameFromDest(dest);
     return <PdfAssetLink dest={dest} label={labelStr} spanAttrs={spanAttrs} />;
   }
+  // OG parity (og-1.0.0 block.cljs:989-1011 show-link? -> :1213 media-link;
+  // util/text.cljs:31 media-link?): a BARE http(s) URL ending in a media
+  // extension auto-renders inline as media. Keyed on s.full (OG full_text) so a
+  // labeled [text](x.png) — full_text not http-prefixed — stays a plain link.
+  if (!s.image && /^https?:\/\//i.test(s.full.trimStart())) {
+    const k = mediaKind(dest);
+    if (k === "image")
+      return <AssetImage url={dest} alt="" blockId={blockId} spanAttrs={spanAttrs} />;
+    if (k === "video" || k === "audio")
+      return <MediaEmbed url={dest} kind={k} alt="" blockId={blockId} spanAttrs={spanAttrs} />;
+  }
   return (
     <span class="link-copy-wrap">
       <a
@@ -393,7 +441,7 @@ function renderLink(s: Extract<Inline, { k: "link" }>, blockId?: string, spanMod
         {...(spanAttrs ?? {})}
         onClick={(e) => { e.preventDefault(); e.stopPropagation(); void backend().openExternal(dest); }}
       >
-        <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode)}</Show>
+        <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode, macroExpansion, format)}</Show>
       </a>
       <CopyButton text={dest} title="Copy link" class="copy-inline" />
     </span>
@@ -442,11 +490,25 @@ function renderTimestamp(s: TimestampInline): JSX.Element {
   );
 }
 
+// Video-embed hosts (youtube/vimeo/loom/bilibili) that reject an embed when it
+// arrives with no referrer — YouTube in particular fails with error 153. For
+// those we send the app origin (`strict-origin-when-cross-origin`), matching OG
+// (og-1.0.0 youtube.cljs:63). Every other pasted `<iframe>` keeps `no-referrer`
+// so an arbitrary third-party embed still can't see where it was opened from.
+const EMBED_REFERRER_HOSTS =
+  /(?:^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be|vimeo\.com|loom\.com|bilibili\.com)$/i;
+function embedReferrerPolicy(src: string): "strict-origin-when-cross-origin" | "no-referrer" {
+  // Extract the host with a regex rather than `new URL()` — the referrer decision
+  // must not depend on a global others can shim, and a malformed src stays private.
+  const host = /^https?:\/\/([^/?#]+)/i.exec(src)?.[1]?.replace(/^[^@]*@/, "").replace(/:.*$/, "") ?? "";
+  return EMBED_REFERRER_HOSTS.test(host) ? "strict-origin-when-cross-origin" : "no-referrer";
+}
+
 // Sandboxed-iframe rendering, reused for inline `inline_html` and block `raw_html`.
 function renderIframe(src: string, width?: string, height?: string, spanAttrs?: SpanDomAttrs): JSX.Element {
   return (
     <span class="embed-iframe-wrap" style={{ ...(width ? { width } : {}), ...(height ? { "aspect-ratio": "auto", height } : {}) }} {...(spanAttrs ?? {})}>
-      <iframe class="embed-iframe" src={src} sandbox="allow-scripts allow-same-origin allow-popups allow-forms" referrerpolicy="no-referrer" title="embed" />
+      <iframe class="embed-iframe" src={src} sandbox="allow-scripts allow-same-origin allow-popups allow-forms" referrerpolicy={embedReferrerPolicy(src)} title="embed" />
     </span>
   );
 }
@@ -471,6 +533,12 @@ export function renderRawHtml(text: string, spanAttrs?: SpanDomAttrs): JSX.Eleme
       return renderIframe(src, width, height, spanAttrs);
     }
   }
+  return renderSanitizedHtml(text, spanAttrs);
+}
+
+/** The sanitizer-only HTML insertion path. Unlike `renderRawHtml`, this helper
+ * never performs iframe dispatch; macro-expanded Hiccup must enter here. */
+export function renderSanitizedHtml(text: string, spanAttrs?: SpanDomAttrs): JSX.Element {
   return <RawHtmlContent text={text} spanAttrs={spanAttrs} />;
 }
 
@@ -1007,7 +1075,7 @@ function blockInlines(blocks: AstBlock[]): Inline[] {
  *  preview line, …) — anything NOT a full block body. Parses via the in-browser
  *  wasm parser (src/render/parse.ts) and renders the inline run; `blockId` is
  *  threaded to inline `{{query}}` macros so they can rewrite the owning block. */
-export function InlineText(props: { text: string; blockId?: string; format?: Format }): JSX.Element {
+export function InlineText(props: { text: string; blockId?: string; format?: Format; macroExpansion?: boolean }): JSX.Element {
   // Only parse once the wasm parser is ready — `parseBlock` THROWS otherwise, and
   // unlike AstBody these callers (property values, breadcrumbs, ref previews, PDF
   // annotations) have no error boundary. When the parser isn't ready, OR when the
@@ -1019,7 +1087,7 @@ export function InlineText(props: { text: string; blockId?: string; format?: For
   );
   return (
     <Show when={inlines() && inlines()!.length > 0} fallback={<EmojiText text={props.text} />}>
-      {renderInlines(inlines()!, props.blockId, false)}
+      {renderInlines(inlines()!, props.blockId, false, props.macroExpansion ?? false, props.format)}
     </Show>
   );
 }
@@ -1068,11 +1136,11 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
     if (parserReady() && expansionIsBlockLevel(expanded, fmt)) {
       return (
         <div class="macro-blocks">
-          <AstBody raw={expanded} blockId={props.blockId} format={fmt} headingLevel={expansionHeadingLevel(expanded, fmt)} />
+          <AstBody raw={expanded} blockId={props.blockId} format={fmt} headingLevel={expansionHeadingLevel(expanded, fmt)} macroExpansion />
         </div>
       );
     }
-    return <InlineText text={expanded} blockId={props.blockId} format={fmt} />;
+    return <InlineText text={expanded} blockId={props.blockId} format={fmt} macroExpansion />;
   } finally {
     userMacroDepth--;
   }

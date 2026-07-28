@@ -28,6 +28,10 @@ import {
   toggleWideMode,
   documentMode,
   toggleDocumentMode,
+  docModeEnterForNewBlock,
+  changeDocModeEnterForNewBlock,
+  logicalOutdenting,
+  changeLogicalOutdenting,
   typographyMode,
   setTypographyMode,
   autoPairing,
@@ -203,6 +207,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
   { tab: "appearance", label: "Document mode", description: "hide bullets prose" },
+  { tab: "appearance", label: "Document-mode Enter creates a new block", description: "Enter Shift Enter internal newline config" },
   { tab: "appearance", label: "Show brackets", description: "page references config shortcut" },
   { tab: "appearance", label: "Typographic replacements", description: "arrows dashes glyphs" },
   { tab: "appearance", label: "Auto-pair brackets & quotes", description: "closers selections backspace" },
@@ -212,6 +217,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "appearance", label: "Smooth scrolling (experimental)", description: "animated journal scrolling WebKit", aliases: ["scroll animation"], level: "advanced" },
   { tab: "appearance", label: "System title bar & window controls", description: "native frame chrome" },
   { tab: "editor", label: "File format", description: "new pages Markdown Org" },
+  { tab: "editor", label: "Logical outdenting", description: "Shift Tab following siblings Roam config" },
   { tab: "editor", label: "Link autocomplete default", description: "OG adaptive existing typed page tag completion", level: "advanced" },
   { tab: "editor", label: "Switch to an already-open tab when navigating", description: "reuse tabs", level: "advanced" },
   { tab: "editor", label: "Learn Ctrl+K choices", description: "adaptive launcher ranking reset history", level: "advanced" },
@@ -1357,6 +1363,16 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       </Field>
 
       <Field
+        label="Document-mode Enter creates a new block"
+        hint={<>Keep the normal Enter = new block and Shift + Enter = line break mapping while Document mode is on. Off (the default) swaps them, like Logseq. Saved to <code>:shortcut/doc-mode-enter-for-new-block?</code> in <code>config.edn</code>.</>}
+      >
+        <Toggle
+          on={docModeEnterForNewBlock()}
+          onClick={() => changeDocModeEnterForNewBlock(!docModeEnterForNewBlock())}
+        />
+      </Field>
+
+      <Field
         label="Show brackets"
         hint={<>Show the <code>[[ ]]</code> around page references. Saved to <code>:ui/show-brackets?</code> in <code>config.edn</code>; toggle with <code>mod+c mod+b</code>.</>}
       >
@@ -1824,6 +1840,13 @@ function EditorTab(props: { search: string }): JSX.Element {
         <Toggle on={spellcheckEnabled()} onClick={() => setSpellcheckEnabled(!spellcheckEnabled())} />
       </Field>
 
+      <Field
+        label="Logical outdenting"
+        hint={<>Move an outdented block after its parent while leaving following siblings in place. Off (the default) reparents those siblings beneath the moved block. Saved to <code>:editor/logical-outdenting?</code> in <code>config.edn</code>.</>}
+      >
+        <Toggle on={logicalOutdenting()} onClick={() => changeLogicalOutdenting(!logicalOutdenting())} />
+      </Field>
+
       <Show when={spellcheckEnabled()}>
         <Field
           label="Spellcheck languages"
@@ -2142,18 +2165,31 @@ function BackupsTab(): JSX.Element {
   const [keep, setKeep] = createSignal(12);
   const [list, setList] = createSignal<BackupInfo[]>([]);
   const [busy, setBusy] = createSignal(false);
+  const [loading, setLoading] = createSignal(true);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
+  const ready = () => !loading() && !loadError();
 
   const refresh = async () => {
+    setLoading(true);
+    setLoadError(null);
     try {
-      setList(await backend().listBackups());
-    } catch {
+      const [nextKeep, nextList] = await Promise.all([
+        backend().getBackupKeep(),
+        backend().listBackups(),
+      ]);
+      setKeep(nextKeep);
+      setList(nextList);
+    } catch (e) {
       setList([]);
+      setLoadError(String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
-  // Load the current keep count + snapshot list when this tab mounts.
+  // Load the current keep count + snapshot list when this tab mounts, before
+  // enabling controls that depend on that data.
   createEffect(() => {
-    void backend().getBackupKeep().then(setKeep).catch(() => {});
     void refresh();
   });
 
@@ -2169,6 +2205,7 @@ function BackupsTab(): JSX.Element {
   };
 
   const restore = async (b: BackupInfo) => {
+    if (!ready() || busy()) return;
     const when = fmtStamp(b.stamp);
     // Native GTK confirm — window.confirm silently returns true here, which would
     // overwrite the graph with no prompt.
@@ -2219,19 +2256,44 @@ function BackupsTab(): JSX.Element {
           max="1000"
           class="settings-num"
           value={keep()}
+          disabled={!ready() || busy()}
           onChange={(e) => void saveKeep(Number(e.currentTarget.value))}
         />
       </Field>
 
       <div class="settings-section">
         Available snapshots
-        <button class="settings-btn" style={{ "margin-left": "10px" }} onClick={() => void refresh()}>
+        <button
+          class="settings-btn"
+          style={{ "margin-left": "10px" }}
+          disabled={loading() || busy()}
+          onClick={() => void refresh()}
+        >
           Refresh
         </button>
       </div>
+      <Show when={loading()}>
+        <div class="settings-hint settings-block" role="status">
+          Loading snapshot settings…
+        </div>
+      </Show>
+      <Show when={loadError()}>
+        {(error) => (
+          <div class="settings-hint settings-block" role="alert">
+            Couldn&apos;t load backup settings: {error()}
+            <button class="settings-btn" style={{ "margin-left": "10px" }} onClick={() => void refresh()}>
+              Retry
+            </button>
+          </div>
+        )}
+      </Show>
       <Show
-        when={list().length}
-        fallback={<div class="settings-hint settings-block">No snapshots yet.</div>}
+        when={ready() && list().length}
+        fallback={
+          <Show when={ready()}>
+            <div class="settings-hint settings-block">No snapshots yet.</div>
+          </Show>
+        }
       >
         <div class="settings-backups">
           <For each={list()}>
@@ -2239,7 +2301,7 @@ function BackupsTab(): JSX.Element {
               <div class="settings-backup-row">
                 <span class="settings-backup-when">{fmtStamp(b.stamp)}</span>
                 <span class="settings-backup-files mono">{b.files} files</span>
-                <button class="settings-btn" disabled={busy()} onClick={() => void restore(b)}>
+                <button class="settings-btn" disabled={!ready() || busy()} onClick={() => void restore(b)}>
                   Restore
                 </button>
               </div>

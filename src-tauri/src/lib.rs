@@ -32,11 +32,13 @@ use commands::{
     list_orphan_assets, list_pages, list_sync_conflicts, list_templates, load_workspaces, merge_pages,
     open_asset, open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
     publish_html, query_facets, quick_switch, read_asset, read_custom_css, read_highlights,
-    read_journal_file, read_local_image, read_text_file, rename_file_to_page, rename_page,
+    read_journal_file, read_local_image, read_text_file, referenced_page_names,
+    rename_file_to_page, rename_page,
     resolve_block, resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search,
     run_query, save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
-    set_favorites, set_guide_announced, set_journal_title_format, set_preferred_format,
-    set_preferred_workflow, set_show_brackets, set_start_of_week, set_timetracking_enabled,
+    set_doc_mode_enter_for_new_block, set_favorites, set_guide_announced, set_journal_title_format,
+    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
+    set_start_of_week, set_timetracking_enabled,
     stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
     save_workspaces, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
@@ -572,9 +574,12 @@ pub fn run() {
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_system_bars::init());
     // Mobile has no xdg-open/open/explorer, so `open_external` routes URL opens
-    // through this plugin's platform Intent instead (GH #49). Desktop keeps its
-    // env-scrubbed spawn; the plugin is compiled/registered on mobile only.
-    #[cfg(mobile)]
+    // through this plugin's platform Intent instead (GH #49). Windows uses it
+    // for ShellExecute, because `explorer <url>` opens a File Explorer window
+    // instead of the browser (GH #215). `app.opener()` reads this plugin's
+    // state, so both arms need it registered. Linux/macOS keep their
+    // env-scrubbed spawn and do not compile the plugin at all.
+    #[cfg(any(mobile, target_os = "windows"))]
     let builder = builder.plugin(tauri_plugin_opener::init());
 
     builder
@@ -741,6 +746,7 @@ pub fn run() {
             android_media::cancel_recording,
             android_system_bars::set_system_bar_appearance,
             list_pages,
+            referenced_page_names,
             journal_feed_page,
             get_page,
             graph_source_files,
@@ -768,6 +774,8 @@ pub fn run() {
             set_preferred_workflow,
             set_timetracking_enabled,
             set_show_brackets,
+            set_doc_mode_enter_for_new_block,
+            set_logical_outdenting,
             set_guide_announced,
             set_preferred_format,
             set_journal_title_format,

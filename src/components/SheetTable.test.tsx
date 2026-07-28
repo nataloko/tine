@@ -85,6 +85,25 @@ function pointerLeave(target: EventTarget): Event {
   return event;
 }
 
+function fieldHeader(root: HTMLElement, label: string): HTMLElement {
+  const header = [...root.querySelectorAll<HTMLElement>(".sheet-field-header")].find((el) => el.textContent?.trim() === label);
+  if (!header) throw new Error(`missing ${label} field header`);
+  return header;
+}
+
+function dragFieldHeader(source: HTMLElement, target: HTMLElement, before = true): void {
+  const elementFromPoint = document.elementFromPoint;
+  document.elementFromPoint = () => target;
+  try {
+    source.dispatchEvent(pointer("pointerdown", 0, 0));
+    const x = before ? -10 : 10;
+    window.dispatchEvent(pointer("pointermove", x, 0));
+    window.dispatchEvent(pointer("pointerup", x, 0));
+  } finally {
+    document.elementFromPoint = elementFromPoint;
+  }
+}
+
 function cell(root: HTMLElement, row: number, col: number, gridId = "table"): HTMLElement {
   const el = root.querySelector(
     `.sheet-cell[data-sheet-grid-id="${gridId}"][data-row="${row}"][data-col="${col}"]`
@@ -576,6 +595,139 @@ describe("SheetTable", () => {
     expect(doc.byId.table.raw).toBe(
       "Table\ntine.view:: table\ntine.fields:: state=state;priority=priority;owner=text;estimate=text"
     );
+    dispose();
+  });
+
+  it("materializes the current visual schema before reordering a first property drag", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table", null, ["r1"]),
+        r1: node("r1", "TODO Task\nowner:: Martin\nestimate:: 2", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const initial = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+
+    dragFieldHeader(fieldHeader(initial.root, "estimate"), fieldHeader(initial.root, "owner"));
+
+    expect(blockProperty("table", "tine.fields")).toBe("state=state;estimate=text;owner=text");
+    expect([...initial.root.querySelectorAll(".sheet-header-cell")].map((h) => h.textContent?.trim()))
+      .toEqual(["Block", "State", "estimate", "owner", "+Add column"]);
+    initial.dispose();
+
+    const restarted = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    expect([...restarted.root.querySelectorAll(".sheet-header-cell")].map((h) => h.textContent?.trim()))
+      .toEqual(["Block", "State", "estimate", "owner", "+Add column"]);
+    restarted.dispose();
+  });
+
+  it("reorders declared fields without absorbing undeclared columns into the schema", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: b=number;a=text", null, ["r1"]),
+        r1: node("r1", "Row\na:: first\nb:: 2\nx:: kept\ny:: kept too", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+
+    dragFieldHeader(fieldHeader(root, "a"), fieldHeader(root, "b"));
+
+    expect(blockProperty("table", "tine.fields")).toBe("a=text;b=number");
+    expect([...root.querySelectorAll(".sheet-header-cell")].map((h) => h.textContent?.trim()))
+      .toEqual(["Block", "a", "b", "x", "y", "+Add column"]);
+    dispose();
+  });
+
+  it("keeps formula columns pinned after a property is dropped on them", () => {
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: a=text;b=text\ntine.formula.total:: a + b",
+          null,
+          ["r1"]
+        ),
+        r1: node("r1", "Row\na:: 1\nb:: 2", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+
+    dragFieldHeader(fieldHeader(root, "a"), fieldHeader(root, "ƒtotal"), false);
+
+    expect(blockProperty("table", "tine.fields")).toBe("b=text;a=text");
+    expect([...root.querySelectorAll(".sheet-header-cell")].map((h) => h.textContent?.trim()))
+      .toEqual(["Block", "b", "a", "ƒtotal", "+Add column"]);
+    dispose();
+  });
+
+  it("round-trips reordered schemas through block and page schema homes", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: first=text;second=number", null, ["r1"]),
+        r1: node("r1", "Row\nfirst:: one\nsecond:: 2", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const block = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    dragFieldHeader(fieldHeader(block.root, "second"), fieldHeader(block.root, "first"));
+    expect(blockProperty("table", "tine.fields")).toBe("second=number;first=text");
+    block.dispose();
+
+    const blockRestarted = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    expect([...blockRestarted.root.querySelectorAll(".sheet-field-header")].map((h) => h.textContent?.trim()))
+      .toEqual(["second", "first"]);
+    blockRestarted.dispose();
+    document.body.innerHTML = "";
+
+    setDoc({
+      byId: { row: node("row", "Tagged #Tag\nfirst:: one\nsecond:: 2", null) },
+      pages: [page(["row"], "tine.fields:: first=text;second=number")], feed: ["Sheet"], loaded: true,
+    });
+    const groups: RefGroup[] = [{
+      page: "Sheet",
+      kind: "page",
+      blocks: [{
+        id: "row",
+        raw: doc.byId.row.raw,
+        collapsed: false,
+        children: [],
+        tags: ["Tag"],
+        properties: [["first", "one"], ["second", "2"]],
+      }],
+    }];
+    const pageSchema = () => <SheetTable ownerId="tag-page:Tag" rowSource="query" groups={groups} schemaPage="Sheet" />;
+    const pageHome = mount(pageSchema);
+    dragFieldHeader(fieldHeader(pageHome.root, "second"), fieldHeader(pageHome.root, "first"));
+    expect(readPageProperty("Sheet", "tine.fields")).toBe("second=number;first=text");
+    pageHome.dispose();
+
+    const pageRestarted = mount(pageSchema);
+    expect([...pageRestarted.root.querySelectorAll(".sheet-field-header")].map((h) => h.textContent?.trim()).slice(0, 2))
+      .toEqual(["second", "first"]);
+    pageRestarted.dispose();
+  });
+
+  it("keeps a header click as a sort when pointer movement stays below the drag threshold", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: score=number", null, ["r1", "r2"]),
+        r1: node("r1", "Beta\nscore:: 2", "table"),
+        r2: node("r2", "Alpha\nscore:: 1", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    const score = fieldHeader(root, "score");
+
+    score.dispatchEvent(pointer("pointerdown", 0, 0));
+    window.dispatchEvent(pointer("pointermove", 2, 0));
+    window.dispatchEvent(pointer("pointerup", 2, 0));
+    score.click();
+
+    expect([...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((cell) => cell.textContent?.trim()))
+      .toEqual(["Alpha", "Beta"]);
     dispose();
   });
 
@@ -1253,7 +1405,9 @@ describe("SheetTable", () => {
     const day10 = [...root.querySelectorAll(".date-picker .dp-cell")]
       .find((el) => el.textContent?.trim() === "10") as HTMLButtonElement | undefined;
     day10!.click();
-    expect(doc.byId.r1.raw).toBe("Task\nstarts:: 2026-07-08 09:30\ndue:: 2026-07-10");
+    // Editing the `due` cell keeps `due` in its original (first) position — a
+    // value edit must not reorder the columns (GH #216).
+    expect(doc.byId.r1.raw).toBe("Task\ndue:: 2026-07-10\nstarts:: 2026-07-08 09:30");
 
     (cell(root, 0, 2).querySelector(".date-chip") as HTMLElement).click();
     const day11 = [...root.querySelectorAll(".date-picker .dp-cell")]
