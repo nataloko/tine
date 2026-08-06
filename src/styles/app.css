@@ -1985,6 +1985,16 @@ textarea {
   color: var(--text-muted);
   font-size: 12px;
 }
+.settings-activation-progress {
+  display: grid;
+  gap: 5px;
+  width: min(320px, 100%);
+  margin-top: 8px;
+}
+.settings-activation-progress progress {
+  display: block;
+  width: 100%;
+}
 /* A setting laid out vertically: label + control on the top line, the
    explanatory hint on its own full-width line below (so long hints wrap
    cleanly instead of being crammed into the right column). Matches the
@@ -2224,6 +2234,29 @@ textarea {
 }
 .settings-advanced-toggle:hover,.settings-advanced-toggle:focus-visible { color: var(--text-primary); background: var(--bg-tertiary); }
 .settings-advanced-body { padding: 2px 0 0 12px; border-left: 1px solid var(--border-color); }
+.settings-experimental .settings-advanced-toggle {
+  border: 1px solid color-mix(in srgb, #c0392b 35%, transparent);
+  background: color-mix(in srgb, #c0392b 7%, var(--bg-secondary));
+  color: var(--danger, #b33);
+}
+.settings-experimental .settings-advanced-toggle:hover,
+.settings-experimental .settings-advanced-toggle:focus-visible {
+  background: color-mix(in srgb, #c0392b 12%, var(--bg-secondary));
+  color: var(--danger, #b33);
+}
+.settings-experimental .settings-advanced-body {
+  border-left-color: color-mix(in srgb, #c0392b 45%, var(--border-color));
+}
+.settings-experimental-warning {
+  margin: 8px 0;
+  padding: 7px 9px;
+  border-left: 3px solid #c0392b;
+  background: color-mix(in srgb, #c0392b 8%, var(--bg-secondary));
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.settings-experimental-warning strong { color: var(--danger, #b33); }
 /* Segmented two-option control (e.g. task workflow). */
 .settings-segment {
   display: inline-flex;

@@ -74,6 +74,10 @@ see the project `CLAUDE.md`.
 | [0045](0045-tine-native-plugin-platform.md) | Tine-native plugins run as capability-limited WebAssembly guests | Accepted |
 | [0046](0046-declarative-plugin-settings-and-themes.md) | Plugin settings and themes are separate declarative host contracts | Accepted |
 | [0047](0047-android-plugin-platform-at-launch.md) | Android joins the initial plugin-platform launch through explicit opt-in | Accepted |
+| [0048](0048-compatible-managed-sync.md) | Managed sync uses operation truth with an optional shared Markdown projection | Superseded by 0049 |
+| [0049](0049-oplog-first-sparse-storage.md) | Oplog-first sparse storage uses catalog and stable home-page shards | Accepted — implementation/LocalActive gated |
+| [0050](0050-private-enrollment-checkpoint-authority.md) | Private enrollment authority authenticates bounded immutable checkpoints | Accepted |
+| [0051](0051-single-user-multipart-bootstrap-authority.md) | Single-user multipart bootstrap authority is one commit-last V1 publication | Accepted — inactive format contract |
 
 **Fork (`mine`) ADRs** - this fork's own extras keep a separate numbering track so upstream syncs
 never collide: see [`mine/README.md`](mine/README.md).

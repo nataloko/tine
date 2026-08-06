@@ -100,6 +100,38 @@ pub(crate) fn update_settings(
     .map_err(|e| e.to_string())
 }
 
+/// Stable installation identity for managed sync. It lives in device-local app
+/// settings, never in the provider-shared graph: two installations writing the
+/// same device stream would violate the one-writer invariant. Loro peer ids are
+/// session-scoped separately; this UUID names the installation directory only.
+pub(crate) fn managed_sync_device_id(app: &tauri::AppHandle) -> Result<uuid::Uuid, String> {
+    let path = settings_path(app).ok_or("no app-data dir")?;
+    managed_sync_device_id_at(&path)
+}
+
+fn managed_sync_device_id_at(path: &std::path::Path) -> Result<uuid::Uuid, String> {
+    let chosen = std::sync::Mutex::new(None);
+    update_settings_strict_at(path, |json| {
+        let id = match json.get("managed_sync_device_id") {
+            None => uuid::Uuid::new_v4(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| "managed_sync_device_id must be a UUID string".to_string())
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map_err(|_| "managed_sync_device_id is not a valid UUID".to_string())
+                })?,
+        };
+        json["managed_sync_device_id"] = serde_json::Value::String(id.to_string());
+        *chosen.lock().unwrap() = Some(id);
+        Ok(())
+    })?;
+    chosen
+        .into_inner()
+        .map_err(|_| "managed sync device-id lock poisoned".to_string())?
+        .ok_or_else(|| "managed sync device id was not written".to_string())
+}
+
 fn graph_display_name(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -136,7 +168,9 @@ fn forget_graph_json(json: &mut serde_json::Value, path: &str) {
     json["known_graphs"] = serde_json::to_value(graphs).unwrap_or_default();
 }
 
-fn external_assets_approvals(json: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+fn external_assets_approvals(
+    json: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
     json.get("external_assets_approvals")
         .and_then(serde_json::Value::as_object)
         .cloned()
@@ -169,16 +203,17 @@ pub(crate) fn remember_external_assets_approval(
 ) -> Result<(), String> {
     let graph = graph_root.display().to_string();
     let assets = assets_root.display().to_string();
-    update_settings(app, |json| remember_external_assets_approval_json(json, &graph, &assets))
+    update_settings(app, |json| {
+        remember_external_assets_approval_json(json, &graph, &assets)
+    })
 }
 
-fn remember_external_assets_approval_json(
-    json: &mut serde_json::Value,
-    graph: &str,
-    assets: &str,
-) {
+fn remember_external_assets_approval_json(json: &mut serde_json::Value, graph: &str, assets: &str) {
     let mut approvals = external_assets_approvals(json);
-    approvals.insert(graph.to_string(), serde_json::Value::String(assets.to_string()));
+    approvals.insert(
+        graph.to_string(),
+        serde_json::Value::String(assets.to_string()),
+    );
     json["external_assets_approvals"] = serde_json::Value::Object(approvals);
 }
 
@@ -672,5 +707,43 @@ mod tests {
         assert!(app_bool_at(&path, "missing", true));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_sync_device_id_is_stable_and_preserves_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tine-settings.json");
+        std::fs::write(&path, r#"{"unrelated":true}"#).unwrap();
+
+        let first = managed_sync_device_id_at(&path).unwrap();
+        let second = managed_sync_device_id_at(&path).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(persisted["managed_sync_device_id"], first.to_string());
+        assert_eq!(persisted["unrelated"], true);
+    }
+
+    #[test]
+    fn managed_sync_device_id_refuses_to_replace_malformed_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tine-settings.json");
+        let malformed = b"not json\n";
+        std::fs::write(&path, malformed).unwrap();
+
+        assert!(managed_sync_device_id_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn managed_sync_device_id_refuses_to_regenerate_an_invalid_existing_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tine-settings.json");
+        let invalid = br#"{"managed_sync_device_id":"not-a-uuid","unrelated":true}"#;
+        std::fs::write(&path, invalid).unwrap();
+
+        assert!(managed_sync_device_id_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
     }
 }

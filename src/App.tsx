@@ -272,6 +272,32 @@ export async function handleGraphChange(c: GraphChange) {
   }
 }
 
+export async function handleSparseV2Changed() {
+  // Managed reconciliation reports one admitted aggregate epoch rather than
+  // legacy per-file changes. Refresh only live surfaces and invalidate the
+  // bounded inventory; unloaded pages remain demand-loaded from SQLite.
+  bumpDataRev();
+  bumpPageInventoryRev();
+  const routes = layoutPaneIds().map((paneId) => ({
+    paneId,
+    route: paneRouter(paneId).route(),
+  }));
+  const refreshed = new Set<string>();
+  for (const { route } of routes) {
+    if (route.kind !== "page" || refreshed.has(`${route.pageKind}:${route.name}`)) continue;
+    refreshed.add(`${route.pageKind}:${route.name}`);
+    const disposition = reloadDisposition(route.name);
+    if (disposition === "skip") continue;
+    if (disposition === "conflict") {
+      markConflict(route.name);
+      continue;
+    }
+    const dto = await backend().getPage(route.name, route.pageKind);
+    if (dto) reloadPage(toLoadablePage(dto, route.name));
+  }
+  requestJournalFeedWatcherRestart(routes);
+}
+
 export function PaneTree(props: { node: LayoutNode; path: number[] }): JSX.Element {
   const n = () => props.node;
   // Keyed leaf: PaneLeaf freezes its router (and its context providers) at
@@ -641,6 +667,20 @@ export function App(): JSX.Element {
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onSparseV2Changed(() => void handleSparseV2Changed())
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onManagedSyncError(() => pushToast("Tine-managed storage stopped. Open Storage & sync to retry setup.", "error"))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
   // Load the asset-filename format template (Settings → Backups → Asset names).
   onMount(() => void initAssetSettings());
   // Load external media-editor command templates (Settings → Files; GH #38).
@@ -700,8 +740,19 @@ export function App(): JSX.Element {
         try {
           await backend().closeGraphWindow();
           return;
-        } catch {
-          // fall through to the direct close below
+        } catch (error) {
+          if (String(error).includes("sparse-v2-shutdown-refused")) {
+            allowClose = false;
+            safeClose.reset();
+            closeInProgress = false;
+            pushToast(
+              "Tine-managed storage could not verify a clean stop. The window remains open so you can retry or inspect recovery status.",
+              "error"
+            );
+            return;
+          }
+          // Non-sparse native window failures retain the established direct
+          // close fallback below.
         }
         try {
           await w.destroy();
@@ -950,7 +1001,7 @@ export function App(): JSX.Element {
       </Show>
       <Show when={graphTransitioning()}>
         <DrawerBackground class="graph-transition-shield" blockedBy="any" role="status" ariaLive="polite">
-          Finishing graph operation…
+          {firstLoadDone() ? "Finishing graph operation…" : "Opening graph storage…"}
         </DrawerBackground>
       </Show>
       <Show when={sidebarOpen()}>

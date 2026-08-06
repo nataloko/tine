@@ -17,6 +17,7 @@ import {
   windowsWebviewProfileSnapshot,
 } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
+import { LINUX_TINE_CORE_SHARD_COUNT } from "./tine-core-nextest-contract.mjs";
 
 const version = "0.5.6";
 const commit = "a".repeat(40);
@@ -24,6 +25,7 @@ const repository = "martinkoutecky/tine";
 const layout = releaseLayout(version);
 const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
+const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
 const flatpakMetadataWorkflow = fs.readFileSync(
@@ -45,6 +47,64 @@ const windowsScenarios = [
   "e2e-print-security.mjs",
   "e2e-tab-overflow.mjs",
 ];
+
+function yamlBlock(lines, key, indent) {
+  const header = `${" ".repeat(indent)}${key}:`;
+  const start = lines.findIndex((line) => line === header);
+  assert.ok(start >= 0, `CI workflow is missing YAML mapping ${key}`);
+
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line.trim() && line.length - line.trimStart().length <= indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start + 1, end);
+}
+
+function yamlScalar(lines, key, indent) {
+  const prefix = `${" ".repeat(indent)}${key}:`;
+  const line = lines.find((candidate) => candidate.startsWith(prefix));
+  assert.ok(line, `CI workflow is missing YAML scalar ${key}`);
+  return line.slice(prefix.length).trim();
+}
+
+function yamlNamedStep(lines, name) {
+  const marker = `- name: ${name}`;
+  const start = lines.findIndex((line) => line.trimStart() === marker);
+  assert.ok(start >= 0, `CI workflow is missing step ${name}`);
+  const indent = lines[start].length - lines[start].trimStart().length;
+
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line.trimStart().startsWith("- ") && line.length - line.trimStart().length === indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start, end);
+}
+
+function yamlLiteral(lines, key) {
+  const line = lines.find((candidate) => candidate.trimStart() === `${key}: |`);
+  assert.ok(line, `CI workflow is missing literal ${key}`);
+  const indent = line.length - line.trimStart().length;
+  const start = lines.indexOf(line) + 1;
+  let end = start;
+  while (end < lines.length) {
+    const candidate = lines[end];
+    if (candidate.trim() && candidate.length - candidate.trimStart().length <= indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start, end).map((candidate) => candidate.trim()).join("\n").trimEnd();
+}
+
+const ciYaml = ciWorkflow.split(/\r?\n/);
 
 const successfulFullCiRun = {
   id: 1234,
@@ -108,8 +168,17 @@ assert.match(
   "docs-only pull requests still start app validation"
 );
 for (const name of REQUIRED_FULL_CI_JOBS) {
+  if (/Full CI \/ Linux tine-core nextest shard [1-4]\/4/.test(name)) continue;
   assert.ok(ciWorkflow.includes(`name: ${name}`), `CI workflow is missing stable evidence job ${name}`);
 }
+assert.deepEqual(
+  REQUIRED_FULL_CI_JOBS.filter((name) => name.includes("Linux tine-core nextest shard")),
+  Array.from(
+    { length: LINUX_TINE_CORE_SHARD_COUNT },
+    (_, index) => `Full CI / Linux tine-core nextest shard ${index + 1}/${LINUX_TINE_CORE_SHARD_COUNT}`
+  ),
+  "exact-SHA evidence does not enumerate every Linux nextest shard"
+);
 assert.match(
   ciWorkflow,
   /test:[\s\S]*?name: Full CI \/ Linux tests and release contracts[\s\S]*?inputs\.scope == 'full'/,
@@ -117,23 +186,314 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
-  /test:\n    name: Full CI \/ Linux tests and release contracts[\s\S]*?uses: dtolnay\/rust-toolchain@stable\n        with:\n          targets: wasm32-unknown-unknown[\s\S]*?name: Standalone plugin template builds and conforms\n        run: npm run plugin:template-check/,
+  /test:\n    name: Full CI \/ Linux tests and release contracts[\s\S]*?uses: dtolnay\/rust-toolchain@1\.96\.0\n        with:\n          targets: wasm32-unknown-unknown[\s\S]*?name: Standalone plugin template builds and conforms\n        run: npm run plugin:template-check/,
   "the Linux full-CI plugin-template check does not install the WASM target"
 );
-assert.match(
-  ciWorkflow,
-  /windows-compile:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'windows'/,
-  "the Windows lane cannot distinguish full and focused dispatches"
+const ciOn = yamlBlock(ciYaml, "on", 0);
+const dispatch = yamlBlock(ciOn, "workflow_dispatch", 2);
+const dispatchInputs = yamlBlock(dispatch, "inputs", 4);
+const windowsTestInput = yamlBlock(dispatchInputs, "windows_test_name", 6);
+assert.equal(yamlScalar(windowsTestInput, "required", 8), "false");
+assert.equal(yamlScalar(windowsTestInput, "default", 8), '""');
+assert.equal(yamlScalar(windowsTestInput, "type", 8), "string");
+
+const runName = yamlScalar(ciYaml, "run-name", 0);
+assert.ok(runName.includes("focused Windows / {0}"), "focused dispatches are not labeled in run metadata");
+assert.ok(
+  runName.includes("format('focused Windows / {0}', inputs.windows_test_name)"),
+  "focused run metadata does not expose the exact selected test name"
 );
+assert.ok(runName.includes("full suite / {0}"), "full dispatches are not labeled in run metadata");
+assert.ok(runName.includes("${{ github.sha }}"), "CI run metadata does not expose the exact dispatched SHA");
+const ciPermissions = yamlBlock(ciYaml, "permissions", 0);
+assert.equal(yamlScalar(ciPermissions, "contents", 2), "read");
+assert.doesNotMatch(ciPermissions.join("\n"), /write/, "CI must not request write permissions");
+
+const ciJobs = yamlBlock(ciYaml, "jobs", 0);
+assert.match(nextestConfig, /^nextest-version = "0\.9\.143"$/m, "nextest version is not pinned");
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?default-filter = "all\(\)"/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?fail-fast = false/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?retries = 0/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?flaky-result = "fail"/);
 assert.match(
-  ciWorkflow,
-  /android-core-compile:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'android'/,
-  "the Android lane cannot distinguish full and focused dispatches"
+  nextestConfig,
+  /slow-timeout = \{ period = "5m", terminate-after = 2, grace-period = "30s", on-timeout = "fail" \}/,
+  "nextest CI profile does not fail on a finite per-test timeout"
 );
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?global-timeout = "4h"/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?status-level = "slow"[\s\S]*?final-status-level = "slow"/);
+const windowsNextestProfile = nextestConfig.match(
+  /^\[profile\.ci-windows\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m
+)?.[1];
+assert.ok(windowsNextestProfile, "nextest config is missing the Windows profile");
+assert.match(windowsNextestProfile, /^inherits = "ci"$/m);
+assert.match(windowsNextestProfile, /^run-extra-args = \["--test-threads=1"\]$/m);
+assert.doesNotMatch(
+  windowsNextestProfile,
+  /^test-threads\s*=\s*1\s*$/m,
+  "Windows nextest profile globally serializes isolated test processes"
+);
+assert.doesNotMatch(nextestConfig, /on-timeout = "pass"|retries = [1-9]/, "nextest profile masks a failure");
+const scopeValidation = yamlBlock(ciJobs, "validate-windows-focused-test-input", 2);
+assert.equal(
+  yamlScalar(scopeValidation, "if", 4),
+  "github.event_name == 'workflow_dispatch' && inputs.windows_test_name != '' && inputs.scope != 'windows'"
+);
+const scopeValidationScript = yamlLiteral(
+  yamlNamedStep(scopeValidation, "Reject Windows focused test outside Windows scope"),
+  "run"
+);
+assert.ok(scopeValidationScript.includes("::error::windows_test_name may only be used with scope=windows."));
+assert.ok(scopeValidationScript.endsWith("exit 1"));
+const needsWindowsScope = (scope, testName) => testName !== "" && scope !== "windows";
+for (const scope of ["full", "android", "performance"]) {
+  assert.equal(needsWindowsScope(scope, "model::tests::focused"), true, `${scope} must reject a filter`);
+}
+assert.equal(needsWindowsScope("windows", "model::tests::focused"), false);
+assert.equal(needsWindowsScope("full", ""), false);
+
+const windowsCompile = yamlBlock(ciJobs, "windows-compile", 2);
+assert.equal(
+  yamlScalar(windowsCompile, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))"
+);
+const runsWindowsLane = (scope, testName) => scope === "windows" || (scope === "full" && testName === "");
+assert.equal(runsWindowsLane("full", ""), true);
+assert.equal(runsWindowsLane("full", "config::tests::focused"), false);
+assert.equal(runsWindowsLane("windows", "config::tests::focused"), true);
+const nextestInstall = yamlNamedStep(windowsCompile, "Install cargo-nextest 0.9.143");
+assert.equal(yamlScalar(nextestInstall, "uses", 8), "taiki-e/install-action@v2");
+assert.equal(yamlScalar(yamlBlock(nextestInstall, "with", 8), "tool", 10), "nextest@0.9.143");
+const windowsCoreCompile = yamlNamedStep(windowsCompile, "Windows core test targets compile (all; release gate)");
+assert.equal(yamlScalar(windowsCoreCompile, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsCoreCompile, "run", 8), "cargo test -p tine-core --no-run");
+const windowsStorageCompile = yamlNamedStep(windowsCompile, "Windows storage test targets compile (all; release gate)");
+assert.equal(yamlScalar(windowsStorageCompile, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsStorageCompile, "run", 8), "cargo test -p tine-storage --no-run");
+const windowsCoreSmoke = yamlNamedStep(
+  windowsCompile,
+  "Windows core + storage smoke (isolated contract selections; release gate)"
+);
+assert.equal(yamlScalar(windowsCoreSmoke, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsCoreSmoke, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke");
+assert.doesNotMatch(
+  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsStorageCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8)].join("\n"),
+  /continue-on-error|retries|--skip/,
+  "Windows release coverage masks a failed compile, smoke, or storage test"
+);
+assert.doesNotMatch(
+  windowsCompile.join("\n"),
+  /cargo nextest run --profile ci-windows --package tine-storage$/m,
+  "Windows release coverage accidentally restored the full tine-storage runtime suite"
+);
+assert.doesNotMatch(
+  yamlScalar(windowsCoreSmoke, "run", 8),
+  /cargo nextest run --profile ci-windows --package tine-core$/,
+  "Windows release coverage accidentally restored the whole tine-core runtime suite"
+);
+
+const focusedWindowsCore = yamlNamedStep(
+  windowsCompile,
+  "Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}"
+);
+assert.equal(yamlScalar(focusedWindowsCore, "if", 8), "inputs.scope == 'windows' && inputs.windows_test_name != ''");
+assert.equal(yamlScalar(focusedWindowsCore, "shell", 8), "pwsh");
+assert.equal(
+  yamlScalar(yamlBlock(focusedWindowsCore, "env", 8), "TINE_WINDOWS_RUST_TEST", 10),
+  "${{ inputs.windows_test_name }}"
+);
+const focusedWindowsScript = yamlLiteral(focusedWindowsCore, "run");
+assert.ok(focusedWindowsScript.includes("$testName = $env:TINE_WINDOWS_RUST_TEST.Trim()"));
+assert.ok(focusedWindowsScript.includes("[string]::IsNullOrWhiteSpace($testName)"));
+assert.ok(focusedWindowsScript.includes("$testName -notmatch '^[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*$'"));
+assert.ok(focusedWindowsScript.includes("$listedTests = & cargo test -p tine-core --lib -- --list"));
+assert.ok(focusedWindowsScript.includes('$_ -ceq "${testName}: test"'));
+assert.ok(focusedWindowsScript.includes("if ($matchingTests.Count -ne 1)"));
+assert.ok(focusedWindowsScript.includes('"--lib"'));
+assert.ok(focusedWindowsScript.includes("$testName"));
+assert.ok(focusedWindowsScript.includes('"--exact"'));
+assert.ok(focusedWindowsScript.includes('"--nocapture"'));
+assert.ok(focusedWindowsScript.includes('"--test-threads=1"'));
+assert.ok(focusedWindowsScript.includes("& cargo @cargoArgs"));
+
+const exactHarnessMatches = (listedTests, testName) =>
+  listedTests.split(/\r?\n/).filter((line) => line === `${testName}: test`);
+const knownHarnessName = "model::tests::active_rename_projection_scan_budget_has_exact_pre_commit_boundary";
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, knownHarnessName).length, 1);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, "model::tests::unknown_name").length, 0);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, knownHarnessName.toUpperCase()).length, 0);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test\n${knownHarnessName}: test`, knownHarnessName).length, 2);
+const safeRustTestPath = /^[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*$/;
+assert.equal("   \t".trim(), "");
+assert.equal(safeRustTestPath.test(knownHarnessName), true);
+assert.equal(safeRustTestPath.test("model::tests::unknown name"), false);
+assert.equal(safeRustTestPath.test("model::tests::unknown; exit 0"), false);
+
+const tauriCompile = yamlNamedStep(windowsCompile, "Windows Tauri shell compiles");
+assert.equal(yamlScalar(tauriCompile, "run", 8), "cargo check -p tine --features custom-protocol");
+const fullLinux = yamlBlock(ciJobs, "test", 2);
+const linuxCoreContract = yamlBlock(ciJobs, "linux-core-nextest-contract", 2);
+assert.equal(yamlScalar(linuxCoreContract, "name", 4), "Full CI / Linux tine-core nextest contract");
+assert.equal(yamlScalar(linuxCoreContract, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreContract, "Install cargo-nextest 0.9.143"), "uses", 8),
+  "taiki-e/install-action@v2"
+);
+assert.equal(
+  yamlScalar(yamlBlock(yamlNamedStep(linuxCoreContract, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
+  "nextest@0.9.143"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreContract, "Verify Linux tine-core nextest inventory and deterministic shards"), "run", 8),
+  "node scripts/tine-core-nextest-contract.mjs --mode linux"
+);
+const linuxCoreShards = yamlBlock(ciJobs, "linux-core-nextest", 2);
+assert.equal(
+  yamlScalar(linuxCoreShards, "name", 4),
+  `Full CI / Linux tine-core nextest shard \${{ matrix.shard }}/${LINUX_TINE_CORE_SHARD_COUNT}`
+);
+assert.equal(yamlScalar(linuxCoreShards, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.match(
-  ciWorkflow,
-  /bench:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'performance'/,
-  "the performance lane cannot distinguish full and focused dispatches"
+  linuxCoreShards.join("\n"),
+  new RegExp(`strategy:[\\s\\S]*?fail-fast: false[\\s\\S]*?shard: \\[1, 2, 3, ${LINUX_TINE_CORE_SHARD_COUNT}\\]`),
+  "Linux nextest shard topology is not explicit and complete"
+);
+assert.equal(
+  yamlScalar(
+    yamlNamedStep(linuxCoreShards, "Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4"),
+    "run",
+    8
+  ),
+  "cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "uses", 8),
+  "taiki-e/install-action@v2"
+);
+assert.equal(
+  yamlScalar(yamlBlock(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
+  "nextest@0.9.143"
+);
+assert.doesNotMatch(
+  [linuxCoreContract, linuxCoreShards, windowsCompile].map((job) => job.join("\n")).join("\n"),
+  /continue-on-error:/,
+  "nextest release evidence hides a failed contract or test job"
+);
+assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
+const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
+const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
+const performanceBench = yamlBlock(ciJobs, "bench", 2);
+assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.equal(
+  yamlScalar(androidCompile, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+);
+assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
+assert.equal(
+  yamlScalar(androidTestApk, "if", 4),
+  "github.event_name == 'workflow_dispatch' && inputs.scope == 'android'"
+);
+const runsAndroidTestApk = (event, scope) => event === "workflow_dispatch" && scope === "android";
+assert.equal(runsAndroidTestApk("workflow_dispatch", "android"), true);
+assert.equal(runsAndroidTestApk("pull_request", "android"), false);
+for (const scope of ["full", "windows", "performance"]) {
+  assert.equal(runsAndroidTestApk("workflow_dispatch", scope), false, `${scope} must not build a test APK`);
+}
+
+const androidTestJava = yamlNamedStep(androidTestApk, "Set up Java 17");
+assert.equal(yamlScalar(androidTestJava, "uses", 8), "actions/setup-java@v4");
+assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "distribution", 10), "temurin");
+assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "java-version", 10), '"17"');
+const androidTestNode = yamlNamedStep(androidTestApk, "Set up Node 20");
+assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v4");
+assert.equal(yamlScalar(yamlBlock(androidTestNode, "with", 8), "node-version", 10), "20");
+const androidTestRust = yamlNamedStep(androidTestApk, "Set up Rust 1.96.0");
+assert.equal(yamlScalar(androidTestRust, "uses", 8), "dtolnay/rust-toolchain@1.96.0");
+assert.equal(
+  yamlScalar(yamlBlock(androidTestRust, "with", 8), "targets", 10),
+  "aarch64-linux-android"
+);
+const androidTestSdk = yamlLiteral(yamlNamedStep(androidTestApk, "Install Android SDK packages"), "run");
+assert.match(androidTestSdk, /"platforms;android-36" "platforms;android-35"/);
+assert.match(androidTestSdk, /"build-tools;35\.0\.0" "ndk;26\.3\.11579264" "platform-tools"/);
+assert.match(
+  androidTestSdk,
+  /for v in NDK_HOME ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME; do[\s\S]*?echo "\$v=\$NDK" >> "\$GITHUB_ENV"/
+);
+assert.match(androidTestSdk, /! -name "26\.3\.11579264" -exec rm -rf \{\} \+/);
+assert.match(androidTestSdk, /rm -rf "\$ANDROID_SDK_ROOT\/ndk-bundle"/);
+assert.equal(yamlScalar(yamlNamedStep(androidTestApk, "Install JS deps"), "run", 8), "npm ci");
+
+const androidSigningCheck = yamlLiteral(yamlNamedStep(androidTestApk, "Require Android signing secrets"), "run");
+for (const secret of [
+  "ANDROID_KEYSTORE_BASE64",
+  "ANDROID_KEYSTORE_PASSWORD",
+  "ANDROID_KEY_ALIAS",
+  "ANDROID_KEY_PASSWORD",
+]) {
+  assert.match(androidSigningCheck, new RegExp(`\\b${secret}\\b`), `${secret} is not fail-closed`);
+}
+assert.match(androidSigningCheck, /exit "\$missing"/);
+const androidSigningConfig = yamlNamedStep(androidTestApk, "Write signing config from secrets");
+const androidSigningEnv = yamlBlock(androidSigningConfig, "env", 8);
+for (const secret of [
+  "ANDROID_KEYSTORE_BASE64",
+  "ANDROID_KEYSTORE_PASSWORD",
+  "ANDROID_KEY_ALIAS",
+  "ANDROID_KEY_PASSWORD",
+]) {
+  assert.match(
+    androidSigningEnv.join("\n"),
+    new RegExp(`secrets\\.${secret}`),
+    `${secret} is not passed only to the signing-config step`
+  );
+}
+const androidSigningScript = yamlLiteral(androidSigningConfig, "run");
+assert.match(androidSigningScript, /base64 -d > "\$RUNNER_TEMP\/tine-test-apk\.jks"/);
+assert.match(androidSigningScript, /src-tauri\/gen\/android\/keystore\.properties/);
+
+const androidVersion = yamlLiteral(yamlNamedStep(androidTestApk, "Set Android test version"), "run");
+assert.match(androidVersion, /short_sha="\$\{GITHUB_SHA:0:12\}"/);
+assert.match(androidVersion, /version_name="0\.7\.0-sync-\$short_sha"/);
+assert.match(androidVersion, /tauri\.android\.versionName=%s\\ntauri\.android\.versionCode=%s/);
+assert.match(androidVersion, /"\$version_name" "6999"/);
+const androidIdentifier = yamlLiteral(yamlNamedStep(androidTestApk, "Pin Android identifier to page.tine.app"), "run");
+assert.match(androidIdentifier, /c\.identifier='page\.tine\.app'/);
+const androidBuild = yamlLiteral(yamlNamedStep(androidTestApk, "Build signed Android test APK"), "run");
+assert.match(androidBuild, /RUSTFLAGS="--remap-path-prefix=\$GITHUB_WORKSPACE=\/build --remap-path-prefix=\$HOME\/\.cargo=\/cargo"/);
+assert.match(androidBuild, /npx tauri android build --target aarch64 --apk/);
+const androidLoaderCheck = yamlLiteral(
+  yamlNamedStep(androidTestApk, "Verify Android 9 native-loader compatibility"),
+  "run"
+);
+assert.match(androidLoaderCheck, /unzip -p "\$apk" lib\/arm64-v8a\/libtine_lib\.so/);
+assert.match(androidLoaderCheck, /renameat2/);
+
+const androidUploads = androidTestApk.filter((line) => line.trim() === "uses: actions/upload-artifact@v4");
+assert.equal(androidUploads.length, 1, "the test-APK job must upload only one artifact");
+const androidUpload = yamlNamedStep(androidTestApk, "Upload signed Android test APK");
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "name", 10), "tine-android-test-apk-${{ github.sha }}");
+assert.equal(
+  yamlScalar(yamlBlock(androidUpload, "with", 8), "path", 10),
+  "Tine_${{ steps.android-version.outputs.version_name }}_android-arm64.apk"
+);
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "if-no-files-found", 10), "error");
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "retention-days", 10), "3");
+const androidCleanup = yamlNamedStep(androidTestApk, "Remove Android test signing material");
+assert.equal(yamlScalar(androidCleanup, "if", 8), "always()");
+const androidCleanupScript = yamlLiteral(androidCleanup, "run");
+assert.match(androidCleanupScript, /tine-test-apk\.jks/);
+assert.match(androidCleanupScript, /libtine_lib\.so/);
+assert.match(androidCleanupScript, /src-tauri\/gen\/android\/keystore\.properties/);
+assert.match(androidCleanupScript, /src-tauri\/gen\/android\/app\/tauri\.properties/);
+assert.doesNotMatch(
+  androidTestApk.join("\n"),
+  /contents:\s*write|actions\/create-release|action-gh-release|gh release|git tag|git push|publish|deploy/i,
+  "the test-APK lane must stay read-only and never release, tag, publish, or deploy"
+);
+assert.equal(
+  yamlScalar(performanceBench, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'performance')"
 );
 assert.doesNotMatch(flatpakWorkflow, /\n  push:/, "the expensive Flatpak build still runs automatically on pushes");
 assert.match(flatpakMetadataWorkflow, /\n  pull_request:/, "lightweight Flatpak metadata validation is not on PRs");
@@ -161,14 +521,21 @@ assert.throws(
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{ run: successfulFullCiRun, jobs: successfulFullCiJobs.slice(0, 1) }]),
-  /Full CI \/ Windows compile and core tests concluded missing/
+  /Full CI \/ Windows compile \+ storage smoke \+ core smoke concluded missing/
+);
+assert.throws(
+  () => selectExactCiEvidence(commit, [{
+    run: successfulFullCiRun,
+    jobs: successfulFullCiJobs.filter((job) => job.name !== "Full CI / Linux tine-core nextest shard 4/4"),
+  }]),
+  /Full CI \/ Linux tine-core nextest shard 4\/4 concluded missing/
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{
     run: successfulFullCiRun,
     jobs: successfulFullCiJobs.map((job) => ({
       ...job,
-      conclusion: job.name === REQUIRED_FULL_CI_JOBS[3] ? "failure" : job.conclusion,
+      conclusion: job.name === "Full CI / performance A/B" ? "failure" : job.conclusion,
     })),
   }]),
   /Full CI \/ performance A\/B concluded failure/

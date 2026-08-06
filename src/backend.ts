@@ -22,12 +22,25 @@ import type {
   SyncConflictDiff,
   MergeDecision,
   PrintOpts,
+  ManagedSyncStatus,
+  SyncIdentityPlan,
+  ManagedSyncEnableResult,
+  SparseV2Status,
+  SparseV2CancelResult,
+  SparseV2ActivationProgressEvent,
+  SparseV2Tick,
+  SparseV2QueryRequest,
+  SparseV2QueryReply,
+  SparseV2EditorLoadRequest,
+  SparseV2EditorSaveRequest,
+  SparseV2EditorOutcome,
   PdfState,
   QueryExecution,
   QueryPageScope,
   QueryExportBatch,
   QueryExportSpec,
 } from "./types";
+import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
 
@@ -219,6 +232,23 @@ export interface Backend {
    *  rejects with "conflict" if the file changed on disk since then (unless
    *  `force`). Returns the new on-disk rev to use as the next baseline. */
   savePage(page: PageDto, baseRev: string | null, force?: boolean): Promise<string>;
+  managedSyncStatus(): Promise<ManagedSyncStatus | null>;
+  managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
+  enableManagedSync(): Promise<ManagedSyncEnableResult>;
+  sparseV2Status(): Promise<SparseV2Status>;
+  onSparseV2ActivationProgress(
+    bindingGeneration: number,
+    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
+  ): Promise<() => void>;
+  activateSparseV2(): Promise<SparseV2Status>;
+  cancelSparseV2(): Promise<SparseV2CancelResult>;
+  prepareSparseV2Share(): Promise<SparseV2Status>;
+  joinSparseV2Shared(): Promise<SparseV2Status>;
+  sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
+  sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
+  sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
+  sparseV2Tick(): Promise<SparseV2Tick>;
+  sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
   /** Copy the bundled Guide into the real graph under `tine-guide/`. */
@@ -434,6 +464,10 @@ export interface Backend {
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
+  /** Subscribe to an admitted aggregate managed-storage change. */
+  onSparseV2Changed(cb: () => void): Promise<() => void>;
+  /** Subscribe to deduplicated managed-sync reconciliation failures. */
+  onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
   setBackupKeep(keep: number): Promise<void>;
@@ -586,9 +620,13 @@ class TauriBackend implements Backend {
   }
 
   private async call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+    // Lease the graph binding at the synchronous call boundary. `ready` is
+    // normally already fulfilled, but awaiting even a fulfilled promise yields;
+    // a graph switch in that gap must not retarget queued work to the new graph.
+    const bindingGeneration = this.bindingGeneration;
     await this.ready;
-    const leasedArgs = this.bindingGeneration
-      ? { ...(args ?? {}), bindingGeneration: this.bindingGeneration }
+    const leasedArgs = bindingGeneration
+      ? { ...(args ?? {}), bindingGeneration }
       : args;
     return this.invoke<T>(cmd, leasedArgs);
   }
@@ -699,7 +737,65 @@ class TauriBackend implements Backend {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
   savePage(page: PageDto, baseRev: string | null, force = false) {
-    return this.call<string>("save_page", { page, baseRev, force });
+    return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
+      this.call<string>("save_page", { page, baseRev, force })
+    );
+  }
+  managedSyncStatus() {
+    return this.call<ManagedSyncStatus | null>("managed_sync_status");
+  }
+  managedSyncIdentityPlan() {
+    return this.call<SyncIdentityPlan>("managed_sync_identity_plan");
+  }
+  enableManagedSync() {
+    return this.call<ManagedSyncEnableResult>("enable_managed_sync");
+  }
+  sparseV2Status() {
+    return this.call<SparseV2Status>("sparse_v2_status");
+  }
+  async onSparseV2ActivationProgress(
+    bindingGeneration: number,
+    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
+  ): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SparseV2ActivationProgressEvent>("sparse-v2-activation-progress", (event) => {
+      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.progress);
+    });
+  }
+  async activateSparseV2() {
+    const result = await this.call<SparseV2Status>("activate_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async cancelSparseV2() {
+    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async prepareSparseV2Share() {
+    const result = await this.call<SparseV2Status>("prepare_sparse_v2_share");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async joinSparseV2Shared() {
+    const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  sparseV2Query(request: SparseV2QueryRequest) {
+    return this.call<SparseV2QueryReply>("sparse_v2_query", { request });
+  }
+  sparseV2EditorLoad(request: SparseV2EditorLoadRequest) {
+    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_load", { request });
+  }
+  sparseV2EditorSave(request: SparseV2EditorSaveRequest) {
+    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_save", { request });
+  }
+  sparseV2Tick() {
+    return this.call<SparseV2Tick>("sparse_v2_tick");
+  }
+  sparseV2CleanShutdown() {
+    return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");
   }
   guidePages() {
     return this.call<GuidePage[]>("guide_pages");
@@ -1036,6 +1132,14 @@ class TauriBackend implements Backend {
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+  }
+  async onSparseV2Changed(cb: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen("sparse-v2-changed", () => cb());
+  }
+  async onManagedSyncError(cb: (message: string) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<string>("managed-sync-error", (e) => cb(e.payload));
   }
   getBackupKeep() {
     return this.call<number>("get_backup_keep");

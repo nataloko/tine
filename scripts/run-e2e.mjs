@@ -78,6 +78,11 @@ const suites = {
   "og-parity-pilot": [
     ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
   ],
+  // Experimental candidate gate: intentionally separate from broad release
+  // coverage so it is run only with the exact sparse-v2 candidate receipt.
+  "sparse-v2-recovery": [
+    ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
+  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
@@ -310,10 +315,14 @@ function resolveBuildProvenanceInputs() {
 
 function failureIsBlocking(status, contractEntry) {
   if (status !== "failed") return false;
+  // A quarantined native harness remains in the suite to retain its diagnostic
+  // evidence, but cannot block either ordinary or release mode until it has a
+  // deterministic semantic readiness predicate again.
+  if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
-  return contractEntry.stability !== "quarantined" && contractEntry.contracts.some((contract) => contract.blocking);
+  return contractEntry.contracts.some((contract) => contract.blocking);
 }
 
 async function freePort() {

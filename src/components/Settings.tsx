@@ -8,6 +8,7 @@ import {
   clearSettingsTabRequest,
   setJournalTemplate,
   setGraphTransitioning,
+  bumpGraphEpoch,
   theme,
   toggleTheme,
   workflow,
@@ -134,9 +135,9 @@ import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
-import { flushAll } from "../store";
+import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -200,7 +201,13 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "about", label: "About" },
 ];
 
-type SettingSearchEntry = { tab: Tab; label: string; description: string; aliases?: string[]; level?: "advanced" };
+type SettingSearchEntry = {
+  tab: Tab;
+  label: string;
+  description: string;
+  aliases?: string[];
+  level?: "advanced" | "experimental";
+};
 const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "appearance", label: "Theme", description: "light dark gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
@@ -241,6 +248,12 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "extras", label: "Bullet threading", description: "thread active path outline depth rainbow accent colour animate flow" },
   { tab: "extras", label: "Live code highlighting", description: "syntax highlight fenced code block overlay" },
   { tab: "extras", label: "Git integration", description: "commit push pull auto version control repository branch" },
+  {
+    tab: "backups",
+    label: "Storage & sync",
+    description: "Direct files Tine-managed storage recovery",
+    level: "experimental",
+  },
   { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
@@ -254,6 +267,10 @@ function settingMatches(entry: SettingSearchEntry, query: string): boolean {
 
 function advancedMatch(tab: Tab, query: string): boolean {
   return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "advanced" && settingMatches(entry, query));
+}
+
+function experimentalMatch(tab: Tab, query: string): boolean {
+  return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "experimental" && settingMatches(entry, query));
 }
 
 export function Settings(): JSX.Element {
@@ -392,7 +409,10 @@ export function Settings(): JSX.Element {
                       {(entry) => (
                         <button type="button" class="settings-search-result" onClick={() => openSearchResult(entry)}>
                           <span>{entry.label}</span>
-                          <small>{TABS.find((candidate) => candidate.id === entry.tab)?.label}{entry.level === "advanced" ? " › Advanced" : ""}</small>
+                          <small>
+                            {TABS.find((candidate) => candidate.id === entry.tab)?.label}
+                            {entry.level === "advanced" ? " › Advanced" : entry.level === "experimental" ? " › Experimental" : ""}
+                          </small>
                         </button>
                       )}
                     </For>
@@ -412,7 +432,7 @@ export function Settings(): JSX.Element {
                 <FilesTab search={settingsQuery()} />
               </Show>
               <Show when={tab() === "backups"}>
-                <BackupsTab />
+                <BackupsTab search={settingsQuery()} />
               </Show>
               <Show when={tab() === "graph"}>
                 <GraphTab publishMsg={publishMsg()} doPublish={doPublish} />
@@ -1015,9 +1035,16 @@ function OgField(props: {
   );
 }
 
-function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.Element }): JSX.Element {
-  const layerId = `settings-advanced-${createUniqueId()}`;
-  const key = `tine.settings.advanced.${props.tab}`;
+function SettingsDisclosure(props: {
+  label: string;
+  storageKey: string;
+  layerPrefix: string;
+  forceOpen?: boolean;
+  className?: string;
+  children: JSX.Element;
+}): JSX.Element {
+  const layerId = `${props.layerPrefix}-${createUniqueId()}`;
+  const key = props.storageKey;
   let initial = false;
   try { initial = localStorage.getItem(key) === "1"; } catch {}
   const [open, setOpen] = createSignal(initial);
@@ -1043,7 +1070,7 @@ function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.El
     onCleanup(unregister);
   });
   return (
-    <section class="settings-advanced">
+    <section class={`settings-advanced ${props.className ?? ""}`}>
       <button
         ref={button}
         type="button"
@@ -1060,12 +1087,39 @@ function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.El
           }
         }}
       >
-        <span aria-hidden="true">{expanded() ? "▾" : "▸"}</span> Advanced
+        <span aria-hidden="true">{expanded() ? "▾" : "▸"}</span> {props.label}
       </button>
       <Show when={expanded()}>
         <div class="settings-advanced-body">{props.children}</div>
       </Show>
     </section>
+  );
+}
+
+function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.Element }): JSX.Element {
+  return (
+    <SettingsDisclosure
+      label="Advanced"
+      storageKey={`tine.settings.advanced.${props.tab}`}
+      layerPrefix="settings-advanced"
+      forceOpen={props.forceOpen}
+    >
+      {props.children}
+    </SettingsDisclosure>
+  );
+}
+
+function ExperimentalSection(props: { forceOpen: boolean; children: JSX.Element }): JSX.Element {
+  return (
+    <SettingsDisclosure
+      label="Experimental"
+      storageKey="tine.settings.experimental.storage"
+      layerPrefix="settings-experimental"
+      className="settings-experimental"
+      forceOpen={props.forceOpen}
+    >
+      {props.children}
+    </SettingsDisclosure>
   );
 }
 
@@ -2161,7 +2215,384 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
   );
 }
 
-function BackupsTab(): JSX.Element {
+function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
+  const [status, setStatus] = createSignal<SparseV2Status | null>(null);
+  const [loading, setLoading] = createSignal(true);
+  const [enabling, setEnabling] = createSignal(false);
+  const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
+  const [sharing, setSharing] = createSignal(false);
+  const [cancelling, setCancelling] = createSignal(false);
+  const retryable = () => {
+    const value = status();
+    return value?.state === "retryable" ? value : null;
+  };
+  const blocked = () => {
+    const value = status();
+    return value?.state === "blocked" ? value : null;
+  };
+  const refused = () => {
+    const value = status();
+    return value?.state === "refused" ? value : null;
+  };
+  const activationPartProgress = () => {
+    const progress = activationProgress();
+    return progress?.kind === "bootstrap_detached_authoring" && progress.total > 0
+      ? progress
+      : null;
+  };
+  const activationProgressLabel = () => {
+    const progress = activationProgress();
+    if (!progress) return "Preparing Tine-managed storage…";
+    if (progress.kind === "bootstrap_detached_authoring") {
+      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
+    }
+    if (progress.kind === "bootstrap_preparation_subphase") {
+      return {
+        source_protocol: "Preparing source inventory…",
+        operation_spool: "Planning graph operations…",
+        partition: "Dividing setup work into parts…",
+        detached_authoring: "Building operation history…",
+        sealing: "Sealing prepared history…",
+      }[progress.subphase];
+    }
+    if (progress.kind === "bootstrap_preparation_summary") {
+      return "Prepared graph operation history…";
+    }
+    return {
+      source_capture: "Capturing source files…",
+      bootstrap_import_preparation: "Preparing graph operation history…",
+      immutable_publication_install: "Installing prepared history…",
+      backup_proof: "Verifying the safety backup…",
+      sqlite_open_build: "Building the local index…",
+      shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
+      promotion_receipt_confirmation: "Confirming managed storage…",
+      reconciliation_baseline_actor_open: "Starting managed storage…",
+    }[progress.phase];
+  };
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      setStatus(await backend().sparseV2Status());
+    } catch {
+      pushToast("Couldn't read Tine-managed storage status. Try again.", "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+  onMount(() => void refresh());
+
+  const refreshAuthorityState = () => {
+    resetStore();
+    bumpGraphEpoch();
+  };
+
+  const failureDetail = (value: SparseV2Status): string => {
+    if (value.state === "retryable") return "Setup can be retried.";
+    if (value.state === "refused") return "This graph cannot use Tine-managed storage.";
+    if (value.state === "blocked") return "Setup is waiting until it can continue safely.";
+    return "Tine-managed storage did not become active.";
+  };
+
+  const enable = async () => {
+    setEnabling(true);
+    setActivationProgress(null);
+    setGraphTransitioning(true);
+    let unlisten: (() => void) | undefined;
+    try {
+      if (!(await flushAll())) {
+        pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
+        return;
+      }
+      const confirmed = await backend().confirm(
+        `Enable Tine-managed storage for this graph?\n\n` +
+          `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
+          `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
+      );
+      if (!confirmed) return;
+      const generation = status()?.binding_generation;
+      if (generation !== undefined) {
+        try {
+          unlisten = await backend().onSparseV2ActivationProgress(
+            generation,
+            setActivationProgress
+          );
+        } catch {
+          // Progress is observational; setup must continue if event listening
+          // is unavailable in an older or closing WebView.
+        }
+      }
+      const result = await backend().activateSparseV2();
+      setStatus(result);
+      refreshAuthorityState();
+      if (result.state === "active") {
+        pushToast("Tine-managed storage is active.", "success");
+      } else {
+        pushToast(`Tine-managed storage setup did not complete: ${failureDetail(result)}`, "error");
+      }
+    } catch {
+      pushToast("Tine-managed storage was not enabled. Retry setup.", "error");
+    } finally {
+      unlisten?.();
+      setActivationProgress(null);
+      setGraphTransitioning(false);
+      setEnabling(false);
+    }
+  };
+
+  const prepareShare = async () => {
+    setSharing(true);
+    setGraphTransitioning(true);
+    try {
+      if (!(await flushAll())) {
+        pushToast("Resolve pending save conflicts before preparing sharing.", "error");
+        return;
+      }
+      if (!(await backend().confirm(
+        "Set up sync with another device?\n\n" +
+          "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
+      ))) return;
+      const result = await backend().prepareSparseV2Share();
+      setStatus(result);
+      refreshAuthorityState();
+      pushToast(
+        result.state === "active"
+          ? "Sync is ready to use on another device."
+          : `Sync setup did not complete: ${failureDetail(result)}`,
+        result.state === "active" ? "success" : "error"
+      );
+    } catch {
+      pushToast("Couldn't set up sync. Retry setup.", "error");
+    } finally {
+      setGraphTransitioning(false);
+      setSharing(false);
+    }
+  };
+
+  const joinShare = async () => {
+    setSharing(true);
+    setGraphTransitioning(true);
+    try {
+      if (!(await flushAll())) {
+        pushToast("Resolve pending save conflicts before joining.", "error");
+        return;
+      }
+      if (!(await backend().confirm(
+        "Join this synced graph?\n\n" +
+          "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
+      ))) return;
+      const result = await backend().joinSparseV2Shared();
+      setStatus(result);
+      refreshAuthorityState();
+      pushToast(
+        result.state === "active"
+          ? "This device joined the synced graph."
+          : `Joining the synced graph did not complete: ${failureDetail(result)}`,
+        result.state === "active" ? "success" : "error"
+      );
+    } catch {
+      pushToast("Couldn't join the synced graph. Retry setup.", "error");
+    } finally {
+      setGraphTransitioning(false);
+      setSharing(false);
+    }
+  };
+
+  const cancelSparse = async () => {
+    setCancelling(true);
+    setGraphTransitioning(true);
+    try {
+      try {
+        await flushAll();
+      } catch {
+        // Setup may be unavailable in the exact failure state this rollback
+        // repairs. Keep the store intact and retry after Direct files
+        // has been restored.
+      }
+      if (!(await backend().confirm(
+        "Return to Direct files?\n\n" +
+          "Tine preserves complete recovery state before switching this graph back to Direct files. " +
+          "Pending in-memory edits will be retried after Direct files returns."
+      ))) return;
+      const result = await backend().cancelSparseV2();
+      setStatus(result.status);
+      let flushed = false;
+      try {
+        flushed = await flushAll();
+      } catch {
+        // Report the durable rollback separately from the still-unsaved pages.
+      }
+      if (!flushed) {
+        pushToast(
+          "Direct files is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
+          "error"
+        );
+        return;
+      }
+      refreshAuthorityState();
+      // Older native builds may still use the former mode name in this recovery text.
+      pushToast(
+        result.recovery_statement
+          .replace(/\bDirect\s+Markdown\b/g, "Direct file mode")
+          .replace(/^Direct files is active\./, "Direct file mode is active."),
+        "success"
+      );
+    } catch {
+      pushToast("Couldn't return to Direct files. Try again.", "error");
+    } finally {
+      setGraphTransitioning(false);
+      setCancelling(false);
+    }
+  };
+
+  return (
+    <>
+      <div class="settings-section">Storage &amp; sync</div>
+      <ExperimentalSection forceOpen={props.forceOpen}>
+        <div class="settings-experimental-warning" role="note">
+          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. You can keep using Direct files in the meantime.
+        </div>
+        <Show
+          when={!loading()}
+          fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
+        >
+          <Show
+            when={status()}
+            fallback={
+              <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
+            }
+          >
+            {(current) => (
+              <div class="settings-row">
+                <span class="settings-label">Storage mode</span>
+                <div>
+                  <Show when={current().state === "legacy_default"}>
+                    <span class="settings-value">Direct files</span>
+                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                      Uses your graph’s Markdown or Org files directly.
+                    </div>
+                    <div style={{ "margin-top": "6px" }}>
+                      <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                        {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
+                      </button>
+                    </div>
+                  </Show>
+                  <Show when={current().state === "joinable"}>
+                    <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                      {sharing() ? "Joining..." : "Join this synced graph..."}
+                    </button>
+                  </Show>
+                  <Show when={retryable()}>
+                    <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                      {enabling() ? "Retrying..." : "Retry setup"}
+                    </button>
+                  </Show>
+                  <Show when={enabling()}>
+                    <div class="settings-activation-progress" role="status" aria-live="polite">
+                      <div class="settings-hint">{activationProgressLabel()}</div>
+                      <Show
+                        when={activationPartProgress()}
+                        fallback={<progress aria-label={activationProgressLabel()} />}
+                      >
+                        {(part) => (
+                          <progress
+                            aria-label={activationProgressLabel()}
+                            value={part().completed}
+                            max={part().total}
+                          />
+                        )}
+                      </Show>
+                    </div>
+                  </Show>
+                  <Show when={current().state === "active"}>
+                    <span class="settings-value">Tine-managed storage active</span>
+                    <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
+                      <div style={{ "margin-top": "6px" }}>
+                        <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
+                          {sharing()
+                            ? "Setting up..."
+                            : current().runtime?.shared_phase === "share_prepared"
+                              ? "Retry setup"
+                              : "Set up sync with another device..."}
+                        </button>
+                      </div>
+                    </Show>
+                    <Show when={current().runtime?.shared_phase === "joining"}>
+                      <div style={{ "margin-top": "6px" }}>
+                        <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                          {sharing() ? "Joining..." : "Join this synced graph..."}
+                        </button>
+                      </div>
+                    </Show>
+                  </Show>
+                  <Show when={blocked()}>
+                    <span class="settings-value">Tine-managed storage needs attention.</span>
+                  </Show>
+                  <Show when={refused()}>
+                    <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
+                  </Show>
+                  <Show
+                    when={
+                      current().state !== "legacy_default" && current().state !== "joinable"
+                    }
+                  >
+                    <Show
+                      when={current().can_cancel}
+                      fallback={
+                        <div class="settings-hint" style={{ "margin-top": "8px" }}>
+                          Return to Direct files is unavailable because safety could not be verified.
+                        </div>
+                      }
+                    >
+                      <div style={{ "margin-top": "8px" }}>
+                        <button
+                          class="settings-btn settings-btn-danger"
+                          disabled={cancelling()}
+                          onClick={() => void cancelSparse()}
+                        >
+                          {cancelling() ? "Returning..." : "Return to Direct files"}
+                        </button>
+                        <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                          Complete recovery state is preserved before returning to Direct files.
+                        </div>
+                      </div>
+                    </Show>
+                  </Show>
+                  <Show when={retryable()}>
+                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                      Setup paused. You can retry setup when you are ready.
+                    </div>
+                  </Show>
+                  <Show when={current().runtime}>
+                    {(runtime) => (
+                      <>
+                        <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
+                          <div class="settings-hint">
+                            Updating external changes...
+                          </div>
+                        </Show>
+                        <Show when={runtime().provider_pending > 0}>
+                          <div class="settings-hint">
+                            Sync updates are pending.
+                          </div>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
+                  <div class="settings-hint" style={{ "margin-top": "6px" }}>
+                    Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
+                  </div>
+                </div>
+              </div>
+            )}
+          </Show>
+        </Show>
+      </ExperimentalSection>
+    </>
+  );
+}
+
+function BackupsTab(props: { search: string }): JSX.Element {
   const [keep, setKeep] = createSignal(12);
   const [list, setList] = createSignal<BackupInfo[]>([]);
   const [busy, setBusy] = createSignal(false);
@@ -2243,8 +2674,10 @@ function BackupsTab(): JSX.Element {
 
   return (
     <>
+      <ManagedSyncPanel forceOpen={experimentalMatch("backups", props.search)} />
+
       <div class="settings-hint settings-block">
-        Tine snapshots your graph’s markdown to a local folder each time it opens
+          Tine snapshots your graph’s Markdown/Org files to a local folder each time it opens
         (outside the graph, so Syncthing never sees it). A safety net against a bad
         write — independent of OG Logseq’s own backups.
       </div>

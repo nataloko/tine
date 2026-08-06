@@ -21,11 +21,11 @@ import {
 } from "../store";
 import { editingId, endEdit, startEditing } from "../editorController";
 import { journalTitle } from "../journal";
-import type { JournalFeedPage, PageDto, RefGroup } from "../types";
+import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setRightSidebar } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setGraphMeta, setRightSidebar } from "../ui";
 
 beforeAll(async () => {
   await initParser();
@@ -41,6 +41,7 @@ afterEach(() => {
   endEdit("blur");
   closeContextMenu();
   resetStore();
+  setGraphMeta(null);
   document.body.innerHTML = "";
   resetTabsToJournals();
 });
@@ -88,7 +89,84 @@ function feedResponse(pages: PageDto[], patch: Partial<JournalFeedPage> = {}): J
   return { pages, next_before_day: null, done: true, as_of_day: localDay(), ...patch };
 }
 
+function graphMetaWithTemplate(template: string | null): GraphMeta {
+  return {
+    root: "/tmp/journal-rollover-graph",
+    journals_dir: "journals",
+    pages_dir: "pages",
+    preferred_workflow: "now",
+    shortcuts: {},
+    start_of_week: 6,
+    block_hidden_properties: [],
+    default_journal_template: template,
+    favorites: [],
+    journal_page_title_format: "MMM do, yyyy",
+    journal_file_name_format: "yyyy_MM_dd",
+    preferred_format: "md",
+    macros: {},
+    enable_timetracking: true,
+    show_brackets: true,
+    logbook_with_second_support: true,
+    logbook_enabled_in_timestamped_blocks: false,
+    logbook_enabled_in_all_blocks: false,
+    guide_announced: true,
+  };
+}
+
 describe("Journals feed generation lifecycle", () => {
+  it("saves an edited page route when activation reset abandons the Journals reload", async () => {
+    vi.useFakeTimers();
+    const existing: PageDto = {
+      name: "Résumé 日本語",
+      kind: "page",
+      title: "Résumé 日本語",
+      pre_block: null,
+      rev: "sparse-load-rev",
+      blocks: [{ id: "nested-utf", raw: "nested UTF original", collapsed: false, children: [] }],
+    };
+    vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise(() => {}));
+    vi.spyOn(backend(), "getPage").mockResolvedValue(existing);
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("sparse-saved-rev");
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      // This is Settings' post-activation refresh. Its Journals request is still
+      // pending when the user immediately opens a regular page from inventory.
+      resetStore();
+      bumpGraphEpoch();
+      await flushMicrotasks();
+      mainPaneRouter.openPage(existing.name, existing.kind, { inPlace: true });
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      expect(doc.loaded).toBe(true);
+      startEditing("nested-utf", existing.blocks[0].raw.length);
+      await tick();
+      const editor = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor");
+      expect(editor).not.toBeNull();
+      const edited = "nested UTF original sparse v2 saved existing UTF page";
+      editor!.value = edited;
+      editor!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: "page",
+      }));
+      editor!.blur();
+
+      await vi.advanceTimersByTimeAsync(400);
+      expect(save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: existing.name,
+          blocks: [expect.objectContaining({ raw: edited })],
+        }),
+        "sparse-load-rev",
+        false,
+      );
+    } finally {
+      mounted.dispose();
+    }
+  });
+
   it("settles an initial Journals route load without reacting to its own feed replacement", async () => {
     const api = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("settled")]));
     const mounted = mount(() => <PageView />);
@@ -103,34 +181,25 @@ describe("Journals feed generation lifecycle", () => {
     }
   });
 
-  it("uses a real route/graph owner and discards an out-of-order older restart", async () => {
-    let resolveOld!: (value: JournalFeedPage) => void;
-    let resolveNew!: (value: JournalFeedPage) => void;
-    let calls = 0;
-    vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => {
-      calls += 1;
-      return new Promise((resolve) => {
-        if (calls === 1) resolveOld = resolve;
-        else resolveNew = resolve;
-      });
-    });
+  it("coalesces concurrent same-day restarts under one live route/graph owner", async () => {
+    let resolveFeed!: (value: JournalFeedPage) => void;
+    const api = vi.spyOn(backend(), "journalFeedPage").mockImplementation(() =>
+      new Promise((resolve) => { resolveFeed = resolve; })
+    );
     const mounted = mount(() => <PageView />);
     try {
       await flushMicrotasks();
       const owner = { graphEpoch: graphEpoch(), isLive: () => true };
-      const winning = reloadJournalsFeedFromStart(owner);
+      const duplicate = reloadJournalsFeedFromStart(owner);
       await flushMicrotasks();
-      resolveNew(feedResponse([journalDto("newer")], { next_before_day: 20300714, done: false }));
-      await winning;
-      expect(doc.feed).toContain("newer");
-      resolveOld(feedResponse([journalDto("older")]));
-      await flushMicrotasks();
-      expect(doc.feed).toContain("newer");
-      expect(doc.feed).not.toContain("older");
+      expect(api).toHaveBeenCalledTimes(1);
+      resolveFeed(feedResponse([journalDto("single-flight")], { next_before_day: 20300714, done: false }));
+      await duplicate;
+      expect(doc.feed).toContain("single-flight");
 
-      const beforeInactive = calls;
+      const beforeInactive = api.mock.calls.length;
       await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => false });
-      expect(calls).toBe(beforeInactive);
+      expect(api).toHaveBeenCalledTimes(beforeInactive);
     } finally {
       mounted.dispose();
     }
@@ -162,6 +231,99 @@ describe("Journals feed generation lifecycle", () => {
     const afterDispose = call.mock.calls.length;
     vi.advanceTimersByTime(24 * 60 * 60 * 1000);
     expect(call.mock.calls.length).toBe(afterDispose);
+  });
+
+  it("materializes the configured template once before the rollover feed refresh despite duplicate triggers", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 11, 31, 23, 59, 59, 990));
+    setGraphMeta(graphMetaWithTemplate("Daily"));
+    const oldTitle = journalTitle(new Date());
+    const events: string[] = [];
+    const feed = vi.spyOn(backend(), "journalFeedPage").mockImplementation(async () => {
+      events.push("feed");
+      return feedResponse([journalDto(localDay() === 20301231 ? oldTitle : "Jan 1st, 2031")]);
+    });
+    vi.spyOn(backend(), "getPage").mockImplementation(async (name) =>
+      name === oldTitle ? journalDto(oldTitle, "existing old day") : null
+    );
+    vi.spyOn(backend(), "listTemplates").mockResolvedValue([{
+      name: "Daily",
+      page: "Templates",
+      kind: "page",
+      blocks: [
+        { id: "meetings", raw: "### Meetings", collapsed: false, children: [] },
+        { id: "notes", raw: "### Notes", collapsed: false, children: [] },
+        { id: "tasks", raw: "### Tasks", collapsed: false, children: [] },
+      ],
+    }]);
+    let releaseSave!: () => void;
+    const save = vi.spyOn(backend(), "savePage").mockImplementation(() =>
+      new Promise((resolve) => {
+        events.push("save");
+        releaseSave = () => resolve("rollover-rev");
+      })
+    );
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(feed).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(35);
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+      expect(feed).toHaveBeenCalledTimes(1);
+
+      window.dispatchEvent(new Event("focus"));
+      Object.defineProperty(document, "hidden", { configurable: true, value: false });
+      document.dispatchEvent(new Event("visibilitychange"));
+      await flushMicrotasks();
+      expect(save).toHaveBeenCalledTimes(1);
+      expect(feed).toHaveBeenCalledTimes(1);
+
+      releaseSave();
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Jan 1st, 2031",
+          kind: "journal",
+          title: "Jan 1st, 2031",
+          blocks: [
+            expect.objectContaining({ raw: "### Meetings" }),
+            expect.objectContaining({ raw: "### Notes" }),
+            expect.objectContaining({ raw: "### Tasks" }),
+          ],
+        }),
+        null,
+        false,
+      );
+      expect(feed).toHaveBeenCalledTimes(2);
+      expect(events).toEqual(["feed", "save", "feed"]);
+    } finally {
+      mounted.dispose();
+    }
+  });
+
+  it("keeps rollover lazy when no default journal template is configured", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 0, 31, 23, 59, 59, 990));
+    setGraphMeta(graphMetaWithTemplate(null));
+    const feed = vi.spyOn(backend(), "journalFeedPage").mockImplementation(async () =>
+      feedResponse([journalDto(localDay() === 20300131 ? "Jan 31st, 2030" : "Feb 1st, 2030")])
+    );
+    const getPage = vi.spyOn(backend(), "getPage");
+    const listTemplates = vi.spyOn(backend(), "listTemplates");
+    const save = vi.spyOn(backend(), "savePage");
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(feed).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(35);
+      await vi.waitFor(() => expect(feed).toHaveBeenCalledTimes(2));
+      expect(getPage).not.toHaveBeenCalled();
+      expect(listTemplates).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      mounted.dispose();
+    }
   });
 
   it("does not let an unrelated sidebar/page editor defer the visible feed refresh", async () => {
@@ -1040,6 +1202,39 @@ describe("page route loading", () => {
       await tick();
       expect(root.textContent).toContain("new route content");
       expect(root.textContent).not.toContain("obsolete slow-page failure");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not arm persistence from an obsolete successful page load", async () => {
+    const stale: PageDto = {
+      name: "Stale page",
+      kind: "page",
+      title: "Stale page",
+      pre_block: null,
+      rev: "stale-rev",
+      blocks: [{ id: "stale-block", raw: "obsolete content", collapsed: false, children: [] }],
+    };
+    let resolveStale!: (value: PageDto) => void;
+    vi.spyOn(backend(), "getPage").mockImplementation((name) => {
+      if (name === stale.name) {
+        return new Promise((resolve) => { resolveStale = resolve; });
+      }
+      return new Promise(() => {});
+    });
+    mainPaneRouter.openPage(stale.name, stale.kind, { inPlace: true });
+
+    const { dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      mainPaneRouter.openPage("Current page", "page", { inPlace: true });
+      await flushMicrotasks();
+      resolveStale(stale);
+      await flushMicrotasks();
+
+      expect(pageByName(stale.name)).toBeUndefined();
+      expect(doc.loaded).toBe(false);
     } finally {
       dispose();
     }

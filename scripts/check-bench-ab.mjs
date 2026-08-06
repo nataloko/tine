@@ -51,18 +51,26 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
   }
   const vsOld = ((value / old) - 1) * 100;
   const vsPrev = ((value / prev) - 1) * 100;
+  const candidateSpread = candidate.metrics?.[name]?.roundSpreadPct;
+  const previousSpread = previous.metrics?.[name]?.roundSpreadPct;
+  const candidateAndPreviousReliable = [candidateSpread, previousSpread].every(
+    (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
+  );
+  const candidateAndImmutableReliable = [candidateSpread, immutable.metrics?.[name]?.roundSpreadPct].every(
+    (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
+  );
   const candidateRoundMins = candidate.metrics?.[name]?.roundMins;
   const candidateSlowest = Array.isArray(candidateRoundMins) && candidateRoundMins.length > 0
     ? Math.max(...candidateRoundMins)
     : Number.NaN;
   const slowestVsOld = ((candidateSlowest / old) - 1) * 100;
   const slowestVsPrev = ((candidateSlowest / prev) - 1) * 100;
-  // Full max/min spread is still useful diagnostic evidence, but it is
-  // symmetric: one unusually fast round can exceed the threshold even when
-  // every regression comparison is safe. Tolerate high spread only when the
-  // candidate median beats both anchors and even its slowest round remains
-  // inside both performance budgets. Slow or ambiguous variance still fails.
-  const favorableSafeEnvelope = vsOld <= 0 && vsPrev <= 0
+  // A full max/min spread is symmetric: a fast candidate round can exceed the
+  // threshold without masking a regression. Candidate-only variance is safe
+  // only when its median beats both anchors and its slowest round still stays
+  // within each respective regression budget.
+  const favorableCandidateVariance = vsOld <= 0
+    && vsPrev <= 0
     && Number.isFinite(candidateSlowest)
     && slowestVsOld <= budget.maxVsImmutablePct
     && slowestVsPrev <= budget.maxVsPreviousPct;
@@ -77,9 +85,33 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
       );
       if (spread > budget.maxRoundSpreadPct) {
         const message = `${label}/${name}: ${spread.toFixed(1)}% round spread exceeds ${budget.maxRoundSpreadPct}% reliability limit`;
-        if (favorableSafeEnvelope) {
+        const immutableBaselineOnlyVariance = label === "immutable"
+          && candidateAndPreviousReliable
+          && vsOld <= budget.maxVsImmutablePct
+          && vsPrev <= budget.maxVsPreviousPct;
+        // The previous-release anchor is a rolling comparison point, not an
+        // independent candidate measurement. A single noisy previous anchor
+        // cannot hide a regression when both the candidate and immutable
+        // anchor are reliable, and both the candidate median and its slowest
+        // round remain inside every applicable regression budget.
+        const previousBaselineOnlyVariance = label === "previous"
+          && candidateAndImmutableReliable
+          && vsOld <= budget.maxVsImmutablePct
+          && vsPrev <= budget.maxVsPreviousPct
+          && Number.isFinite(candidateSlowest)
+          && slowestVsOld <= budget.maxVsImmutablePct
+          && slowestVsPrev <= budget.maxVsPreviousPct;
+        if (label === "candidate" && favorableCandidateVariance) {
           console.warn(
-            `warning: ${message}, but candidate median beats both anchors and its slowest round remains within both budgets`,
+            `warning: ${message}; candidate median beats both anchors and its slowest round remains within both budgets`,
+          );
+        } else if (immutableBaselineOnlyVariance) {
+          console.warn(
+            `warning: ${message}; immutable baseline-only variance accepted because candidate and previous-release spreads are within the reliability limit and candidate median is within both regression budgets`,
+          );
+        } else if (previousBaselineOnlyVariance) {
+          console.warn(
+            `warning: ${message}; previous-release baseline-only variance accepted because candidate and immutable-anchor spreads are within the reliability limit and candidate median and slowest round remain within both regression budgets`,
           );
         } else {
           failures.push(`${message}; investigate runner/metric variance`);

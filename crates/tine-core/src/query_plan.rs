@@ -958,13 +958,10 @@ impl PartialOrd for ScoredBlock<'_> {
 impl Ord for ScoredBlock<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Max-heap root is the WORST retained candidate, ready for eviction.
-        other
-            .relevance
-            .cmp_quality(&self.relevance)
-            .then_with(|| {
-                (self.page.rel_path.as_str(), self.index)
-                    .cmp(&(other.page.rel_path.as_str(), other.index))
-            })
+        other.relevance.cmp_quality(&self.relevance).then_with(|| {
+            (self.page.rel_path.as_str(), self.index)
+                .cmp(&(other.page.rel_path.as_str(), other.index))
+        })
     }
 }
 
@@ -1241,8 +1238,7 @@ fn best_page_match(
     aliases: &[String],
 ) -> Option<(i32, ObjectiveMatchClass, String, Option<String>)> {
     let page_match = page_base_score(plan, expr, page_name, &canonical_fold(page_name));
-    let mut best = page_match
-        .map(|(score, class)| (score, class, page_name.to_string(), None));
+    let mut best = page_match.map(|(score, class)| (score, class, page_name.to_string(), None));
     for alias in aliases {
         let Some((score, class)) = page_base_score(plan, expr, alias, &canonical_fold(alias))
         else {
@@ -1260,13 +1256,23 @@ fn best_page_match(
     // bypassing NOT/OR/regex membership semantics for syntax-looking names.
     if let Some(exact) = plan.page_exact.as_deref() {
         if page_match.is_some() && canonical_fold(page_name) == exact {
-            return Some((1500, ObjectiveMatchClass::Exact, page_name.to_string(), None));
+            return Some((
+                1500,
+                ObjectiveMatchClass::Exact,
+                page_name.to_string(),
+                None,
+            ));
         }
         if let Some(alias) = aliases.iter().find(|alias| {
             canonical_fold(alias) == exact
                 && page_base_score(plan, expr, alias, &canonical_fold(alias)).is_some()
         }) {
-            return Some((1500, ObjectiveMatchClass::Exact, alias.clone(), Some(alias.clone())));
+            return Some((
+                1500,
+                ObjectiveMatchClass::Exact,
+                alias.clone(),
+                Some(alias.clone()),
+            ));
         }
     }
     best
@@ -1499,12 +1505,9 @@ fn execute_blocks(
         }
         let mut winners = heap.into_vec();
         winners.sort_by(|a, b| {
-            b.relevance
-                .cmp_quality(&a.relevance)
-                .then_with(|| {
-                    (a.page.rel_path.as_str(), a.index)
-                        .cmp(&(b.page.rel_path.as_str(), b.index))
-                })
+            b.relevance.cmp_quality(&a.relevance).then_with(|| {
+                (a.page.rel_path.as_str(), a.index).cmp(&(b.page.rel_path.as_str(), b.index))
+            })
         });
         Some((
             winners
@@ -1638,11 +1641,7 @@ mod tests {
             .collect()
     }
 
-    fn reference_literal_search(
-        graph: &Graph,
-        query: &str,
-        limit: usize,
-    ) -> Vec<(String, String)> {
+    fn reference_literal_search(graph: &Graph, query: &str, limit: usize) -> Vec<(String, String)> {
         if limit == 0 || query.is_empty() {
             return Vec::new();
         }
@@ -1724,7 +1723,7 @@ mod tests {
         assert!(!complete.has_more.pages);
         assert!(!complete.has_more.blocks);
 
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -1773,20 +1772,12 @@ mod tests {
         assert_eq!(multiword_page.1, ObjectiveMatchClass::Exact);
 
         let syntax = QueryPlan::friendly("foo -draft", 8, 8);
-        assert!(best_page_match(
-            &syntax,
-            &syntax.branches[0].predicate,
-            "foo -draft",
-            &[],
-        )
-        .is_none());
-        assert!(best_page_match(
-            &syntax,
-            &syntax.branches[0].predicate,
-            "foo ready",
-            &[],
-        )
-        .is_some());
+        assert!(
+            best_page_match(&syntax, &syntax.branches[0].predicate, "foo -draft", &[],).is_none()
+        );
+        assert!(
+            best_page_match(&syntax, &syntax.branches[0].predicate, "foo ready", &[],).is_some()
+        );
 
         let page_plan = QueryPlan::page_name_fuzzy("Café", 8);
         let page_pred = &page_plan.branches[0].predicate;
@@ -1924,7 +1915,7 @@ mod tests {
                 if display_text == "Re\u{301}sume\u{301}"
                     && evidence[0].spans == vec![MatchSpan { start: 0, end: 8 }]
         ));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -1968,9 +1959,7 @@ mod tests {
                     match_class,
                     matched_alias,
                     ..
-                } if !page.rel_path.is_empty() => {
-                    Some((page.rel_path, match_class, matched_alias))
-                }
+                } if !page.rel_path.is_empty() => Some((page.rel_path, match_class, matched_alias)),
                 QueryHit::Page { .. } => None,
                 QueryHit::Block { .. } => None,
             })
@@ -1995,9 +1984,7 @@ mod tests {
                     match_class,
                     matched_alias,
                     ..
-                } if !page.rel_path.is_empty() => {
-                    Some((page.rel_path, match_class, matched_alias))
-                }
+                } if !page.rel_path.is_empty() => Some((page.rel_path, match_class, matched_alias)),
                 QueryHit::Page { .. } => None,
                 QueryHit::Block { .. } => None,
             })
@@ -2012,7 +1999,7 @@ mod tests {
             "a unique page name must retain ordinary alias matching"
         );
 
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2138,7 +2125,7 @@ mod tests {
 
         let no_explain = graph.run_graph_search("foo", 10, 10, false);
         assert!(no_explain.explanation.branches.is_empty());
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2172,7 +2159,7 @@ mod tests {
                     && path == "pages/Opinion Diffusion.md"
                     && block.raw != "duplicate foo"
         )));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2202,7 +2189,7 @@ mod tests {
                 ..
             }) if display_text == "research hub" && matched_alias == "research hub"
         ));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2223,7 +2210,7 @@ mod tests {
             .unwrap();
         assert_eq!(text, "regex ABC");
         assert_eq!(evidence[0].spans, vec![MatchSpan { start: 6, end: 9 }]);
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2254,7 +2241,7 @@ mod tests {
                 );
             }
         }
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2313,6 +2300,6 @@ mod tests {
         });
         assert!(execution.cancelled);
         assert!(execution.hits.is_empty());
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 }

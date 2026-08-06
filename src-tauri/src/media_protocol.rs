@@ -29,7 +29,13 @@ fn decode_path(path: &str) -> Option<String> {
 }
 
 fn mime(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
         "ogv" => "video/ogg",
@@ -90,7 +96,10 @@ pub(crate) fn respond<R: Runtime>(
     if slot.binding_generation != binding {
         return response(StatusCode::FORBIDDEN, Vec::new());
     }
-    let Ok(path) = slot.graph.stream_asset_path(name) else {
+    let Ok(graph) = slot.legacy_graph() else {
+        return response(StatusCode::FORBIDDEN, Vec::new());
+    };
+    let Ok(path) = graph.stream_asset_path(name) else {
         return response(StatusCode::NOT_FOUND, Vec::new());
     };
     let Ok(mut file) = File::open(path) else {
@@ -147,7 +156,11 @@ pub(crate) fn respond<R: Runtime>(
     let end = start.saturating_add(count).saturating_sub(1);
     let partial = request.headers().contains_key(header::RANGE) || count < len;
     let mut builder = Response::builder()
-        .status(if partial { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
         .header(header::CONTENT_TYPE, mime(name))
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, count);
@@ -163,13 +176,37 @@ mod tests {
 
     #[test]
     fn decodes_safe_percent_encoded_names() {
-        assert_eq!(decode_path("/voice%20memo.wav").as_deref(), Some("voice memo.wav"));
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=123-")), 500), Some((123, 499)));
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=-20")), 500), Some((480, 499)));
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=4-9")), 500), Some((4, 9)));
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=0-1")), 500), Some((0, 1)));
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=9-4")), 500), None);
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("garbage")), 500), None);
-        assert_eq!(byte_range(Some(&header::HeaderValue::from_static("bytes=0-")), 0), None);
+        assert_eq!(
+            decode_path("/voice%20memo.wav").as_deref(),
+            Some("voice memo.wav")
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=123-")), 500),
+            Some((123, 499))
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=-20")), 500),
+            Some((480, 499))
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=4-9")), 500),
+            Some((4, 9))
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=0-1")), 500),
+            Some((0, 1))
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=9-4")), 500),
+            None
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("garbage")), 500),
+            None
+        );
+        assert_eq!(
+            byte_range(Some(&header::HeaderValue::from_static("bytes=0-")), 0),
+            None
+        );
     }
 }

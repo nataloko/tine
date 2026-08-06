@@ -7,7 +7,60 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::{Graph, GraphMeta};
+use tine_core::sync_runtime::inspect_shared_enrollment_for_cold_discovery;
+
+pub(crate) fn ensure_managed_sync_safety_snapshot(
+    app: &tauri::AppHandle,
+    graph: &Graph,
+    state: ManagedSyncStoreState,
+    already_complete: bool,
+    suffix: &str,
+) -> Result<bool, String> {
+    if state == ManagedSyncStoreState::Absent || already_complete {
+        return Ok(already_complete);
+    }
+    let (_, complete) = backup_graph_now(app, graph, suffix);
+    if !complete {
+        return Err(
+            "managed sync needs a complete safety snapshot before replay; graph left unchanged"
+                .into(),
+        );
+    }
+    Ok(true)
+}
+
+pub(crate) fn start_managed_sync_after_safety(
+    app: &tauri::AppHandle,
+    graph: &Graph,
+    state: ManagedSyncStoreState,
+) -> Result<(), String> {
+    if state == ManagedSyncStoreState::Absent {
+        return Ok(());
+    }
+    let device_id = crate::settings::managed_sync_device_id(app)?;
+    match state {
+        ManagedSyncStoreState::Absent => unreachable!("handled before reading device identity"),
+        ManagedSyncStoreState::Unclaimed | ManagedSyncStoreState::Claimed => {
+            graph
+                .enable_managed_sync(device_id, uuid::Uuid::new_v4())
+                .map_err(|error| format!("managed sync could not resume activation: {error}"))?;
+        }
+        ManagedSyncStoreState::Initialized => {
+            let started = graph
+                .start_managed_sync(device_id, uuid::Uuid::new_v4())
+                .map_err(|error| format!("managed sync could not start: {error}"))?;
+            if !started {
+                return Err("managed sync store changed while it was being opened".into());
+            }
+        }
+    }
+    graph
+        .project_all_managed_sync()
+        .map_err(|error| format!("managed sync could not project: {error}"))?;
+    Ok(())
+}
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
@@ -102,6 +155,66 @@ struct LoadedGraph {
     launch_backup_done: bool,
 }
 
+fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
+    refuse_unclaimed_sparse_archive_with(root, |shared| {
+        inspect_shared_enrollment_for_cold_discovery(shared).map(|descriptor| descriptor.is_some())
+    })
+}
+
+fn refuse_unclaimed_sparse_archive_with(
+    root: &Path,
+    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
+) -> Result<(), String> {
+    const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+    let archive = root.join(".tine-sync/v2");
+    let metadata = match std::fs::symlink_metadata(&archive) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(REFUSAL.into());
+    }
+    let mut entries = std::fs::read_dir(&archive).map_err(|error| {
+        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
+    })?;
+    let Some(shared) = entries.next().transpose().map_err(|error| {
+        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
+    })?
+    else {
+        return Err(REFUSAL.into());
+    };
+    if shared.file_name() != "shared"
+        || !shared
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+                )
+            })?
+            .is_dir()
+        || entries
+            .next()
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+                )
+            })?
+            .is_some()
+    {
+        return Err(REFUSAL.into());
+    }
+    match inspect_shared(&shared.path()) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(REFUSAL.into()),
+    }
+}
+
 fn open_graph_for_load(
     root: &str,
     approved_assets: Option<&Path>,
@@ -117,10 +230,15 @@ fn open_graph_for_load(
         (0, false)
     };
     let launch_backup_done = backup_n > 0 && backup_complete;
-    if needs_migration && launch_backup_done {
+    let migration_may_run_before_sync = graph
+        .managed_sync_store_state()
+        .is_ok_and(|state| state == ManagedSyncStoreState::Absent);
+    if needs_migration && launch_backup_done && migration_may_run_before_sync {
         // Recover any journals mis-saved under their title (see method docs),
         // but only after the launch snapshot has captured the original names.
-        graph.migrate_journal_filenames();
+        graph
+            .migrate_journal_filenames_checked()
+            .map_err(|error| format!("journal filename migration failed: {error}"))?;
     }
     Ok(LoadedGraph {
         graph,
@@ -184,13 +302,50 @@ pub(crate) fn approve_external_assets(
 }
 
 #[tauri::command]
-pub(crate) fn load_graph(
+pub(crate) async fn load_graph(
     path: String,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<LoadGraphResult, String> {
-    load_graph_for_label(path, &app, window.label(), &state)
+    let label = window.label().to_string();
+    drop((window, state));
+    let worker_app = app.clone();
+    let worker_label = label.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker_app.state::<AppState>();
+        load_graph_for_label(path, &worker_app, &worker_label, &state)
+    })
+    .await
+    .map_err(|error| format!("graph-open worker failed: {error}"))??;
+
+    if app.get_webview_window(&label).is_none() {
+        let binding_generation = match &result {
+            LoadGraphResult::Loaded {
+                binding_generation, ..
+            }
+            | LoadGraphResult::AlreadyCurrent {
+                binding_generation, ..
+            } => Some(*binding_generation),
+            LoadGraphResult::FocusedExisting { .. } => None,
+        };
+        if let Some(binding_generation) = binding_generation {
+            let state = app.state::<AppState>();
+            let removed = {
+                let mut graphs = state.graphs.write().unwrap();
+                let owns_generation = graphs
+                    .slot(&label)
+                    .is_some_and(|slot| slot.binding_generation == binding_generation);
+                owns_generation.then(|| graphs.remove(&label)).flatten()
+            };
+            if removed.is_some() {
+                poke_watcher(&state);
+            }
+        }
+        return Err("graph window closed while storage was opening".into());
+    }
+
+    Ok(result)
 }
 
 pub(crate) fn load_graph_for_label(
@@ -207,7 +362,7 @@ pub(crate) fn load_graph_for_label(
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
             return Ok(LoadGraphResult::AlreadyCurrent {
-                meta: slot.graph.meta(),
+                meta: slot.graph_meta(),
                 binding_generation: slot.binding_generation,
             });
         }
@@ -230,15 +385,62 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
+    if let Some(record) = state.sync_runtime.binding_record(app, &root_key)? {
+        let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
+        let binding = state.sync_runtime.open_record(app, &record)?;
+        let slot = Arc::new(GraphSlot::from_sparse_v2(
+            binding,
+            root_key.clone(),
+            meta.clone(),
+        ));
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(window_label.to_string(), Arc::clone(&slot))?;
+        state.note_focused(window_label);
+        poke_watcher(state);
+        remember_graph(app, &meta.root)?;
+        if let Some(window) = app.get_webview_window(window_label) {
+            let name = Path::new(&meta.root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Graph");
+            let _ = window.set_title(&format!("Tine — {name}"));
+        }
+        return Ok(LoadGraphResult::Loaded {
+            meta,
+            binding_generation: slot.binding_generation,
+        });
+    }
+    refuse_unclaimed_sparse_archive(&root_key)?;
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
     let LoadedGraph {
         graph,
         meta,
-        launch_backup_done,
+        mut launch_backup_done,
     } = open_graph_for_load(&root, approved_assets.as_deref(), |graph| {
         backup_graph_now(app, graph, "")
     })?;
+    let managed_state = graph
+        .managed_sync_store_state()
+        .map_err(|error| format!("managed sync store is unsafe or invalid: {error}"))?;
+    if managed_state != ManagedSyncStoreState::Absent {
+        launch_backup_done = ensure_managed_sync_safety_snapshot(
+            app,
+            &graph,
+            managed_state,
+            launch_backup_done,
+            "pre-sync-replay",
+        )?;
+        start_managed_sync_after_safety(app, &graph, managed_state)?;
+    }
+    if launch_backup_done {
+        graph
+            .migrate_journal_filenames_checked()
+            .map_err(|error| format!("journal filename migration failed: {error}"))?;
+    }
     let slot = Arc::new(GraphSlot::new(graph, root_key));
     let warm_generation = begin_warm_cache(&slot);
     state
@@ -249,7 +451,7 @@ pub(crate) fn load_graph_for_label(
     state.note_focused(window_label);
     poke_watcher(&state);
     if !launch_backup_done {
-        backup_async(app.clone(), slot.clone());
+        backup_async(app.clone(), slot.clone())?;
     }
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
@@ -260,7 +462,7 @@ pub(crate) fn load_graph_for_label(
         let _ = window.set_title(&format!("Tine — {name}"));
     }
     let binding_generation = slot.binding_generation;
-    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation);
+    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
     Ok(LoadGraphResult::Loaded {
         meta,
         binding_generation,
@@ -420,7 +622,8 @@ pub(crate) fn warm_cache_async(
     window_label: String,
     slot: Arc<GraphSlot>,
     warm_generation: u64,
-) {
+) -> Result<(), String> {
+    let graph = slot.legacy_graph_cloned()?;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
@@ -445,7 +648,7 @@ pub(crate) fn warm_cache_async(
         {
             return;
         }
-        let completed = slot.graph.warm_cache_cancellable(|| {
+        let completed = graph.warm_cache_cancellable(|| {
             slot.background_cancelled.load(Ordering::Acquire)
                 || slot.warm_generation.load(Ordering::Acquire) != warm_generation
         });
@@ -453,19 +656,17 @@ pub(crate) fn warm_cache_async(
             return;
         }
         let state: State<'_, AppState> = app.state();
-        let current = state
-            .graphs
-            .read()
-            .unwrap()
-            .slot(&window_label);
+        let current = state.graphs.read().unwrap().slot(&window_label);
         let still_current = current.as_ref().is_some_and(|current| {
-            current.binding_generation == slot.binding_generation && current.root_key == slot.root_key
+            current.binding_generation == slot.binding_generation
+                && current.root_key == slot.root_key
         });
         if still_current && slot.warm_generation.load(Ordering::Acquire) == warm_generation {
             current.unwrap().warm_done.store(true, Ordering::Release);
             let _ = app.emit_to(&window_label, "warm-cache-done", ());
         }
     });
+    Ok(())
 }
 
 /// "Have the whole-graph derived caches finished warming for the current graph?"
@@ -523,6 +724,63 @@ mod tests {
     }
 
     #[test]
+    fn unclaimed_sparse_archive_refuses_legacy_graph_open() {
+        let dir = scratch("unclaimed-sparse");
+        assert_eq!(refuse_unclaimed_sparse_archive(&dir), Ok(()));
+        std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+            "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cold_shared_discovery_requires_the_sole_real_v2_shared_namespace() {
+        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+        let dir = scratch("cold-shared-layout");
+        let v2 = dir.join(".tine-sync/v2");
+        let shared = v2.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |path| {
+                assert_eq!(path, shared);
+                Ok(true)
+            }),
+            Ok(())
+        );
+
+        std::fs::write(v2.join("unknown"), b"retain").unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
+            REFUSAL
+        );
+        std::fs::remove_file(v2.join("unknown")).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(false)).unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
+            REFUSAL
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::remove_dir_all(&shared).unwrap();
+            let target = dir.join("provider-target");
+            std::fs::create_dir_all(&target).unwrap();
+            symlink(&target, &shared).unwrap();
+            assert_eq!(
+                refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
+                REFUSAL
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn graph_load_snapshots_original_journal_filename_before_migration() {
         let dir = scratch("pre-migrate-backup");
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
@@ -563,5 +821,78 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_graph_load_defers_journal_migration_until_it_is_an_operation() {
+        let dir = scratch("managed-journal-migration");
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(
+            dir.join("logseq/config.edn"),
+            "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        let old = dir.join("journals/Thursday, 25-06-2026.org");
+        let canonical = dir.join("journals/2026_06_25.org");
+        std::fs::write(&old, "* managed journal\n").unwrap();
+        let initial = Graph::open(&dir);
+        initial
+            .enable_managed_sync(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .unwrap();
+        let original_id = std::fs::read_to_string(&old)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .find(|value| uuid::Uuid::parse_str(value).is_ok())
+            .unwrap()
+            .to_string();
+        drop(initial);
+
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |graph| {
+            copy_graph_text_dir(&graph.journals_path(), &dir.join("backup/journals"))
+        })
+        .unwrap();
+        assert!(
+            old.exists(),
+            "the startup layer must not move it before replay"
+        );
+        assert!(!canonical.exists());
+        loaded
+            .graph
+            .start_managed_sync(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .unwrap();
+        loaded.graph.project_all_managed_sync().unwrap();
+        assert_eq!(loaded.graph.migrate_journal_filenames_checked().unwrap(), 1);
+
+        assert!(!old.exists());
+        let projected = std::fs::read_to_string(&canonical).unwrap();
+        assert_eq!(projected.matches(&original_id).count(), 1);
+        assert_eq!(loaded.graph.managed_sync_status().unwrap().page_count, 1);
+        assert_eq!(
+            count_update_chunks(&dir.join(".tine-sync/v1")),
+            1,
+            "journal migration is one durable update operation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn count_update_chunks(path: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    count_update_chunks(&entry.path())
+                } else {
+                    usize::from(
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("chunk")
+                            && entry.path().to_string_lossy().contains("/sessions/"),
+                    )
+                }
+            })
+            .sum()
     }
 }

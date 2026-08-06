@@ -6,7 +6,7 @@ use cap_std::{
 };
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
@@ -20,8 +20,10 @@ const BACKUP_KEEP_DEFAULT: usize = 12;
 const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) {
-    let source = BackupSource::from_graph(&slot.graph);
+pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) -> Result<(), String> {
+    let graph = slot.legacy_graph()?;
+    let source = BackupSource::from_graph(&graph);
+    drop(graph);
     std::thread::spawn(move || {
         // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
         // contend for disk I/O with first-journal paint and the warm-cache parse
@@ -46,6 +48,7 @@ pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) {
             slot.background_cancelled.load(Ordering::Acquire)
         }); // launch snapshot is best-effort
     });
+    Ok(())
 }
 
 pub(crate) fn backup_graph_now(
@@ -383,7 +386,8 @@ pub(crate) fn set_backup_keep(
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
     let slot = slot_for_context(&state)?;
-    if let Some(base) = backup_base(&app, &slot.graph) {
+    let graph = slot.legacy_graph()?;
+    if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
     Ok(())
@@ -404,7 +408,7 @@ pub(crate) async fn list_backups(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<Vec<BackupInfo>, String> {
-    let root = slot_for_context(&state)?.graph.root.clone();
+    let root = slot_for_context(&state)?.legacy_graph()?.root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(base) = backup_base_for_root(&app, &root) else {
             return Vec::new();
@@ -506,11 +510,13 @@ pub(crate) async fn restore_backup(
     {
         return Err("invalid backup id".into());
     }
-    let source = BackupSource::from_graph(&slot_for_context(&state)?.graph);
+    let slot = slot_for_context(&state)?;
+    let graph = slot.legacy_graph_cloned()?;
+    let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let base = backup_base_for_root(&restore_app, &source.root).ok_or("no app-data dir")?;
-        restore_from_backup_source(&stamp, &base, source, |source| {
+        restore_from_backup_source(&stamp, &base, source, Some(&graph), |source| {
             do_backup_source(&restore_app, source.clone(), "pre-restore")
         })
     })
@@ -523,6 +529,7 @@ fn restore_from_backup_source(
     stamp: &str,
     base: &std::path::Path,
     source: BackupSource,
+    managed_graph: Option<&Graph>,
     snapshot_current: impl FnOnce(&BackupSource) -> (usize, bool),
 ) -> Result<(), String> {
     let journals = source.journals.clone();
@@ -609,6 +616,13 @@ fn restore_from_backup_source(
     // The safety snapshot can take time. Revalidate after it so a symlink swap
     // cannot redirect the destructive copy/delete phase outside the graph.
     validate_live_layout()?;
+    if let Some(graph) = managed_graph.filter(|graph| graph.managed_sync_status().is_some()) {
+        let restore_files =
+            collect_restore_graph_text(&src, &manifest.journals_dir, &manifest.pages_dir)?;
+        graph
+            .commit_managed_restore(&restore_files)
+            .map_err(|error| format!("managed-sync restore preflight failed: {error}"))?;
+    }
     // Restore each dir; copies happen before extras are moved to the dedicated
     // recovery area, so a failure leaves either the original or a recoverable copy.
     restore_md_dir(
@@ -655,6 +669,64 @@ fn restore_from_backup_source(
             .map_err(|e| format!("restore config failed: {e}"))?;
     }
     Ok(())
+}
+
+fn collect_restore_graph_text(
+    snapshot: &Path,
+    journals_dir: &str,
+    pages_dir: &str,
+) -> Result<Vec<(String, String)>, String> {
+    fn collect(
+        source: &Path,
+        graph_dir: &str,
+        relative: &Path,
+        output: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(source)
+            .map_err(|error| format!("cannot read verified backup directory: {error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read verified backup: {error}"))?;
+            let path = entry.path();
+            let child = relative.join(entry.file_name());
+            if is_graph_text(&path) {
+                let tail = child
+                    .components()
+                    .map(|component| match component {
+                        std::path::Component::Normal(value) => value
+                            .to_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "backup contains a non-UTF-8 graph path".to_string()),
+                        _ => Err("backup contains an unsafe graph path".to_string()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("/");
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|error| format!("cannot read verified backup page: {error}"))?;
+                output.push((format!("{graph_dir}/{tail}"), content));
+            } else if is_visible_real_dir(&entry)
+                .map_err(|error| format!("cannot inspect verified backup: {error}"))?
+            {
+                collect(&path, graph_dir, &child, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    collect(
+        &snapshot.join("journals"),
+        journals_dir,
+        Path::new(""),
+        &mut files,
+    )?;
+    collect(
+        &snapshot.join("pages"),
+        pages_dir,
+        Path::new(""),
+        &mut files,
+    )?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
 }
 
 struct RestoreRecovery {
@@ -1752,7 +1824,7 @@ mod tests {
         };
 
         PAYLOAD_HASH_READS.with(|reads| reads.set(0));
-        let result = restore_from_backup_source(stamp, &base, source, |_| {
+        let result = restore_from_backup_source(stamp, &base, source, None, |_| {
             std::fs::write(&live_page, b"mutated graph data").unwrap();
             (1, true)
         });
@@ -1797,6 +1869,31 @@ mod tests {
         assert!(!dst.join("nested").join("image.png").exists());
         assert!(!dst.join(ASSET_RESTORE_RECOVERY_DIR).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_preflight_collects_nested_text_with_configured_graph_paths() {
+        let root = scratch("restore-preflight");
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(snapshot.join("journals")).unwrap();
+        std::fs::create_dir_all(snapshot.join("pages").join("nested")).unwrap();
+        std::fs::write(snapshot.join("journals").join("day.org"), "* day\n").unwrap();
+        std::fs::write(
+            snapshot.join("pages").join("nested").join("Page.md"),
+            "- page\n",
+        )
+        .unwrap();
+        std::fs::write(snapshot.join("pages").join("ignored.txt"), "ignored\n").unwrap();
+
+        let files = collect_restore_graph_text(&snapshot, "diary", "notes").unwrap();
+        assert_eq!(
+            files,
+            vec![
+                ("diary/day.org".into(), "* day\n".into()),
+                ("notes/nested/Page.md".into(), "- page\n".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

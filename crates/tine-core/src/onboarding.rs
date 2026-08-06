@@ -69,6 +69,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         markdown: include_str!("templates/plugins.md"),
     },
     GuideTemplate {
+        title: "Features/Managed sync",
+        markdown: include_str!("templates/managed-sync.md"),
+    },
+    GuideTemplate {
         title: "Features/Tips & shortcuts",
         markdown: include_str!("templates/tips.md"),
     },
@@ -116,18 +120,18 @@ pub fn guide_copy_page_name(title: &str) -> String {
     format!("{GUIDE_COPY_PREFIX}{title}")
 }
 
-pub fn bundled_guide_pages() -> Vec<GuidePage> {
+pub fn bundled_guide_pages() -> io::Result<Vec<GuidePage>> {
     GUIDE_TEMPLATES
         .iter()
         .map(|t| {
-            let mut page = markdown_page_dto(&guide_page_name(t.title), t.title, t.markdown);
+            let mut page = markdown_page_dto(&guide_page_name(t.title), t.title, t.markdown)?;
             page.read_only = true;
             page.guide = true;
-            GuidePage {
+            Ok(GuidePage {
                 title: t.title.to_string(),
                 markdown: t.markdown.to_string(),
                 page,
-            }
+            })
         })
         .collect()
 }
@@ -162,6 +166,28 @@ fn rewrite_bundled_guide_links(markdown: &str, renames: &HashMap<String, String>
     crate::refs::rename_refs_multi(markdown, renames, false)
 }
 
+fn bind_copied_page_title(markdown: String, copied_name: &str) -> String {
+    let Some(first_newline) = markdown.find('\n') else {
+        return markdown;
+    };
+    let first = markdown[..first_newline].trim_end_matches('\r');
+    let Some((key, _)) = first.split_once("::") else {
+        return markdown;
+    };
+    if !key.trim().eq_ignore_ascii_case("title") {
+        return markdown;
+    }
+    let newline = if markdown[..first_newline].ends_with('\r') {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    format!(
+        "title:: {copied_name}{newline}{}",
+        &markdown[first_newline + 1..]
+    )
+}
+
 pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopyResult> {
     let Some(viewed) = GUIDE_TEMPLATES
         .iter()
@@ -177,7 +203,10 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
     let mut skipped_pages = Vec::new();
     for template in GUIDE_TEMPLATES {
         let name = guide_copy_page_name(template.title);
-        let markdown = rewrite_bundled_guide_links(template.markdown, &renames);
+        let markdown = bind_copied_page_title(
+            rewrite_bundled_guide_links(template.markdown, &renames),
+            &name,
+        );
         if graph.create_markdown_page_if_absent(&name, &markdown)? {
             created_pages.push(name);
         } else {
@@ -325,7 +354,7 @@ mod tests {
             graph.resolve_block(TARGET_ID).is_some(),
             "block-ref target missing"
         );
-        let counts = graph.block_ref_counts();
+        let counts = graph.block_ref_counts().unwrap();
         assert_eq!(
             counts.get(TARGET_ID).copied(),
             Some(2),
@@ -359,7 +388,7 @@ mod tests {
 
     #[test]
     fn bundled_guide_pages_are_read_only_virtual_pages() {
-        let pages = bundled_guide_pages();
+        let pages = bundled_guide_pages().unwrap();
         let index = pages
             .iter()
             .find(|p| p.title == "Tine Guide")
@@ -492,7 +521,7 @@ mod tests {
         assert!(copied.skipped_pages.is_empty());
         assert_eq!(copied.copied_assets, vec!["quick-capture.png".to_string()]);
 
-        for guide in bundled_guide_pages() {
+        for guide in bundled_guide_pages().unwrap() {
             let name = guide_copy_page_name(&guide.title);
             let path = graph.path_for(&name, PageKind::Page);
             assert!(path.is_file(), "missing copied guide page {name}");

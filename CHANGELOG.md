@@ -8,6 +8,102 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.90] - 2026-08-04
+
+### Fixed
+
+- **Post-activation managed-storage reads and writes no longer freeze the app
+  while the required first reconciliation finishes.** Ordinary page, journal,
+  query, editor, status, transition, tick, and shutdown commands run actor waits
+  on the blocking pool and revalidate their exact graph generation before work,
+  so queued commands cannot gain authority over a replacement graph.
+- **Restarting after interrupted managed-storage activation no longer leaves the
+  desktop window hidden behind synchronous native setup.** The themed window now
+  paints before the unchanged fail-closed recovery path runs, while ordered
+  recovery phases and periodic wait diagnostics make legitimate long recovery
+  observable without admitting unvalidated state.
+- **Sparse-v2 now detects sampled interior corruption in its disposable SQLite
+  projection during reopen.** Versioned, bounded fingerprints cover up to 1 MiB
+  across the interior of each database and WAL file in addition to their edges;
+  a mismatch preserves forensic evidence and rebuilds from oplog authority.
+- **Sparse-v2 activation now uses lsdoc as the single Markdown and Org outline
+  authority.** Parser-owned source spans and topology replace Tine's duplicate
+  structural scanners, so Logseq-compatible headings, multiline blocks, mixed
+  indentation, and other unusual but parseable layouts import without changing
+  their meaning. Admission remains fail-closed when a layout cannot be
+  represented safely.
+- **Reverse-delivered experimental shared-provider histories now schedule inbound
+  batches by causal dependency instead of repeatedly scanning the pending
+  queue.** Each ready manifest is registered once, already-active parents are
+  satisfied immediately, and accepting a parent wakes only its deterministically
+  indexed children while blocked work remains visible to status and Safe
+  shutdown.
+- **Experimental shared-provider sync no longer loses oversized or overlapping
+  delivery callbacks or preempts an already-observed local file edit.** Rejected
+  callbacks retain a bounded rescan before `Safe`, observations arriving during
+  an active cursor force a subsequent scan, and watcher-captured bytes take
+  priority over remote ingestion. Safe reopen also republishes a completely
+  missing provider namespace, and exact deletion of an accepted manifest repairs
+  from authenticated local archive bytes.
+- **Eligible Markdown and Org files outside configured page roots stay
+  discoverable and exact-path load/save never exposes a blank writable substitute**
+  (GH #246). Lowercase `.markdown` files and external add/delete updates follow
+  the same graph-wide text scope without overwriting the original bytes.
+- **Page titles now map injectively to reversible, Windows-safe filenames**
+  (GH #249). Existing graph filenames remain readable as stored, while unsafe
+  create/rename/rescue identities and collisions are refused without overwriting
+  another page's bytes.
+- **A missing remembered graph no longer prevents Tine from starting** (GH #250).
+  Startup reaches the visible graph chooser instead of panicking during native
+  setup, without creating or changing the missing path.
+- **Configured default journal templates materialize once across local midnight**
+  (GH #260). Timer, focus, and visibility refreshes use one graph/day guard, so
+  a new day is initialized without duplicate template blocks or stale-graph writes.
+
+### Changed
+
+- **Experimental sparse-v2 storage can explicitly enroll two honest devices
+  through a shared filesystem provider.** A Safe, idle initiator publishes
+  immutable archive objects and manifests before one descriptor; a second
+  device joins only the exact shared lineage and projection base. Both roles
+  reconcile exact paths or retained incremental cursors through the one actor,
+  without whole-provider archive caps or historical-manifest replay. Durable
+  pending-publication markers resume accepted local and external-import batches
+  after a crash, poll mode observes provider delivery independently of graph
+  polling, and `SharePrepared` resumes before descriptor publication. Exact
+  byte-identical generated conflict copies are retired with no-follow proof;
+  differing or ambiguous evidence remains visible and blocks without graph
+  writes. The Settings actions remain explicit and experimental.
+- **Experimental sparse-v2 storage now has an explicit per-graph application
+  boundary.** Opt-in retires and drains the legacy graph authority before
+  publishing the durable binding, then routes bounded queries, editor intents,
+  whole-root external-file observations, recovery status, and clean shutdown
+  through one actor. Startup never enables it implicitly or falls back to a
+  legacy writer after opt-in.
+- **The disconnected experimental v2 oplog engine now uses one leased,
+  authenticated run-local scratch store.** Exact causal clocks, compact
+  store-backed batch status/waits, shallow document checkpoints with
+  content-addressed chunks, and paged conflict evidence replace archive-history
+  scans and unbounded hot maps. Scratch performs no durability sync and cannot
+  delete or rewrite authoritative archive bytes. This engine remains disconnected
+  from graph startup, migration, and user-visible writes.
+
+### Added
+
+- **Experimental managed sync can make an existing Syncthing/Dropbox graph
+  operation-backed without moving it.** Tine stores immutable per-session Loro
+  updates in `.tine-sync/`, keeps Markdown/Org as an editable projection for Logseq
+  and other tools, imports external file edits conservatively, and automatically
+  removes only conflict copies proven to be generated projections. Activation adds
+  durable Logseq-compatible block IDs after a complete local safety snapshot;
+  ordinary backup restore is operation-first and crash-resumable. This first version
+  manages page and journal text; assets, PDF sidecars, and configuration remain
+  ordinary provider-synchronized files. (Experimental, opt-in.)
+- **Sparse-oplog crash takeover can recover to a clean handoff.** A restarted
+  experimental runtime that takes over an `Unsafe` predecessor now performs an
+  authenticated full external-file reconciliation before admitting automatic imports
+  or publishing `Safe`, preserving unimported projection bytes.
+
 ## [0.6.5] - 2026-07-22
 
 ### Added
@@ -2496,7 +2592,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.90...HEAD
+[0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/martinkoutecky/tine/compare/v0.5.8...v0.5.9

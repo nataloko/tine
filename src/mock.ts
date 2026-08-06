@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult, InstalledPluginRecord, PluginRegistryCacheEnvelope } from "./backend";
-import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup } from "./types";
+import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -635,6 +635,16 @@ function cloneGuideBlockForCopy(block: BlockDto, copied: Map<string, string>): B
 
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
+  let managedSync: ManagedSyncStatus | null = null;
+  let sparseV2: SparseV2Status = {
+    state: "legacy_default",
+    runtime: null,
+    can_activate: true,
+    can_retry: false,
+    can_cancel: false,
+    cancel_reason: null,
+    binding_generation: 1,
+  };
   const find = (name: string) =>
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ?? null;
 
@@ -857,6 +867,125 @@ export function mockBackend(): Backend {
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean): Promise<string> {
       return "mock-rev"; // no-op in mock
+    },
+    async managedSyncStatus() {
+      return managedSync;
+    },
+    async managedSyncIdentityPlan() {
+      return { pages: all.length, blocks: 42 };
+    },
+    async enableManagedSync() {
+      managedSync = {
+        workspace_id: "00000000-0000-4000-8000-000000000001",
+        device_id: "00000000-0000-4000-8000-000000000002",
+        session_id: "00000000-0000-4000-8000-000000000003",
+        page_count: all.length,
+        imported_chunks: 1,
+        store_root: "/mock/.tine-sync/v1",
+        durability_blocked: false,
+      };
+      return {
+        migration: { pages_changed: all.length, blocks_changed: 42 },
+        status: managedSync,
+      };
+    },
+    async sparseV2Status() {
+      return sparseV2;
+    },
+    async onSparseV2ActivationProgress() {
+      return () => {};
+    },
+    async activateSparseV2() {
+      sparseV2 = {
+        state: "active",
+        runtime: {
+          lifecycle: "active",
+          recovery: "first_promotion",
+          watcher: {
+            latest_enqueue: 0,
+            acknowledged: 0,
+            drain_in_flight: false,
+            pending: false,
+            pending_requires_full_scan: false,
+            deferred: false,
+            quiescing: false,
+            sequence_exhausted: false,
+          },
+          last_tick: null,
+          detail: null,
+          shared_role: null,
+          shared_phase: null,
+          provider_pending: 0,
+        },
+        can_activate: false,
+        can_retry: false,
+        can_cancel: true,
+        cancel_reason: null,
+        binding_generation: sparseV2.binding_generation + 1,
+      };
+      return sparseV2;
+    },
+    async cancelSparseV2() {
+      sparseV2 = {
+        state: "legacy_default",
+        runtime: null,
+        can_activate: true,
+        can_retry: false,
+        can_cancel: false,
+        cancel_reason: null,
+        binding_generation: sparseV2.binding_generation + 1,
+      };
+      return {
+        status: sparseV2,
+        binding_generation: sparseV2.binding_generation,
+        recovery_statement:
+          "Direct file mode is active. Complete recovery state was preserved.",
+      };
+    },
+    async prepareSparseV2Share() {
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "initiator",
+          shared_phase: "active",
+        },
+      };
+      return sparseV2;
+    },
+    async joinSparseV2Shared() {
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "joiner",
+          shared_phase: "active",
+        },
+      };
+      return sparseV2;
+    },
+    async sparseV2Query() {
+      return { kind: "pages", value: [] };
+    },
+    async sparseV2EditorLoad() {
+      return { status: "missing_page" };
+    },
+    async sparseV2EditorSave() {
+      return { status: "conflict", reason: "missing_page" };
+    },
+    async sparseV2Tick() {
+      return { state: "idle", detail: null, epoch: null };
+    },
+    async sparseV2CleanShutdown() {
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
+      const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
+      sparseV2 = {
+        ...sparseV2,
+        runtime,
+      };
+      return runtime;
     },
     async guidePages(): Promise<GuidePage[]> {
       return mockGuidePages().map((g) => ({ ...g, page: clonePage(g.page) }));
@@ -1524,6 +1653,12 @@ export function mockBackend(): Backend {
     },
     async onGraphChanged(): Promise<() => void> {
       return () => {}; // no external watcher in the browser mock
+    },
+    async onSparseV2Changed(): Promise<() => void> {
+      return () => {};
+    },
+    async onManagedSyncError(): Promise<() => void> {
+      return () => {};
     },
     async getBackupKeep(): Promise<number> {
       return 12;

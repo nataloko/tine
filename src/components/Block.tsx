@@ -387,6 +387,20 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
     }
     return cfg;
   });
+  // `thread-lines` only decorates the ordinary outline container below this
+  // row. Do not subscribe every leaf to plugin installation/settings changes:
+  // large flat pages are predominantly leaves, and there is no container for
+  // the plugin CSS to affect. Deliberately keep collapsed parents eligible so
+  // their normal decoration state is already current when they expand.
+  const hasThreadLineHost = () => hasChildren() && sheet().view === null;
+  const threadLineDecoration = createMemo(() => {
+    if (!hasThreadLineHost()) return { enabled: false, active: false, standard: false };
+    return {
+      enabled: pluginManager.hasDeclarativeDecoration("thread-lines"),
+      active: pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
+      standard: pluginManager.declarativeDecorationSetting("thread-lines", "intensity") === "standard",
+    };
+  });
   // Heading level of THIS block's first line, so the bullet column can match the
   // (taller) heading line box and the bullet stays centered on it.
   const headingLevel = createMemo(() => {
@@ -424,10 +438,6 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
     if (threadColorMode() === "accent") return undefined;
     return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
   };
-  // Upstream's WASM bullet-threading plugin renders through host-owned CSS
-  // decorations; keep that path for anyone who installs it. The built-in toggle
-  // draws the fork's own SVG threads (below) instead, so the two never overlap.
-  const pluginThreadingEnabled = () => pluginManager.hasDeclarativeDecoration("thread-lines");
   // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
   // outline. Showing both this storage block's controls and the referenced root's
   // controls produces two consecutive bullets. Keep the referenced root controls
@@ -447,9 +457,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
         "block-embed-host": blockEmbedHost(),
         // Upstream plugin decoration path — active only when an actual plugin
         // declares it; the fork toggle draws its own SVG so these never both apply.
-        "plugin-thread-lines": pluginThreadingEnabled(),
-        "plugin-thread-lines-active": pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
-        "plugin-thread-lines-standard": pluginManager.declarativeDecorationSetting("thread-lines", "intensity") === "standard",
+        "plugin-thread-lines": threadLineDecoration().enabled,
+        "plugin-thread-lines-active": threadLineDecoration().active,
+        "plugin-thread-lines-standard": threadLineDecoration().standard,
       }}
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}

@@ -35,7 +35,8 @@
       "contracts": [{ "class": "stateful-ux", "userOutcome": "Quick Capture activates, accepts first-show typing, saves the journal entry, and supports a safe second-instance handoff.", "blocking": true }],
       "acceptableVariations": ["Native focus timing and frame decoration may vary by window manager."],
       "nonRequirements": ["Exact window position, border pixels, or focus-animation timing."],
-      "stability": "stable"
+      "stability": "quarantined",
+      "quarantineReason": "2026-08-04: exact staged Linux binary 716056889fa7d1bad905b32b5255a05b724f0d3d intermittently accepted [[Fz]] after the fresh-process Quick Capture handoff while autocomplete labels stayed empty. The retained Xvfb/Openbox failure includes an X11 BadWindow error, while the unchanged-binary retry passed, so the current timing is not a deterministic readiness predicate. Keep running this semantic journey for artifacts; restore release blocking only with a proven test-visible frontend-ready boundary."
     },
     "scripts/e2e-clipboard-roundtrip.mjs": {
       "contracts": [{ "class": "core-operation", "userOutcome": "app's own block copy is recognized on paste (private payload association)", "blocking": false }],
@@ -65,6 +66,18 @@
       "contracts": [{ "class": "exact-safety-interoperability", "userOutcome": "An approved external asset directory is read and written through its exact canonical graph and target identity.", "blocking": true, "authority": "Tine external-asset consent and canonical-path contract" }],
       "acceptableVariations": ["The native file-picker implementation and media presentation may vary after consent is established."],
       "nonRequirements": ["Exact dialog appearance or host file-manager behavior."],
+      "stability": "stable"
+    },
+    "scripts/e2e-file-poll.mjs": {
+      "contracts": [{ "class": "core-operation", "userOutcome": "Disk-backed E2E journeys observe an atomically replaced file within a bounded wait without treating its transient absence as a product failure.", "blocking": true }],
+      "acceptableVariations": ["The number and timing of transient missing-file observations may vary within the bounded save window."],
+      "nonRequirements": ["Retrying permission errors, malformed paths, persistent absence, or content that never satisfies the journey predicate."],
+      "stability": "stable"
+    },
+    "scripts/e2e-file-poll.test.mjs": {
+      "contracts": [{ "class": "core-operation", "userOutcome": "The atomic-save polling contract retries only transient missing files and remains fail-closed for persistent absence and other I/O errors.", "blocking": true }],
+      "acceptableVariations": ["The helper implementation and test clock may evolve while the three error-class boundaries remain proved."],
+      "nonRequirements": ["Any product UI journey or exact polling interval by itself."],
       "stability": "stable"
     },
     "scripts/e2e-journal-format.mjs": {
@@ -214,6 +227,15 @@
       "acceptableVariations": ["Scrollbar thickness, palette, overlay behavior, and platform rendering may evolve."],
       "nonRequirements": ["Exact scrollbar palette/RGB, thumb dimensions, CSS selector, or DOM structure."],
       "stability": "stable"
+    },
+    "scripts/e2e-sparse-v2-recovery.mjs": {
+      "contracts": [
+        { "class": "exact-safety-interoperability", "userOutcome": "Explicit sparse-v2 activation and return to standard Markdown mode preserve the graph's authority transition and user-visible Markdown continuity across real native restarts.", "blocking": true, "authority": "Tine sparse-v2 local authority-transition and Markdown interoperability contract" },
+        { "class": "core-operation", "userOutcome": "Users can edit an existing UTF-named page and create a new page in sparse v2, then reopen both saved edits after restart and after returning to standard Markdown mode.", "blocking": true }
+      ],
+      "acceptableVariations": ["Settings layout, native dialog decoration, page-list order, and restart timing may vary while visible content and Markdown continuity remain intact."],
+      "nonRequirements": ["Sparse private-storage layout, internal digests, exact native-dialog pixels, or animation timing."],
+      "stability": "burn-in"
     },
     "scripts/e2e-search-parity.mjs": {
       "contracts": [{ "class": "core-operation", "userOutcome": "Ctrl-K search preserves canonical Unicode matching, current-page scope, evidence, Shift-Enter sidebar opening, and the selected physical owner for same-name page and block results.", "blocking": true }],

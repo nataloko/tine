@@ -12,45 +12,45 @@ mod git;
 mod graph;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
-mod migrate_identifier;
 mod media_protocol;
+mod migrate_identifier;
 mod native_mouse_history;
 mod platform;
 mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
+mod sync_runtime;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
     asset_trash_stats, block_ref_counts, block_referrers, capture_quick_switch, close_graph_window,
     copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
-    empty_asset_trash, export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page,
-    get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages, import_asset,
-    import_native_capture, journal_content_days, journal_feed_page, list_journal_conflicts,
-    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, load_workspaces, merge_pages,
-    open_asset, open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
+    empty_asset_trash, enable_managed_sync, export_query_subtrees, get_backlink_filter_context,
+    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
+    import_asset, import_native_capture, journal_content_days, journal_feed_page,
+    list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts, list_templates,
+    load_workspaces, managed_sync_identity_plan, managed_sync_status, merge_pages, open_asset,
+    open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
     publish_html, query_facets, quick_switch, read_asset, read_custom_css, read_highlights,
     read_journal_file, read_local_image, read_text_file, referenced_page_names,
-    rename_file_to_page, rename_page,
-    resolve_block, resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search,
-    run_query, save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
-    set_doc_mode_enter_for_new_block, set_favorites, set_guide_announced, set_journal_title_format,
-    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
-    set_start_of_week, set_timetracking_enabled,
-    stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
-    save_workspaces, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
+    rename_file_to_page, rename_page, resolve_block, resolve_blocks, resolve_sync_conflict,
+    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
+    save_workspaces, search, set_default_journal_template, set_doc_mode_enter_for_new_block,
+    set_favorites, set_guide_announced, set_journal_title_format, set_logical_outdenting,
+    set_preferred_format, set_preferred_workflow, set_show_brackets, set_start_of_week,
+    set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit,
+    trash_asset, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
-use debug::{
-    debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
-};
+use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use git::{
     git_commit, git_force_pull, git_force_push, git_init, git_pull, git_push, git_status,
 };
 use graph::{
-    app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph, default_graph_parent,
-    inspect_graph_access, load_graph, open_graph_window, resolve_root, startup_graph_path, warm_done,
+    app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
+    default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
+    warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use plugins::{
@@ -69,6 +69,11 @@ use state::AppState;
 #[cfg(desktop)]
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
+use sync_runtime::{
+    activate_sparse_v2, cancel_sparse_v2, join_sparse_v2_shared, prepare_sparse_v2_share,
+    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
+    sparse_v2_status, sparse_v2_tick,
+};
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
@@ -488,8 +493,7 @@ pub fn run() {
     let mut context = tauri::generate_context!();
     #[cfg(target_os = "windows")]
     {
-        let automation_enabled =
-            std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true");
+        let automation_enabled = std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true");
         let inherited = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
         apply_windows_webdriver_window_policy(
             &mut context.config_mut().app.windows,
@@ -514,10 +518,10 @@ pub fn run() {
         }
     }
 
-    let builder = tauri::Builder::default().register_uri_scheme_protocol(
-        "tine-media",
-        |ctx, request| media_protocol::respond(ctx, request),
-    );
+    let builder = tauri::Builder::default()
+        .register_uri_scheme_protocol("tine-media", |ctx, request| {
+            media_protocol::respond(ctx, request)
+        });
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let builder = builder.append_invoke_initialization_script(format!(
@@ -563,7 +567,11 @@ pub fn run() {
                         | tauri_plugin_window_state::StateFlags::POSITION
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED,
                 )
-                .with_denylist(if deny_main_window_state_restore { &["capture", "main"] } else { &["capture"] })
+                .with_denylist(if deny_main_window_state_restore {
+                    &["capture", "main"]
+                } else {
+                    &["capture"]
+                })
                 .build(),
         );
 
@@ -624,6 +632,7 @@ pub fn run() {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
+            sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
         })
@@ -644,64 +653,12 @@ pub fn run() {
             }
             #[cfg(desktop)]
             schedule_main_window_reveal_fallback(app.handle());
-            // Eagerly open the graph if one was configured at startup.
-            let startup_root = resolve_root("").or_else(|| settings::last_graph_path(app.handle()));
-            if let Some(root) = startup_root {
-                let state = app.state::<AppState>();
-                graph::load_graph_for_label(root, app.handle(), "main", &state)?;
-                let slot = state::slot_for_window(&state, "main")?;
-                let g = &slot.graph;
-                // These diagnostics enumerate dirs AND force a whole-graph cache
-                // build (journals_desc()/list_pages()) — on the cold-cache critical
-                // path to first paint, before warm_cache_async. The format! args
-                // are evaluated regardless of whether diag() ends up writing, so
-                // gate the whole block on debug to keep it off the 99% hot launch.
-                if debug_enabled() {
-                    let meta = g.meta();
-                    let jdir = g.journals_path();
-                    let pdir = g.pages_path();
-                    let count_md = |d: &std::path::Path| {
-                        std::fs::read_dir(d)
-                            .map(|rd| {
-                                rd.flatten()
-                                    .filter(|e| {
-                                        e.path().extension().and_then(|x| x.to_str()) == Some("md")
-                                    })
-                                    .count()
-                            })
-                            .ok()
-                    };
-                    diag(format!("graph root: {}", meta.root));
-                    diag(format!(
-                        "journals dir: {} (exists={}, .md files={:?})",
-                        jdir.display(),
-                        jdir.is_dir(),
-                        count_md(&jdir)
-                    ));
-                    diag(format!(
-                        "pages dir: {} (exists={}, .md files={:?})",
-                        pdir.display(),
-                        pdir.is_dir(),
-                        count_md(&pdir)
-                    ));
-                    diag(format!(
-                        "journals recognized as dates: {} | total page entries: {}",
-                        g.journals_desc().len(),
-                        g.list_pages().len()
-                    ));
-                    if let Ok(rd) = std::fs::read_dir(&jdir) {
-                        let sample: Vec<String> = rd
-                            .flatten()
-                            .filter_map(|e| e.file_name().into_string().ok())
-                            .filter(|n| n.ends_with(".md"))
-                            .take(3)
-                            .collect();
-                        diag(format!("sample journal files: {sample:?}"));
-                    }
-                }
-            } else {
-                diag("NO graph root resolved — set TINE_GRAPH=/path/to/graph");
-            }
+            // The themed WebView owns startup graph loading through the normal
+            // `load_graph` command. In particular, authenticated managed crash
+            // recovery may be legitimate work; running it here would block the
+            // native event loop before either the stable-frame reveal or the
+            // fallback can show a window.
+            diag("setup() defers graph open to the visible webview");
             // Watch for external changes (reads whichever graph is current).
             start_watcher(app.handle().clone());
             diag("setup() done — watcher started, handing off to webview");
@@ -751,6 +708,19 @@ pub fn run() {
             get_page,
             graph_source_files,
             save_page,
+            managed_sync_status,
+            managed_sync_identity_plan,
+            enable_managed_sync,
+            sparse_v2_status,
+            activate_sparse_v2,
+            cancel_sparse_v2,
+            prepare_sparse_v2_share,
+            join_sparse_v2_shared,
+            sparse_v2_query,
+            sparse_v2_editor_load,
+            sparse_v2_editor_save,
+            sparse_v2_tick,
+            sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,
             get_backlink_filter_context,

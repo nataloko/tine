@@ -20,136 +20,35 @@
 //! orgize 0.9, which splits the block at such a line). The self-check is the
 //! corruption firewall regardless of any parser's classification choices.
 
-use crate::doc::{DocBlock, Document};
-
-/// Heading level of a line if it is an org headline (`*`/`**`/… followed by a
-/// space, tab, CR or end-of-line), else `None`. Headlines start at column 0.
-/// `**bold**` (stars immediately followed by a non-space) is NOT a headline,
-/// matching org; `** title` (stars then space) IS a level-2 headline.
-fn headline_level(line: &str) -> Option<usize> {
-    let stars = line.bytes().take_while(|&b| b == b'*').count();
-    if stars == 0 {
-        return None;
-    }
-    let rest = &line[stars..];
-    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') || rest.starts_with('\r')
-    {
-        Some(stars)
-    } else {
-        None
-    }
-}
-
-/// Scan a file's lines for the real headlines, in document order, returning
-/// `(line_index, level)` for each. Lines inside an org block
-/// (`#+BEGIN_x` … `#+END_x`, any `x`, case-insensitive, leading whitespace
-/// allowed) are content, so a `*`-line there is not mistaken for a headline.
-fn scan_headlines(lines: &[&str]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut block_depth: usize = 0;
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        let b = trimmed.as_bytes();
-        if b.len() >= 2 && b[0] == b'#' && b[1] == b'+' {
-            let kw = &trimmed[2..];
-            if kw.len() >= 6 && kw[..6].eq_ignore_ascii_case("begin_") {
-                block_depth += 1;
-                continue;
-            }
-            if kw.len() >= 4 && kw[..4].eq_ignore_ascii_case("end_") {
-                block_depth = block_depth.saturating_sub(1);
-                continue;
-            }
-        }
-        if block_depth == 0 {
-            if let Some(level) = headline_level(line) {
-                out.push((i, level));
-            }
-        }
-    }
-    out
-}
+use crate::doc::{DocBlock, Document, ParsedDocument, SerializeOpts, StructuralLayoutIdentity};
 
 /// Number of trailing `\n` bytes (the document-level trailing-newline run),
 /// stripped on parse and reproduced on serialize so block bodies stay free of
 /// trailing-blank artifacts.
 fn trailing_newlines(s: &str) -> usize {
-    s.bytes().rev().take_while(|&b| b == b'\n').count()
+    s.bytes()
+        .rev()
+        .take_while(|&b| b == b'\n' || b == b'\r')
+        .filter(|&b| b == b'\n')
+        .count()
 }
 
 /// Parse org `content` into a [`Document`]: headlines become blocks (nesting =
 /// headline level), the pre-headline region becomes `pre_block`, and each
 /// block's body is kept verbatim in `raw` (leading stars stripped).
 pub fn parse_org(content: &str) -> Document {
-    let body = content.trim_end_matches('\n');
-    if body.is_empty() {
-        return Document::default();
-    }
-    let lines: Vec<&str> = body.split('\n').collect();
-    let heads = scan_headlines(&lines);
-
-    let first = heads.first().map(|h| h.0).unwrap_or(lines.len());
-    let pre_block = if first == 0 {
-        None
-    } else {
-        Some(lines[..first].join("\n"))
-    };
-
-    // One (level, block) per headline; body = lines up to the next headline.
-    let mut flat: Vec<(usize, DocBlock)> = Vec::with_capacity(heads.len());
-    for (n, &(start, level)) in heads.iter().enumerate() {
-        let end = heads.get(n + 1).map(|h| h.0).unwrap_or(lines.len());
-        let seg = &lines[start..end];
-        // Drop the `level` stars and exactly one following space, so a block's raw
-        // is the title text with no leading marker (matching the markdown path,
-        // where `- ` is stripped). A second space, a tab, or no space is kept, so
-        // serialize re-adds one space and still round-trips multi-space headlines.
-        let after = &seg[0][level..];
-        let first_content = after.strip_prefix(' ').unwrap_or(after);
-        let raw = if seg.len() == 1 {
-            first_content.to_string()
-        } else {
-            let mut s = String::with_capacity(first_content.len() + 16);
-            s.push_str(first_content);
-            for l in &seg[1..] {
-                s.push('\n');
-                s.push_str(l);
-            }
-            s
-        };
-        let mut b = DocBlock::new(raw);
-        b.is_org = true; // org-format block → lsdoc parses inline refs in org mode
-        flat.push((level, b));
-    }
-
-    Document {
-        pre_block,
-        roots: build_tree(flat),
-    }
+    parse_org_with_source_spans(content).document
 }
 
-/// Assemble a flat list of `(level, block)` in document order into a forest,
-/// nesting each block under the nearest preceding block of smaller level.
-fn build_tree(flat: Vec<(usize, DocBlock)>) -> Vec<DocBlock> {
-    let mut roots: Vec<DocBlock> = Vec::new();
-    let mut stack: Vec<(usize, DocBlock)> = Vec::new();
-    fn attach(stack: &mut Vec<(usize, DocBlock)>, roots: &mut Vec<DocBlock>, done: DocBlock) {
-        match stack.last_mut() {
-            Some((_, parent)) => parent.children.push(done),
-            None => roots.push(done),
-        }
-    }
-    for (level, blk) in flat {
-        while stack.last().is_some_and(|(l, _)| *l >= level) {
-            let (_, done) = stack.pop().unwrap();
-            attach(&mut stack, &mut roots, done);
-        }
-        stack.push((level, blk));
-    }
-    while let Some((_, done)) = stack.pop() {
-        attach(&mut stack, &mut roots, done);
-    }
-    roots
+pub(crate) fn try_parse_org_with_source_spans(
+    content: &str,
+) -> Result<ParsedDocument, crate::outline::OutlineAdapterError> {
+    crate::outline::parse_document(content, crate::outline::OutlineFormat::Org)
+}
+
+pub(crate) fn parse_org_with_source_spans(content: &str) -> ParsedDocument {
+    try_parse_org_with_source_spans(content)
+        .unwrap_or_else(|error| panic!("unrepresentable lsdoc Org outline: {error}"))
 }
 
 /// Serialize a [`Document`] to org text with one trailing newline (the common
@@ -159,25 +58,56 @@ pub fn serialize_org(doc: &Document) -> String {
     serialize_org_with(doc, 1)
 }
 
-/// Serialize a [`Document`] to org text, ending with exactly `trailing` newline
-/// bytes. The inverse of [`parse_org`] for round-trip-safe input: stars come
-/// from tree depth (depth 0 → `*`), the pre-block and each block body verbatim.
+/// Serialize a [`Document`] to canonical org text, ending with exactly
+/// `trailing` newline bytes. Stars come from tree depth (depth 0 → `*`) and
+/// bodies are verbatim. To preserve source-owned structural blank lines and
+/// line endings, use [`serialize_org_detect`].
 pub fn serialize_org_with(doc: &Document, trailing: usize) -> String {
+    serialize_org_with_layout(doc, trailing, &[])
+}
+
+fn serialize_org_with_layout(
+    doc: &Document,
+    trailing: usize,
+    blank_lines_before_blocks: &[usize],
+) -> String {
     let mut out: Vec<String> = Vec::new();
     if let Some(pre) = &doc.pre_block {
         for line in pre.split('\n') {
             out.push(line.to_string());
         }
     }
+    let mut block_index = 0_usize;
     for block in &doc.roots {
-        emit_org(block, 1, &mut out);
+        emit_org(
+            block,
+            1,
+            blank_lines_before_blocks,
+            &mut block_index,
+            &mut out,
+        );
     }
     let mut s = out.join("\n");
     s.push_str(&"\n".repeat(trailing));
     s
 }
 
-fn emit_org(block: &DocBlock, level: usize, out: &mut Vec<String>) {
+fn emit_org(
+    block: &DocBlock,
+    level: usize,
+    blank_lines_before_blocks: &[usize],
+    block_index: &mut usize,
+    out: &mut Vec<String>,
+) {
+    out.extend(
+        std::iter::repeat_with(String::new).take(
+            blank_lines_before_blocks
+                .get(*block_index)
+                .copied()
+                .unwrap_or(0),
+        ),
+    );
+    *block_index = block_index.saturating_add(1);
     let stars = "*".repeat(level);
     let mut lines = block.raw.split('\n');
     let first = lines.next().unwrap_or("");
@@ -191,7 +121,13 @@ fn emit_org(block: &DocBlock, level: usize, out: &mut Vec<String>) {
         out.push(line.to_string());
     }
     for child in &block.children {
-        emit_org(child, level + 1, out);
+        emit_org(
+            child,
+            level + 1,
+            blank_lines_before_blocks,
+            block_index,
+            out,
+        );
     }
 }
 
@@ -199,13 +135,50 @@ fn emit_org(block: &DocBlock, level: usize, out: &mut Vec<String>) {
 /// trailing-newline run (default one newline for a new file). The org analogue
 /// of `doc::serialize_with(&doc, &SerializeOpts::detect(existing))`.
 pub fn serialize_org_detect(doc: &Document, existing: Option<&str>) -> String {
-    serialize_org_with(doc, existing.map(trailing_newlines).unwrap_or(1))
+    serialize_org_detect_with_layout_identities(doc, existing, &[])
+}
+
+pub(crate) fn serialize_org_detect_with_layout_identities(
+    doc: &Document,
+    existing: Option<&str>,
+    identities: &[StructuralLayoutIdentity],
+) -> String {
+    let opts = existing.map_or_else(SerializeOpts::default, |source| {
+        SerializeOpts::from_parsed_source(
+            source,
+            parse_org_with_source_spans(source),
+            String::new(),
+            identities,
+        )
+    });
+    let trailing = existing.map_or(1, trailing_newlines);
+    let blank_lines_before_blocks = opts.resolved_blank_lines(doc);
+    let mut rendered = serialize_org_with_layout(doc, trailing, &blank_lines_before_blocks);
+    if existing.is_some_and(|source| source.contains("\r\n")) {
+        rendered = rendered.replace('\n', "\r\n");
+    }
+    rendered
 }
 
 /// Whether `serialize_org(parse_org(content))` reproduces `content`
 /// byte-for-byte (including its exact trailing-newline run).
 pub fn org_round_trips(content: &str) -> bool {
-    serialize_org_with(&parse_org(content), trailing_newlines(content)) == content
+    let Ok(parsed) = try_parse_org_with_source_spans(content) else {
+        return false;
+    };
+    org_editable_parsed(content, &parsed)
+}
+
+pub(crate) fn org_editable_parsed(content: &str, parsed: &ParsedDocument) -> bool {
+    let mut rendered = serialize_org_with_layout(
+        &parsed.document,
+        trailing_newlines(content),
+        &parsed.blank_lines_before_blocks,
+    );
+    if content.contains("\r\n") {
+        rendered = rendered.replace('\n', "\r\n");
+    }
+    rendered == content
 }
 
 /// Whether Tine may safely **edit and write** this org file — i.e. it
@@ -269,7 +242,7 @@ mod tests {
     #[test]
     fn corpus_round_trips_byte_for_byte() {
         for (name, src) in corpus() {
-            let got = serialize_org_with(&parse_org(src), trailing_newlines(src));
+            let got = serialize_org_detect(&parse_org(src), Some(src));
             assert_eq!(got, src, "round-trip mismatch for sample `{name}`");
             assert!(org_round_trips(src), "org_round_trips false for `{name}`");
         }
@@ -344,6 +317,23 @@ mod tests {
     fn crlf_round_trips_verbatim() {
         let src = "* a\r\n* b\r\n";
         assert!(org_round_trips(src));
+        let doc = parse_org(src);
+        assert_eq!(doc.roots[0].raw, "a");
+        assert_eq!(doc.roots[1].raw, "b");
+    }
+
+    #[test]
+    fn structural_blank_lines_are_not_block_body_content() {
+        let src = "* a\n\n\n* b\n";
+        let parsed = parse_org_with_source_spans(src);
+        assert_eq!(parsed.document.roots[0].raw, "a");
+        assert_eq!(parsed.document.roots[1].raw, "b");
+        assert_eq!(parsed.blank_lines_before_blocks, vec![0, 2]);
+        assert_eq!(
+            serialize_org_detect(&parsed.document, Some(src)),
+            src,
+            "source layout must own and reproduce inter-heading blank lines"
+        );
     }
 
     /// GH #25: the id `rawWithBlockId` (store.ts) writes into an ORG block — a
@@ -368,7 +358,11 @@ mod tests {
             assert!(org_round_trips(src), "org drawer must round-trip: {src:?}");
             let doc = parse_org(src);
             let b = &doc.roots[0];
-            assert_eq!(b.property("id").as_deref(), Some(*id), "id read back: {src:?}");
+            assert_eq!(
+                b.property("id").as_deref(),
+                Some(*id),
+                "id read back: {src:?}"
+            );
             assert!(
                 !b.visible_text().contains(":PROPERTIES:") && !b.visible_text().contains(":id:"),
                 "drawer must be hidden from visible body: {src:?} -> {:?}",
