@@ -25,11 +25,18 @@ pub(crate) struct CaptureGraphBinding {
     pub(crate) binding_generation: u64,
 }
 
-/// The single write authority retained for one graph/window binding.
+/// The single **write** authority retained for one graph/window binding.
 ///
 /// Sparse v2 has its own bounded commands and is never routed through legacy
 /// Tauri graph surfaces. Keeping the variants mutually exclusive prevents a
 /// binding from retaining both a legacy `Graph` writer and a sparse actor.
+///
+/// Reads are a separate question, and conflating the two is what left managed
+/// storage with six working commands: `require_legacy_authority` refused every
+/// caller of `with_graph`, including the ~50 that only ever read. Whole-graph
+/// reads now go through [`GraphSlot::with_read_graph`], which serves managed
+/// bindings from a read-only view of the projected tree. This enum still
+/// answers "who may write", and still says: not sparse.
 pub(crate) enum GraphAuthority {
     Legacy(Arc<Graph>),
     SparseV2(crate::sync_runtime::SparseV2Binding),
@@ -112,10 +119,37 @@ impl Drop for LegacyGraphLease {
     }
 }
 
+/// An owned handle to whichever graph may answer read-only whole-graph queries
+/// for one binding. A legacy binding keeps its lease semantics (promotion still
+/// waits for it to drop); a managed binding shares the read-only view.
+pub(crate) enum ReadGraphLease {
+    Legacy(LegacyGraphLease),
+    Derived(Arc<Graph>),
+}
+
+impl Deref for ReadGraphLease {
+    type Target = Graph;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(lease) => lease,
+            Self::Derived(graph) => graph,
+        }
+    }
+}
+
 pub(crate) struct GraphSlot {
     authority: GraphAuthority,
     legacy_leases: Option<Arc<LegacyLeaseTracker>>,
-    graph_meta: tine_core::model::GraphMeta,
+    /// The configuration snapshot `load_graph` hands the frontend. Replaceable
+    /// because a settings change under managed storage has to update it: the
+    /// legacy path publishes a whole replacement slot after a reopen, and
+    /// without this a managed graph would report the settings it activated with
+    /// the next time the same window loads the same root.
+    graph_meta: RwLock<tine_core::model::GraphMeta>,
+    /// The graph root this slot answers for, as the meta first reported it.
+    /// Fixed for the life of the slot, so refreshing the meta can never move it.
+    graph_root: PathBuf,
     pub(crate) root_key: PathBuf,
     /// Unique lease for this exact window→graph binding. Frontend mutations carry
     /// it so an IPC queued before an in-place graph switch cannot execute against
@@ -126,6 +160,19 @@ pub(crate) struct GraphSlot {
     /// Revoked as soon as this exact window→graph binding is replaced/removed.
     /// Detached warm/backup workers check it before and during graph-sized work.
     pub(crate) background_cancelled: Arc<AtomicBool>,
+    /// Read-only view of the projected Markdown/Org tree, opened lazily on the
+    /// first whole-graph read of a **managed** binding. Legacy bindings never
+    /// populate it -- they already hold the real `Graph`.
+    ///
+    /// Lazy because most managed sessions open, render and save pages without
+    /// ever asking a whole-graph question, and building this view costs a graph
+    /// scan. It is dropped with the slot, so an in-place graph switch cannot
+    /// leave a stale view behind.
+    ///
+    /// Replaceable rather than write-once: a `Graph` reads `logseq/config.edn`
+    /// when it opens, so a settings change has to be able to discard this view
+    /// and let the next read build one that sees the new configuration.
+    derived_read_graph: RwLock<Option<Arc<Graph>>>,
 }
 
 impl GraphSlot {
@@ -134,12 +181,14 @@ impl GraphSlot {
         Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
             legacy_leases: Some(Arc::new(LegacyLeaseTracker::default())),
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
             warm_generation: AtomicU64::new(0),
             background_cancelled: Arc::new(AtomicBool::new(false)),
+            derived_read_graph: RwLock::new(None),
         }
     }
 
@@ -153,12 +202,14 @@ impl GraphSlot {
         Self {
             authority: GraphAuthority::SparseV2(binding),
             legacy_leases: None,
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
             warm_generation: AtomicU64::new(0),
             background_cancelled: Arc::new(AtomicBool::new(false)),
+            derived_read_graph: RwLock::new(None),
         }
     }
 
@@ -193,8 +244,118 @@ impl GraphSlot {
         self.authority.is_sparse_v2()
     }
 
+    /// Run a **read-only** whole-graph query against whichever authority this
+    /// slot holds.
+    ///
+    /// Legacy bindings answer from their own `Graph` under an ordinary lease, so
+    /// promotion still drains them. Managed bindings answer from a read-only
+    /// view of the projected tree: that tree is the managed runtime's own
+    /// materialization of the oplog, so reading it answers backlinks, search,
+    /// `{{query}}` and alias questions from the same truth the editor renders.
+    ///
+    /// The view cannot write -- `Graph::open_derived_read_only` fails every
+    /// graph-text write admission -- so routing a command here can never put a
+    /// second writer on the graph. Routing a command here that *needs* to write
+    /// produces a hard error rather than a stray file, which is the outcome we
+    /// want from a mistake.
+    pub(crate) fn with_read_graph<T>(
+        &self,
+        f: impl FnOnce(&Graph) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => {
+                let lease = self.legacy_graph()?;
+                f(&lease)
+            }
+            GraphAuthority::SparseV2(_) => f(&self.derived_read_graph()),
+        }
+    }
+
+    /// Persist a change to `logseq/config.edn` under whichever authority this
+    /// slot holds.
+    ///
+    /// Graph configuration is **outside the oplog's document domain**: the
+    /// managed scanner classifies `logseq/config.edn` as configuration and the
+    /// reconciliation baseline drops it as "not managed content", so nothing
+    /// imports or projects it. That is why every Settings toggle may be served
+    /// from the same view that answers reads, and why this is a separate name
+    /// from [`GraphSlot::with_read_graph`]: the capability it needs is real and
+    /// is enforced in `tine-core` by `Graph::ensure_config_write_target`. This
+    /// only decides *which* `Graph` answers.
+    pub(crate) fn with_config_graph<T>(
+        &self,
+        f: impl FnOnce(&Graph) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_read_graph(f)
+    }
+
+    /// Move something into (or clear) the recoverable trash under whichever
+    /// authority this slot holds.
+    ///
+    /// `logseq/.tine-trash` is outside the oplog's document domain in exactly
+    /// the way `assets/` is, so the asset-side trash writes that a read-only
+    /// view refused only incidentally come back here. Trashing a page, journal
+    /// or conflict copy is a graph-text deletion and is still refused inside
+    /// `tine-core`, at `Graph::admit_managed_text_writer`.
+    pub(crate) fn with_trash_graph<T>(
+        &self,
+        f: impl FnOnce(&Graph) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_read_graph(f)
+    }
+
+    /// An owned read handle, for the read commands that hand the graph to
+    /// `spawn_blocking`. Mirrors [`GraphSlot::with_read_graph`]'s authority
+    /// rules; see there for why a managed binding may be served this way.
+    pub(crate) fn read_graph_cloned(&self) -> Result<ReadGraphLease, String> {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => Ok(ReadGraphLease::Legacy(self.legacy_graph()?)),
+            GraphAuthority::SparseV2(_) => Ok(ReadGraphLease::Derived(self.derived_read_graph())),
+        }
+    }
+
+    /// Open the managed read-only view, reusing the one already built. Never
+    /// called for legacy slots.
+    fn derived_read_graph(&self) -> Arc<Graph> {
+        if let Some(graph) = self.derived_read_graph.read().unwrap().as_ref() {
+            return Arc::clone(graph);
+        }
+        let mut slot = self.derived_read_graph.write().unwrap();
+        Arc::clone(
+            slot.get_or_insert_with(|| Arc::new(Graph::open_derived_read_only(&self.graph_root))),
+        )
+    }
+
+    /// Drop the managed read-only view's cached parse of the graph.
+    ///
+    /// Managed saves and external admissions land in the oplog and are projected
+    /// to the tree; this view holds an in-memory parse of that tree, so it has
+    /// to be told when the tree moved. Cheap when the view was never opened,
+    /// which is the common case.
+    pub(crate) fn invalidate_derived_read_graph(&self) {
+        if let Some(graph) = self.derived_read_graph.read().unwrap().as_ref() {
+            graph.invalidate_cache();
+        }
+    }
+
+    /// Rebuild the managed read-only view and the configuration snapshot the
+    /// frontend is given, after a settings change.
+    ///
+    /// A `Graph` reads `logseq/config.edn` when it opens and keeps the result,
+    /// so invalidating the parse is not enough: the view has to be rebuilt or it
+    /// keeps answering with the previous journal title format, preferred format,
+    /// hidden paths and so on. The stored `GraphMeta` is refreshed for the same
+    /// reason -- `load_graph` returns it verbatim when a window reloads the root
+    /// it already holds, so a stale copy makes a saved setting look reverted.
+    /// This is what the legacy path gets by publishing a replacement slot.
+    pub(crate) fn reopen_derived_read_graph(&self) {
+        *self.derived_read_graph.write().unwrap() = None;
+        let refreshed = self.derived_read_graph().meta();
+        *self.graph_meta.write().unwrap() = refreshed;
+    }
+
     pub(crate) fn graph_meta(&self) -> tine_core::model::GraphMeta {
-        self.graph_meta.clone()
+        self.graph_meta.read().unwrap().clone()
     }
 
     /// Borrow the actor only through the graph slot that owns it.
@@ -280,7 +441,8 @@ impl GraphSlot {
         Ok(Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
             legacy_leases: old.legacy_leases.clone(),
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key: old.root_key.clone(),
             binding_generation: old.binding_generation,
             warm_done: AtomicBool::new(old.warm_done.load(std::sync::atomic::Ordering::Acquire)),
@@ -289,6 +451,9 @@ impl GraphSlot {
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
             background_cancelled: Arc::clone(&old.background_cancelled),
+            // A refresh reopens the legacy graph; it never carries a managed
+            // read-only view, and this slot is legacy by construction.
+            derived_read_graph: RwLock::new(None),
         })
     }
 }
@@ -511,6 +676,8 @@ pub(crate) fn capture_quick_switch_slot(
     Ok(slot)
 }
 
+/// Run a whole-graph operation that may **write**. Managed bindings are refused
+/// here, deliberately: graph text belongs to the oplog, not to a legacy `Graph`.
 pub(crate) fn with_graph<T>(
     ctx: &GraphContext<'_>,
     f: impl FnOnce(&Graph) -> Result<T, String>,
@@ -520,6 +687,37 @@ pub(crate) fn with_graph<T>(
     f(&graph)
 }
 
+/// Run a whole-graph operation that only **reads**, under either authority.
+///
+/// Use this for backlinks, search, `{{query}}`, aliases, templates, icons and
+/// the rest of the read surface. See [`GraphSlot::with_read_graph`] for why it
+/// is safe to serve a managed binding from the projected tree, and for what
+/// happens if a writing command is routed here by mistake (it fails closed).
+pub(crate) fn with_read_graph<T>(
+    ctx: &GraphContext<'_>,
+    f: impl FnOnce(&Graph) -> Result<T, String>,
+) -> Result<T, String> {
+    slot_for_context(ctx)?.with_read_graph(f)
+}
+
+/// Run a `logseq/config.edn` write under either authority. See
+/// [`GraphSlot::with_config_graph`] for why a managed binding may answer it.
+pub(crate) fn with_config_graph<T>(
+    ctx: &GraphContext<'_>,
+    f: impl FnOnce(&Graph) -> Result<T, String>,
+) -> Result<T, String> {
+    slot_for_context(ctx)?.with_config_graph(f)
+}
+
+/// Run a recoverable-trash write under either authority. See
+/// [`GraphSlot::with_trash_graph`] for what it does and does not cover.
+pub(crate) fn with_trash_graph<T>(
+    ctx: &GraphContext<'_>,
+    f: impl FnOnce(&Graph) -> Result<T, String>,
+) -> Result<T, String> {
+    slot_for_context(ctx)?.with_trash_graph(f)
+}
+
 pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
@@ -527,6 +725,19 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     // no legacy writer can be reopened after authority retirement begins.
     let _transition = ctx.state.graph_load.lock().unwrap();
     let old = slot_for_window(&ctx.state, &label)?;
+    if old.is_sparse_v2() {
+        // A managed binding has no legacy graph to reopen, and the reopen below
+        // would install one as a second writer. What the callers actually need
+        // after a settings change is for the next read to see the new
+        // configuration, so discard the read-only view and wake the watcher.
+        //
+        // Deliberately NOT done here: `migrate_journal_filenames_checked`. That
+        // renames journal files, which is a graph-text mutation the oplog owns;
+        // it stays refused until managed renames exist.
+        old.reopen_derived_read_graph();
+        poke_watcher(&ctx.state);
+        return Ok(());
+    }
     old.legacy_graph()?;
     let approved =
         crate::settings::approved_external_assets(ctx.window.app_handle(), &old.root_key);
@@ -574,6 +785,225 @@ mod tests {
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::create_dir_all(root.join("journals")).unwrap();
         Arc::new(GraphSlot::new(Graph::open(root), root.to_path_buf()))
+    }
+
+    fn managed_slot(root: &Path) -> Arc<GraphSlot> {
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        let meta = Graph::open(root).meta();
+        Arc::new(GraphSlot::from_sparse_v2(
+            crate::sync_runtime::SparseV2Binding::without_actor_for_test(),
+            root.to_path_buf(),
+            meta,
+        ))
+    }
+
+    /// The defect this whole change is about: a managed binding refused every
+    /// whole-graph read, so Linked References (and search, and `{{query}}`)
+    /// failed on every page with a generic "backend request failed".
+    #[test]
+    fn a_managed_binding_answers_whole_graph_reads_and_still_refuses_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-managed-read-routing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let slot = managed_slot(&root);
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha mentions [[Target]]\n").unwrap();
+
+        assert!(slot.is_sparse_v2(), "fixture must be a managed binding");
+
+        let backlinks = slot
+            .with_read_graph(|graph| Ok(graph.backlinks("Target")))
+            .expect("a managed binding must be able to answer a whole-graph read");
+        assert_eq!(
+            backlinks
+                .iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha"],
+            "the read must come back with real content, not an empty success"
+        );
+
+        // Same slot, write authority: still refused, and with the message the
+        // user sees. Reads becoming possible must not have widened writes.
+        let refused = slot
+            .legacy_graph()
+            .err()
+            .expect("a managed binding must never yield legacy write authority");
+        assert_eq!(refused, SPARSE_V2_UNSUPPORTED);
+
+        // And the read view itself cannot write, so a misrouted command fails
+        // rather than writing behind the oplog.
+        let write_attempt = slot.with_read_graph(|graph| {
+            let mut page = graph.load_by_path("pages/Alpha.md").unwrap().unwrap();
+            let base_rev = page.rev.clone();
+            page.blocks[0].raw = "- edited behind the oplog".into();
+            graph
+                .save_page(&page, base_rev.as_deref())
+                .map_err(|error| error.to_string())
+        });
+        assert!(
+            write_attempt.is_err(),
+            "the managed read view must refuse a graph-text write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Alpha.md")).unwrap(),
+            "- alpha mentions [[Target]]\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every Settings toggle and the orphaned-asset cleanup were dead under
+    /// managed storage: both wrote outside the oplog's document domain but were
+    /// routed through the write authority that answers "may this caller touch
+    /// graph text". They must work; graph text must stay refused.
+    #[test]
+    fn a_managed_binding_persists_settings_and_trash_but_not_graph_text() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-managed-write-routing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let slot = managed_slot(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(root.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+
+        assert!(slot.is_sparse_v2(), "fixture must be a managed binding");
+
+        // The old route, which is what these commands used: still refused.
+        assert_eq!(
+            slot.legacy_graph()
+                .err()
+                .expect("a managed binding must never yield legacy write authority"),
+            SPARSE_V2_UNSUPPORTED
+        );
+
+        // Settings.
+        slot.with_config_graph(|graph| {
+            graph
+                .set_favorites(&["Alpha".to_owned()])
+                .map_err(|error| error.to_string())
+        })
+        .expect("a managed binding must be able to persist a setting");
+        assert!(std::fs::read_to_string(root.join("logseq/config.edn"))
+            .expect("the setting must have reached config.edn")
+            .contains(":favorites [\"Alpha\"]"),);
+
+        // Orphaned-asset cleanup.
+        slot.with_trash_graph(|graph| graph.trash_asset("orphan.png").map_err(|e| e.to_string()))
+            .expect("a managed binding must be able to trash an orphaned asset");
+        assert!(!root.join("assets/orphan.png").exists());
+
+        // Graph text: still the oplog's, through every one of these routes.
+        for (route, attempt) in [
+            (
+                "config",
+                slot.with_config_graph(|graph| {
+                    graph
+                        .trash_journal_file("2026_08_07.md")
+                        .map_err(|e| e.to_string())
+                }),
+            ),
+            (
+                "trash",
+                slot.with_trash_graph(|graph| {
+                    graph
+                        .trash_journal_file("2026_08_07.md")
+                        .map_err(|e| e.to_string())
+                }),
+            ),
+        ] {
+            assert!(
+                attempt.is_err(),
+                "the {route} capability must not delete graph text"
+            );
+        }
+        assert!(
+            root.join("journals/2026_08_07.md").exists(),
+            "the refused journal deletion must not have touched the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `Graph` reads `logseq/config.edn` when it opens, so a settings change
+    /// has to rebuild the managed read-only view — invalidating its parse is not
+    /// enough, and a stale view answers with the previous configuration.
+    #[test]
+    fn a_managed_settings_change_rebuilds_the_read_only_view() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-managed-config-reopen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let slot = managed_slot(&root);
+
+        let before = slot
+            .with_read_graph(|graph| Ok(graph.config.start_of_week))
+            .expect("a managed binding answers a configuration read");
+
+        slot.with_config_graph(|graph| graph.set_start_of_week(3).map_err(|e| e.to_string()))
+            .expect("a managed binding must be able to persist a setting");
+        assert_ne!(before, 3, "fixture must actually change the value");
+        assert_eq!(
+            slot.with_read_graph(|graph| Ok(graph.config.start_of_week))
+                .unwrap(),
+            before,
+            "the already-open view still holds the configuration it opened with"
+        );
+
+        assert_eq!(
+            slot.graph_meta().start_of_week,
+            before,
+            "and so does the snapshot load_graph hands back"
+        );
+
+        slot.reopen_derived_read_graph();
+        assert_eq!(
+            slot.with_read_graph(|graph| Ok(graph.config.start_of_week))
+                .unwrap(),
+            3,
+            "after the reopen the view must answer with the new configuration"
+        );
+        assert_eq!(
+            slot.graph_meta().start_of_week,
+            3,
+            "a window reloading this root must not be told the old setting"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A legacy binding must keep its lease semantics: promotion waits on
+    /// outstanding reads, so a read served here has to be a tracked lease.
+    #[test]
+    fn a_legacy_binding_serves_reads_through_its_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-legacy-read-routing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let slot = graph(&root);
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha [[Target]]\n").unwrap();
+
+        slot.begin_legacy_retirement()
+            .expect("retirement starts on a legacy slot");
+        let refused = slot
+            .with_read_graph(|_| Ok(()))
+            .expect_err("a retiring legacy binding must not hand out new reads");
+        assert!(
+            refused.contains("retiring"),
+            "expected the retirement refusal, got {refused}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

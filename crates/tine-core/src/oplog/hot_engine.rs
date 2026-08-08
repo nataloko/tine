@@ -2019,10 +2019,45 @@ pub(crate) struct DetachedBootstrapCandidate {
     // Even an empty engine is large in test/debug builds. Heap ownership keeps
     // nested direct replay and validation stack-bounded at maximum part width.
     engine: Box<ShardedHotEngine>,
-    scratch_root: DetachedBootstrapScratchRoot,
+    /// The ordinary detached-replay path owns a private temp root. The
+    /// ephemeral recovery path deliberately leaves this `None`: its scratch is
+    /// already an archive-local disposable run whose ownership transfers into
+    /// the enrolled engine rather than being copied into a retained run.
+    scratch_root: Option<DetachedBootstrapScratchRoot>,
     part_count: u32,
     last_part: Option<BootstrapPartId>,
     index_durability: DetachedBootstrapIndexDurability,
+}
+
+/// A one-process bootstrap checkpoint reconstructed directly into an
+/// archive-local **ephemeral** scratch run.
+///
+/// This is intentionally neither `Clone` nor serializable. It carries a live
+/// scratch capability and run-local roots only long enough to hand them to the
+/// same enrolled engine; it never names a retained run, cannot be published as
+/// a resume point, and cannot survive this process. The enrolled restore still
+/// re-authenticates every durable-derived root and the run-local roots before
+/// it skips the already reconstructed bootstrap prefix.
+pub(crate) struct EphemeralBootstrapPredecessor {
+    scratch: Arc<ScratchStore>,
+    block_claim_index: Arc<BlockClaimIndexStore>,
+    // Keep the graph-shaped roots off the caller's recovery frame from the
+    // instant this capability is sealed. This predecessor crosses the
+    // promoted-runtime mint/open seam, whose stack budget must stay constant
+    // for both retained and ephemeral recovery paths.
+    snapshot: Box<RuntimeResumeSnapshot>,
+}
+
+impl EphemeralBootstrapPredecessor {
+    fn into_parts(
+        self,
+    ) -> (
+        Arc<ScratchStore>,
+        Arc<BlockClaimIndexStore>,
+        Box<RuntimeResumeSnapshot>,
+    ) {
+        (self.scratch, self.block_claim_index, self.snapshot)
+    }
 }
 
 enum DetachedBootstrapIndexDurability {
@@ -2309,6 +2344,111 @@ impl DetachedBootstrapCandidate {
         });
         Ok((retained, snapshot))
     }
+
+    /// Seal an already reconstructed bootstrap as a one-process ephemeral
+    /// predecessor. Unlike `migrate_for_same_process_promotion`, this creates
+    /// no retained directory and copies no scratch bytes: the candidate was
+    /// authored directly into the archive-local disposable scratch that the
+    /// enrolled engine will consume.
+    pub(crate) fn seal_ephemeral_bootstrap_predecessor(
+        self,
+        history: super::object_store::EngineHistoryAuthority,
+        latest_batch_id: BatchId,
+        durable_binding: &super::object_store::EngineHistoryBinding,
+        expected_lineage: LineageDigest,
+        expected_catalog_document_id: DocumentId,
+    ) -> Result<Box<EphemeralBootstrapPredecessor>, EngineError> {
+        if self.scratch_root.is_some() {
+            return Err(EngineError::Archive(
+                "ephemeral bootstrap predecessor must use archive-local scratch".into(),
+            ));
+        }
+        let engine = self.engine;
+        if self.part_count == 0
+            || history.generation != u64::from(self.part_count)
+            || engine.lineage_digest != expected_lineage
+            || engine.catalog_document_id != expected_catalog_document_id
+            || !engine
+                .durable_history_binding()
+                .same_replay_authority(durable_binding)
+            || engine.history_failure.is_some()
+            || engine.is_blocked()
+            || !engine.portable_path_conflicts.is_empty()
+            || !engine.page_name_conflicts.is_empty()
+            || engine.fatal_evidence.is_some()
+            || engine.has_pending_author_work()
+            || !scratch_roots_are_stage_quiescent(&engine.scratch_roots)
+            || !engine.current_path_catalog.available
+            || engine.current_path_catalog.accepted_frontier_root != engine.accepted_frontier_root
+            || engine.next_acceptance_sequence != engine.accepted_frontier_root.acceptance_sequence
+        {
+            return Err(EngineError::Archive(
+                "ephemeral bootstrap candidate is not an exact quiescent durable predecessor"
+                    .into(),
+            ));
+        }
+        engine
+            .reference_catalog
+            .ensure_ready()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        let (terminal_batch_id, terminal_evidence) = engine
+            .accepted_batch_entry_at(u64::from(self.part_count))?
+            .ok_or_else(|| {
+                EngineError::Archive(
+                    "ephemeral bootstrap candidate has no terminal accepted entry".into(),
+                )
+            })?;
+        let terminal_evidence = terminal_evidence.ok_or_else(|| {
+            EngineError::Archive(
+                "ephemeral bootstrap candidate terminal entry has no accepted evidence".into(),
+            )
+        })?;
+        if terminal_batch_id != latest_batch_id
+            || terminal_evidence.batch_id != latest_batch_id
+            || terminal_evidence.acceptance_sequence != history.generation
+            || terminal_evidence.post_frontier_root != engine.accepted_frontier_root
+        {
+            return Err(EngineError::Archive(
+                "ephemeral bootstrap terminal frontier is not the durable history head".into(),
+            ));
+        }
+        let scratch = Arc::clone(engine.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive("ephemeral bootstrap candidate has no scratch store".into())
+        })?);
+        if scratch.workspace_id() != engine.workspace_id {
+            return Err(EngineError::Archive(
+                "ephemeral bootstrap scratch belongs to another workspace".into(),
+            ));
+        }
+        let block_claim_index = Arc::clone(engine.block_claim_index.as_ref().ok_or_else(|| {
+            EngineError::Archive("ephemeral bootstrap candidate has no block-claim index".into())
+        })?);
+        let snapshot = Box::new(RuntimeResumeSnapshot {
+            history_generation: history.generation,
+            history_index_root: history.index_root,
+            history_latest_batch_id: latest_batch_id,
+            scratch_run_id: scratch.run_id(),
+            scratch_binding_digest: scratch
+                .binding_digest()
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+            scratch_roots: engine.scratch_roots.clone(),
+            block_claim_root: engine.block_claim_root,
+            accepted_frontier_root: engine.accepted_frontier_root.clone(),
+            next_acceptance_sequence: engine.next_acceptance_sequence,
+            current_path_catalog_root: engine.current_path_catalog.root.clone(),
+            current_path_catalog_available: engine.current_path_catalog.available,
+            current_path_catalog_frontier: engine
+                .current_path_catalog
+                .accepted_frontier_root
+                .clone(),
+            catalog_checkpoint_binding: engine.catalog_checkpoint_binding(),
+        });
+        Ok(Box::new(EphemeralBootstrapPredecessor {
+            scratch,
+            block_claim_index,
+            snapshot,
+        }))
+    }
 }
 
 /// Inactive, single-use multipart bootstrap author. Every candidate mutation
@@ -2385,6 +2525,7 @@ impl DetachedBootstrapAuthoringSession {
             reference_catalog_policy,
             indexes,
             true,
+            None,
         )
     }
 
@@ -2402,6 +2543,31 @@ impl DetachedBootstrapAuthoringSession {
             reference_catalog_policy,
             indexes,
             false,
+            None,
+        )
+    }
+
+    /// Replay into an already-created archive-local ephemeral scratch run.
+    /// The caller owns the only capability that can create this run, and the
+    /// finished candidate transfers the same live scratch into the enrolled
+    /// engine; there is intentionally no clone/migration step.
+    fn new_replay_in_ephemeral_scratch(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        reference_catalog_policy: ReferenceCatalogPolicyV1,
+        indexes: &BootstrapAuthoringCapability,
+        scratch: Arc<ScratchStore>,
+        block_claim_index: Arc<BlockClaimIndexStore>,
+    ) -> Result<Self, EngineError> {
+        Self::new_with_catalog_mode(
+            workspace_id,
+            lineage_digest,
+            catalog_document_id,
+            reference_catalog_policy,
+            indexes,
+            false,
+            Some((scratch, block_claim_index)),
         )
     }
 
@@ -2412,6 +2578,7 @@ impl DetachedBootstrapAuthoringSession {
         reference_catalog_policy: ReferenceCatalogPolicyV1,
         indexes: &BootstrapAuthoringCapability,
         private_construction: bool,
+        ephemeral_scratch: Option<(Arc<ScratchStore>, Arc<BlockClaimIndexStore>)>,
     ) -> Result<Self, EngineError> {
         if indexes.workspace_id() != workspace_id {
             return Err(EngineError::Archive(
@@ -2444,11 +2611,29 @@ impl DetachedBootstrapAuthoringSession {
                 indexes.page_name_index(),
             )
         };
-        let scratch_root = DetachedBootstrapScratchRoot::create()?;
-        let scratch = Arc::new(
-            ScratchStore::create_retained(&scratch_root.root, workspace_id)
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-        );
+        let (scratch_root, scratch, block_claim_index) = match ephemeral_scratch {
+            Some((scratch, block_claim_index)) => {
+                if scratch.workspace_id() != workspace_id {
+                    return Err(EngineError::Archive(
+                        "archive-local ephemeral bootstrap scratch belongs to another workspace"
+                            .into(),
+                    ));
+                }
+                (None, scratch, block_claim_index)
+            }
+            None => {
+                let scratch_root = DetachedBootstrapScratchRoot::create()?;
+                let scratch = Arc::new(
+                    ScratchStore::create_retained(&scratch_root.root, workspace_id)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                );
+                let block_claim_index = Arc::new(
+                    BlockClaimIndexStore::for_scratch(&scratch)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                );
+                (Some(scratch_root), scratch, block_claim_index)
+            }
+        };
         let mut candidate = Box::new(ShardedHotEngine::new(
             workspace_id,
             lineage_digest,
@@ -2459,10 +2644,7 @@ impl DetachedBootstrapAuthoringSession {
         // exactly like an enrolled engine's. The bounded in-memory fallback is
         // a no-store test map whose fixed capacity would cap an importable
         // graph at a few thousand blocks.
-        candidate.block_claim_index = Some(Arc::new(
-            BlockClaimIndexStore::for_scratch(&scratch)
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-        ));
+        candidate.block_claim_index = Some(block_claim_index);
         candidate.scratch = Some(scratch);
         // Every authenticated root an accepted bootstrap cold record binds is
         // built here, in the target archive's durable stores. The promoted
@@ -2484,7 +2666,7 @@ impl DetachedBootstrapAuthoringSession {
         }
         Ok(Self {
             candidate: Some(candidate),
-            scratch_root: Some(scratch_root),
+            scratch_root,
             continuity: None,
             next_ordinal: 0,
             last_part: None,
@@ -2689,9 +2871,7 @@ impl DetachedBootstrapAuthoringSession {
         }
         Ok(DetachedBootstrapCandidate {
             engine: candidate,
-            scratch_root: self
-                .scratch_root
-                .expect("live candidate owns its scratch root"),
+            scratch_root: self.scratch_root,
             part_count: self.next_ordinal,
             last_part: self.last_part,
             index_durability,
@@ -2771,6 +2951,7 @@ fn replay_direct_loaded_bootstrap_with<F>(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
     preparation: &DetachedBootstrapReplayIdentity,
+    ephemeral_scratch: Option<(Arc<ScratchStore>, Arc<BlockClaimIndexStore>)>,
     mut validate_part: F,
 ) -> Result<DetachedBootstrapCandidate, EngineError>
 where
@@ -2798,13 +2979,26 @@ where
     let indexes = store
         .bootstrap_authoring_capability()
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut session = DetachedBootstrapAuthoringSession::new_replay(
-        preparation.workspace_id,
-        preparation.lineage_digest,
-        preparation.catalog_document_id,
-        preparation.reference_catalog_policy.clone(),
-        &indexes,
-    )?;
+    let mut session = match ephemeral_scratch {
+        Some((scratch, block_claim_index)) => {
+            DetachedBootstrapAuthoringSession::new_replay_in_ephemeral_scratch(
+                preparation.workspace_id,
+                preparation.lineage_digest,
+                preparation.catalog_document_id,
+                preparation.reference_catalog_policy.clone(),
+                &indexes,
+                scratch,
+                block_claim_index,
+            )?
+        }
+        None => DetachedBootstrapAuthoringSession::new_replay(
+            preparation.workspace_id,
+            preparation.lineage_digest,
+            preparation.catalog_document_id,
+            preparation.reference_catalog_policy.clone(),
+            &indexes,
+        )?,
+    };
     for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
         let loaded = store
             .load_bootstrap_part(publication, ordinal)
@@ -2829,7 +3023,7 @@ pub(crate) fn replay_direct_loaded_bootstrap(
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
     preparation: &DetachedBootstrapReplayIdentity,
 ) -> Result<DetachedBootstrapCandidate, EngineError> {
-    replay_direct_loaded_bootstrap_with(store, publication, preparation, |_, _| Ok(()))
+    replay_direct_loaded_bootstrap_with(store, publication, preparation, None, |_, _| Ok(()))
 }
 
 pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
@@ -2851,6 +3045,7 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
         store,
         publication,
         preparation,
+        None,
         |descriptor, material| {
             let found = history
                 .lookup(history_root, descriptor.batch_id())
@@ -2867,6 +3062,98 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
         },
     )?;
     Ok((candidate, terminal_history_binding))
+}
+
+/// Reconstruct a promoted bootstrap directly into the enrolled archive's
+/// disposable scratch namespace and seal it for one immediate enrolled open.
+///
+/// This is deliberately separate from retained resume migration: a retention
+/// policy that selected `Ephemeral` has denied permission to mint another
+/// retained run. The returned capability therefore cannot be serialized,
+/// cloned, published, or revived after this process; it only lets the current
+/// open avoid replaying an already authenticated bootstrap prefix a second
+/// time.
+pub(crate) fn replay_promoted_bootstrap_into_ephemeral_predecessor(
+    store: &ObjectStore,
+    publication: &super::object_store::ValidatedBootstrapPublicationV1,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    storage: ProjectionStorageBinding,
+    history: &super::object_store::DurableEngineHistoryStore,
+    history_root: ContentDigest,
+    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
+    live_history: super::object_store::EngineHistoryAuthority,
+) -> Result<Box<EphemeralBootstrapPredecessor>, EngineError> {
+    let terminal = publication
+        .aggregate()
+        .parts()
+        .last()
+        .copied()
+        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
+    let bytes = history
+        .lookup(history_root, terminal.batch_id())
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .ok_or_else(|| {
+            EngineError::Archive(
+                "promoted bootstrap terminal record is absent from durable history".into(),
+            )
+        })?;
+    let record = decode_history_record(terminal.batch_id(), &bytes)?;
+    if record.generation != u64::from(bootstrap.part_count())
+        || record.bootstrap != Some(bootstrap)
+        || !matches!(record.status, ArchiveStatus::Accepted { .. })
+    {
+        return Err(EngineError::Archive(
+            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
+        ));
+    }
+    let terminal_binding = history_record_binding(&record);
+    let replay_identity = DetachedBootstrapReplayIdentity::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        record.reference_catalog_policy,
+        storage,
+        store
+            .canonical_archive_identity()
+            .map_err(|error| EngineError::Archive(error.to_string()))?,
+    );
+    let (scratch, block_claim_index) = store
+        .start_engine_scratch()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    let candidate = replay_direct_loaded_bootstrap_with(
+        store,
+        publication,
+        &replay_identity,
+        Some((scratch, Arc::new(block_claim_index))),
+        |descriptor, material| {
+            let found = history
+                .lookup(history_root, descriptor.batch_id())
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "fresh history is missing an aggregate-bound cold record".into(),
+                    )
+                })?;
+            let replayed = validate_bootstrap_history_record_against_material(
+                descriptor, &found, bootstrap, material,
+            )?;
+            if replayed != terminal_binding && descriptor == terminal {
+                return Err(EngineError::Archive(
+                    "ephemeral bootstrap replay changed the terminal history binding".into(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    candidate.seal_ephemeral_bootstrap_predecessor(
+        live_history,
+        terminal.batch_id(),
+        &terminal_binding,
+        lineage_digest,
+        catalog_document_id,
+    )
 }
 
 /// Reconstruct a promoted bootstrap into one detached candidate, deriving the
@@ -3037,6 +3324,11 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) completion: Option<ProjectionCompletion>,
     pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
     pub(crate) managed_local_authority: Option<(u64, BatchId)>,
+    /// This predecessor was reproved from the authenticated completed-path
+    /// authority and the live file, rather than from an old receipt base.
+    /// Finalization repeats the same live-layout proof, not a canonical
+    /// historical re-render that could reject harmless preserved trivia.
+    pub(crate) receipt_backed_live_authority: bool,
 }
 
 impl CapabilityCapturedPriorProjection {
@@ -3045,11 +3337,12 @@ impl CapabilityCapturedPriorProjection {
             &self.completion,
             self.bootstrap_owner_binding,
             self.managed_local_authority,
+            self.receipt_backed_live_authority,
         ) {
-            (Some(completion), None, None) => completion
+            (Some(completion), None, None, _) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None) | (None, None, Some(_)) => Ok(()),
+            (None, Some(_), None, false) | (None, None, Some(_), false) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3148,6 +3441,7 @@ impl CapabilityCapturedProjectionInput {
                     completion: Some(prior_completion.clone()),
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
+                    receipt_backed_live_authority: false,
                 }),
             },
         };
@@ -3300,7 +3594,7 @@ pub struct AcceptedBatchEvidence {
     reference_catalog_delta: ReferenceCatalogDeltaV2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Device-local evidence for a derived accepted-frontier projection.
 ///
@@ -3325,6 +3619,65 @@ pub struct AcceptedFrontierRoot {
     reference_catalog_root: ReferenceCatalogRootV2,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
+}
+
+/// Exactly the fields that make two accepted frontier roots the *same accepted
+/// frontier*, borrowed from one.
+///
+/// This exists so that identity has a single definition. Comparing two roots
+/// and digesting one are the same question asked two ways, and they used to be
+/// answered by two independently maintained field lists -- `PartialEq` below
+/// and a whole-struct `postcard` encoding. That divergence is a live defect
+/// class here, not a hypothetical: `scratch_root` is a run-local address, so a
+/// digest that includes it reports two names for one frontier the moment a
+/// reopen moves the scratch store. Both answers now come from this one view.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AcceptedFrontierIdentity<'a> {
+    schema_version: u32,
+    acceptance_sequence: u64,
+    document_count: u64,
+    retained_bytes_total: u64,
+    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_digest: &'a ContentDigest,
+    batch_map_root_key: Option<[u8; 16]>,
+    batch_map_root_digest: &'a ContentDigest,
+    reference_catalog_root: &'a ReferenceCatalogRootV2,
+    state_digest: &'a ContentDigest,
+}
+
+impl AcceptedFrontierRoot {
+    /// The frontier's identity, with the run-local `scratch_root` left out.
+    ///
+    /// `scratch_root` is a run-local address for the frontier's maps. It is
+    /// deliberately absent from `state_digest`, so it carries no authenticated
+    /// meaning, and reopening a graph moves it as a matter of course. Counting
+    /// it as identity made an up-to-date SQLite projection compare unequal to
+    /// the very frontier it was already at, which the recovery path could only
+    /// read as corruption -- and answer by rebuilding the entire graph.
+    /// Dereferencing still uses the field directly; only identity ignores it.
+    pub(crate) const fn identity(&self) -> AcceptedFrontierIdentity<'_> {
+        AcceptedFrontierIdentity {
+            schema_version: self.schema_version,
+            acceptance_sequence: self.acceptance_sequence,
+            document_count: self.document_count,
+            retained_bytes_total: self.retained_bytes_total,
+            document_map_root_key: self.document_map_root_key,
+            document_map_root_digest: &self.document_map_root_digest,
+            batch_map_root_key: self.batch_map_root_key,
+            batch_map_root_digest: &self.batch_map_root_digest,
+            reference_catalog_root: &self.reference_catalog_root,
+            state_digest: &self.state_digest,
+        }
+    }
+}
+
+/// Two accepted frontier roots are equal when they are the same accepted
+/// frontier -- not when they additionally happen to live at the same place in
+/// this process. See [`AcceptedFrontierRoot::identity`].
+impl PartialEq for AcceptedFrontierRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
 }
 
 impl AcceptedBatchEvidence {
@@ -3493,6 +3846,20 @@ impl AcceptedFrontierRoot {
 
     pub const fn state_digest(&self) -> ContentDigest {
         self.state_digest
+    }
+
+    /// This root without its run-local scratch-store reference.
+    ///
+    /// `scratch_root` says *where* this run keeps the frontier's maps; it is
+    /// never hashed into `state_digest` and carries no authenticated meaning.
+    /// It therefore must not appear in anything persisted, or in any comparison
+    /// asking whether two roots are the same accepted version -- reopening a
+    /// graph legitimately moves the scratch store, and a durable identity that
+    /// moved with it would declare an up-to-date projection stale.
+    pub(crate) fn without_scratch_root(&self) -> Self {
+        let mut normalized = self.clone();
+        normalized.scratch_root = None;
+        normalized
     }
 
     pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {
@@ -4083,6 +4450,13 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
     /// counter that separates "this event resolved the catalog" from "this
     /// event read the whole catalog checkpoint off disk again".
     exact_catalog_decodes: usize,
+    /// Root/kind-bound decoded-segment sessions, held for the materializer's
+    /// whole life exactly as the bootstrap bulk materializer holds them.
+    /// Without them every document resolution re-walked the scratch LSM from
+    /// the top, so per-document cost grew with the graph and a rebuild that
+    /// visits a linear number of documents came out superlinear overall.
+    accepted_frontier_session: Option<ScratchLookupSession>,
+    external_exact_session: Option<ScratchLookupSession>,
 }
 
 /// Maximum page residency of one private bootstrap materialization step.
@@ -4091,6 +4465,11 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
 /// home checkpoints live only for one chunk and are dropped before the next.
 pub(crate) const BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES: usize = 64;
 pub(crate) const BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT: usize = 32 * 1024 * 1024;
+/// Residency budget for an accepted-root materializer's two sessions. It is a
+/// cap on retained decoded segments, not a target: the sessions exist to stop
+/// repeated LSM descent, and a session that never reaches this bound has
+/// already done its job.
+pub(crate) const ACCEPTED_ROOT_LOOKUP_SESSION_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 struct BootstrapBulkPage {
@@ -4574,6 +4953,25 @@ impl AcceptedRootMaterializer<'_> {
         self.exact_catalog_decodes
     }
 
+    /// Accepted-frontier and external-exact session statistics, in that order.
+    /// A materializer with no scratch-backed root reports defaults, which is
+    /// how "there was nothing to bind a session to" stays distinguishable from
+    /// "a session existed and was never consulted".
+    pub(crate) fn lookup_session_stats(
+        &self,
+    ) -> (ScratchLookupSessionStats, ScratchLookupSessionStats) {
+        (
+            self.accepted_frontier_session.as_ref().map_or_else(
+                ScratchLookupSessionStats::default,
+                ScratchLookupSession::stats,
+            ),
+            self.external_exact_session.as_ref().map_or_else(
+                ScratchLookupSessionStats::default,
+                ScratchLookupSession::stats,
+            ),
+        )
+    }
+
     fn load_document(
         &mut self,
         document_id: DocumentId,
@@ -4583,9 +4981,20 @@ impl AcceptedRootMaterializer<'_> {
         // causal state is the one *this* accepted root selects for this
         // document, and it refuses a blocked engine, an unauthenticated root
         // and an absent document before any reuse is even considered.
+        // `accepted_frontier_documents_many_authenticated_with_session` assumes
+        // its caller already authenticated, so the blocked-engine refusal that
+        // the single-point entry performs must stay explicit here: it is
+        // supposed to run on every resolution, hit or miss.
+        self.engine.ensure_not_blocked()?;
         let Some(dependencies) = self
             .engine
-            .accepted_frontier_document(&self.root, document_id)?
+            .accepted_frontier_documents_many_authenticated_with_session(
+                &self.root,
+                &[document_id],
+                self.accepted_frontier_session.as_mut(),
+            )?
+            .pop()
+            .flatten()
         else {
             return Ok(None);
         };
@@ -4614,7 +5023,10 @@ impl AcceptedRootMaterializer<'_> {
             }
         }
         let frontier = FrontierV2::new(vec![dependencies.clone()]).map_err(EngineError::from)?;
-        let mut reconstructed = self.engine.reconstruct_projection_frontier(&frontier)?;
+        let mut reconstructed = self.engine.reconstruct_projection_frontier_with_session(
+            &frontier,
+            self.external_exact_session.as_mut(),
+        )?;
         let document = reconstructed
             .remove(&document_id)
             .ok_or(EngineError::MissingDocument(document_id))?;
@@ -5214,10 +5626,13 @@ pub struct EngineInstrumentation {
 /// touched by admission, authoring, acceptance, or projection, so the standing
 /// bounded-admission tables can assert it stays at its startup value.
 ///
-/// `replayed_generations` is the whole point: a full replay reports
-/// `live_history_generation`, an adopted restart reports only the durable tail.
-/// That difference is what makes "adoption actually happened" falsifiable
-/// instead of inferred from a successful startup.
+/// `replay_base_generation` names the outcome precisely: zero means a full
+/// immutable-history replay, while a nonzero authenticated predecessor means
+/// only its durable tail was replayed. `adopted` remains narrower: it is true
+/// only when that predecessor was a retained runtime-resume run, never for a
+/// one-process ephemeral bootstrap predecessor. This keeps recovery work
+/// falsifiable without conflating an unpublishable ephemeral accelerator with
+/// retained-run adoption.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeResumeObservation {
     /// The engine resumed from a retained run named by a resume snapshot.
@@ -5613,6 +6028,38 @@ pub(crate) enum EngineOpenRetention<'a> {
         retained: Box<super::object_store::RetainedEngineScratch>,
         resume: Box<RuntimeResumeSnapshot>,
     },
+    /// A bootstrap reconstructed into the exact archive-local ephemeral scratch
+    /// run this enrolled open will own. This is one-process-only recovery
+    /// acceleration, not runtime-resume adoption: it never mints a retained
+    /// run, publishes a point, or marks the resume observation adopted.
+    EphemeralBootstrap {
+        predecessor: Box<EphemeralBootstrapPredecessor>,
+    },
+}
+
+/// The scratch construction input for one enrolled engine. This is private so
+/// only the recovery entry point can consume an ephemeral predecessor.
+enum EngineScratchOpen {
+    Fresh,
+    Retained(super::object_store::RetainedEngineScratch),
+    ExistingEphemeral {
+        scratch: Arc<ScratchStore>,
+        block_claim_index: Arc<BlockClaimIndexStore>,
+    },
+}
+
+/// Run-local state that lets one recovery skip a revalidated prefix. The
+/// ephemeral form owns its snapshot and cannot leave this call; retained
+/// snapshots remain borrowed from their authenticated resume point.
+enum RecoveryPredecessor<'a> {
+    Retained(&'a RuntimeResumeSnapshot),
+    EphemeralBootstrap(Box<RuntimeResumeSnapshot>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PredecessorKind {
+    Retained,
+    EphemeralBootstrap,
 }
 
 /// What one resuming open actually did, including why it refused.
@@ -5645,10 +6092,74 @@ pub(crate) struct EnrolledProjectionOpenInstrumentation {
     pub(crate) bootstrap_parts_examined: usize,
 }
 
+/// Always-recorded stage breakdown of a promoted engine open.
+///
+/// `engine_open_ms` alone cannot say WHICH part of recovery is slow, and the
+/// existing breakdown is `#[cfg(test)]` -- so a slow startup on a real graph
+/// was, until now, unanswerable anywhere except a benchmark. That is how a
+/// reproduction gets mistaken for a diagnosis. This costs a handful of
+/// `Instant::now()` calls per startup, holds only durations and counts, and
+/// never touches page content or paths.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineOpenStageBreakdown {
+    pub prepare_replay: std::time::Duration,
+    pub predecessor_restore: std::time::Duration,
+    pub bootstrap_part_replay: std::time::Duration,
+    pub archived_tail_replay: std::time::Duration,
+    pub finish_replay: std::time::Duration,
+    pub bootstrap_parts_replayed: usize,
+    pub archived_manifests_offered: usize,
+    pub archived_manifests_replayed: usize,
+}
+
+thread_local! {
+    static ENGINE_OPEN_STAGES: Cell<EngineOpenStageBreakdown> =
+        const { Cell::new(EngineOpenStageBreakdown {
+            prepare_replay: std::time::Duration::ZERO,
+            predecessor_restore: std::time::Duration::ZERO,
+            bootstrap_part_replay: std::time::Duration::ZERO,
+            archived_tail_replay: std::time::Duration::ZERO,
+            finish_replay: std::time::Duration::ZERO,
+            bootstrap_parts_replayed: 0,
+            archived_manifests_offered: 0,
+            archived_manifests_replayed: 0,
+        }) };
+}
+
+fn reset_engine_open_stages() {
+    ENGINE_OPEN_STAGES.with(|slot| slot.set(EngineOpenStageBreakdown::default()));
+}
+
+fn update_engine_open_stages(update: impl FnOnce(&mut EngineOpenStageBreakdown)) {
+    ENGINE_OPEN_STAGES.with(|slot| {
+        let mut current = slot.get();
+        update(&mut current);
+        slot.set(current);
+    });
+}
+
+/// Take the breakdown recorded by the most recent engine open on this thread.
+pub(crate) fn take_engine_open_stage_breakdown() -> EngineOpenStageBreakdown {
+    ENGINE_OPEN_STAGES.with(|slot| {
+        let current = slot.get();
+        slot.set(EngineOpenStageBreakdown::default());
+        current
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     static ENROLLED_PROJECTION_OPEN_INSTRUMENTATION:
         RefCell<Option<EnrolledProjectionOpenInstrumentation>> = const { RefCell::new(None) };
+    /// One bounded restore refusal used only to prove that an ephemeral
+    /// bootstrap predecessor falls back to a fresh ephemeral full replay.
+    /// This has no production representation or persistence surface.
+    static FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_ephemeral_bootstrap_predecessor_restore_for_test() {
+    FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE.set(true);
 }
 
 #[cfg(test)]
@@ -6335,6 +6846,30 @@ pub struct ShardedHotEngine {
     status_point_cache: RefCell<BTreeMap<BatchId, Option<ColdHistoryRecord>>>,
     external_anchor_point_cache:
         RefCell<BTreeSet<(DocumentId, BatchId, ContentDigest, ContentDigest)>>,
+    // Observed manifests memoized for the SAME public operation as the two
+    // point caches above, and cleared with them.
+    //
+    // A manifest is immutable content addressed by its batch id, but resolving
+    // one is not cheap: it may clone a manifest carrying a descriptor per
+    // document, or reload and revalidate an entire retained bootstrap part off
+    // disk. Anchor validation needs the manifest *per document*, and every
+    // document of one bootstrap batch names that same batch — so without this
+    // memo a rebuild reloads one whole-graph manifest once per page, which is
+    // quadratic in graph size and was the dominant cost of crash reopen.
+    //
+    // This memoizes only WHERE the manifest was found, never WHETHER the
+    // record matches it: each document still proves its own descriptor digest
+    // and manifest fingerprint against the manifest below.
+    observed_manifest_point_cache: RefCell<BTreeMap<BatchId, Arc<OperationBatch>>>,
+    // The retained bootstrap part behind those manifests, memoized under the
+    // same operation scope, together with its document -> CrdtUpdate index.
+    //
+    // Resolving one document's archive object otherwise reloaded the entire
+    // retained part from disk AND scanned every object in it — the second
+    // per-document whole-graph cost in the same anchor validation. The index is
+    // built once per memoized part so the per-document step is a lookup.
+    retained_bootstrap_part_point_cache:
+        RefCell<BTreeMap<BatchId, Arc<BTreeMap<DocumentId, OperationObject>>>>,
     // At most one decoded page catalog, reused across accepted events by
     // content identity alone. Unlike the two point caches above this is *not*
     // cleared per operation: a content-only save leaves the catalog's causal
@@ -6484,6 +7019,8 @@ impl ShardedHotEngine {
             terminal_document_heads: BTreeMap::new(),
             status_point_cache: RefCell::new(BTreeMap::new()),
             external_anchor_point_cache: RefCell::new(BTreeSet::new()),
+            observed_manifest_point_cache: RefCell::new(BTreeMap::new()),
+            retained_bootstrap_part_point_cache: RefCell::new(BTreeMap::new()),
             retained_accepted_catalog: RefCell::new(None),
             retained_catalog_dependency_anchor: Cell::new(None),
             #[cfg(test)]
@@ -6532,21 +7069,24 @@ impl ShardedHotEngine {
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
     ) -> Self {
-        Self::with_archive_store_scratch(store, lineage_digest, catalog_document_id, None)
+        Self::with_archive_store_scratch(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            EngineScratchOpen::Fresh,
+        )
     }
 
     /// The one construction that installs this engine's run-local scratch.
     ///
-    /// `retained` is `None` for every ordinary open, which mints a disposable
-    /// ephemeral run exactly as before. A `Some` value is a retained run the
-    /// caller already created or adopted through the archive's retained entry
-    /// points, and carrying it here is what lets a later quiescent snapshot
-    /// name the run without re-deriving retention from a marker read.
+    /// A fresh open mints a disposable run. Retained and already-created
+    /// ephemeral inputs are capabilities produced by their respective narrow
+    /// lifecycle paths; neither is reconstructed from a marker or pathname.
     fn with_archive_store_scratch(
         store: ObjectStore,
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
-        retained: Option<super::object_store::RetainedEngineScratch>,
+        scratch_open: EngineScratchOpen,
     ) -> Self {
         let workspace_id = store.workspace_id();
         let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
@@ -6570,14 +7110,27 @@ impl ShardedHotEngine {
             }
             Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
         }
-        match retained {
-            Some(retained) => {
+        match scratch_open {
+            EngineScratchOpen::Retained(retained) => {
                 let (scratch, index, identity) = retained.into_parts();
                 engine.scratch = Some(scratch);
                 engine.block_claim_index = Some(Arc::new(index));
                 engine.retained_scratch = Some(identity);
             }
-            None => match store.start_engine_scratch() {
+            EngineScratchOpen::ExistingEphemeral {
+                scratch,
+                block_claim_index,
+            } => {
+                if scratch.workspace_id() != workspace_id {
+                    engine.history_failure = Some(EngineError::Archive(
+                        "ephemeral bootstrap scratch belongs to another workspace".into(),
+                    ));
+                } else {
+                    engine.scratch = Some(scratch);
+                    engine.block_claim_index = Some(block_claim_index);
+                }
+            }
+            EngineScratchOpen::Fresh => match store.start_engine_scratch() {
                 Ok((scratch, index)) => {
                     engine.scratch = Some(scratch);
                     engine.block_claim_index = Some(Arc::new(index));
@@ -6735,7 +7288,7 @@ impl ShardedHotEngine {
             graph,
             receipts,
             None,
-            None,
+            EngineScratchOpen::Fresh,
             false,
         )
     }
@@ -6761,7 +7314,7 @@ impl ShardedHotEngine {
             graph,
             receipts,
             Some(promotion),
-            None,
+            EngineScratchOpen::Fresh,
             false,
         )
     }
@@ -6860,6 +7413,7 @@ impl ShardedHotEngine {
         retention: EngineOpenRetention<'_>,
         bootstrap_publication: Option<Arc<super::object_store::ValidatedBootstrapPublicationV1>>,
     ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
+        reset_engine_open_stages();
         #[cfg(test)]
         reset_enrolled_projection_open_instrumentation();
         #[cfg(test)]
@@ -6868,22 +7422,38 @@ impl ShardedHotEngine {
         // capability, before anything is moved into an engine. A refusal here
         // is a plain fallback, so the fresh run is minted from the same
         // capability and the candidate's bytes are never opened for writing.
-        let (retained, migrated_resume, adopted, mut refused_run_id, mut refusal) = match retention
-        {
-            EngineOpenRetention::Ephemeral => (None, None, None, None, None),
+        let (
+            scratch_open,
+            migrated_resume,
+            adopted,
+            ephemeral_predecessor,
+            mut refused_run_id,
+            mut refusal,
+        ) = match retention {
+            EngineOpenRetention::Ephemeral => {
+                (EngineScratchOpen::Fresh, None, None, None, None, None)
+            }
             EngineOpenRetention::Retained {
                 resume: Some(snapshot),
             } => match store.adopt_retained_engine_scratch(
                 snapshot.scratch_run_id,
                 snapshot.scratch_binding_digest,
             ) {
-                Ok(retained) => (Some(retained), None, Some(snapshot), None, None),
+                Ok(retained) => (
+                    EngineScratchOpen::Retained(retained),
+                    None,
+                    Some(snapshot),
+                    None,
+                    None,
+                    None,
+                ),
                 Err(error) => (
-                    Some(
+                    EngineScratchOpen::Retained(
                         store
                             .create_retained_engine_scratch()
                             .map_err(|error| EngineError::Archive(error.to_string()))?,
                     ),
+                    None,
                     None,
                     None,
                     Some(snapshot.scratch_run_id),
@@ -6891,7 +7461,7 @@ impl ShardedHotEngine {
                 ),
             },
             EngineOpenRetention::Retained { resume: None } => (
-                Some(
+                EngineScratchOpen::Retained(
                     store
                         .create_retained_engine_scratch()
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
@@ -6900,12 +7470,38 @@ impl ShardedHotEngine {
                 None,
                 None,
                 None,
+                None,
             ),
-            EngineOpenRetention::MigratedBootstrap { retained, resume } => {
-                (Some(*retained), Some(resume), None, None, None)
+            EngineOpenRetention::MigratedBootstrap { retained, resume } => (
+                EngineScratchOpen::Retained(*retained),
+                Some(resume),
+                None,
+                None,
+                None,
+                None,
+            ),
+            EngineOpenRetention::EphemeralBootstrap { predecessor } => {
+                let (scratch, block_claim_index, snapshot) = predecessor.into_parts();
+                (
+                    EngineScratchOpen::ExistingEphemeral {
+                        scratch,
+                        block_claim_index,
+                    },
+                    None,
+                    None,
+                    Some(snapshot),
+                    None,
+                    None,
+                )
             }
         };
-        let adopted = migrated_resume.as_deref().or(adopted);
+        let predecessor = match ephemeral_predecessor {
+            Some(snapshot) => Some(RecoveryPredecessor::EphemeralBootstrap(snapshot)),
+            None => migrated_resume
+                .as_deref()
+                .map(RecoveryPredecessor::Retained)
+                .or(adopted.map(RecoveryPredecessor::Retained)),
+        };
         #[cfg(test)]
         let phase_started = Instant::now();
         let mut engine = Self::with_enrolled_projection_promoted(
@@ -6915,8 +7511,8 @@ impl ShardedHotEngine {
             graph,
             receipts,
             promotion,
-            retained,
-            adopted.is_some(),
+            scratch_open,
+            predecessor.is_some(),
         );
         #[cfg(test)]
         update_enrolled_projection_open_instrumentation(|timing| {
@@ -6947,8 +7543,8 @@ impl ShardedHotEngine {
                 engine.history_failure = Some(error);
             }
         }
-        let (outcomes, rotated) =
-            engine.complete_enrolled_projection_recovery_resuming(committed_manifests, adopted)?;
+        let (outcomes, rotated) = engine
+            .complete_enrolled_projection_recovery_resuming(committed_manifests, predecessor)?;
         #[cfg(test)]
         update_enrolled_projection_open_instrumentation(|timing| {
             timing.total = open_started.elapsed();
@@ -6976,7 +7572,7 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
-        retained: Option<super::object_store::RetainedEngineScratch>,
+        scratch_open: EngineScratchOpen,
         retain_current_authority: bool,
     ) -> Self {
         let workspace_id = store.workspace_id();
@@ -7023,7 +7619,7 @@ impl ShardedHotEngine {
                 open,
                 lineage_digest,
                 catalog_document_id,
-                retained,
+                scratch_open,
                 retain_current_authority,
             ),
             Err((store, error)) => Self::failed_archive_open(
@@ -7072,7 +7668,7 @@ impl ShardedHotEngine {
             open,
             lineage_digest,
             catalog_document_id,
-            None,
+            EngineScratchOpen::Fresh,
             false,
         )
     }
@@ -7081,7 +7677,7 @@ impl ShardedHotEngine {
         open: super::object_store::EnrolledProjectionOpen,
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
-        retained: Option<super::object_store::RetainedEngineScratch>,
+        scratch_open: EngineScratchOpen,
         retain_current_authority: bool,
     ) -> Self {
         let binding = open.binding();
@@ -7115,8 +7711,12 @@ impl ShardedHotEngine {
                 EngineError::ProjectionWork(error.to_string()),
             );
         }
-        let mut engine =
-            Self::with_archive_store_scratch(store, lineage_digest, catalog_document_id, retained);
+        let mut engine = Self::with_archive_store_scratch(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            scratch_open,
+        );
         engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
         // An enrolled runtime may use the persistent page-name index only
         // after the authenticated history root and its latest record prove the
@@ -7357,8 +7957,9 @@ impl ShardedHotEngine {
             .0)
     }
 
-    /// Complete startup recovery, optionally resuming from an adopted retained
-    /// run instead of replaying immutable history from nothing.
+    /// Complete startup recovery, optionally restoring a revalidated retained
+    /// or one-process ephemeral bootstrap predecessor instead of replaying its
+    /// already authenticated prefix from nothing.
     ///
     /// `resume` is `None` on every path that existed before runtime-resume
     /// adoption. On those paths `replay_base_generation` stays zero, no batch is
@@ -7372,7 +7973,7 @@ impl ShardedHotEngine {
     fn complete_enrolled_projection_recovery_resuming(
         &mut self,
         committed_manifests: &[OperationBatch],
-        resume: Option<&RuntimeResumeSnapshot>,
+        predecessor: Option<RecoveryPredecessor<'_>>,
     ) -> Result<(Vec<StageOutcome>, Option<(Uuid, EngineError)>), EngineError> {
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
@@ -7386,20 +7987,42 @@ impl ShardedHotEngine {
             Err(error) => return Err(EngineError::ReferenceCatalog(error.to_string())),
         }
 
+        let prepare_started = Instant::now();
         self.prepare_operational_recovery_replay()?;
+        update_engine_open_stages(|stages| stages.prepare_replay = prepare_started.elapsed());
         let mut rotation = None;
-        if let Some(snapshot) = resume {
+        if let Some(predecessor) = predecessor {
+            let (snapshot, kind) = match &predecessor {
+                RecoveryPredecessor::Retained(snapshot) => (*snapshot, PredecessorKind::Retained),
+                RecoveryPredecessor::EphemeralBootstrap(snapshot) => {
+                    (snapshot.as_ref(), PredecessorKind::EphemeralBootstrap)
+                }
+            };
             #[cfg(test)]
             let phase_started = Instant::now();
-            if let Err(refusal) = self.restore_adopted_predecessor_state(snapshot) {
+            let restore_started = Instant::now();
+            let restore_result = self.restore_predecessor_state(snapshot, kind);
+            update_engine_open_stages(|stages| {
+                stages.predecessor_restore = restore_started.elapsed();
+            });
+            if let Err(refusal) = restore_result {
                 // The restore is all-or-nothing: it validates everything before
                 // it installs anything, so the engine is still exactly at the
                 // baseline `prepare_operational_recovery_replay` produced. All
-                // that is left is to stop writing into the run we no longer
-                // trust — its bytes stay untouched — and replay everything.
+                // that is left is to stop using the candidate scratch and replay
+                // everything. A retained refusal preserves its old run; an
+                // ephemeral predecessor is disposable and may be replaced with
+                // another ephemeral run, never a retained one.
                 self.validate_retained_bootstrap_publication()?;
-                let refused = self.rotate_to_fresh_retained_scratch()?;
-                rotation = Some((refused, refusal));
+                match kind {
+                    PredecessorKind::Retained => {
+                        let refused = self.rotate_to_fresh_retained_scratch()?;
+                        rotation = Some((refused, refusal));
+                    }
+                    PredecessorKind::EphemeralBootstrap => {
+                        self.rotate_to_fresh_ephemeral_scratch()?;
+                    }
+                }
             }
             #[cfg(test)]
             update_enrolled_projection_open_instrumentation(|timing| {
@@ -7433,6 +8056,7 @@ impl ShardedHotEngine {
         // conflict with `&mut self` staging. Each part is then loaded, staged,
         // and dropped before the next ordinal is read, so restart resident
         // memory is one bootstrap part rather than the whole graph.
+        let bootstrap_started = Instant::now();
         #[cfg(test)]
         let phase_started = Instant::now();
         if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
@@ -7477,6 +8101,13 @@ impl ShardedHotEngine {
                 timing.bootstrap_part_recovery = phase_started.elapsed();
             });
         }
+        let bootstrap_replayed = outcomes.len();
+        update_engine_open_stages(|stages| {
+            stages.bootstrap_part_replay = bootstrap_started.elapsed();
+            stages.bootstrap_parts_replayed = bootstrap_replayed;
+            stages.archived_manifests_offered = committed_manifests.len();
+        });
+        let tail_started = Instant::now();
         for manifest in committed_manifests {
             if self.covered_by_predecessor_state(manifest.batch_id())? {
                 continue;
@@ -7488,7 +8119,14 @@ impl ShardedHotEngine {
             }
             outcomes.push(outcome);
         }
+        let tail_replayed = outcomes.len().saturating_sub(bootstrap_replayed);
+        update_engine_open_stages(|stages| {
+            stages.archived_tail_replay = tail_started.elapsed();
+            stages.archived_manifests_replayed = tail_replayed;
+        });
+        let finish_started = Instant::now();
         self.finish_operational_recovery_replay()?;
+        update_engine_open_stages(|stages| stages.finish_replay = finish_started.elapsed());
         Ok(outcomes)
     }
 
@@ -7584,6 +8222,29 @@ impl ShardedHotEngine {
         self.retained_scratch = Some(identity);
         self.resume_observation.refused = true;
         Ok(refused)
+    }
+
+    /// Discard an untrusted one-process ephemeral predecessor and rebuild the
+    /// ordinary disposable scratch baseline. Unlike retained rotation this
+    /// cannot publish, preserve, or add a retained run; the original ephemeral
+    /// run is removed with its last owner.
+    fn rotate_to_fresh_ephemeral_scratch(&mut self) -> Result<(), EngineError> {
+        if self.retained_scratch.is_some() {
+            return Err(EngineError::Archive(
+                "ephemeral bootstrap fallback cannot rotate a retained run".into(),
+            ));
+        }
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
+        let (scratch, claim_index) = store
+            .start_engine_scratch()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.forget_retained_accepted_documents();
+        self.scratch = Some(scratch);
+        self.block_claim_index = Some(Arc::new(claim_index));
+        Ok(())
     }
 
     /// Retain this promoted lineage's immutable bootstrap publication and the
@@ -8003,24 +8664,59 @@ impl ShardedHotEngine {
     /// `accepted_sequence`, every `ephemeral_*` map), so the catalog document is
     /// the whole gap between an adopted engine and the engine a full replay
     /// produces.
-    fn restore_adopted_predecessor_state(
+    fn restore_predecessor_state(
         &mut self,
         snapshot: &RuntimeResumeSnapshot,
+        kind: PredecessorKind,
     ) -> Result<(), EngineError> {
+        #[cfg(test)]
+        if matches!(kind, PredecessorKind::EphemeralBootstrap)
+            && FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE.replace(false)
+        {
+            return Err(EngineError::Archive(
+                "injected ephemeral bootstrap predecessor restore refusal".into(),
+            ));
+        }
         if !self.authenticated_history_replay || self.replay_base_generation != 0 {
             return Err(EngineError::Archive(
                 "runtime resume restore requires a fresh authenticated replay baseline".into(),
             ));
         }
-        let identity = self.retained_scratch.ok_or_else(|| {
-            EngineError::Archive("runtime resume restore requires a retained run".into())
-        })?;
-        if identity.run_id() != snapshot.scratch_run_id
-            || identity.binding_digest() != snapshot.scratch_binding_digest
-        {
-            return Err(EngineError::Archive(
-                "adopted retained run is not the run this resume snapshot names".into(),
-            ));
+        match kind {
+            PredecessorKind::Retained => {
+                let identity = self.retained_scratch.ok_or_else(|| {
+                    EngineError::Archive("runtime resume restore requires a retained run".into())
+                })?;
+                if identity.run_id() != snapshot.scratch_run_id
+                    || identity.binding_digest() != snapshot.scratch_binding_digest
+                {
+                    return Err(EngineError::Archive(
+                        "adopted retained run is not the run this resume snapshot names".into(),
+                    ));
+                }
+            }
+            PredecessorKind::EphemeralBootstrap => {
+                if self.retained_scratch.is_some() {
+                    return Err(EngineError::Archive(
+                        "ephemeral bootstrap predecessor unexpectedly owns a retained run".into(),
+                    ));
+                }
+                let scratch = self.scratch.as_ref().ok_or_else(|| {
+                    EngineError::Archive(
+                        "ephemeral bootstrap predecessor has no run-local scratch".into(),
+                    )
+                })?;
+                if scratch.run_id() != snapshot.scratch_run_id
+                    || scratch
+                        .binding_digest()
+                        .map_err(|error| EngineError::Archive(error.to_string()))?
+                        != snapshot.scratch_binding_digest
+                {
+                    return Err(EngineError::Archive(
+                        "ephemeral bootstrap scratch is not the sealed predecessor run".into(),
+                    ));
+                }
+            }
         }
         if snapshot.history_generation == 0 {
             return Err(EngineError::Archive(
@@ -8228,7 +8924,9 @@ impl ShardedHotEngine {
         self.validated_run_local_current_authority = exact_current_authority;
         self.adoptable_current_history_head =
             exact_current_authority.map(|authority| (authority, record.batch_id));
-        self.resume_observation.adopted = true;
+        if matches!(kind, PredecessorKind::Retained) {
+            self.resume_observation.adopted = true;
+        }
         Ok(())
     }
 
@@ -10112,6 +10810,8 @@ impl ShardedHotEngine {
     ) -> Result<AcceptedRootMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
+        let (accepted_frontier_session, external_exact_session) =
+            self.accepted_root_lookup_sessions(root, ACCEPTED_ROOT_LOOKUP_SESSION_BYTES)?;
         Ok(AcceptedRootMaterializer {
             engine: self,
             root: root.clone(),
@@ -10120,7 +10820,37 @@ impl ShardedHotEngine {
             exact_document_loads: 0,
             exact_catalog_loads: 0,
             exact_catalog_decodes: 0,
+            accepted_frontier_session,
+            external_exact_session,
         })
+    }
+
+    /// The two decoded-segment sessions a root-bound materializer reuses.
+    /// Absent scratch, or a root with no scratch address, has nothing to bind
+    /// to and resolves through the in-memory frontier instead.
+    fn accepted_root_lookup_sessions(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes: usize,
+    ) -> Result<(Option<ScratchLookupSession>, Option<ScratchLookupSession>), EngineError> {
+        let (Some(store), Some(scratch_root)) = (&self.scratch, &root.scratch_root) else {
+            return Ok((None, None));
+        };
+        let accepted_frontier = store
+            .lookup_session(
+                scratch_root,
+                super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                budget_bytes,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let external_exact = store
+            .lookup_session(
+                &self.scratch_roots.external_document_state_root,
+                super::scratch_store::ScratchPageKind::DocumentExternalExact,
+                budget_bytes,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok((Some(accepted_frontier), Some(external_exact)))
     }
 
     pub(crate) fn bootstrap_bulk_materializer(
@@ -13731,6 +14461,7 @@ impl ShardedHotEngine {
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
+            receipt_backed_live_authority: false,
         }))
     }
 
@@ -13912,7 +14643,45 @@ impl ShardedHotEngine {
                 Some(prior)
             } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
-                let authority = match completed.as_slice() {
+                let before = draft.pages[&requirement.page_id]
+                    .before
+                    .as_ref()
+                    .expect("prior requirement was selected from a semantic pre-state");
+                let receipt_backed_live = current
+                    .as_deref()
+                    .map(|live_bytes| {
+                        super::projection::receipt_backed_live_projection_predecessor(
+                            self.workspace_id,
+                            source,
+                            receipts,
+                            &work_index,
+                            before,
+                            live_bytes,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                    .flatten();
+                if let Some(live) = receipt_backed_live {
+                    charge_preauthoring_receipt_bytes(
+                        &mut retained_bytes,
+                        live.intent(),
+                        live.completion(),
+                        "live semantic predecessor receipt",
+                    )?;
+                    let bytes = current
+                        .as_ref()
+                        .expect("live receipt predecessor requires a present graph file")
+                        .clone();
+                    Some(CapabilityCapturedPriorProjection {
+                        bytes,
+                        intent: live.intent().clone(),
+                        completion: Some(live.completion().clone()),
+                        bootstrap_owner_binding: None,
+                        managed_local_authority: None,
+                        receipt_backed_live_authority: true,
+                    })
+                } else if let Some(authority) = match completed.as_slice() {
                     [authority]
                         if matches!(authority.target(), ProjectionWorkTarget::Present(_)) =>
                     {
@@ -13922,8 +14691,7 @@ impl ShardedHotEngine {
                         authority_matches = false;
                         None
                     }
-                };
-                if let Some(authority) = authority {
+                } {
                     let (intent, completion) = receipts
                         .load_completed_receipt(authority)
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -13933,10 +14701,6 @@ impl ShardedHotEngine {
                         &completion,
                         "semantic predecessor receipt",
                     )?;
-                    let before = draft.pages[&requirement.page_id]
-                        .before
-                        .as_ref()
-                        .expect("prior requirement was selected from a semantic pre-state");
                     let base = receipts
                         .load_base(&intent)
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -13963,6 +14727,7 @@ impl ShardedHotEngine {
                             completion: Some(completion),
                             bootstrap_owner_binding: None,
                             managed_local_authority: None,
+                            receipt_backed_live_authority: false,
                         })
                     }
                 } else if completed.is_empty() {
@@ -14015,6 +14780,7 @@ impl ShardedHotEngine {
                                 completion: None,
                                 bootstrap_owner_binding: Some(baseline.owner_binding()),
                                 managed_local_authority: None,
+                                receipt_backed_live_authority: false,
                             })
                         }
                     } else {
@@ -14311,7 +15077,10 @@ impl ShardedHotEngine {
                     Some(prior.intent.annotations()),
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if replay.target() != prior.bytes {
+                if replay.target() != prior.bytes
+                    || (prior.receipt_backed_live_authority
+                        && replay.intent().annotations() != prior.intent.annotations())
+                {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} prior bytes are not the exact semantic pre-state"
                     )));
@@ -18928,6 +19697,33 @@ impl ShardedHotEngine {
     fn begin_point_operation(&self) {
         self.status_point_cache.borrow_mut().clear();
         self.external_anchor_point_cache.borrow_mut().clear();
+        self.observed_manifest_point_cache.borrow_mut().clear();
+        self.retained_bootstrap_part_point_cache
+            .borrow_mut()
+            .clear();
+    }
+
+    /// [`Self::load_observed_manifest`], memoized for this public operation.
+    ///
+    /// Bounded so a pathological operation spanning many batches cannot retain
+    /// an unbounded number of manifests: at the cap the whole memo is dropped
+    /// rather than evicting by policy, because correctness never depends on a
+    /// hit and a cleared memo simply pays the ordinary load again.
+    fn observed_manifest_for_point_operation(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Arc<OperationBatch>, EngineError> {
+        const OBSERVED_MANIFEST_POINT_CACHE_BATCHES: usize = 4;
+        if let Some(manifest) = self.observed_manifest_point_cache.borrow().get(&batch_id) {
+            return Ok(Arc::clone(manifest));
+        }
+        let manifest = Arc::new(self.load_observed_manifest(batch_id)?);
+        let mut cache = self.observed_manifest_point_cache.borrow_mut();
+        if cache.len() >= OBSERVED_MANIFEST_POINT_CACHE_BATCHES {
+            cache.clear();
+        }
+        cache.insert(batch_id, Arc::clone(&manifest));
+        Ok(manifest)
     }
 
     /// Reuse the retained decode of `document_id` at this exact causal state,
@@ -22168,22 +22964,48 @@ impl ShardedHotEngine {
         &self,
         frontier: &FrontierV2,
     ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
+        self.reconstruct_projection_frontier_with_session(frontier, None)
+    }
+
+    /// The same reconstruction, optionally reusing a caller-held
+    /// `DocumentExternalExact` session. The session changes only how the bytes
+    /// are reached: every record still proves its own anchor and its peer
+    /// counters and heads against the frontier below.
+    fn reconstruct_projection_frontier_with_session(
+        &self,
+        frontier: &FrontierV2,
+        mut external_exact_session: Option<&mut ScratchLookupSession>,
+    ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
         let Some(store) = &self.scratch else {
             return self.reconstruct_frontier(frontier);
         };
         let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
-            let (record, document, state_work) = super::document_state::load_external_exact(
-                store,
-                &self.scratch_roots,
-                super::document_state::DocumentLane::Visible,
-                dependencies.document_id(),
-                dependencies.causal_state_digest(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or(EngineError::FrontierVectorMismatch(
-                dependencies.document_id(),
-            ))?;
+            let loaded = match external_exact_session.as_deref_mut() {
+                Some(session) => super::document_state::load_external_exact_many_with_session(
+                    store,
+                    &self.scratch_roots,
+                    super::document_state::DocumentLane::Visible,
+                    &[(
+                        dependencies.document_id(),
+                        dependencies.causal_state_digest(),
+                    )],
+                    Some(session),
+                )
+                .map(|mut loaded| loaded.pop().flatten()),
+                None => super::document_state::load_external_exact(
+                    store,
+                    &self.scratch_roots,
+                    super::document_state::DocumentLane::Visible,
+                    dependencies.document_id(),
+                    dependencies.causal_state_digest(),
+                ),
+            };
+            let (record, document, state_work) = loaded
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or(EngineError::FrontierVectorMismatch(
+                    dependencies.document_id(),
+                ))?;
             self.record_document_state_work(state_work);
             self.validate_external_record_anchor(dependencies.document_id(), &record)?;
             if record.peer_counters() != dependencies.peer_counters()
@@ -22450,7 +23272,7 @@ impl ShardedHotEngine {
             self.external_anchor_point_cache.borrow_mut().insert(anchor);
             return Ok(());
         }
-        let manifest = self.load_observed_manifest(record.latest_source_batch())?;
+        let manifest = self.observed_manifest_for_point_operation(record.latest_source_batch())?;
         let object = self.load_archive_document_object(
             record.latest_source_batch(),
             &manifest,
@@ -22873,6 +23695,40 @@ impl ShardedHotEngine {
         Ok(true)
     }
 
+    /// The retained bootstrap part's CrdtUpdate objects, indexed by document and
+    /// memoized for this public operation. Returns `None` exactly when
+    /// [`Self::load_retained_bootstrap_part`] finds no retained part, so the
+    /// caller's branch structure is unchanged.
+    fn retained_bootstrap_document_updates_for_point_operation(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<Arc<BTreeMap<DocumentId, OperationObject>>>, EngineError> {
+        const RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES: usize = 4;
+        if let Some(index) = self
+            .retained_bootstrap_part_point_cache
+            .borrow()
+            .get(&batch_id)
+        {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? else {
+            return Ok(None);
+        };
+        let mut index = BTreeMap::new();
+        for object in loaded.objects() {
+            if object.kind() == ObjectKind::CrdtUpdate {
+                index.insert(object.document_id(), object.clone());
+            }
+        }
+        let index = Arc::new(index);
+        let mut cache = self.retained_bootstrap_part_point_cache.borrow_mut();
+        if cache.len() >= RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES {
+            cache.clear();
+        }
+        cache.insert(batch_id, Arc::clone(&index));
+        Ok(Some(index))
+    }
+
     fn load_archive_document_object(
         &self,
         batch_id: BatchId,
@@ -22892,13 +23748,11 @@ impl ShardedHotEngine {
                     dependency: batch_id,
                 });
         }
-        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
-            return loaded
-                .objects()
-                .iter()
-                .find(|object| {
-                    object.kind() == ObjectKind::CrdtUpdate && object.document_id() == document_id
-                })
+        if let Some(index) =
+            self.retained_bootstrap_document_updates_for_point_operation(batch_id)?
+        {
+            return index
+                .get(&document_id)
                 .cloned()
                 .ok_or(EngineError::MissingDocumentUpdate {
                     document_id,
@@ -29366,7 +30220,7 @@ mod validation_tests {
                 .unwrap();
                 let expected = DetachedBootstrapCandidate {
                     engine: author.candidate.take().unwrap(),
-                    scratch_root: author.scratch_root.take().unwrap(),
+                    scratch_root: Some(author.scratch_root.take().unwrap()),
                     part_count: 2,
                     last_part: Some(second_descriptor.part_id()),
                     index_durability: DetachedBootstrapIndexDurability::ReplayedArchive {
@@ -29691,6 +30545,10 @@ mod validation_tests {
         assert!(engine.history_store.is_none());
         assert!(engine.projection_work_index.is_none());
         assert!(engine.projection_endpoint.is_none());
+        let scratch_root = completed
+            .scratch_root
+            .as_ref()
+            .expect("ordinary detached authoring owns its private scratch root");
         for forbidden in [
             "archive",
             "history",
@@ -29700,16 +30558,12 @@ mod validation_tests {
             "manifests",
         ] {
             assert!(
-                completed
-                    .scratch_root
-                    .root
-                    .symlink_metadata(forbidden)
-                    .is_err(),
+                scratch_root.root.symlink_metadata(forbidden).is_err(),
                 "detached authoring created forbidden live/durable path {forbidden}"
             );
         }
-        let parent = completed.scratch_root.parent.try_clone().unwrap();
-        let root_name = completed.scratch_root.name.clone();
+        let parent = scratch_root.parent.try_clone().unwrap();
+        let root_name = scratch_root.name.clone();
         drop(completed);
         assert!(
             parent.symlink_metadata(&root_name).is_err(),
@@ -41749,5 +42603,45 @@ mod replay_benchmark {
             status.pending
         );
         assert_eq!(restored.get_deep_value(), expected.get_deep_value());
+    }
+}
+
+#[cfg(test)]
+mod frontier_identity_tests {
+    use super::*;
+
+    /// A frontier must answer "which frontier are you?" the same way however
+    /// the question is asked -- by comparison or by digest.
+    ///
+    /// The two answers were once maintained separately, and drifted: `PartialEq`
+    /// excluded the run-local `scratch_root` while the simulator harness named a
+    /// frontier by encoding the whole struct. A reopen moves the scratch store,
+    /// so the SQLite projection sitting exactly at the accepted frontier
+    /// compared equal (read gate open) and digested differently (oracle: stale
+    /// projection) at the same instant. Fifteen coordinator scenarios failed on
+    /// that contradiction.
+    #[test]
+    fn a_frontier_keeps_one_identity_when_the_scratch_store_moves_under_it() {
+        let key_bytes = crate::oplog::scratch_store::MAX_CARRIED_SCRATCH_KEY_BYTES;
+        let before_reopen = AcceptedFrontierRoot::saturated_for_test(key_bytes);
+        let mut after_reopen = before_reopen.clone();
+        after_reopen.scratch_root = None;
+
+        assert_eq!(
+            before_reopen, after_reopen,
+            "scratch_root is a run-local address, so it cannot make two frontiers different"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&before_reopen.identity()).unwrap(),
+            postcard::to_allocvec(&after_reopen.identity()).unwrap(),
+            "frontiers that compare equal must digest equal, or an up-to-date \
+             projection reads as stale"
+        );
+        assert_ne!(
+            postcard::to_allocvec(&before_reopen).unwrap(),
+            postcard::to_allocvec(&after_reopen).unwrap(),
+            "the whole-struct encoding still differs -- which is precisely why \
+             identity may not be taken from it"
+        );
     }
 }

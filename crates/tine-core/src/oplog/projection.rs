@@ -24,11 +24,11 @@ use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BatchInspection, BlockId, EngineError,
     LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
-    PageId, ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
-    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkBlockAuthority,
-    ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget, ReceiptError,
-    ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
+    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
+    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
+    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -369,8 +369,12 @@ impl From<ProjectionError> for ExactSourceProjectionError {
 /// Prove that `source` is the complete accepted semantic page, then construct
 /// an adoption baseline whose target and precondition both name those exact
 /// bytes. When ordinary rendering would change harmless trivia, source
-/// coordinates come from the parser-owned spans used by external import;
-/// already byte-equal sources retain their established projector annotations.
+/// coordinates come from the parser-owned spans used by external import. When
+/// authenticated annotations accompany a Markdown source, they are retained
+/// only if ordinary rendering reproduces both the bytes and annotations;
+/// otherwise the exact source establishes a guarded parser-owned baseline
+/// again. Org keeps its stricter ordinary guarded rendering when authenticated
+/// annotations are present.
 pub(crate) fn plan_projection_adopting_exact_source(
     workspace_id: WorkspaceId,
     state: &ProjectionPageState,
@@ -385,7 +389,9 @@ pub(crate) fn plan_projection_with_layout_annotations(
     expected_base: Option<&[u8]>,
     expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
-    if let Some(source) = expected_base.filter(|_| expected_base_annotations.is_none()) {
+    let may_adopt_exact_source = expected_base_annotations.is_none()
+        || matches!(format_for_page(&state.page)?, ProjectionFormat::Markdown);
+    if let Some(source) = expected_base.filter(|_| may_adopt_exact_source) {
         match plan_exact_source_projection(workspace_id, state, source, expected_base_annotations) {
             Ok(plan) => return Ok(plan),
             Err(ExactSourceProjectionError::Semantic(_)) => {}
@@ -394,6 +400,93 @@ pub(crate) fn plan_projection_with_layout_annotations(
     }
     let rendered = render_projection(state, expected_base, expected_base_annotations)?;
     projection_plan_from_rendered(workspace_id, state, expected_base, rendered)
+}
+
+/// One current completed-path receipt whose immutable completion and the live
+/// graph bytes together prove the exact semantic predecessor for a new local
+/// projection. This is deliberately a *live* proof: an old receipt base is
+/// not reconstructed and compared with a newer serializer. The completed-path
+/// row authenticates which receipt is current, while the live target digest and
+/// layout-aware replay prove that those bytes still describe the accepted page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptBackedLiveProjectionPredecessor {
+    completed: ProjectionCompletedReceipt,
+    intent: ProjectionIntent,
+    completion: ProjectionCompletion,
+}
+
+impl ReceiptBackedLiveProjectionPredecessor {
+    pub(crate) const fn completed(&self) -> &ProjectionCompletedReceipt {
+        &self.completed
+    }
+
+    pub(crate) const fn intent(&self) -> &ProjectionIntent {
+        &self.intent
+    }
+
+    pub(crate) const fn completion(&self) -> &ProjectionCompletion {
+        &self.completion
+    }
+}
+
+/// Prove that `live_bytes` remain the current projection of `state` through
+/// the enrolled completed-path authority. `None` is an ordinary stale or
+/// externally-divergent observation and must enter reconciliation; an error
+/// denotes malformed or foreign durable authority.
+pub(crate) fn receipt_backed_live_projection_predecessor(
+    workspace_id: WorkspaceId,
+    endpoint: ProjectionEndpointBinding,
+    receipts: &ProjectionReceiptStore,
+    work_index: &ProjectionWorkIndex,
+    state: &ProjectionPageState,
+    live_bytes: &[u8],
+) -> Result<Option<ReceiptBackedLiveProjectionPredecessor>, ProjectionError> {
+    if receipts.workspace_id() != workspace_id
+        || receipts.endpoint_binding() != Some(endpoint)
+        || work_index.workspace_id() != workspace_id
+        || work_index.endpoint_id() != endpoint.endpoint_id()
+        || work_index.graph_resource_id() != endpoint.graph_resource_id()
+        || work_index.receipt_store_id() != receipts.store_id()
+    {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
+
+    let completed = work_index
+        .completed_receipts_for_path(&state.page.path)
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    let [completed] = completed.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(completed.target(), ProjectionWorkTarget::Present(_)) {
+        return Ok(None);
+    }
+
+    let (intent, completion) = receipts.load_completed_receipt(completed)?;
+    if intent.workspace_id() != workspace_id
+        || intent.page_id() != state.page.page_id
+        || intent.path() != &state.page.path
+        || intent.frontier() != &state.frontier
+        || intent.claim_evidence() != state.claim_evidence
+        || intent.target() != super::BlobDescription::of(live_bytes)
+    {
+        return Ok(None);
+    }
+
+    let replay = plan_projection_with_layout_annotations(
+        workspace_id,
+        state,
+        Some(live_bytes),
+        Some(intent.annotations()),
+    )?;
+    if replay.target() != live_bytes || replay.intent().annotations() != intent.annotations() {
+        return Ok(None);
+    }
+
+    Ok(Some(ReceiptBackedLiveProjectionPredecessor {
+        completed: completed.clone(),
+        intent,
+        completion,
+    }))
 }
 
 fn projection_plan_from_rendered(
@@ -511,8 +604,35 @@ fn plan_exact_source_projection(
         expected_base_annotations,
         metadata,
     )?;
-    let rendered_annotations_match = expected_base_annotations
-        .is_none_or(|expected| expected == rendered.annotations.as_slice());
+    // Retain the rendered plan when ordinary rendering reproduces the source
+    // bytes AND binds the same blocks to the same outline positions.
+    //
+    // This deliberately compares identities, not whole annotations. Two
+    // annotation sets over ONE byte sequence are produced here by two different
+    // routes: `rendered.annotations` comes from marker instrumentation over the
+    // rendered document and ends a block before its line terminator, while the
+    // fall-through below derives spans from the parser's block tiling, which
+    // runs to the start of the next block and so includes it. Demanding `==`
+    // therefore compared a span convention, not the authenticated binding, and
+    // it was self-perpetuating: one save that took the fall-through wrote
+    // tiling spans into the receipt, those became the next save's authenticated
+    // base annotations, they could never equal freshly rendered annotations,
+    // and every later save took the fall-through too. A replay computed without
+    // authenticated annotations always takes the rendered route, so its intent
+    // could never match the durable receipt again and the drain refused with
+    // `no durable completion/base exactly matches the current accepted affected
+    // frontier`.
+    //
+    // Identity comparison keeps what authentication is for — the same blocks,
+    // in the same outline positions — while letting spans be re-derived from
+    // bytes that are, by the equality on the same line, identical.
+    let rendered_annotations_match = expected_base_annotations.is_none_or(|expected| {
+        expected.len() == rendered.annotations.len()
+            && expected
+                .iter()
+                .zip(&rendered.annotations)
+                .all(|(expected, rendered)| expected.binds_same_identity_as(rendered))
+    });
     if rendered.target == source && rendered_annotations_match {
         return projection_plan_from_rendered(workspace_id, state, Some(source), rendered)
             .map_err(ExactSourceProjectionError::Projection);
@@ -2918,6 +3038,58 @@ mod tests {
         .unwrap()
     }
 
+    /// Planning the same state over the same bytes must yield the same intent
+    /// annotations whether or not authenticated base annotations are supplied.
+    ///
+    /// The managed drain proves a durable receipt still describes the accepted
+    /// state by replaying it and comparing intents. The receipt was written
+    /// WITH authenticated annotations; the replay runs WITHOUT them. If those
+    /// two routes can disagree, no receipt ever matches and every
+    /// external-change reconcile refuses with `no durable completion/base
+    /// exactly matches the current accepted affected frontier`.
+    ///
+    /// The authenticated annotations here use the parser's block tiling, whose
+    /// span runs to the start of the next block and so includes the line
+    /// terminator — the convention a receipt written through the fall-through
+    /// branch carries. Rendering ends a block before its terminator. Comparing
+    /// whole annotations therefore compared conventions, sent this plan down
+    /// the fall-through branch, and made the disagreement permanent.
+    #[test]
+    fn authenticated_annotations_do_not_change_the_planned_annotations() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/legacy-spans.md",
+            vec![(80_011, None, "a", "alpha".into(), None)],
+        );
+        let source = b"- alpha\n";
+
+        let replayed = plan_projection(workspace, &state, Some(source)).unwrap();
+        assert_eq!(replayed.target(), source);
+        let rendered_annotations = replayed.intent().annotations().to_vec();
+        assert_eq!(rendered_annotations.len(), 1);
+
+        // The same binding, but spanning the terminator as block tiling does.
+        let rendered_span = rendered_annotations[0].span();
+        let legacy = vec![AnnotatedIdentity::new(
+            rendered_annotations[0].locator().clone(),
+            StructuralSpan::new(rendered_span.start(), rendered_span.end() + 1).unwrap(),
+            rendered_annotations[0].block_id(),
+            rendered_annotations[0].logseq_uuid(),
+        )];
+        assert_eq!(u64::from(rendered_span.end()) + 1, source.len() as u64);
+        assert_ne!(legacy.as_slice(), rendered_annotations.as_slice());
+
+        let written =
+            plan_projection_with_layout_annotations(workspace, &state, Some(source), Some(&legacy))
+                .unwrap();
+        assert_eq!(written.target(), source);
+        assert_eq!(
+            written.intent().annotations(),
+            rendered_annotations.as_slice(),
+            "a receipt written with legacy tiling spans must replay to the same annotations"
+        );
+    }
+
     #[test]
     fn exact_source_adoption_preserves_equivalent_layout_and_source_spans() {
         let mut state = structural_layout_state(
@@ -3005,6 +3177,99 @@ mod tests {
             next.intent().precondition(),
             &ProjectionPrecondition::Base(BlobDescription::of(source))
         );
+    }
+
+    #[test]
+    fn receipt_backed_layout_replay_preserves_a_nonleading_atx_heading_target() {
+        let state = structural_layout_state(
+            "pages/heading.md",
+            vec![(80_040, None, "a", "## Current plan".into(), None)],
+        );
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_041));
+        let source = b"## Current plan\n";
+
+        let rendered = render_projection(&state, Some(source), None).unwrap();
+        assert_eq!(rendered.target, source);
+        let replay = plan_projection_with_layout_annotations(
+            workspace,
+            &state,
+            Some(source),
+            Some(&rendered.annotations),
+        )
+        .unwrap();
+        assert_eq!(replay.target(), source);
+        assert_eq!(replay.intent().annotations(), rendered.annotations);
+    }
+
+    #[test]
+    fn authenticated_exact_source_adoption_retains_markdown_whitespace_layouts() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_004));
+        let cases = [
+            (
+                "empty-root-bullet",
+                "pages/empty-root.md",
+                vec![(80_111, None, "a", String::new(), None)],
+                "- \n",
+            ),
+            (
+                "empty-nested-bullet",
+                "pages/empty-nested.md",
+                vec![
+                    (80_121, None, "a", "parent".into(), None),
+                    (80_122, Some(80_121), "a", String::new(), None),
+                ],
+                "- parent\n  - \n",
+            ),
+            (
+                "empty-bullet-crlf",
+                "pages/empty-crlf.md",
+                vec![(80_131, None, "a", String::new(), None)],
+                "- \r\n",
+            ),
+            (
+                "nonempty-trailing-space",
+                "pages/nonempty-trailing.md",
+                vec![(80_141, None, "a", "keeps trailing ".into(), None)],
+                "- keeps trailing \n",
+            ),
+        ];
+
+        for (name, path, blocks, source) in cases {
+            let state = structural_layout_state(path, blocks);
+            let imported =
+                plan_projection_adopting_exact_source(workspace, &state, source.as_bytes())
+                    .unwrap_or_else(|error| panic!("{name} exact-source import failed: {error:?}"));
+            let replay = plan_projection_with_layout_annotations(
+                workspace,
+                &state,
+                Some(source.as_bytes()),
+                Some(imported.intent().annotations()),
+            )
+            .unwrap_or_else(|error| panic!("{name} authenticated replay failed: {error}"));
+            assert_eq!(
+                replay.target(),
+                source.as_bytes(),
+                "{name} changed source bytes"
+            );
+            assert_eq!(
+                replay.intent().annotations(),
+                imported.intent().annotations(),
+                "{name} changed source annotations"
+            );
+        }
+    }
+
+    #[test]
+    fn unannotated_exact_source_adoption_remains_available_for_org() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_005));
+        let state = structural_layout_state(
+            "journals/2026_08_05.org",
+            vec![(80_151, None, "a", "headline".into(), None)],
+        );
+        let source = b"* headline\r\n";
+        let plan = plan_projection_with_layout_annotations(workspace, &state, Some(source), None)
+            .expect("unannotated exact Org source must remain adoptable");
+        assert_eq!(plan.target(), source);
     }
 
     #[test]
@@ -3231,6 +3496,24 @@ mod tests {
         );
     }
 
+    /// Inserting a root ABOVE an unbulleted heading keeps the heading's own
+    /// bytes; only the new root is added.
+    ///
+    /// This is a DELIBERATE divergence from OG's writer, which would re-bullet
+    /// the heading: `og@6e7afa8`
+    /// `src/main/frontend/modules/file/core.cljs` `transform-content` drops the
+    /// `-` only for `markdown-top-heading?` — `(and markdown? (= parent page
+    /// left) (number? heading))` — and `left` is the new root here, not the
+    /// page. Tine preserves the bytes instead, for two reasons:
+    ///
+    ///   * Real Logseq graphs already contain mid-file unbulleted headings that
+    ///     OG itself reads back correctly (a journal page in Martin's graph
+    ///     holds a bulleted `- # A` followed by unbulleted `# B` / `# C`, each
+    ///     owning tab-indented children). Re-bulleting on an unrelated edit
+    ///     would churn those files, and managed storage must accept every shape
+    ///     Direct Markdown accepts — not a subset of it.
+    ///   * The unbulleted form round-trips: the reparse below proves the
+    ///     projected bytes restore the exact sibling topology.
     #[test]
     fn collapsed_heading_projection_retains_parser_owned_sibling_topology() {
         let base = structural_layout_state(
@@ -3251,7 +3534,7 @@ mod tests {
         );
         let projection = reproject_with_source_identities(&base, source, &inserted_root);
         let projected = std::str::from_utf8(projection.target()).unwrap();
-        assert!(projected.starts_with("- new root\n- # Parent\n"));
+        assert!(projected.starts_with("- new root\n# Parent\n"));
         let reparsed = crate::doc::parse(projected);
         assert_eq!(reparsed.roots.len(), 3);
         assert_eq!(reparsed.roots[0].raw, "new root");

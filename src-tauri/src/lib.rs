@@ -12,6 +12,10 @@ mod git;
 mod graph;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
+/// Test-only: the enumeration of what every command can do under Tine-managed
+/// storage. Nothing in the shipped app reads it.
+#[cfg(test)]
+mod managed_command_surface;
 mod media_protocol;
 mod migrate_identifier;
 mod native_mouse_history;

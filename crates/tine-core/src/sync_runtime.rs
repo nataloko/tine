@@ -73,10 +73,10 @@ use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::local_active::{
-    activate_verified_local_with_retained_validation,
-    reopen_promoted_local_runtime_existing_projection, seal_local_runtime_promotion,
-    take_over_promoted_local_runtime_recovering_projection, InactiveBootstrapRuntimeSession,
-    LocalActiveAuthority, LocalActiveRuntime, PromotedLocalRuntime, PromotedRuntimeOpen,
+    activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
+    seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
+    InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
+    PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
     RuntimeRecoveryState,
 };
 #[cfg(test)]
@@ -139,8 +139,8 @@ use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
 };
 use crate::oplog::trusted_local_commit::{
-    TrustedLocalCommitCoordinator, TrustedLocalCommitOutcome, TrustedLocalCommitted,
-    TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
+    TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
+    TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
     TrustedLocalRestartProjectionOutcome,
 };
 use crate::oplog::watcher_queue::WatcherObservation;
@@ -1360,7 +1360,100 @@ pub enum SyncRuntimeOpenPhase {
     AssemblingActor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Content-free detail for a debug-enabled promoted-runtime recovery.  It is
+/// observational only: no field grants recovery, scan, or mutation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncRuntimeRecoveryDiagnostics {
+    pub recovery: &'static str,
+    pub retention_plan: &'static str,
+    pub retained_run_count: usize,
+    pub resume_candidate: &'static str,
+    pub detached_bootstrap_reconstruction: bool,
+    pub full_bootstrap_replay: bool,
+    pub manifest_count: usize,
+    pub manifest_enumeration: Duration,
+    pub resume_selection: Duration,
+    pub bootstrap_reconstruction: Option<Duration>,
+    pub engine_open: Duration,
+    pub sqlite_open: Duration,
+    pub tail_construction: Duration,
+    pub total: Duration,
+    pub projection_recovery: &'static str,
+    pub projection_reason: String,
+    pub projection_sidecar_shape: Duration,
+    pub projection_checkpoint_authentication: Duration,
+    pub projection_read_only_open: Duration,
+    pub projection_schema_and_claim: Duration,
+    pub projection_structural_validation: Duration,
+    pub projection_materialization_stamp: Duration,
+    pub projection_forensics_preservation: Duration,
+    pub projection_rebuild: Duration,
+    pub projection_applied_batches: usize,
+    pub projection_bulk_pages_materialized: usize,
+    pub projection_ancestry_full_scans: usize,
+    pub prepare_replay: Duration,
+    pub predecessor_restore: Duration,
+    pub bootstrap_part_replay: Duration,
+    pub archived_tail_replay: Duration,
+    pub finish_replay: Duration,
+    pub bootstrap_parts_replayed: usize,
+    pub archived_manifests_offered: usize,
+    pub archived_manifests_replayed: usize,
+    pub resume_adopted: bool,
+    pub resume_refused: bool,
+    pub replay_base_generation: u64,
+    pub live_history_generation: u64,
+    pub replayed_generations: u64,
+}
+
+fn map_promoted_runtime_recovery_diagnostics(
+    value: PromotedRuntimeRecoveryDiagnostics,
+) -> SyncRuntimeRecoveryDiagnostics {
+    SyncRuntimeRecoveryDiagnostics {
+        recovery: value.recovery,
+        retention_plan: value.retention_plan,
+        retained_run_count: value.retained_run_count,
+        resume_candidate: value.resume_candidate,
+        detached_bootstrap_reconstruction: value.detached_bootstrap_reconstruction,
+        full_bootstrap_replay: value.full_bootstrap_replay,
+        manifest_count: value.manifest_count,
+        manifest_enumeration: value.manifest_enumeration,
+        resume_selection: value.resume_selection,
+        bootstrap_reconstruction: value.bootstrap_reconstruction,
+        engine_open: value.engine_open,
+        sqlite_open: value.sqlite_open,
+        tail_construction: value.tail_construction,
+        total: value.total,
+        projection_recovery: value.projection.recovery,
+        projection_reason: value.projection.reason.clone(),
+        projection_sidecar_shape: value.projection.sidecar_shape,
+        projection_checkpoint_authentication: value.projection.checkpoint_authentication,
+        projection_read_only_open: value.projection.read_only_open,
+        projection_schema_and_claim: value.projection.schema_and_claim,
+        projection_structural_validation: value.projection.structural_validation,
+        projection_materialization_stamp: value.projection.materialization_stamp,
+        projection_forensics_preservation: value.projection.forensics_preservation,
+        projection_rebuild: value.projection.rebuild,
+        projection_applied_batches: value.projection.applied_batches,
+        projection_bulk_pages_materialized: value.projection.bulk_pages_materialized,
+        projection_ancestry_full_scans: value.projection.ancestry_full_scans,
+        prepare_replay: value.engine_stages.prepare_replay,
+        predecessor_restore: value.engine_stages.predecessor_restore,
+        bootstrap_part_replay: value.engine_stages.bootstrap_part_replay,
+        archived_tail_replay: value.engine_stages.archived_tail_replay,
+        finish_replay: value.engine_stages.finish_replay,
+        bootstrap_parts_replayed: value.engine_stages.bootstrap_parts_replayed,
+        archived_manifests_offered: value.engine_stages.archived_manifests_offered,
+        archived_manifests_replayed: value.engine_stages.archived_manifests_replayed,
+        resume_adopted: value.resume_adopted,
+        resume_refused: value.resume_refused,
+        replay_base_generation: value.replay_base_generation,
+        live_history_generation: value.live_history_generation,
+        replayed_generations: value.replayed_generations,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeOpenProgress {
     Phase {
         phase: SyncRuntimeOpenPhase,
@@ -1369,6 +1462,9 @@ pub enum SyncRuntimeOpenProgress {
     Waiting {
         phase: SyncRuntimeOpenPhase,
         elapsed: Duration,
+    },
+    RecoveryDiagnostics {
+        diagnostics: SyncRuntimeRecoveryDiagnostics,
     },
 }
 
@@ -1404,6 +1500,24 @@ pub enum SyncRuntimeTick {
     AdmittedNoop { epoch: u64 },
     AdmittedComplete { epoch: u64 },
     Terminal(String),
+}
+
+impl SyncRuntimeTick {
+    /// Did this tick commit anything a reader could observe?
+    ///
+    /// Only `AdmittedComplete` did: it is the variant produced when the drain
+    /// took a completed batch, while `AdmittedNoop` is the same step with no
+    /// batch to take. Both were previously treated as "the graph changed", so
+    /// every quiet admission woke the frontend with a contentless signal, and a
+    /// wake-up arriving while a page was dirty was read as a conflict against
+    /// nothing.
+    ///
+    /// This is a claim about content, not about progress: a noop tick is still
+    /// real progress for the queue epoch and still updates status.
+    #[must_use]
+    pub const fn committed_observable_change(&self) -> bool {
+        matches!(self, Self::AdmittedComplete { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1793,12 +1907,102 @@ pub enum SyncApplicationPageInvalidRequest {
     MalformedPage,
 }
 
+/// Stable, bounded diagnostics for refusals in the actor-owned managed-save
+/// transaction. These codes deliberately describe only the failed stage: they
+/// must never carry graph paths, page contents, identities, or nested errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncEditorRefusalCode {
+    TrustedLocalMissingBaseRevision,
+    TrustedLocalPreparationBindings,
+    TrustedLocalPreparationPlanning,
+    TrustedLocalPreparationDraft,
+    TrustedLocalPreparationCapture,
+    TrustedLocalPreparationFinalize,
+    TrustedLocalPreparationTailReservation,
+    TrustedLocalPreparationPublication,
+    TrustedLocalPreparationArchiveStage,
+    TrustedLocalPreparationTailAdmission,
+    TrustedLocalPreparationSqliteDrain,
+    TrustedLocalPreparationProjectionDrain,
+    TrustedLocalEngineAuthority,
+    TrustedLocalCommitInvalidPreparedInput,
+    TrustedLocalCommitManagedRecord,
+    TrustedLocalCommitPrecommitGraph,
+    FallbackReadmission,
+    PostCommitCurrentPageLookup,
+    TrustedOutcomeDeclined,
+    ManagedSequenceOverflow,
+    ManagedQueueMonotonicity,
+    ManagedRecordDecode,
+}
+
+impl SyncEditorRefusalCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedLocalMissingBaseRevision => "trusted_local.missing_base_revision",
+            Self::TrustedLocalPreparationBindings => "trusted_local.preparation.bindings",
+            Self::TrustedLocalPreparationPlanning => "trusted_local.preparation.planning",
+            Self::TrustedLocalPreparationDraft => "trusted_local.preparation.draft",
+            Self::TrustedLocalPreparationCapture => "trusted_local.preparation.capture",
+            Self::TrustedLocalPreparationFinalize => "trusted_local.preparation.finalize",
+            Self::TrustedLocalPreparationTailReservation => {
+                "trusted_local.preparation.tail_reservation"
+            }
+            Self::TrustedLocalPreparationPublication => "trusted_local.preparation.publication",
+            Self::TrustedLocalPreparationArchiveStage => "trusted_local.preparation.archive_stage",
+            Self::TrustedLocalPreparationTailAdmission => {
+                "trusted_local.preparation.tail_admission"
+            }
+            Self::TrustedLocalPreparationSqliteDrain => "trusted_local.preparation.sqlite_drain",
+            Self::TrustedLocalPreparationProjectionDrain => {
+                "trusted_local.preparation.projection_drain"
+            }
+            Self::TrustedLocalEngineAuthority => "trusted_local.engine_authority",
+            Self::TrustedLocalCommitInvalidPreparedInput => {
+                "trusted_local.commit.invalid_prepared_input"
+            }
+            Self::TrustedLocalCommitManagedRecord => "trusted_local.commit.managed_record",
+            Self::TrustedLocalCommitPrecommitGraph => "trusted_local.commit.precommit_graph",
+            Self::FallbackReadmission => "fallback.readmission",
+            Self::PostCommitCurrentPageLookup => "post_commit.current_page_lookup",
+            Self::TrustedOutcomeDeclined => "trusted_outcome.declined",
+            Self::ManagedSequenceOverflow => "managed_queue.sequence_overflow",
+            Self::ManagedQueueMonotonicity => "managed_queue.monotonicity",
+            Self::ManagedRecordDecode => "managed_record.decode",
+        }
+    }
+}
+
+impl fmt::Display for SyncEditorRefusalCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
     ActorRefusedAt(&'static str),
+    ActorRefusedWithCode(SyncEditorRefusalCode),
+    ActorRefusedAtWithCode {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+    },
+    ActorRefusedWithDebugDetail {
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
+    /// A diagnostic-only carrier for a bounded public refusal.  The detail is
+    /// constructed only when TINE_DEBUG/--debug is active and is never used by
+    /// `Display`, so application toasts retain their stable, non-sensitive
+    /// reason-code contract.
+    ActorRefusedAtWithDebugDetail {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
     ActorUnavailable,
 }
 
@@ -1817,12 +2021,40 @@ impl fmt::Display for SyncApplicationPageRequestError {
             Self::ActorRefusedAt(stage) => {
                 write!(formatter, "sync actor refused application page intent at {stage}")
             }
+            Self::ActorRefusedWithCode(code) => write!(
+                formatter,
+                "sync actor refused application page intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithCode { stage, code } => write!(
+                formatter,
+                "sync actor refused application page intent at {stage} (reason code: {code})"
+            ),
+            Self::ActorRefusedWithDebugDetail { code, .. } => write!(
+                formatter,
+                "sync actor refused application page intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithDebugDetail { stage, code, .. } => write!(
+                formatter,
+                "sync actor refused application page intent at {stage} (reason code: {code})"
+            ),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
 }
 
 impl std::error::Error for SyncApplicationPageRequestError {}
+
+impl SyncApplicationPageRequestError {
+    /// Exact inner failure text for a locally enabled diagnostic trace.  This
+    /// must never be shown through the normal application-error display path.
+    pub fn debug_detail(&self) -> Option<&str> {
+        match self {
+            Self::ActorRefusedWithDebugDetail { debug_detail, .. }
+            | Self::ActorRefusedAtWithDebugDetail { debug_detail, .. } => Some(debug_detail),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncEditorRequestSize {
@@ -1843,12 +2075,28 @@ pub enum SyncEditorInvalidRequest {
     InvalidName,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncEditorRequestError {
     InvalidRequest(SyncEditorInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
     ActorRefusedAt(&'static str),
+    ActorRefusedWithCode(SyncEditorRefusalCode),
+    ActorRefusedAtWithCode {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+    },
+    /// See the application-level equivalent.  This is a transport-only
+    /// diagnostic carrier; normal `Display` deliberately omits the detail.
+    ActorRefusedWithDebugDetail {
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
+    ActorRefusedAtWithDebugDetail {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
     ActorUnavailable,
 }
 
@@ -1865,6 +2113,22 @@ impl fmt::Display for SyncEditorRequestError {
             Self::ActorRefusedAt(stage) => {
                 write!(formatter, "sync actor refused editor intent at {stage}")
             }
+            Self::ActorRefusedWithCode(code) => write!(
+                formatter,
+                "sync actor refused editor intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithCode { stage, code } => write!(
+                formatter,
+                "sync actor refused editor intent at {stage} (reason code: {code})"
+            ),
+            Self::ActorRefusedWithDebugDetail { code, .. } => write!(
+                formatter,
+                "sync actor refused editor intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithDebugDetail { stage, code, .. } => write!(
+                formatter,
+                "sync actor refused editor intent at {stage} (reason code: {code})"
+            ),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -2327,6 +2591,9 @@ impl SyncRuntimeHandle {
                         elapsed: open_started.elapsed(),
                     });
                 }
+                Ok(ActorStartupEvent::RecoveryDiagnostics(diagnostics)) => {
+                    progress(SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics });
+                }
                 Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
                     *status.write().unwrap() = snapshot;
                     #[cfg(test)]
@@ -2468,6 +2735,13 @@ impl SyncRuntimeHandle {
                 drop(sender);
                 let _ = join.join();
                 refused("same-process sync actor reported an unexpected cold-open phase".into())
+            }
+            Ok(ActorStartupEvent::RecoveryDiagnostics(_)) => {
+                drop(sender);
+                let _ = join.join();
+                refused(
+                    "same-process sync actor reported an unexpected cold-open diagnostic".into(),
+                )
             }
             Err(_) => {
                 drop(sender);
@@ -5286,6 +5560,7 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
 
 enum ActorStartupEvent {
     Phase(SyncRuntimeOpenPhase),
+    RecoveryDiagnostics(SyncRuntimeRecoveryDiagnostics),
     Finished(Result<SyncRuntimeStatusSnapshot, String>),
 }
 
@@ -5379,7 +5654,7 @@ fn actor_thread(
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
     let phases = started.clone();
-    let actor = match RuntimeActor::open(request, advisory, session_id, |phase| {
+    let mut actor = match RuntimeActor::open(request, advisory, session_id, |phase| {
         let _ = phases.send(ActorStartupEvent::Phase(phase));
     }) {
         Ok(actor) => actor,
@@ -5388,6 +5663,9 @@ fn actor_thread(
             return;
         }
     };
+    if let Some(diagnostics) = actor.take_startup_recovery_diagnostics() {
+        let _ = started.send(ActorStartupEvent::RecoveryDiagnostics(diagnostics));
+    }
     run_actor_loop(actor, receiver, started, shared_status);
 }
 
@@ -5738,14 +6016,17 @@ fn prepare_trusted_local_runtime_commit(
     journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
     target_page: &PageDto,
     transaction: &OperationTransaction,
-) -> Result<TrustedLocalRuntimeAttempt, String> {
-    let base_revision = target_page
-        .rev
-        .as_deref()
-        .ok_or_else(|| "existing managed page has no exact graph revision".to_owned())?;
+) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
+    let base_revision =
+        target_page
+            .rev
+            .as_deref()
+            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
+            ))?;
     let prepared =
         OperationalCoordinator::prepare_trusted_local(session, graph, receipts, transaction)
-            .map_err(|error| format!("trusted-local preparation failed before append: {error}"))?;
+            .map_err(trusted_local_preparation_refusal)?;
     let prepared = match prepared {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
@@ -5754,9 +6035,11 @@ fn prepare_trusted_local_runtime_commit(
             ));
         }
     };
-    let engine = session
-        .engine()
-        .map_err(|error| format!("trusted-local engine authority was refused: {error}"))?;
+    let engine = session.engine().map_err(|_| {
+        SyncEditorRequestError::ActorRefusedWithCode(
+            SyncEditorRefusalCode::TrustedLocalEngineAuthority,
+        )
+    })?;
     let outcome = TrustedLocalCommitCoordinator::commit(
         graph,
         journal,
@@ -5765,7 +6048,7 @@ fn prepare_trusted_local_runtime_commit(
         base_revision,
         prepared,
     )
-    .map_err(|error| format!("trusted-local commit failed before append: {error}"))?;
+    .map_err(trusted_local_commit_refusal)?;
     Ok(match outcome {
         TrustedLocalCommitOutcome::Declined { .. } => TrustedLocalRuntimeAttempt::Declined,
         committed => TrustedLocalRuntimeAttempt::Committed(committed),
@@ -6088,6 +6371,7 @@ struct RuntimeActor {
     local_mutation: Option<PendingLocalMutation>,
     managed_local: Option<ManagedLocalRuntimeState>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
+    startup_recovery_diagnostics: Option<SyncRuntimeRecoveryDiagnostics>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -6693,7 +6977,13 @@ impl RuntimeActor {
         #[cfg(test)]
         let phase_started = Instant::now();
         let (authority, runtime) = match advisory.handoff {
-            EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime_existing_projection(
+            // Both handoffs may rebuild the disposable projection. It is a
+            // frontier-stamped cache of an authoritative oplog, so its loss is
+            // recoverable by definition -- and refusing it here made the
+            // *cleanly* shut down graph the unrecoverable one while a crashed
+            // one repaired itself. A present, current projection still opens
+            // as-is; only the previously fatal states change.
+            EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime(
                 &enrollment_root,
                 &advisory.binding,
                 session_id,
@@ -6816,6 +7106,9 @@ impl RuntimeActor {
         #[cfg(test)]
         let workspace_id = binding.workspace_id();
         let recovery = map_recovery(runtime.recovery());
+        let startup_recovery_diagnostics = runtime
+            .recovery_diagnostics()
+            .map(map_promoted_runtime_recovery_diagnostics);
         let managed_local = open_managed_local_runtime(
             &request.application_runtime_root,
             &binding,
@@ -6907,6 +7200,7 @@ impl RuntimeActor {
             local_mutation: None,
             managed_local: Some(managed_local),
             prepared_application_reply: None,
+            startup_recovery_diagnostics,
             recovery,
             last_watcher,
             last_tick: None,
@@ -6986,6 +7280,10 @@ impl RuntimeActor {
             },
         );
         Ok(actor)
+    }
+
+    fn take_startup_recovery_diagnostics(&mut self) -> Option<SyncRuntimeRecoveryDiagnostics> {
+        self.startup_recovery_diagnostics.take()
     }
 
     fn observe(
@@ -8551,12 +8849,7 @@ impl RuntimeActor {
                         &mut managed.journal,
                         target_page,
                         &transaction,
-                    )
-                    .map_err(|_error| {
-                        #[cfg(test)]
-                        eprintln!("trusted-local runtime preparation refused: {_error}");
-                        SyncEditorRequestError::ActorRefused
-                    })?
+                    )?
                 }
                 None => TrustedLocalRuntimeAttempt::Declined,
             };
@@ -8645,7 +8938,11 @@ impl RuntimeActor {
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
                     let mut session = runtime
                         .admit_promoted_mutation(authority, &self.graph)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedWithCode(
+                                SyncEditorRefusalCode::FallbackReadmission,
+                            )
+                        })?;
                     OperationalCoordinator::execute_local(
                         &mut session,
                         &self.graph,
@@ -8688,8 +8985,16 @@ impl RuntimeActor {
                     .runtime
                     .as_ref()
                     .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                let current = load_current_editor_page(runtime, page_id)?
-                    .ok_or(SyncEditorRequestError::ActorRefused)?;
+                let current = load_current_editor_page(runtime, page_id)
+                    .map_err(|error| {
+                        editor_refusal_with_code(
+                            error,
+                            SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                        )
+                    })?
+                    .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                        SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                    ))?;
                 Ok(SyncEditorSaveOutcome::Durable {
                     batch_id: completion.batch_id().to_string(),
                     page: current.dto,
@@ -8806,28 +9111,23 @@ impl RuntimeActor {
                 recovery.prepared_record().journal_payload().to_vec(),
             ),
             TrustedLocalCommitOutcome::Declined { .. } => {
-                return Err(SyncEditorRequestError::ActorRefused)
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                ))
             }
         };
         let managed = self
             .managed_local
             .as_mut()
             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-        let expected_next = sequence
-            .checked_add(1)
-            .ok_or(SyncEditorRequestError::ActorRefused)?;
-        if managed.journal.next_sequence() != expected_next
-            || managed
-                .frames
-                .back()
-                .is_some_and(|frame| frame.sequence() >= sequence)
-        {
-            return Err(SyncEditorRequestError::ActorRefused);
-        }
+        validate_managed_editor_queue_admission(
+            managed.journal.next_sequence(),
+            sequence,
+            managed.frames.back().map(LocalJournalFrame::sequence),
+        )?;
         let queued_frame =
             LocalJournalFrame::new(managed.journal.device_id(), sequence, payload_kind, payload);
-        let queued_record = decode_managed_local_record(&queued_frame)
-            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        let queued_record = decode_managed_editor_record(&queued_frame)?;
         managed.latest_projection_frames.insert(
             queued_record
                 .projection()
@@ -8894,7 +9194,9 @@ impl RuntimeActor {
                     }
                 }
                 TrustedLocalCommitOutcome::Declined { .. } => {
-                    return Err(SyncEditorRequestError::ActorRefused)
+                    return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                        SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                    ))
                 }
             };
         }
@@ -8910,7 +9212,9 @@ impl RuntimeActor {
                 PendingManagedLocalCommit::Response(committed)
             }
             TrustedLocalCommitOutcome::Declined { .. } => {
-                return Err(SyncEditorRequestError::ActorRefused)
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                ))
             }
         };
         self.managed_local
@@ -13510,6 +13814,24 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
         SyncEditorRequestError::ActorRefusedAt(stage) => {
             SyncApplicationPageRequestError::ActorRefusedAt(stage)
         }
+        SyncEditorRequestError::ActorRefusedWithCode(code) => {
+            SyncApplicationPageRequestError::ActorRefusedWithCode(code)
+        }
+        SyncEditorRequestError::ActorRefusedAtWithCode { stage, code } => {
+            SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code }
+        }
+        SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        } => SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        },
+        SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
+            SyncApplicationPageRequestError::ActorRefusedWithDebugDetail { code, debug_detail }
+        }
         SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
             SyncApplicationPageRequestError::ActorRefused
         }
@@ -13519,8 +13841,117 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
 fn editor_refusal_at(error: SyncEditorRequestError, stage: &'static str) -> SyncEditorRequestError {
     match error {
         SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),
+        SyncEditorRequestError::ActorRefusedWithCode(code) => {
+            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+        }
+        SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
+            SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+                stage,
+                code,
+                debug_detail,
+            }
+        }
         other => other,
     }
+}
+
+fn editor_refusal_with_code(
+    error: SyncEditorRequestError,
+    code: SyncEditorRefusalCode,
+) -> SyncEditorRequestError {
+    match error {
+        SyncEditorRequestError::ActorRefused | SyncEditorRequestError::ActorRefusedAt(_) => {
+            SyncEditorRequestError::ActorRefusedWithCode(code)
+        }
+        other => other,
+    }
+}
+
+fn trusted_local_preparation_refusal(
+    error: crate::oplog::operational_coordinator::OperationalCoordinatorError,
+) -> SyncEditorRequestError {
+    let code = trusted_local_preparation_refusal_code(error.phase());
+    if runtime_debug_diagnostics_enabled() {
+        SyncEditorRequestError::ActorRefusedWithDebugDetail {
+            code,
+            debug_detail: error.to_string(),
+        }
+    } else {
+        SyncEditorRequestError::ActorRefusedWithCode(code)
+    }
+}
+
+fn trusted_local_preparation_refusal_code(phase: OperationalPhase) -> SyncEditorRefusalCode {
+    match phase {
+        OperationalPhase::Bindings => SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+        OperationalPhase::Planning => SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+        OperationalPhase::Draft => SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+        OperationalPhase::Capture => SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+        OperationalPhase::Finalize => SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+        OperationalPhase::TailReservation => {
+            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation
+        }
+        OperationalPhase::Publication => SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+        OperationalPhase::ArchiveStage => {
+            SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage
+        }
+        OperationalPhase::TailAdmission => {
+            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission
+        }
+        OperationalPhase::SqliteDrain => SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+        OperationalPhase::ProjectionDrain => {
+            SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain
+        }
+    }
+}
+
+fn runtime_debug_diagnostics_enabled() -> bool {
+    matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
+        || std::env::args().any(|argument| argument == "--debug")
+}
+
+fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorRequestError {
+    let code = match error {
+        TrustedLocalCommitError::InvalidPreparedInput(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput
+        }
+        TrustedLocalCommitError::ManagedRecord(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitManagedRecord
+        }
+        TrustedLocalCommitError::PrecommitGraph(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
+        }
+    };
+    SyncEditorRequestError::ActorRefusedWithCode(code)
+}
+
+fn decode_managed_editor_record(
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+) -> Result<crate::oplog::ManagedLocalRecord, SyncEditorRequestError> {
+    decode_managed_local_record(frame).map_err(|_| {
+        SyncEditorRequestError::ActorRefusedWithCode(SyncEditorRefusalCode::ManagedRecordDecode)
+    })
+}
+
+fn validate_managed_editor_queue_admission(
+    journal_next_sequence: u64,
+    committed_sequence: u64,
+    queued_last_sequence: Option<u64>,
+) -> Result<(), SyncEditorRequestError> {
+    let expected_next =
+        committed_sequence
+            .checked_add(1)
+            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedSequenceOverflow,
+            ))?;
+    if journal_next_sequence != expected_next
+        || queued_last_sequence.is_some_and(|sequence| sequence >= committed_sequence)
+    {
+        return Err(SyncEditorRequestError::ActorRefusedWithCode(
+            SyncEditorRefusalCode::ManagedQueueMonotonicity,
+        ));
+    }
+    Ok(())
 }
 
 fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {
@@ -15131,6 +15562,297 @@ mod tests {
     }
 
     #[test]
+    fn managed_save_refusal_codes_are_bounded_and_render_through_application_error() {
+        const STAGE: &str = "committing the semantic page transaction";
+        let codes = [
+            SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
+            SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+            SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+            SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+            SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+            SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
+            SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+            SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
+            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
+            SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+            SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
+            SyncEditorRefusalCode::TrustedLocalEngineAuthority,
+            SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput,
+            SyncEditorRefusalCode::TrustedLocalCommitManagedRecord,
+            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+            SyncEditorRefusalCode::FallbackReadmission,
+            SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+            SyncEditorRefusalCode::TrustedOutcomeDeclined,
+            SyncEditorRefusalCode::ManagedSequenceOverflow,
+            SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            SyncEditorRefusalCode::ManagedRecordDecode,
+        ];
+        let mut unique = BTreeSet::new();
+        for code in codes {
+            assert!(unique.insert(code.as_str()), "refusal codes must be unique");
+            assert!(
+                code.as_str().bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_')
+                }),
+                "refusal codes must remain bounded identifiers: {code}"
+            );
+            assert!(code.as_str().len() <= 48);
+
+            let staged =
+                editor_refusal_at(SyncEditorRequestError::ActorRefusedWithCode(code), STAGE);
+            assert_eq!(
+                staged,
+                SyncEditorRequestError::ActorRefusedAtWithCode { stage: STAGE, code }
+            );
+            let application = map_editor_application_error(staged);
+            assert_eq!(
+                application,
+                SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage: STAGE, code }
+            );
+            assert_eq!(
+                application.to_string(),
+                format!(
+                    "sync actor refused application page intent at {STAGE} (reason code: {code})"
+                )
+            );
+        }
+
+        assert_eq!(
+            SyncApplicationPageRequestError::ActorRefusedAt(STAGE).to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction",
+            "uncoded refusal rendering remains unchanged"
+        );
+    }
+
+    #[test]
+    fn managed_save_queue_refusals_distinguish_overflow_from_monotonicity() {
+        assert_eq!(
+            validate_managed_editor_queue_admission(u64::MAX, u64::MAX, None),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedSequenceOverflow,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 8, None),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 7, Some(7)),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 7, Some(6)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn trusted_local_preparation_and_commit_substages_map_without_nested_detail() {
+        let preparation = [
+            (
+                OperationalPhase::Bindings,
+                SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+            ),
+            (
+                OperationalPhase::Planning,
+                SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+            ),
+            (
+                OperationalPhase::Draft,
+                SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+            ),
+            (
+                OperationalPhase::Capture,
+                SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+            ),
+            (
+                OperationalPhase::Finalize,
+                SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            ),
+            (
+                OperationalPhase::TailReservation,
+                SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
+            ),
+            (
+                OperationalPhase::Publication,
+                SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+            ),
+            (
+                OperationalPhase::ArchiveStage,
+                SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
+            ),
+            (
+                OperationalPhase::TailAdmission,
+                SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
+            ),
+            (
+                OperationalPhase::SqliteDrain,
+                SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+            ),
+            (
+                OperationalPhase::ProjectionDrain,
+                SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
+            ),
+        ];
+        for (phase, code) in preparation {
+            assert_eq!(trusted_local_preparation_refusal_code(phase), code);
+        }
+
+        let nested = "private/page.md user-id page text";
+        let commit_errors = [
+            (
+                TrustedLocalCommitError::InvalidPreparedInput(nested.into()),
+                SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput,
+            ),
+            (
+                TrustedLocalCommitError::ManagedRecord(
+                    crate::oplog::ManagedLocalRecordError::CorruptPayload(nested.into()),
+                ),
+                SyncEditorRefusalCode::TrustedLocalCommitManagedRecord,
+            ),
+            (
+                TrustedLocalCommitError::PrecommitGraph(std::io::Error::other(nested)),
+                SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+            ),
+        ];
+        for (error, code) in commit_errors {
+            let mapped = trusted_local_commit_refusal(error);
+            assert_eq!(mapped, SyncEditorRequestError::ActorRefusedWithCode(code));
+            assert!(!mapped.to_string().contains(nested));
+        }
+    }
+
+    #[test]
+    fn managed_save_debug_detail_preserves_the_bounded_public_refusal_contract() {
+        const STAGE: &str = "committing the semantic page transaction";
+        let nested = "Finalize: private/path.md and opaque user content";
+        let editor = editor_refusal_at(
+            SyncEditorRequestError::ActorRefusedWithDebugDetail {
+                code: SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+                debug_detail: nested.into(),
+            },
+            STAGE,
+        );
+        assert_eq!(
+            editor.to_string(),
+            "sync actor refused editor intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!editor.to_string().contains(nested));
+
+        let application = map_editor_application_error(editor);
+        assert_eq!(
+            application.to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!application.to_string().contains(nested));
+        assert_eq!(application.debug_detail(), Some(nested));
+    }
+
+    #[test]
+    fn managed_save_record_decode_has_an_exact_code() {
+        let invalid = LocalJournalFrame::new(
+            Uuid::new_v4(),
+            0,
+            ManagedLocalJournalPayloadKind::RecordV1,
+            vec![0xff],
+        );
+        assert!(matches!(
+            decode_managed_editor_record(&invalid),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedRecordDecode
+            ))
+        ));
+    }
+
+    #[test]
+    fn managed_save_conflict_and_deferred_wire_classifications_are_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&SyncApplicationPageSaveOutcome::Conflict {
+                reason: SyncApplicationPageConflict::StaleBase,
+            })
+            .unwrap(),
+            r#"{"status":"conflict","reason":"stale_base"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableExternalWork,
+            })
+            .unwrap(),
+            r#"{"status":"deferred","state":{"status":"retryable_external_work"}}"#
+        );
+    }
+
+    #[test]
+    fn managed_save_refusal_origins_are_closed_over_the_permitted_slice() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+        let prepare = production
+            .split_once("fn prepare_trusted_local_runtime_commit(")
+            .and_then(|(_, tail)| tail.split_once("\nenum EditorTurnReadiness"))
+            .map(|(body, _)| body)
+            .expect("trusted-local preparation has a narrow source boundary");
+        for code in [
+            "TrustedLocalMissingBaseRevision",
+            "trusted_local_preparation_refusal",
+            "TrustedLocalEngineAuthority",
+            "trusted_local_commit_refusal",
+        ] {
+            assert!(
+                prepare.contains(code),
+                "preparation omits refusal code {code}"
+            );
+        }
+
+        let execute = production
+            .split_once("    fn execute_editor_transaction(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_trusted_local_editor_outcome("))
+            .map(|(body, _)| body)
+            .expect("editor transaction has a narrow source boundary");
+        for code in ["FallbackReadmission", "PostCommitCurrentPageLookup"] {
+            assert!(
+                execute.contains(code),
+                "transaction omits refusal code {code}"
+            );
+        }
+
+        let finish = production
+            .split_once("    fn finish_trusted_local_editor_outcome(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn retry_managed_local_overlay("))
+            .map(|(body, _)| body)
+            .expect("trusted-local finish has a narrow source boundary");
+        for origin in [
+            "TrustedOutcomeDeclined",
+            "validate_managed_editor_queue_admission",
+            "decode_managed_editor_record",
+            "application_from_trusted_local_commit",
+        ] {
+            assert!(
+                finish.contains(origin),
+                "finish omits refusal origin {origin}"
+            );
+        }
+
+        let response = production
+            .split_once("    fn application_from_trusted_local_commit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn tick_managed_local_derivative("))
+            .map(|(body, _)| body)
+            .expect("trusted-local response construction has a narrow source boundary");
+        assert!(response.contains("SyncEditorRequestError::ActorRefused"));
+        assert!(!response.contains("ActorRefusedWithCode"));
+        assert!(!response.contains("SyncEditorRefusalCode"));
+    }
+
+    #[test]
     fn legacy_and_absent_discovery_start_no_actor_and_create_nothing() {
         let (legacy_root, legacy_request) = empty_request(SyncStorageProfile::LegacyDefault);
         let legacy = SyncRuntimeHandle::open(legacy_request);
@@ -16526,6 +17248,231 @@ mod tests {
         ));
     }
 
+    /// Historical path spellings are each one isolated existing-page shape,
+    /// rather than a collision fixture. Every shape must remain the exact
+    /// projection owner across an unsafe takeover and a subsequent Safe reopen.
+    #[test]
+    fn managed_path_shapes_survive_activation_crash_and_safe_reopen() {
+        const CASES: [(&str, &str, &str, &[u8], &[u8], &[u8]); 5] = [
+            (
+                "encoded-colon",
+                "notes/2026-07-23_18%3A01%3A20.md",
+                "2026-07-23_18:01:20",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "raw-percent",
+                "notes/Literal 100% complete.md",
+                "Literal 100% complete",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "encoded-percent",
+                "notes/Literal 100%25 complete.md",
+                "Literal 100% complete",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "legacy-dot",
+                "notes/Release 1.0.md",
+                "Release 1.0",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "explicit-title-path-mismatch",
+                "notes/physical-mismatch.md",
+                "Explicit title survives physical mismatch",
+                b"title:: Explicit title survives physical mismatch\n\n- initial path shape\n",
+                b"title:: Explicit title survives physical mismatch\n\n- warm projected state\n",
+                b"title:: Explicit title survives physical mismatch\n\n- second durable state\n",
+            ),
+        ];
+
+        for (case_index, (label, path, name, initial, warm, second)) in
+            CASES.into_iter().enumerate()
+        {
+            // Do not co-locate legacy and encoded spellings: this regression
+            // covers the accepted exact owner for one historical shape at a
+            // time, not portable-collision policy.
+            let fixture = ActivationFixture::empty(
+                &format!("managed-path-shape-{label}"),
+                0xa160 + case_index as u128 * 0x10,
+            );
+            fs::write(fixture.graph_root.join(path), initial).unwrap();
+            let expected_user_paths = vec!["logseq/config.edn".to_owned(), (*path).to_owned()];
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: setup must contain only the exact historical source path"
+            );
+
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(
+                activated.status,
+                SyncLocalActivationStatus::Active,
+                "{label}"
+            );
+            let handle = activated
+                .handle
+                .expect("path-shape activation retains an actor");
+            drive_initial_feed(&handle);
+
+            let (page, revision) = load_application_exact(&handle, path);
+            assert_eq!(
+                page.path, path,
+                "{label}: activation changed exact path identity"
+            );
+            assert_eq!(page.name, name, "{label}: activation changed logical title");
+            let (warm_page, warm_revision) =
+                save_application_block_text(&handle, page, revision, "warm projected state");
+            assert_eq!(
+                warm_page.path, path,
+                "{label}: warm save changed exact path"
+            );
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                warm,
+                "{label}: warm save did not project the expected exact bytes"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: warm save created an alternate document path"
+            );
+            assert_eq!(handle.status().unwrap().managed_local_pending, 1, "{label}");
+
+            // Intentionally omit both derivative draining and Safe shutdown:
+            // this is the actor-accepted local frame whose exact owner must
+            // survive the crash-style takeover.
+            drop(handle);
+            let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+            drive_initial_feed(&reopened);
+            assert_eq!(
+                reopened.status().unwrap().recovery,
+                Some(SyncRuntimeRecovery::TookOverCrashedUnsafe),
+                "{label}: pending exact-owner recovery was not an unsafe takeover"
+            );
+            let (recovered, recovered_revision) = load_application_exact(&reopened, path);
+            assert_eq!(
+                recovered.path, path,
+                "{label}: unsafe reopen changed exact path"
+            );
+            assert_eq!(
+                recovered.name, name,
+                "{label}: unsafe reopen changed logical title"
+            );
+            assert_parser_dto_semantics(&warm_page, &recovered);
+            assert_eq!(warm_revision, recovered_revision);
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                warm,
+                "{label}"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: unsafe reopen created an alternate document path"
+            );
+
+            let (second_page, second_revision) = save_application_block_text(
+                &reopened,
+                recovered,
+                recovered_revision,
+                "second durable state",
+            );
+            assert_eq!(
+                second_page.path, path,
+                "{label}: second save changed exact path"
+            );
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                second,
+                "{label}: second save did not project the expected exact bytes"
+            );
+            drain_managed_local(&reopened);
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+
+            let safely_reopened =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+            drive_initial_feed(&safely_reopened);
+            let (safe_page, safe_revision) = load_application_exact(&safely_reopened, path);
+            assert_eq!(
+                safe_page.path, path,
+                "{label}: Safe reopen changed exact path"
+            );
+            assert_eq!(
+                safe_page.name, name,
+                "{label}: Safe reopen changed logical title"
+            );
+            assert_parser_dto_semantics(&second_page, &safe_page);
+            assert_eq!(second_revision, safe_revision);
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                second,
+                "{label}"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: Safe reopen created an alternate document path"
+            );
+            assert!(matches!(
+                safely_reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
+    }
+
+    /// A raw `:` is a deliberate source-path portability incompatibility before
+    /// any activation state is created. Keep that fact explicit instead of
+    /// mixing it with the supported historical-path recovery regression above.
+    #[test]
+    fn raw_colon_path_is_classified_incompatible_before_activation() {
+        const RAW_COLON_PATH: &str = "notes/2026-07-23_18:01:20.md";
+        let fixture = ActivationFixture::empty("managed-path-raw-colon-incompatible", 0xa1b0);
+        fs::write(
+            fixture.graph_root.join(RAW_COLON_PATH),
+            b"- externally named\n",
+        )
+        .unwrap();
+        let bytes_before = user_graph_bytes(&fixture.graph_root);
+
+        let activation = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        eprintln!(
+            "managed_raw_colon_preactivation status={:?} graph_bytes={bytes_before:?}",
+            activation.status
+        );
+        assert!(matches!(
+            activation.status,
+            SyncLocalActivationStatus::Retryable {
+                durable_stage: SyncLocalActivationStage::Absent,
+                ref detail,
+            } if detail.contains("source path is not portable")
+                && detail.contains(RAW_COLON_PATH)
+        ));
+        assert!(activation.handle.is_none());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), bytes_before);
+    }
+
     #[test]
     fn managed_application_task_toggle_is_direct_and_durable() {
         let fixture = ActivationFixture::nested_unicode("application-task-toggle", 0xa125);
@@ -17362,7 +18309,7 @@ mod tests {
             .sum::<u64>();
         let retained_bound = 2
             * (MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
-                + tine_storage::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
+                + tine_storage::formats::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
             + 64 * 1024;
         assert!(retained_bytes < retained_bound);
 
@@ -19609,6 +20556,99 @@ mod tests {
     }
 
     #[test]
+    fn fresh_activation_application_save_preserves_empty_markdown_bullet_layout() {
+        let fixture = ActivationFixture::empty("managed-empty-markdown-bullet-save", 0xd1a6);
+        fs::write(fixture.graph_root.join("Tine.md"), b"- \n")
+            .expect("fixture source page must be written before activation");
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("fresh activation must retain an actor");
+        drive_initial_feed(&handle);
+        let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        assert_eq!(page.blocks[0].raw, "");
+        page.blocks[0].raw = "saved after empty Markdown bullet".into();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .expect("an application save after an empty Markdown bullet must commit");
+        assert!(matches!(
+            outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            b"- saved after empty Markdown bullet\n"
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn fresh_activation_save_preserves_nonleading_atx_headings_across_restart() {
+        let fixture = ActivationFixture::empty("managed-nonleading-atx-heading-save", 0xd1a7);
+        fs::write(
+            fixture.graph_root.join("Tine.md"),
+            b"- editable root\n## first section\n### second section\n- trailing root\n",
+        )
+        .expect("fixture source page must be written before activation");
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("fresh activation must retain an actor");
+        drive_initial_feed(&handle);
+        let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        page.blocks[0].raw = "edited root".into();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .expect("an unrelated application edit must commit");
+        assert!(matches!(
+            outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        const EXPECTED: &[u8] =
+            b"- edited root\n## first section\n### second section\n- trailing root\n";
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            EXPECTED
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        drive_initial_feed(&reopened);
+        let (reloaded, _) = load_application_logical(&reopened, "Tine", SyncPageKind::Page);
+        assert_eq!(reloaded.blocks[0].raw, "edited root");
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            EXPECTED
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn public_queries_are_bounded_serialized_and_read_the_exact_materialized_frontier() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-public-query");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -20246,7 +21286,8 @@ mod tests {
                 .iter()
                 .filter_map(|update| match update {
                     SyncRuntimeOpenProgress::Phase { phase, .. } => Some(*phase),
-                    SyncRuntimeOpenProgress::Waiting { .. } => None,
+                    SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             vec![
@@ -20791,24 +21832,40 @@ mod tests {
     }
 
     #[test]
-    fn missing_existing_projection_is_refused_without_rebuild() {
+    fn missing_projection_is_rebuilt_rather_than_refused() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-existing-only");
         let mut request = fixture.request();
         request.database_path = fixture.graph_root().join("missing.sqlite");
         let opened = SyncRuntimeHandle::open(request.clone());
-        assert!(matches!(
+        assert_eq!(
             opened.status,
-            SyncRuntimeOpenStatus::OpenRefused { .. }
-        ));
-        assert!(opened.handle.is_none());
-        assert!(!request.database_path.exists());
+            SyncRuntimeOpenStatus::Active,
+            "a missing disposable projection is rebuildable from the oplog, so it must not refuse the open"
+        );
+        assert!(opened.handle.is_some());
+        assert!(
+            request.database_path.exists(),
+            "the rebuild must leave a projection where the request asked for one"
+        );
+        drop(opened.handle);
     }
 
     #[test]
-    fn interrupted_forensics_is_refused_without_moving_the_existing_projection() {
+    /// An interrupted forensic preservation is finished, not left half-done.
+    ///
+    /// This used to refuse the open outright, which left the user with an
+    /// unopenable graph *and* an incomplete evidence directory -- the worst of
+    /// both. The rebuild path already knows how to resume a cut-short
+    /// preservation; what must not happen is the evidence being discarded, so
+    /// that is what this asserts.
+    fn interrupted_forensics_is_resumed_and_completed_rather_than_refused() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-forensics-existing-only");
         let request = fixture.request();
         let database_bytes = fs::read(&request.database_path).unwrap();
+        assert!(
+            !database_bytes.is_empty(),
+            "the fixture must start with real projection bytes for their survival to mean anything"
+        );
         let file_name = request.database_path.file_name().unwrap().to_str().unwrap();
         let forensic = request
             .database_path
@@ -20818,14 +21875,21 @@ mod tests {
         fs::create_dir(&forensic).unwrap();
 
         let opened = SyncRuntimeHandle::open(request.clone());
-        assert!(matches!(
+        assert_eq!(
             opened.status,
-            SyncRuntimeOpenStatus::OpenRefused { .. }
-        ));
-        assert!(opened.handle.is_none());
-        assert_eq!(fs::read(&request.database_path).unwrap(), database_bytes);
-        assert!(!forensic.join("database").exists());
-        assert!(!forensic.join("EVIDENCE_COMPLETE").exists());
+            SyncRuntimeOpenStatus::Active,
+            "an interrupted preservation is resumable, so it must not strand the graph"
+        );
+        assert!(opened.handle.is_some());
+        assert!(
+            forensic.join("EVIDENCE_COMPLETE").exists(),
+            "the resumed preservation must finish, leaving no second interrupted directory behind"
+        );
+        assert!(
+            request.database_path.exists(),
+            "the rebuild must leave a usable projection in place"
+        );
+        drop(opened.handle);
     }
 
     /// Drive the feed until the watcher queue settles, reporting every tick so
@@ -30196,12 +31260,49 @@ mod tests {
         )
     }
 
+    /// The rebuild's own work counters. A rebuild that is superlinear in graph
+    /// size is superlinear in one of these, and elapsed time alone cannot say
+    /// which -- so the receipt names the quantities rather than the duration.
+    fn startup_projection_rebuild_receipt(
+        rebuild: &crate::oplog::sqlite::RebuildInstrumentation,
+    ) -> String {
+        format!(
+            " rebuild_events_validated={} rebuild_events_applied={} rebuild_root_authentications={} rebuild_exact_document_loads={} rebuild_exact_catalog_loads={} rebuild_exact_catalog_decodes={} rebuild_bulk_chunks={} rebuild_peak_bulk_pages={} rebuild_sequence_page_reads={} rebuild_sequence_bytes_read={} rebuild_cleanup_page_attempts={} rebuild_cleanup_existing_pages={} rebuild_cleanup_owned_rows={} rebuild_cleanup_fts_rowids={} rebuild_reference_inductive_checks={} rebuild_reference_full_scans={} rebuild_semantic_proofs={} rebuild_row_digest_proofs={} rebuild_frontier_session_hits={} rebuild_frontier_session_misses={} rebuild_external_session_hits={} rebuild_external_session_misses={} rebuild_candidate_transactions={} rebuild_candidate_barriers={} rebuild_ordinary_transactions={} rebuild_ordinary_barriers={}",
+            rebuild.accepted_events_validated,
+            rebuild.accepted_events_applied,
+            rebuild.accepted_root_authentications,
+            rebuild.exact_document_loads,
+            rebuild.exact_catalog_loads,
+            rebuild.exact_catalog_decodes,
+            rebuild.bulk_materialization_chunks,
+            rebuild.peak_bulk_pages,
+            rebuild.accepted_sequence_page_reads,
+            rebuild.accepted_sequence_bytes_read,
+            rebuild.cleanup_page_attempts,
+            rebuild.cleanup_existing_pages,
+            rebuild.cleanup_owned_rows,
+            rebuild.cleanup_fts_rowids,
+            rebuild.reference_coverage_inductive_checks,
+            rebuild.reference_coverage_full_scans,
+            rebuild.final_semantic_equivalence_proofs,
+            rebuild.final_row_digest_equivalence_proofs,
+            rebuild.accepted_frontier_session_hits,
+            rebuild.accepted_frontier_session_misses,
+            rebuild.external_exact_session_hits,
+            rebuild.external_exact_session_misses,
+            rebuild.physical_candidate_transactions,
+            rebuild.physical_candidate_durability_barriers,
+            rebuild.physical_ordinary_transactions,
+            rebuild.physical_ordinary_durability_barriers,
+        )
+    }
+
     fn startup_promoted_open_phase_receipt(
         promoted: &PromotedRuntimeOpenInstrumentation,
     ) -> String {
         let engine = &promoted.engine;
         format!(
-            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={}",
+            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={} projection_recovery={} projection_rebuild_reason={:?} projection_applied_batches={} projection_bulk_pages_materialized={} projection_ancestry_full_scans={}",
             startup_ms(promoted.total),
             startup_ms(promoted.bootstrap_anchor),
             startup_ms(promoted.enrollment_session),
@@ -30220,7 +31321,12 @@ mod tests {
             startup_ms(engine.resume_restore),
             startup_ms(engine.bootstrap_part_recovery),
             engine.bootstrap_parts_examined,
-        )
+            promoted.projection_recovery,
+            promoted.projection_rebuild_reason,
+            promoted.projection_applied_batches,
+            promoted.projection_bulk_pages_materialized,
+            promoted.projection_ancestry_full_scans,
+        ) + &startup_projection_rebuild_receipt(&promoted.projection_rebuild_counters)
     }
 
     #[test]
@@ -30387,6 +31493,27 @@ mod tests {
         );
     }
 
+    fn remove_resume_points(root: &Path) -> usize {
+        let mut removed = 0;
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "resume-point")
+                {
+                    fs::remove_file(entry.path()).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     #[test]
     #[ignore = "manual release benchmark: crash reopen of a real graph copy"]
     fn managed_crash_reopen_real_graph_manual_benchmark() {
@@ -30448,21 +31575,10 @@ mod tests {
         // calling clean_shutdown matches a killed process during a pending save.
         drop(handle);
         if std::env::var_os("TINE_MANAGED_CRASH_REOPEN_FORCE_FULL_REPLAY").is_some() {
-            let mut directories = vec![fixture.request.archive_root.clone()];
-            while let Some(directory) = directories.pop() {
-                for entry in fs::read_dir(directory).unwrap() {
-                    let entry = entry.unwrap();
-                    if entry.file_type().unwrap().is_dir() {
-                        directories.push(entry.path());
-                    } else if entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "resume-point")
-                    {
-                        fs::remove_file(entry.path()).unwrap();
-                    }
-                }
-            }
+            assert!(
+                remove_resume_points(&fixture.request.archive_root) > 0,
+                "the manual cacheless comparison requires a published resume point"
+            );
         }
         reset_runtime_open_instrumentation(workspace_id);
         reset_promoted_runtime_open_instrumentation(workspace_id);
@@ -30495,6 +31611,686 @@ mod tests {
             "real-graph crash reopen exceeded 10 seconds"
         );
         drop(reopened.handle);
+    }
+
+    /// Unsafe reopen of a real-scale graph whose managed history has been AGED:
+    /// many accepted saves across many pages, each drained so the local journal
+    /// compacts, before the final pending save and the unsafe drop.
+    ///
+    /// `managed_crash_reopen_real_graph_manual_benchmark` reopens a graph that was
+    /// activated moments earlier, so its oplog holds one generation and recovery is
+    /// trivially fast. That is not the state Martin's ~63 s reopen came from: his is
+    /// a graph lived in for days, with accumulated generations, retained runs and
+    /// manifests. This benchmark exists to find out which of those quantities the
+    /// recovery cost actually tracks — graph size is already known not to explain it.
+    ///
+    /// `TINE_MANAGED_CRASH_REOPEN_ROUNDS` sets the number of accepted+drained saves
+    /// (default 32; the test-build compaction threshold is 4 frames, so 32 rounds
+    /// crosses it repeatedly). Sweep it to get the shape of the curve.
+    /// An unsafe reopen after an aged managed history must OPEN the projection
+    /// it already has, not rebuild it.
+    ///
+    /// The projection was at the accepted frontier the whole time; only the
+    /// engine's run-local scratch address had moved, and that used to make the
+    /// two roots compare unequal. Recovery could read that only as corruption,
+    /// so it discarded a correct database and replayed the entire accepted
+    /// history to reproduce it -- 72 s on a 1,046-file graph, and worse as the
+    /// graph grows. This asserts on counters rather than elapsed time: a return
+    /// of the defect means batches applied or pages materialized, which is
+    /// visible whatever the machine's speed.
+    #[test]
+    fn managed_unsafe_reopen_at_the_accepted_frontier_opens_without_rebuilding() {
+        let fixture = ActivationFixture::nested_unicode("managed-reopen-no-rebuild", 0xa0e8);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        // Age the local journal well past its compaction threshold, draining
+        // every round, so the reopen faces a compacted multi-generation history
+        // rather than the single generation a freshly activated graph has.
+        for round in 0..6 {
+            let (page, revision) = load_application_exact(&handle, "Root.md");
+            let _ =
+                save_application_block_text(&handle, page, revision, &format!("aged edit {round}"));
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+        // Drop the live actor without a clean shutdown: a killed process.
+        drop(handle);
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, "opened-existing",
+            "a projection already at the accepted frontier was not opened as-is (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        assert_eq!(
+            promoted.projection_applied_batches, 0,
+            "an unsafe reopen at the accepted frontier replayed accepted batches"
+        );
+        assert_eq!(
+            promoted.projection_bulk_pages_materialized, 0,
+            "an unsafe reopen at the accepted frontier re-materialized pages"
+        );
+    }
+
+    /// Age a graph, shut it down cleanly, then damage only the disposable
+    /// SQLite projection. The oplog is untouched and authoritative, so the
+    /// graph must still open.
+    ///
+    /// `damage` runs with the runtime stopped and returns what the projection
+    /// recovery is expected to report.
+    fn managed_safe_reopen_after_projection_damage(
+        name: &str,
+        seed: u128,
+        damage: impl FnOnce(&Path),
+        expected_recovery: &str,
+    ) {
+        let fixture = ActivationFixture::nested_unicode(name, seed);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(&handle, page, revision, "edit before the damage");
+        for _ in 0..512 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            0,
+            "the pre-damage edit must drain, so the projection is current at shutdown"
+        );
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the graph must reach a Safe handoff, which is the case this covers"
+        );
+        drop(handle);
+
+        damage(&fixture.request.database_path);
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "a damaged disposable projection must not make an authoritative oplog unopenable"
+        );
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, expected_recovery,
+            "recovery took the wrong branch (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+
+        // Opening is not the whole claim: the rebuilt projection must actually
+        // answer for the graph, including the edit made before the damage.
+        let handle = reopened
+            .handle
+            .expect("the reopened runtime retains a handle");
+        let (page, _) = load_application_exact(&handle, "Root.md");
+        assert!(
+            page.blocks
+                .iter()
+                .any(|block| block.raw.contains("edit before the damage")),
+            "the rebuilt projection lost an accepted, drained edit"
+        );
+        drop(handle);
+    }
+
+    /// A cleanly shut down graph whose disposable projection has been deleted
+    /// -- a cleared cache directory, a sweeper, a restore that skipped it.
+    ///
+    /// The crash path already rebuilds this exact state. Refusing it after a
+    /// *clean* shutdown made the tidier lifecycle the unrecoverable one, and
+    /// the refusal is reported to the frontend as `Retryable`, so the user gets
+    /// a retry button that cannot ever succeed.
+    #[test]
+    fn managed_safe_reopen_rebuilds_a_deleted_disposable_projection() {
+        managed_safe_reopen_after_projection_damage(
+            "managed-safe-reopen-deleted-projection",
+            0xa0ea,
+            |database_path| {
+                tine_storage::sqlite::SqliteFileSet::new(database_path)
+                    .remove()
+                    .expect("the projection file set is removable");
+            },
+            "rebuilt-missing",
+        );
+    }
+
+    /// The same graph whose projection file is present but unreadable. This is
+    /// the shape a schema-version bump or genuine corruption takes, and unlike
+    /// deletion it also has forensic evidence to preserve.
+    #[test]
+    fn managed_safe_reopen_rebuilds_an_unreadable_disposable_projection() {
+        managed_safe_reopen_after_projection_damage(
+            "managed-safe-reopen-unreadable-projection",
+            0xa0eb,
+            |database_path| {
+                fs::write(database_path, b"this is not a SQLite database")
+                    .expect("the projection file is writable");
+            },
+            "rebuilt-preserving-evidence",
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
+    fn managed_crash_reopen_aged_history_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_crash_reopen_aged_history_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY")
+                .expect("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let rounds: usize = std::env::var("TINE_MANAGED_CRASH_REOPEN_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32);
+        let fixture = ActivationFixture::copied_graph("managed-crash-reopen-aged", 0xa0e7, &source);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let mut directories = vec![fixture.graph_root.clone()];
+        let mut managed_paths = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("md" | "org")
+                ) {
+                    managed_paths.push(
+                        entry
+                            .path()
+                            .strip_prefix(&fixture.graph_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        managed_paths.sort();
+        let editable = managed_paths
+            .into_iter()
+            .filter(|path| {
+                let (page, _) = load_application_exact(&handle, path);
+                !page.blocks.is_empty()
+            })
+            .take(rounds.max(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !editable.is_empty(),
+            "real graph copy has an editable managed page"
+        );
+
+        // Age the history: each round is an accepted save that is then fully
+        // drained, so the local journal reaches and crosses its compaction
+        // threshold repeatedly rather than staying in one generation.
+        let aging_started = Instant::now();
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("aged-history benchmark edit {round}"),
+            );
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+        let aging = aging_started.elapsed();
+
+        // One final UNDRAINED save, then drop the live actor without
+        // clean_shutdown: a killed process during a pending save.
+        let path = &editable[rounds % editable.len()];
+        let (page, revision) = load_application_exact(&handle, path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "aged-history benchmark pending edit",
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let resume = reopened
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.engine_instrumentation().ok())
+            .map(|instrumentation| instrumentation.resume);
+        eprintln!(
+            "managed_crash_reopen_aged rounds={rounds} aging_ms={:.3} elapsed_ms={:.3} resume={resume:?} open_phases: {} promoted_phases: {}",
+            startup_ms(aging),
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+        );
+        // Not a tuned budget: a tripwire far above the measured cost, so a
+        // return of the per-document whole-graph anchor work (which put this
+        // same case at 72 s) fails loudly instead of being read as "slow today".
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "aged-history crash reopen exceeded 45 seconds"
+        );
+        drop(reopened.handle);
+    }
+
+    /// Only a tick that committed a batch may be reported as a content change.
+    ///
+    /// The two admitted variants were treated alike, so a drain that took no
+    /// completed batch still told the frontend the graph had changed. That
+    /// contentless signal, arriving while a page was dirty, is what produced a
+    /// conflict against nothing -- the false-conflict incident of 2026-08-06.
+    #[test]
+    fn only_a_committing_tick_reports_an_observable_change() {
+        assert!(SyncRuntimeTick::AdmittedComplete { epoch: 7 }.committed_observable_change());
+        assert!(
+            !SyncRuntimeTick::AdmittedNoop { epoch: 7 }.committed_observable_change(),
+            "an admission that took no completed batch is not a content change"
+        );
+        for quiet in [
+            SyncRuntimeTick::Idle,
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::RetryFull,
+            SyncRuntimeTick::Blocked("blocked".into()),
+            SyncRuntimeTick::RecoveryBlocked("blocked".into()),
+            SyncRuntimeTick::Failed("failed".into()),
+            SyncRuntimeTick::Terminal("terminal".into()),
+        ] {
+            assert!(
+                !quiet.committed_observable_change(),
+                "{quiet:?} committed nothing and must not be reported as a change"
+            );
+        }
+    }
+
+    /// A rebuild must resolve documents through its root-bound lookup sessions.
+    ///
+    /// This asserts the mechanism, not a duration, because the defect it guards
+    /// is invisible in a single measurement: with the sessions unthreaded every
+    /// document resolution re-walked the scratch LSM from the top, so
+    /// per-document cost grew with the graph and a rebuild visiting a linear
+    /// number of documents came out at about n^1.6 -- 15 s on a 1,045-file
+    /// graph against Martin's 10-s ceiling. A wall-clock budget would pass on a
+    /// small CI fixture no matter how the lookups are routed; session reuse is
+    /// the property that actually holds the curve down, and it is checkable at
+    /// any scale.
+    #[test]
+    fn managed_projection_rebuild_resolves_documents_through_lookup_sessions() {
+        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 60);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("scaled graph activates");
+        drive_initial_feed(&handle);
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the fixture must reach a Safe handoff before its projection is discarded"
+        );
+        drop(handle);
+
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the projection file set is removable");
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, "rebuilt-missing",
+            "this test only says something if a rebuild actually ran (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        let rebuild = &promoted.projection_rebuild_counters;
+        assert!(
+            rebuild.exact_document_loads > 1,
+            "a rebuild that loaded {} document(s) is too small to show reuse",
+            rebuild.exact_document_loads
+        );
+        // Sessions must exist AND be reused. A session that is constructed and
+        // then consulted once per document would report only misses, which is
+        // the same cost as having none.
+        assert!(
+            rebuild.accepted_frontier_session_hits > rebuild.accepted_frontier_session_misses,
+            "accepted-frontier lookups did not reuse their session ({} hits, {} misses over {} document loads)",
+            rebuild.accepted_frontier_session_hits,
+            rebuild.accepted_frontier_session_misses,
+            rebuild.exact_document_loads
+        );
+        assert!(
+            rebuild.external_exact_session_hits > rebuild.external_exact_session_misses,
+            "external-exact document loads did not reuse their session ({} hits, {} misses over {} document loads)",
+            rebuild.external_exact_session_hits,
+            rebuild.external_exact_session_misses,
+            rebuild.exact_document_loads
+        );
+        drop(reopened.handle);
+    }
+
+    /// Cost of a FULL projection rebuild on a real-scale graph.
+    ///
+    /// Every other managed benchmark measures a reopen that is *allowed to keep*
+    /// its projection, so none of them price the rebuild itself. Since the
+    /// frontier-identity cut, an ordinary reopen never rebuilds -- but a rebuild
+    /// is still legitimately reachable through genuine corruption, a schema
+    /// change, or a persisted identity-format change, and on that day it is the
+    /// user's whole experience of the product. Martin's requirement is that it
+    /// stay under 10 s and be truly linear, because other graphs are 10x this
+    /// one.
+    ///
+    /// The trigger here is deliberately the cheapest legitimate one: the
+    /// projection file set is deleted after a clean shutdown, so recovery takes
+    /// `RebuiltMissing` and no forensic preservation is charged to the number.
+    /// A corruption trigger would rebuild the same way plus evidence capture.
+    ///
+    /// `TINE_MANAGED_REBUILD_GRAPH_COPY` names a disposable graph copy;
+    /// `TINE_MANAGED_REBUILD_ROUNDS` sets how many accepted+drained saves age
+    /// the history first (compacted generations carry whole-graph slices, so an
+    /// aged history is what a rebuild actually has to replay).
+    #[test]
+    #[ignore = "manual release benchmark: full projection rebuild on a real-scale graph"]
+    fn managed_projection_rebuild_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_projection_rebuild_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_REBUILD_GRAPH_COPY")
+                .expect("TINE_MANAGED_REBUILD_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let rounds: usize = std::env::var("TINE_MANAGED_REBUILD_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let fixture =
+            ActivationFixture::copied_graph("managed-projection-rebuild", 0xa0e9, &source);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let mut directories = vec![fixture.graph_root.clone()];
+        let mut managed_paths = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("md" | "org")
+                ) {
+                    managed_paths.push(
+                        entry
+                            .path()
+                            .strip_prefix(&fixture.graph_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        managed_paths.sort();
+        let graph_files = managed_paths.len();
+        let editable = managed_paths
+            .into_iter()
+            .filter(|path| {
+                let (page, _) = load_application_exact(&handle, path);
+                !page.blocks.is_empty()
+            })
+            .take(rounds.max(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !editable.is_empty(),
+            "real graph copy has an editable managed page"
+        );
+
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("projection-rebuild benchmark edit {round}"),
+            );
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+
+        // A clean shutdown, so the number below prices the rebuild and not a
+        // crash recovery that happens to rebuild.
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the aged graph must reach a Safe handoff before the projection is discarded"
+        );
+        drop(handle);
+
+        // The trigger: the disposable projection is gone. Recovery must
+        // reconstruct it from authoritative history alone.
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the projection file set is removable");
+        assert!(
+            !tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path).any_exists(),
+            "the benchmark must actually discard the projection it means to price"
+        );
+
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        eprintln!(
+            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+        );
+        // Reading the branch off the run, not inferring it from the timing:
+        // a number that turned out to price "opened an existing projection"
+        // would be measuring the opposite of this benchmark's subject.
+        assert_eq!(
+            promoted.projection_recovery, "rebuilt-missing",
+            "the benchmark must price a real rebuild (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        assert!(
+            promoted.projection_applied_batches > 0,
+            "a rebuild that applied no accepted batches did not reconstruct anything"
+        );
+        drop(reopened.handle);
+    }
+
+    #[test]
+    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point() {
+        const PATH: &str = "notes/Synthetic crash history.md";
+        const INITIAL: &[u8] = b"- initial synthetic history\n";
+
+        for accepted_edits in [1_u64, 2] {
+            assert!(
+                accepted_edits + 1 < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD,
+                "the synthetic history sweep and final pending tail must remain below compaction"
+            );
+            for cacheless in [false, true] {
+                let fixture = ActivationFixture::empty(
+                    &format!(
+                        "managed-crash-history-{accepted_edits}-{}",
+                        if cacheless {
+                            "cacheless"
+                        } else {
+                            "accelerated"
+                        }
+                    ),
+                    0xa170 + accepted_edits as u128 * 0x20 + cacheless as u128,
+                );
+                fs::write(fixture.graph_root.join(PATH), INITIAL).unwrap();
+                let request = reopen_request(&fixture.request);
+                let workspace_id = fixture.request.identities.workspace_id;
+                let activated =
+                    SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+                assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+                let handle = activated
+                    .handle
+                    .expect("synthetic history fixture activates");
+                drive_initial_feed(&handle);
+
+                let (mut page, mut revision) = load_application_exact(&handle, PATH);
+                for edit in 1..=accepted_edits {
+                    (page, revision) = save_application_block_text(
+                        &handle,
+                        page,
+                        revision,
+                        &format!("accepted and drained synthetic edit {edit}"),
+                    );
+                }
+                drain_managed_local(&handle);
+                let drained = handle.status().unwrap();
+                assert_eq!(drained.managed_local_pending, 0);
+                assert_eq!(drained.managed_local_checkpointed_sequence, accepted_edits);
+                assert_eq!(drained.managed_local_next_sequence, accepted_edits);
+
+                let (tail_page, tail_revision) = save_application_block_text(
+                    &handle,
+                    page,
+                    revision,
+                    "actor-accepted undrained synthetic tail",
+                );
+                let tail_bytes = fs::read(fixture.graph_root.join(PATH)).unwrap();
+                let pending = handle.status().unwrap();
+                assert_eq!(pending.managed_local_pending, 1);
+                assert_eq!(pending.managed_local_checkpointed_sequence, accepted_edits);
+                assert_eq!(pending.managed_local_next_sequence, accepted_edits + 1);
+                let retained_frames = managed_local_journal_frames(&request);
+                assert_eq!(retained_frames.len(), accepted_edits as usize + 1);
+                assert_eq!(
+                    retained_frames.last().unwrap().sequence(),
+                    accepted_edits,
+                    "the sole undrained tail must be the final accepted sequence"
+                );
+
+                // The final tail is actor-accepted and projected, but its
+                // derivative journal frame has not been drained or handed off.
+                drop(handle);
+                if cacheless {
+                    assert!(
+                        remove_resume_points(&fixture.request.archive_root) > 0,
+                        "synthetic cacheless reopen requires a published resume point"
+                    );
+                }
+                reset_runtime_open_instrumentation(workspace_id);
+                reset_promoted_runtime_open_instrumentation(workspace_id);
+                let started = Instant::now();
+                let opened = SyncRuntimeHandle::open(request.clone());
+                let elapsed = started.elapsed();
+                assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+                let open = take_runtime_open_instrumentation(workspace_id);
+                let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+                if cacheless {
+                    assert!(
+                        promoted.reconstructed_bootstrap_resume,
+                        "cacheless synthetic reopen must reconstruct the detached bootstrap resume"
+                    );
+                }
+                eprintln!(
+                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+                    startup_ms(elapsed),
+                    startup_open_phase_receipt(&open),
+                    startup_promoted_open_phase_receipt(&promoted),
+                );
+                assert!(
+                    elapsed < Duration::from_secs(10),
+                    "synthetic crash reopen exceeded 10 seconds: accepted_edits={accepted_edits} cacheless={cacheless}"
+                );
+
+                let reopened = opened.handle.expect("active synthetic reopen has an actor");
+                drive_initial_feed(&reopened);
+                let recovered_status = reopened.status().unwrap();
+                assert_eq!(
+                    recovered_status.recovery,
+                    Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+                );
+                assert_eq!(recovered_status.managed_local_pending, 0);
+                assert_eq!(
+                    recovered_status.managed_local_checkpointed_sequence,
+                    accepted_edits + 1
+                );
+                assert_eq!(
+                    recovered_status.managed_local_next_sequence,
+                    accepted_edits + 1
+                );
+                let (recovered, recovered_revision) = load_application_exact(&reopened, PATH);
+                assert_parser_dto_semantics(&tail_page, &recovered);
+                assert_eq!(tail_revision, recovered_revision);
+                assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), tail_bytes);
+                assert!(matches!(
+                    reopened.clean_shutdown().unwrap(),
+                    SyncShutdownOutcome::Safe(_)
+                ));
+            }
+        }
     }
 
     #[test]

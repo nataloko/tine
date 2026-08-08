@@ -1359,7 +1359,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs",
@@ -1368,7 +1368,7 @@
         "scenario": "sync.editor-intent-actor-owned-frontier",
         "failBefore": "source-proven"
       },
-      "notes": "Covers OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
+      "notes": "Negative follow-up on 2026-08-05 revoked the prior evidence: deployed v0.6.90 refused an ordinary application-page save at the semantic page transaction and the edit was not durable. Reproduce the literal path before restoring covered status. Earlier coverage included OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
     },
     {
       "id": "REG-SYNC-SPARSE-V2-APP-AUTHORITY-001",
@@ -1433,7 +1433,7 @@
         "all"
       ],
       "layer": "native-app",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs",
@@ -1444,7 +1444,7 @@
         "scenario": "sync.sparse-v2-activation-responsive-progress-scaled",
         "failBefore": "proven"
       },
-      "notes": "The source-boundary regression requires the complete graph transition and every ordinary or explicit command that can wait on the managed actor to run behind spawn_blocking without carrying borrowed Tauri state across await. Each command captures its window label and binding generation, then re-resolves that exact authority inside the blocking operation so a queued command cannot act on a replacement graph. Core fixtures retain exact graph bytes and crash-resume stages while recording ordered semantic phases. Two nested Unicode synthetic scales retain ordinary references, properties, and tasks; instrumentation records source files, bytes, blocks, and per-phase elapsed time and rejects plainly superlinear shared construction."
+      "notes": "Negative follow-up on 2026-08-05 revoked the prior responsiveness evidence: the deployed v0.6.90 managed graph again spent roughly 60 seconds in recovery. Reproduce and classify actual recovery work versus an actor/request wait before restoring covered status. The earlier source-boundary regression required the complete graph transition and every ordinary or explicit command that can wait on the managed actor to run behind spawn_blocking without carrying borrowed Tauri state across await."
     },
     {
       "id": "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",
@@ -1518,7 +1518,7 @@
         "scenario": "sync.shared-provider-r6-transient-ingress",
         "failBefore": "proven"
       },
-      "notes": "Exact safety/interoperability contract: only direct-child Syncthing staging siblings with the documented Unix/macOS .syncthing.<payload>.tmp or Windows ~syncthing~<payload>.tmp shape are non-authoritative in both full scans and exact callbacks; invented Dropbox sibling names and malformed canonical names remain visible and fail-closed. An exact path that is absent when processed settles idempotently. Authenticated restart/full reconciliation also pages the complete accepted sequence: every ordinary accepted batch must retain an exact local manifest, exact provider manifest, or digest-bound recovery mirror before Safe, including non-tip A in A→B→C. Recoverable local authority is republished idempotently; deleting canonical provider, recovery link/blob, and local manifest refuses reopen/Safe until local recovery evidence returns, after which the bounded audit repairs provider authority."
+      "notes": "Exact safety/interoperability contract: only direct-child Syncthing staging siblings with the documented Unix/macOS .syncthing.<payload>.tmp or Windows ~syncthing~<payload>.tmp shape are non-authoritative in both full scans and exact callbacks; invented Dropbox sibling names and malformed canonical names remain visible and fail-closed. An exact path that is absent when processed settles idempotently. Authenticated restart/full reconciliation also pages the complete accepted sequence: every ordinary accepted batch must retain an exact local manifest, exact provider manifest, or digest-bound recovery mirror before Safe, including non-tip A in A\u2192B\u2192C. Recoverable local authority is republished idempotently; deleting canonical provider, recovery link/blob, and local manifest refuses reopen/Safe until local recovery evidence returns, after which the bounded audit repairs provider authority."
     },
     {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-ACCEPTED-AUDIT-RETRY-001",
@@ -1540,7 +1540,7 @@
         "scenario": "sync.shared-provider-r6-accepted-audit-retry",
         "failBefore": "proven"
       },
-      "notes": "A bounded accepted-sequence audit owns an exact retry cursor until it validates the current acceptance root. One-shot provider-read and repair-publication failures at accepted non-tip A in A→B→C fail closed as RecoveryBlocked, remain visible as provider work, and resume in the same live actor. The cursor advances only after the current entry is validated or durably repaired; recovered ticks restore canonical manifest plus digest-bound recovery evidence and reach Idle/Safe without a restart, full provider scan, or manifest/object directory enumeration."
+      "notes": "A bounded accepted-sequence audit owns an exact retry cursor until it validates the current acceptance root. One-shot provider-read and repair-publication failures at accepted non-tip A in A\u2192B\u2192C fail closed as RecoveryBlocked, remain visible as provider work, and resume in the same live actor. The cursor advances only after the current entry is validated or durably repaired; recovered ticks restore canonical manifest plus digest-bound recovery evidence and reach Idle/Safe without a restart, full provider scan, or manifest/object directory enumeration."
     },
     {
       "id": "REG-SYNC-SHARED-ENROLLMENT-R6-STABLE-PROVIDER-CUT-001",
@@ -1812,7 +1812,7 @@
         "scenario": "sync.projection-r6-portable-path-reacquisition",
         "failBefore": "proven"
       },
-      "notes": "The permanent local regression creates a Markdown page and renames it A→B→A→B, proving every round reaches durable projection instead of retrying against the original A frontier. Historical projection reuse is bound to the current portable-path owner and acquisition batch, and any existing local completion must uniquely match that lifecycle and target. The neighboring unrelated-frontier external-delete regression remains covered so the correction does not weaken intentional delete authority."
+      "notes": "The permanent local regression creates a Markdown page and renames it A\u2192B\u2192A\u2192B, proving every round reaches durable projection instead of retrying against the original A frontier. Historical projection reuse is bound to the current portable-path owner and acquisition batch, and any existing local completion must uniquely match that lifecycle and target. The neighboring unrelated-frontier external-delete regression remains covered so the correction does not weaken intentional delete authority."
     },
     {
       "id": "REG-SYNC-PROJECTION-R6-BOUNDED-SEALED-OPEN-001",
@@ -2129,7 +2129,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_real_graph_manual_benchmark"
@@ -2137,7 +2137,7 @@
         "scenario": "managed-storage.crash-reopen-with-and-without-resume-accelerator",
         "failBefore": "proven"
       },
-      "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. Fixed on fe5dfb7f by reconstructing the immutable bootstrap once in the existing detached authoring engine, migrating that authenticated candidate into the resume path, and replaying only post-bootstrap history in the enrolled engine. The exact fail-before fixture then reopened in 2.36 seconds, adopted bootstrap generation 5, replayed zero bootstrap generations through enrolled recovery, and preserved the original accelerator-refusal reason."
+      "notes": "Negative follow-up on 2026-08-05 revoked the deployed-state evidence: v0.6.90 again took roughly 60 seconds to recover a managed graph. Current master still passes the original permitted 1,045-file anonymized fresh-copy receipt (ordinary pending-save crash takeover 0.19 seconds; forced resume-accelerator removal 6.85 seconds), so the missing regression fixture is accumulated or failed-transaction state rather than the original fresh activation alone. Historical fail-before on 92edd261 took 30.9 seconds locally and about 58 seconds on the user's slower machine; fe5dfb7f reconstructed the immutable bootstrap once and reduced that exact case to 2.36 seconds. Restore covered status only after the deployed state shape is represented and bounded."
     },
     {
       "id": "REG-MISSING-REMEMBERED-GRAPH-250",
@@ -2204,6 +2204,607 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED. Instrumented run 30994134161 on cf2ca70f localized the first failure to flush_bootstrap_source_prefix. On non-Linux targets that durability pass recursively opened each regular capture artifact with File::open (GENERIC_READ on Windows) and then called sync_all (FlushFileBuffers on Windows); FlushFileBuffers requires write access and therefore returned ERROR_ACCESS_DENIED on the valid read-only handle. Fixed by e04469c3 using the established shadow-projection and migration-backup pattern: request write access only for the Windows regular-file flush handle, preserve read-only access elsewhere, and propagate every open or flush error. Hosted pass-after run 30995033385 proved capture now completes, then exposed the same legacy portability defect in prepare_inactive_bootstrap_import: its non-Linux preparation-tree flush also used read-only File::open handles for file FlushFileBuffers, while its recursive, post-rename, and retry directory barriers bypassed Tine's explicit Windows directory-sync contract. Fixed by 87a41863: preparation file barriers use Windows write access, and every preparation directory barrier now uses tine-storage ValidatedDirectorySync, which validates a real non-reparse retained capability and explicitly records Windows directory-entry crash durability as unsupported after validation. No PermissionDenied or other open/flush error is ignored. Hosted run 30995785773 proved both production stages pass, then exposed a test-oracle defect: authoritative_world used the generic whole-tree snapshot and filtered .tine-runtime and engine-scratch-v2 only after reading them. The helper process intentionally holds the archive-rooted lease, so Windows correctly rejected reading the locked lease with ERROR_LOCK_VIOLATION while Unix advisory locking had hidden the mistake. Fixed test-only by 8cd3e322 with a path-filtered walker that prunes non-authoritative namespaces before opening contents while continuing to hash every selected durable file. The same caller audit moved volatile SQLite -shm exclusion, lease-namespace exclusion, and immutable batches/objects selection before reads; generic whole-tree snapshots remain unchanged. Hosted run 30996661360 proved the archive-lease pruning worked, then exposed the device-local enrollment lease at sparse-storage/v2/local/<graph>/enrollment/lease: its stable file identity, not its locked empty bytes, is authority and is already bound into every authenticated enrollment record and revalidated separately. Fixed test-only by d9f78a09 by excluding that exact six-component lease path before reads while continuing to hash its authoritative enrollment head and all other durable siblings; snapshot read panics now include root and relative path. A guarded-reader regression proves neither locked lease reaches the reader and authoritative siblings are still hashed. Hosted run 30997515786 then reached the intended same-profile contention operation, but fs2's Windows LockFileEx failure surfaced ERROR_LOCK_VIOLATION (33) with ErrorKind::Uncategorized and enrollment mapped it to generic I/O. Fixed by 0c942015 with one shared narrow nonblocking-lock classifier: WouldBlock everywhere plus exact Windows ERROR_LOCK_VIOLATION. Enrollment, SQLite, and projection mutation leases retain their preexisting explicit PermissionDenied policy; packed-Patricia and object-store transition locks do not gain it. ERROR_SHARING_VIOLATION (32) remains an open/share-mode error, not contention, because fs2 calls LockFileEx only after the file is open. The breadth audit found direct Windows LockFileEx implementations in local-journal, scratch, and simulator already classify exactly code 33; blocking object-store locks need no nonblocking mapping. Focused helpers directly exercise durability and lock contracts; the unchanged full live-runtime witness, capture family, preparation seal/retry, enrollment, SQLite, packed-Patricia, and object-store serialization tests cover the surrounding fail-closed protocol. Linux and Android use syncfs for both prefixes and never enter the recursive per-file FlushFileBuffers paths."
+    },
+    {
+      "id": "REG-MANAGED-EPOCH-FALSE-CONFLICT-001",
+      "title": "An unsaved edit is not conflicted by a change notification that carries no per-page divergence",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows",
+        "android"
+      ],
+      "layer": "frontend-integration",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx::does not conflict a dirty page when the admitted epoch left it unchanged",
+          "src/App.test.tsx::still conflicts a dirty page when the stored revision genuinely moved",
+          "src/App.test.tsx::still conflicts a dirty page whose file was deleted under it",
+          "src/App.test.tsx::leaves an in-flight save alone \u2014 its own base_rev guard is the authority",
+          "src/App.test.tsx::does not conflict a dirty page on a legacy watcher echo of our own write",
+          "src/App.test.tsx::still conflicts a dirty page on a legacy watcher event that really changed it",
+          "crates/tine-core/src/sync_runtime.rs::only_a_committing_tick_reports_an_observable_change"
+        ],
+        "scenario": "managed-storage.notification-is-not-divergence-evidence",
+        "failBefore": "proven"
+      },
+      "notes": "Martin, managed graph, deployed 263f8c21: editing a block and then moving it up QUICKLY raised the top-bar banner \u201c\u201cTine\u201d changed on disk (edited elsewhere or synced in). Your unsaved changes weren\u2019t written.\u201d Doing the same slowly did not. No external writer was involved. Root cause: the managed runtime emits sparse-v2-changed (src-tauri/src/watcher.rs) on every completed tick, and the tick (SyncRuntimeTick, crates/tine-core/src/sync_runtime.rs:1448) carries only epoch: u64 \u2014 no page, no origin \u2014 and fires for AdmittedNoop, which by name changed nothing. handleSparseV2Changed then asked reloadDisposition, which returns \"conflict\" for isDirty || isConflicted || isSaving, and called markConflict. So a contentless aggregate signal plus a dirty page produced a conflict with nothing compared. The harm is not cosmetic: doSave refuses a conflicted page, so the banner's own claim became true only because of the banner, and it blocked the very save whose base_rev guard would have decided the question correctly. reloadDisposition conflates two judgments \u2014 \u201cdo not overwrite the in-memory edit\u201d (always right for a dirty page) and \u201cdeclare a conflict\u201d (needs proof this page diverged). Fix: divergedFromBaseline(name, stored) in persistence.ts compares the stored page's content revision against the editor's baseline across all four quadrants (equal revision = our own echo, not diverged; different revision = diverged; absent with a baseline = deleted under us, diverged; absent with no baseline = never-written page, not diverged). An in-flight save is skipped entirely: its own base_rev guard is the authority and decides against the exact bytes it is writing. The same proof is applied to the legacy watcher path in handleGraphChange, where Tine's save normally suppresses its own echo but a synced/polled graph or a self-write-marker gap can still surface one (see store.upsertPage). Fail-before proven by reverting only the two production files and rerunning the new tests: the three false-conflict tests failed, and the three \u201cstill conflicts\u201d guards passed both before and after, so they are not vacuous. Frontend-integration layer: the real-app reproduction depends on watcher timing and was not reproduced natively; the mechanism was reproduced deterministically at the frontend observation boundary. Follow-up not taken here: give the tick page identity and origin in the backend so the frontend does not have to re-derive per-page divergence from a contentless signal, and consider not emitting sparse-v2-changed for AdmittedNoop at all. 2026-08-07 (021e21a8): the backend half, owed since the frontend repair. The watcher emitted sparse-v2-changed for both admitted tick variants, but AdmittedNoop is by construction the drain step that took no completed batch. So a quiet admission woke the frontend with a contentless signal, which is what a dirty page then read as a conflict against nothing. Only AdmittedComplete now reports a change, via a named and unit-tested predicate in core rather than an inline match in the watcher loop. divergedFromBaseline is unchanged and still required: a tick still names no page and carries no origin, so per-page proof remains the authority."
+    },
+    {
+      "id": "REG-MANAGED-CRASH-REOPEN-ANCHOR-QUADRATIC-001",
+      "title": "Crash reopen of a lived-in managed graph does not re-resolve one whole-graph manifest per page",
+      "family": "sync-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows",
+        "android"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_aged_history_manual_benchmark"
+        ],
+        "scenario": "managed-storage.crash-reopen-aged-history",
+        "failBefore": "proven"
+      },
+      "notes": "Martin reported unsafe reopen of his real managed graph spending about 63.6 s in RecoveringPromotedRuntime. The existing managed_crash_reopen_real_graph_manual_benchmark could not see it: it reopens a graph activated seconds earlier, so its oplog holds one generation (195 ms accelerated, 2.5 s forced-full-replay). The missing variable was aged history. managed_crash_reopen_aged_history_manual_benchmark adds it \u2014 N accepted saves across N pages, each fully drained so the local journal crosses its compaction threshold repeatedly, then one pending save and an unsafe drop \u2014 and reproduces 72.2 s on the 1,046-file anonymized graph. Localization by successive splitting, each step measured rather than inferred: the reopen rebuilds the disposable projection (projection_recovery=rebuilt-preserving-evidence, reason 'SQLite projection files differ from their authenticated checkpoint'), but the rebuild's own SQLite work is under 0.5 s and forensic preservation is 0.16 ms; 99.6% is materialize_accepted_event_with_stats, and inside that 83% is validate_external_record_anchor at about 30 ms per document. Cause: anchor validation needs the manifest per document, and every document of one bootstrap batch names the same source batch, but load_observed_manifest was called per document \u2014 cloning a manifest carrying a descriptor per document, or reloading and revalidating the entire retained bootstrap part off disk, once per page. load_archive_document_object then reloaded that same retained part a second time per document and linearly scanned every object in it. Two whole-graph costs per page, so quadratic in graph size. Fixed by memoizing both for the SAME public operation as the existing status/anchor point caches (cleared together in begin_point_operation, bounded at 4 batches, cleared wholesale at the cap because correctness never depends on a hit), plus a document -> CrdtUpdate index built once per memoized part. This memoizes only WHERE a manifest was found, never WHETHER a record matches it: every document still proves its own descriptor content digest and manifest fingerprint. Measured on the same commit pair: 1,046 files 72,229 ms -> 19,751 ms total and 69,911 ms -> 17,390 ms sqlite_open; 350 files 12,230 -> 3,428; 100 files 2,101 -> 874. Anchor validation 31.6 s -> 0.86 s. tine-core release suite 2030 passed with the same 15 pre-existing failures as master (doc::promoted_heading_tests and model::tests::write_highlights_*, all unrelated and failing identically before the change). STILL OPEN, deliberately not claimed fixed here: the remaining cost is superlinear too \u2014 per-document scratch LSM lookups in load_external_exact run without a ScratchLookupSession, unlike the bootstrap bulk materializer which threads one; and the reopen still re-materializes about twice the graph because compacted generations replay whole-graph slices (240/453/220/78 pages for eight single-page edits). Also unaddressed: why the projection is invalidated at all after ordinary drained saves. The regression guard is a 45 s tripwire inside the manual benchmark, which is NOT a CI gate; a counter-based assertion that manifest resolutions are bounded per batch rather than per document would be the durable guard."
+    },
+    {
+      "id": "REG-MANAGED-REOPEN-SCRATCH-POINTER-FALSE-REBUILD-001",
+      "title": "Unsafe reopen opens a projection already at the accepted frontier instead of rebuilding the whole graph",
+      "family": "sync-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows",
+        "android"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_unsafe_reopen_at_the_accepted_frontier_opens_without_rebuilding",
+          "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_aged_history_manual_benchmark"
+        ],
+        "scenario": "managed-storage.crash-reopen-aged-history",
+        "failBefore": "proven"
+      },
+      "notes": "Unsafe reopen of a lived-in managed graph rebuilt the ENTIRE SQLite projection even though that projection was already exactly at the oplog's accepted frontier. Established by evidence, not inference: the single rebuild reason string in validate_projection_checkpoint collapsed three independent bindings into one message; split apart, the one that fired was 'checkpoint names a different frontier root'. A field-by-field probe of the two AcceptedFrontierRoot values then showed exactly ONE differing field: scratch_root. Every authenticated field -- acceptance_sequence, document_map_root_digest, batch_map_root_digest, reference_catalog_root, state_digest -- was identical. scratch_root is a run-local address for where THIS process keeps the frontier's maps; next_accepted_frontier_root never hashes it into state_digest, and the type's own doc comment calls it a run-local scratch-store reference. Reopening a graph moves it as a matter of course. Because it sat inside the derived PartialEq and inside canonical_frontier_root_bytes (postcard of the whole struct), it also propagated into every durable identity derived from those bytes -- the projection checkpoint, the materialization stamp, the stored frontier row -- so a correct, up-to-date projection compared unequal to the very frontier it was already at, and recovery could only read that as corruption and answer by discarding the database and replaying the whole accepted history. Fixed by CUTTING the pointer out of identity rather than by making the rebuild faster: a hand-written PartialEq for AcceptedFrontierRoot that compares the authenticated fields only, and canonical_frontier_root_bytes stripping scratch_root so no persisted digest can depend on where this process happened to put things. Measured on the same commit pair, full anonymized 1,046-file graph: total reopen 72,229 ms -> 2,138 ms, sqlite_open 69,911 ms -> 3.1 ms, projection_recovery rebuilt-preserving-evidence -> opened-existing with 0 batches applied and 0 pages materialized. 350 files 12,230 -> 1,261; 100 files 2,101 -> 598. sqlite_open is now flat (about 3-6 ms) at every graph size instead of about n^1.6. Also landed, diagnosis-only: the three checkpoint bindings now report separately, and validate_existing validates the database against its OWN sequence and distinguishes 'behind the oplog' from 'diverged from the oplog' (both still rebuild; they are no longer reported with the same words). A catch-up path that would apply only the missing batches was written and then REMOVED before landing: with the identity cut in place it never runs (applied_batches=0), and shipping an unexercised recovery posture on the data-safety path is the opposite of cutting. Guard: managed_unsafe_reopen_at_the_accepted_frontier_opens_without_rebuilding is a NON-ignored CI test asserting on counters (projection_recovery == opened-existing, 0 applied batches, 0 materialized pages) rather than elapsed time, so a return of the defect fails on any machine. Fail-before proven by reverting ONLY the two production hunks: the gate failed with 'a projection already at the accepted frontier was not opened as-is (reason: SQLite frontier is stale)'. tine-core release suite 2031 passed with exactly the same 15 pre-existing failures as master (failure sets diffed, byte-identical). Note on suite noise: the oplog::local_active ephemeral-retention test family is load-flaky on master too (reproduced on unmodified master under CPU load); the new gate adds contention and raises how often it is seen. STILL OPEN: the remaining 2.1 s is engine_open, not the projection; per-document scratch LSM lookups in load_external_exact still run without a ScratchLookupSession."
+    },
+    {
+      "id": "REG-EXTERNAL-GRAPH-WIDE-EVENTS-268",
+      "title": "External edits to pages outside journals/ and pages/ reach the open app instead of staying invisible until reopen",
+      "family": "external-change-reconciliation",
+      "sources": {
+        "issues": [
+          268
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs::graph_wide_external_paths_are_routed_like_discovery_routes_them",
+          "src-tauri/src/watcher.rs::snapshot_covers_exactly_what_discovery_covers",
+          "src-tauri/src/watcher.rs::unclassified_paths_force_a_full_scan_only_where_pages_could_live",
+          "crates/tine-core/src/model.rs::watch_predicates_track_the_same_scope_discovery_walks"
+        ],
+        "scenario": "direct-markdown.external-change-graph-wide",
+        "failBefore": "proven"
+      },
+      "notes": "Discovery went graph-wide in the #246 fix; watcher event routing did not follow. The OS watch was already installed recursively on the graph ROOT, so events for a page at the root or in a custom folder arrived correctly -- and were then discarded by the reconcile lane, which filtered pending paths against [journals/, pages/] and built its diff snapshot from those two directories only. Such a page was therefore listed at open and never updated again while the app stayed open. Fixed by giving the watcher the same authority discovery uses (GraphTextScope), via Graph::graph_text_watch_relevant / _descend / _could_contain. Fail-before proven by restoring the two pre-fix predicates in place: the snapshot returned only [journals/2026_08_06.md, pages/Page.md] against an expected five, and event routing returned only [pages/Page.md] against an expected three. Conflict copies stay routed (they are not eligible text but must refresh the conflicts panel); excluded trees (assets/, dot-directories, logseq/bak/) stay excluded on both the routing and the force-a-full-scan paths, so dropping an image into assets/ still cannot trigger a graph rescan. Freshness defect only, not write-safety: the pre-debounce write-guard lane always saw every event and stayed fail-closed."
+    },
+    {
+      "id": "REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001",
+      "title": "A network-share (poll-mode) graph keeps its save-time admission index warm instead of rebuilding the whole graph on every save",
+      "family": "direct-save-performance",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs::quiet_poll_cycles_keep_the_admission_index_warm",
+          "src-tauri/src/watcher.rs::a_poll_cycle_publishes_what_it_actually_observed",
+          "src-tauri/src/watcher.rs::an_incomplete_poll_scan_invalidates_instead_of_publishing",
+          "src-tauri/src/watcher.rs::an_unreadable_directory_makes_the_scan_report_itself_incomplete"
+        ],
+        "scenario": "direct-markdown.poll-mode-save-latency",
+        "failBefore": "proven"
+      },
+      "notes": "When the watcher runs in poll mode (a network share, or TINE_WATCH=poll), every 3 s cycle invalidated the guarded graph-text admission index unconditionally before reconciling. Since a Direct save consults that index and rebuilds it when invalid -- a two-pass byte-retaining walk of the whole graph -- such a user could never hold a warm index and paid a full-graph rebuild on essentially every save. The blanket invalidation was compensating for the poll rescan being narrower than the index (journals/+pages/ vs graph-wide); once REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 widened the rescan to the same scope, the rescan's own result became a complete account of what changed and is published as exact observations instead. Ordering is load-bearing and asserted: the observation happens after the scan and BEFORE any reconcile, so the index is never staler than the scan that produced it -- the same window the inotify callback lane already had, not a wider one. A scan that could not read part of the graph reports itself incomplete and still invalidates. Fail-before proven by restoring the blanket invalidation in place: the quiet-cycle test then reported invalidated: true with complete_builds unchanged at 1."
+    },
+    {
+      "id": "REG-DIRECT-SAVE-WHOLE-GRAPH-REPARSE-267",
+      "title": "Saving a page does not reparse every document in the graph",
+      "family": "direct-save-performance",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::a_rebuild_parses_only_the_documents_whose_bytes_changed",
+          "crates/tine-core/src/model.rs::reused_semantics_follow_the_bytes_not_the_file",
+          "crates/tine-core/src/model.rs::steady_state_direct_saves_do_not_rebuild_the_graph_index",
+          "crates/tine-core/src/model.rs::direct_save_latency_manual_benchmark"
+        ],
+        "scenario": "direct-markdown.save-latency",
+        "failBefore": "proven"
+      },
+      "notes": "A Direct save validates its target against a guarded graph-wide admission index. Whenever the exact-observation chain had broken -- which on Windows and in poll mode was permanent before REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 and REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001 -- rebuilding that index PARSED EVERY DOCUMENT IN THE GRAPH, on every save. An invalidation means 'we lost track of the filesystem', not 'everything changed': the capture already carries a per-file BlobDescription (SHA-256 of the content plus its length), so a rebuild now reuses the prior index's parsed semantics for every file whose digest is unchanged and parses only what actually moved. Soundness rests on a new per-record `semantic_parsed` flag: a record whose semantic came from the page cache or from its filename is a guess and is never reused, so the reuse cannot launder a guess into something later builds treat as parsed. Fail-before proven by disabling the reuse in place: a rebuild then parsed 27 documents whether or not anything had changed, against 3 (nothing changed) and 4 (one document changed) with it. Measured on a synthetic 1,001-page / 12 MB graph, release build, local ext4: a save that rebuilds went 81 ms -> 62 ms, with the index-construction phase 29 ms -> 9 ms and decode_semantics still true (authority preserved). The remaining ~50 ms is the two-pass capture, which still reads every file; that cut is not in this change. Two simpler designs were tried and rejected with evidence, both recorded in the handoff: threading a `need_semantics` flag into the cache-hit test forced an index rebuild MID-WRITE, when the save's own .editor-recovery file still aliases the target's inode, and failed the save outright; and skipping the parse for saves alone opened a real hole where a page creation could be admitted over an externally retitled document. Also note the codebase's standing contract, asserted by generation_bound_identity_validation_avoids_save_time_graph_reparse, that name-only creation must not run a per-document parse pass -- any future cut here has to keep it."
+    },
+    {
+      "id": "REG-SAME-BYTES-EXTERNAL-REPLACE-STRANDS-EDITOR-001",
+      "title": "A page whose file was replaced with identical content can still be saved instead of stranding the edit",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::a_same_bytes_external_replace_does_not_strand_the_editor",
+          "crates/tine-core/src/model.rs::a_changed_bytes_external_replace_still_conflicts"
+        ],
+        "scenario": "direct-markdown.external-atomic-replace",
+        "failBefore": "proven"
+      },
+      "notes": "A save proves it is not clobbering someone else's work two ways: base_rev must still match the bytes on disk, AND the file must still be the same physical file read at load. External tools break the second without touching the first -- OneDrive rehydrating a Files-On-Demand placeholder, a Syncthing pull landing identical bytes, cp over a hardlink. Every later save then failed with 'existing page identity changed since load', and BOTH exits from the resulting conflict prompt were dead ends: Keep-mine re-ran the same check and failed too, and Use-disk-version discarded the user's edit. The watcher now re-pins the retained identity when, and only when, the retained revision still matches the bytes now on disk, so the proof it stands on is unchanged. Fail-before proven by disabling the re-pin in place. The control (a replace that also changes the bytes) still conflicts and still writes nothing, and is asserted alongside."
+    },
+    {
+      "id": "REG-SYMLINK-BLOCKS-ALL-SAVES-001",
+      "title": "A symlink inside the graph does not make every other page unsaveable",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::a_symlink_blocks_saves_only_inside_a_descended_scope",
+          "crates/tine-core/src/model.rs::the_shadow_import_capture_still_refuses_a_symlink"
+        ],
+        "scenario": "direct-markdown.symlink-in-scope",
+        "failBefore": "proven"
+      },
+      "notes": "One symlink in a descended, non-excluded scope (graph root, pages/, journals/, a custom folder) aborted the save-time admission capture, and because every Direct save takes that capture to answer a filename question, the whole graph became read-only -- the user's OTHER pages could not be saved either. Skipping is what the rest of Tine already does: every traversal is no-follow, the watcher snapshot never descends a symlinked directory, and graph_inventory_entry never admits a symlinked file, so the capture was the only place escalating a non-entity to a fatal error. The shadow-import bootstrap capture still refuses, asserted separately: an import that silently leaves out a file the user considers part of their graph is a worse failure than a refused import. NOTE the audit's own repro for this finding is WRONG -- it used assets/, which is fixed-excluded, so that experiment goes green and would retire a real finding; both halves are asserted in one test so nobody re-runs it. Known bounded gap: a symlink is no longer a member of the portable-key collision group, matching discovery, which never knew about it either."
+    },
+    {
+      "id": "REG-SAVE-ERROR-MISCLASSIFIED-AS-CONFLICT-001",
+      "title": "Save failures that a conflict prompt cannot resolve are reported as themselves, not as a content conflict",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/commands.rs::only_a_real_base_revision_conflict_raises_the_conflict_prompt"
+        ],
+        "scenario": "direct-markdown.save-error-classification",
+        "failBefore": "proven"
+      },
+      "notes": "The backend collapsed EVERY io::ErrorKind::AlreadyExists to the literal string 'conflict', and the frontend recognised a conflict by testing whether the message CONTAINED that substring. A portable-filename collision, a physical-resource alias, a symlink refusal and 'another document owns this page identity' therefore all raised the content-conflict prompt, whose only options are Keep-mine and Use-disk-version -- neither of which can resolve any of them. Choosing either left the page marked conflicted, and a conflicted page silently refuses to save from then on, so the user's page was stranded by an error message. Only a real base-revision conflict carries the 'conflict' contract now; everything else carries its bounded D0 failure code as a stable prefix and falls through to the retryable path. The frontend match is exact rather than substring. Fail-before is structural and asserted directly on the mapping function."
+    },
+    {
+      "id": "REG-CAPTURE-TWO-PASS-CONCURRENCY-001",
+      "title": "A sync client touching an unrelated file does not fail the save in progress",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::a_concurrent_change_during_capture_is_retried_not_surfaced"
+        ],
+        "scenario": "direct-markdown.capture-concurrency",
+        "failBefore": "proven"
+      },
+      "notes": "The save-time admission capture runs two full-graph passes that must agree exactly, and ANY concurrent filesystem activity anywhere in the graph makes them disagree. On a Syncthing / Dropbox / OneDrive folder that is not an anomaly, it is the steady state -- and a single disagreement surfaced as a failed save. Disagreement means 'something moved while we looked', not 'the graph is broken', so it is now retried in place up to 4 attempts; every other error still surfaces immediately, and the caller holds the identity-mutation authority across all attempts so this cannot interleave with one of our own writes. Fail-before proven by setting CAPTURE_ATTEMPTS to 1."
+    },
+    {
+      "id": "REG-SAVE-RETRY-AMPLIFICATION-001",
+      "title": "A save failure a retry cannot change is reported once instead of re-running the whole check three times",
+      "family": "direct-save-performance",
+      "sources": {
+        "issues": [
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistence.test.ts::does not retry failures a retry cannot change"
+        ],
+        "scenario": "direct-markdown.save-retry-policy",
+        "failBefore": "proven"
+      },
+      "notes": "scheduleTransientRetry re-ran a failed save at 100 ms and 300 ms before toasting -- three full attempts per dirty page. Each attempt re-runs the whole pre-save admission check, which on a large graph is the expensive part, only to reach the same answer for a failure class that cannot change on retry: a portable-filename collision, a physical-resource alias, a symlink in scope, a non-portable path, a nofollow refusal, a limit breach, or another page already owning the title. #267's 'about a minute, then a red toast' is that multiplier on top of an already slow check. Those classes now report once; genuinely transient ones (precheck.interrupted, identity.changed_since_load, unclassified I/O) still retry. Depends on REG-SAVE-ERROR-MISCLASSIFIED-AS-CONFLICT-001 for the bounded codes that make the distinction possible."
+    },
+    {
+      "id": "REG-DIRECT-FORCE-SAVE-WIRE-DTO-001",
+      "title": "Resolving a save conflict with \"keep mine\" overwrites the file, including after a real external change",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::force_save_succeeds_on_the_revless_dto_the_frontend_sends",
+          "crates/tine-core/src/model.rs::force_save_overrides_a_real_external_change_with_the_wire_dto"
+        ],
+        "scenario": "direct-markdown.conflict-keep-mine",
+        "failBefore": "proven"
+      },
+      "notes": "force_save_page proved its right to write the pinned file from PageDto.rev, which pageToDto never sets -- ordinary saves carry the load revision in the separate base_rev argument, as the parameter's own comment said. With rev=None the retained-owner check could not hold, so every override failed AlreadyExists 'path-pinned page does not match its captured exact owner', leaving discard-my-edits as the only working exit from the conflict prompt. The suite missed it because every test force-saved a load_named/load_by_path DTO, which does carry rev=Some -- a shape the wire never produces. Replaced the untyped revision argument with an explicit PinnedSaveAuthority. Audit 2026-08-06 N1 (Critical)."
+    },
+    {
+      "id": "REG-DIRECT-SAVE-ERROR-CLASSIFICATION-002",
+      "title": "An unclassified save failure reports what happened instead of raising an unresolvable conflict prompt",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::direct_save_failure_codes_are_stable",
+          "src-tauri/src/commands.rs::only_a_real_base_revision_conflict_raises_the_conflict_prompt",
+          "src-tauri/src/commands.rs::an_unobserved_external_change_still_raises_the_conflict_prompt"
+        ],
+        "scenario": "direct-markdown.save-error-codes",
+        "failBefore": "proven"
+      },
+      "notes": "direct_save_failure_code ended with a catch-all mapping any AlreadyExists to conflict.other, which commands.rs turned into the literal 'conflict' -- the string that raises the keep-mine/use-disk banner. About forty-five other conditions raise AlreadyExists (managed and projection internals, reservation and page-name collisions) for which neither button helps and 'use disk' discards the user's edits; the mapping also replaced the message text, so a failure that had RETAINED those edits under a recovery name arrived as a bare unexplained conflict. conflict.* membership is now decided by naming a condition. Audit 2026-08-06 N3 (High) and the still-open half of N2."
+    },
+    {
+      "id": "REG-DIRECT-MOVE-BARRIER-FORCE-003",
+      "title": "A conflict resolution during a cross-page move waits for the destination write instead of writing the moved block out of existence",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistenceMoveBarrier.test.ts::defers a keep-mine on a held source, then applies it on release"
+        ],
+        "scenario": "direct-markdown.move-barrier",
+        "failBefore": "proven"
+      },
+      "notes": "heldSources holds a moved subtree's SOURCE pages until the DESTINATION write is durable, so the block is never in neither place. The guard read heldSources.has(name) && !force, so a forced save walked through it. Latent while force-save could not reach the backend (N1); live once it could. A deferred keep-mine is now remembered and re-issued when the destination lands, because the ordinary save path skips a conflicted page and dropping it would strand the resolution. Audit 2026-08-06 N6."
+    },
+    {
+      "id": "REG-MANAGED-ANNOTATION-SPAN-REPLAY-004",
+      "title": "External changes to a Tine-managed graph reconcile instead of being refused to the retry limit",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/projection.rs::authenticated_annotations_do_not_change_the_planned_annotations",
+          "crates/tine-core/src/sync_runtime.rs::ordinary_external_edit_settles_its_epoch_and_still_reaches_a_safe_handoff",
+          "crates/tine-core/src/sync_runtime.rs::external_changes_outside_configured_roots_reconcile_without_flattening"
+        ],
+        "scenario": "managed.external-reconcile",
+        "failBefore": "proven"
+      },
+      "notes": "The drain proves a durable receipt still describes the accepted state by replaying it and comparing intents; the receipt is written WITH authenticated annotations and the replay runs WITHOUT them. plan_exact_source_projection compared whole annotations, whose spans come from two producers with different conventions over the same bytes: marker instrumentation ends a block before its line terminator, block tiling runs to the start of the next block and includes it. One save through the fall-through branch wrote tiling spans into the receipt, which then became the next save's authenticated base and could never match a fresh render, so every later save took the fall-through while the replay always took the rendered route. Now compares identities and lets spans be re-derived. Bisected to 547f8713, which is correct and was NOT reverted. Eight sync_runtime tests were one defect."
+    },
+    {
+      "id": "REG-MANAGED-CONFLICT-SURFACING-005",
+      "title": "A refused managed save reports the refusal instead of retrying silently forever",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistence.test.ts::does not retry failures a retry cannot change"
+        ],
+        "scenario": "managed.conflict-surfacing",
+        "failBefore": "not-required"
+      },
+      "notes": "A managed conflict returned 'conflict: {Reason}'. The frontend compares the conflict string exactly, so it matched neither the banner nor any bounded code and fell into the transient-retry path -- retried on a timer, never surfaced, and the user could quit believing the page was written. Now carries a managed.conflict code the frontend treats as permanent, with a message saying to reload. Deliberately not the bare 'conflict': force is hard-refused while managed storage is active, so that banner's only working button would be the one that discards the user's edits. A real managed resolution path is a product decision and remains open as audit M2's second half. Audit 2026-08-06 M2 (High) and M5."
+    },
+    {
+      "id": "REG-MANAGED-WINDOWS-RENAME-NOREPLACE-006",
+      "title": "A managed rename on Windows refuses to replace a file that appears between the check and the rename",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::rename_managed_noreplace"
+        ],
+        "scenario": "managed.windows-rename",
+        "failBefore": "not-required"
+      },
+      "notes": "rename_managed_noreplace used renameat2(RENAME_NOREPLACE) on Linux/Android and renameatx_np(RENAME_EXCL) on macOS/BSD, but Dir::rename on Windows -- which cap-std implements with replace semantics, so the one guarantee its name makes was the one Windows did not provide. Now delegates to rename_projection_between_noreplace, which renames an opened DELETE-access handle with FileRenameInformation and ReplaceIfExists=FALSE and rejects filesystems lacking the primitive before retiring the live source name. Compile-verified for x86_64-pc-windows-gnu locally; behaviour is proved by the Windows CI job, so confidence is partial by design. Audit 2026-08-06 M3."
+    },
+    {
+      "id": "REG-MANAGED-SAFE-REOPEN-DISPOSABLE-PROJECTION-001",
+      "title": "A cleanly shut down managed graph never opens again if its disposable SQLite projection is lost or damaged",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_safe_reopen_rebuilds_a_deleted_disposable_projection",
+          "crates/tine-core/src/sync_runtime.rs::managed_safe_reopen_rebuilds_an_unreadable_disposable_projection"
+        ],
+        "scenario": "managed.safe-reopen-projection-recovery",
+        "failBefore": "proven"
+      },
+      "notes": "A Safe (clean-shutdown) reopen used reopen_promoted_local_runtime_existing_projection, which refused a missing or invalid projection instead of rebuilding it, while the crash path already rebuilt the same state. So the tidier lifecycle was the unrecoverable one: deleting the cache (cleared cache directory, sweeper, restore that skipped it) or leaving it unreadable (corruption, schema-version bump) left the graph permanently unopenable, reported to the frontend as Retryable -- a retry button that can never succeed. The projection is a frontier-stamped disposable cache of an authoritative oplog per ADR 0049, so losing it is recoverable by definition. The Safe path now uses reopen_promoted_local_runtime (AllowRebuild) and the existing-only entry point is deleted; ExistingOnly survives only for the same-process handoff, where the projection is held open by this very process. A present, current projection still opens as-is. Fail-before: both tests fail on the parent commit with OpenRefused."
+    },
+    {
+      "id": "REG-MANAGED-PROJECTION-REBUILD-SUPERLINEAR-001",
+      "title": "Rebuilding a managed graph's projection cost about n^1.6, so a large graph spent minutes on a recovery a small one did in a second",
+      "family": "managed-storage-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_projection_rebuild_resolves_documents_through_lookup_sessions"
+        ],
+        "scenario": "managed.projection-rebuild-cost",
+        "failBefore": "proven"
+      },
+      "notes": "AcceptedRootMaterializer -- the materializer a projection rebuild actually uses -- held no scratch lookup sessions, while BootstrapBulkMaterializer held two. Every document resolution therefore re-walked the scratch LSM from the top, and the LSM grows with the graph, so per-document cost rose with graph size even though the number of document loads stayed linear (2.17, 2.04, 1.96 loads per file at 100/350/1045 files). Measured on the anonymized corpus: 388 ms / 2,214 ms / 14,976 ms, i.e. exponent 1.46 then 1.76, against Martin's stated ceiling of 10 s and truly linear. After giving the materializer the same two root-bound sessions: 271 ms / 796 ms / 2,627 ms, exponent 0.86 then 1.09. Sessions change only how bytes are reached; every record still proves its own anchor, peer counters and direct heads. The guard asserts session hits exceed misses rather than a wall-clock budget, because a small CI fixture is fast whatever the routing -- which is how this went unnoticed. Fail-before: 0 hits, 0 misses over 128 document loads."
+    },
+    {
+      "id": "REG-MANAGED-ALIAS-BINDING-UNREAD-ROOT-STAMP-001",
+      "title": "An unread catalog-root stamp in the page-alias table made two correct builds of the same graph disagree",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-storage/src/formats.rs::format_identity_is_pinned",
+          "crates/tine-core/src/oplog/sqlite.rs::ordinary_drained_saves_match_clean_archive_replay_across_rich_shapes"
+        ],
+        "scenario": "managed.alias-binding-provenance",
+        "failBefore": "proven"
+      },
+      "notes": "reference_alias_bindings carried a catalog_root_digest column that every write path set and no read path ever consulted -- both production reads select resolved_page_id filtered by normalized_alias only. Because it sat in the primary key and the row digest, it made an incrementally drained database and a rebuilt one disagree on a page they resolved identically: the drain stamps the catalog root current when the alias was last touched, a rebuild stamps the root it resolved at. Dumped rows confirmed same alias, same ordinal, same resolved page, different stamp, while both databases carried the same materialization_stamp. Column dropped from the table, its primary key, its index and the digested column list; SQLITE_SCHEMA_VERSION 11 -> 12, so each managed graph rebuilds its projection once. The projection's own materialization_stamp already records the catalog root the whole database is at, which is the question anyone actually asks. Fail-before: format_identity_is_pinned caught the version change immediately, which is what it is for."
+    },
+    {
+      "id": "REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001",
+      "title": "Linked/Unlinked References, search, quick switch, {{query}}, aliases, templates and asset reads work while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/state.rs::tests::a_managed_binding_answers_whole_graph_reads_and_still_refuses_writes",
+          "src-tauri/src/state.rs::tests::a_legacy_binding_serves_reads_through_its_lease",
+          "crates/tine-core/src/model.rs::a_derived_read_only_graph_reads_the_tree_but_cannot_write_it",
+          "crates/tine-core/src/model.rs::a_derived_read_only_graph_still_accepts_asset_writes"
+        ]
+      },
+      "notes": "Martin reported \"Couldn't load references because the backend request failed.\" on every page of a managed graph. Root cause was authority, not references: GraphSlot exposed only legacy write authority, so with_graph refused all ~50 read-only commands under managed storage and only six page-path commands worked. Reads now go through with_read_graph, served for managed bindings by a Graph opened with open_derived_read_only over the projected tree. That view fails every graph-text write at admit_managed_text_writer and ensure_write_target, so a misrouted write command errors instead of writing behind the oplog; assets stay writable because assets/ is outside the oplog's document domain. Writes (rename, delete, merge, config setters, conflict resolution) remain refused under managed storage and still need real oplog implementations."
+    },
+    {
+      "id": "REG-MANAGED-SETTINGS-WRITES-REFUSED-001",
+      "title": "Every Settings toggle persists while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::a_derived_read_only_graph_still_writes_graph_configuration",
+          "src-tauri/src/state.rs::tests::a_managed_binding_persists_settings_and_trash_but_not_graph_text",
+          "src-tauri/src/state.rs::tests::a_managed_settings_change_rebuilds_the_read_only_view",
+          "src-tauri/src/managed_command_surface.rs::tests::settings_and_asset_trash_are_not_refused_under_managed_storage"
+        ]
+      },
+      "notes": "Favorites, preferred workflow, preferred format, journal title format, start of week, show brackets, logical outdenting, doc-mode Enter, time tracking, default journal template and the guide-announced flag all silently failed under Tine-managed storage: the eleven set_* commands went through with_graph, the authority that answers \"may this caller write graph text\", and a managed binding correctly says no. Settled from source that graph configuration is NOT oplog-owned: the reconciliation scanner classifies logseq/config.edn as GraphTextScanPathClass::Configuration (model.rs, capture_reconciliation_scan_pass) and reconciliation_baseline_adapter.rs::scan_file_row drops those rows as \"not managed content\" that \"cannot be represented as a ManagedPath\", so nothing imports, projects or reconciles it; config bytes only join the within-scan two-pass stability digest. sync_runtime.rs:17310, the line that raised the question, is a test fixture's filesystem walk and says nothing about the oplog's domain. Fix: a Graph::ensure_config_write_target capability narrowed to that one exact path, and a with_config_graph route at the command layer. refresh_graph now takes a managed branch that rebuilds the read-only view instead of reopening a legacy graph, because a Graph reads config.edn when it opens. The same branch refreshes the GraphMeta snapshot the slot hands back, which load_graph returns verbatim when a window reloads the root it already holds; without it a saved setting looked reverted on the next load. The legacy path gets that for free by publishing a replacement slot. Still not done under managed storage: set_journal_title_format does not migrate journal filenames, since that is a rename the oplog owns."
+    },
+    {
+      "id": "REG-MANAGED-ASSET-TRASH-REFUSED-001",
+      "title": "Orphaned assets can be trashed and the asset trash emptied while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::a_derived_read_only_graph_trashes_assets_but_not_journals",
+          "src-tauri/src/state.rs::tests::a_managed_binding_persists_settings_and_trash_but_not_graph_text",
+          "src-tauri/src/managed_command_surface.rs::tests::settings_and_asset_trash_are_not_refused_under_managed_storage"
+        ]
+      },
+      "notes": "trash_asset and empty_asset_trash were refused under managed storage only incidentally: the asset itself passed ensure_asset_write_target, but the destination directory went through ensure_write_target, which the read-only view refuses along with graph text. Settled from source that the trash tree is outside the oplog's document domain: graph_text_scope.rs::fixed_excluded lists logseq/.tine-trash beside assets, publish and .tine-sync, so nothing under it is scanned, imported or projected. Fix: Graph::ensure_trash_write_target, used by the four asset-side trash destinations, plus a with_trash_graph route. Page, journal and conflict trashing is unaffected and still refused, because its SOURCE is graph text and it goes through admit_managed_text_writer."
+    },
+    {
+      "id": "REG-MANAGED-WHOLE-GRAPH-WRITES-REFUSED-001",
+      "title": "Page rename/delete/merge, conflict resolution, guide copy and native capture work while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/managed_command_surface.rs::tests::every_graph_command_declares_what_managed_storage_can_do_with_it",
+          "src-tauri/src/managed_command_surface.rs::tests::the_refused_surface_is_exactly_the_commands_still_on_the_legacy_authority",
+          "src-tauri/src/managed_command_surface.rs::tests::no_graph_routing_hides_in_the_unscanned_sources"
+        ]
+      },
+      "notes": "Remaining half of the 2026-08-07 authority defect. The read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001 (25f36f16); settings and the asset trash are REG-MANAGED-SETTINGS-WRITES-REFUSED-001 and REG-MANAGED-ASSET-TRASH-REFUSED-001. Still refused under managed storage, needing real oplog transactions: rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, copy_guide_into_graph. The enumeration this row asked for now exists: src-tauri/src/managed_command_surface.rs lists all 141 Tauri commands with the routing each one uses, re-derives that routing from the sources, and fails when the refused set changes -- so a new command that cannot work under managed storage is a failing diff rather than a user report. That enumeration surfaced a group nobody had listed: publish_html, open_pdf, read_highlights, write_highlights, write_pdf_view_state, save_pdf_area_image, save_asset and stream_asset_path are all asset/publish-domain work, outside the oplog's document domain, still sitting on the legacy write authority. They are the cheapest remaining slice. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md."
     }
   ]
 }

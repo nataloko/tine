@@ -283,7 +283,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use crate::model::Graph;
@@ -297,9 +296,10 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
+    replay_promoted_bootstrap_into_ephemeral_predecessor,
     replay_promoted_bootstrap_validating_history, EngineError, EngineOpenRetention,
-    LocalAuthorGeneration, PackedPatriciaMaintenanceReport, ProjectionStorageBinding,
-    RuntimeResumeObservation, ShardedHotEngine,
+    EphemeralBootstrapPredecessor, LocalAuthorGeneration, PackedPatriciaMaintenanceReport,
+    ProjectionStorageBinding, RuntimeResumeObservation, ShardedHotEngine,
 };
 use super::import::{
     InactiveBootstrapAcceptedAuthority, RetainedBootstrapPromotionCandidate,
@@ -390,9 +390,23 @@ pub(crate) struct PromotedRuntimeOpenInstrumentation {
     pub(crate) bootstrap_runtime_authority: Duration,
     pub(crate) resume_candidate: Duration,
     pub(crate) reconstructed_bootstrap_resume: bool,
+    pub(crate) reconstructed_ephemeral_bootstrap: bool,
     pub(crate) engine_open: Duration,
     pub(crate) sqlite_open: Duration,
     pub(crate) tail_construction: Duration,
+    /// Which branch the disposable SQLite projection actually took at open, and
+    /// what the rebuild did if it rebuilt. `sqlite_open` alone cannot distinguish
+    /// "reopened a valid projection slowly" from "threw it away and rebuilt the
+    /// whole graph", and those have opposite fixes.
+    pub(crate) projection_recovery: &'static str,
+    pub(crate) projection_rebuild_reason: String,
+    pub(crate) projection_applied_batches: usize,
+    pub(crate) projection_bulk_pages_materialized: usize,
+    pub(crate) projection_ancestry_full_scans: usize,
+    /// The rebuild's own counters, carried whole rather than field by field.
+    /// Which term carries a superlinear rebuild is not known in advance, so
+    /// copying three of them forces a source change every time the search moves.
+    pub(crate) projection_rebuild_counters: super::sqlite::RebuildInstrumentation,
     pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
 }
 
@@ -431,9 +445,16 @@ fn record_promoted_runtime_mint(
     record.bootstrap_runtime_authority = timing.bootstrap_runtime_authority;
     record.resume_candidate = timing.resume_candidate;
     record.reconstructed_bootstrap_resume = timing.reconstructed_bootstrap_resume;
+    record.reconstructed_ephemeral_bootstrap = timing.reconstructed_ephemeral_bootstrap;
     record.engine_open = timing.engine_open;
     record.sqlite_open = timing.sqlite_open;
     record.tail_construction = timing.tail_construction;
+    record.projection_recovery = timing.projection_recovery;
+    record.projection_rebuild_reason = timing.projection_rebuild_reason;
+    record.projection_applied_batches = timing.projection_applied_batches;
+    record.projection_bulk_pages_materialized = timing.projection_bulk_pages_materialized;
+    record.projection_ancestry_full_scans = timing.projection_ancestry_full_scans;
+    record.projection_rebuild_counters = timing.projection_rebuild_counters;
     record.engine = timing.engine;
 }
 
@@ -2152,6 +2173,10 @@ pub(crate) struct PromotedLocalRuntime {
     /// authority, neither vends a scan, a reachability proof, a record, or any
     /// deletion surface, and neither is consulted by any admission path.
     resume_open: RuntimeResumeOpenStatus,
+    /// Opt-in, bounded recovery timings and classifications. This has no
+    /// authority semantics and exists only when local debug logging was enabled
+    /// before the promoted runtime was opened.
+    recovery_diagnostics: Option<PromotedRuntimeRecoveryDiagnostics>,
     resume_publication: Option<ResumePublicationStatus>,
     /// Sealed post-open/pre-first-mutation publication window.
     post_open_publication_available: bool,
@@ -2180,6 +2205,39 @@ pub(crate) enum RuntimeRecoveryState {
     TookOverCrashedUnsafe { previous_session: SessionId },
 }
 
+/// Bounded, content-free receipt for one promoted runtime recovery.  The
+/// application may write this to its local TINE_DEBUG trace, but it contains no
+/// graph paths, page/block names, identifiers, payloads, or opaque nested
+/// errors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PromotedRuntimeRecoveryDiagnostics {
+    pub(crate) recovery: &'static str,
+    pub(crate) retention_plan: &'static str,
+    pub(crate) retained_run_count: usize,
+    pub(crate) resume_candidate: &'static str,
+    pub(crate) detached_bootstrap_reconstruction: bool,
+    pub(crate) full_bootstrap_replay: bool,
+    pub(crate) manifest_count: usize,
+    pub(crate) manifest_enumeration: Duration,
+    pub(crate) resume_selection: Duration,
+    pub(crate) bootstrap_reconstruction: Option<Duration>,
+    pub(crate) engine_open: Duration,
+    pub(crate) sqlite_open: Duration,
+    pub(crate) tail_construction: Duration,
+    pub(crate) total: Duration,
+    /// Which branch the SQLite projection open took, and where its time went.
+    pub(crate) projection: super::sqlite::ProjectionOpenBreakdown,
+    /// Which stage inside `engine_open` the time actually went to.
+    pub(crate) engine_stages: super::hot_engine::EngineOpenStageBreakdown,
+    /// What the resume accelerator actually did, which decides how much
+    /// history has to be replayed at all.
+    pub(crate) resume_adopted: bool,
+    pub(crate) resume_refused: bool,
+    pub(crate) replay_base_generation: u64,
+    pub(crate) live_history_generation: u64,
+    pub(crate) replayed_generations: u64,
+}
+
 /// Whether this runtime may run automatic external Markdown/Org import.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalImportAdmission {
@@ -2197,8 +2255,10 @@ pub(crate) enum ExternalImportAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeResumeOpenStatus {
     /// The pre-mint retention decision, taken before any run was created or
-    /// adopted. `Ephemeral` means this engine runs on a disposable run and
-    /// replayed in full, and that no new retained run was added.
+    /// adopted. `Ephemeral` means this engine runs on a disposable run and no
+    /// new retained run was added. It may still consume an authenticated,
+    /// one-process ephemeral bootstrap predecessor; `replay_base_generation`
+    /// in `observation` distinguishes that tail replay from a full replay.
     plan: EngineScratchRetentionPlan,
     /// `None` means a published candidate was offered to the engine. `Some`
     /// records why the accelerator was not even offered.
@@ -3596,6 +3656,13 @@ impl PromotedLocalRuntime {
         &self.resume_open
     }
 
+    /// The bounded startup receipt is deliberately separate from the runtime's
+    /// authority and is absent unless debug diagnostics were enabled before
+    /// construction.
+    pub(crate) fn recovery_diagnostics(&self) -> Option<PromotedRuntimeRecoveryDiagnostics> {
+        self.recovery_diagnostics.clone()
+    }
+
     /// The last quiescent publication attempt's status, if one has run.
     pub(crate) const fn resume_publication_status(&self) -> Option<&ResumePublicationStatus> {
         self.resume_publication.as_ref()
@@ -4238,25 +4305,6 @@ pub(crate) fn reopen_promoted_local_runtime(
     )
 }
 
-/// Runtime-host reopen which refuses a missing or invalid disposable
-/// projection instead of repairing it during startup.
-pub(crate) fn reopen_promoted_local_runtime_existing_projection(
-    root: &EnrollmentApplicationRoot,
-    binding: &EnrollmentBindingV1,
-    session_id: SessionId,
-    open: &PromotedRuntimeOpen<'_>,
-) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
-    reopen_promoted_local_runtime_with_adoption(
-        root,
-        binding,
-        session_id,
-        open,
-        HandoffAdoption::OwnSessionOrSafe,
-        TakeoverPublication::Durable,
-        PromotedProjectionOpen::ExistingOnly,
-    )
-}
-
 /// The sole archive-lease-proved `LocalActive` crash-takeover boundary.
 ///
 /// A new process may adopt a *different* session's committed
@@ -4861,6 +4909,64 @@ fn same_process_token_matches(
             .is_ok_and(|digest| digest == state.enrollment_binding_digest)
 }
 
+fn promoted_runtime_debug_enabled() -> bool {
+    matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
+        || std::env::args().any(|argument| argument == "--debug")
+}
+
+fn recovery_diagnostic_class(recovery: RuntimeRecoveryState) -> &'static str {
+    match recovery {
+        RuntimeRecoveryState::FirstPromotion => "first_promotion",
+        RuntimeRecoveryState::ResumedOwnUnsafe => "resumed_own_unsafe",
+        RuntimeRecoveryState::AdoptedSafeHandoff => "adopted_safe_handoff",
+        RuntimeRecoveryState::TookOverCrashedUnsafe { .. } => "crash_takeover",
+    }
+}
+
+fn retention_plan_diagnostic(plan: &EngineScratchRetentionPlan) -> (&'static str, usize) {
+    match plan {
+        EngineScratchRetentionPlan::Retained { retained_runs } => ("retained", *retained_runs),
+        EngineScratchRetentionPlan::Ephemeral { retained_runs, .. } => {
+            ("ephemeral", *retained_runs)
+        }
+    }
+}
+
+fn resume_candidate_diagnostic(
+    plan: &EngineScratchRetentionPlan,
+    candidate: Option<&ResumeAdoptionCandidate>,
+) -> &'static str {
+    match (plan, candidate) {
+        (EngineScratchRetentionPlan::Ephemeral { .. }, None) => "not_read_ephemeral",
+        (_, Some(ResumeAdoptionCandidate::Available(_))) => "available",
+        (
+            _,
+            Some(ResumeAdoptionCandidate::Unavailable(
+                ResumeAcceleratorUnavailable::NeverPublished,
+            )),
+        ) => "never_published",
+        (
+            _,
+            Some(ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::ProofDenied(
+                _,
+            ))),
+        ) => "proof_denied",
+        (
+            _,
+            Some(ResumeAdoptionCandidate::Unavailable(
+                ResumeAcceleratorUnavailable::BindingRefused(_),
+            )),
+        ) => "binding_refused",
+        (
+            _,
+            Some(ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::Unavailable(
+                _,
+            ))),
+        ) => "unavailable",
+        _ => "not_read",
+    }
+}
+
 fn require_promoted_bootstrap_runtime_authority(
     archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
@@ -4928,6 +5034,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     projection_open: PromotedProjectionOpen,
     same_process: Option<SameProcessPromotionToken>,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
+    // Always recorded. A startup breakdown that only exists when someone
+    // remembered to set an environment variable is not available at the moment
+    // it is needed -- the first time a user reports a slow open.
+    let diagnostic_started = Some(Instant::now());
+    let _ = promoted_runtime_debug_enabled();
     #[cfg(test)]
     let workspace_id = state.workspace_id;
     #[cfg(test)]
@@ -5030,6 +5141,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // been written.
     #[cfg(test)]
     resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeCandidateRead);
+    let resume_selection_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
     try_release!(workspace_lease.revalidate_identity());
@@ -5061,9 +5173,16 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.resume_candidate = phase_started.elapsed();
     }
 
+    let resume_selection = resume_selection_started.map(|started| started.elapsed());
+    let mut resume_candidate = resume_candidate_diagnostic(&retention_plan, candidate.as_ref());
+    let (retention_plan_class, retained_run_count) = retention_plan_diagnostic(&retention_plan);
+
     // Recovery replays the archive's committed manifests. This is the existing
     // enrolled-recovery cost and reads no graph text.
+    let manifest_enumeration_started = diagnostic_started.map(|_| Instant::now());
     let committed_manifests = try_release!(archive.committed_manifests());
+    let manifest_enumeration = manifest_enumeration_started.map(|started| started.elapsed());
+    let manifest_count = committed_manifests.len();
     let anchor = state.anchor_authority();
     // Strict selection with an unconditional fallback: only an `Available`
     // candidate is offered, and every other shape — never published, proof
@@ -5158,16 +5277,20 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         }
         (None, _) => None,
     };
+    let mut ephemeral_predecessor: Option<Box<EphemeralBootstrapPredecessor>> = None;
     // A crash can leave no adoptable run-local resume point even though the
     // immutable bootstrap publication and its sealed history are intact. Build
     // that bootstrap once in the detached authoring engine, then migrate the
     // completed candidate into the same authenticated resume path used by
     // same-process promotion. The enrolled open below still validates the
     // migrated snapshot and replays every post-bootstrap history record.
+    let mut detached_bootstrap_reconstruction = false;
+    let mut bootstrap_reconstruction = None;
     if migrated.is_none()
         && snapshot.is_none()
         && matches!(retention_plan, EngineScratchRetentionPlan::Retained { .. })
     {
+        let reconstruction_started = diagnostic_started.map(|_| Instant::now());
         let reconstructed = (|| {
             let (history_store_capability, history_store) =
                 open_retained_history_control(&archive, &state)?;
@@ -5208,6 +5331,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         match reconstructed {
             Ok(reconstructed) => {
                 migrated = Some(reconstructed);
+                detached_bootstrap_reconstruction = true;
+                resume_candidate = "detached_bootstrap_reconstruction";
                 #[cfg(test)]
                 {
                     timing.reconstructed_bootstrap_resume = true;
@@ -5219,17 +5344,79 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
                 )));
             }
         }
+        bootstrap_reconstruction = reconstruction_started.map(|started| started.elapsed());
     }
-    let retention = match (retention_plan.clone(), migrated) {
-        (_, Some((retained, resume))) => EngineOpenRetention::MigratedBootstrap {
+    // The retention plan may deny creating another retained run while the
+    // immutable bootstrap and history remain fully valid. In that case full
+    // replay is still correct but need not replay the same multipart bootstrap
+    // twice: reconstruct it once directly into the exact archive-local
+    // ephemeral scratch this open will own, then revalidate that live scratch
+    // through the enrolled predecessor restore before replaying only its tail.
+    // This capability is process-local and cannot produce a resume point.
+    if snapshot.is_none()
+        && migrated.is_none()
+        && matches!(retention_plan, EngineScratchRetentionPlan::Ephemeral { .. })
+    {
+        let reconstructed = (|| {
+            let (history_store_capability, history_store) =
+                open_retained_history_control(&archive, &state)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+            replay_promoted_bootstrap_into_ephemeral_predecessor(
+                &history_store_capability,
+                &bootstrap_runtime_authority.publication,
+                state.workspace_id,
+                state.lineage_digest,
+                state.catalog_document_id,
+                promoted_storage_binding(&state),
+                &history_store,
+                state.anchor_history_index_root,
+                state.bootstrap,
+                EngineHistoryAuthority {
+                    generation: state.anchor_history_generation,
+                    index_root: state.anchor_history_index_root,
+                },
+            )
+        })();
+        match reconstructed {
+            Ok(predecessor) => {
+                ephemeral_predecessor = Some(predecessor);
+                #[cfg(test)]
+                {
+                    timing.reconstructed_ephemeral_bootstrap = true;
+                }
+            }
+            Err(error) => {
+                unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
+                    "ephemeral bootstrap recovery refused: {error}"
+                )));
+            }
+        }
+    }
+    let retention = match (retention_plan.clone(), migrated, ephemeral_predecessor) {
+        (_, Some((retained, resume)), None) => EngineOpenRetention::MigratedBootstrap {
             retained: Box::new(retained),
             resume,
         },
-        (EngineScratchRetentionPlan::Ephemeral { .. }, None) => EngineOpenRetention::Ephemeral,
-        (EngineScratchRetentionPlan::Retained { .. }, None) => EngineOpenRetention::Retained {
-            resume: snapshot.as_deref(),
-        },
+        (EngineScratchRetentionPlan::Ephemeral { .. }, None, Some(predecessor)) => {
+            EngineOpenRetention::EphemeralBootstrap { predecessor }
+        }
+        (EngineScratchRetentionPlan::Ephemeral { .. }, None, None) => {
+            EngineOpenRetention::Ephemeral
+        }
+        (EngineScratchRetentionPlan::Retained { .. }, None, None) => {
+            EngineOpenRetention::Retained {
+                resume: snapshot.as_deref(),
+            }
+        }
+        (EngineScratchRetentionPlan::Retained { .. }, Some(_), Some(_))
+        | (EngineScratchRetentionPlan::Retained { .. }, None, Some(_)) => {
+            unreachable!("ephemeral predecessor is only constructed for ephemeral retention")
+        }
+        (EngineScratchRetentionPlan::Ephemeral { .. }, Some(_), Some(_)) => {
+            unreachable!("retained migration is only constructed for retained retention")
+        }
     };
+    let engine_open_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
     let (engine, receipt, _outcomes) =
@@ -5249,15 +5436,19 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.engine_open = phase_started.elapsed();
         timing.engine = super::hot_engine::take_enrolled_projection_open_instrumentation();
     }
+    let engine_open = engine_open_started.map(|started| started.elapsed());
+    let engine_stages = super::hot_engine::take_engine_open_stage_breakdown();
     if let Some(error) = receipt.refusal.as_ref() {
+        resume_candidate = "engine_refused";
         unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
             "runtime resume restore refused: {error}"
         )));
     }
+    let resume_observation = engine.runtime_resume_observation();
     let resume_open = RuntimeResumeOpenStatus {
         plan: retention_plan,
         unavailable,
-        observation: engine.runtime_resume_observation(),
+        observation: resume_observation,
     };
     if engine.promoted_lineage() != Some(&state) {
         release!(RuntimePromotionError::Anchor(
@@ -5326,6 +5517,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // namespace rather than the ordinary object namespace. The publication
     // identity comes from the authorized promotion state.
     let publication = Arc::clone(&bootstrap_runtime_authority.publication);
+    // Same-process handoff: this very process already verified and is still
+    // holding that projection, so "it must already exist" is a fact here rather
+    // than a startup policy. Across processes the projection is a disposable
+    // cache and a rebuild is the correct answer to losing it.
     let projection_open = if verified_same_process_sqlite.is_some() {
         PromotedProjectionOpen::ExistingOnly
     } else {
@@ -5336,6 +5531,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // a second, temporary workspace lease of its own. A failed open returns the
     // slot *and* the lease, which is what makes it retryable without ever
     // releasing the archive.
+    let sqlite_open_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
     let (projection, ()) = match LeasedWorkspaceProjection::open_under::<(), ProjectionError>(
@@ -5374,7 +5570,33 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     #[cfg(test)]
     {
         timing.sqlite_open = phase_started.elapsed();
+        let opened = projection.projection();
+        let (recovery, reason, applied) = match &opened.recovery {
+            super::sqlite::ProjectionRecovery::OpenedExisting => {
+                ("opened-existing", String::new(), 0)
+            }
+            super::sqlite::ProjectionRecovery::RebuiltMissing { applied_batches } => {
+                ("rebuilt-missing", String::new(), *applied_batches)
+            }
+            super::sqlite::ProjectionRecovery::RebuiltPreservingEvidence {
+                reason,
+                applied_batches,
+                ..
+            } => (
+                "rebuilt-preserving-evidence",
+                reason.clone(),
+                *applied_batches,
+            ),
+        };
+        timing.projection_recovery = recovery;
+        timing.projection_rebuild_reason = reason;
+        timing.projection_applied_batches = applied;
+        timing.projection_bulk_pages_materialized = opened.rebuild.bulk_pages_materialized;
+        timing.projection_ancestry_full_scans = opened.rebuild.ancestry_full_scans;
+        timing.projection_rebuild_counters = opened.rebuild;
     }
+    let sqlite_open = sqlite_open_started.map(|started| started.elapsed());
+    let projection_breakdown = super::sqlite::take_projection_open_breakdown();
 
     // The lease now lives inside `projection`, so a failure has to close the
     // database to get it back — which releases the database-adjacent lock and
@@ -5411,6 +5633,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             close_and_release!(RuntimePromotionError::Sqlite(error));
         }
     }
+    let tail_construction_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
     let tail_source = match RebuildSource::from_promoted_runtime(&engine, store, &publication) {
@@ -5430,6 +5653,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     {
         timing.tail_construction = phase_started.elapsed();
     }
+    let tail_construction = tail_construction_started.map(|started| started.elapsed());
     // The archive identity facts above were authenticated for exactly this
     // session binding generation, so an unchanged-head admission may carry
     // them and any change forces the reread again.
@@ -5441,6 +5665,34 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         },
         WatcherQueueLimits::exact_external_feed(),
     );
+    let recovery_diagnostics =
+        diagnostic_started.map(|started| PromotedRuntimeRecoveryDiagnostics {
+            recovery: recovery_diagnostic_class(recovery),
+            retention_plan: retention_plan_class,
+            retained_run_count,
+            resume_candidate,
+            detached_bootstrap_reconstruction,
+            // Retained resume adoption and the process-local ephemeral
+            // predecessor both skip the bootstrap prefix. `adopted` names only
+            // the retained case, so the authenticated replay base is the exact
+            // discriminator for a generation-zero full replay.
+            full_bootstrap_replay: resume_observation.replay_base_generation == 0,
+            manifest_count,
+            manifest_enumeration: manifest_enumeration.unwrap_or_default(),
+            resume_selection: resume_selection.unwrap_or_default(),
+            bootstrap_reconstruction,
+            engine_open: engine_open.unwrap_or_default(),
+            sqlite_open: sqlite_open.unwrap_or_default(),
+            tail_construction: tail_construction.unwrap_or_default(),
+            total: started.elapsed(),
+            projection: projection_breakdown.clone(),
+            engine_stages,
+            resume_adopted: resume_observation.adopted,
+            resume_refused: resume_observation.refused,
+            replay_base_generation: resume_observation.replay_base_generation,
+            live_history_generation: resume_observation.live_history_generation,
+            replayed_generations: resume_observation.replayed_generations,
+        });
     let mut runtime = Box::new(PromotedLocalRuntime {
         state,
         anchor,
@@ -5463,6 +5715,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         // starts un-revoked. Nothing ever puts it back here.
         revocation: RuntimeRevocationLatch::default(),
         resume_open,
+        recovery_diagnostics,
         resume_publication: None,
         post_open_publication_available: true,
         _seal: seal::Seal,

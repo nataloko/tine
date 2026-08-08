@@ -4,7 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_graph, AppState, GraphContext,
+    slot_for_context, with_config_graph, with_graph, with_read_graph, with_trash_graph, AppState,
+    GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -319,7 +320,28 @@ fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<Strin
     match outcome {
         SyncApplicationPageSaveOutcome::Saved { revision, .. }
         | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
-        SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!("conflict: {reason:?}")),
+        // NOT the bare `"conflict"` the frontend matches to raise the keep-mine
+        // banner, and deliberately so: `save_sparse_page_with` hard-refuses
+        // `force` while managed storage is active, so that banner's "Keep mine"
+        // button cannot do anything here. Offering it would repeat the Direct
+        // mode trap of a prompt whose only working option discards the user's
+        // edits.
+        //
+        // What this DOES fix is the silent loop. `"conflict: {reason}"` matched
+        // neither the banner (which compares exactly) nor any bounded code, so
+        // it landed in the transient-retry path and retried forever without
+        // ever telling the user their save was refused — they could quit
+        // believing the page was written. A managed conflict is permanent until
+        // the page is reloaded, so it now carries a code the frontend knows is
+        // not worth retrying, and says what to do.
+        //
+        // Giving managed mode a real resolution path is a product decision
+        // (what "keep mine" means when the oplog is the source of truth) and is
+        // tracked as audit M2's remaining half.
+        SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!(
+            "managed.conflict: this page changed in Tine-managed storage ({reason:?}). \
+             Reload the page to see the current version, then reapply your edit."
+        )),
         SyncApplicationPageSaveOutcome::Deferred { state: _ } => Err(
             "Tine-managed storage is updating this page. Try saving again when it finishes.".into(),
         ),
@@ -340,6 +362,18 @@ where
     map_sparse_page_save(outcome)
 }
 
+/// Keep the user-facing save error bounded, while allowing an opt-in local
+/// diagnostic trace to carry the exact core refusal that led to it.  The core
+/// only constructs this detail under TINE_DEBUG/--debug; this helper is a
+/// second gate before the text reaches the debug log.
+fn managed_save_debug_detail_line(
+    error: &tine_core::sync_runtime::SyncApplicationPageRequestError,
+) -> Option<String> {
+    error
+        .debug_detail()
+        .map(|detail| format!("managed storage save refusal detail: {detail}"))
+}
+
 #[tauri::command]
 pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -357,7 +391,7 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 
 #[tauri::command]
 pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
-    with_graph(&state, |g| Ok(g.referenced_page_names()))
+    with_read_graph(&state, |g| Ok(g.referenced_page_names()))
 }
 
 #[derive(Serialize)]
@@ -699,7 +733,7 @@ pub(crate) fn graph_source_files(
     state: GraphContext<'_>,
 ) -> Result<Vec<GraphSourceFile>, String> {
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let mut out: Vec<GraphSourceFile> = Vec::new();
         let mut roots = vec![g.pages_path()];
         if include_journals {
@@ -751,6 +785,84 @@ fn collect_graph_text(
     }
 }
 
+/// A Direct-Markdown save is slow enough to be worth a line above this. Chosen
+/// so ordinary saves stay silent (0.6.5 saved in single-digit milliseconds) while
+/// anything a user would notice as a hitch is on the record.
+const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
+
+/// Turn a failed Direct save into a message the frontend can act on.
+///
+/// The old mapping collapsed EVERY `AlreadyExists` to the literal string
+/// "conflict", and the frontend recognised a conflict by testing whether the
+/// message contained that substring. So a portable-filename collision, a
+/// physical-resource alias, or "another document owns this page identity" all
+/// raised the content-conflict prompt — whose two buttons are "Keep mine
+/// (overwrite)" and "Use disk version", neither of which can resolve any of
+/// them. Choosing either left the page marked conflicted, and a conflicted page
+/// silently refuses to save from then on.
+///
+/// Only a real base-revision conflict gets the "conflict" contract now. Every
+/// other failure carries its bounded code as a stable prefix, so the frontend
+/// can classify it without sniffing prose and the user gets an error they can
+/// read instead of a prompt that cannot help.
+fn direct_save_error_message(error: std::io::Error) -> String {
+    let code = tine_core::model::direct_save_failure_code(&error);
+    // `conflict.*` is the one family the frontend turns into the keep-mine /
+    // use-disk banner, so membership is decided in `direct_save_failure_code`
+    // by naming the condition, never by a catch-all on an error kind. Matching
+    // the prefix keeps that set open to new named conflicts without this arm
+    // silently widening to cover unclassified failures.
+    if code.starts_with("conflict.") {
+        return "conflict".to_string();
+    }
+    format!("{code}: {error}")
+}
+
+/// Report what a slow or failed Direct-Markdown save actually did.
+///
+/// Always on. Every field is a duration, a count, or a bounded failure code --
+/// no page names, no paths, no content -- so the line is safe to paste into a
+/// public issue, which is the only way it helps the people reporting #266/#267
+/// from Windows machines we cannot reproduce.
+///
+/// The counters are the load-bearing part. `builds` distinguishes "the save was
+/// slow" from "the save rebuilt a whole-graph index to answer a filename
+/// question", and those have opposite fixes.
+fn report_direct_save_diagnostics(
+    graph: &tine_core::model::Graph,
+    elapsed: std::time::Duration,
+    error: Option<&std::io::Error>,
+) {
+    if error.is_none() && elapsed.as_millis() < DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS {
+        return;
+    }
+    let report = graph.guarded_graph_text_identity_report();
+    let outcome = match error {
+        Some(error) => tine_core::model::direct_save_failure_code(error),
+        None => "ok",
+    };
+    let build = report.last_build.map_or_else(
+        || " last_build=none".to_string(),
+        |build| {
+            format!(
+                " last_build_capture_ms={} last_build_index_ms={} last_build_parsed={} last_build_entries={} last_build_bytes={}",
+                build.capture.as_millis(),
+                build.index.as_millis(),
+                build.decode_semantics,
+                build.captured_entries,
+                build.captured_bytes,
+            )
+        },
+    );
+    crate::debug::diag(format!(
+        "direct save: outcome={outcome} total_ms={} guarded_index_builds={} guarded_index_exact_updates={} guarded_index_invalidated={}{build}",
+        elapsed.as_millis(),
+        report.complete_builds,
+        report.exact_updates,
+        report.invalidated,
+    ));
+}
+
 #[tauri::command]
 pub(crate) async fn save_page(
     page: PageDto,
@@ -768,7 +880,15 @@ pub(crate) async fn save_page(
                 Some(handle) => {
                     let result =
                         save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
-                            handle.save_application_page(request)
+                            let saved = handle.save_application_page(request);
+                            if crate::debug::debug_enabled() {
+                                if let Err(error) = &saved {
+                                    if let Some(line) = managed_save_debug_detail_line(error) {
+                                        crate::debug::diag(line);
+                                    }
+                                }
+                            }
+                            saved
                         });
                     // A successful managed save has already made its exact user
                     // projection durable, but archive/checkpoint derivatives are
@@ -780,26 +900,27 @@ pub(crate) async fn save_page(
                 }
                 None => {
                     let graph = slot.legacy_graph()?;
-                    let legacy_save_started = benchmark_started.map(|_| Instant::now());
+                    // Always timed, not just under the issue-248 benchmark env
+                    // var. A save that takes minutes is the thing users report,
+                    // and a measurement that only exists when someone thought to
+                    // set an environment variable beforehand is not available at
+                    // the moment it is needed.
+                    let started = Instant::now();
                     let result = if force.unwrap_or(false) {
                         graph.force_save_page(&page)
                     } else {
                         graph.save_page(&page, base_rev.as_deref())
                     };
-                    if let Some(started) = legacy_save_started {
+                    let elapsed = started.elapsed();
+                    if benchmark_started.is_some() {
                         let _ = app.emit_to(
                             &label,
                             "issue-248-legacy-save-page-ms",
-                            started.elapsed().as_secs_f64() * 1_000.0,
+                            elapsed.as_secs_f64() * 1_000.0,
                         );
                     }
-                    result.map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            "conflict".to_string()
-                        } else {
-                            error.to_string()
-                        }
-                    })
+                    report_direct_save_diagnostics(&graph, elapsed, result.as_ref().err());
+                    result.map_err(direct_save_error_message)
                 }
             }
         };
@@ -876,7 +997,7 @@ pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.backlinks_bounded(
             &name,
@@ -900,7 +1021,7 @@ pub(crate) async fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         Ok(tine_core::query::backlink_filter_context(
             &graph, &name, &targets,
@@ -915,7 +1036,7 @@ pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.unlinked_refs_bounded(
             &name,
@@ -934,7 +1055,7 @@ pub(crate) async fn get_unlinked_refs(
 pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
         .await
         .map_err(|error| error.to_string())?
@@ -948,7 +1069,7 @@ pub(crate) fn block_referrers(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         bounded_groups_or_error(g.block_referrers_bounded(
             &uuid,
             RESULT_BRIDGE_MAX_ROWS,
@@ -1056,7 +1177,7 @@ pub(crate) fn page_print_html(
     opts: tine_core::publish::PrintOpts,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.page_print_html(&name, opts)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no-page".to_string())
@@ -1069,7 +1190,7 @@ pub(crate) fn run_query(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     validate_query_source(&query)?;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         bounded_groups_or_error(g.run_query_bounded(
             &query,
             RESULT_BRIDGE_MAX_ROWS,
@@ -1102,7 +1223,7 @@ pub(crate) fn export_query_subtrees(
             QUERY_EXPORT_MAX_QUERIES,
         ));
     }
-    with_graph(&state, |graph| {
+    with_read_graph(&state, |graph| {
         let batch = tine_core::query::export_query_subtrees(
             graph,
             &specs,
@@ -1147,7 +1268,7 @@ pub(crate) async fn run_graph_search(
     scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     // QueryExecution carries backward-defaulted per-category `has_more` bits;
@@ -1176,7 +1297,7 @@ pub(crate) fn run_advanced_query(
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::AdvancedResult, String> {
     validate_query_source(&query)?;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let (result, exceeded, total) = g.run_advanced_query_bounded_cached(
             &query,
             current_page.as_deref(),
@@ -1197,7 +1318,7 @@ pub(crate) fn query_facets(
     state: GraphContext<'_>,
     autocomplete: Option<bool>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         if autocomplete.unwrap_or(false) {
             // The editor's OG policy intentionally differs from query-builder
             // facets; use a separately bounded collector without changing the
@@ -1224,7 +1345,7 @@ pub(crate) fn query_facets(
 
 #[tauri::command]
 pub(crate) fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
-    with_graph(&state, |g| Ok(g.page_aliases()))
+    with_read_graph(&state, |g| Ok(g.page_aliases()))
 }
 
 #[tauri::command]
@@ -1232,12 +1353,12 @@ pub(crate) fn page_icons(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    with_graph(&state, |g| Ok(g.page_icons(&names)))
+    with_read_graph(&state, |g| Ok(g.page_icons(&names)))
 }
 
 #[tauri::command]
 pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_favorites(&names).map_err(|e| e.to_string())
     })
 }
@@ -1247,7 +1368,7 @@ pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_preferred_workflow(&workflow)
             .map_err(|e| e.to_string())
     })
@@ -1258,7 +1379,7 @@ pub(crate) fn set_timetracking_enabled(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_timetracking_enabled(enabled)
             .map_err(|e| e.to_string())
     })?;
@@ -1268,7 +1389,7 @@ pub(crate) fn set_timetracking_enabled(
 
 #[tauri::command]
 pub(crate) fn set_show_brackets(enabled: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_show_brackets(enabled).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1280,7 +1401,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_doc_mode_enter_for_new_block(enabled)
             .map_err(|e| e.to_string())
     })?;
@@ -1290,7 +1411,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
 
 #[tauri::command]
 pub(crate) fn set_logical_outdenting(enabled: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_logical_outdenting(enabled).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1299,7 +1420,7 @@ pub(crate) fn set_logical_outdenting(enabled: bool, state: GraphContext<'_>) -> 
 
 #[tauri::command]
 pub(crate) fn set_guide_announced(announced: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_guide_announced(announced).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1311,7 +1432,7 @@ pub(crate) fn set_default_journal_template(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_default_journal_template(name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -1319,7 +1440,7 @@ pub(crate) fn set_default_journal_template(
 
 #[tauri::command]
 pub(crate) fn set_start_of_week(n: u32, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_start_of_week(n).map_err(|e| e.to_string())
     })
 }
@@ -1332,7 +1453,7 @@ pub(crate) fn set_preferred_format(format: String, state: GraphContext<'_>) -> R
     } else {
         tine_core::model::Format::Md
     };
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_preferred_format(fmt).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?; // so new pages/journals use the new extension immediately
@@ -1346,7 +1467,7 @@ pub(crate) fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_journal_page_title_format(&format)
             .map_err(|e| e.to_string())
     })?;
@@ -1356,7 +1477,7 @@ pub(crate) fn set_journal_title_format(
 
 #[tauri::command]
 pub(crate) fn read_custom_css(state: GraphContext<'_>) -> Result<String, String> {
-    with_graph(&state, |g| Ok(g.custom_css()))
+    with_read_graph(&state, |g| Ok(g.custom_css()))
 }
 
 #[tauri::command]
@@ -1366,7 +1487,7 @@ pub(crate) async fn search(
     lane: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<RefGroup>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let limit = limit.min(RESULT_BRIDGE_MAX_ROWS);
     let groups = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
         Some(lane) => graph.search_latest(lane, &query, limit),
@@ -1384,7 +1505,7 @@ pub(crate) fn quick_switch(
     limit: usize,
     state: GraphContext<'_>,
 ) -> Result<Vec<PageEntry>, String> {
-    with_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
+    with_read_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
 }
 
 fn capture_quick_switch_for(
@@ -1528,7 +1649,7 @@ mod capture_quick_switch_tests {
 pub(crate) fn list_templates(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::TemplateDto>, String> {
-    with_graph(&state, |g| Ok(g.templates()))
+    with_read_graph(&state, |g| Ok(g.templates()))
 }
 
 fn application_property_line(line: &str) -> bool {
@@ -1595,7 +1716,7 @@ pub(crate) fn resolve_block(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Option<RefGroup>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let group = g.resolve_block(&uuid);
         if let Some(group) = &group {
             enforce_result_bridge_budget(std::slice::from_ref(group))?;
@@ -1615,7 +1736,7 @@ pub(crate) fn resolve_blocks(
             uuids.len()
         ));
     }
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
             g,
             &uuids,
@@ -1640,7 +1761,7 @@ pub(crate) fn preview_block(
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::BlockPreview>, String> {
     const MAX_PREVIEW_NODES: usize = 2_000;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         // Leave room for RefGroup/page/serializer overhead, then assert the
         // shared bridge invariant as a second line of defense.
         let preview = g.preview_block_with_budget(
@@ -1664,7 +1785,7 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         max_bytes
             .map_or_else(
                 || g.read_asset(&name),
@@ -1828,7 +1949,7 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.import_asset(std::path::Path::new(&path), name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -1902,7 +2023,7 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
-    let stored = with_graph(&state, |graph| {
+    let stored = with_read_graph(&state, |graph| {
         graph
             .import_asset_file(&mut capture, &name, max_bytes)
             .map_err(|error| error.to_string())
@@ -1952,7 +2073,7 @@ pub(crate) fn read_text_file(path: String) -> Result<String, String> {
 /// (canonicalized) so a crafted name can't open a file outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    let target = with_graph(&state, |g| {
+    let target = with_read_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -1992,7 +2113,7 @@ pub(crate) fn open_page_file(
     reveal: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_graph(&state, |graph| {
+    let target = with_read_graph(&state, |graph| {
         graph
             .page_source_file(&name, kind, path.as_deref())
             .map_err(|error| error.to_string())
@@ -2030,7 +2151,7 @@ pub(crate) fn edit_asset_external(
     command: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_graph(&state, |g| {
+    let target = with_read_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2371,13 +2492,13 @@ mod editor_argv_tests {
 pub(crate) fn list_orphan_assets(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::AssetInfo>, String> {
-    with_graph(&state, |g| Ok(g.orphan_assets()))
+    with_read_graph(&state, |g| Ok(g.orphan_assets()))
 }
 
 /// Move an orphaned asset to the recoverable trash.
 #[tauri::command]
 pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
+    with_trash_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
 }
 
 /// Count + total bytes in the recoverable asset trash.
@@ -2385,13 +2506,13 @@ pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), S
 pub(crate) fn asset_trash_stats(
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::TrashStats, String> {
-    with_graph(&state, |g| Ok(g.asset_trash_stats()))
+    with_read_graph(&state, |g| Ok(g.asset_trash_stats()))
 }
 
 /// Permanently delete everything in the asset trash; returns files removed.
 #[tauri::command]
 pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> {
-    with_graph(&state, |g| g.empty_asset_trash().map_err(|e| e.to_string()))
+    with_trash_graph(&state, |g| g.empty_asset_trash().map_err(|e| e.to_string()))
 }
 
 /// Journal days that resolve to more than one file (e.g. a date-stem file plus a
@@ -2400,7 +2521,7 @@ pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> 
 pub(crate) fn list_journal_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalConflict>, String> {
-    with_graph(&state, |g| Ok(g.journal_conflicts()))
+    with_read_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
@@ -2409,7 +2530,7 @@ pub(crate) fn list_journal_conflicts(
 pub(crate) fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, String> {
-    with_graph(&state, |g| Ok(g.list_sync_conflicts()))
+    with_read_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
@@ -2420,7 +2541,7 @@ pub(crate) fn sync_conflict_diff(
     conflict: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.sync_conflict_diff(&winner, &conflict)
             .map_err(|e| e.to_string())
     })
@@ -2480,7 +2601,7 @@ pub(crate) fn trash_journal_file(name: String, state: GraphContext<'_>) -> Resul
 /// duplicate day's files before reconciling.
 #[tauri::command]
 pub(crate) fn read_journal_file(name: String, state: GraphContext<'_>) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.read_journal_file(&name).map_err(|e| e.to_string())
     })
 }
@@ -2517,7 +2638,10 @@ mod application_page_authority_tests {
     use std::cell::Cell;
     use tempfile::TempDir;
     use tine_core::model::Graph;
-    use tine_core::sync_runtime::{SyncApplicationPageConflict, SyncEditorDeferred, SyncPageKind};
+    use tine_core::sync_runtime::{
+        SyncApplicationPageConflict, SyncApplicationPageRequestError, SyncEditorDeferred,
+        SyncEditorRefusalCode, SyncPageKind,
+    };
 
     fn page(name: &str, kind: PageKind, path: &str, raw: &str) -> PageDto {
         let mut block = BlockDto::default();
@@ -2674,6 +2798,27 @@ mod application_page_authority_tests {
         .unwrap_err();
         assert!(refused.contains("Force save is unavailable"));
         assert!(!called.get());
+    }
+
+    #[test]
+    fn managed_save_debug_line_keeps_private_detail_out_of_public_error_rendering() {
+        let detail = "Finalize: exact internal coordinator refusal";
+        let error = SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage: "committing the semantic page transaction",
+            code: SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            debug_detail: detail.into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!error.to_string().contains(detail));
+        assert_eq!(
+            managed_save_debug_detail_line(&error).as_deref(),
+            Some(
+                "managed storage save refusal detail: Finalize: exact internal coordinator refusal"
+            )
+        );
     }
 
     #[test]
@@ -2883,4 +3028,90 @@ pub(crate) fn save_pdf_area_image(
         g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
             .map_err(|e| e.to_string())
     })
+}
+
+#[cfg(test)]
+mod direct_save_error_tests {
+    use super::direct_save_error_message;
+    use std::io;
+
+    /// The frontend puts up a conflict prompt ("Keep mine" / "Use disk version")
+    /// for exactly one message, and a page it marks conflicted stops saving until
+    /// the user resolves it. So the set of failures that produce that message is
+    /// a contract, not a formatting detail: anything in it that the two buttons
+    /// cannot resolve strands the page.
+    #[test]
+    fn only_a_real_base_revision_conflict_raises_the_conflict_prompt() {
+        assert_eq!(
+            direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, "conflict")),
+            "conflict"
+        );
+
+        for (message, expected_code) in [
+            (
+                "graph text paths share one portable case/NFC identity: pages/foo.md and pages/Foo.md",
+                "precheck.portable_collision",
+            ),
+            (
+                "graph text files alias one physical resource: pages/a.md and pages/b.md",
+                "precheck.resource_alias",
+            ),
+            (
+                "managed text entry is a symlink or reparse point: pages/Alias.md",
+                "precheck.symlink",
+            ),
+            (
+                "existing page identity changed since load",
+                "identity.changed_since_load",
+            ),
+            (
+                "another graph document owns this effective page identity",
+                "identity.owned_elsewhere",
+            ),
+            (
+                "a page with that name already exists",
+                "identity.name_taken",
+            ),
+            (
+                "target page exists in another supported text extension",
+                "identity.name_taken",
+            ),
+            // The class this contract exists to keep out: an unclassified
+            // AlreadyExists. It used to reach a `conflict.other` catch-all, so
+            // a failure that had PRESERVED the user's bytes under a recovery
+            // name was reported as a bare "conflict" -- the one message that
+            // both hides the retention text and offers a "use disk" button
+            // that throws those very edits away.
+            (
+                "displaced target retained as pages/Note.md.editor-recovery",
+                "unknown",
+            ),
+        ] {
+            let reported =
+                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message));
+            assert!(
+                reported.starts_with(expected_code),
+                "{message} should report as {expected_code}, got {reported}"
+            );
+            assert_ne!(
+                reported, "conflict",
+                "{message} cannot be resolved by keep-mine or use-disk, so it must not \
+                 raise the conflict prompt"
+            );
+        }
+    }
+
+    /// The counterpart: a page whose file moved between load and save IS a
+    /// content conflict, and since `011658a9` "keep mine" can actually resolve
+    /// it. It must reach the prompt.
+    #[test]
+    fn an_unobserved_external_change_still_raises_the_conflict_prompt() {
+        assert_eq!(
+            direct_save_error_message(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "path-pinned page does not match its captured exact owner",
+            )),
+            "conflict"
+        );
+    }
 }

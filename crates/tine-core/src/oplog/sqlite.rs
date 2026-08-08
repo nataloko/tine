@@ -20,6 +20,7 @@
 //! file replaced out of band inside the replicated archive would otherwise let
 //! the old holder and a new opener both believe they own the workspace.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::CString;
@@ -37,6 +38,7 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OsMetadataExt as CapOsMetadataExt};
@@ -71,8 +73,8 @@ use super::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-pub const SQLITE_APPLICATION_ID: u32 = storage_frontier::SQLITE_APPLICATION_ID;
-pub const SQLITE_SCHEMA_VERSION: u32 = storage_frontier::SQLITE_SCHEMA_VERSION;
+pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;
+pub const SQLITE_SCHEMA_VERSION: u32 = tine_storage::formats::SQLITE_SCHEMA_VERSION;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
@@ -1257,6 +1259,19 @@ fn materialize_accepted_event_with_stats(
         instrumentation.exact_document_loads = materializer.exact_document_loads();
         instrumentation.exact_catalog_loads = materializer.exact_catalog_loads();
         instrumentation.exact_catalog_decodes = materializer.exact_catalog_decodes();
+        let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
+        instrumentation.accepted_frontier_session_hits = accepted_frontier.hits;
+        instrumentation.accepted_frontier_session_misses = accepted_frontier.misses;
+        instrumentation.accepted_frontier_session_evictions = accepted_frontier.evictions;
+        instrumentation.accepted_frontier_session_oversize = accepted_frontier.oversize;
+        instrumentation.accepted_frontier_session_peak_resident_bytes =
+            accepted_frontier.peak_resident_bytes;
+        instrumentation.external_exact_session_hits = external_exact.hits;
+        instrumentation.external_exact_session_misses = external_exact.misses;
+        instrumentation.external_exact_session_evictions = external_exact.evictions;
+        instrumentation.external_exact_session_oversize = external_exact.oversize;
+        instrumentation.external_exact_session_peak_resident_bytes =
+            external_exact.peak_resident_bytes;
     }
     let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
     Ok((change, instrumentation))
@@ -1724,6 +1739,65 @@ struct ProjectionCheckpoint {
 struct ProjectionCheckpointEnvelope {
     checkpoint: ProjectionCheckpoint,
     digest: ContentDigest,
+}
+
+fn record_projection_rebuild(
+    class: &'static str,
+    reason: &str,
+    elapsed: std::time::Duration,
+    rebuild: &RebuildInstrumentation,
+) {
+    update_projection_open_breakdown(|breakdown| {
+        breakdown.recovery = class;
+        breakdown.reason = reason.to_owned();
+        breakdown.rebuild = elapsed;
+        breakdown.applied_batches = rebuild.accepted_events_applied;
+        breakdown.bulk_pages_materialized = rebuild.bulk_pages_materialized;
+        breakdown.ancestry_full_scans = rebuild.ancestry_full_scans;
+    });
+}
+
+/// Always-recorded breakdown of one SQLite projection open.
+///
+/// `sqlite_open_ms` on its own cannot distinguish "opened a valid projection
+/// slowly" from "threw the graph away and rebuilt it", and those have opposite
+/// fixes. The recovery class and reason existed only under `#[cfg(test)]`, so on
+/// a real user's graph the single most important fact about a slow open was
+/// unreadable. Durations, counts and fixed reason strings only -- no page
+/// content, no paths.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectionOpenBreakdown {
+    pub recovery: &'static str,
+    pub reason: String,
+    pub sidecar_shape: std::time::Duration,
+    pub checkpoint_authentication: std::time::Duration,
+    pub read_only_open: std::time::Duration,
+    pub schema_and_claim: std::time::Duration,
+    pub structural_validation: std::time::Duration,
+    pub materialization_stamp: std::time::Duration,
+    pub forensics_preservation: std::time::Duration,
+    pub rebuild: std::time::Duration,
+    pub applied_batches: usize,
+    pub bulk_pages_materialized: usize,
+    pub ancestry_full_scans: usize,
+}
+
+thread_local! {
+    static PROJECTION_OPEN_BREAKDOWN: RefCell<ProjectionOpenBreakdown> =
+        RefCell::new(ProjectionOpenBreakdown::default());
+}
+
+fn reset_projection_open_breakdown() {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
+}
+
+fn update_projection_open_breakdown(update: impl FnOnce(&mut ProjectionOpenBreakdown)) {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| update(&mut slot.borrow_mut()));
+}
+
+/// Take the breakdown recorded by the most recent projection open on this thread.
+pub(crate) fn take_projection_open_breakdown() -> ProjectionOpenBreakdown {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3236,6 +3310,7 @@ impl SqliteFrontier {
         authorization: &ApplierAuthorization<'_, '_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
     ) -> Result<(OpenProjection, BootstrapSqliteRebuildInstrumentation), ProjectionError> {
+        reset_projection_open_breakdown();
         validate_source(claim, &source)?;
         source.authenticate_exact_frontier()?;
         let path = prepare_database_path(path)?;
@@ -3380,7 +3455,35 @@ impl SqliteFrontier {
 
         if existed {
             match validate_existing(&path, claim, &source) {
-                Ok(()) => {
+                Ok(ExistingProjection::Behind { applied_through }) => {
+                    // Rebuild, as before. Naming the sequence it stood at is
+                    // the point: an unsafe shutdown that lost undrained work is
+                    // an ordinary lag, and it should not be reported with the
+                    // same words as a projection that disagrees with the oplog.
+                    let reason =
+                        format!("SQLite projection is behind at sequence {applied_through}");
+                    let stage = Instant::now();
+                    pending_forensics.extend(preserve_forensics(&path)?);
+                    update_projection_open_breakdown(|b| {
+                        b.forensics_preservation = stage.elapsed()
+                    });
+                    maybe_abort_forensic_test("before-rebuild", 0);
+                    let stage = Instant::now();
+                    let (database, rebuild, _) =
+                        Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    record_projection_rebuild("rebuilt-behind", &reason, stage.elapsed(), &rebuild);
+                    mark_rebuild_complete(&pending_forensics)?;
+                    return Ok(OpenProjection {
+                        database,
+                        recovery: ProjectionRecovery::RebuiltPreservingEvidence {
+                            reason,
+                            evidence: pending_forensics.evidence,
+                            applied_batches: rebuild.accepted_events_applied,
+                        },
+                        rebuild,
+                    });
+                }
+                Ok(ExistingProjection::Current) => {
                     if !pending_forensics.directories.is_empty() {
                         mark_rebuild_complete(&pending_forensics)?;
                         let physical = PhysicalSqliteDatabase::open_writable(&path)?;
@@ -3423,15 +3526,29 @@ impl SqliteFrontier {
                             reference_coverage: None,
                             _lease: lease,
                         },
-                        recovery: ProjectionRecovery::OpenedExisting,
+                        recovery: {
+                            update_projection_open_breakdown(|b| b.recovery = "opened-existing");
+                            ProjectionRecovery::OpenedExisting
+                        },
                         rebuild: RebuildInstrumentation::default(),
                     });
                 }
                 Err(reason) => {
+                    let stage = Instant::now();
                     pending_forensics.extend(preserve_forensics(&path)?);
+                    update_projection_open_breakdown(|b| {
+                        b.forensics_preservation = stage.elapsed()
+                    });
                     maybe_abort_forensic_test("before-rebuild", 0);
+                    let stage = Instant::now();
                     let (database, rebuild, _) =
                         Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    record_projection_rebuild(
+                        "rebuilt-preserving-evidence",
+                        &reason,
+                        stage.elapsed(),
+                        &rebuild,
+                    );
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
                         database,
@@ -4886,22 +5003,52 @@ fn validate_source(
     Ok(())
 }
 
+/// What an existing projection on disk turned out to be.
+#[derive(Debug)]
+enum ExistingProjection {
+    /// Authentic and already at the oplog's accepted frontier.
+    Current,
+    /// Authentic and internally consistent, but standing at an older accepted
+    /// sequence than the oplog. Still rebuilt today; distinguished from a
+    /// genuine divergence so the receipt says which one happened, because they
+    /// have different causes and only one of them is a corruption signal.
+    Behind { applied_through: u64 },
+}
+
 fn validate_existing(
     path: &Path,
     claim: ProjectionClaim,
     source: &RebuildSource<'_>,
-) -> Result<(), String> {
+) -> Result<ExistingProjection, String> {
+    let stage = Instant::now();
     validate_sidecar_shape(path).map_err(|error| error.to_string())?;
-    validate_projection_checkpoint(path, claim, &source.exact_frontier_root)
-        .map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.sidecar_shape = stage.elapsed());
+    let stage = Instant::now();
+    // Authenticate the bytes on disk BEFORE opening them, exactly as before.
+    // What is deferred is only the comparison against the version we expect,
+    // which cannot be decided until the database's own root has been read.
+    let checkpointed_root_digest =
+        authenticate_projection_checkpoint(path, claim).map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.checkpoint_authentication = stage.elapsed());
+    let stage = Instant::now();
     let physical = PhysicalSqliteDatabase::open_read_only(path)
         .map_err(|error| format!("cannot open SQLite projection read-only: {error}"))?;
+    update_projection_open_breakdown(|b| b.read_only_open = stage.elapsed());
+    let stage = Instant::now();
     physical
         .validate_schema_and_claim(lower_physical_claim(claim))
         .map_err(|error| ProjectionError::from(error).to_string())?;
+    update_projection_open_breakdown(|b| b.schema_and_claim = stage.elapsed());
+    let stage = Instant::now();
     let found_frontier = read_frontier_root(&physical).map_err(|error| error.to_string())?;
-    if found_frontier != source.exact_frontier_root {
-        return Err("SQLite frontier is stale".into());
+    let found_root_bytes =
+        canonical_frontier_root_bytes(&found_frontier).map_err(|error| error.to_string())?;
+    // The authenticated checkpoint must name the very root this database
+    // carries. That is what binds the byte-level integrity proof to a specific
+    // accepted version; without it a stale checkpoint could vouch for bytes at
+    // a version it never described.
+    if checkpointed_root_digest != ContentDigest::of(&found_root_bytes) {
+        return Err("SQLite projection checkpoint does not name the database's own root".into());
     }
     let count = physical
         .read_frontier()
@@ -4909,8 +5056,16 @@ fn validate_existing(
         .applied_batch_count;
     let expected_count = i64::try_from(source.accepted_batch_count)
         .map_err(|_| "accepted batch count exceeds SQLite".to_string())?;
-    if i64::try_from(count).ok() != Some(expected_count) {
+    // Validate the database against its OWN sequence. Being behind the oplog is
+    // a legitimate state after an unsafe shutdown; being internally inconsistent
+    // is not.
+    let found_count = i64::try_from(found_frontier.acceptance_sequence())
+        .map_err(|_| "SQLite frontier sequence exceeds SQLite".to_string())?;
+    if i64::try_from(count).ok() != Some(found_count) {
         return Err("SQLite frontier batch count is stale".into());
+    }
+    if found_count > expected_count {
+        return Err("SQLite frontier is ahead of the accepted oplog".into());
     }
     if let Some(root_key) = found_frontier.document_map_root_key() {
         physical
@@ -4924,9 +5079,9 @@ fn validate_existing(
     } else if found_frontier.document_count() != 0 {
         return Err("SQLite authenticated frontier root key is missing".into());
     }
-    if expected_count > 0 {
+    if found_count > 0 {
         let final_record =
-            load_batch_at_sequence(&physical, expected_count).map_err(|error| error.to_string())?;
+            load_batch_at_sequence(&physical, found_count).map_err(|error| error.to_string())?;
         let final_record =
             final_record.ok_or_else(|| "SQLite final accepted row is missing".to_string())?;
         let prior_root = decode_frontier_root(&final_record.prior_frontier_root)
@@ -4934,8 +5089,8 @@ fn validate_existing(
         let final_root = final_record
             .validate_canonical_transition(&prior_root)
             .map_err(|error| error.to_string())?;
-        if final_record.sequence != expected_count
-            || final_record.acceptance_sequence != expected_count
+        if final_record.sequence != found_count
+            || final_record.acceptance_sequence != found_count
             || final_root != found_frontier
         {
             return Err("SQLite final accepted row is not bound to the frontier root".into());
@@ -4954,15 +5109,26 @@ fn validate_existing(
             return Err("SQLite final accepted row is absent from its authenticated map".into());
         }
     }
-    let root_bytes =
-        canonical_frontier_root_bytes(&found_frontier).map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.structural_validation = stage.elapsed());
+    let stage = Instant::now();
     physical
         .ensure_materialization_stamp(
             found_frontier.acceptance_sequence(),
-            ContentDigest::of(&root_bytes),
+            ContentDigest::of(&found_root_bytes),
         )
         .map_err(|error| error.to_string())?;
-    Ok(())
+    update_projection_open_breakdown(|b| b.materialization_stamp = stage.elapsed());
+    if found_frontier == source.exact_frontier_root && found_count == expected_count {
+        return Ok(ExistingProjection::Current);
+    }
+    if found_count == expected_count {
+        // Same sequence, different root: this is a genuine divergence, not a
+        // lag, and applying batches forward cannot repair it.
+        return Err("SQLite frontier is stale".into());
+    }
+    Ok(ExistingProjection::Behind {
+        applied_through: found_frontier.acceptance_sequence(),
+    })
 }
 
 fn validate_sidecar_shape(path: &Path) -> Result<(), ProjectionError> {
@@ -5045,13 +5211,37 @@ fn validate_projection_checkpoint(
     claim: ProjectionClaim,
     expected_root: &AcceptedFrontierRoot,
 ) -> Result<(), ProjectionError> {
+    let expected_root_bytes = canonical_frontier_root_bytes(expected_root)?;
+    let named = authenticate_projection_checkpoint(path, claim)?;
+    if named != ContentDigest::of(&expected_root_bytes) {
+        return Err(ProjectionError::Corrupt(
+            "SQLite projection checkpoint names a different frontier root".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Authenticate the checkpoint envelope and its binding to the database and WAL
+/// bytes on disk, and return the frontier root the checkpoint names.
+///
+/// This is deliberately separate from comparing that root against the version a
+/// caller expects. Those are different questions: this one asks whether the
+/// bytes on disk are the ones we last published and which accepted version they
+/// carry, and it must be answerable before the database is opened at all.
+/// Keeping them apart is what let the caller below tell "these bytes moved
+/// under me" from "these bytes are fine, at a version I did not expect" -- the
+/// distinction the whole-graph rebuild used to be hiding.
+fn authenticate_projection_checkpoint(
+    path: &Path,
+    claim: ProjectionClaim,
+) -> Result<ContentDigest, ProjectionError> {
     let files = SqliteFileSet::new(path);
     let checkpoint_path = files.checkpoint_path();
     let metadata = fs::symlink_metadata(&checkpoint_path)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() == 0
-        || metadata.len() > storage_frontier::MAX_SQLITE_CHECKPOINT_BYTES as u64
+        || metadata.len() > tine_storage::formats::MAX_SQLITE_CHECKPOINT_BYTES as u64
     {
         return Err(ProjectionError::Corrupt(
             "SQLite projection checkpoint is not a bounded regular file".into(),
@@ -5073,17 +5263,22 @@ fn validate_projection_checkpoint(
             "SQLite projection checkpoint authentication failed".into(),
         ));
     }
-    let expected_root_bytes = canonical_frontier_root_bytes(expected_root)?;
     let physical_checkpoint = files.physical_checkpoint()?;
-    if envelope.checkpoint.frontier_root_digest != ContentDigest::of(&expected_root_bytes)
-        || envelope.checkpoint.database != physical_checkpoint.database
-        || envelope.checkpoint.wal != physical_checkpoint.wal
-    {
+    // Report which binding broke. A database or WAL mismatch says the bytes on
+    // disk moved under an unchanged version, which is a real integrity failure;
+    // collapsing that together with an ordinary version difference hides which
+    // recovery a stall actually came from.
+    if envelope.checkpoint.database != physical_checkpoint.database {
         return Err(ProjectionError::Corrupt(
-            "SQLite projection files differ from their authenticated checkpoint".into(),
+            "SQLite projection database differs from its authenticated checkpoint".into(),
         ));
     }
-    Ok(())
+    if envelope.checkpoint.wal != physical_checkpoint.wal {
+        return Err(ProjectionError::Corrupt(
+            "SQLite projection WAL differs from its authenticated checkpoint".into(),
+        ));
+    }
+    Ok(envelope.checkpoint.frontier_root_digest)
 }
 
 fn write_projection_checkpoint(
@@ -5481,10 +5676,22 @@ fn decode_frontier(bytes: &[u8]) -> Result<FrontierV2, ProjectionError> {
     Ok(frontier)
 }
 
+/// The durable identity of an accepted frontier root.
+///
+/// A root's `scratch_root` is this run's address for the frontier's maps, not
+/// part of what the frontier IS -- it is deliberately absent from
+/// `state_digest`. Persisting it made every durable identity derived from these
+/// bytes (the projection checkpoint, the materialization stamp, the stored
+/// frontier row) change whenever the scratch store moved, which is exactly what
+/// reopening a graph does. The projection then failed to recognise its own
+/// up-to-date state and rebuilt the whole graph. It is stripped here, at the
+/// one boundary where a durable identity is minted, so no persisted digest can
+/// depend on where this process happened to put things.
 fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>, ProjectionError> {
-    let bytes = postcard::to_allocvec(root)
+    let durable = root.without_scratch_root();
+    let bytes = postcard::to_allocvec(&durable)
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
-    if decode_frontier_root(&bytes)? != *root {
+    if decode_frontier_root(&bytes)? != durable {
         return Err(ProjectionError::InvalidFrontier(
             "frontier root did not survive canonical round trip".into(),
         ));
@@ -8322,14 +8529,14 @@ fn corrupt_equal_length_interior_block_payload_with_coverage(
 
     let mut bytes = fs::read(database_path).unwrap();
     assert!(
-        bytes.len() > storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES * 2,
+        bytes.len() > tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES * 2,
         "fixture database is too small to have an edge-excluded interior"
     );
     let mut patched = 0;
     let sampled_ranges =
         storage_frontier::physical_checkpoint_interior_ranges_for_test(bytes.len() as u64);
-    let interior_start = storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
-    let interior_end = bytes.len() - storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
+    let interior_start = tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES;
+    let interior_end = bytes.len() - tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES;
     for page in block_pages {
         let page_start = page.saturating_sub(1).saturating_mul(page_size);
         let start = page_start.max(interior_start);
@@ -9846,9 +10053,9 @@ mod tests {
             .physical
             .execute_corrupting_statement_for_test(
                 "INSERT INTO reference_alias_bindings (
-                     normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
+                     normalized_alias, candidate_ordinal, resolved_page_id
                  )
-                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1, catalog_root_digest
+                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1
                  FROM reference_alias_bindings WHERE normalized_alias = ?2 LIMIT 1",
                 params![
                     inserted_source.as_uuid().as_bytes().as_slice(),

@@ -13,21 +13,94 @@ import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 
 const THEME_KEY = "logseq-claude.theme";
-function loadTheme(): "light" | "dark" {
+export type ThemePreference = "light" | "dark" | "system";
+
+function loadThemePreference(): ThemePreference {
   try {
     const t = localStorage.getItem(THEME_KEY);
-    if (t === "dark" || t === "light") return t;
+    if (t === "dark" || t === "light" || t === "system") return t;
   } catch {
     // ignore
   }
   return "light";
 }
-export const [theme, setTheme] = createSignal<"light" | "dark">(loadTheme());
 
-/** Apply the stored theme to the document (call once at startup). */
+// --- OS color-scheme signal (GH #193) -------------------------------------
+// Cached so add/removeEventListener always target the same MediaQueryList.
+let colorSchemeMql: MediaQueryList | null | undefined;
+function colorSchemeQuery(): MediaQueryList | null {
+  if (colorSchemeMql !== undefined) return colorSchemeMql;
+  try {
+    const q =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(prefers-color-scheme: dark)")
+        : null;
+    colorSchemeMql = q ?? null;
+  } catch {
+    colorSchemeMql = null;
+  }
+  return colorSchemeMql;
+}
+
+function systemColorScheme(): "light" | "dark" {
+  const mql = colorSchemeQuery();
+  // Deterministic fallback to Tine's default when the platform signal is missing.
+  return mql && mql.matches ? "dark" : "light";
+}
+
+export function resolveTheme(pref: ThemePreference): "light" | "dark" {
+  return pref === "system" ? systemColorScheme() : pref;
+}
+
+export const [appearancePreference, setAppearancePreferenceSignal] =
+  createSignal<ThemePreference>(loadThemePreference());
+// `theme` stays the resolved light/dark mode for every existing consumer; the
+// raw preference (incl. "system") lives in appearancePreference.
+export const [theme, setTheme] = createSignal<"light" | "dark">(resolveTheme(appearancePreference()));
+
+let colorSchemeListening = false;
+const onColorSchemeChange = () => {
+  if (appearancePreference() === "system") applyTheme();
+};
+
+// The OS listener lives only while the preference is "system": manual Light/Dark
+// must ignore later system changes, and an idle listener is meaningless there.
+function syncColorSchemeListener(pref: ThemePreference) {
+  const mql = colorSchemeQuery();
+  if (!mql) return;
+  const want = pref === "system";
+  if (want === colorSchemeListening) return;
+  try {
+    if (want) {
+      mql.addEventListener("change", onColorSchemeChange);
+      colorSchemeListening = true;
+    } else {
+      mql.removeEventListener("change", onColorSchemeChange);
+      colorSchemeListening = false;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/** Apply the resolved theme (preference + OS signal) to the document. */
 export function applyTheme() {
-  document.documentElement.setAttribute("data-theme", theme());
-  void backend().setSystemBarAppearance(theme() === "dark").catch(() => {});
+  const resolved = resolveTheme(appearancePreference());
+  setTheme(resolved);
+  document.documentElement.setAttribute("data-theme", resolved);
+  void backend().setSystemBarAppearance(resolved === "dark").catch(() => {});
+  syncColorSchemeListener(appearancePreference());
+}
+
+/** Persist and apply an appearance choice: Light / Dark / System (GH #193). */
+export function setAppearancePreference(pref: ThemePreference) {
+  setAppearancePreferenceSignal(pref);
+  try {
+    localStorage.setItem(THEME_KEY, pref);
+  } catch {
+    // ignore
+  }
+  applyTheme();
 }
 
 // Task workflow from config.edn (:preferred-workflow): drives mod+enter cycling.
@@ -561,15 +634,9 @@ export function bumpPageInventoryRev() {
   setPageInventoryRev((n) => n + 1);
 }
 export function toggleTheme() {
-  const next = theme() === "light" ? "dark" : "light";
-  setTheme(next);
-  document.documentElement.setAttribute("data-theme", next);
-  void backend().setSystemBarAppearance(next === "dark").catch(() => {});
-  try {
-    localStorage.setItem(THEME_KEY, next);
-  } catch {
-    // ignore
-  }
+  // Manual flip between light and dark — leaves System mode if it was active,
+  // picking the opposite of the currently resolved theme (GH #193).
+  setAppearancePreference(theme() === "light" ? "dark" : "light");
 }
 
 // Left sidebar open/collapsed — persisted (default open; store only when collapsed).
@@ -732,6 +799,17 @@ export function toggleFavorite(name: string, kind: "page" | "journal" = "page") 
   const next = f.some(matches)
     ? f.filter((x) => !matches(x))
     : [...f, { name, kind }];
+  setFavorites(next);
+  persistFavorites(next);
+}
+/** Move a favorite to a new position (GH #211 drag-reorder). Order persists
+ *  through the same config.edn :favorites owner as add/remove. */
+export function moveFavorite(from: number, to: number) {
+  const favs = favorites();
+  if (from === to || from < 0 || to < 0 || from >= favs.length || to >= favs.length) return;
+  const next = [...favs];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
   setFavorites(next);
   persistFavorites(next);
 }
@@ -1210,9 +1288,19 @@ export function setRightSidebar(items: SidebarItem[]) {
   }
   scheduleSessionSave(); // durable right-sidebar items (localStorage isn't kept)
 }
+/** Move a right-sidebar item to a new position (GH #211 drag-reorder). Order
+ *  persists through the same setRightSidebar owner (localStorage + session). */
+export function moveRightSidebarItem(from: number, to: number) {
+  const items = rightSidebar();
+  if (from === to || from < 0 || to < 0 || from >= items.length || to >= items.length) return;
+  const next = [...items];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  setRightSidebar(next);
+}
 
 /** History captures the same sidebar-open/item app state as OG does at
- * `src/main/frontend/modules/editor/undo_redo.cljs:261-272`
+ *  `src/main/frontend/modules/editor/undo_redo.cljs:261-272`
  * (OG commit 6e7afa8eb). */
 export function captureHistorySidebarContext(): HistorySidebarContext {
   return { open: rightSidebarOpen(), items: rightSidebar().map((item) => ({ ...item })) };

@@ -383,6 +383,17 @@ impl SparseV2Binding {
         self.handle.as_ref()
     }
 
+    /// A managed binding with no live actor, for tests that only need the slot
+    /// to *be* sparse -- e.g. proving that a read command is routed to the
+    /// read-only view instead of being refused for lacking legacy authority.
+    #[cfg(test)]
+    pub(crate) fn without_actor_for_test() -> Self {
+        Self {
+            availability: SparseV2Availability::Active,
+            handle: None,
+        }
+    }
+
     pub(crate) fn availability(&self) -> &SparseV2Availability {
         &self.availability
     }
@@ -737,24 +748,69 @@ impl SyncRuntimeFacade {
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
         crate::debug::diag("managed storage open: begin authenticated existing-state recovery");
-        let opened =
-            SyncRuntimeHandle::open_with_progress(
-                record.open_request(app)?,
-                |update| match update {
-                    SyncRuntimeOpenProgress::Phase { phase, elapsed } => {
-                        crate::debug::diag(format!(
-                            "managed storage open: phase {phase:?} at {} ms",
-                            elapsed.as_millis()
-                        ))
-                    }
-                    SyncRuntimeOpenProgress::Waiting { phase, elapsed } => {
-                        crate::debug::diag(format!(
-                            "managed storage open: still waiting in {phase:?} at {} ms",
-                            elapsed.as_millis()
-                        ))
-                    }
-                },
-            );
+        let opened = SyncRuntimeHandle::open_with_progress(record.open_request(app)?, |update| {
+            match update {
+                SyncRuntimeOpenProgress::Phase { phase, elapsed } => crate::debug::diag(format!(
+                    "managed storage open: phase {phase:?} at {} ms",
+                    elapsed.as_millis()
+                )),
+                SyncRuntimeOpenProgress::Waiting { phase, elapsed } => crate::debug::diag(format!(
+                    "managed storage open: still waiting in {phase:?} at {} ms",
+                    elapsed.as_millis()
+                )),
+                SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } => {
+                    crate::debug::diag(format!(
+                            "managed storage open: promoted recovery recovery={} retention={} retained_runs={} resume_candidate={} detached_bootstrap_reconstruction={} full_bootstrap_replay={} manifests={} manifest_enumeration_ms={} resume_selection_ms={} bootstrap_reconstruction_ms={} engine_open_ms={} sqlite_open_ms={} tail_construction_ms={} total_ms={}",
+                            diagnostics.recovery,
+                            diagnostics.retention_plan,
+                            diagnostics.retained_run_count,
+                            diagnostics.resume_candidate,
+                            diagnostics.detached_bootstrap_reconstruction,
+                            diagnostics.full_bootstrap_replay,
+                            diagnostics.manifest_count,
+                            diagnostics.manifest_enumeration.as_millis(),
+                            diagnostics.resume_selection.as_millis(),
+                            diagnostics.bootstrap_reconstruction.map(|elapsed| elapsed.as_millis()).map_or_else(|| "not_attempted".to_owned(), |elapsed| elapsed.to_string()),
+                            diagnostics.engine_open.as_millis(),
+                            diagnostics.sqlite_open.as_millis(),
+                            diagnostics.tail_construction.as_millis(),
+                            diagnostics.total.as_millis(),
+                        ));
+                    crate::debug::diag(format!(
+                            "managed storage open: projection recovery={} reason={:?} sidecar_shape_ms={} checkpoint_auth_ms={} read_only_open_ms={} schema_claim_ms={} structural_ms={} materialization_stamp_ms={} forensics_ms={} rebuild_ms={} applied_batches={} bulk_pages_materialized={} ancestry_full_scans={}",
+                            diagnostics.projection_recovery,
+                            diagnostics.projection_reason,
+                            diagnostics.projection_sidecar_shape.as_millis(),
+                            diagnostics.projection_checkpoint_authentication.as_millis(),
+                            diagnostics.projection_read_only_open.as_millis(),
+                            diagnostics.projection_schema_and_claim.as_millis(),
+                            diagnostics.projection_structural_validation.as_millis(),
+                            diagnostics.projection_materialization_stamp.as_millis(),
+                            diagnostics.projection_forensics_preservation.as_millis(),
+                            diagnostics.projection_rebuild.as_millis(),
+                            diagnostics.projection_applied_batches,
+                            diagnostics.projection_bulk_pages_materialized,
+                            diagnostics.projection_ancestry_full_scans,
+                        ));
+                    crate::debug::diag(format!(
+                            "managed storage open: engine stages prepare_replay_ms={} predecessor_restore_ms={} bootstrap_part_replay_ms={} archived_tail_replay_ms={} finish_replay_ms={} bootstrap_parts_replayed={} archived_manifests_offered={} archived_manifests_replayed={} resume_adopted={} resume_refused={} replay_base_generation={} live_history_generation={} replayed_generations={}",
+                            diagnostics.prepare_replay.as_millis(),
+                            diagnostics.predecessor_restore.as_millis(),
+                            diagnostics.bootstrap_part_replay.as_millis(),
+                            diagnostics.archived_tail_replay.as_millis(),
+                            diagnostics.finish_replay.as_millis(),
+                            diagnostics.bootstrap_parts_replayed,
+                            diagnostics.archived_manifests_offered,
+                            diagnostics.archived_manifests_replayed,
+                            diagnostics.resume_adopted,
+                            diagnostics.resume_refused,
+                            diagnostics.replay_base_generation,
+                            diagnostics.live_history_generation,
+                            diagnostics.replayed_generations,
+                        ));
+                }
+            }
+        });
         crate::debug::diag(format!(
             "managed storage open: completed with {:?}",
             opened.status

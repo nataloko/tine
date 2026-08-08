@@ -2100,6 +2100,7 @@ pub(crate) mod simulator_harness {
         act_once_at, fail_once_at, ExternalPublishedContinuation, LocalRuntimeAdmission,
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
+    use crate::oplog::hot_engine::AcceptedFrontierRoot;
     use crate::oplog::simulator::{
         publish_bootstrap_prepared_for_simulator_fixture, CoordinatorAction,
         CoordinatorDurableBoundary, CoordinatorExpectedState, CoordinatorFailureWitness,
@@ -3238,8 +3239,17 @@ pub(crate) mod simulator_harness {
         Ok(ready.saturating_add(pending))
     }
 
-    fn frontier_digest(root: &impl serde::Serialize) -> Result<String, String> {
-        let bytes = postcard::to_allocvec(root).map_err(display)?;
+    /// Names a frontier by its identity, so that "same digest" and "compares
+    /// equal" cannot disagree.
+    ///
+    /// Every use of this digest in the harness and the simulator oracles is
+    /// relational -- it asks whether the SQLite projection sits at the accepted
+    /// frontier. Digesting the whole struct instead answered a different
+    /// question, because the run-local `scratch_root` moves on reopen: the read
+    /// gate would (correctly) be Open with the two roots equal, while the
+    /// oracle read the two digests and reported the projection as stale.
+    fn frontier_digest(root: &AcceptedFrontierRoot) -> Result<String, String> {
+        let bytes = postcard::to_allocvec(&root.identity()).map_err(display)?;
         Ok(hex(ContentDigest::of(&bytes).as_bytes()))
     }
 
@@ -4609,6 +4619,36 @@ mod tests {
             fs::read(fixture.graph_root.join(&path)).unwrap(),
             b"- root edited\r\n\r\n\t- child\r\n",
             "the next real semantic edit must render from the adopted formatting baseline"
+        );
+    }
+
+    #[test]
+    fn formatting_receipt_survives_crash_reopen_late_callback_and_next_local_save() {
+        let mut fixture = Fixture::formatting_only("formatting-receipt-reopen");
+        let path = fixture.path.clone();
+        let formatted = b"- root\r\n\r\n\t- child\r\n";
+        fixture.overwrite(formatted);
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+
+        // Model a process loss after the durable completion/path row exists,
+        // before its watcher callback. Reopen has no RAM predecessor to use.
+        fixture = fixture.restart_projection_runtime();
+
+        // The late callback must derive an authenticated no-op from retained
+        // inventory and the durable completed-path receipt, not reconcile its
+        // own exact projection as an external edit.
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+        expect_local_active(fixture.local_edit(49_050, "after unsafe reopen"));
+        fixture.assert_drained();
+        assert_eq!(
+            fs::read(fixture.graph_root.join(&path)).unwrap(),
+            b"- after unsafe reopen\r\n\r\n\t- child\r\n"
         );
     }
 

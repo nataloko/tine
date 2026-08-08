@@ -1,4 +1,5 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
+import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
 import {
@@ -10,7 +11,8 @@ import {
   setGraphTransitioning,
   bumpGraphEpoch,
   theme,
-  toggleTheme,
+  appearancePreference,
+  setAppearancePreference,
   workflow,
   changeWorkflow,
   timetrackingEnabled,
@@ -137,7 +139,7 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2ActivationProgress, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -209,7 +211,7 @@ type SettingSearchEntry = {
   level?: "advanced" | "experimental";
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
-  { tab: "appearance", label: "Theme", description: "light dark gallery colors" },
+  { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
@@ -245,6 +247,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
   { tab: "graph", label: "Graph", description: "folder export publish" },
+  { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
   { tab: "extras", label: "Bullet threading", description: "thread active path outline depth rainbow accent colour animate flow" },
   { tab: "extras", label: "Live code highlighting", description: "syntax highlight fenced code block overlay" },
   { tab: "extras", label: "Git integration", description: "commit push pull auto version control repository branch" },
@@ -1226,18 +1229,44 @@ function AppearanceTab(props: { search: string }): JSX.Element {
     <>
       <div class="settings-row">
         <span class="settings-label">Theme</span>
-        <button
-          class="theme-switch"
-          classList={{ "is-dark": theme() === "dark" }}
-          role="switch"
-          aria-checked={theme() === "dark"}
-          title="Toggle light / dark (t t)"
-          onClick={toggleTheme}
+        <div
+          class="theme-switch theme-switch3"
+          classList={{ "is-light": appearancePreference() === "light", "is-system": appearancePreference() === "system", "is-dark": appearancePreference() === "dark" }}
+          role="radiogroup"
+          aria-label="Appearance"
         >
-          <span class="theme-opt"><span class="theme-ico">☀</span>Light</span>
-          <span class="theme-opt"><span class="theme-ico">☾</span>Dark</span>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "light"}
+            title="Light theme"
+            onClick={() => setAppearancePreference("light")}
+          >
+            <span class="theme-ico">☀</span>Light
+          </button>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "system"}
+            title="Follow the OS light/dark setting"
+            onClick={() => setAppearancePreference("system")}
+          >
+            <span class="theme-ico">◐</span>System
+          </button>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "dark"}
+            title="Dark theme"
+            onClick={() => setAppearancePreference("dark")}
+          >
+            <span class="theme-ico">☾</span>Dark
+          </button>
           <span class="theme-knob" />
-        </button>
+        </div>
       </div>
 
       <div class="settings-section">Themes</div>
@@ -2183,6 +2212,159 @@ function JournalsTab(props: { search: string }): JSX.Element {
   );
 }
 
+// Optional graph home page (GH #245): opened automatically in the primary tab
+// whenever this graph is opened. The value lives in the per-graph app-settings
+// string (see homePage.ts); picking only offers existing pages and a stale
+// value is surfaced with an explicit Clear.
+function HomePageField(): JSX.Element {
+  const root = () => graphMeta()?.root ?? "";
+  const [value, setValue] = createSignal<string | null>(null);
+  const [missing, setMissing] = createSignal(false);
+  const [picking, setPicking] = createSignal(false);
+  const [q, setQ] = createSignal("");
+  const [dq, setDq] = createSignal("");
+  let dqTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    const s = q();
+    clearTimeout(dqTimer);
+    dqTimer = setTimeout(() => setDq(s), 120);
+  });
+  onCleanup(() => clearTimeout(dqTimer));
+  // Page picker over the existing quick-switch index; home pages are ordinary
+  // pages, so journals are filtered out here and at open time.
+  const [matches] = createResource(dq, async (s) => {
+    if (value() && !picking()) return [];
+    const hits = await backend().quickSwitch(s, 8).catch(() => [] as PageEntry[]);
+    return (hits ?? []).filter((p) => p.kind === "page");
+  });
+
+  createEffect(on(root, async (r) => {
+    setValue(null);
+    if (!r) {
+      setValue("");
+      return;
+    }
+    setValue(await getHomePageSetting(r));
+  }));
+
+  // A configured page that no longer resolves (deleted / renamed) is surfaced
+  // so the user can clear or replace it; the startup navigation itself just
+  // skips it silently.
+  createEffect(() => {
+    const v = value();
+    if (!v || !root()) {
+      setMissing(false);
+      return;
+    }
+    let alive = true;
+    void backend()
+      .getPage(v, "page")
+      .then((dto) => {
+        if (alive) setMissing(!dto);
+      })
+      .catch(() => {
+        if (alive) setMissing(true);
+      });
+    onCleanup(() => {
+      alive = false;
+    });
+  });
+
+  const commit = async (name: string) => {
+    const r = root();
+    if (!r) return;
+    await setHomePageSetting(r, name);
+    setValue(name.trim());
+    setPicking(false);
+    setQ("");
+    setDq("");
+  };
+  const clear = async () => {
+    const r = root();
+    if (!r) return;
+    await setHomePageSetting(r, null);
+    setValue("");
+    setQ("");
+    setDq("");
+  };
+
+  return (
+    <Field
+      label="Home page"
+      hint={
+        <>
+          Open this page automatically whenever this graph opens. Only existing
+          pages can be picked; if the page is deleted or renamed the setting is
+          skipped. <code>/</code> deep links and explicit launch intents still
+          win over it.
+        </>
+      }
+    >
+      <Show when={value() !== null} fallback={<span class="settings-value">…</span>}>
+        <Show
+          when={picking() || !value()}
+          fallback={
+            <div style={{ display: "flex", "align-items": "center", gap: "8px", "flex-wrap": "wrap" }}>
+              <span class="settings-value" data-home-page-value>{value()}</span>
+              <button class="settings-btn" onClick={() => setPicking(true)}>
+                Change…
+              </button>
+              <button class="settings-btn" onClick={() => void clear()}>
+                Clear
+              </button>
+              <Show when={missing()}>
+                <span class="settings-hint" data-home-page-missing>
+                  Not found in this graph — it may have been deleted or renamed.
+                  Clear it or pick a replacement.
+                </span>
+              </Show>
+            </div>
+          }
+        >
+          <div>
+            <input
+              class="settings-input"
+              style={{ width: "260px" }}
+              placeholder="Search pages…"
+              value={q()}
+              onInput={(e) => setQ(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                const first = (matches() ?? [])[0];
+                if (e.key === "Enter" && first) void commit(first.name);
+                else if (e.key === "Escape") {
+                  setPicking(false);
+                  setQ("");
+                  setDq("");
+                }
+              }}
+            />
+            <For each={matches() ?? []}>
+              {(p) => (
+                <button class="settings-btn" style={{ "margin-left": "6px" }} onClick={() => void commit(p.name)}>
+                  {p.name}
+                </button>
+              )}
+            </For>
+            <Show when={value()}>
+              <button
+                class="settings-btn"
+                style={{ "margin-left": "6px" }}
+                onClick={() => {
+                  setPicking(false);
+                  setQ("");
+                  setDq("");
+                }}
+              >
+                Cancel
+              </button>
+            </Show>
+          </div>
+        </Show>
+      </Show>
+    </Field>
+  );
+}
+
 function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Element {
   return (
     <>
@@ -2197,6 +2379,8 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
           </div>
         </div>
       </div>
+
+      <HomePageField />
 
       <div class="settings-row">
         <span class="settings-label">Publish</span>

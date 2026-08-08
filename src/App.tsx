@@ -94,6 +94,7 @@ import {
   reloadPage,
   restoreTodayJournalInFeed,
 } from "./store";
+import { divergedFromBaseline, isSaving } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -240,7 +241,17 @@ export async function handleGraphChange(c: GraphChange) {
     return;
   }
   if (disp === "conflict") {
-    markConflict(c.name);
+    // The page has an unsaved edit. A watcher event proves this page's FILE was
+    // written, not that it was written to anything other than what we already
+    // hold: Tine's own save normally suppresses its echo, but a synced/polled
+    // graph or a self-write-marker gap still surfaces one (see store.upsertPage).
+    // Require the same per-page divergence proof as the managed path — a false
+    // conflict here blocks every subsequent save of the very edit it warns about.
+    if (!isSaving(c.name)) {
+      const current = await backend().getPage(c.name, c.kind);
+      if (divergedFromBaseline(c.name, { exists: !!current, rev: current?.rev ?? null }))
+        markConflict(c.name);
+    }
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
     return;
   }
@@ -288,11 +299,19 @@ export async function handleSparseV2Changed() {
     refreshed.add(`${route.pageKind}:${route.name}`);
     const disposition = reloadDisposition(route.name);
     if (disposition === "skip") continue;
+    // A save already in flight needs no notification: its own `base_rev` guard is
+    // the authority, and it decides against the exact bytes it is writing. Waking
+    // it with an aggregate epoch can only produce a verdict on staler evidence.
+    if (disposition === "conflict" && isSaving(route.name)) continue;
+    const dto = await backend().getPage(route.name, route.pageKind);
     if (disposition === "conflict") {
+      // The page has an unsaved edit. Prove this page actually diverged before
+      // blocking its saves — the epoch alone says only that SOMETHING was
+      // admitted, which is usually our own write coming back.
+      if (!divergedFromBaseline(route.name, { exists: !!dto, rev: dto?.rev ?? null })) continue;
       markConflict(route.name);
       continue;
     }
-    const dto = await backend().getPage(route.name, route.pageKind);
     if (dto) reloadPage(toLoadablePage(dto, route.name));
   }
   requestJournalFeedWatcherRestart(routes);
@@ -678,6 +697,19 @@ export function App(): JSX.Element {
     let unsub = () => {};
     void backend()
       .onManagedSyncError(() => pushToast("Tine-managed storage stopped. Open Storage & sync to retry setup.", "error"))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // A plain Markdown graph whose folder watch failed a reconcile cycle. Says
+  // only what is known: Tine may miss outside changes until it recovers. It
+  // deliberately makes no claim about whether saving still works — the guarded
+  // write path has its own failure modes and this event does not measure them.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphWatchError(() =>
+        pushToast("Tine couldn't finish checking the graph folder for outside changes. It will keep retrying.", "error"),
+      )
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

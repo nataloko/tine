@@ -324,6 +324,41 @@ pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
         .is_some_and(|source| source.is::<ProjectionSemanticRefusal>())
 }
 
+/// Markdown's parser deliberately omits layout trivia such as empty separator
+/// lines, but a guarded journal target may retain that trivia through its
+/// authenticated projection annotations. This comparison is intentionally
+/// stricter than `Document`'s content-only `PartialEq`: it keeps the exact
+/// preamble, block order/ancestry, raw block bodies (including `id::` lines),
+/// and parser-carried identity metadata equal.
+fn guarded_markdown_documents_match(left: &str, right: &str) -> bool {
+    fn blocks_match(left: &DocBlock, right: &DocBlock) -> bool {
+        left.raw == right.raw
+            && left.uuid == right.uuid
+            && left.is_org == right.is_org
+            && left.children.len() == right.children.len()
+            && left
+                .children
+                .iter()
+                .zip(&right.children)
+                .all(|(left, right)| blocks_match(left, right))
+    }
+
+    let Ok(left) = doc::try_parse_with_source_spans(left) else {
+        return false;
+    };
+    let Ok(right) = doc::try_parse_with_source_spans(right) else {
+        return false;
+    };
+    left.document.pre_block == right.document.pre_block
+        && left.document.roots.len() == right.document.roots.len()
+        && left
+            .document
+            .roots
+            .iter()
+            .zip(&right.document.roots)
+            .all(|(left, right)| blocks_match(left, right))
+}
+
 /// One lexical/scope validation result shared by exact points and feed events.
 ///
 /// This deliberately has no twin path. `.markdown` is one exact physical
@@ -1304,6 +1339,17 @@ fn managed_write_identity_mismatch_error() -> io::Error {
     )
 }
 
+/// Refusal for any graph-text write attempted through a read-only view. It is
+/// deliberately a hard error rather than a silent no-op: a caller that reached
+/// here is routed wrongly, and the write it wanted must go through the managed
+/// runtime instead. See [`Graph::derived_read_only`].
+fn derived_read_only_write_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "this graph view is read-only: graph text is owned by Tine-managed storage",
+    )
+}
+
 /// An active managed-text writer admission. Its only job is to keep the graph
 /// handoff mint from observing a false quiescent point.
 struct ManagedTextWritePermit {
@@ -1922,6 +1968,20 @@ fn verify_handoff_binding(
 
 pub struct Graph {
     pub root: PathBuf,
+    /// This instance may only ever *read* graph text.
+    ///
+    /// Tine-managed storage keeps the oplog as the sole authority and projects
+    /// it onto the ordinary Markdown/Org tree. Whole-graph reads -- backlinks,
+    /// search, `{{query}}`, aliases -- want that tree, but nothing outside the
+    /// managed runtime may write it, or a write would land behind the oplog's
+    /// back and be reverted (or worse, survive) at the next reconciliation.
+    ///
+    /// Rather than promise per caller that a command only reads, this flag fails
+    /// the *single* graph-text write admission (`admit_managed_text_writer`) and
+    /// the in-root write-containment check closed for the whole instance. Asset
+    /// writes keep their own capability and are deliberately still permitted:
+    /// `assets/` is outside the oplog's document domain.
+    derived_read_only: bool,
     /// Retained no-follow identity of the graph root. Sparse projection writes
     /// fail closed when this capability could not be established at graph open.
     projection_root: Option<Dir>,
@@ -2103,10 +2163,41 @@ struct GuardedGraphTextIdentityState {
     /// warm cache is reusable only if no sibling transition intervened.
     observed_resource_epoch: Option<u64>,
     generation: u64,
-    #[cfg(test)]
+    /// Always recorded, NOT `#[cfg(test)]`. A complete rebuild of this index is
+    /// the dominant cost of a save on a large graph, and "how many times did it
+    /// rebuild?" is the first question any slow-save report raises. A counter
+    /// that exists only in the test binary cannot answer that question on the
+    /// machine that has the problem -- which is exactly how the managed-recovery
+    /// lane burned a full diagnostic cycle on 2026-08-05/06.
     complete_builds: usize,
-    #[cfg(test)]
     exact_updates: usize,
+    /// Cost of the most recent complete rebuild, split into its two phases.
+    /// Durations and counts only -- never a path and never file content, so this
+    /// is safe to surface from a user's own graph.
+    last_build: Option<GuardedGraphTextIdentityBuild>,
+}
+
+/// One complete rebuild of the guarded graph-text admission index, measured.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardedGraphTextIdentityBuild {
+    /// Two-pass whole-graph retained capture.
+    pub capture: std::time::Duration,
+    /// Admission-index construction, including the per-document parse when
+    /// `decode_semantics` is set.
+    pub index: std::time::Duration,
+    pub decode_semantics: bool,
+    pub captured_entries: usize,
+    pub captured_bytes: u64,
+}
+
+/// Always-on report of what the guarded graph-text identity index has cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardedGraphTextIdentityReport {
+    pub complete_builds: usize,
+    pub exact_updates: usize,
+    pub invalidated: bool,
+    pub generation: u64,
+    pub last_build: Option<GuardedGraphTextIdentityBuild>,
 }
 
 impl std::ops::Deref for GraphTextAdmissionControl {
@@ -2702,6 +2793,15 @@ struct GraphTextAdmissionRecord {
     link_count: u64,
     semantic: PageEntry,
     format: Format,
+    /// Whether `semantic` came from parsing this file's bytes, rather than from
+    /// the page cache or from the filename alone.
+    ///
+    /// A rebuild reuses a prior record's `semantic` when this is set and the
+    /// prior `description` (a SHA-256 of the content, plus its length) equals
+    /// the freshly captured one — the bytes are identical, so the parse result
+    /// is too. Without the flag the reuse would launder a cache-derived guess
+    /// into something later builds treat as parsed.
+    semantic_parsed: bool,
 }
 
 #[derive(Clone)]
@@ -4855,6 +4955,22 @@ impl Graph {
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
+        // Publish writes reach the tree without a graph-text writer permit, so
+        // the read-only view has to refuse them here too. Configuration and the
+        // recoverable trash have their own capabilities below: both are outside
+        // the oplog's document domain and stay writable in a read-only view.
+        if self.derived_read_only {
+            return Err(derived_read_only_write_error());
+        }
+        self.ensure_within_graph_root(target)
+    }
+
+    /// Pure containment: the target must resolve inside this graph root. Split
+    /// out of `ensure_write_target` so the asset capability can reuse the check
+    /// without inheriting the graph-text read-only refusal -- `assets/` is
+    /// outside the oplog's document domain and stays writable in a read-only
+    /// view.
+    fn ensure_within_graph_root(&self, target: &Path) -> io::Result<()> {
         if path_stays_within_root(&self.root, target)
             && !path_uses_managed_alias(&self.root, target)
         {
@@ -4867,12 +4983,62 @@ impl Graph {
         }
     }
 
+    /// Graph configuration has its own capability boundary.
+    ///
+    /// `logseq/config.edn` is **not** oplog-owned. The managed reconciliation
+    /// scanner classifies it `GraphTextScanPathClass::Configuration`
+    /// (`model.rs`, `capture_reconciliation_scan_pass`) and the baseline adapter
+    /// drops every such row as "not managed content" that "cannot be represented
+    /// as a `ManagedPath`" (`oplog/reconciliation_baseline_adapter.rs`), so no
+    /// import, expected-path row or projection ever covers it. Configuration is
+    /// therefore writable in a read-only view — a Settings toggle is not a
+    /// write behind the oplog's back.
+    ///
+    /// Narrowed to that one exact path so the capability can never widen into a
+    /// general `logseq/` write.
+    pub(crate) fn ensure_config_write_target(&self, target: &Path) -> io::Result<()> {
+        if target != self.root.join("logseq").join("config.edn") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write target is not this graph's configuration: {}",
+                    target.display()
+                ),
+            ));
+        }
+        self.ensure_within_graph_root(target)
+    }
+
+    /// The recoverable trash tree has its own capability boundary.
+    ///
+    /// `logseq/.tine-trash` sits beside `assets`, `publish` and `.tine-sync` in
+    /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
+    /// imported or projected: it is outside the oplog's document domain exactly
+    /// the way `assets/` is. Only the *destination* is covered here. Page,
+    /// journal and conflict trashing still passes through
+    /// [`Graph::admit_managed_text_writer`] because its **source** is graph
+    /// text; this capability restores the asset-side trash writes that were
+    /// refused only incidentally.
+    fn ensure_trash_write_target(&self, target: &Path) -> io::Result<()> {
+        let trash = trash_root(&self.root);
+        if target != trash && !target.starts_with(&trash) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write target is not inside the recoverable trash: {}",
+                    target.display()
+                ),
+            ));
+        }
+        self.ensure_within_graph_root(target)
+    }
+
     /// Asset writes have their own capability boundary. Keeping this separate
     /// from `ensure_write_target` means approving external assets cannot widen a
     /// page/config/publish write into the same directory.
     fn ensure_asset_write_target(&self, target: &Path) -> io::Result<()> {
         if self.assets_root == self.root.join("assets") {
-            return self.ensure_write_target(target);
+            return self.ensure_within_graph_root(target);
         }
         if path_stays_within_root(&self.assets_root, target)
             && !path_uses_managed_alias(&self.assets_root, target)
@@ -4891,6 +5057,21 @@ impl Graph {
 
     /// Open a graph directory, reading `logseq/config.edn` if present.
     pub fn open(root: impl AsRef<Path>) -> Graph {
+        Self::open_inner(root, false)
+    }
+
+    /// Open the same directory as a **read-only view of graph text**.
+    ///
+    /// This is what Tine-managed storage hands to whole-graph read commands.
+    /// The projected Markdown/Org tree is the managed runtime's own output, so
+    /// reading it answers backlinks/search/query questions from the oplog's
+    /// materialization -- but this instance can never write graph text back.
+    /// See [`Graph::derived_read_only`].
+    pub fn open_derived_read_only(root: impl AsRef<Path>) -> Graph {
+        Self::open_inner(root, true)
+    }
+
+    fn open_inner(root: impl AsRef<Path>, derived_read_only: bool) -> Graph {
         let root = root.as_ref().to_path_buf();
         let projection_root = open_projection_root_nofollow(&root).ok();
         let managed_write_binding =
@@ -4914,6 +5095,7 @@ impl Graph {
         let graph_text_admission_instance = Arc::new(GraphTextAdmissionInstance);
         Graph {
             assets_root: root.join("assets"),
+            derived_read_only,
             projection_root,
             root,
             config,
@@ -5019,6 +5201,12 @@ impl Graph {
     }
 
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
+        // Every graph-text write in this file passes through here, which is why
+        // the read-only view is enforced at this one point rather than trusted
+        // to each of the ~28 callers.
+        if self.derived_read_only {
+            return Err(derived_read_only_write_error());
+        }
         let binding = self.managed_write_binding()?;
         let mut permit = binding.gate.admit_writer()?;
         if let Err(error) = managed_write_after_admission_hook() {
@@ -5417,6 +5605,7 @@ impl Graph {
                 state.invalidated || state.observed_resource_epoch != Some(resource_epoch),
             )
         };
+        let capture_started = std::time::Instant::now();
         let (capture, combined_capture_bytes) = self
             .capture_retained_graph_text_identity_with_limits(INITIAL_SHADOW_LIMITS)
             .map_err(|error| {
@@ -5425,9 +5614,12 @@ impl Graph {
                     format!("guarded graph-text identity capture failed: {error}"),
                 )
             })?;
+        let capture_elapsed = capture_started.elapsed();
+        let captured_entries = capture.entries.len();
         let replacement_peak = prior.as_ref().map_or(combined_capture_bytes, |index| {
             combined_capture_bytes.saturating_add(index.permanent_bytes)
         });
+        let index_started = std::time::Instant::now();
         let mut replacement = build_graph_text_admission_index(
             self,
             &capture,
@@ -5435,6 +5627,7 @@ impl Graph {
             INITIAL_SHADOW_LIMITS,
             replacement_peak,
             decode_semantics,
+            prior.as_deref(),
         )
         .map_err(|error| {
             io::Error::new(
@@ -5442,6 +5635,7 @@ impl Graph {
                 format!("guarded graph-text identity construction failed: {error}"),
             )
         })?;
+        let index_elapsed = index_started.elapsed();
 
         if binding.gate.identity_mutation_epoch_under_authority() != resource_epoch {
             return Err(graph_text_admission_unavailable(
@@ -5459,10 +5653,14 @@ impl Graph {
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
-        #[cfg(test)]
-        {
-            state.complete_builds = state.complete_builds.saturating_add(1);
-        }
+        state.complete_builds = state.complete_builds.saturating_add(1);
+        state.last_build = Some(GuardedGraphTextIdentityBuild {
+            capture: capture_elapsed,
+            index: index_elapsed,
+            decode_semantics,
+            captured_entries,
+            captured_bytes: combined_capture_bytes,
+        });
         Ok(replacement)
     }
 
@@ -5628,7 +5826,6 @@ impl Graph {
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
-        #[cfg(test)]
         {
             state.exact_updates = state.exact_updates.saturating_add(1);
         }
@@ -5671,13 +5868,28 @@ impl Graph {
 
     #[cfg(test)]
     pub(crate) fn guarded_graph_text_identity_stats(&self) -> (usize, usize, bool, u64) {
-        let state = self.guarded_graph_text_identity.read().unwrap();
+        let report = self.guarded_graph_text_identity_report();
         (
-            state.complete_builds,
-            state.exact_updates,
-            state.invalidated,
-            state.generation,
+            report.complete_builds,
+            report.exact_updates,
+            report.invalidated,
+            report.generation,
         )
+    }
+
+    /// Always available, including in a release build. The whole point is that a
+    /// user reporting a slow save can be answered from the binary they are
+    /// running, without a debug build or an environment variable. Carries
+    /// durations and counts only -- no paths, no content.
+    pub fn guarded_graph_text_identity_report(&self) -> GuardedGraphTextIdentityReport {
+        let state = self.guarded_graph_text_identity.read().unwrap();
+        GuardedGraphTextIdentityReport {
+            complete_builds: state.complete_builds,
+            exact_updates: state.exact_updates,
+            invalidated: state.invalidated,
+            generation: state.generation,
+            last_build: state.last_build,
+        }
     }
 
     #[cfg(test)]
@@ -7601,6 +7813,7 @@ impl Graph {
                 limits,
                 combined_capture_bytes,
                 true,
+                None,
             )?;
             let collision = initial_shadow_global_collision(&index);
             Ok((first, index, collision))
@@ -7656,10 +7869,43 @@ impl Graph {
         &self,
         limits: InitialShadowLimits,
     ) -> io::Result<(InitialShadowCapture, u64)> {
+        // GH #267 / F3. The two passes must agree, and ANY concurrent filesystem
+        // activity anywhere in the graph makes them disagree -- which on a
+        // Syncthing, Dropbox or OneDrive folder is not an anomaly, it is the
+        // steady state. A single disagreement used to surface as a failed save.
+        //
+        // Disagreement means "something moved while we looked", not "the graph
+        // is broken", so retry it in place a bounded number of times. Only that
+        // one outcome is retried; every other error still surfaces at once.
+        // The caller holds the identity-mutation authority across all attempts,
+        // so this cannot interleave with one of our own writes.
+        const CAPTURE_ATTEMPTS: usize = 4;
+        let mut last_disagreement = None;
+        for _ in 0..CAPTURE_ATTEMPTS {
+            match self.attempt_retained_graph_text_identity_capture(limits) {
+                Ok(captured) => return Ok(captured),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    last_disagreement = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_disagreement.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed inventory changed during retained identity capture",
+            )
+        }))
+    }
+
+    fn attempt_retained_graph_text_identity_capture(
+        &self,
+        limits: InitialShadowLimits,
+    ) -> io::Result<(InitialShadowCapture, u64)> {
         require_projection_platform()?;
         let permit = self.admit_managed_text_writer()?;
         let first = collect_initial_shadow_managed_inventory_with_limits_inner(
-            self, &permit, true, limits, 0, false,
+            self, &permit, true, limits, 0, false, true,
         )?;
         initial_shadow_revalidation_hook(&self.root)?;
         let second = collect_initial_shadow_managed_inventory_with_limits_inner(
@@ -7669,6 +7915,7 @@ impl Graph {
             limits,
             first.peak_build_charge,
             false,
+            true,
         )?;
         if !initial_shadow_captures_match(&first, &second) {
             return Err(io::Error::new(
@@ -8073,6 +8320,7 @@ impl Graph {
             INITIAL_SHADOW_LIMITS,
             replacement_peak_base,
             true,
+            Some(&current),
         )?;
         if let Some(error) = initial_shadow_global_collision(&replacement) {
             return Err(error);
@@ -9576,6 +9824,7 @@ impl Graph {
                     link_count,
                     semantic,
                     format,
+                    semantic_parsed: decode_semantics,
                 },
             ))
         } else {
@@ -15041,7 +15290,7 @@ impl Graph {
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
         self.ensure_asset_write_target(&src)?;
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
         move_to_trash(&src, &dest, &trash)?;
         Ok(())
@@ -15059,7 +15308,7 @@ impl Graph {
     /// entries stay recoverable in `logseq/.tine-trash`.
     pub fn empty_asset_trash(&self) -> io::Result<u64> {
         let trash = trash_root(&self.root);
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         let mut removed = 0;
         match fs::read_dir(&trash) {
             Ok(rd) => {
@@ -15325,7 +15574,7 @@ impl Graph {
             let source = self.assets_path().join(source_key).join(&name);
             if !source.is_file()
                 || self.ensure_asset_write_target(&source).is_err()
-                || self.ensure_write_target(&trash).is_err()
+                || self.ensure_trash_write_target(&trash).is_err()
                 || fs::create_dir_all(&trash).is_err()
             {
                 continue;
@@ -15924,6 +16173,70 @@ impl Graph {
     /// it isn't in the graph's journals/pages dirs.
     pub fn entry_for_path(&self, path: &Path) -> Option<PageEntry> {
         self.managed_entry_for_path(path).ok().flatten()
+    }
+
+    /// True when an external filesystem event at `path` can change this graph's
+    /// text inventory or its conflict list.
+    ///
+    /// Purely lexical and cheap, and deliberately so: the path need not exist,
+    /// which lets the watcher route deletions through the same predicate it
+    /// uses for creations.
+    ///
+    /// This exists to give the reconcile lane the *same* scope authority that
+    /// discovery uses. `graph_text_inventory` walks graph-wide through
+    /// `GraphTextScope`, but the watcher used to filter events against
+    /// `journals/` + `pages/` alone, so an external edit to a page at the graph
+    /// root or in a custom folder was watched, delivered, and then silently
+    /// discarded before reconciliation (GH #268).
+    pub fn graph_text_watch_relevant(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let relative = slash_path(relative);
+        if relative.is_empty() {
+            return false;
+        }
+        if self.graph_text_scope.is_eligible(&relative) {
+            return true;
+        }
+        // A provider conflict copy is deliberately NOT eligible text — it is
+        // never cached as a page — but its appearance or removal still has to
+        // refresh the conflicts panel, so the watcher must be able to see one
+        // wherever an eligible document could live.
+        if !path_is_sync_conflict(path) {
+            return false;
+        }
+        let (parent, filename) = match relative.rsplit_once('/') {
+            Some((parent, filename)) => (parent, filename),
+            None => ("", relative.as_str()),
+        };
+        self.graph_text_scope.should_descend(parent)
+            && filename.rsplit_once('.').is_some_and(|(_, extension)| {
+                extension.eq_ignore_ascii_case("md")
+                    || extension.eq_ignore_ascii_case("markdown")
+                    || extension.eq_ignore_ascii_case("org")
+            })
+    }
+
+    /// True when the watcher's snapshot walk may descend into the directory at
+    /// `path`. Companion to [`Graph::graph_text_watch_relevant`], same authority
+    /// (`GraphTextScope`), same reason: the snapshot has to cover exactly what
+    /// discovery covers or a graph-wide event has nothing to reconcile against.
+    pub fn graph_text_watch_descend(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.graph_text_scope.should_descend(&slash_path(relative))
+    }
+
+    /// Ownership test for an event path whose file-or-directory nature we do not
+    /// know — a directory move, or a kind the watcher cannot classify. Such an
+    /// event forces a full diff for the owning graph, so the only question is
+    /// whether anything eligible could live *at or under* the path. Excluded
+    /// trees (`assets/`, `node_modules/`, dot-directories, `logseq/bak/`) answer
+    /// no, which is what keeps an image drop from rescanning the graph.
+    pub fn graph_text_watch_could_contain(&self, path: &Path) -> bool {
+        self.graph_text_watch_relevant(path) || self.graph_text_watch_descend(path)
     }
 
     /// Record that Tine just wrote content with rev `rev` to `path`, so the file
@@ -17780,7 +18093,7 @@ impl Graph {
         }
 
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         fs::create_dir_all(&trash)?;
         let name = path
             .file_name()
@@ -18033,6 +18346,7 @@ impl Graph {
                 "managed text watcher snapshot changed before reconciliation",
             ));
         }
+        self.repin_retained_identity_at_equal_bytes(path, &content, identity);
         // The watcher consumes the self-write marker (one-shot) so the map stays
         // bounded to in-flight writes.
         let reconciled = match self.sync_file_content(Some(&write), path, &content, true) {
@@ -18880,14 +19194,48 @@ impl Graph {
         Ok((path, false))
     }
 
+    /// Re-pin a loaded page's retained file identity when the file was replaced
+    /// atomically with **byte-identical** content.
+    ///
+    /// A save proves it is not clobbering someone else's work two ways: the
+    /// editor's `base_rev` must still match the bytes on disk, and the file must
+    /// still be the same physical file that was read at load. External tools
+    /// break the second without touching the first — OneDrive rehydrating a
+    /// Files-On-Demand placeholder, a Syncthing pull that lands the same bytes,
+    /// a `cp` over a hardlink. The path then holds exactly the bytes the editor
+    /// started from, but a different inode.
+    ///
+    /// Before this, every later save of that page failed with "existing page
+    /// identity changed since load", and both exits from the resulting conflict
+    /// prompt were dead ends: "Keep mine (overwrite)" re-ran the same check and
+    /// failed too, and "Use disk version" discarded the user's edit. The user
+    /// could not save, and the only button that worked lost their work.
+    ///
+    /// This re-pins the identity **only** when the retained revision still
+    /// matches the bytes now on disk, so the proof it stands on is unchanged.
+    /// A file whose content differs is a real external change and still
+    /// conflicts.
+    fn repin_retained_identity_at_equal_bytes(
+        &self,
+        path: &Path,
+        content: &str,
+        identity: ContentDigest,
+    ) {
+        let revision = content_rev(content);
+        let mut retained = self.loaded_file_identities.write().unwrap();
+        if let Some((captured_revision, captured_identity)) = retained.get_mut(path) {
+            if *captured_revision == revision {
+                *captured_identity = identity;
+            }
+        }
+    }
+
     fn require_pinned_save_owner(
         &self,
         page: &PageDto,
         path: &Path,
         loaded: Option<&ExactGraphLoadedPage>,
-        // Ordinary frontend saves carry their load revision in the separate
-        // base_rev argument; PageDto.rev is not part of the working-store DTO.
-        loaded_rev: Option<&str>,
+        authority: PinnedSaveAuthority<'_>,
     ) -> io::Result<()> {
         if page.path.is_empty() {
             return Ok(());
@@ -18898,17 +19246,22 @@ impl Graph {
                 "a path-pinned page requires its existing retained file owner",
             )
         })?;
-        let retained = self.loaded_file_identities.read().unwrap();
-        let retained_matches = loaded_rev.is_some_and(|revision| {
-            retained
-                .get(path)
-                .is_some_and(|(captured_revision, captured_identity)| {
-                    captured_revision == revision
-                        && *captured_identity == loaded.file_identity
-                        && loaded.entry.path == path
+        let owner_matches = match authority {
+            PinnedSaveAuthority::UserOverride => loaded.entry.path == path,
+            PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
+                let retained = self.loaded_file_identities.read().unwrap();
+                loaded_rev.is_some_and(|revision| {
+                    retained
+                        .get(path)
+                        .is_some_and(|(captured_revision, captured_identity)| {
+                            captured_revision == revision
+                                && *captured_identity == loaded.file_identity
+                                && loaded.entry.path == path
+                        })
                 })
-        });
-        if !retained_matches {
+            }
+        };
+        if !owner_matches {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "path-pinned page does not match its captured exact owner",
@@ -19190,7 +19543,12 @@ impl Graph {
 
         let validation =
             self.validate_graph_text_target(write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), Some(base_rev))?;
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            PinnedSaveAuthority::LoadedRevision(Some(base_rev)),
+        )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -19248,7 +19606,10 @@ impl Graph {
         }
 
         let (_, serialized) = self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
-        if serialized != exact_target {
+        let exact_target_matches_guarded_page = serialized == exact_target
+            || (Format::from_path(&path) == Format::Md
+                && guarded_markdown_documents_match(&serialized, exact_target));
+        if !exact_target_matches_guarded_page {
             return Err(projection_semantic_refusal(
                 io::ErrorKind::InvalidData,
                 "journal target differs from strict guarded page serialization",
@@ -19473,7 +19834,12 @@ impl Graph {
         // avoids re-reading the file 2-3× per save, which is felt on NFS.
         let validation =
             self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), base_rev)?;
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            PinnedSaveAuthority::LoadedRevision(base_rev),
+        )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -19573,7 +19939,7 @@ impl Graph {
             page,
             &path,
             validation.target.as_ref(),
-            page.rev.as_deref(),
+            PinnedSaveAuthority::UserOverride,
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -24729,6 +25095,26 @@ struct ManagedLoadedPage {
     page_reservation: RetainedContentReservation,
 }
 
+/// What entitles a save to write the file its page is pinned to.
+enum PinnedSaveAuthority<'a> {
+    /// The revision the editor loaded. The retained pin must still agree with
+    /// it: a change nobody observed between load and save is a conflict to
+    /// report, not bytes to overwrite.
+    ///
+    /// Ordinary frontend saves carry this in the separate `base_rev` argument;
+    /// `PageDto.rev` is NOT part of the working-store DTO that `pageToDto`
+    /// builds, so it must never be read as one.
+    LoadedRevision(Option<&'a str>),
+    /// The user was shown the conflict and chose to keep their own edits.
+    ///
+    /// A stale revision and a stale identity ARE the conflict being resolved —
+    /// requiring either to match makes "keep mine" refuse exactly when it is
+    /// needed, leaving discard-my-work as the only exit the app offers. The pin
+    /// must still resolve to a retained file owner at the validated path, so an
+    /// override cannot be redirected onto a file this page never came from.
+    UserOverride,
+}
+
 struct ExactGraphLoadedPage {
     entry: PageEntry,
     document: Document,
@@ -27819,6 +28205,7 @@ fn collect_initial_shadow_managed_inventory_with_limits(
         limits,
         simultaneous_capture_bytes,
         true,
+        false,
     )
 }
 
@@ -27829,6 +28216,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     limits: InitialShadowLimits,
     simultaneous_capture_bytes: u64,
     require_ambient_binding: bool,
+    skip_symlinks: bool,
 ) -> io::Result<InitialShadowCapture> {
     struct PendingDirectory {
         directory: Dir,
@@ -27934,9 +28322,27 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             };
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
-                if !graph.graph_text_scope.should_descend(&child_relative)
-                    && !graph.graph_text_scope.is_eligible(&child_relative)
+                if skip_symlinks
+                    || (!graph.graph_text_scope.should_descend(&child_relative)
+                        && !graph.graph_text_scope.is_eligible(&child_relative))
                 {
+                    // GH #267 / F3. A symlink anywhere in a descended scope used
+                    // to abort this capture, and because the save path takes the
+                    // capture to answer a filename question, that made the whole
+                    // graph permanently unsaveable -- one symlink in `pages/`
+                    // and none of the user's OTHER pages could be written.
+                    //
+                    // Skipping is what the rest of Tine already does: every
+                    // traversal here is no-follow, the watcher's snapshot walk
+                    // never descends a symlinked directory, and
+                    // `graph_inventory_entry` never admits a symlinked file. A
+                    // symlink is not a graph-text document on any other path, so
+                    // the capture stops being the one place that escalates it to
+                    // an error that costs the user their other pages.
+                    //
+                    // `skip_symlinks` is false for the shadow-import bootstrap,
+                    // which still refuses: importing a graph must not silently
+                    // leave out a file the user considers part of it.
                     continue;
                 }
                 return Err(io::Error::new(
@@ -28231,6 +28637,7 @@ fn build_graph_text_admission_index(
     limits: InitialShadowLimits,
     combined_capture_bytes: u64,
     decode_semantics: bool,
+    prior: Option<&CompleteGraphTextAdmissionIndex>,
 ) -> io::Result<CompleteGraphTextAdmissionIndex> {
     let (scope_binding, graph_resource) = if decode_semantics {
         (
@@ -28333,7 +28740,24 @@ fn build_graph_text_admission_index(
             .bytes
             .as_deref()
             .expect("the first initial-shadow pass retains bytes");
-        let (semantic, format) = if decode_semantics {
+        // THE cut (GH #267). A rebuild used to parse EVERY document in the graph
+        // whenever the exact-observation chain had broken -- on every save, and
+        // on Windows or a network share that was essentially always. But an
+        // invalidation says "we lost track", not "everything changed": almost
+        // every file still holds byte-for-byte the same content it held when we
+        // last parsed it, and `description` (a SHA-256 of the content plus its
+        // length) proves which. Reuse those, and parse only what actually moved.
+        //
+        // `semantic_parsed` is what makes the reuse sound: a record whose
+        // semantic came from the page cache or from its filename is a guess, and
+        // carrying it forward would let later builds treat it as parsed.
+        let reused = decode_semantics
+            .then(|| prior?.files_by_exact_path.get(&entry.path))
+            .flatten()
+            .filter(|record| record.semantic_parsed && record.description == entry.description);
+        let (semantic, format) = if let Some(record) = reused {
+            (record.semantic.clone(), record.format)
+        } else if decode_semantics {
             let content = std::str::from_utf8(bytes).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -28367,6 +28791,7 @@ fn build_graph_text_admission_index(
             link_count: entry.link_count,
             semantic,
             format,
+            semantic_parsed: decode_semantics,
         };
         index
             .file_is_graph_text_by_exact_relative
@@ -29523,6 +29948,72 @@ fn graph_text_admission_unavailable(cause: &str) -> io::Error {
     )
 }
 
+/// Classify a Direct-Markdown save failure into a BOUNDED code.
+///
+/// Two reasons this exists rather than logging the error itself. First, the
+/// error messages carry graph-relative paths, and a user's page titles are their
+/// private data -- a diagnostic that cannot be pasted into a bug report is not a
+/// diagnostic. Second, "the save failed" is useless triage: the failure classes
+/// behind it (a symlink somewhere in the walk, ambient filesystem churn between
+/// the capture's two passes, a same-bytes external replace that moved the inode,
+/// a rejected reparse point) have completely different fixes, and today they are
+/// indistinguishable from outside the process.
+///
+/// The strings matched here are produced by this module, so this is internal
+/// consistency rather than parsing a foreign format. `direct_save_failure_codes_
+/// are_stable` pins each code to the site that produces it.
+pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
+    let message = error.to_string();
+    let has = |needle: &str| message.contains(needle);
+    if has("is a symlink or reparse point") {
+        "precheck.symlink"
+    } else if has("changed during retained identity capture") || has("changed during capture") {
+        "precheck.interrupted"
+    } else if has("share one portable case/NFC identity") {
+        "precheck.portable_collision"
+    } else if has("alias one physical resource") {
+        "precheck.resource_alias"
+    } else if has("is not portable") {
+        "precheck.not_portable"
+    } else if has("not a real no-follow directory") || has("no retained no-follow") {
+        "precheck.nofollow"
+    } else if has("bound exceeded") {
+        "precheck.limit"
+    } else if has("existing page identity changed since load") {
+        "identity.changed_since_load"
+    } else if has("owns this effective page identity") {
+        "identity.owned_elsewhere"
+    } else if has("does not match its captured exact owner") {
+        // The file changed between load and save without the watcher seeing it.
+        // A genuine content conflict, and one "keep mine" can now resolve.
+        "conflict.pinned_owner"
+    } else if message == "conflict" {
+        "conflict.base_rev"
+    } else if has("a page with that name already exists")
+        || has("target page exists")
+        || has("target page identity already exists elsewhere")
+    {
+        "identity.name_taken"
+    } else {
+        // Deliberately NOT a `conflict.*` catch-all on AlreadyExists.
+        //
+        // Every `conflict.*` code becomes the literal string the frontend
+        // matches to raise the keep-mine/use-disk banner, and that banner can
+        // only resolve a content conflict. `AlreadyExists` is raised by roughly
+        // forty-five other conditions in this module -- managed and projection
+        // internals, reservation-name collisions, recovery-name collisions --
+        // for which the banner offers two buttons that cannot help and whose
+        // "use disk" arm discards the user's edits. Worse, the catch-all
+        // replaced the message text, so a failure that RETAINED the user's
+        // bytes under a recovery name reached them as an unexplained conflict.
+        //
+        // An unclassified failure now reports its real message. If a new
+        // condition genuinely is a resolvable conflict, give it its own
+        // `conflict.*` code above, where the decision is visible.
+        "unknown"
+    }
+}
+
 fn initial_shadow_limit_error(resource: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -30096,7 +30587,20 @@ fn rename_managed_noreplace(
     destination_dir: &Dir,
     destination: &str,
 ) -> io::Result<()> {
-    source_dir.rename(source, destination_dir, destination)
+    // Every other platform gives this function a real no-replace primitive
+    // (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). Windows used
+    // `Dir::rename`, which cap-std implements with replace semantics — so the
+    // one guarantee the name promises was the one Windows did not provide, and
+    // an external file landing in the check-to-rename window was clobbered.
+    //
+    // `rename_projection_between_noreplace` is the same operation done properly:
+    // it opens the source with DELETE access through the retained directory
+    // capability and renames that exact handle with
+    // `FileRenameInformation`/`ReplaceIfExists = FALSE`, rejecting filesystems
+    // that cannot provide the primitive BEFORE the live source name is retired.
+    // It already takes separate source and destination directories, so this is
+    // the cross-directory case it was written for.
+    rename_projection_between_noreplace(source_dir, source, destination_dir, destination)
 }
 
 #[cfg(not(any(
@@ -30763,6 +31267,141 @@ mod tests {
             assert_eq!(durable.target().revision(), content_rev(&fixture.target));
             assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_accepts_only_semantically_equal_markdown_layout_trivia() {
+        let fixture = JournalProjectionFixture::new(
+            "journal-projection-authenticated-layout",
+            "pages/Authenticated Layout.md",
+            "- first\n\n- second\n",
+            "edited",
+        );
+        let exact_target = "- edited\n\n- second\n";
+        assert_ne!(fixture.target, exact_target);
+        assert!(guarded_markdown_documents_match(
+            &fixture.target,
+            exact_target
+        ));
+        let calls = Cell::new(0_usize);
+        let outcome = fixture
+            .graph
+            .commit_existing_page_with_journal(
+                &fixture.page,
+                &fixture.base_rev,
+                fixture.base.as_bytes(),
+                exact_target.as_bytes(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok("authenticated-layout-proof")
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, JournalPageProjectionOutcome::Durable(_)));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fs::read(&fixture.path).unwrap(), exact_target.as_bytes());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_refuses_semantically_different_markdown_layout_targets_before_append() {
+        fn assert_refused(label: &str, mut fixture: JournalProjectionFixture, exact_target: &str) {
+            let before = regular_file_tree(&fixture.root);
+            let calls = Cell::new(0_usize);
+            let error = fixture
+                .graph
+                .commit_existing_page_with_journal(
+                    &fixture.page,
+                    &fixture.base_rev,
+                    fixture.base.as_bytes(),
+                    exact_target.as_bytes(),
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{label} semantic mismatch committed"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(calls.get(), 0, "{label}");
+            assert_eq!(regular_file_tree(&fixture.root), before, "{label}");
+            fixture.cleanup_root = false;
+            let _ = fs::remove_dir_all(&fixture.root);
+        }
+
+        assert_refused(
+            "content",
+            JournalProjectionFixture::new(
+                "journal-projection-mismatch-content",
+                "pages/Content.md",
+                "- first\n\n- second\n",
+                "edited",
+            ),
+            "- different\n\n- second\n",
+        );
+        assert_refused(
+            "order-and-ancestry",
+            JournalProjectionFixture::new(
+                "journal-projection-mismatch-order",
+                "pages/Order.md",
+                "- first\n  - child\n- second\n",
+                "edited",
+            ),
+            "- second\n\n- edited\n  - child\n",
+        );
+        assert_refused(
+            "page-property",
+            JournalProjectionFixture::new(
+                "journal-projection-mismatch-property",
+                "pages/Property.md",
+                "status:: accepted\n\n- first\n",
+                "edited",
+            ),
+            "status:: changed\n\n- edited\n",
+        );
+
+        let original_id = "11111111-1111-1111-1111-111111111111";
+        let replacement_id = "22222222-2222-2222-2222-222222222222";
+        let base = format!("- first\n  id:: {original_id}\n");
+        let fixture = JournalProjectionFixture::new(
+            "journal-projection-mismatch-explicit-id",
+            "pages/Explicit Id.md",
+            &base,
+            &format!("edited\nid:: {original_id}"),
+        );
+        let exact_target = format!("- edited\n  id:: {replacement_id}\n");
+        assert_refused("explicit-id", fixture, &exact_target);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_keeps_org_byte_exact_when_layout_only_target_differs() {
+        let fixture = JournalProjectionFixture::new(
+            "journal-projection-org-layout",
+            "journals/2026_08_05.org",
+            "* first\n* second\n",
+            "edited",
+        );
+        let exact_target = "* edited\n\n* second\n";
+        let calls = Cell::new(0_usize);
+        let error = fixture
+            .graph
+            .commit_existing_page_with_journal(
+                &fixture.page,
+                &fixture.base_rev,
+                fixture.base.as_bytes(),
+                exact_target.as_bytes(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .err()
+            .expect("Org layout-only difference must remain refused before append");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
     }
 
     #[cfg(any(unix, windows))]
@@ -32285,6 +32924,180 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    /// The read-only view exists so managed storage can answer whole-graph
+    /// questions from its own projected tree. It must answer them -- and it must
+    /// not be able to write that tree back, because the oplog owns it.
+    #[test]
+    fn a_derived_read_only_graph_reads_the_tree_but_cannot_write_it() {
+        let dir = scratch("derived-read-only-graph");
+        fs::write(
+            dir.join("pages/Alpha.md"),
+            "- alpha mentions [[Target]]\n- and again [[Target]]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/Target.md"), "- the target page\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+
+        // Reads: the whole point. Backlinks are the query that was dead in
+        // managed mode, so assert that one specifically.
+        let groups = view.backlinks("Target");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha"],
+            "the read-only view must resolve backlinks from the projected tree"
+        );
+        assert!(
+            view.list_pages().iter().any(|entry| entry.name == "Alpha"),
+            "the read-only view must enumerate pages"
+        );
+
+        // Writes: refused at the single graph-text admission, whatever the
+        // caller. A command routed here by mistake fails loudly rather than
+        // leaving a file behind the oplog's back.
+        let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited behind the oplog".into();
+        let refused = view.save_page(&page, base_rev.as_deref()).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "a graph-text write through the read-only view must be refused: {refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Alpha.md")).unwrap(),
+            "- alpha mentions [[Target]]\n- and again [[Target]]\n",
+            "the refused save must not have touched the file"
+        );
+
+        // Control: the same directory opened normally still saves, so the test
+        // proves the flag and not some unrelated breakage in the fixture.
+        let writable = Graph::open(&dir);
+        let mut page = writable.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited by the owner".into();
+        writable
+            .save_page(&page, base_rev.as_deref())
+            .expect("an ordinary graph still writes");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `assets/` is outside the oplog's document domain, so importing an image
+    /// while managed storage owns graph text must keep working.
+    #[test]
+    fn a_derived_read_only_graph_still_accepts_asset_writes() {
+        let dir = scratch("derived-read-only-assets");
+        let source = dir.join("incoming.png");
+        fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+        let stored = view
+            .import_asset(&source, Some("picture.png"))
+            .expect("asset writes are outside the graph-text boundary");
+        assert!(
+            dir.join("assets").join(&stored).exists(),
+            "the imported asset must land in assets/"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every Settings toggle writes `logseq/config.edn`, and configuration is
+    /// **not** oplog-owned: the managed scanner classifies it
+    /// `GraphTextScanPathClass::Configuration` and the baseline adapter drops
+    /// those rows as "not managed content", so no managed path, import or
+    /// projection ever covers it. Persisting a setting must therefore keep
+    /// working while managed storage owns graph text.
+    #[test]
+    fn a_derived_read_only_graph_still_writes_graph_configuration() {
+        let dir = scratch("derived-read-only-config");
+        let view = Graph::open_derived_read_only(&dir);
+
+        view.set_favorites(&["Alpha".to_owned(), "Beta".to_owned()])
+            .expect("configuration is outside the graph-text boundary");
+        view.set_start_of_week(3)
+            .expect("configuration is outside the graph-text boundary");
+
+        let written = fs::read_to_string(dir.join("logseq/config.edn"))
+            .expect("the setting must have been persisted");
+        assert!(
+            written.contains(":favorites [\"Alpha\" \"Beta\"]"),
+            "favorites must round-trip into config.edn: {written}"
+        );
+        assert!(
+            written.contains(":start-of-week 3"),
+            "start of week must round-trip into config.edn: {written}"
+        );
+
+        // The same view still cannot touch graph text, so the config capability
+        // did not widen into the oplog's domain.
+        fs::write(dir.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let view = Graph::open_derived_read_only(&dir);
+        let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited behind the oplog".into();
+        assert_eq!(
+            view.save_page(&page, base_rev.as_deref())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+            "a config write must not have widened the graph-text boundary"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `logseq/.tine-trash` sits next to `assets`, `publish` and `.tine-sync` in
+    /// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
+    /// imported or projected. Trashing an orphaned asset is an asset-side write
+    /// into that tree and must stay available under managed storage; trashing a
+    /// journal file is a graph-text deletion and must not.
+    #[test]
+    fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
+        let dir = scratch("derived-read-only-trash");
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+
+        view.trash_asset("orphan.png")
+            .expect("the trash tree is outside the graph-text boundary");
+        assert!(
+            !dir.join("assets/orphan.png").exists(),
+            "the orphaned asset must have left assets/"
+        );
+        assert_eq!(
+            view.asset_trash_stats().count,
+            1,
+            "the orphaned asset must be recoverable from the trash"
+        );
+
+        let removed = view
+            .empty_asset_trash()
+            .expect("emptying the asset trash is an asset-side write");
+        assert_eq!(removed, 1, "the emptied entry must be counted");
+
+        // A journal file is graph text. Its deletion belongs to the oplog and
+        // stays refused at the single graph-text admission.
+        let refused = view.trash_journal_file("2026_08_07.md").unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "a journal deletion must stay refused under managed storage: {refused}"
+        );
+        assert!(
+            dir.join("journals/2026_08_07.md").exists(),
+            "the refused journal deletion must not have touched the file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -34751,6 +35564,54 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// "Keep mine" must work on the DTO the frontend actually sends.
+    ///
+    /// `pageToDto` (`src/store.ts`) builds every saved page without a `rev`
+    /// field — ordinary saves carry their load revision in the separate
+    /// `base_rev` argument instead. Every Rust test, though, force-saves a DTO
+    /// straight from `load_named`/`load_by_path`, which DOES carry
+    /// `rev: Some(..)`. So the whole suite exercised a shape the wire never
+    /// produces, and the one exit offered to a user in a conflict — keep my
+    /// edits — could not succeed for any page loaded from disk.
+    #[test]
+    fn force_save_succeeds_on_the_revless_dto_the_frontend_sends() {
+        let dir = scratch("force-save-wire-shape");
+        let path = dir.join("pages").join("A.md");
+        fs::write(&path, "- original\n").unwrap();
+        let g = Graph::open(&dir);
+        let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        assert!(!dto.path.is_empty(), "a loaded page is path-pinned");
+        dto.blocks[0].raw = "mine".into();
+        // The wire shape: the working store has no revision to send.
+        dto.rev = None;
+
+        g.force_save_page(&dto).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same override after a real external change — the situation that
+    /// actually raises the conflict banner. The load-time identity pin is stale
+    /// by construction here, because a foreign writer replaced the file; that
+    /// staleness is the conflict, not a reason to refuse the resolution.
+    #[test]
+    fn force_save_overrides_a_real_external_change_with_the_wire_dto() {
+        let dir = scratch("force-save-wire-shape-external");
+        let path = dir.join("pages").join("A.md");
+        fs::write(&path, "- original\n").unwrap();
+        let g = Graph::open(&dir);
+        let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        dto.blocks[0].raw = "mine".into();
+        dto.rev = None;
+        fs::write(&path, "- theirs\n").unwrap();
+
+        g.force_save_page(&dto).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn force_save_refuses_unreadable_existing_bytes() {
         let dir = scratch("force-save-invalid-utf8");
@@ -36171,11 +37032,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Make `dir` read-only and report whether the restriction is actually
+    /// enforced for this process. Root ignores directory permissions, so a test
+    /// that needs a write to FAIL cannot demonstrate anything when running as
+    /// uid 0 — it must skip rather than pass vacuously or fail spuriously.
+    #[cfg(unix)]
+    fn deny_writes_if_enforced(dir: &Path) -> Option<fs::Permissions> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = fs::metadata(dir).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(dir, read_only).unwrap();
+        let probe = dir.join(".write-enforcement-probe");
+        match fs::write(&probe, b"x") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+                fs::set_permissions(dir, original).unwrap();
+                None
+            }
+            Err(_) => Some(original),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_highlights_rolls_back_sidecar_when_notes_page_commit_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = scratch("highlights-page-commit-rollback");
         let g = Graph::open(&dir);
         let key = crate::pdf::asset_key("paper.pdf");
@@ -36189,10 +37071,10 @@ mod tests {
         let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
 
         let pages = dir.join("pages");
-        let original_permissions = fs::metadata(&pages).unwrap().permissions();
-        let mut read_only = original_permissions.clone();
-        read_only.set_mode(0o555);
-        fs::set_permissions(&pages, read_only).unwrap();
+        let Some(original_permissions) = deny_writes_if_enforced(&pages) else {
+            let _ = fs::remove_dir_all(&dir);
+            return; // running as root: a read-only directory proves nothing
+        };
         let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
         fs::set_permissions(&pages, original_permissions).unwrap();
 
@@ -36212,8 +37094,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_highlights_quarantines_new_sidecar_when_notes_page_commit_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = scratch("highlights-new-sidecar-page-failure");
         let g = Graph::open(&dir);
         let key = crate::pdf::asset_key("paper.pdf");
@@ -36225,10 +37105,10 @@ mod tests {
         let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
 
         let pages = dir.join("pages");
-        let original_permissions = fs::metadata(&pages).unwrap().permissions();
-        let mut read_only = original_permissions.clone();
-        read_only.set_mode(0o555);
-        fs::set_permissions(&pages, read_only).unwrap();
+        let Some(original_permissions) = deny_writes_if_enforced(&pages) else {
+            let _ = fs::remove_dir_all(&dir);
+            return; // running as root: a read-only directory proves nothing
+        };
         let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
         fs::set_permissions(&pages, original_permissions).unwrap();
 
@@ -38290,6 +39170,657 @@ mod tests {
             );
         });
         assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pins every bounded save-failure code to the exact message its production
+    /// site emits. If someone rewords one of those messages, this fails and they
+    /// have to update the classifier deliberately -- which is the point, because
+    /// a silently-reclassified failure reads as `unknown` in a user's report and
+    /// tells us nothing.
+    #[test]
+    fn direct_save_failure_codes_are_stable() {
+        use std::io::{Error, ErrorKind};
+        for (code, error) in [
+            // model.rs `capture_managed_text_entries` symlink arm.
+            (
+                "precheck.symlink",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "managed text entry is a symlink or reparse point: pages/Note.md",
+                ),
+            ),
+            // `capture_retained_graph_text_identity_with_limits` two-pass equality.
+            (
+                "precheck.interrupted",
+                Error::new(
+                    ErrorKind::Interrupted,
+                    "managed inventory changed during retained identity capture",
+                ),
+            ),
+            // `validate_current_graph_text_collision_strict`, portable-key arm.
+            (
+                "precheck.portable_collision",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "graph text paths share one portable case/NFC identity: pages/a.md and pages/A.md",
+                ),
+            ),
+            // `validate_current_graph_text_collision_strict`, resource arm.
+            (
+                "precheck.resource_alias",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "graph text files alias one physical resource: pages/a.md and pages/b.md",
+                ),
+            ),
+            (
+                "precheck.not_portable",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "guarded graph-text target is not portable: reserved name",
+                ),
+            ),
+            (
+                "precheck.nofollow",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "projection parent is not a real no-follow directory",
+                ),
+            ),
+            (
+                "precheck.limit",
+                initial_shadow_limit_error("peak build memory"),
+            ),
+            // `save_page`, retained-identity arm -- the F4 class.
+            (
+                "identity.changed_since_load",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "existing page identity changed since load",
+                ),
+            ),
+            (
+                "identity.owned_elsewhere",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
+            ),
+            // `save_page`, base-rev arm.
+            (
+                "conflict.base_rev",
+                Error::new(ErrorKind::AlreadyExists, "conflict"),
+            ),
+            // `require_pinned_save_owner`, LoadedRevision arm: the file moved
+            // between load and save without the watcher seeing it. A real
+            // conflict, and one "keep mine" resolves.
+            (
+                "conflict.pinned_owner",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "path-pinned page does not match its captured exact owner",
+                ),
+            ),
+            // Name collisions are real but are NOT content conflicts: the
+            // keep-mine/use-disk prompt cannot resolve one.
+            (
+                "identity.name_taken",
+                Error::new(ErrorKind::AlreadyExists, "a page with that name already exists"),
+            ),
+            (
+                "identity.name_taken",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "target page exists in another supported text extension",
+                ),
+            ),
+            // The inversion this classifier exists for: an UNCLASSIFIED
+            // AlreadyExists must not become a conflict. It used to fall into a
+            // `conflict.other` catch-all, which raised a prompt whose two
+            // options could not resolve it and whose "use disk" arm discards
+            // the user's edits -- and which replaced the message text, so a
+            // failure that had RETAINED those edits under a recovery name
+            // reached the user as an unexplained conflict.
+            (
+                "unknown",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "displaced target retained as pages/Note.md.editor-recovery",
+                ),
+            ),
+            (
+                "unknown",
+                Error::new(ErrorKind::PermissionDenied, "permission denied"),
+            ),
+        ] {
+            assert_eq!(
+                direct_save_failure_code(&error),
+                code,
+                "classifier drifted for: {error}"
+            );
+        }
+    }
+
+    /// A symlink in a DESCENDED scope aborts the whole guarded capture, so it
+    /// takes down saves of unrelated pages. That is the real F3a class.
+    ///
+    /// It also settles an error in the 2026-08-06 Direct Files audit, which used
+    /// `assets/` as its exemplar and proposed it as the repro: `assets` is
+    /// fixed-excluded (`graph_text_scope.rs`, `fixed_excluded`), so the walk
+    /// skips it and the save succeeds. Both halves are asserted here so nobody
+    /// re-runs the wrong experiment and retires a real finding.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_blocks_saves_only_inside_a_descended_scope() {
+        use std::os::unix::fs::symlink;
+
+        // (a) assets/ is excluded from the walk -- a symlink there is harmless.
+        let dir = scratch("symlink-scope-assets");
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        symlink(dir.join("pages/Target.md"), dir.join("assets/link.md")).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        let base = content_rev("- before\n");
+        assert!(
+            graph.save_page(&page, Some(&base)).is_ok(),
+            "a symlink under assets/ must not block saves -- assets is fixed-excluded"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // (b) a symlink in pages/ IS in a descended scope. It used to abort the
+        // guarded capture and therefore take down every OTHER page's save --
+        // "one symlink and my graph is read-only". It is now skipped, exactly as
+        // every other traversal in Tine already skips it.
+        for (tag, link, target) in [
+            (
+                "symlink-scope-pages-file",
+                "pages/Alias.md",
+                "pages/Target.md",
+            ),
+            ("symlink-scope-pages-dir", "pages/Linked", "pages"),
+            ("symlink-scope-root-dir", "Linked", "pages"),
+        ] {
+            let dir = scratch(tag);
+            fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+            symlink(dir.join(target), dir.join(link)).unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+            let base = content_rev("- before\n");
+            graph.save_page(&page, Some(&base)).unwrap_or_else(|error| {
+                panic!("a symlink at {link} must not block an unrelated save: {error}")
+            });
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The symlink skip is scoped to the save-time admission capture. Importing
+    /// a graph into managed storage still refuses, because an import that
+    /// silently leaves out a file the user considers part of their graph is a
+    /// different and worse failure than a refused import.
+    #[cfg(unix)]
+    #[test]
+    fn the_shadow_import_capture_still_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-import-refuses");
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        symlink(dir.join("pages/Target.md"), dir.join("pages/Alias.md")).unwrap();
+        let graph = Graph::open(&dir);
+        let permit = graph.admit_managed_text_writer().unwrap();
+        let error = match collect_initial_shadow_managed_inventory(&graph, &permit, true) {
+            Ok(_) => panic!("the import capture must still refuse a symlink in scope"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(
+            error.to_string().contains("symlink or reparse point"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build a Direct-mode graph of `pages` ordinary pages plus one target.
+    fn direct_save_bench_graph(tag: &str, pages: usize) -> (PathBuf, Graph) {
+        let dir = scratch(tag);
+        for index in 0..pages {
+            let body = (0..24)
+                .map(|line| format!("- block {line} of page {index} with some ordinary text\n"))
+                .collect::<String>();
+            fs::write(
+                dir.join(format!("pages/Page {index:05}.md")),
+                format!("title:: Page {index:05}\n\n{body}"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        (dir, graph)
+    }
+
+    fn direct_save_bench_once(graph: &Graph, marker: &str) -> std::time::Duration {
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = marker.to_owned();
+        let started = std::time::Instant::now();
+        graph
+            .save_page(&page, page.rev.as_deref())
+            .expect("direct save");
+        started.elapsed()
+    }
+
+    /// The Direct-save admission gate, stated as counters rather than a
+    /// stopwatch — a stopwatch on shared CI measures the machine, not the code.
+    ///
+    /// This is the gate that never existed. #267 ("saving takes about a minute,
+    /// then a red toast") is a whole-graph rebuild happening per save, and
+    /// nothing in the suite would have noticed it appear.
+    #[test]
+    fn steady_state_direct_saves_do_not_rebuild_the_graph_index() {
+        let (dir, graph) = direct_save_bench_graph("direct-save-steady", 40);
+
+        direct_save_bench_once(&graph, "- warm");
+        let warm = graph.guarded_graph_text_identity_report();
+        assert!(
+            warm.complete_builds >= 1 && !warm.invalidated,
+            "the first save should have built and kept an index: {warm:?}"
+        );
+
+        for round in 0..8 {
+            direct_save_bench_once(&graph, &format!("- round {round}"));
+        }
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert_eq!(
+            after.complete_builds, warm.complete_builds,
+            "a steady-state Direct save must not rebuild the whole-graph admission index"
+        );
+        assert!(
+            !after.invalidated,
+            "a steady-state Direct save must not leave the index invalidated: {after:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE cut (GH #267). An invalidation means "we lost track of the
+    /// filesystem", not "every document changed" — yet a rebuild used to reparse
+    /// the whole graph, on every save, in the condition Windows and network
+    /// shares were permanently in.
+    #[test]
+    fn a_rebuild_parses_only_the_documents_whose_bytes_changed() {
+        let dir = scratch("rebuild-reuses-parsed-semantics");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("title:: Unrelated {index}\n\n- body {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        // Reach the state where the index holds parsed semantics: one save after
+        // an invalidation pays for the whole graph, once.
+        direct_save_bench_once(&graph, "- warm");
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- first rebuild");
+        let full = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+        assert!(
+            full >= 24,
+            "the first rebuild after a cache-derived build still reads the graph: {full}"
+        );
+
+        // Control: nothing in the graph changed, but we lost track again. Every
+        // document's semantics must be reused; whatever this costs is the save's
+        // own irreducible work, not the graph's.
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- unchanged rebuild");
+        let unchanged = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+
+        // Now exactly one document changes, and we lose track again.
+        fs::write(
+            dir.join("pages/Unrelated 7.md"),
+            b"title:: Unrelated 7\n\n- externally edited\n",
+        )
+        .unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- one changed document");
+        let incremental = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+
+        assert_eq!(
+            incremental,
+            unchanged + 1,
+            "a rebuild must parse exactly the documents whose bytes changed \
+             (unchanged rebuild {unchanged}, one-change rebuild {incremental}, graph of 25)"
+        );
+        assert!(
+            incremental < full,
+            "a rebuild after one external edit must cost far less than the full pass \
+             ({incremental} vs {full})"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GH #267 / F3. The save-time capture runs two passes that must agree, and
+    /// any concurrent filesystem activity anywhere in the graph makes them
+    /// disagree. On a Syncthing / Dropbox / OneDrive folder that is not an
+    /// anomaly, it is the steady state — and one disagreement failed the save.
+    #[test]
+    fn a_concurrent_change_during_capture_is_retried_not_surfaced() {
+        let dir = scratch("capture-retry");
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        // One disturbance between the two passes — the hook is one-shot, so the
+        // next attempt sees a quiet graph, which is exactly the bounded-retry
+        // premise: "something moved while we looked", not "the graph is broken".
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            let other = dir.join("pages/Other.md");
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- other, pulled in\n")));
+        });
+
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        let base = page.rev.clone().expect("loaded page carries its revision");
+        page.blocks[0].raw = "saved during sync activity".into();
+        graph
+            .save_page(&page, Some(&base))
+            .expect("a sync client touching an unrelated file must not fail this save");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Target.md")).unwrap(),
+            "- saved during sync activity\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replace `relative` atomically with `content`, giving the path a NEW inode
+    /// while its bytes may be unchanged. This is what OneDrive rehydration, a
+    /// Syncthing pull and a plain `cp` into place all look like from Tine.
+    fn replace_file_with_a_new_inode(dir: &Path, relative: &str, content: &[u8]) {
+        let target = dir.join(relative);
+        let staged = dir.join(format!("{relative}.replacement"));
+        fs::write(&staged, content).unwrap();
+        fs::rename(&staged, &target).unwrap();
+    }
+
+    /// GH #267 / F4. An external tool replacing a file with byte-identical
+    /// content used to strand the page: the save refused with "existing page
+    /// identity changed since load", "Keep mine (overwrite)" hit the same check,
+    /// and the only working button discarded the user's edit.
+    #[test]
+    fn a_same_bytes_external_replace_does_not_strand_the_editor() {
+        let dir = scratch("same-bytes-replace");
+        fs::write(dir.join("pages/Foo.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut page = graph.load_by_path("pages/Foo.md").unwrap().unwrap();
+        let base_rev = page.rev.clone().expect("loaded page carries its revision");
+
+        // Same bytes, new inode.
+        replace_file_with_a_new_inode(&dir, "pages/Foo.md", b"- before\n");
+        graph.sync_file_checked(&dir.join("pages/Foo.md")).unwrap();
+
+        page.blocks[0].raw = "edited after the replace".into();
+        graph
+            .save_page(&page, Some(&base_rev))
+            .expect("the path holds exactly the bytes the editor loaded");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Foo.md")).unwrap(),
+            "- edited after the replace\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction, which must NOT change: a replace that also changes
+    /// the bytes is a real external edit and still conflicts.
+    #[test]
+    fn a_changed_bytes_external_replace_still_conflicts() {
+        let dir = scratch("changed-bytes-replace");
+        fs::write(dir.join("pages/Foo.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut page = graph.load_by_path("pages/Foo.md").unwrap().unwrap();
+        let base_rev = page.rev.clone().expect("loaded page carries its revision");
+
+        replace_file_with_a_new_inode(&dir, "pages/Foo.md", b"- changed elsewhere\n");
+        graph.sync_file_checked(&dir.join("pages/Foo.md")).unwrap();
+
+        page.blocks[0].raw = "edited after the replace".into();
+        let error = graph
+            .save_page(&page, Some(&base_rev))
+            .expect_err("an external edit must still raise a conflict");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Foo.md")).unwrap(),
+            "- changed elsewhere\n",
+            "the refused save must not have written anything"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The reuse is keyed on a content digest, so it must survive a rewrite that
+    /// leaves the bytes identical — and must NOT survive one that does not, even
+    /// when the file keeps its length.
+    #[test]
+    fn reused_semantics_follow_the_bytes_not_the_file() {
+        let dir = scratch("rebuild-reuse-follows-bytes");
+        fs::write(dir.join("pages/Owner.md"), b"title:: Alpha Name\n\n- o\n").unwrap();
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        direct_save_bench_once(&graph, "- warm");
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        direct_save_bench_once(&graph, "- parsed rebuild");
+
+        // Same length, different bytes: a digest notices, a stat does not.
+        fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        direct_save_bench_once(&graph, "- after retitle");
+
+        // The retitled document must own its NEW identity. This is the direction
+        // the reuse could get wrong: a stale parse would still say "Alpha Name",
+        // and creating "Omega Name" would be admitted over a file that already
+        // holds it.
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Name"), None)
+            .expect_err("the retitled document owns this effective page identity");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+
+        // The opposite direction is deliberately NOT asserted here. Creating
+        // "Alpha Name" is still refused, and for a reason that predates this
+        // reuse: the page cache has not seen the external retitle either, and
+        // `validate_name_only_effective_identity` fails closed on the identity it
+        // last knew. Verified by disabling the reuse entirely -- the refusal is
+        // unchanged. Fail-closed is the safe direction, so it stays a separate
+        // question from this one.
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn direct_save_bench_new_page(name: &str) -> PageDto {
+        PageDto {
+            name: name.to_owned(),
+            kind: PageKind::Page,
+            title: name.to_owned(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                id: "created".into(),
+                raw: "created".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        }
+    }
+
+    /// The measured receipt behind that gate. Release-only and `--ignored`:
+    /// it prints the shape of a Direct save, split into the phases D0 added, in
+    /// both the warm and the rebuild condition. Point it at a real graph copy
+    /// with TINE_DIRECT_SAVE_BENCH_GRAPH_COPY, or let it synthesise one.
+    #[test]
+    #[ignore = "manual benchmark: Direct-mode save latency, warm vs rebuilding"]
+    fn direct_save_latency_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "release-only; run cargo test -p tine-core --release direct_save_latency_manual_benchmark -- --ignored --nocapture"
+        );
+        let rounds: usize = std::env::var("TINE_DIRECT_SAVE_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let (dir, graph) = match std::env::var("TINE_DIRECT_SAVE_BENCH_GRAPH_COPY") {
+            Ok(source) => {
+                let dir = scratch("direct-save-bench-copy");
+                copy_directory_tree(Path::new(&source), &dir);
+                fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+                let graph = Graph::open(&dir);
+                graph.warm_cache();
+                (dir, graph)
+            }
+            Err(_) => {
+                let pages: usize = std::env::var("TINE_DIRECT_SAVE_BENCH_PAGES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1_000);
+                direct_save_bench_graph("direct-save-bench", pages)
+            }
+        };
+
+        let describe = |label: &str, samples: &mut Vec<std::time::Duration>, graph: &Graph| {
+            samples.sort();
+            let report = graph.guarded_graph_text_identity_report();
+            println!(
+                "{label}: median {:?} p95 {:?} max {:?} over {} rounds; builds {} exact {} last {:?}",
+                samples[samples.len() / 2],
+                samples[samples.len() * 95 / 100],
+                samples[samples.len() - 1],
+                samples.len(),
+                report.complete_builds,
+                report.exact_updates,
+                report.last_build,
+            );
+        };
+
+        direct_save_bench_once(&graph, "- prime");
+        let mut warm = Vec::new();
+        for round in 0..rounds {
+            warm.push(direct_save_bench_once(&graph, &format!("- warm {round}")));
+        }
+        describe("warm index", &mut warm, &graph);
+
+        let mut cold = Vec::new();
+        for round in 0..rounds {
+            graph
+                .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+                .unwrap();
+            cold.push(direct_save_bench_once(&graph, &format!("- cold {round}")));
+        }
+        describe("rebuilding index", &mut cold, &graph);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn copy_directory_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory_tree(&entry.path(), &target);
+            } else if entry.file_type().unwrap().is_file() {
+                let _ = fs::copy(entry.path(), target);
+            }
+        }
+    }
+
+    /// The watcher's routing predicates must admit exactly what discovery
+    /// admits, plus conflict copies (which are never cached as pages but must
+    /// still refresh the conflicts panel). GH #268 was the gap between the two.
+    #[test]
+    fn watch_predicates_track_the_same_scope_discovery_walks() {
+        let dir = scratch("watch-predicate-scope");
+        fs::create_dir_all(dir.join("Archive/Deep")).unwrap();
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::create_dir_all(dir.join(".hidden")).unwrap();
+        fs::write(dir.join("pages/Page.md"), b"- p\n").unwrap();
+        fs::write(dir.join("top.md"), b"- t\n").unwrap();
+        fs::write(dir.join("Archive/Deep/deep.org"), b"* d\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        for relative in [
+            "pages/Page.md",
+            "journals/2026_08_06.md",
+            "top.md",
+            "Archive/Deep/deep.org",
+            // Not present on disk: the predicate is lexical on purpose, so a
+            // deletion routes through exactly the same test as a creation.
+            "Archive/Gone.md",
+            // A Syncthing conflict copy is not eligible text, but its arrival
+            // still has to reach the conflicts panel.
+            "pages/Page.sync-conflict-20260806-101500-ABCDEFG.md",
+        ] {
+            assert!(
+                graph.graph_text_watch_relevant(&dir.join(relative)),
+                "{relative} must be routed to its graph"
+            );
+        }
+
+        for relative in [
+            "assets/image.md",
+            ".hidden/skip.md",
+            "logseq/bak/old.md",
+            "pages/notes.txt",
+            "pages",
+        ] {
+            assert!(
+                !graph.graph_text_watch_relevant(&dir.join(relative)),
+                "{relative} must not be routed as graph text"
+            );
+        }
+        assert!(
+            !graph.graph_text_watch_relevant(Path::new("/elsewhere/pages/Other.md")),
+            "a path outside the graph root belongs to another graph, or none"
+        );
+
+        // Unclassified paths (directory moves) force a full scan, but only where
+        // eligible text could live.
+        for relative in ["pages/Moved", "Archive", "top.md"] {
+            assert!(
+                graph.graph_text_watch_could_contain(&dir.join(relative)),
+                "{relative} could contain graph text"
+            );
+        }
+        for relative in ["assets", "assets/pictures", ".git/objects", "logseq/bak"] {
+            assert!(
+                !graph.graph_text_watch_could_contain(&dir.join(relative)),
+                "{relative} is excluded -- a move there must not rescan the graph"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

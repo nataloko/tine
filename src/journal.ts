@@ -4,6 +4,8 @@
 // current format is fed in from GraphMeta on graph load (see graph.ts);
 // it defaults to Logseq's "MMM do, yyyy".
 
+import { createSignal } from "solid-js";
+
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const MONTHS_FULL = [
   "January", "February", "March", "April", "May", "June",
@@ -160,10 +162,63 @@ export function parseJournalWith(s: string, fmt: string): JournalDateParts | nul
   return { y, m: mo, d };
 }
 
+/// Reactive local day key, ticking at each local midnight. UI that derives
+/// "is this journal page TODAY?" from the wall clock must read this instead of
+/// a bare `new Date()`: without a reactive tick the comparison is computed once
+/// at mount and goes stale when the calendar rolls over (e.g. the journal-title
+/// carry buttons kept showing today's pull-in actions on what had become
+/// yesterday). Constructed dates (not 24h arithmetic) stay correct across DST.
+const [dayKey, setDayKey] = createSignal(localDayKey());
+let dayKeyArmed = false;
+
+/** Test-only: force the reactive day key (and leave the clock alone). */
+export function setCurrentDayKeyForTest(k: number): void {
+  setDayKey(k);
+}
+
+/** Inverse of {@link localDayKey}: the local Date of that day key. Kept beside
+ *  the key so consumers compare journal titles against the SAME reactive value
+ *  that ticks at midnight (rather than a fresh wall-clock read). */
+export function localDateFromDayKey(k: number): Date {
+  return new Date(Math.floor(k / 10_000), Math.floor((k % 10_000) / 100) - 1, k % 100);
+}
+
+export function currentDayKey(): number {
+  if (!dayKeyArmed && typeof window !== "undefined") {
+    dayKeyArmed = true;
+    const arm = () => {
+      window.setTimeout(() => {
+        setDayKey(localDayKey());
+        arm();
+      }, localDayRolloverDelay(new Date()));
+    };
+    arm();
+    // Sleeping machines miss the midnight timeout — re-sync on wake/focus.
+    const sync = () => setDayKey(localDayKey());
+    window.addEventListener("focus", sync);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) sync();
+    });
+    // App-lifetime singleton: no cleanup.
+  }
+  return dayKey();
+}
+
 /// Whether `name` is a journal date in the graph's title format (or a common
 /// default) — so a `[[name]]` link / quick-switch pick opens the journal, not an
 /// empty page. Mirrors the backend's `safe-journal-title-formatters` leniency.
 export function isJournalTitle(name: string): boolean {
   if (!name.trim()) return false;
   return [titleFormat, DEFAULT_TITLE_FORMAT, "yyyy-MM-dd"].some((f) => parseJournalWith(name, f) !== null);
+}
+
+/// Parse a journal page title back to a local-calendar `Date`, trying the
+/// graph's configured format, the default, and yyyy-MM-dd. Returns null if the
+/// title is not a recognizable journal date.
+export function parseJournalTitle(name: string): Date | null {
+  for (const fmt of [titleFormat, DEFAULT_TITLE_FORMAT, "yyyy-MM-dd"]) {
+    const parts = parseJournalWith(name, fmt);
+    if (parts) return new Date(parts.y, parts.m - 1, parts.d);
+  }
+  return null;
 }

@@ -48,6 +48,14 @@ const assetWriteChain = new Set<Promise<boolean>>();
 // it, released the moment that dest saves durably (immediately, or after a conflict is
 // resolved). Until then the source keeps the block on disk, so it's never lost.
 const heldSources = new Set<string>();
+// Sources whose "keep mine" arrived DURING the dest-write window. The barrier
+// below is absolute — including for a forced save — because the two rules guard
+// different things: a conflict is about not clobbering someone else's bytes,
+// while the barrier is about not writing a moved block out of existence. An
+// override of the first must not override the second. Dropping the resolution
+// would strand the page (a conflicted page is skipped by the ordinary save
+// path), so remember it and re-issue it the moment the dest is durable.
+const heldForcedSaves = new Set<string>();
 const heldByDest = new Map<string, string[]>();
 // Names of pages written to disk since the last drain — a read-only sink consumed
 // by the optional git integration to compose a descriptive commit message. Purely
@@ -92,6 +100,41 @@ export function dirtyPages(): Iterable<string> {
 export function isSaving(name: string): boolean {
   return saveChain.has(name);
 }
+/** What the store currently holds for a page: whether it exists at all, and its
+ *  revision (the content hash) if it does. */
+export interface StoredPageState {
+  exists: boolean;
+  rev: string | null;
+}
+
+/** Has the stored page actually diverged from the baseline this editor loaded or
+ *  last saved? This is the per-page proof that a change NOTIFICATION does not carry.
+ *
+ *  The managed runtime's `sparse-v2-changed` tick is a bare aggregate epoch — it
+ *  names no page and carries no origin. (It no longer fires for an admission that
+ *  committed nothing, which removed one source of spurious wake-ups, but a tick
+ *  still cannot say WHICH page changed or whose write it was.)
+ *  The legacy watcher event names a page but still cannot distinguish our
+ *  own write echoing back from someone else's. So "a notification arrived while this
+ *  page was dirty" is not evidence of a conflict, and treating it as one is a false
+ *  positive the user pays for: `doSave` refuses a conflicted page, which makes the
+ *  banner's own claim ("your unsaved changes weren't written") true only BECAUSE of
+ *  the banner, and blocks the very save whose `base_rev` guard would have decided
+ *  the question correctly.
+ *
+ *  All four quadrants matter:
+ *  - stored revision equals the baseline → byte-for-byte what we already hold; the
+ *    wake-up was our own echo (or another page's). NOT diverged.
+ *  - stored revision differs → a genuine external change. Diverged.
+ *  - gone from the store, but we had a baseline → the file we loaded was deleted
+ *    under us. Diverged.
+ *  - gone, and we never had a baseline → a brand-new page that was never written;
+ *    there is nothing on disk to diverge from. NOT diverged. */
+export function divergedFromBaseline(name: string, stored: StoredPageState): boolean {
+  const baseline = baseRev.get(name) ?? null;
+  if (!stored.exists) return baseline !== null;
+  return stored.rev !== baseline;
+}
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
 export function holdSourcesForDest(dest: string, sources: string[]) {
@@ -123,10 +166,17 @@ function releaseSourcesFor(dest: string) {
   heldByDest.delete(dest);
   let any = false;
   for (const s of srcs) {
-    if (heldSources.delete(s)) {
-      dirty.add(s); // its removal (and any held edit) can write now
-      any = true;
+    if (!heldSources.delete(s)) continue;
+    if (heldForcedSaves.delete(s)) {
+      // A "keep mine" the barrier deferred. Re-issue it now rather than letting
+      // `scheduleSave` pick it up: the page is still marked conflicted, and the
+      // ordinary path skips a conflicted page, so this resolution would
+      // otherwise be silently lost.
+      void forceSave(s);
+      continue;
     }
+    dirty.add(s); // its removal (and any held edit) can write now
+    any = true;
   }
   if (any) scheduleSave();
 }
@@ -193,12 +243,47 @@ function clearTransientRetry(name: string) {
   retryTimers.delete(name);
 }
 
+/** Save failures the backend reports with a bounded code that a retry cannot
+ *  change: the graph has two files whose names collide on case-insensitive
+ *  filesystems, two paths pointing at one physical file, a symlink where a page
+ *  was expected, or another page already holding this title. Retrying re-runs
+ *  the whole pre-save check — on a large graph the expensive part — to arrive at
+ *  the same answer, three times, per dirty page. Report it once instead. */
+export function isRetryableSaveFailure(error: unknown): boolean {
+  const message = String(error);
+  return ![
+    "precheck.symlink",
+    "precheck.portable_collision",
+    "precheck.resource_alias",
+    "precheck.not_portable",
+    "precheck.nofollow",
+    "precheck.limit",
+    "identity.owned_elsewhere",
+    "identity.name_taken",
+    // Managed storage refused the save because the page moved underneath it.
+    // Permanent until the page is reloaded — retrying just hides it.
+    "managed.conflict",
+  ].some((code) => message.includes(code));
+}
+
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
+  if (!isRetryableSaveFailure(error)) {
+    transientFailures.delete(name);
+    pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
+    return;
+  }
   const failures = (transientFailures.get(name) ?? 0) + 1;
   transientFailures.set(name, failures);
   if (failures >= 3) {
+    // Automatic retries stop here. The caller has already put the page back in
+    // `dirty`, so it still saves on the next edit or flush — but nothing is
+    // scheduled, and the old copy ("will retry") implied a timer that does not
+    // exist. Say what actually happens.
     transientFailures.delete(name);
-    pushToast(`Couldn't save “${name}” — will retry. (${String(error)})`, "error");
+    pushToast(
+      `Couldn't save “${name}” after 3 tries — it will be retried when you next edit it. (${String(error)})`,
+      "error"
+    );
     return;
   }
   const prior = retryTimers.get(name);
@@ -262,7 +347,10 @@ async function doSave(
   if (isConflicted(name) && !force) return false;
   // A cross-page move source: hold its save until the destination is durable (C#1).
   // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
-  if (heldSources.has(name) && !force) return false;
+  if (heldSources.has(name)) {
+    if (force) heldForcedSaves.add(name);
+    return false;
+  }
   const token = graphToken;
   const dto = measureIssue248("frontend.pageToDtoMs", () => pageToDto(name));
   if (!dto) return false;
@@ -295,7 +383,15 @@ async function doSave(
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
-    if (String(e).includes("conflict")) {
+    // The backend says "conflict" and nothing else for a real base-revision
+    // conflict. Match it exactly: a substring test used to catch every other
+    // backend `AlreadyExists` too -- a portable-filename collision, a
+    // physical-resource alias, "another document owns this page identity" --
+    // and mark the page conflicted, which puts up a prompt whose only two
+    // options cannot resolve any of them AND stops the page saving from then on.
+    // Those now arrive with their own bounded code and fall through to the
+    // retry/toast path below.
+    if (String(e) === "conflict" || String(e) === "Error: conflict") {
       clearTransientRetry(name);
       markConflict(name);
     } else if (token === graphToken) {

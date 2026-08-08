@@ -3078,7 +3078,8 @@ textarea {
   font-size: 13px;
 }
 
-/* Light/Dark switcher: a pill with a knob that slides between the two options. */
+/* Appearance switcher: a pill with a knob that slides between the three
+   options (light / system / dark, GH #193). */
 .theme-switch {
   position: relative;
   display: inline-flex;
@@ -3087,7 +3088,6 @@ textarea {
   border: 1px solid var(--border-color);
   border-radius: 999px;
   background: var(--bg-tertiary);
-  cursor: pointer;
 }
 .theme-opt {
   position: relative;
@@ -3095,7 +3095,7 @@ textarea {
   flex: 1;
   min-width: 68px;
   /* Center icon + label as one row with a fixed icon column, so ☀/☾ (different
-     glyph widths) don't shift the labels out of alignment between the two options. */
+     glyph widths) don't shift the labels out of alignment between the options. */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3103,6 +3103,10 @@ textarea {
   padding: 4px 16px;
   font-size: 12px;
   color: var(--text-secondary);
+  background: none;
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
   transition: color 0.15s ease;
 }
 .theme-ico {
@@ -3111,8 +3115,7 @@ textarea {
   text-align: center;
 }
 /* Highlight whichever option the knob is under. */
-.theme-switch:not(.is-dark) .theme-opt:first-child,
-.theme-switch.is-dark .theme-opt:last-child {
+.theme-switch .theme-opt[aria-checked="true"] {
   color: var(--text-primary);
   font-weight: 600;
 }
@@ -3122,14 +3125,17 @@ textarea {
   top: 2px;
   bottom: 2px;
   left: 2px;
-  width: calc(50% - 2px);
+  width: calc(33.3333% - 2px);
   border-radius: 999px;
   background: var(--bg-primary);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
   transition: transform 0.16s ease;
 }
-.theme-switch.is-dark .theme-knob {
+.theme-switch.is-system .theme-knob {
   transform: translateX(100%);
+}
+.theme-switch.is-dark .theme-knob {
+  transform: translateX(200%);
 }
 .settings-num {
   width: 64px;
@@ -6667,6 +6673,20 @@ ol.md-list { list-style: decimal; }
   color: var(--text-muted);
   font-weight: 400;
 }
+.calc-out {
+  position: relative;
+}
+.calc-copy {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 4px;
+}
+.calc-out:hover .calc-copy,
+.calc-copy:focus-visible {
+  opacity: 1;
+}
 /* Editor: the textarea is the middle (expression) column; the gutter and the
    live-results column flank it. */
 .calc-wrap .block-editor {
@@ -8249,6 +8269,20 @@ img.emoji {
   gap: 5px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border-color);
+  cursor: grab;
+}
+/* GH #211: insertion line while a sidebar row reorder drag is in progress.
+ *  Shared by the right sidebar (.rs-item) and the favorites list (.nav-page). */
+.rs-item.row-drop-before,
+.nav-page.row-drop-before {
+  box-shadow: inset 0 2px 0 var(--link-color);
+}
+.rs-item.row-drop-after,
+.nav-page.row-drop-after {
+  box-shadow: inset 0 -2px 0 var(--link-color);
+}
+#sidebar-favorites-list .nav-page {
+  cursor: grab;
 }
 .rs-item.collapsed .rs-item-head {
   border-bottom: 0;

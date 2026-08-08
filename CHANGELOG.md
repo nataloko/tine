@@ -8,6 +8,303 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.91] - 2026-08-07
+
+### Added
+
+- **Hierarchical Ctrl/Cmd+A and symmetric Shift+Up block selection.** In the
+  editor, Ctrl/Cmd+A still selects the block's text first; a further press
+  selects the block's subtree, then each ancestor's subtree, then the whole
+  visible outline, where it stays. Shift+ArrowUp extended onto a parent no
+  longer leaves the parent's later children behind: a selection that includes
+  an ancestor of its anchor covers that ancestor's whole visible subtree,
+  mirroring Shift+ArrowDown.
+- **Block-boundary keyboard navigation and forward merge.** At the exact end
+  of a block, Delete now merges the next visible block's text and children in
+  (mirroring Backspace's merge into the previous block at offset 0), and
+  ArrowRight moves into the start of the next block; ArrowLeft at the very
+  start moves into the end of the previous block. Annotation and calc blocks
+  are never merged in either direction, and a single undo restores both
+  blocks after a forward merge.
+- **Drag-reorder for sidebar lists.** Right-sidebar open items and
+  left-sidebar favorites can be reordered by dragging the row (right sidebar:
+  the header area). Sub-threshold presses stay ordinary clicks and the click
+  that ends a drag is swallowed, so navigation, middle-click, context menus,
+  close buttons and scrolling are unaffected. Order persists through the
+  existing owners (right-sidebar session state; favorites in the graph's
+  `config.edn`).
+- **Configurable graph home page.** The Graph settings tab can now pick an
+  existing page as the graph's home page; it opens in-place in the primary
+  tab whenever that graph is opened. A deleted or renamed page is skipped
+  silently at startup and surfaced in Settings with a Clear option. The
+  setting is stored per graph via the existing app-settings owner.
+- **"System" appearance option.** The Appearance settings now offer Light /
+  System / Dark. System follows the OS/WebView `prefers-color-scheme` signal,
+  applying it immediately and tracking live changes while the app runs; manual
+  Light/Dark selections ignore system changes as before. Existing saved
+  Light/Dark preferences are untouched.
+- **"Open in new tab" in the block context menu.** Right-clicking a block now
+  offers "Open in new tab", mirroring the existing page context-menu item and
+  block-bullet middle-click. Works on both editable and read-only blocks.
+- **One-click copy on calculator results.** Hovering a successful ```calc
+  result shows a copy button that copies the displayed value to the clipboard
+  via Tine's existing clipboard facade. Error and blank result lines do not
+  offer the button. The button is available in both the rendered calculator
+  and the live editor's result column; clicking it does not mutate the block
+  or create an empty row.
+- **`/That day` slash command.** Inserts a `[[date]]` reference to the
+  containing journal page's date (not today's clock date), using the
+  configured journal title format. On a non-journal page it does nothing and
+  shows a toast.
+
+### Fixed
+
+- **Linked References, search, quick switch, queries and most of the rest of the
+  app now work while Tine-managed storage is active.** Every page showed
+  "Couldn't load references because the backend request failed", and the same
+  refusal silently disabled search, quick switch, `{{query}}`, aliases,
+  templates, page icons, block references, asset browsing and more: only page
+  loading, saving and the journal feed had been given a managed path, and
+  everything else was refused for not holding the older storage mode's
+  authority. Reading and writing are now separate permissions, so whole-graph
+  *reads* are answered from the managed graph's own files while writes stay with
+  managed storage. Actions that change many pages at once — renaming, deleting
+  and merging pages, and resolving sync conflicts — are still unavailable under
+  managed storage and now say so plainly instead of reporting a failed request.
+- **Settings changes save again while Tine-managed storage is active.** Every
+  toggle in Settings was dead: favourites, task workflow, file format for new
+  pages, journal title format, first day of the week, showing brackets, logical
+  outdenting, Enter behaviour in document mode, time tracking and the default
+  journal template all appeared to work and were forgotten on the next launch.
+  Settings live in the graph's own `logseq/config.edn`, which managed storage
+  does not own, so writing them never needed the permission that was being
+  asked for. One exception remains: changing the journal title format no longer
+  renames existing journal files under managed storage.
+- **Cleaning up orphaned assets works again while Tine-managed storage is
+  active.** Moving an unused image to the recoverable trash, and emptying that
+  trash, were both refused — not because either touches your pages, but because
+  the trash folder was covered by the same permission as page text. Deleting a
+  page, journal or conflict copy is still unavailable.
+- **Error messages from the references panels no longer hide what went wrong.**
+  Both panels replaced every backend message with a generic "the backend request
+  failed", including messages that explained the cause exactly. They now show
+  what the backend actually reported.
+- **Fewer false "changed on disk" warnings while editing a managed graph.** The
+  background sync loop announced a change after every completed pass, including
+  passes that committed nothing. Arriving while a page had unsaved edits, that
+  contentless signal could be read as a conflict — which then blocked the very
+  save that would have resolved it. Only a pass that actually committed
+  something now reports a change.
+- **A managed graph that was closed cleanly now reopens even if its internal
+  cache database was deleted or damaged.** That cache is rebuildable from the
+  graph's own history, and a graph closed by a crash already rebuilt it — but a
+  graph closed *properly* refused to open at all, and the error offered a retry
+  that could never succeed. Clearing a cache directory, a backup that skipped
+  the file, or on-disk corruption could therefore make a graph permanently
+  unopenable. Both cases now rebuild. A cache that is present and current still
+  opens directly, so ordinary startup is unchanged.
+
+- **"Keep mine" now works.** When Tine found that a page had changed on disk
+  behind your back, it offered you two ways out — keep your edits, or take the
+  disk version. Keeping your edits could never succeed for any page opened from
+  a file: it failed every time with an internal message about a "captured exact
+  owner", leaving discarding your own work as the only exit that did anything.
+  It now writes your version, including after a genuine external change, which
+  is the whole situation the prompt exists for.
+- **Errors that are not conflicts no longer pretend to be.** Any unrecognised
+  save failure was reported as a conflict, which put up that same two-button
+  prompt — and neither button could resolve, say, a filename collision or an
+  internal storage failure. It also replaced the real error text, so in the one
+  case where Tine had safely set your unsaved bytes aside under a recovery file,
+  the message telling you where they were is what got thrown away. Unrecognised
+  failures now report what actually happened.
+- **A "keep mine" during a cross-page move can no longer lose the moved block.**
+  While a block moved between pages is being written to its destination, Tine
+  holds back the source page so the block is never briefly in neither place.
+  Resolving a conflict used to walk straight through that hold; it now waits and
+  is applied the moment the destination is safely written.
+- **The "couldn't save" message no longer promises a retry it wasn't making.**
+  After three failed attempts Tine said it would retry and then scheduled
+  nothing. The page was still saved on your next edit — which is what it now
+  says.
+- **External edits reach Tine-managed storage again.** Every reconcile of a
+  change made outside Tine was refused with an internal mismatch and retried to
+  the limit, so edits made by another program to a managed graph never came in.
+  Two internal descriptions of the same unchanged bytes disagreed about a
+  detail neither of them needed to agree on.
+- **A refused save in Tine-managed storage now tells you.** A managed save that
+  could not proceed retried quietly forever without ever surfacing; you could
+  close the app believing the page had been written. It now reports the refusal
+  and what resolves it.
+- **Windows: a managed page rename no longer overwrites a file that appears
+  underneath it.** The rename was documented and implemented as
+  never-replace everywhere except Windows, where it would overwrite a file that
+  arrived in the moment between the check and the rename.
+- **A sync client working in the background no longer fails your save.** Before
+  writing, Tine looks over the graph twice and requires the two looks to agree.
+  Any file changing anywhere in the graph in between makes them disagree — which
+  on a Syncthing, Dropbox or OneDrive folder is simply what a normal minute looks
+  like — and a single disagreement failed the save outright. Disagreeing means
+  something moved while Tine was looking, not that anything is wrong, so it now
+  simply looks again.
+- **A save that cannot succeed says so once, instead of trying twice more
+  first.** When a save failed for a reason no retry could change, Tine retried it
+  anyway, twice, each time redoing the whole (potentially slow) pre-save check
+  before finally showing the error. That multiplier is a large part of why
+  #267 reported "about a minute, then a red toast". Genuinely temporary failures
+  still retry.
+- **A page whose file was replaced behind Tine's back is no longer stranded.**
+  Some tools replace a file wholesale even when its contents don't change —
+  OneDrive filling in a file it had only been holding a placeholder for, a sync
+  client landing the same bytes, a plain copy over the top. Tine checks both that
+  the contents are what you started from *and* that it is the same file it read,
+  so these left a page it refused to save: "existing page identity changed since
+  load". Worse, the conflict prompt that followed had no working way out —
+  "Keep mine" hit the same check and failed, and the only button that did
+  anything threw your edit away. When the contents on disk are still exactly what
+  you started from, Tine now accepts the replacement quietly. A file whose
+  contents really did change is still a genuine conflict and still asks you.
+- **One symlink no longer makes your whole graph read-only.** A symbolic link
+  anywhere Tine looks — at the top of the graph, in `pages/`, in a folder of your
+  own — made *every* save fail, including saves of completely unrelated pages.
+  Tine never followed symlinks anyway; the pre-save check was the only place that
+  treated finding one as fatal rather than as something to step over. It now
+  steps over it. (Importing a graph into managed storage still stops, because
+  quietly leaving a file out of an import is worse than refusing it.)
+- **Errors that a conflict prompt can't fix no longer pretend to be conflicts.**
+  Several unrelated save failures — two files whose names collide on
+  case-insensitive filesystems, two paths pointing at the same physical file,
+  another page already holding the title — all surfaced as "this page changed on
+  disk", offering you a choice between two options that could not resolve any of
+  them. Whichever you picked, the page was then marked as conflicted and silently
+  stopped saving. Each now reports what actually happened.
+- **Saving a page no longer re-reads and re-analyses your whole graph
+  (GH #267).** Before writing, Tine checks that no other file in the graph is
+  about to collide with the one you are saving. Whenever it had lost track of
+  what was on disk — which, on Windows or a graph on a network drive, was
+  essentially all the time — that check re-analysed every single document you
+  own, on every save. On a large graph that is the difference between a save you
+  don't notice and a save that takes long enough to give up and show an error.
+  Losing track means Tine doesn't know what changed, not that everything did, so
+  it now re-reads only the documents whose contents actually differ from what it
+  last saw, and reuses what it already knew about the rest. Measured on a
+  1,000-page graph: the documents examined per save dropped from all of them to
+  three. Nothing about the safety check itself was relaxed.
+- **Edits made outside Tine to pages that are not in `journals/` or `pages/`
+  now show up while Tine is open (GH #268).** If you keep pages at the top level
+  of your graph or in your own folders, Tine listed them correctly when it
+  opened the graph, but then never noticed another editor or a sync client
+  changing them — the page you were looking at simply stayed stale until you
+  reopened the graph. Tine watched the whole graph folder all along; the part
+  that decides which of those changes to act on had been left looking only at
+  `journals/` and `pages/`. It now uses the same rule the rest of Tine uses to
+  decide what counts as a page, so external edits, creations and deletions
+  anywhere in your graph arrive the same way they already did under `pages/`.
+  Folders Tine deliberately ignores (`assets/`, hidden folders, `logseq/bak/`)
+  stay ignored, so dropping in an image still costs nothing.
+- **Graphs on a network share no longer re-examine the whole graph on every
+  save.** When Tine cannot use the operating system's file-change notifications
+  — typically a graph on a network drive — it checks the folder every few
+  seconds instead. Each of those checks was throwing away everything Tine knew
+  about the graph's files, so the very next save had to walk and read the entire
+  graph again before it could write. Saving got slower the bigger your graph
+  was, permanently. The periodic check now records what it actually found, so an
+  ordinary save no longer pays for it. If a check cannot read part of the graph,
+  Tine still starts over from scratch rather than trusting an incomplete
+  picture.
+- **A folder Tine cannot watch is no longer a silent failure.** If the operating
+  system refuses to install the folder watch — too many watches, a permission
+  problem, an unavailable network share — Tine kept retrying quietly while every
+  outside change went unnoticed. It now tells you once per distinct problem, and
+  keeps retrying.
+- **App now starts on macOS 12 with an older Safari/WebKit (GH #256).** A JS
+  regex lookbehind shipped in the eagerly loaded bundle; pre-16.4 WebKit can't
+  parse it and the app died with "SyntaxError: invalid group specifier name"
+  and a white screen. The regex was rewritten lookbehind-free (byte-identical
+  behavior) and a source guard test now rejects any lookbehind in `src/`.
+- **Ctrl+F now scrolls to the exact occurrence, not just its block (GH #253).**
+  In a block taller than the viewport, in-page find previously only centered
+  the block, leaving off-screen matches invisible; the reveal now centers the
+  active occurrence inside the pane (falling back to block-centering while the
+  block is being edited).
+- **Update failures are no longer silent (GH #241).** When the desktop
+  self-update fails (signature, download, or install), the error is now written
+  to the debug log and shown in a toast instead of indistinguishably opening
+  the releases page; the releases page still opens as the safe fallback. The
+  underlying Windows update failure reported in #241 is not yet diagnosed —
+  the now-visible error message is exactly what a Windows repro needs.
+
+- **Reopening a lived-in graph after a crash no longer rebuilds it.** Opening a
+  managed graph that had been edited over many sessions could stall for over a
+  minute after an unclean shutdown while it rebuilt its search/index database
+  from scratch — and the delay grew faster than the graph did. It turned out the
+  database had nothing wrong with it: it was already exactly up to date, but its
+  identity included a note of where the previous run happened to keep some
+  in-memory data, and reopening a graph moves that. Tine compared the two, saw a
+  difference that meant nothing, and concluded the database was corrupt. That
+  bookkeeping detail is no longer part of what identifies a graph's state, so an
+  up-to-date database is now recognised and simply opened. Measured on a
+  1,046-file graph: 72 s to 2 s, with the database step itself down to a few
+  milliseconds and no longer growing with the size of the graph at all.
+- **A page you are editing is no longer falsely reported as “changed on disk.”**
+  Editing a block and immediately moving it could raise the “changed on disk
+  (edited elsewhere or synced in)” banner with no external editor or sync
+  involved — and because a page with an open conflict refuses to save, the
+  banner's own warning that your unsaved changes weren't written became true
+  only because the banner appeared. Tine now requires proof that the page
+  actually diverged — its stored revision no longer matches the one the editor
+  holds — before declaring a conflict, instead of treating any change
+  notification arriving during an unsaved edit as one. A save already in flight
+  is left to its own base-revision guard. Genuine external edits, and a file
+  deleted out from under an unsaved edit, still raise the banner exactly as
+  before.
+- **Journal carry-over buttons now switch correctly at midnight.** The buttons
+  under a journal title were chosen once at mount from a bare wall-clock
+  comparison, so after the calendar rolled over, yesterday's journal kept
+  today's pull-in buttons ("Carry from previous day", "Carry last N days")
+  instead of switching to "Carry unfinished tasks → today". The choice now
+  follows a reactive day tick (DST-safe, re-synced on focus/wake), so an
+  already-open app swaps the button sets the moment the day changes.
+- **Delete/Backspace over text selected in a rendered (not-editing) block now
+  deletes that text.** Selecting a block's text with the mouse and pressing
+  Delete or Backspace did nothing — the keypress reached no editor, the
+  highlight stayed, and nothing changed (OG deletes it, since its rendered
+  view is the editor). The key now maps the rendered selection back to source
+  and deletes it through the normal store path (one undo step), then opens the
+  block in the editor at the deletion point. Conservative no-ops remain for
+  cross-block selections, selections wholly inside atomic constructs (links,
+  chips), annotation/calc blocks, and read-only pages.
+- **Managed Markdown saves now retain their authenticated projection predecessor
+  across drain, compaction, and unsafe reopen.** The next save and delayed
+  filesystem callback re-prove the exact completed-path receipt instead of
+  regenerating its historical base through the canonical serializer, so
+  empty-bullet and non-leading-heading layouts no longer strand the graph in a
+  global “updating” state. Exact live bytes, path, page, frontier, claim,
+  endpoint, and receipt bindings remain required; divergent external edits and
+  Org layout differences still fail closed.
+
+### Changed
+
+- **Rebuilding a managed graph's internal cache is much faster, and now scales
+  with the graph instead of against it.** On a 1,045-file graph the rebuild went
+  from about 15 seconds to about 2.6 seconds, and the cost is now roughly
+  proportional to graph size rather than growing faster than it — so the saving
+  gets larger, not smaller, as a graph grows. This is the recovery a graph
+  reaches after corruption or an internal format change, so it is rare, but when
+  it happens it is the whole wait before the app is usable.
+- **Managed graphs rebuild their internal cache once on first launch after this
+  update.** A field that was recorded but never used has been removed from the
+  cache's page-alias table, which changes its internal format. Nothing in your
+  graph changes; the rebuild is the faster one described above, and it happens
+  only once.
+
+- **Managed-storage save refusals now report a bounded internal reason code.**
+  This keeps graph content and filesystem details private while distinguishing
+  preparation, commit, queue, decode, and authority failures that previously
+  collapsed into one generic semantic-transaction message. Crash-reopen
+  coverage now also exercises accepted undrained history both with and without
+  the disposable resume accelerator.
+
 ## [0.6.90] - 2026-08-04
 
 ### Fixed
