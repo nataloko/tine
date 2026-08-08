@@ -38,7 +38,16 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   (`fencedCodeBlock` and `isOpeningFenceLine`).
 - Git integration: `src-tauri/src/git.rs` and Settings.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
-- Notification-only updater: `src/update.ts`.
+- Notification-only updater: `src/update.ts` and `src/update.test.ts`. The
+  divergence is one line — `updateMode()` returns `"manual"` on every desktop
+  platform, where upstream returns `"self"` on Windows/Linux — so the Download
+  action opens the releases page and upstream's `check()` /
+  `downloadAndInstall()` block is never reached. Keep that block unedited so
+  upstream's fixes to it keep merging cleanly; the fork test asserts the
+  updater is never called, which conflicts whenever upstream edits its own
+  GH #241 test. Both edits carry `FORK:` comments. Note `REPO` deliberately
+  points at `martinkoutecky/tine`: the toast announces *upstream* releases,
+  which is the signal to run this sync.
 - Fork ADRs: `docs/adr/mine/` (its own numbering and README), not the upstream
   `docs/adr/` sequence.
 
