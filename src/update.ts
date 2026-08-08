@@ -16,6 +16,13 @@
 //
 // Deliberately quiet: Tauri-only check, silent on ANY failure (offline, rate-
 // limited, blocked) — it must never block startup or nag with an error.
+//
+// FORK (nataloko): this build is notification-only. It ships
+// `createUpdaterArtifacts: false` (src-tauri/tauri.conf.json), so no signed
+// `latest.json` is ever published and the self-updater above can only fail.
+// `updateMode()` therefore resolves every desktop platform to "manual": the
+// toast tells you a release exists, the releases page does the rest. Upstream's
+// self-update block is left in place unchanged so its fixes keep merging cleanly.
 
 import { isTauri, backend } from "./backend";
 import { platformKind } from "./platform";
@@ -51,9 +58,13 @@ async function updateMode(): Promise<UpdateMode> {
   } catch {
     return "unavailable";
   }
-  return /\bMac/i.test(typeof navigator !== "undefined" ? navigator.userAgent : "")
-    ? "manual"
-    : "self";
+  // FORK: upstream returns "self" here on Windows/Linux (macOS is "manual"
+  // because its unsigned bundle would trip Gatekeeper). This build publishes no
+  // updater manifest, so `check()` can only 404 or throw — and since GH #241
+  // that failure raises an error toast on every Download click. Go straight to
+  // the manual path instead; it is the fork's real update route on every
+  // desktop platform, not a fallback.
+  return "manual";
 }
 
 /** Open the GitHub releases page in the system browser (the manual fallback). */
