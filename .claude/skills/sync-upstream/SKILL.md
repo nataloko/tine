@@ -21,15 +21,23 @@ when there's something to decide.
   fork ADR on an upstream-range number, move it to `mine/` and fix its cross-refs — never renumber
   into upstream's range.)
 - Releases: a **`mine-v*`** tag triggers `.github/workflows/personal-build.yml` (AppImage + Windows).
-- Fork feature surfaces (used by the overlap scan): query filter
-  (`src/components/Macro.tsx`, `QueryBuilder.tsx`, `src/sheet/config.ts`, `src/editor/queryFilter.ts`),
-  bullet threading (`src/bulletThreading.ts`, `src/components/Block.tsx`), the "mine (extras)"
-  settings tab (`src/components/Settings.tsx`), the notification-only updater (`src/update.ts`).
+- Fork feature surfaces (used by the overlap scan). **Shared** files exist upstream and carry
+  fork edits on top — these are the ones that can interact silently:
+  `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, `src/sheet/config.ts`,
+  `src/components/Block.tsx`, `src/editor/properties.ts`, `src/render/body.tsx`,
+  `src/components/Settings.tsx`, `src/update.ts`, `src/update.test.ts`, `src/styles/app.css`.
+  **Fork-only** files upstream has never seen, so they can never conflict:
+  `src/editor/queryFilter.ts`, `src/bulletThreading.ts`, `src/codeHighlightSettings.ts`,
+  `src-tauri/src/git.rs`. (Re-derive this split with
+  `git cat-file -e "$TAG:<path>"` when a surface is added or upstream absorbs one.)
 
 ## Policy
 **Auto-proceed when clean; stop only when there's something to decide.** "Clean" = the merge
-preview has **zero conflicts** AND **no upstream commit reimplements a fork feature**. Anything
-else → STOP, show the maintainer what's wrong, and ask how to resolve before mutating anything.
+preview has **zero conflicts** AND **no upstream commit reimplements a fork feature** AND
+**every shared-surface change was read and is compatible with what the fork does there**.
+Anything else → STOP, show the maintainer what's wrong, and ask how to resolve before mutating
+anything. A shared-surface change that merges cleanly but changes fork behavior is not a
+blocker for the merge — report it, finish the sync, then fix it as a follow-up commit.
 
 ---
 
@@ -50,13 +58,31 @@ git log --oneline "$BASE".."$TAG"            # what's new upstream
 git diff --stat "$BASE" "$TAG" | tail -1     # scope
 # Conflict preview — empty output after the tree line == clean:
 git merge-tree --write-tree --name-only mine "$TAG"
-# Files changed by BOTH sides (the only possible conflict/interaction points):
+# Files changed by BOTH sides SINCE BASE (the possible *conflict* points):
 comm -12 <(git diff --name-only "$BASE" mine | sort) <(git diff --name-only "$BASE" "$TAG" | sort)
+
+# Fork SHARED surfaces upstream touched this release (the possible *interaction* points).
+# NOT a subset of the line above — it catches surfaces `comm` misses, so run both:
+SHARED="src/components/Macro.tsx src/components/QueryBuilder.tsx src/sheet/config.ts
+src/components/Block.tsx src/editor/properties.ts src/render/body.tsx
+src/components/Settings.tsx src/update.ts src/update.test.ts src/styles/app.css"
+git diff --stat "$BASE" "$TAG" -- $SHARED
+
+# Did upstream reimplement a fork feature? Any hit here needs reading in full:
+git diff "$BASE" "$TAG" | grep -inE 'query-filter|queryFilter|bulletThread|thread-svg|codeHlEnabled|highlightFenced|loadHljs|updateMode|downloadAndInstall|createUpdaterArtifacts|"extras"'
 ```
-Then judge two things:
+Then judge three things:
 - **Conflicts:** does `merge-tree` list any conflicted files?
 - **Feature overlap:** do any of the new commits (subjects + diffs) touch the fork feature
   surfaces above — i.e. did upstream implement something the fork already added?
+- **Silent interaction:** for every shared surface in the `git diff --stat` above, read
+  upstream's change against what the fork does in that file — *even when it auto-merges
+  and even when it is absent from the `comm` list*. **The trap:** `comm` only catches files
+  both sides changed *since BASE*. A fork edit made in an earlier sync is already inside
+  BASE, so a file the fork owns behavior in looks upstream-only, merges without a murmur,
+  and changes fork behavior anyway. That is exactly how v0.6.91's GH #241 patch to
+  `src/update.ts` — an error toast on a self-update path this build can never take —
+  reached `mine` unnoticed by every mechanical check.
 - **Dep/pin check:** did `package.json` / `Cargo.*` change (→ reinstall)? did the lsdoc pin
   (`crates/tine-core/Cargo.toml`) or `src/render/wasm/` change (→ `npm run build:wasm` + wasm-pin)?
 
