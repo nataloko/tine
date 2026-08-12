@@ -35,15 +35,17 @@ import {
   toggleBlockProperty,
   toggleOwnNumberedList,
   blockProperty,
-  setHeading,
+  setSelectionHeading,
   setCollapsedDeep,
   dtoSubtreeMarkdown,
   flushAll,
   flushPage,
+  isDirty,
   deletePage,
   restoreTodayJournalInFeed,
   selectedIds,
   blockPageReadOnly,
+  blockWritable,
   pageByName,
   buildClipboardPayload,
 } from "../store";
@@ -340,31 +342,38 @@ function ShowChildrenAsSubmenu(props: { id: string; close: () => void }): JSX.El
 function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
   const hasChildren = () => (doc.byId[props.id]?.children.length ?? 0) > 0;
   const readOnly = () => blockPageReadOnly(props.id);
+  const headingTargets = () => {
+    const selected = selectedIds();
+    return selected.length ? selected : [props.id];
+  };
+  const headingsWritable = () => headingTargets().length > 0 && headingTargets().every(blockWritable);
   return (
     <>
       <Show when={!readOnly()}>
         {/* Color row */}
         <ColorPalette id={props.id} close={props.close} />
+      </Show>
 
+      <Show when={headingsWritable()}>
         {/* Heading row */}
         <div class="ctx-row ctx-headings">
-          <button class="ctx-h" title="Automatic heading" onClick={() => { setHeading(props.id, true); props.close(); }}>
+          <button class="ctx-h" title="Automatic heading" onClick={() => { setSelectionHeading(props.id, true); props.close(); }}>
             Auto
           </button>
           <For each={[1, 2, 3, 4, 5, 6]}>
             {(h) => (
-              <button class="ctx-h" title={`Heading ${h}`} onClick={() => { setHeading(props.id, h); props.close(); }}>
+              <button class="ctx-h" title={`Heading ${h}`} onClick={() => { setSelectionHeading(props.id, h); props.close(); }}>
                 H{h}
               </button>
             )}
           </For>
-          <button class="ctx-h" title="Remove heading" onClick={() => { setHeading(props.id, null); props.close(); }}>
+          <button class="ctx-h" title="Remove heading" onClick={() => { setSelectionHeading(props.id, null); props.close(); }}>
             ⌫
           </button>
         </div>
-
-        <div class="ctx-sep" />
       </Show>
+
+      <Show when={!readOnly() || headingsWritable()}><div class="ctx-sep" /></Show>
 
       <For each={blockActions(props.id)}>
         {(it) => (
@@ -820,7 +829,7 @@ function PageMenu(props: {
     const captured = target();
     // Native GTK confirm — window.confirm silently returns true here, which would
     // delete the page with no prompt.
-    if (!(await backend().confirm(`Delete "${name}"? The file moves to the graph's .tine-trash folder.`))) return;
+    if (!(await backend().confirm(deletePageConfirmText(name)))) return;
     // Route through the store (not backend directly) so it tombstones the page and
     // cancels any pending save — otherwise a just-typed, never-saved page could be
     // recreated by a queued save right after we delete it.
@@ -834,7 +843,7 @@ function PageMenu(props: {
         // Deleted a day IN the journals feed (in place, no navigation) → the feed
         // loader's withToday didn't re-run, so restore today's empty placeholder
         // here if it was the one deleted (#17). No-op for an older day.
-        if (kind === "journal") restoreTodayJournalInFeed();
+        if (kind === "journal") void restoreTodayJournalInFeed();
         pushToast(`Deleted “${name}”`, "success");
       })
       .catch(() => pushToast("Delete failed", "error"));
@@ -931,6 +940,22 @@ export function pageMenuAvailability(pageKind: PageKind): { rename: boolean; del
 
 export function deletePageMenuLabel(pageKind: PageKind): string {
   return pageKind === "journal" ? "Delete journal" : "Delete page";
+}
+
+/** What the delete confirmation actually promises.
+ *
+ *  "Moves to .tine-trash" reads as fully recoverable, and for a saved page it
+ *  is. But the trash receives the FILE, and a page with unsaved edits has work
+ *  that is not in that file: a dirty page's latest keystrokes, or — provably —
+ *  every edit on a conflicted page, whose saves are refused by design until the
+ *  conflict is resolved. Deleting throws that away with nothing to recover from,
+ *  so the prompt has to say so while the user can still answer no. (Direct Files
+ *  data-safety audit, 2026-08-09, finding 18.) */
+export function deletePageConfirmText(name: string): string {
+  const trashed = `Delete "${name}"? The file moves to the graph's .tine-trash folder.`;
+  return isDirty(name) || isConflicted(name)
+    ? `${trashed}\n\nThis page has unsaved changes. They were never written to the file, so they are NOT in the trash copy and cannot be recovered.`
+    : trashed;
 }
 
 // Inline page rename: a context-menu item that expands into a name field (mirrors

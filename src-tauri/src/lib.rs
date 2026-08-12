@@ -4,12 +4,16 @@
 
 mod android_folder_picker;
 mod android_media;
+mod android_safe_back;
 mod android_system_bars;
 mod backup;
 mod commands;
+mod data_home;
 mod debug;
 mod git;
 mod graph;
+#[cfg(target_os = "ios")]
+mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
 /// Test-only: the enumeration of what every command can do under Tine-managed
@@ -29,23 +33,24 @@ mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    asset_trash_stats, block_ref_counts, block_referrers, capture_quick_switch, close_graph_window,
-    copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
-    empty_asset_trash, enable_managed_sync, export_query_subtrees, get_backlink_filter_context,
-    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
-    import_asset, import_native_capture, journal_content_days, journal_feed_page,
-    list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts, list_templates,
-    load_workspaces, managed_sync_identity_plan, managed_sync_status, merge_pages, open_asset,
-    open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
-    publish_html, query_facets, quick_switch, read_asset, read_custom_css, read_highlights,
-    read_journal_file, read_local_image, read_text_file, referenced_page_names,
-    rename_file_to_page, rename_page, resolve_block, resolve_blocks, resolve_sync_conflict,
-    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
-    save_workspaces, search, set_default_journal_template, set_doc_mode_enter_for_new_block,
-    set_favorites, set_guide_announced, set_journal_title_format, set_logical_outdenting,
-    set_preferred_format, set_preferred_workflow, set_show_brackets, set_start_of_week,
-    set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit,
-    trash_asset, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
+    activate_absent_editor, activate_editor, asset_trash_stats, block_ref_counts, block_referrers,
+    capture_quick_switch, close_graph_window, copy_guide_into_graph, delete_page,
+    detect_media_editor, edit_asset_external, empty_asset_trash, existing_page_names,
+    export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page, get_page_by_path,
+    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
+    journal_content_days, journal_feed_page, list_journal_conflicts, list_orphan_assets,
+    list_pages, list_sync_conflicts, list_templates, load_workspaces, merge_pages, open_asset,
+    open_page_file, open_pdf, page_aliases, page_icons, page_print_html, prepare_tine_quit,
+    present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
+    read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
+    referenced_page_names, rename_file_to_page, rename_page, resolve_block, resolve_blocks,
+    resolve_sync_conflict, retire_editor_activation, run_advanced_query, run_graph_search,
+    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
+    set_default_journal_template, set_doc_mode_enter_for_new_block, set_favorites,
+    set_guide_announced, set_journal_title_format, set_logical_outdenting, set_preferred_format,
+    set_preferred_workflow, set_show_brackets, set_start_of_week, set_timetracking_enabled,
+    stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
 use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use git::{
@@ -74,9 +79,9 @@ use state::AppState;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 use sync_runtime::{
-    activate_sparse_v2, cancel_sparse_v2, join_sparse_v2_shared, prepare_sparse_v2_share,
-    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
-    sparse_v2_status, sparse_v2_tick,
+    activate_sparse_v2, cancel_sparse_v2, cancel_sparse_v2_cold, join_sparse_v2_shared,
+    prepare_sparse_v2_share, sparse_v2_clean_shutdown, sparse_v2_editor_load,
+    sparse_v2_editor_save, sparse_v2_query, sparse_v2_status, sparse_v2_tick,
 };
 #[cfg(desktop)]
 use tauri::Emitter;
@@ -479,6 +484,12 @@ pub fn run() {
     // (localStorage) + settings + backups. Records a one-shot flag; the frontend
     // toasts about the (possible) prefs reset. Android intentionally keeps
     // page.tine.app and run_early() is a no-op there.
+    // Tauri creates the WebView user-data dir inside its own setup() and panics
+    // if it cannot; a user whose app-data home is unwritable got a hard crash at
+    // launch. Probe it first — and relocate for this launch if needed — before
+    // anything else resolves that path, the migration below included.
+    data_home::ensure_usable(migrate_identifier::CURRENT_IDENTIFIER);
+
     migrate_identifier::run_early();
 
     // Wayland resolves the shell/titlebar icon by matching a window app ID to a
@@ -585,6 +596,10 @@ pub fn run() {
     let builder = builder.plugin(android_media::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_system_bars::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_safe_back::init());
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(ios_folder_picker::init());
     // Mobile has no xdg-open/open/explorer, so `open_external` routes URL opens
     // through this plugin's platform Intent instead (GH #49). Windows uses it
     // for ShellExecute, because `explorer <url>` opens a File Explorer window
@@ -636,6 +651,7 @@ pub fn run() {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
+            startup_recovery: Mutex::new(std::collections::HashMap::new()),
             sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
@@ -700,7 +716,10 @@ pub fn run() {
             create_graph,
             app_platform,
             default_graph_parent,
+            #[cfg(not(target_os = "ios"))]
             android_folder_picker::pick_graph_folder,
+            #[cfg(target_os = "ios")]
+            ios_folder_picker::pick_graph_folder,
             android_media::capture_photo,
             android_media::start_recording,
             android_media::stop_recording,
@@ -712,12 +731,10 @@ pub fn run() {
             get_page,
             graph_source_files,
             save_page,
-            managed_sync_status,
-            managed_sync_identity_plan,
-            enable_managed_sync,
             sparse_v2_status,
             activate_sparse_v2,
             cancel_sparse_v2,
+            cancel_sparse_v2_cold,
             prepare_sparse_v2_share,
             join_sparse_v2_shared,
             sparse_v2_query,
@@ -744,6 +761,7 @@ pub fn run() {
             query_facets,
             page_aliases,
             page_icons,
+            existing_page_names,
             set_favorites,
             set_preferred_workflow,
             set_timetracking_enabled,
@@ -775,6 +793,10 @@ pub fn run() {
             trash_journal_file,
             read_journal_file,
             get_page_by_path,
+            activate_editor,
+            activate_absent_editor,
+            retire_editor_activation,
+            present_conflict_override,
             merge_pages,
             rename_file_to_page,
             search,
@@ -822,6 +844,7 @@ pub fn run() {
             load_plugin_registry_cache,
             store_plugin_registry_cache,
             migrate_identifier::take_identifier_migration_notice,
+            data_home::take_data_home_fallback_notice,
             gpu_env,
             get_smooth_scroll,
             set_smooth_scroll,
@@ -840,6 +863,7 @@ pub fn run() {
             git_pull,
             git_force_push,
             git_force_pull,
+            prepare_tine_quit,
             tine_quit,
             close_graph_window,
             tine_open_devtools

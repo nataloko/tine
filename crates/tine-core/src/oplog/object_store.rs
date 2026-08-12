@@ -58,9 +58,10 @@ use super::{
         SourceBlobChunkDescriptorV1, SourceBlobChunkDigestV1, SourceBlobChunkRootBuilderV1,
         SourceBlobChunkRootV1, SourceBlobIndexPageV1, SourceBlobIndexValidatorV1,
         SourceInventoryIndexPageV1, SourceInventoryIndexValidatorV1, SourceInventoryRootV1,
-        SourceLeafV1, MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES, MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES,
-        MAX_BOOTSTRAP_PART_EVIDENCE_BYTES, MAX_PART_SPAN_INDEX_BYTES, MAX_SOURCE_BLOB_CHUNK_BYTES,
-        MAX_SOURCE_INDEX_PAGE_BYTES,
+        SourceLeafV1, MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART,
+        MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES, MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES,
+        MAX_BOOTSTRAP_PART_EVIDENCE_BYTES, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
+        MAX_PART_SPAN_INDEX_BYTES, MAX_SOURCE_BLOB_CHUNK_BYTES, MAX_SOURCE_INDEX_PAGE_BYTES,
     },
     BatchError, BatchId, BatchOrigin, CanonicalArchiveResourceId, ContentDigest, DeviceId,
     DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
@@ -76,10 +77,13 @@ const BOOTSTRAP_SOURCE_BLOB_DIR: &str = "source-blob-indexes";
 const BOOTSTRAP_SOURCE_CHUNKS_DIR: &str = "source-chunks";
 const BOOTSTRAP_PARTS_DIR: &str = "parts";
 const BOOTSTRAP_PART_SPANS_DIR: &str = "part-spans";
+const BOOTSTRAP_PART_PACKS_DIR: &str = "part-object-packs";
 const BOOTSTRAP_OBJECTS_DIR: &str = "objects";
 const BOOTSTRAP_EVIDENCE_DIR: &str = "evidence";
 const BOOTSTRAP_AGGREGATES_DIR: &str = "aggregates";
 const BOOTSTRAP_COMMITS_DIR: &str = "commits";
+const MAX_BOOTSTRAP_PART_PACK_BYTES: u64 =
+    MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 4 * MAX_OPERATIONS_PER_BOOTSTRAP_PART as u64;
 const LINEAGE_CLAIM_FILE: &str = "lineage.claim";
 const ENGINE_HISTORY_DIR: &str = "engine-history";
 const ENGINE_HISTORY_NODES_DIR: &str = "nodes";
@@ -418,6 +422,23 @@ pub(crate) struct AcceptedReadStats {
     pub manifest_reads: usize,
     pub object_reads: usize,
 }
+
+/// Process-wide `inspect_batch` cost, for the F49 quadratic probe only.
+///
+/// The per-store `counters` are reset with the store; these are not, so an
+/// import's *total* re-read volume can be read once at the end of a run.
+/// Diagnostic only — nothing reads these outside the probe.
+pub static INSPECT_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// `caller file:line -> (calls, required objects)`. `#[track_caller]` on
+/// `inspect_batch` makes this exact without touching a single call site --
+/// which matters, because guessing which callers dominate has already been
+/// wrong once.
+pub static INSPECT_BATCH_SITES: std::sync::Mutex<
+    std::collections::BTreeMap<String, (usize, usize)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+pub static INSPECT_BATCH_OBJECT_READS: AtomicUsize = AtomicUsize::new(0);
+pub static INSPECT_BATCH_OBJECT_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static INSPECT_BATCH_DIGEST_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObjectStoreStats {
@@ -1280,8 +1301,15 @@ impl BlockClaimIndexRoot {
 
 #[derive(Debug)]
 pub(crate) struct BlockClaimIndexStore {
-    file: Mutex<fs::File>,
+    backing: BlockClaimIndexBacking,
     counters: Arc<StoreCounters>,
+}
+
+#[derive(Debug)]
+enum BlockClaimIndexBacking {
+    Scratch(Arc<super::scratch_store::ScratchStore>),
+    #[cfg(test)]
+    Standalone(Mutex<fs::File>),
 }
 
 impl BlockClaimIndexStore {
@@ -1295,14 +1323,10 @@ impl BlockClaimIndexStore {
     /// in-memory test map, whose fixed capacity would otherwise cap an
     /// importable graph at a few thousand blocks.
     pub(crate) fn for_scratch(
-        scratch: &super::scratch_store::ScratchStore,
+        scratch: Arc<super::scratch_store::ScratchStore>,
     ) -> Result<Self, StoreError> {
         Ok(Self {
-            file: Mutex::new(
-                scratch
-                    .clone_pages_file()
-                    .map_err(|error| StoreError::Scratch(error.to_string()))?,
-            ),
+            backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::new(StoreCounters::default()),
         })
     }
@@ -1336,13 +1360,14 @@ impl RetainedEngineScratch {
         store: &ObjectStore,
         scratch: super::scratch_store::ScratchStore,
     ) -> Result<Self, StoreError> {
-        let claim_index = store.engine_claim_index(&scratch)?;
+        let scratch = Arc::new(scratch);
+        let claim_index = store.engine_claim_index(Arc::clone(&scratch))?;
         let run_id = scratch.run_id();
         let binding_digest = scratch
             .binding_digest()
             .map_err(|error| StoreError::Scratch(error.to_string()))?;
         Ok(Self {
-            scratch: Arc::new(scratch),
+            scratch,
             claim_index,
             run_id,
             binding_digest,
@@ -1703,10 +1728,7 @@ pub(crate) struct BootstrapPublicationBatch<'a> {
     inventory_pages: BTreeMap<u32, ()>,
     blob_root: Option<SourceBlobChunkRootV1>,
     blob_pages: BTreeMap<u32, ()>,
-    expected_chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
-    chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
-    expected_objects: BTreeMap<ContentDigest, ()>,
-    objects: BTreeMap<ContentDigest, ()>,
+    part_packs: BTreeMap<super::identity::BootstrapPartId, ()>,
     parts: BTreeMap<super::identity::BootstrapPartId, ()>,
 }
 
@@ -1779,6 +1801,7 @@ pub(crate) struct DetachedBootstrapAuthoringIndexes {
     portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
     logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
     page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
+    construction_resident_budget_bytes: usize,
 }
 
 impl DetachedBootstrapAuthoringIndexes {
@@ -1799,6 +1822,90 @@ impl DetachedBootstrapAuthoringIndexes {
     pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
         Arc::clone(&self.page_name_index)
     }
+
+    pub(crate) const fn construction_resident_budget_bytes(&self) -> usize {
+        self.construction_resident_budget_bytes
+    }
+}
+
+fn parse_available_kib(meminfo: &str) -> Option<u64> {
+    let value = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    value.checked_mul(1024)
+}
+
+fn finite_cgroup_available(maximum: &str, current: &str) -> Option<u64> {
+    let maximum = maximum.trim().parse::<u64>().ok()?;
+    if maximum >= (1_u64 << 60) {
+        return None;
+    }
+    let current = current.trim().parse::<u64>().ok()?;
+    Some(maximum.saturating_sub(current))
+}
+
+fn detached_bootstrap_available_memory_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let host = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| parse_available_kib(&meminfo));
+        let cgroup_v2 = fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .zip(fs::read_to_string("/sys/fs/cgroup/memory.current").ok())
+            .and_then(|(maximum, current)| finite_cgroup_available(&maximum, &current));
+        let cgroup_v1 = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            .ok()
+            .zip(fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok())
+            .and_then(|(maximum, current)| finite_cgroup_available(&maximum, &current));
+        return [host, cgroup_v2, cgroup_v1].into_iter().flatten().min();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+fn detached_bootstrap_construction_budget_for_available(available: Option<u64>) -> usize {
+    const FALLBACK_BYTES: usize = 128 * 1024 * 1024;
+    let target = available
+        .and_then(|available| usize::try_from(available / 8).ok())
+        .unwrap_or(FALLBACK_BYTES);
+    target.clamp(
+        tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+        tine_storage::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    )
+}
+
+fn detached_bootstrap_construction_resident_budget_bytes() -> usize {
+    detached_bootstrap_construction_budget_for_available(detached_bootstrap_available_memory_bytes())
+}
+
+#[cfg(test)]
+#[test]
+fn detached_bootstrap_construction_budget_tracks_available_memory_with_bounds() {
+    assert_eq!(
+        parse_available_kib("MemAvailable: 1024 kB\n"),
+        Some(1024 * 1024)
+    );
+    assert_eq!(finite_cgroup_available("1024\n", "256\n"), Some(768));
+    assert_eq!(finite_cgroup_available("max\n", "256\n"), None);
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(Some(128 * 1024 * 1024)),
+        tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    );
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(Some(8 * 1024 * 1024 * 1024)),
+        tine_storage::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    );
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(None),
+        128 * 1024 * 1024,
+    );
 }
 
 impl BootstrapAuthoringCapability {
@@ -1843,21 +1950,31 @@ impl BootstrapAuthoringCapability {
             self.archive_identity,
         )?;
         let publisher = publication.publisher();
-        let indexes = DetachedBootstrapAuthoringIndexes {
-            reference_catalog: Arc::new(
-                self.reference_catalog
-                    .for_detached_bootstrap(publisher.clone())?,
-            ),
-            portable_path_index: Arc::new(
-                self.portable_path_index
-                    .for_detached_bootstrap(publisher.clone())?,
-            ),
-            logseq_claim_index: Arc::new(
-                self.logseq_claim_index
-                    .for_detached_bootstrap_construction(publisher.clone())?,
-            ),
-            page_name_index: Arc::new(self.page_name_index.for_detached_bootstrap(publisher)?),
-        };
+        let construction_resident_budget_bytes =
+            detached_bootstrap_construction_resident_budget_bytes();
+        let indexes =
+            DetachedBootstrapAuthoringIndexes {
+                reference_catalog: Arc::new(
+                    self.reference_catalog
+                        .for_detached_bootstrap(publisher.clone())?,
+                ),
+                portable_path_index: Arc::new(self.portable_path_index.for_detached_bootstrap(
+                    publisher.clone(),
+                    construction_resident_budget_bytes,
+                )?),
+                logseq_claim_index: Arc::new(
+                    self.logseq_claim_index
+                        .for_detached_bootstrap_construction(
+                            publisher.clone(),
+                            construction_resident_budget_bytes,
+                        )?,
+                ),
+                page_name_index: Arc::new(
+                    self.page_name_index
+                        .for_detached_bootstrap(publisher, construction_resident_budget_bytes)?,
+                ),
+                construction_resident_budget_bytes,
+            };
         Ok((publication, indexes))
     }
 }
@@ -2169,10 +2286,7 @@ impl ObjectStore {
             inventory_pages: BTreeMap::new(),
             blob_root: None,
             blob_pages: BTreeMap::new(),
-            expected_chunks: BTreeMap::new(),
-            chunks: BTreeMap::new(),
-            expected_objects: BTreeMap::new(),
-            objects: BTreeMap::new(),
+            part_packs: BTreeMap::new(),
             parts: BTreeMap::new(),
         })
     }
@@ -2249,6 +2363,36 @@ impl ObjectStore {
             digest.to_string(),
         )?;
         Ok(digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_bootstrap_part_pack_for_test(
+        &self,
+        descriptor: BootstrapPartDescriptorV1,
+        objects: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        let mut pack = Vec::new();
+        for object in objects {
+            let length = u32::try_from(object.len()).map_err(|_| {
+                StoreError::BootstrapArtifactMismatch("bootstrap test part object length")
+            })?;
+            pack.extend_from_slice(&length.to_be_bytes());
+            pack.extend_from_slice(object);
+        }
+        if pack.len() as u64 > MAX_BOOTSTRAP_PART_PACK_BYTES {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap test part object pack length",
+            ));
+        }
+        let part_name = hex_bytes(descriptor.part_id().as_bytes());
+        let dir = self.bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, true)?;
+        publish_bootstrap_immutable(
+            &dir,
+            &part_name,
+            &pack,
+            "bootstrap test part object pack",
+            part_name.clone(),
+        )
     }
 
     pub(crate) fn publish_bootstrap_part_artifacts(
@@ -2480,7 +2624,13 @@ impl ObjectStore {
 
     /// Inspect a single manifest and validate every present required object.
     /// Missing objects stage the batch; corrupt or mismatched objects reject it.
+    #[track_caller]
     pub fn inspect_batch(&self, batch_id: BatchId) -> Result<BatchInspection, StoreError> {
+        INSPECT_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let site = super::inspect_site_trace_enabled().then(|| {
+            let caller = std::panic::Location::caller();
+            format!("{}:{}", caller.file(), caller.line())
+        });
         let batches = self.open_namespace(BATCHES_DIR)?;
         let filename = manifest_filename(batch_id);
         let manifest_bytes =
@@ -2508,6 +2658,13 @@ impl ObjectStore {
             });
         }
 
+        if let Some(site) = site {
+            if let Ok(mut sites) = INSPECT_BATCH_SITES.lock() {
+                let entry = sites.entry(site).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += manifest.required_objects().len();
+            }
+        }
         let objects_dir = self.open_namespace(OBJECTS_DIR)?;
         let mut missing = Vec::new();
         let mut objects = Vec::with_capacity(manifest.required_objects().len());
@@ -2529,6 +2686,9 @@ impl ObjectStore {
             self.counters
                 .inspected_object_bytes
                 .fetch_add(bytes.len(), Ordering::Relaxed);
+            INSPECT_BATCH_OBJECT_READS.fetch_add(1, Ordering::Relaxed);
+            INSPECT_BATCH_OBJECT_BYTES.fetch_add(bytes.len(), Ordering::Relaxed);
+            INSPECT_BATCH_DIGEST_BYTES.fetch_add(bytes.len(), Ordering::Relaxed);
             let content_digest = ContentDigest::of(&bytes);
             if content_digest != descriptor.content_digest() {
                 return Err(StoreError::ObjectPathMismatch(descriptor.content_digest()));
@@ -2949,7 +3109,7 @@ impl ObjectStore {
         file.sync_all()?;
         sync_dir_required(&run)?;
         Ok(BlockClaimIndexStore {
-            file: Mutex::new(file),
+            backing: BlockClaimIndexBacking::Standalone(Mutex::new(file)),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -3036,19 +3196,18 @@ impl ObjectStore {
             super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
                 .map_err(|error| StoreError::Scratch(error.to_string()))?,
         );
-        Ok((Arc::clone(&scratch), self.engine_claim_index(&scratch)?))
+        Ok((
+            Arc::clone(&scratch),
+            self.engine_claim_index(Arc::clone(&scratch))?,
+        ))
     }
 
     fn engine_claim_index(
         &self,
-        scratch: &super::scratch_store::ScratchStore,
+        scratch: Arc<super::scratch_store::ScratchStore>,
     ) -> Result<BlockClaimIndexStore, StoreError> {
         Ok(BlockClaimIndexStore {
-            file: Mutex::new(
-                scratch
-                    .clone_pages_file()
-                    .map_err(|error| StoreError::Scratch(error.to_string()))?,
-            ),
+            backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -3507,6 +3666,95 @@ impl ObjectStore {
         Ok(true)
     }
 
+    /// Read and validate only a batch's manifest, without touching its objects.
+    ///
+    /// The manifest's descriptors already carry `document_id`, `kind`,
+    /// `content_digest` and `encoded_byte_length` for every object, so a caller
+    /// that needs object *metadata* -- which documents a batch updates, how many
+    /// bytes it retains, which object holds a given kind -- never needs to read
+    /// the objects themselves. Pair this with [`Self::read_object`] to fetch the
+    /// one payload that is genuinely required.
+    pub(crate) fn read_manifest(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<OperationBatch>, StoreError> {
+        let batches = self.open_namespace(BATCHES_DIR)?;
+        let filename = manifest_filename(batch_id);
+        let Some(manifest_bytes) =
+            read_optional_regular(&batches, &filename, MAX_MANIFEST_BYTES as u64, None)?
+        else {
+            return Ok(None);
+        };
+        self.counters
+            .inspected_manifest_operations
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inspected_manifest_bytes
+            .fetch_add(manifest_bytes.len(), Ordering::Relaxed);
+        let manifest = OperationBatch::decode(&manifest_bytes)?;
+        if manifest.batch_id() != batch_id {
+            return Err(StoreError::ManifestPathMismatch {
+                expected: batch_id,
+                found: manifest.batch_id(),
+            });
+        }
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            });
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Read exactly the one content-addressed object a caller already has the
+    /// digest for.
+    ///
+    /// This is the access path [`Self::inspect_batch`] is *not*: inspecting a
+    /// batch to obtain a single object costs O(whole batch) — it reads,
+    /// SHA-256s and decodes every object the manifest requires. Callers that
+    /// hold a digest are asking for a file whose name already *is* that digest,
+    /// so there is nothing to search and nothing to re-prove about the rest of
+    /// the batch.
+    ///
+    /// The object's own integrity is still checked here (digest + workspace),
+    /// because that is O(one object) and keeps the content-addressing contract.
+    /// What is dropped is re-proving *batch completeness* per object, which is
+    /// established once at acceptance: `hot_engine.rs:13120-13127` admits a
+    /// batch to the archive only on `BatchInspection::Ready`, and projection
+    /// work rows reach `Ready` only inside `accept_batch_at_history`.
+    pub(crate) fn read_object(&self, digest: ContentDigest) -> Result<OperationObject, StoreError> {
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        // Counted on the same counters as `inspect_batch`'s per-object reads.
+        // These measure *object reads*, not one particular access path, and
+        // tests use them as an oracle for how much an operation reconstructs
+        // (`ordinary_drain_reconstructs_each_accepted_event_once`). A new path
+        // that read objects silently would make that oracle lie.
+        self.counters
+            .inspected_object_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let bytes = read_required_regular(
+            &objects,
+            &object_filename(digest),
+            MAX_OBJECT_BYTES as u64,
+            None,
+        )?;
+        self.counters
+            .inspected_object_bytes
+            .fetch_add(bytes.len(), Ordering::Relaxed);
+        if ContentDigest::of(&bytes) != digest {
+            return Err(StoreError::ObjectPathMismatch(digest));
+        }
+        let object = OperationObject::decode(&bytes)?;
+        if object.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        Ok(object)
+    }
+
     pub(crate) fn read_object_bytes(&self, digest: ContentDigest) -> Result<Vec<u8>, StoreError> {
         let objects = self.open_namespace(OBJECTS_DIR)?;
         let bytes = read_required_regular(
@@ -3898,16 +4146,27 @@ impl ObjectStore {
         let spans = BootstrapPartSpanIndexV1::decode(&span_bytes)?;
         spans.validate_part(evidence)?;
 
-        let object_dir = self.bootstrap_namespace(BOOTSTRAP_OBJECTS_DIR, false)?;
+        let pack_dir = self.bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, false)?;
+        let pack = open_file_nofollow(&pack_dir, &part_name)?;
+        if pack.metadata()?.len() > MAX_BOOTSTRAP_PART_PACK_BYTES {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap part object pack exceeds its bound",
+            ));
+        }
+        let mut pack = BufReader::with_capacity(64 * 1024, pack);
         let mut objects = Vec::with_capacity(manifest.required_objects().len());
         let mut payloads = Vec::with_capacity(manifest.required_objects().len());
         for expected in manifest.required_objects() {
-            let bytes = read_required_regular(
-                &object_dir,
-                &object_filename(expected.content_digest()),
-                MAX_OBJECT_BYTES as u64,
-                Some(expected.encoded_byte_length()),
-            )?;
+            let mut length = [0; 4];
+            pack.read_exact(&mut length)?;
+            let length = u64::from(u32::from_be_bytes(length));
+            if length != expected.encoded_byte_length() || length > MAX_OBJECT_BYTES as u64 {
+                return Err(StoreError::BootstrapArtifactMismatch(
+                    "bootstrap part object pack frame length",
+                ));
+            }
+            let mut bytes = vec![0; length as usize];
+            pack.read_exact(&mut bytes)?;
             if ContentDigest::of(&bytes) != expected.content_digest() {
                 return Err(StoreError::ObjectPathMismatch(expected.content_digest()));
             }
@@ -3928,6 +4187,12 @@ impl ObjectStore {
                 expected.encoded_byte_length(),
             )?);
             objects.push(object);
+        }
+        let mut trailing = [0; 1];
+        if pack.read(&mut trailing)? != 0 {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap part object pack has trailing bytes",
+            ));
         }
         let manifest_fingerprint = BootstrapManifestFingerprintV1::from_bytes(
             *ContentDigest::of(&manifest_bytes).as_bytes(),
@@ -6834,6 +7099,24 @@ fn validate_engine_history_root(
 }
 
 impl BlockClaimIndexStore {
+    fn with_file<T>(
+        &self,
+        operation: impl FnOnce(&mut fs::File) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match &self.backing {
+            BlockClaimIndexBacking::Scratch(scratch) => scratch
+                .with_pages(operation)
+                .map_err(|error| StoreError::Scratch(error.to_string()))?,
+            #[cfg(test)]
+            BlockClaimIndexBacking::Standalone(file) => {
+                let mut file = file
+                    .lock()
+                    .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
+                operation(&mut file)
+            }
+        }
+    }
+
     pub(crate) fn lookup_many(
         &self,
         root: BlockClaimIndexRoot,
@@ -6845,62 +7128,54 @@ impl BlockClaimIndexStore {
         if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err(StoreError::MalformedBlockClaimIndex);
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        let mut segments: Vec<_> = root.levels.into_iter().flatten().flatten().collect();
-        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
-        let mut remaining: Vec<_> = keys
-            .iter()
-            .copied()
-            .map(|key| {
-                let (first, second) = block_claim_filter_hashes(&key);
-                (key, first, second)
-            })
-            .collect();
-        let global_filter = self.read_claim_global_filter(
-            &mut file,
-            root.global_filter
-                .ok_or(StoreError::MalformedBlockClaimIndex)?,
-        )?;
-        remaining.retain(|(_, first, second)| {
-            block_claim_global_filter_might_contain(&global_filter, *first, *second)
-        });
-        if remaining.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let mut found = BTreeMap::new();
-        for segment in segments {
-            let filter = self.read_claim_filter(&mut file, segment.filter_ref)?;
-            if filter.entry_count != segment.entry_count {
-                return Err(StoreError::MalformedBlockClaimIndex);
-            }
-            let selected: Vec<_> = remaining
+        self.with_file(|file| {
+            let mut segments: Vec<_> = root.levels.into_iter().flatten().flatten().collect();
+            segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
+            let mut remaining: Vec<_> = keys
                 .iter()
-                .filter(|(_, first, second)| {
-                    block_claim_filter_might_contain(&filter, *first, *second)
+                .copied()
+                .map(|key| {
+                    let (first, second) = block_claim_filter_hashes(&key);
+                    (key, first, second)
                 })
-                .map(|(key, _, _)| *key)
                 .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let mut segment_found = BTreeMap::new();
-            self.lookup_many_at(
-                &mut file,
-                segment.page_ref,
-                0,
-                &selected,
-                &mut segment_found,
+            let global_filter = self.read_claim_global_filter(
+                file,
+                root.global_filter
+                    .ok_or(StoreError::MalformedBlockClaimIndex)?,
             )?;
-            found.extend(segment_found);
-            remaining.retain(|(key, _, _)| !found.contains_key(key));
+            remaining.retain(|(_, first, second)| {
+                block_claim_global_filter_might_contain(&global_filter, *first, *second)
+            });
             if remaining.is_empty() {
-                break;
+                return Ok(BTreeMap::new());
             }
-        }
-        Ok(found)
+            let mut found = BTreeMap::new();
+            for segment in segments {
+                let filter = self.read_claim_filter(file, segment.filter_ref)?;
+                if filter.entry_count != segment.entry_count {
+                    return Err(StoreError::MalformedBlockClaimIndex);
+                }
+                let selected: Vec<_> = remaining
+                    .iter()
+                    .filter(|(_, first, second)| {
+                        block_claim_filter_might_contain(&filter, *first, *second)
+                    })
+                    .map(|(key, _, _)| *key)
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+                let mut segment_found = BTreeMap::new();
+                self.lookup_many_at(file, segment.page_ref, 0, &selected, &mut segment_found)?;
+                found.extend(segment_found);
+                remaining.retain(|(key, _, _)| !found.contains_key(key));
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+            Ok(found)
+        })
     }
 
     pub(crate) fn insert_many(
@@ -6918,66 +7193,64 @@ impl BlockClaimIndexStore {
         {
             return Err(StoreError::MalformedBlockClaimIndex);
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        let generation = root
-            .next_generation
-            .checked_add(1)
-            .ok_or(StoreError::MalformedBlockClaimIndex)?;
-        let mut global_filter = match root.global_filter {
-            Some(page_ref) => self.read_claim_global_filter(&mut file, page_ref)?,
-            None => new_block_claim_global_filter(),
-        };
-        update_block_claim_global_filter(&mut global_filter, records)?;
-        let mut next = root;
-        next.next_generation = generation;
-        let mut merged = records.to_vec();
-        let mut installed = false;
-        for level in &mut next.levels {
-            if let Some(empty) = level.iter().position(Option::is_none) {
-                let entry_count = u64::try_from(merged.len())
-                    .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-                let filter_ref = self.append_claim_filter(&mut file, &merged)?;
-                let page_ref = self.build_claim_subtree(&mut file, 0, merged)?;
-                level[empty] = Some(BlockClaimSegmentRef {
-                    generation,
-                    entry_count,
-                    page_ref,
-                    filter_ref,
-                });
-                installed = true;
-                break;
-            }
-            let mut existing: Vec<_> = level.iter_mut().filter_map(Option::take).collect();
-            existing.sort_unstable_by_key(|segment| segment.generation);
-            let capacity = existing.iter().try_fold(merged.len(), |capacity, segment| {
-                usize::try_from(segment.entry_count)
-                    .ok()
-                    .and_then(|entries| capacity.checked_add(entries))
-            });
-            let mut combined =
-                AHashMap::with_capacity(capacity.ok_or(StoreError::MalformedBlockClaimIndex)?);
-            for segment in existing {
-                let mut older = Vec::with_capacity(
-                    usize::try_from(segment.entry_count)
-                        .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-                );
-                self.materialize_claim_segment(&mut file, segment.page_ref, 0, &mut older)?;
-                if older.len() as u64 != segment.entry_count {
-                    return Err(StoreError::MalformedBlockClaimIndex);
+        self.with_file(|file| {
+            let generation = root
+                .next_generation
+                .checked_add(1)
+                .ok_or(StoreError::MalformedBlockClaimIndex)?;
+            let mut global_filter = match root.global_filter {
+                Some(page_ref) => self.read_claim_global_filter(file, page_ref)?,
+                None => new_block_claim_global_filter(),
+            };
+            update_block_claim_global_filter(&mut global_filter, records)?;
+            let mut next = root;
+            next.next_generation = generation;
+            let mut merged = records.to_vec();
+            let mut installed = false;
+            for level in &mut next.levels {
+                if let Some(empty) = level.iter().position(Option::is_none) {
+                    let entry_count = u64::try_from(merged.len())
+                        .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
+                    let filter_ref = self.append_claim_filter(file, &merged)?;
+                    let page_ref = self.build_claim_subtree(file, 0, merged)?;
+                    level[empty] = Some(BlockClaimSegmentRef {
+                        generation,
+                        entry_count,
+                        page_ref,
+                        filter_ref,
+                    });
+                    installed = true;
+                    break;
                 }
-                combined.extend(older);
+                let mut existing: Vec<_> = level.iter_mut().filter_map(Option::take).collect();
+                existing.sort_unstable_by_key(|segment| segment.generation);
+                let capacity = existing.iter().try_fold(merged.len(), |capacity, segment| {
+                    usize::try_from(segment.entry_count)
+                        .ok()
+                        .and_then(|entries| capacity.checked_add(entries))
+                });
+                let mut combined =
+                    AHashMap::with_capacity(capacity.ok_or(StoreError::MalformedBlockClaimIndex)?);
+                for segment in existing {
+                    let mut older = Vec::with_capacity(
+                        usize::try_from(segment.entry_count)
+                            .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
+                    );
+                    self.materialize_claim_segment(file, segment.page_ref, 0, &mut older)?;
+                    if older.len() as u64 != segment.entry_count {
+                        return Err(StoreError::MalformedBlockClaimIndex);
+                    }
+                    combined.extend(older);
+                }
+                combined.extend(merged);
+                merged = combined.into_iter().collect();
             }
-            combined.extend(merged);
-            merged = combined.into_iter().collect();
-        }
-        if !installed {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        next.global_filter = Some(self.append_claim_global_filter(&mut file, &global_filter)?);
-        Ok(next)
+            if !installed {
+                return Err(StoreError::MalformedBlockClaimIndex);
+            }
+            next.global_filter = Some(self.append_claim_global_filter(file, &global_filter)?);
+            Ok(next)
+        })
     }
 
     fn lookup_many_at(
@@ -7807,62 +8080,50 @@ impl BootstrapPublicationBatch<'_> {
         )?;
         self.blob_root = Some(root);
         self.blob_pages.insert(page.page_ordinal(), ());
-        for entry in page.entries() {
-            self.expected_chunks.insert(entry.content_digest(), ());
-        }
         Ok(())
     }
 
-    pub(crate) fn publish_source_chunk(
+    pub(crate) fn publish_part_pack(
         &mut self,
-        digest: SourceBlobChunkDigestV1,
-        bytes: &[u8],
+        descriptor: BootstrapPartDescriptorV1,
+        source: &mut (impl Read + Seek),
+        exact_length: u64,
     ) -> Result<(), StoreError> {
-        if bytes.is_empty()
-            || bytes.len() > MAX_SOURCE_BLOB_CHUNK_BYTES as usize
-            || ContentDigest::of(bytes).as_bytes() != digest.as_bytes()
-        {
+        if exact_length > MAX_BOOTSTRAP_PART_PACK_BYTES {
             return Err(StoreError::BootstrapArtifactMismatch(
-                "source chunk digest or length",
+                "bootstrap part object pack length",
             ));
         }
         let dir = self
             .store
-            .bootstrap_namespace(BOOTSTRAP_SOURCE_CHUNKS_DIR, true)?;
-        let identity = hex_bytes(digest.as_bytes());
-        self.stage(
-            &dir,
-            &identity,
-            bytes,
-            Collision::Bootstrap("source chunk", identity.clone()),
-        )?;
-        self.chunks.insert(digest, ());
+            .bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, true)?;
+        let part_name = hex_bytes(descriptor.part_id().as_bytes());
+        let final_name = part_name.clone();
+        source.seek(SeekFrom::Start(0))?;
+        let staged = tine_storage::StagedExactImmutablePublication::construct(&dir, |target| {
+            let copied = std::io::copy(source, target)?;
+            if copied != exact_length {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "bootstrap part object pack changed while being published",
+                ));
+            }
+            Ok((final_name, copied))
+        })
+        .map_err(|error| {
+            publication_error(
+                error,
+                Collision::Bootstrap("bootstrap part object pack", part_name.clone()),
+            )
+        })?;
+        staged.commit().map_err(|error| {
+            publication_error(
+                error,
+                Collision::Bootstrap("bootstrap part object pack", part_name.clone()),
+            )
+        })?;
+        self.part_packs.insert(descriptor.part_id(), ());
         Ok(())
-    }
-
-    pub(crate) fn publish_object_bytes(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<ContentDigest, StoreError> {
-        let object = OperationObject::decode(bytes)?;
-        if object.workspace_id() != self.store.workspace_id {
-            return Err(StoreError::WorkspaceMismatch {
-                expected: self.store.workspace_id,
-                found: object.workspace_id(),
-            });
-        }
-        let digest = ContentDigest::of(bytes);
-        let dir = self
-            .store
-            .bootstrap_namespace(BOOTSTRAP_OBJECTS_DIR, true)?;
-        self.stage(
-            &dir,
-            &object_filename(digest),
-            bytes,
-            Collision::Bootstrap("bootstrap operation object", digest.to_string()),
-        )?;
-        self.objects.insert(digest, ());
-        Ok(digest)
     }
 
     pub(crate) fn publish_part_artifacts(
@@ -7894,9 +8155,6 @@ impl BootstrapPublicationBatch<'_> {
             )?],
         )?;
         spans.validate_part(descriptor.evidence())?;
-        for object in manifest.required_objects() {
-            self.expected_objects.insert(object.content_digest(), ());
-        }
 
         let parts = self.store.bootstrap_namespace(BOOTSTRAP_PARTS_DIR, true)?;
         let part_name = hex_bytes(descriptor.part_id().as_bytes());
@@ -7955,11 +8213,7 @@ impl BootstrapPublicationBatch<'_> {
             || self.inventory_pages != inventory_ordinals
             || self.blob_root != expected_blob_root
             || self.blob_pages != blob_ordinals
-            || self.expected_chunks != self.chunks
-            || self
-                .expected_objects
-                .keys()
-                .any(|digest| !self.objects.contains_key(digest))
+            || self.part_packs != parts
             || self.parts != parts
         {
             return Err(StoreError::BootstrapArtifactMismatch(
@@ -8021,6 +8275,9 @@ pub(crate) fn filesystem_error_without_collision(
 ) -> StoreError {
     match error {
         tine_storage::FilesystemError::Io(error) => StoreError::Io(error),
+        tine_storage::FilesystemError::DurableNameOperationUnavailable(message) => {
+            StoreError::Io(std::io::Error::new(ErrorKind::Unsupported, message))
+        }
         tine_storage::FilesystemError::UnsafeEntry(message) => StoreError::UnsafeEntry(message),
         tine_storage::FilesystemError::StoredLengthMismatch {
             path,
@@ -11015,6 +11272,9 @@ mod bootstrap_store_tests {
                     store.publish_bootstrap_object_bytes(object).unwrap();
                 }
                 store
+                    .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
+                    .unwrap();
+                store
                     .publish_bootstrap_part_artifacts(
                         part.descriptor,
                         &part.manifest_bytes,
@@ -11188,13 +11448,21 @@ mod bootstrap_store_tests {
                 .publish_source_blob_page(fixture.blob_root, page)
                 .unwrap();
         }
-        for (digest, bytes) in &fixture.source_chunks {
-            publication.publish_source_chunk(*digest, bytes).unwrap();
-        }
         for part in &fixture.parts {
+            let mut pack = Vec::new();
             for object in &part.object_bytes {
-                publication.publish_object_bytes(object).unwrap();
+                let length = u32::try_from(object.len()).unwrap();
+                pack.extend_from_slice(&length.to_be_bytes());
+                pack.extend_from_slice(object);
             }
+            let pack_length = pack.len() as u64;
+            publication
+                .publish_part_pack(
+                    part.descriptor,
+                    &mut std::io::Cursor::new(pack),
+                    pack_length,
+                )
+                .unwrap();
             publication
                 .publish_part_artifacts(part.descriptor, &part.manifest_bytes, &part.spans)
                 .unwrap();
@@ -11269,52 +11537,27 @@ mod bootstrap_store_tests {
             assert_absent();
         }
         for part in &fixture.parts {
-            for object in &part.object_bytes {
-                store.publish_bootstrap_object_bytes(object).unwrap();
-                store.publish_bootstrap_object_bytes(object).unwrap();
-                assert_absent();
-            }
-
-            let part_name = hex_bytes(part.descriptor.part_id().as_bytes());
-            let parts = store
-                .bootstrap_namespace(BOOTSTRAP_PARTS_DIR, true)
+            store
+                .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
                 .unwrap();
-            publish_bootstrap_immutable(
-                &parts,
-                &part_name,
-                &part.manifest_bytes,
-                "bootstrap part manifest",
-                part_name.clone(),
-            )
-            .unwrap();
+            store
+                .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
+                .unwrap();
             assert_absent();
-
-            let evidence = part.descriptor.evidence();
-            let evidence_name = hex_bytes(evidence.evidence_digest().as_bytes());
-            let evidence_dir = store
-                .bootstrap_namespace(BOOTSTRAP_EVIDENCE_DIR, true)
+            store
+                .publish_bootstrap_part_artifacts(
+                    part.descriptor,
+                    &part.manifest_bytes,
+                    &part.spans,
+                )
                 .unwrap();
-            publish_bootstrap_immutable(
-                &evidence_dir,
-                &evidence_name,
-                &evidence.encode().unwrap(),
-                "bootstrap part evidence",
-                evidence_name.clone(),
-            )
-            .unwrap();
-            assert_absent();
-
-            let spans = store
-                .bootstrap_namespace(BOOTSTRAP_PART_SPANS_DIR, true)
+            store
+                .publish_bootstrap_part_artifacts(
+                    part.descriptor,
+                    &part.manifest_bytes,
+                    &part.spans,
+                )
                 .unwrap();
-            publish_bootstrap_immutable(
-                &spans,
-                &part_name,
-                &part.spans.encode().unwrap(),
-                "bootstrap part span index",
-                part_name.clone(),
-            )
-            .unwrap();
             assert_absent();
         }
 
@@ -11495,23 +11738,24 @@ mod bootstrap_store_tests {
             .commit_bootstrap_aggregate(&missing_chunk.aggregate)
             .is_err());
 
-        let missing_object = BootstrapFixture::new("missing-object", 1);
-        let store = missing_object.store();
-        missing_object.publish_replay_prefix(&store);
+        let missing_pack = BootstrapFixture::new("missing-pack", 1);
+        let store = missing_pack.store();
+        missing_pack.publish_replay_prefix(&store);
         store
-            .publish_bootstrap_aggregate_prefix(&missing_object.aggregate)
+            .publish_bootstrap_aggregate_prefix(&missing_pack.aggregate)
             .unwrap();
-        let object_digest = ContentDigest::of(&missing_object.parts[0].object_bytes[0]);
         std::fs::remove_file(
-            missing_object
+            missing_pack
                 .archive
                 .join(BOOTSTRAP_DIR)
-                .join(BOOTSTRAP_OBJECTS_DIR)
-                .join(object_filename(object_digest)),
+                .join(BOOTSTRAP_PART_PACKS_DIR)
+                .join(hex_bytes(
+                    missing_pack.parts[0].descriptor.part_id().as_bytes(),
+                )),
         )
         .unwrap();
         assert!(store
-            .commit_bootstrap_aggregate(&missing_object.aggregate)
+            .commit_bootstrap_aggregate(&missing_pack.aggregate)
             .is_err());
 
         let truncated = BootstrapFixture::new("truncated-span", 1);

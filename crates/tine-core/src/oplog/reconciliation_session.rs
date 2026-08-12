@@ -14,7 +14,10 @@ use super::{
     operational_coordinator::{
         FailedClosedOperationalCoordinator, OperationalCoordinator, OperationalCoordinatorState,
     },
-    reconciliation_baseline::{BaselineBlockedReason, BaselineTimestamp, ReconciliationBaseline},
+    reconciliation_baseline::{
+        BaselineBlockedReason, BaselineTimestamp, PendingAbsenceEvidence,
+        PendingAbsenceObservation, PendingAbsenceState, ReconciliationBaseline,
+    },
     reconciliation_baseline_adapter::{
         append_stable_scan_to_baseline, finish_stable_scan_baseline, BaselineAdapterStatus,
         BaselineBlockedRegistration, BaselineTerminalOutcome, PendingStableScanBaseline,
@@ -24,11 +27,13 @@ use super::{
         ReconciliationImportOutcome,
     },
     reconciliation_scan::{
-        scan_graph_text, GraphTextScanFailureClass, GraphTextScanLimits,
-        JoinedAuthenticatedExpectedPathSource, ReconciliationCompletionOutcome,
-        ReconciliationFullScanReason, ReconciliationJob, ReconciliationLease,
+        scan_graph_text, AuthenticatedExpectedPathSource, ExpectedPathPointRequest,
+        GraphTextCandidateKind, GraphTextScanFailureClass, GraphTextScanLimits,
+        GraphTextScanPathClass, JoinedAuthenticatedExpectedPathSource,
+        ReconciliationCompletionOutcome, ReconciliationFullScanReason,
+        ReconciliationFullScanReasons, ReconciliationJob, ReconciliationLease,
         ReconciliationScheduler, ReconciliationSchedulerLimits, ReconciliationSchedulerStatus,
-        ReconciliationTrigger, ReconciliationWork,
+        ReconciliationTrigger, ReconciliationWork, StableGraphTextScan,
     },
     shadow_projection::BootstrapProjectionAuthority,
     BatchId, ContentDigest, ManagedPath, ProjectionReceiptStore, ShardedHotEngine, SqliteFrontier,
@@ -336,6 +341,23 @@ impl<C, B> ReconciliationSession<C, B> {
     {
         match outcome {
             ReconciliationSessionDispatchOutcome::FailedClosed(continuation) => {
+                // A bounded slice asking to be resumed is not a failure. Charging
+                // it against the transient-failure budget is what wedges a
+                // multi-slice import permanently: three resumes and the work is
+                // abandoned as "a stable blocked state", however much remains.
+                // Resumption is bounded instead by the slice budget itself, which
+                // guarantees each pass charges work and therefore terminates.
+                if dispatch.requires_resume(&continuation) {
+                    let next = self.retain_continuation(
+                        token.lease,
+                        continuation,
+                        baseline,
+                        changed_paths,
+                        retry_attempts,
+                        None,
+                    );
+                    return Ok(ReconciliationSessionStep::Pending(next));
+                }
                 let retry_attempts = retry_attempts
                     .checked_add(1)
                     .expect("published reconciliation retry count exhausted");
@@ -547,7 +569,7 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
             #[cfg(test)]
-            before_second_scan_pass: None,
+            after_scan_capture: None,
             #[cfg(test)]
             arrival_before_dispatch: None,
         };
@@ -555,14 +577,14 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
     }
 
     #[cfg(test)]
-    pub(crate) fn step_with_before_second_scan_pass<'a>(
+    pub(crate) fn step_with_after_scan_capture<'a>(
         &mut self,
         dependencies: ReconciliationSessionDependencies<'a>,
-        before_second_scan_pass: impl FnMut() + 'a,
+        after_scan_capture: impl FnMut() + 'a,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
-            before_second_scan_pass: Some(Box::new(before_second_scan_pass)),
+            after_scan_capture: Some(Box::new(after_scan_capture)),
             arrival_before_dispatch: None,
         };
         self.step_with(&mut dispatch)
@@ -577,7 +599,7 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
             #[cfg(test)]
-            before_second_scan_pass: None,
+            after_scan_capture: None,
             #[cfg(test)]
             arrival_before_dispatch: None,
         };
@@ -665,6 +687,15 @@ trait ReconciliationSessionDispatch {
         retry_attempts: u8,
     ) -> BaselineBlockedObservation;
 
+    /// True when this continuation is a bounded slice asking to be resumed
+    /// rather than a transient failure. Resumption must not be charged against
+    /// the failure-retry budget: retrying cannot advance a slice, so a
+    /// legitimate multi-slice import would exhaust three attempts and wedge.
+    /// Defaults to false so existing dispatches keep their behaviour.
+    fn requires_resume(&self, _continuation: &Self::Continuation) -> bool {
+        false
+    }
+
     fn finish_baseline(
         &mut self,
         pending: Self::PendingBaseline,
@@ -675,16 +706,240 @@ trait ReconciliationSessionDispatch {
 struct LiveReconciliationSessionDispatch<'a> {
     dependencies: ReconciliationSessionDependencies<'a>,
     #[cfg(test)]
-    before_second_scan_pass: Option<Box<dyn FnMut() + 'a>>,
+    after_scan_capture: Option<Box<dyn FnMut() + 'a>>,
     #[cfg(test)]
     arrival_before_dispatch: Option<ReconciliationTrigger>,
 }
 
+enum FullScanAbsenceDisposition {
+    Proceed(Vec<PendingAbsenceObservation>),
+    Deferred,
+    Blocked(String),
+}
+
+fn scan_absence_observations(
+    scan: &StableGraphTextScan,
+) -> Result<Vec<PendingAbsenceObservation>, String> {
+    scan.candidates
+        .iter()
+        .filter(|candidate| candidate.change == GraphTextCandidateKind::Absence)
+        .map(|candidate| {
+            let expected_owner = candidate.expected_owner_binding.ok_or_else(|| {
+                format!(
+                    "absence candidate lacks expected owner binding: {}",
+                    candidate.path
+                )
+            })?;
+            let expected_description = candidate.expected_description.ok_or_else(|| {
+                format!(
+                    "absence candidate lacks expected content description: {}",
+                    candidate.path
+                )
+            })?;
+            Ok(PendingAbsenceObservation {
+                path: candidate.path.clone(),
+                expected_owner,
+                expected_description,
+            })
+        })
+        .collect()
+}
+
+fn full_scan_can_confirm_prior_absence(reasons: &ReconciliationFullScanReasons) -> bool {
+    reasons.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReconciliationFullScanReason::Explicit
+                | ReconciliationFullScanReason::Periodic
+                | ReconciliationFullScanReason::WatcherUncertain
+                | ReconciliationFullScanReason::WatcherPathOverflow
+                | ReconciliationFullScanReason::ProjectionPreconditionPathOverflow
+                | ReconciliationFullScanReason::Uncertain
+        )
+    })
+}
+
+fn catastrophic_shrink(scan: &StableGraphTextScan, absences: usize) -> bool {
+    if scan.expected_path_count < 32 || absences == 0 {
+        return false;
+    }
+    let observed_eligible = scan
+        .baseline_pass
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.class,
+                GraphTextScanPathClass::EligibleManaged(_)
+                    | GraphTextScanPathClass::EligibleUnmanaged
+            )
+        })
+        .count();
+    observed_eligible == 0
+        || (absences >= 32 && absences.saturating_mul(2) >= scan.expected_path_count)
+}
+
+fn catastrophic_shrink_digest(scan: &StableGraphTextScan, absences: usize) -> ContentDigest {
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"tine/reconciliation/catastrophic-shrink/v1\0");
+    bytes.extend_from_slice(scan.binding.expected_source_commitment.as_bytes());
+    bytes.extend_from_slice(scan.binding.expected_rows_commitment.as_bytes());
+    bytes.extend_from_slice(scan.binding.scan_epoch_digest.as_bytes());
+    bytes.extend_from_slice(&(scan.expected_path_count as u64).to_be_bytes());
+    bytes.extend_from_slice(&(absences as u64).to_be_bytes());
+    ContentDigest::of(&bytes)
+}
+
 impl LiveReconciliationSessionDispatch<'_> {
+    fn stage_targeted_absences(&mut self, paths: &BTreeSet<ManagedPath>) -> Result<bool, String> {
+        let ReconciliationSessionDependencies {
+            graph,
+            engine,
+            database,
+            bootstrap,
+            baseline,
+            observed_at,
+            ..
+        } = &mut self.dependencies;
+        let projection = engine
+            .projection_work_index()
+            .map_err(|error| error.to_string())?;
+        let source = bootstrap.map_or_else(
+            || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
+            |bootstrap| {
+                JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+                    engine, projection, bootstrap, database,
+                )
+            },
+        );
+        let mut absent = Vec::new();
+        let point_limits = GraphTextScanLimits::default();
+        for path in paths {
+            if graph
+                .read_raw_managed_text(path)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                continue;
+            }
+            let expected = source
+                .expected_path_at(
+                    path,
+                    ExpectedPathPointRequest {
+                        maximum_path_bytes: point_limits.exact_path_bytes,
+                        maximum_retained_rows: point_limits.retained_rows,
+                        maximum_retained_bytes: point_limits.retained_bytes,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            if let Some(expected) = expected {
+                absent.push(PendingAbsenceObservation {
+                    path: expected.path,
+                    expected_owner: expected.owner_binding,
+                    expected_description: expected.description,
+                });
+            }
+        }
+        if absent.is_empty() {
+            return Ok(false);
+        }
+        baseline
+            .stage_pending_absences(
+                &absent,
+                PendingAbsenceEvidence::TargetedPoint,
+                false,
+                *observed_at,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    fn evaluate_full_scan_absences(
+        baseline: &mut ReconciliationBaseline,
+        observed_at: BaselineTimestamp,
+        scan: &StableGraphTextScan,
+        reasons: &ReconciliationFullScanReasons,
+    ) -> FullScanAbsenceDisposition {
+        let absences = match scan_absence_observations(scan) {
+            Ok(absences) => absences,
+            Err(detail) => return FullScanAbsenceDisposition::Blocked(detail),
+        };
+        if catastrophic_shrink(scan, absences.len()) {
+            let digest = catastrophic_shrink_digest(scan, absences.len());
+            let detail = format!(
+                "catastrophic graph shrink quarantined: {} of {} expected paths are absent",
+                absences.len(),
+                scan.expected_path_count
+            );
+            let prior = match baseline.blocked_signature(digest) {
+                Ok(prior) => prior,
+                Err(error) => {
+                    return FullScanAbsenceDisposition::Blocked(error.to_string());
+                }
+            };
+            let explicit = reasons
+                .reasons
+                .contains(&ReconciliationFullScanReason::Explicit);
+            if prior.is_some() && explicit {
+                // Catastrophic shrink intentionally retains one aggregate
+                // quarantine signature rather than graph-sized pending rows.
+                // The scan candidates still enter the sole affected-path
+                // importer; there are no per-path pending rows to bind or
+                // settle for this confirmed aggregate observation.
+                return FullScanAbsenceDisposition::Proceed(Vec::new());
+            }
+            if let Err(error) = baseline.record_blocked(
+                digest,
+                BaselineBlockedReason::UnstableEpoch,
+                &detail,
+                observed_at,
+            ) {
+                return FullScanAbsenceDisposition::Blocked(error.to_string());
+            }
+            return FullScanAbsenceDisposition::Deferred;
+        }
+
+        let states = match baseline.stage_pending_absences(
+            &absences,
+            PendingAbsenceEvidence::FullScan,
+            true,
+            observed_at,
+        ) {
+            Ok(states) => states,
+            Err(error) => return FullScanAbsenceDisposition::Blocked(error.to_string()),
+        };
+        if absences.is_empty() {
+            return FullScanAbsenceDisposition::Proceed(absences);
+        }
+        let independent_full_scan = full_scan_can_confirm_prior_absence(reasons);
+        let confirmed = states.iter().all(|state: &PendingAbsenceState| {
+            state.existed
+                && (state.had_targeted_point_evidence
+                    || (state.had_full_scan_evidence && independent_full_scan))
+        });
+        if confirmed {
+            FullScanAbsenceDisposition::Proceed(absences)
+        } else {
+            FullScanAbsenceDisposition::Deferred
+        }
+    }
+
     fn execute_targeted(
         &mut self,
         paths: &BTreeSet<ManagedPath>,
     ) -> ReconciliationSessionDispatchOutcome<FailedClosedOperationalCoordinator> {
+        match self.stage_targeted_absences(paths) {
+            Ok(true) => return ReconciliationSessionDispatchOutcome::RetryFull,
+            Ok(false) => {}
+            Err(detail) => {
+                return ReconciliationSessionDispatchOutcome::Blocked(
+                    BaselineBlockedObservation::new(
+                        BaselineBlockedReason::AuthorityUnavailable,
+                        detail,
+                    ),
+                );
+            }
+        }
         let requested_paths = paths.iter().map(ManagedPath::as_str).collect::<Vec<_>>();
         let ReconciliationSessionDependencies {
             admission,
@@ -737,6 +992,7 @@ impl LiveReconciliationSessionDispatch<'_> {
 
     fn execute_full_scan(
         &mut self,
+        reasons: &ReconciliationFullScanReasons,
     ) -> ReconciliationSessionDispatchResult<
         FailedClosedOperationalCoordinator,
         PendingStableScanBaseline,
@@ -809,7 +1065,7 @@ impl LiveReconciliationSessionDispatch<'_> {
                 },
             );
             #[cfg(test)]
-            let result = if let Some(hook) = self.before_second_scan_pass.as_mut() {
+            let result = if let Some(hook) = self.after_scan_capture.as_mut() {
                 super::reconciliation_scan::scan_graph_text_with_hook(
                     graph,
                     &source,
@@ -828,8 +1084,8 @@ impl LiveReconciliationSessionDispatch<'_> {
                 Ok(scan) => scan,
                 Err(error) => {
                     let outcome = match error.class {
-                        // The two-pass scanner established that its observed
-                        // epoch moved. One coalesced fresh scan is meaningful.
+                        // The retained graph or expected binding moved around
+                        // the census. One coalesced fresh scan is meaningful.
                         GraphTextScanFailureClass::UnstableEpoch => {
                             ReconciliationSessionDispatchOutcome::RetryFull
                         }
@@ -850,6 +1106,27 @@ impl LiveReconciliationSessionDispatch<'_> {
                     };
                 }
             };
+            let confirmed_absences =
+                match Self::evaluate_full_scan_absences(baseline, *observed_at, &scan, reasons) {
+                    FullScanAbsenceDisposition::Proceed(absences) => absences,
+                    FullScanAbsenceDisposition::Deferred => {
+                        return ReconciliationSessionDispatchResult {
+                            outcome: ReconciliationSessionDispatchOutcome::Noop,
+                            baseline: None,
+                        };
+                    }
+                    FullScanAbsenceDisposition::Blocked(detail) => {
+                        return ReconciliationSessionDispatchResult {
+                            outcome: ReconciliationSessionDispatchOutcome::Blocked(
+                                BaselineBlockedObservation::new(
+                                    BaselineBlockedReason::AuthorityUnavailable,
+                                    detail,
+                                ),
+                            ),
+                            baseline: None,
+                        };
+                    }
+                };
             let pending =
                 match append_stable_scan_to_baseline(baseline, &scan, &source, *observed_at) {
                     Ok(pending) => pending,
@@ -865,6 +1142,19 @@ impl LiveReconciliationSessionDispatch<'_> {
                         };
                     }
                 };
+            if let Err(error) =
+                baseline.bind_confirmed_absences_to_epoch(pending.epoch(), &confirmed_absences)
+            {
+                return ReconciliationSessionDispatchResult {
+                    outcome: ReconciliationSessionDispatchOutcome::Blocked(
+                        BaselineBlockedObservation::new(
+                            BaselineBlockedReason::AuthorityUnavailable,
+                            error.to_string(),
+                        ),
+                    ),
+                    baseline: None,
+                };
+            }
             (scan, pending)
         };
         let ReconciliationSessionDependencies {
@@ -919,7 +1209,21 @@ fn import_blocked_observation(blocked: ReconciliationImportBlocked) -> BaselineB
                     BaselineBlockedReason::ReconciliationFailed
                 }
             };
-            BaselineBlockedObservation::new(reason, blocked.detail)
+            let mut detail = blocked.detail;
+            if let Some(first) = blocked.evidence.first() {
+                detail.push_str(&format!(
+                    ": first evidence={:?} at {}",
+                    first.kind, first.path
+                ));
+                if blocked.evidence.len() > 1 || blocked.omitted_evidence != 0 {
+                    detail.push_str(&format!(
+                        " ({} additional retained, {} omitted)",
+                        blocked.evidence.len().saturating_sub(1),
+                        blocked.omitted_evidence
+                    ));
+                }
+            }
+            BaselineBlockedObservation::new(reason, detail)
         }
         ReconciliationImportBlocked::Coordinator(plan) => BaselineBlockedObservation::new(
             BaselineBlockedReason::ReconciliationFailed,
@@ -939,6 +1243,10 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
     type Continuation = FailedClosedOperationalCoordinator;
     type PendingBaseline = PendingStableScanBaseline;
 
+    fn requires_resume(&self, continuation: &Self::Continuation) -> bool {
+        continuation.failure().is_continuation_required()
+    }
+
     fn dispatch(
         &mut self,
         work: &ReconciliationWork,
@@ -951,7 +1259,7 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
         let outcome = match work {
             ReconciliationWork::ProjectionPreconditionMismatch { paths }
             | ReconciliationWork::WatcherPaths { paths } => self.execute_targeted(paths),
-            ReconciliationWork::FullScan(_) => return self.execute_full_scan(),
+            ReconciliationWork::FullScan(reasons) => return self.execute_full_scan(reasons),
         };
         ReconciliationSessionDispatchResult {
             outcome,
@@ -1105,11 +1413,17 @@ mod tests {
         baseline: ReconciliationBaseline,
         next_timestamp: u64,
         path: String,
+        paths: Vec<String>,
         admission: LocalRuntimeAdmission<'static>,
     }
 
     impl LiveFixture {
         fn new(label: &str, complete_projection: bool) -> Self {
+            Self::new_with_page_count(label, complete_projection, 1)
+        }
+
+        fn new_with_page_count(label: &str, complete_projection: bool, page_count: usize) -> Self {
+            assert!(page_count > 0);
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             fs::create_dir_all(&graph_root).unwrap();
@@ -1129,15 +1443,37 @@ mod tests {
             .unwrap();
             let lineage = LineageDigest::of(label.as_bytes());
             let catalog = DocumentId::from_uuid(Uuid::from_u128(104));
-            let page_id = PageId::from_uuid(Uuid::from_u128(105));
-            let path = "pages/live.md".to_owned();
-            let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                page_id,
-                home_document_id: DocumentId::from_uuid(Uuid::from_u128(106)),
-                name: LogicalPageName::parse("Live Session").unwrap(),
-                path: ManagedPath::parse(&path).unwrap(),
-                kind: ManagedTextKind::Page,
-            }])
+            let pages = (0..page_count)
+                .map(|index| {
+                    let path = if index == 0 {
+                        "pages/live.md".to_owned()
+                    } else {
+                        format!("pages/nested/live-{index:03}.md")
+                    };
+                    let page_id = PageId::from_uuid(Uuid::from_u128(105 + index as u128));
+                    let operation = SemanticOperation::CreatePage {
+                        page_id,
+                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                            1_000 + index as u128,
+                        )),
+                        name: LogicalPageName::parse(if index == 0 {
+                            "Live Session".to_owned()
+                        } else {
+                            format!("Live Session {index}")
+                        })
+                        .unwrap(),
+                        path: ManagedPath::parse(&path).unwrap(),
+                        kind: ManagedTextKind::Page,
+                    };
+                    (path, page_id, operation)
+                })
+                .collect::<Vec<_>>();
+            let transaction = OperationTransaction::new(
+                pages
+                    .iter()
+                    .map(|(_, _, operation)| operation.clone())
+                    .collect(),
+            )
             .unwrap();
             let author = ShardedHotEngine::new(workspace_id, lineage, catalog);
             let bootstrap = author
@@ -1167,7 +1503,9 @@ mod tests {
                 .stage_archive_batch(bootstrap.manifest().batch_id())
                 .unwrap();
             if complete_projection {
-                write_projection_exact(&graph, &receipts, &engine, page_id, None).unwrap();
+                for (_, page_id, _) in &pages {
+                    write_projection_exact(&graph, &receipts, &engine, *page_id, None).unwrap();
+                }
             }
             let archive = ObjectStore::open(&archive_root, workspace_id).unwrap();
             let runtime =
@@ -1195,6 +1533,11 @@ mod tests {
             .database;
             let source = RebuildSource::new(&engine, &archive).unwrap();
             let tail = TailOverlay::from_durable(&database, &source).unwrap();
+            let paths = pages
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect::<Vec<_>>();
+            let path = paths[0].clone();
             Self {
                 _root: root,
                 graph_root,
@@ -1205,8 +1548,9 @@ mod tests {
                 tail,
                 baseline,
                 next_timestamp: 0,
-                admission: LocalRuntimeAdmission::unenrolled_pre_activation(),
                 path,
+                paths,
+                admission: LocalRuntimeAdmission::unenrolled_pre_activation(),
             }
         }
 
@@ -1230,6 +1574,23 @@ mod tests {
         ReconciliationSession::new(ReconciliationSchedulerLimits::default())
     }
 
+    fn drive_live_session(
+        session: &mut ReconciliationSession,
+        fixture: &mut LiveFixture,
+    ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
+        let mut step = session.step(fixture.dependencies())?;
+        for _ in 0..512 {
+            step = match step {
+                ReconciliationSessionStep::Pending(continuation) => {
+                    session.resume(continuation, fixture.dependencies())?
+                }
+                ReconciliationSessionStep::RetryFull => session.step(fixture.dependencies())?,
+                terminal => return Ok(terminal),
+            };
+        }
+        panic!("live reconciliation did not reach a bounded terminal step");
+    }
+
     fn assert_blocked_and_idle(session: &mut ReconciliationSession, fixture: &mut LiveFixture) {
         assert_eq!(
             session.status().last_completion,
@@ -1242,6 +1603,182 @@ mod tests {
             session.step(fixture.dependencies()),
             Ok(ReconciliationSessionStep::Idle)
         );
+    }
+
+    fn expected_path_exists(fixture: &mut LiveFixture) -> bool {
+        let path = fixture.path.clone();
+        expected_path_exists_at(fixture, &path)
+    }
+
+    fn expected_path_exists_at(fixture: &mut LiveFixture, path: &str) -> bool {
+        let projection = fixture.engine.projection_work_index().unwrap();
+        let source = JoinedAuthenticatedExpectedPathSource::new(&fixture.engine, projection);
+        let limits = GraphTextScanLimits::default();
+        source
+            .expected_path_at(
+                &ManagedPath::parse(path).unwrap(),
+                ExpectedPathPointRequest {
+                    maximum_path_bytes: limits.exact_path_bytes,
+                    maximum_retained_rows: limits.retained_rows,
+                    maximum_retained_bytes: limits.retained_bytes,
+                },
+            )
+            .unwrap()
+            .is_some()
+    }
+
+    fn expected_path_count(fixture: &mut LiveFixture) -> usize {
+        let paths = fixture.paths.clone();
+        paths
+            .iter()
+            .filter(|path| expected_path_exists_at(fixture, path))
+            .count()
+    }
+
+    #[test]
+    fn scan_only_absence_survives_restart_until_independent_confirmation() {
+        let mut fixture = LiveFixture::new("absence-restart", true);
+        fs::remove_file(fixture.graph_root.join(&fixture.path)).unwrap();
+
+        let mut first_process = live_session();
+        first_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            first_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert!(expected_path_exists(&mut fixture));
+
+        let mut reopened_process = live_session();
+        reopened_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            reopened_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert!(
+            expected_path_exists(&mut fixture),
+            "restart/startup is not deletion confirmation"
+        );
+
+        reopened_process.trigger(ReconciliationTrigger::Explicit);
+        let confirmed = drive_live_session(&mut reopened_process, &mut fixture);
+        let blocked_detail = reopened_process.take_terminal_blocked_detail();
+        assert_eq!(
+            confirmed,
+            Ok(ReconciliationSessionStep::Complete),
+            "explicit confirmation failed: {:?}; detail={blocked_detail:?}",
+            reopened_process.status(),
+        );
+        assert!(!expected_path_exists(&mut fixture));
+    }
+
+    #[test]
+    fn targeted_absence_then_full_capture_converges_without_direct_delete_authority() {
+        let mut fixture = LiveFixture::new("absence-targeted", true);
+        fs::remove_file(fixture.graph_root.join(&fixture.path)).unwrap();
+        let mut session = live_session();
+        session.trigger(ReconciliationTrigger::WatcherPaths(paths(&[&fixture.path])));
+
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::RetryFull)
+        );
+        assert!(expected_path_exists(&mut fixture));
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Complete)
+        );
+        assert!(!expected_path_exists(&mut fixture));
+    }
+
+    #[test]
+    fn reappearance_cancels_pending_absence_before_later_disappearance() {
+        let mut fixture = LiveFixture::new("absence-reappears", true);
+        let path = fixture.graph_root.join(&fixture.path);
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let mut session = live_session();
+        session.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+
+        fs::write(&path, original).unwrap();
+        session.trigger(ReconciliationTrigger::Explicit);
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert!(expected_path_exists(&mut fixture));
+
+        fs::remove_file(&path).unwrap();
+        session.trigger(ReconciliationTrigger::Explicit);
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop),
+            "a later disappearance must start a new confirmation cycle"
+        );
+        assert!(expected_path_exists(&mut fixture));
+    }
+
+    #[test]
+    fn empty_provider_view_survives_restart_until_explicit_confirmation() {
+        const PAGE_COUNT: usize = 40;
+        let mut fixture = LiveFixture::new_with_page_count("empty-provider-view", true, PAGE_COUNT);
+        fs::remove_dir_all(fixture.graph_root.join("pages")).unwrap();
+
+        let mut first_process = live_session();
+        first_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            first_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert_eq!(expected_path_count(&mut fixture), PAGE_COUNT);
+
+        let mut reopened_process = live_session();
+        reopened_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            reopened_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert_eq!(
+            expected_path_count(&mut fixture),
+            PAGE_COUNT,
+            "restart over the same empty provider view must not author tombstones"
+        );
+
+        reopened_process.trigger(ReconciliationTrigger::Explicit);
+        let confirmed = drive_live_session(&mut reopened_process, &mut fixture);
+        let blocked_detail = reopened_process.take_terminal_blocked_detail();
+        assert_eq!(
+            confirmed,
+            Ok(ReconciliationSessionStep::Complete),
+            "explicit confirmation failed: {:?}; detail={blocked_detail:?}",
+            reopened_process.status(),
+        );
+        assert_eq!(expected_path_count(&mut fixture), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_traversal_preserves_expected_graph_without_tombstones() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = LiveFixture::new("refused-traversal", true);
+        symlink(
+            fixture.graph_root.join(&fixture.path),
+            fixture.graph_root.join("pages/provider-placeholder.md"),
+        )
+        .unwrap();
+        let mut session = live_session();
+        session.trigger(ReconciliationTrigger::Explicit);
+
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Blocked)
+        );
+        assert!(expected_path_exists(&mut fixture));
+        assert_blocked_and_idle(&mut session, &mut fixture);
     }
 
     #[test]
@@ -1327,14 +1864,14 @@ mod tests {
     }
 
     #[test]
-    fn live_unstable_scan_race_queues_one_full_retry() {
+    fn live_change_after_capture_converges_on_next_explicit_scan() {
         let mut fixture = LiveFixture::new("unstable-scan-race", true);
         let mutation = fixture.graph_root.join(&fixture.path);
         let mut session = live_session();
         session.trigger(ReconciliationTrigger::Explicit);
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies: fixture.dependencies(),
-            before_second_scan_pass: Some(Box::new(move || {
+            after_scan_capture: Some(Box::new(move || {
                 fs::write(&mutation, b"- changed during scan\n").unwrap();
             })),
             arrival_before_dispatch: None,
@@ -1342,16 +1879,17 @@ mod tests {
 
         assert_eq!(
             session.step_with(&mut dispatch),
-            Ok(ReconciliationSessionStep::RetryFull)
+            Ok(ReconciliationSessionStep::Noop)
         );
         drop(dispatch);
         assert_eq!(
             session.status().last_completion,
-            Some(ReconciliationCompletionOutcome::Retry)
+            Some(ReconciliationCompletionOutcome::Noop)
         );
         assert!(!session.status().active);
-        assert!(session.status().pending);
+        assert!(!session.status().pending);
 
+        session.trigger(ReconciliationTrigger::Explicit);
         let retry = session.step(fixture.dependencies());
         assert!(matches!(
             retry,
@@ -1360,11 +1898,7 @@ mod tests {
                 | Ok(ReconciliationSessionStep::Blocked)
         ));
         if retry == Ok(ReconciliationSessionStep::Complete) {
-            assert!(session.status().pending);
-            assert!(matches!(
-                session.step(fixture.dependencies()),
-                Ok(ReconciliationSessionStep::Noop) | Ok(ReconciliationSessionStep::Blocked)
-            ));
+            assert!(!session.status().pending);
         }
         assert!(!session.status().pending);
         assert_eq!(
@@ -1374,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn live_candidate_completion_runs_post_drain_noop_before_clean_promotion() {
+    fn live_candidate_completion_settles_without_redundant_post_drain_scan() {
         let mut fixture = LiveFixture::new("candidate-post-drain", true);
         fs::write(
             fixture.graph_root.join(&fixture.path),
@@ -1388,20 +1922,22 @@ mod tests {
             session.step(fixture.dependencies()),
             Ok(ReconciliationSessionStep::Complete)
         );
-        assert!(session.status().active);
-        assert!(session.status().pending);
-        assert_eq!(session.status().last_completion, None);
+        assert!(!session.status().active);
+        assert!(!session.status().pending);
+        assert_eq!(
+            session.status().last_completion,
+            Some(ReconciliationCompletionOutcome::Complete)
+        );
         assert!(fixture.baseline.head().is_err());
         assert_eq!(
             session.step(fixture.dependencies()),
-            Ok(ReconciliationSessionStep::Noop)
+            Ok(ReconciliationSessionStep::Idle)
         );
-        assert!(!session.status().pending);
-        assert_eq!(fixture.baseline.head().unwrap().baseline_generation, 1);
+        assert!(fixture.baseline.head().is_err());
     }
 
     #[test]
-    fn live_failure_keeps_queued_precondition_ahead_of_full_retry() {
+    fn live_after_capture_change_keeps_queued_precondition_ahead_of_fresh_scan() {
         let mut fixture = LiveFixture::new("queued-precondition", true);
         let mutation = fixture.graph_root.join(&fixture.path);
         let precondition = paths(&[&fixture.path]);
@@ -1409,7 +1945,7 @@ mod tests {
         session.trigger(ReconciliationTrigger::Explicit);
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies: fixture.dependencies(),
-            before_second_scan_pass: Some(Box::new(move || {
+            after_scan_capture: Some(Box::new(move || {
                 fs::write(&mutation, b"- changed during scan\n").unwrap();
             })),
             arrival_before_dispatch: Some(ReconciliationTrigger::ProjectionPreconditionMismatch(
@@ -1419,10 +1955,11 @@ mod tests {
 
         assert_eq!(
             session.step_with(&mut dispatch),
-            Ok(ReconciliationSessionStep::RetryFull)
+            Ok(ReconciliationSessionStep::Noop)
         );
         drop(dispatch);
         assert!(session.status().pending);
+        session.trigger(ReconciliationTrigger::Explicit);
 
         let precondition_job = session
             .scheduler
@@ -1444,7 +1981,7 @@ mod tests {
         let retry_job = session
             .scheduler
             .next()
-            .expect("unstable scan retry must remain after the urgent precondition");
+            .expect("fresh full scan must remain after the urgent precondition");
         assert!(matches!(retry_job.work(), ReconciliationWork::FullScan(_)));
         session
             .scheduler

@@ -21,7 +21,7 @@ use std::fmt;
 use std::io;
 
 use super::{
-    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BatchInspection, BlockId, EngineError,
+    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, EngineError,
     LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
     PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
@@ -50,11 +50,111 @@ thread_local! {
     // Counts only test builds, so the exact-source reuse proof adds no
     // production instrumentation or hot-path work.
     static PAGE_DOCUMENT_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only structural accounting for the affine editor projection.  The
+    /// counters intentionally distinguish finalizer post-state work from
+    /// predecessor replay: the latter remains a separate safety proof.
+    static PREPARED_EDITOR_PROJECTION_INSTRUMENTATION: std::cell::Cell<PreparedEditorProjectionInstrumentation> =
+        const { std::cell::Cell::new(PreparedEditorProjectionInstrumentation::ZERO) };
 }
 
 #[cfg(test)]
 fn page_document_build_count_for_test() -> usize {
     PAGE_DOCUMENT_BUILD_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PreparedEditorProjectionInstrumentation {
+    pub(crate) created: usize,
+    pub(crate) reused: usize,
+    pub(crate) fallback: usize,
+    pub(crate) finalizer_post_state_render: usize,
+    pub(crate) finalizer_predecessor_replay_render: usize,
+    pub(crate) capture_sealed_pending_local_predecessor_success: usize,
+    pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
+    /// The two renders are separate evidence obligations.  Keep their timing
+    /// separate so the managed-save receipt never presents the pair as one
+    /// opaque "projection" cost.
+    pub(crate) accepted_render: std::time::Duration,
+    pub(crate) target_render: std::time::Duration,
+    pub(crate) accepted_blocks_visited: usize,
+    pub(crate) target_blocks_visited: usize,
+}
+
+#[cfg(test)]
+impl PreparedEditorProjectionInstrumentation {
+    const ZERO: Self = Self {
+        created: 0,
+        reused: 0,
+        fallback: 0,
+        finalizer_post_state_render: 0,
+        finalizer_predecessor_replay_render: 0,
+        capture_sealed_pending_local_predecessor_success: 0,
+        finalizer_sealed_pending_local_predecessor_use: 0,
+        accepted_render: std::time::Duration::ZERO,
+        target_render: std::time::Duration::ZERO,
+        accepted_blocks_visited: 0,
+        target_blocks_visited: 0,
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prepared_editor_projection_instrumentation() {
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION
+        .with(|instrumentation| instrumentation.set(PreparedEditorProjectionInstrumentation::ZERO));
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_editor_projection_instrumentation() -> PreparedEditorProjectionInstrumentation
+{
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_prepared_editor_projection(
+    update: impl FnOnce(&mut PreparedEditorProjectionInstrumentation),
+) {
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION.with(|instrumentation| {
+        let mut current = instrumentation.get();
+        update(&mut current);
+        instrumentation.set(current);
+    });
+}
+
+pub(crate) fn note_finalizer_post_state_render() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_post_state_render = instrumentation
+            .finalizer_post_state_render
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_finalizer_predecessor_replay_render() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_predecessor_replay_render = instrumentation
+            .finalizer_predecessor_replay_render
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_capture_sealed_pending_local_predecessor_success() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.capture_sealed_pending_local_predecessor_success = instrumentation
+            .capture_sealed_pending_local_predecessor_success
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_sealed_pending_local_predecessor_use = instrumentation
+            .finalizer_sealed_pending_local_predecessor_use
+            .saturating_add(1);
+    });
 }
 
 /// Operation-scoped capability for the deterministic manifested-projection
@@ -182,6 +282,194 @@ struct RenderedProjection {
     annotations: Vec<AnnotatedIdentity>,
     base_layout_identities: Vec<StructuralLayoutIdentity>,
     generated_anchors: Vec<PolicyGeneratedAnchor>,
+}
+
+/// The affine pre-state half of an editor request.  The page is transferred
+/// from the already authenticated editor load; it is never reconstructed from
+/// a cache or persisted.  `hot_engine` may consume it exactly once while
+/// proving a narrow current pending-local predecessor.  The accepted render
+/// remains process-local evidence only.
+pub(crate) struct PreparedEditorProjectionBeforeCandidate {
+    accepted_page: Option<MaterializedPage>,
+    accepted_rendered: RenderedProjection,
+}
+
+impl PreparedEditorProjectionBeforeCandidate {
+    fn bind_accepted_page(&mut self, accepted_page: MaterializedPage) {
+        debug_assert!(self.accepted_page.is_none());
+        self.accepted_page = Some(accepted_page);
+    }
+
+    pub(crate) fn into_page_and_accepted_render(
+        self,
+    ) -> Option<(MaterializedPage, Vec<u8>, Vec<AnnotatedIdentity>)> {
+        self.accepted_page.map(|accepted_page| {
+            (
+                accepted_page,
+                self.accepted_rendered.target,
+                self.accepted_rendered.annotations,
+            )
+        })
+    }
+}
+
+/// One editor-requested post-state rendering, retained only while the same
+/// trusted-local mutation crosses draft, capture, and finalization.  It is
+/// affine: neither the artifact nor its candidate layout identities are
+/// authority.  Capture must bind both to the exact current base before this
+/// value can mint a fresh final projection plan.
+pub(crate) struct PreparedEditorProjection {
+    requested_page: MaterializedPage,
+    exact_base: Vec<u8>,
+    candidate_base_layout: Vec<StructuralLayoutIdentity>,
+    before_candidate: Option<PreparedEditorProjectionBeforeCandidate>,
+    rendered: RenderedProjection,
+}
+
+impl PreparedEditorProjection {
+    /// Render an editor-requested page with candidate layout identities from
+    /// the already accepted pre-state and exact base.  The accepted rendering
+    /// is only process-local preparation: finalization authenticates the
+    /// captured annotations before it can reuse the target.
+    pub(crate) fn prepare(
+        requested_page: MaterializedPage,
+        accepted_page: &MaterializedPage,
+        exact_base: Vec<u8>,
+    ) -> Result<Self, ProjectionError> {
+        #[cfg(test)]
+        let accepted_started = std::time::Instant::now();
+        let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
+        #[cfg(test)]
+        let accepted_elapsed = accepted_started.elapsed();
+        let candidate_base_layout = structural_layout_identities(&accepted.annotations);
+        #[cfg(test)]
+        let target_started = std::time::Instant::now();
+        let rendered = render_projection_page_with_layout_identities(
+            &requested_page,
+            Some(&exact_base),
+            &candidate_base_layout,
+        )?;
+        #[cfg(test)]
+        let target_elapsed = target_started.elapsed();
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.accepted_render = instrumentation
+                .accepted_render
+                .saturating_add(accepted_elapsed);
+            instrumentation.target_render =
+                instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.accepted_blocks_visited = instrumentation
+                .accepted_blocks_visited
+                .saturating_add(accepted_page.blocks.len());
+            instrumentation.target_blocks_visited = instrumentation
+                .target_blocks_visited
+                .saturating_add(requested_page.blocks.len());
+        });
+        Ok(Self {
+            requested_page,
+            exact_base,
+            candidate_base_layout,
+            before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
+                // The caller binds the owned accepted page below.  Keeping the
+                // render here first lets the UI boundary use the same borrowed
+                // page for all ordinary request construction.
+                accepted_page: None,
+                accepted_rendered: accepted,
+            }),
+            rendered,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &[u8] {
+        &self.rendered.target
+    }
+
+    pub(crate) fn accepted_target(&self) -> &[u8] {
+        &self
+            .before_candidate
+            .as_ref()
+            .expect("accepted editor projection remains available before draft")
+            .accepted_rendered
+            .target
+    }
+
+    /// Replace the provisional accepted page with the exact editor-owned
+    /// value.  The ordinary editor route calls this after it has finished
+    /// reading that page, avoiding a second 511-block clone solely for the
+    /// affine before-projection candidate.
+    pub(crate) fn bind_accepted_page(mut self, accepted_page: MaterializedPage) -> Self {
+        self.before_candidate
+            .as_mut()
+            .expect("new editor projection has an accepted render")
+            .bind_accepted_page(accepted_page);
+        self
+    }
+
+    pub(crate) fn before_candidate_matches_exact_base(&self) -> bool {
+        self.before_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.accepted_rendered.target == self.exact_base)
+    }
+
+    pub(crate) fn take_before_candidate(
+        &mut self,
+    ) -> Option<PreparedEditorProjectionBeforeCandidate> {
+        self.before_candidate.take()
+    }
+
+    /// Consume the artifact only after final capture proves that its accepted
+    /// base/layout candidates are still the exact current projection input.
+    /// The returned plan is freshly minted from the captured base plus the
+    /// final state frontier and claim evidence; no pre-capture plan authority
+    /// is retained.
+    pub(crate) fn into_fresh_plan(
+        self,
+        workspace_id: WorkspaceId,
+        after: &ProjectionPageState,
+        captured_base: &[u8],
+        captured_annotations: &[AnnotatedIdentity],
+    ) -> Result<Option<ProjectionPlan>, ProjectionError> {
+        let reusable =
+            materialized_page_projection_identity_equal(&self.requested_page, &after.page)
+                && self.exact_base == captured_base
+                && self.candidate_base_layout == structural_layout_identities(captured_annotations);
+        if !reusable {
+            #[cfg(test)]
+            note_prepared_editor_projection(|instrumentation| {
+                instrumentation.fallback = instrumentation.fallback.saturating_add(1);
+            });
+            return Ok(None);
+        }
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.reused = instrumentation.reused.saturating_add(1);
+        });
+        projection_plan_from_rendered(workspace_id, after, Some(captured_base), self.rendered)
+            .map(Some)
+    }
+
+    /// Record a deliberate terminal fallback when capture/reconciliation or a
+    /// multi-requirement route makes the affine artifact ineligible.
+    pub(crate) fn record_fallback(self) {
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.fallback = instrumentation.fallback.saturating_add(1);
+        });
+    }
+}
+
+fn materialized_page_projection_identity_equal(
+    left: &MaterializedPage,
+    right: &MaterializedPage,
+) -> bool {
+    left.page_id == right.page_id
+        && left.home_document_id == right.home_document_id
+        && left.name == right.name
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.blocks == right.blocks
 }
 
 /// Identity-bound formatting authority carried from the pure planner (or an
@@ -805,6 +1093,48 @@ fn render_projection_page(
     )
 }
 
+/// Render against already-selected structural layout identities.  This is used
+/// only by the affine editor artifact; those identities are candidates until
+/// capture compares them with authenticated base annotations.
+fn render_projection_page_with_layout_identities(
+    page: &MaterializedPage,
+    expected_base: Option<&[u8]>,
+    base_layout_identities: &[StructuralLayoutIdentity],
+) -> Result<RenderedProjection, ProjectionError> {
+    let format = format_for_page(page)?;
+    let base_text = expected_base
+        .map(|bytes| {
+            std::str::from_utf8(bytes).map_err(|_| ProjectionError::InvalidUtf8("projection base"))
+        })
+        .transpose()?;
+    let mut metadata = ProjectionMetadata::with_capacity(page.blocks.len());
+    let document = build_page_document(
+        page,
+        format,
+        ProjectionRenderMode::Sparse,
+        Some(&mut metadata),
+    )?;
+    let target =
+        serialize_document(format, &document, base_text, base_layout_identities).into_bytes();
+    let annotations = annotate_serialized_blocks(
+        format,
+        &document,
+        base_text,
+        base_layout_identities,
+        &target,
+        &metadata.pending_annotations,
+    )?;
+    metadata
+        .generated_anchors
+        .sort_unstable_by_key(PolicyGeneratedAnchor::block_id);
+    Ok(RenderedProjection {
+        target,
+        annotations,
+        base_layout_identities: base_layout_identities.to_vec(),
+        generated_anchors: metadata.generated_anchors,
+    })
+}
+
 /// Render a document and its projection metadata that were built together.
 /// Exact-source planning uses this to retain the accepted document it already
 /// validated; ordinary callers continue through `render_projection_page`.
@@ -1305,6 +1635,7 @@ fn block_manifested_projection_work(
     receipts: &ProjectionReceiptStore,
     work_index: &ProjectionWorkIndex,
     work: &ProjectionWork,
+    intent_id: super::ProjectionIntentId,
 ) -> Result<(), ProjectionError> {
     let observed = graph
         .read_projection_input(work.path())
@@ -1312,10 +1643,11 @@ fn block_manifested_projection_work(
         .as_deref()
         .map(super::BlobDescription::of);
     work_index
-        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
+        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict_for_intent(
             work,
             receipts.store_id(),
             observed,
+            intent_id,
         ))
         .map_err(|error| ProjectionError::Work(error.to_string()))
 }
@@ -1361,29 +1693,36 @@ fn execute_manifested_projection_work_with_runtime(
     ) {
         return Err(ProjectionError::WorkNotReady);
     }
-    let batch = match archive
-        .inspect_batch(work.batch_id())
-        .map_err(|error| ProjectionError::Archive(error.to_string()))?
-    {
-        BatchInspection::Ready(batch) => batch,
-        BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(ProjectionError::Archive(
-                "projection work batch is not a complete immutable object set".into(),
-            ));
-        }
-    };
-    let intent_object = batch
-        .objects()
-        .iter()
-        .find(|object| {
-            object.kind() == ObjectKind::ProjectionIntent
-                && object.document_id() == work.intent().document_id()
-                && object.descriptor().is_ok_and(|descriptor| {
-                    descriptor.content_digest() == work.intent().content_digest()
-                        && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
-                })
+    // Read the one object this work names, not the batch that contains it.
+    //
+    // The previous shape asked the archive to `inspect_batch(work.batch_id())`
+    // and then linearly scanned the result for an object whose digest it was
+    // already holding. `inspect_batch` reads, SHA-256s and decodes *every*
+    // object the manifest requires, so a single document's projection cost
+    // O(whole batch) and a whole import cost O(n^2): measured at 3.59 GB of
+    // read+SHA-256 to import 300 files of a ~1.3 MB corpus, scaling as n^1.79.
+    //
+    // Nothing is trusted here that was not already established. The object is
+    // content-addressed, so the digest in the authenticated work row pins its
+    // identity exactly as the scan did. Batch *completeness* is proved once at
+    // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the archive
+    // only on `BatchInspection::Ready`, and a projection work row reaches
+    // `Ready` only inside `accept_batch_at_history` -- so re-deriving it per
+    // document was re-derivation, not protection. A missing object still fails
+    // closed, now as an archive read error rather than an incompleteness error.
+    let intent_object = archive
+        .read_object(work.intent().content_digest())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if intent_object.kind() != ObjectKind::ProjectionIntent
+        || intent_object.document_id() != work.intent().document_id()
+        || !intent_object.descriptor().is_ok_and(|descriptor| {
+            descriptor.content_digest() == work.intent().content_digest()
+                && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
         })
-        .ok_or(ProjectionError::WorkIntentMismatch)?;
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let intent_object = &intent_object;
     let manifested = ManifestedProjectionIntent::decode(intent_object.payload())
         .map_err(|error| ProjectionError::Archive(error.to_string()))?;
     if manifested.source_endpoint_id() != work.endpoint_id()
@@ -1404,18 +1743,20 @@ fn execute_manifested_projection_work_with_runtime(
     let expected_base = match manifested.precondition() {
         ManifestProjectionPrecondition::Absent => None,
         ManifestProjectionPrecondition::Present { base } => {
-            let base_object = batch
-                .objects()
-                .iter()
-                .find(|object| {
-                    object.kind() == ObjectKind::AnnotatedBaseBlob
-                        && object.document_id() == base.document_id()
-                        && object.descriptor().is_ok_and(|descriptor| {
-                            descriptor.content_digest() == base.content_digest()
-                                && descriptor.encoded_byte_length() == base.encoded_byte_length()
-                        })
+            // Same one-object read as the intent above, same argument.
+            let base_object = archive
+                .read_object(base.content_digest())
+                .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+            if base_object.kind() != ObjectKind::AnnotatedBaseBlob
+                || base_object.document_id() != base.document_id()
+                || !base_object.descriptor().is_ok_and(|descriptor| {
+                    descriptor.content_digest() == base.content_digest()
+                        && descriptor.encoded_byte_length() == base.encoded_byte_length()
                 })
-                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            {
+                return Err(ProjectionError::WorkIntentMismatch);
+            }
+            let base_object = &base_object;
             Some(
                 AnnotatedProjectionBase::decode(base_object.payload())
                     .map_err(|error| ProjectionError::Archive(error.to_string()))?,
@@ -1446,10 +1787,21 @@ fn execute_manifested_projection_work_with_runtime(
         description,
         annotations,
     )?;
+    // Projecting one document costs ~95ms uniformly (F46), which is far too slow
+    // for ~1.2KB of bytes and points at durable-write barriers rather than work.
+    // This is the first of several durable receipt steps per document; time it to
+    // test that hypothesis instead of assuming it.
+    let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
     receipts.publish_intent(
         &local_attempt_intent,
         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
     )?;
+    if let Some(started) = intent_started {
+        eprintln!(
+            "PHASE TIME Projection.publish_intent {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
         let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
@@ -1516,8 +1868,14 @@ fn execute_manifested_projection_work_with_runtime(
             None
         }
         Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
-            block_manifested_projection_work(graph, receipts, work_index, work)?;
-            return Err(error.into());
+            block_manifested_projection_work(
+                graph,
+                receipts,
+                work_index,
+                work,
+                local_attempt_intent.id()?,
+            )?;
+            return Err(ProjectionError::GuardedConflict(error));
         }
         Some((Err(error), _)) => return Err(error.into()),
         None => None,
@@ -1525,6 +1883,12 @@ fn execute_manifested_projection_work_with_runtime(
     let (proof, authority) = match recovered {
         Some(recovered) => recovered,
         None => {
+            // publish_intent was 0.6ms of the 95ms (F47), so the cost is further
+            // down. Split reservation+begin_mutation from the write that follows:
+            // if one carries ~90ms and the other is sub-millisecond, the lever is
+            // a single barrier; if the cost is spread, per-document work is
+            // inherently multi-step and decision item 13 needs reframing.
+            let mutation_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let mut authority = if has_attempts {
                 let reservation = receipts.reserve_fallback_attempt(&local_attempt_intent)?;
                 receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
@@ -1532,6 +1896,12 @@ fn execute_manifested_projection_work_with_runtime(
                 let reservation = receipts.reserve_attempt(&local_attempt_intent)?;
                 receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
             };
+            if let Some(started) = mutation_started {
+                eprintln!(
+                    "PHASE TIME Projection.begin_mutation {:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             fail_during_manifested_projection_for_harness()?;
             let current = graph
                 .read_projection_input(work.path())
@@ -1616,8 +1986,14 @@ fn execute_manifested_projection_work_with_runtime(
                         io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
                     ) || crate::model::is_projection_semantic_refusal(&error) =>
                 {
-                    block_manifested_projection_work(graph, receipts, work_index, work)?;
-                    return Err(error.into());
+                    block_manifested_projection_work(
+                        graph,
+                        receipts,
+                        work_index,
+                        work,
+                        local_attempt_intent.id()?,
+                    )?;
+                    return Err(ProjectionError::GuardedConflict(error));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -2646,6 +3022,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 #[derive(Debug)]
 pub enum ProjectionError {
     Io(io::Error),
+    /// The singular guarded writer found that the live projection no longer
+    /// matches the immutable work item after publication. The work is durably
+    /// blocked for external reconciliation, so coordinator retry cannot make
+    /// this same projection job progress.
+    GuardedConflict(io::Error),
     Engine(EngineError),
     Receipt(ReceiptError),
     Store(Box<ProjectionStoreError>),
@@ -2689,6 +3070,7 @@ impl fmt::Display for ProjectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => error.fmt(f),
+            Self::GuardedConflict(error) => error.fmt(f),
             Self::Engine(error) => error.fmt(f),
             Self::Receipt(error) => error.fmt(f),
             Self::Store(error) => error.fmt(f),
@@ -2760,6 +3142,7 @@ impl std::error::Error for ProjectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::GuardedConflict(error) => Some(error),
             Self::Engine(error) => Some(error),
             Self::Receipt(error) => Some(error),
             Self::Store(error) => Some(error),
@@ -3036,6 +3419,257 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    fn assert_prepared_editor_projection_matches_ordinary_fallback(
+        label: &str,
+        accepted: ProjectionPageState,
+        after: ProjectionPageState,
+        base: &[u8],
+    ) {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_071));
+        let authenticated_base = plan_projection(workspace, &accepted, Some(base))
+            .unwrap_or_else(|error| panic!("{label}: authenticated base planning failed: {error}"));
+        let ordinary = plan_projection_with_layout_annotations(
+            workspace,
+            &after,
+            Some(base),
+            Some(authenticated_base.intent().annotations()),
+        )
+        .unwrap_or_else(|error| panic!("{label}: ordinary fallback planning failed: {error}"));
+        let prepared =
+            PreparedEditorProjection::prepare(after.page.clone(), &accepted.page, base.to_vec())
+                .unwrap_or_else(|error| panic!("{label}: editor preparation failed: {error}"));
+        let reused = prepared
+            .into_fresh_plan(
+                workspace,
+                &after,
+                base,
+                authenticated_base.intent().annotations(),
+            )
+            .unwrap_or_else(|error| panic!("{label}: reuse validation failed: {error}"))
+            .unwrap_or_else(|| panic!("{label}: exact authenticated inputs did not reuse"));
+
+        // The ordinary plan is the complete planner selected after an
+        // authenticated mismatch.  Compare every authority-bearing component,
+        // not only the target bytes, so rendering reuse cannot retain a stale
+        // precondition, frontier, or claim set.
+        assert_eq!(reused.target(), ordinary.target(), "{label}: target");
+        assert_eq!(
+            reused.intent().annotations(),
+            ordinary.intent().annotations(),
+            "{label}: annotations"
+        );
+        assert_eq!(
+            reused.intent().precondition(),
+            ordinary.intent().precondition(),
+            "{label}: precondition"
+        );
+        assert_eq!(
+            reused.intent().frontier(),
+            ordinary.intent().frontier(),
+            "{label}: frontier"
+        );
+        assert_eq!(
+            reused.intent().claim_evidence(),
+            ordinary.intent().claim_evidence(),
+            "{label}: claim evidence"
+        );
+        assert_eq!(reused.intent(), ordinary.intent(), "{label}: full intent");
+
+        // An exact-base mismatch must decline reuse and leave the same ordinary
+        // post-state plan as the sole finalizer authority.
+        let mut mismatched_base = base.to_vec();
+        mismatched_base.push(b'!');
+        let forced_fallback =
+            PreparedEditorProjection::prepare(after.page.clone(), &accepted.page, base.to_vec())
+                .unwrap_or_else(|error| panic!("{label}: fallback preparation failed: {error}"))
+                .into_fresh_plan(
+                    workspace,
+                    &after,
+                    &mismatched_base,
+                    authenticated_base.intent().annotations(),
+                )
+                .unwrap_or_else(|error| panic!("{label}: fallback validation failed: {error}"));
+        assert!(
+            forced_fallback.is_none(),
+            "{label}: mismatched capture base must select the ordinary planner"
+        );
+    }
+
+    #[test]
+    fn prepared_editor_projection_matches_the_complete_planner_for_markdown_and_org() {
+        let markdown_uuid = LogseqUuid::from_uuid(Uuid::from_u128(80_081));
+        let mut markdown = structural_layout_state(
+            "pages/prepared-layout.md",
+            vec![
+                (80_081, None, "a", "before".into(), Some(markdown_uuid)),
+                (80_083, Some(80_081), "a", "child".into(), None),
+                (80_084, None, "b", "tail".into(), None),
+            ],
+        );
+        markdown.page.preamble = Some("title:: Structural Layout".into());
+        markdown.page.blocks[0].content = format!("before\nid:: {markdown_uuid}");
+        let markdown_base = format!(
+            concat!(
+                "title:: Structural Layout\r\n",
+                "\r\n",
+                "- before\r\n",
+                "  id:: {}\r\n",
+                "  - child\r\n",
+                "\r\n",
+                "- tail\r\n"
+            ),
+            markdown_uuid
+        );
+        let mut markdown_after = markdown.clone();
+        markdown_after.page.blocks[2].content = "tail after reuse".into();
+        assert_prepared_editor_projection_matches_ordinary_fallback(
+            "CRLF Markdown layout",
+            markdown,
+            markdown_after,
+            markdown_base.as_bytes(),
+        );
+
+        let org_uuid = LogseqUuid::from_uuid(Uuid::from_u128(80_091));
+        let mut org = structural_layout_state(
+            "journals/prepared-layout.org",
+            vec![
+                (80_091, None, "a", "before".into(), Some(org_uuid)),
+                (80_093, Some(80_091), "a", "child".into(), None),
+                (80_094, None, "b", "tail".into(), None),
+            ],
+        );
+        org.page.preamble = Some("#+TITLE: Structural Layout".into());
+        org.page.blocks[0].content = format!("before\n:PROPERTIES:\n:ID: {org_uuid}\n:END:");
+        let org_base = format!(
+            concat!(
+                "#+TITLE: Structural Layout\n",
+                "\n",
+                "* before\n",
+                ":PROPERTIES:\n",
+                ":ID: {}\n",
+                ":END:\n",
+                "** child\n",
+                "* tail\n"
+            ),
+            org_uuid
+        );
+        let mut org_after = org.clone();
+        org_after.page.blocks[2].content = "tail after reuse".into();
+        assert_prepared_editor_projection_matches_ordinary_fallback(
+            "editable Org",
+            org,
+            org_after,
+            org_base.as_bytes(),
+        );
+    }
+
+    #[test]
+    fn prepared_editor_projection_reuses_only_authenticated_page_base_and_layout_identity() {
+        reset_prepared_editor_projection_instrumentation();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_101));
+        let accepted = structural_layout_state(
+            "pages/prepared-mismatch.md",
+            vec![
+                (80_102, None, "a", "before".into(), None),
+                (80_103, Some(80_102), "a", "child".into(), None),
+            ],
+        );
+        let base = b"- before\n  - child\n".to_vec();
+        let authenticated_base = plan_projection(workspace, &accepted, Some(&base)).unwrap();
+        let annotations = authenticated_base.intent().annotations().to_vec();
+        assert!(
+            !annotations.is_empty(),
+            "the mismatch matrix needs structural capture annotations"
+        );
+
+        let mut requested = accepted.clone();
+        requested.page.blocks[0].content = "after".into();
+        let attempt = |after: ProjectionPageState,
+                       captured_base: Vec<u8>,
+                       captured_annotations: Vec<AnnotatedIdentity>| {
+            PreparedEditorProjection::prepare(requested.page.clone(), &accepted.page, base.clone())
+                .unwrap()
+                .into_fresh_plan(workspace, &after, &captured_base, &captured_annotations)
+                .unwrap()
+        };
+
+        let mut stats_only = requested.clone();
+        stats_only.page.stats.catalog_documents_loaded = 1;
+        let reused = attempt(stats_only, base.clone(), annotations.clone());
+        assert!(
+            reused.is_some(),
+            "instrumentation-only materialization statistics are not projection identity"
+        );
+
+        let mut base_mismatch = base.clone();
+        base_mismatch.push(b'!');
+        let mut annotations_mismatch = annotations.clone();
+        annotations_mismatch.pop();
+        let mut page_id = requested.clone();
+        page_id.page.page_id = PageId::from_uuid(Uuid::from_u128(80_104));
+        let mut home_document_id = requested.clone();
+        home_document_id.page.home_document_id = DocumentId::from_uuid(Uuid::from_u128(80_105));
+        let mut name = requested.clone();
+        name.page.name = crate::oplog::LogicalPageName::parse("other name").unwrap();
+        let mut path = requested.clone();
+        path.page.path = ManagedPath::parse("pages/other-name.md").unwrap();
+        let mut kind = requested.clone();
+        kind.page.kind = crate::oplog::ManagedTextKind::Journal;
+        let mut preamble = requested.clone();
+        preamble.page.preamble = Some("title:: other preamble".into());
+        let mut blocks = requested.clone();
+        blocks.page.blocks[1].content = "other child".into();
+
+        for (label, after, captured_base, captured_annotations) in [
+            (
+                "exact base bytes",
+                requested.clone(),
+                base_mismatch,
+                annotations.clone(),
+            ),
+            (
+                "structural annotations",
+                requested.clone(),
+                base.clone(),
+                annotations_mismatch,
+            ),
+            ("page id", page_id, base.clone(), annotations.clone()),
+            (
+                "home document id",
+                home_document_id,
+                base.clone(),
+                annotations.clone(),
+            ),
+            ("name", name, base.clone(), annotations.clone()),
+            ("path", path, base.clone(), annotations.clone()),
+            ("kind", kind, base.clone(), annotations.clone()),
+            ("preamble", preamble, base.clone(), annotations.clone()),
+            ("blocks", blocks, base.clone(), annotations.clone()),
+        ] {
+            assert!(
+                attempt(after, captured_base, captured_annotations).is_none(),
+                "{label} mismatch must select the ordinary finalizer planner"
+            );
+        }
+
+        let instrumentation = prepared_editor_projection_instrumentation();
+        assert_eq!(instrumentation.created, 10);
+        assert_eq!(instrumentation.reused, 1);
+        assert_eq!(instrumentation.fallback, 9);
+        assert_eq!(instrumentation.finalizer_post_state_render, 0);
+        assert_eq!(instrumentation.finalizer_predecessor_replay_render, 0);
+        assert_eq!(
+            instrumentation.capture_sealed_pending_local_predecessor_success,
+            0
+        );
+        assert_eq!(
+            instrumentation.finalizer_sealed_pending_local_predecessor_use,
+            0
+        );
+        assert!(instrumentation.accepted_render > std::time::Duration::ZERO);
+        assert!(instrumentation.target_render > std::time::Duration::ZERO);
     }
 
     /// Planning the same state over the same bytes must yield the same intent

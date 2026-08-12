@@ -2,6 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -18,8 +19,25 @@ import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
 import { openConfiguredHomePage } from "./homePage";
+import { safeManagedErrorDetail } from "./managedDiagnostics";
 
 const GRAPH_KEY = "tine.graphPath";
+export const PARTIAL_PROVIDER_REFUSAL =
+  "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
+
+/** Keep a graph-open refusal visible until the user can retry the exact same
+ * target. A picker has already returned its target at this point, so reopening
+ * the picker would be a lossy and surprising substitute for Retry. */
+export function reportGraphOpenFailure(error: unknown, retry: () => void): void {
+  const detail = safeManagedErrorDetail(error);
+  const message = detail === PARTIAL_PROVIDER_REFUSAL
+    ? PARTIAL_PROVIDER_REFUSAL
+    : `Couldn't open the graph. (${detail})`;
+  pushToast(message, "error", {
+    sticky: true,
+    action: { label: "Retry", run: retry },
+  });
+}
 
 export function persistedGraphPath(): string {
   try {
@@ -106,6 +124,11 @@ export async function loadGraphPath(
   }
 
   let result;
+  // Native graph replacement is asynchronous. Stop accepting watcher events
+  // from the retired binding before its completion can publish a new generation;
+  // otherwise an old runtime error can race the successful switch response.
+  const clearedManagedRuntime = hadGraph && (switching || options.forceRefresh === true);
+  if (clearedManagedRuntime) managedStorageRuntime.clear();
   try {
     result = await backend().loadGraph(path);
   } catch (error) {
@@ -113,12 +136,15 @@ export async function loadGraphPath(
     // local generation for the still-bound old graph; the retired viewer stays
     // closed, so no callback can regain its former authority.
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     return { kind: "focused_existing" };
   }
+  managedStorageRuntime.bind(result.binding_generation, result.application_page_admission);
   const meta = result.meta;
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };
@@ -414,41 +440,50 @@ async function injectCustomCss(): Promise<void> {
 /** Pick a folder and open it as the graph. No-op if cancelled. */
 export async function switchGraph(): Promise<LoadGraphPathOutcome> {
   const platform = await platformKind();
-  if (platform === "android") {
+  if (platform === "android" || platform === "ios") {
     let result;
     try {
       result = await backend().pickGraphFolder();
     } catch (e) {
-      pushToast(`Couldn't open the Android folder picker. (${String(e)})`, "error");
+      const platformName = platform === "android" ? "Android" : "iOS";
+      pushToast(`Couldn't open the ${platformName} folder picker. (${String(e)})`, "error");
       return { kind: "aborted" };
     }
     // Diagnostic breadcrumbs (visible in `adb logcat`, chromium console channel):
     // an intermittent first-run stall on "Opening…" — these pin down whether the
     // native picker returned and whether the graph parse completed or hung.
-    console.info(`[tine/android] pickGraphFolder → ${result.status}`);
+    console.info(`[tine/${platform}] pickGraphFolder → ${result.status}`);
     if (result.status === "picked") {
       if (result.path) {
-        console.info("[tine/android] loadGraphPath: start");
-        const outcome = await loadGraphPath(result.path);
-        console.info("[tine/android] loadGraphPath: done");
+        console.info(`[tine/${platform}] loadGraphPath: start`);
+        const outcome = await openPickedGraphPath(result.path);
+        console.info(`[tine/${platform}] loadGraphPath: done`);
         return outcome;
       }
       return { kind: "aborted" };
     }
-    if (result.status === "permission-requested" || result.status === "permission-needed") {
+    if (
+      platform === "android" &&
+      (result.status === "permission-requested" || result.status === "permission-needed")
+    ) {
       pushToast('Grant "All files access" for Tine, then tap Open again.', "info");
+    }
+    if (platform === "ios" && result.status === "refused") {
+      pushToast("Tine can only open folders inside On My iPhone → Tine.", "info");
     }
     return { kind: "aborted" };
   }
-  if (platform === "ios") {
-    pushToast(
-      "Opening an existing graph on iOS is coming soon. For now, tap “Create a new graph” to try Tine.",
-      "info"
-    );
+  const path = await backend().pickFolder();
+  return path ? openPickedGraphPath(path) : { kind: "aborted" };
+}
+
+async function openPickedGraphPath(path: string): Promise<LoadGraphPathOutcome> {
+  try {
+    return await loadGraphPath(path);
+  } catch (error) {
+    reportGraphOpenFailure(error, () => void openPickedGraphPath(path));
     return { kind: "aborted" };
   }
-  const path = await backend().pickFolder();
-  return path ? loadGraphPath(path) : { kind: "aborted" };
 }
 
 /** Onboarding "create a new graph": pick where to put it, scaffold a small

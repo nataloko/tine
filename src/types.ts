@@ -74,10 +74,49 @@ export interface PageDto {
    *  SPECIFIC file (a duplicate-day stray, #21) saves to its own file rather than
    *  being re-resolved by name to the canonical one. Empty for a brand-new page. */
   path?: string;
+  /** Which live editor instance is issuing this save.
+   *
+   *  Stamped from the activation registry when the DTO is built, NOT carried on
+   *  `FeedPage` — a token on the page object is copied by every clone and history
+   *  snapshot, and the copy would then claim an identity it does not have.
+   *  Absent for an editor-less writer; legal on the ordinary save path, refused on
+   *  the override path. (GH #254 increment 3.) */
+  activation?: number;
   /** Bundled in-app Guide page: read-only, ephemeral, and excluded from normal
    *  graph persistence/search/reference surfaces. */
   guide?: boolean;
 }
+
+/** What an activation request means for a path that already has a live editor. */
+export type ActivationIntent = "reuse" | "replace";
+
+/** The exact revision of a DTO being installed, or null only for the mounted
+ * save fallback whose ordinary base-revision guard remains the write authority. */
+export type ActivationExpectedRevision = string | null;
+
+/** The outcome of activating an editor. */
+export interface EditorActivationHandle {
+  activation: number;
+  /** The exact path this activation is live for. For an absent editor this is the
+   *  prospective target resolved at activation time. */
+  target: string;
+  /** True when no file existed at activation time. */
+  prospective: boolean;
+}
+
+/** Result of saving an editor page.
+ *
+ * Direct Files may return the activation that now owns a successful first
+ * creation (including its resolved target). Managed storage keeps its existing
+ * revision-only semantics and therefore omits `activation`. The string arm is
+ * retained for compatibility with older/mock managed backends during the
+ * transport transition. */
+export type SavePageResult =
+  | string
+  | {
+      revision: string;
+      activation?: EditorActivationHandle;
+    };
 
 /** One authoritative Journals-feed transaction.  Cursor fields are ordinal
  * journal days, never counts of returned DTOs (a selected file may vanish). */
@@ -171,29 +210,6 @@ export interface SyncConflict {
   preview: string;
 }
 
-export interface ManagedSyncStatus {
-  workspace_id: string;
-  device_id: string;
-  session_id: string;
-  page_count: number;
-  imported_chunks: number;
-  store_root: string;
-  durability_blocked: boolean;
-}
-
-export interface SyncIdentityPlan {
-  pages: number;
-  blocks: number;
-}
-
-export interface ManagedSyncEnableResult {
-  migration: {
-    pages_changed: number;
-    blocks_changed: number;
-  };
-  status: ManagedSyncStatus;
-}
-
 export interface SparseV2WatcherStatus {
   latest_enqueue: number;
   acknowledged: number;
@@ -209,6 +225,18 @@ export interface SparseV2Tick {
   state: string;
   detail: string | null;
   epoch: number | null;
+}
+
+/** A watcher update scoped to the graph binding that produced it. */
+export interface SparseV2TickEvent {
+  binding_generation: number;
+  tick: SparseV2Tick;
+}
+
+/** A watcher failure scoped to the graph binding that produced it. */
+export interface SparseV2ErrorEvent {
+  binding_generation: number;
+  message: string;
 }
 
 export interface SparseV2RuntimeStatus {
@@ -230,6 +258,19 @@ export type SparseV2Availability =
   | { state: "blocked"; reason_code: string }
   | { state: "refused"; reason_code: string; detail: string | null };
 
+/** Native, binding-scoped advisory envelope for pre-mutation bulk admission.
+ * The managed actor remains the final save authority. */
+export type ApplicationPageAdmission =
+  | { binding_generation: number; authority: "direct" }
+  | {
+      binding_generation: number;
+      authority: "managed_writable";
+      application_save_page_blocks: number;
+      application_page_request_text_bytes: number;
+      application_page_max_depth: number;
+    }
+  | { binding_generation: number; authority: "managed_unavailable" };
+
 export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
   can_activate: boolean;
@@ -237,12 +278,37 @@ export type SparseV2Status = SparseV2Availability & {
   can_cancel: boolean;
   cancel_reason: string | null;
   binding_generation: number;
+  application_page_admission: ApplicationPageAdmission;
 };
+
+/** A status snapshot scoped to the graph binding that produced it. */
+export interface SparseV2RuntimeStatusEvent {
+  binding_generation: number;
+  runtime: SparseV2RuntimeStatus;
+  application_page_admission: ApplicationPageAdmission;
+}
 
 export interface SparseV2CancelResult {
   status: SparseV2Status;
   binding_generation: number;
   recovery_statement: string;
+}
+
+/** Privacy-safe native progress shared by terminal diagnostics and cold-start UI. */
+export type StartupProgressPhase =
+  | "lookup.entry"
+  | "lookup.app_data"
+  | "lookup.settings_stat"
+  | "lookup.settings_read"
+  | "lookup.settings_parse"
+  | "lookup.complete"
+  | `managed_open.${string}`;
+
+export interface StartupProgressEvent {
+  phase: StartupProgressPhase;
+  elapsed_ms: number;
+  terminal: boolean;
+  outcome?: "ok" | "error";
 }
 
 export type SparseV2ActivationPhase =

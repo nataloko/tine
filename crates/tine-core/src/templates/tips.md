@@ -5,9 +5,13 @@ icon:: ⌨️
 - ## Find anything — Ctrl+K
 	- **Ctrl+K** opens the quick switcher: jump to a page, search the text of any block, or run a command — all from one box. **Ctrl+Shift+P** opens the command palette (commands only).
 	- Use **Ctrl+Shift+K** to search only the focused page, including children hidden under folded bullets. In the ordinary Ctrl+K switcher, press **Shift+Enter** on a page or block to send it to the right sidebar without leaving your current page.
-	- Use **Search syntax** for phrases, alternatives, exclusions, and regular expressions. Choose **Open all results** to keep the complete search in a graph-specific tab instead of choosing only one hit.
-	- That result tab can switch between **Search**, **List**, **Table**, and **Board** without changing what matched. Rename it when the search is worth keeping: Tine turns it into an ordinary query page in your graph. The compact filter button handles friendly fields and date ranges; **Query builder** opens the deeper visual editor when needed.
-	- Page-title matching keeps exact, prefix, substring, and fuzzy results in that order. Repeated choices may break ties inside one class using device-local history; disable or reset this under Search settings if you prefer fixed ordering.
+	- Use **Search syntax** for phrases, alternatives, exclusions, and regular expressions. Choose **Open search tab** to keep the complete search in a graph-specific tab instead of choosing only one hit.
+	- That result tab can switch between **Search**, **List**, **Table**, and **Board** without changing what matched. Use **Name this search to save it as a page** and **Save page** when the search is worth keeping: Tine turns it into an ordinary query page in your graph. **Filters / Advanced** handles friendly fields and date ranges; **Edit as visual query** opens the deeper visual editor when needed.
+	- Page-title matching keeps exact, prefix, substring, and fuzzy results in that order. Repeated choices may break ties inside one class using device-local history; Settings → **Editor** → **Learn Ctrl+K choices** disables or resets it.
+	- For a task-first tour of finding things and keeping searches, see [[Workflows/Find and revisit]]; for the exact rules, [[Reference/Pages, links, references, and search]].
+- ## Follow a link without the mouse — Ctrl+O
+	- With the caret inside a `[[link]]` or a `#tag`, **Ctrl+O** opens that page and **Ctrl+Shift+O** opens it in the right sidebar. This works while you are editing, so you can follow a name you just typed without reaching for the mouse.
+	- A link whose page does not exist yet is drawn dimmed with a dotted underline. It still works — opening it creates the page — but you can see before clicking that it will start empty. Tags are left alone, since a tag with no page of its own is perfectly normal.
 - ## Create one yourself
 	- 1. Press **Ctrl+K**.
 	- 2. Type part of a page name, a block phrase, or a command such as `Open Guide`.
@@ -18,6 +22,7 @@ icon:: ⌨️
 - ## Tabs
 	- **Middle-click** any bullet, page, or search result to open it in a background tab. **Double-click** a tab to pin it, **drag** to reorder, **Ctrl+W** to close. Your tabs come back next launch.
 	- When a pane has more tabs than fit, use its tab-overview button to see every full title, activate or pin a tab, close it, or reorder it with the drag handle / **Alt+Up/Down** without guessing from truncated labels.
+	- For arranging tabs with the sidebars and split panes into a working layout — and saving it as a workspace — see [[Workflows/Keep context visible]]; [[Start/Where things are]] maps the places first.
 - ## The sidebars
 	- **t l** toggles the left sidebar — journals, favorites, recents, all pages, and a namespace tree. Favorites and Recent can be folded independently.
 	- **t r** toggles the right sidebar; **Shift-click** any bullet's dot to open it there and keep it beside your work. Each right-sidebar item can be folded independently, and its menu can collapse, expand, or close them all.

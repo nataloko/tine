@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { GraphFolderPickResult } from "./backend";
 import type { GraphMeta, PageDto } from "./types";
 
 const META: GraphMeta = {
@@ -23,11 +24,15 @@ const META: GraphMeta = {
   guide_announced: true,
 };
 
+const DIRECT_ADMISSION = { binding_generation: 1, authority: "direct" as const };
+
 async function loadHarness(
   existing: PageDto | null,
   access = { graph_root: META.root, external_assets_path: null as string | null, approved: true },
   confirm = true,
-  warm = false
+  warm = false,
+  platform: "android" | "ios" | "desktop" = "desktop",
+  pickerResult: GraphFolderPickResult = { status: "cancelled" }
 ) {
   vi.resetModules();
   const events: string[] = [];
@@ -37,7 +42,12 @@ async function loadHarness(
     inspectGraphAccess: vi.fn(async () => access),
     approveExternalAssets: vi.fn(async () => {}),
     confirm: vi.fn(async () => confirm),
-    loadGraph: vi.fn(async () => ({ kind: "loaded" as const, meta: META, binding_generation: 1 })),
+    loadGraph: vi.fn(async () => ({
+      kind: "loaded" as const,
+      meta: META,
+      binding_generation: 1,
+      application_page_admission: DIRECT_ADMISSION,
+    })),
     getPage: vi.fn(async () => existing),
     getAppString: vi.fn(async (_key: string, fallback: string) => fallback),
     setAppString: vi.fn(async (_key: string, _value: string) => {}),
@@ -54,6 +64,7 @@ async function loadHarness(
       return "new-rev";
     }),
     readCustomCss: vi.fn(async () => ""),
+    pickGraphFolder: vi.fn(async () => pickerResult),
     pageAliases: vi.fn(async () => [["page1", "other"], ["shortcut", "other"]] as [string, string][]),
     listPages: vi.fn(async () => [
       { name: "page1", kind: "page" as const, date_key: null, path: "pages/page1.md" },
@@ -70,6 +81,7 @@ async function loadHarness(
   const retirePdfOwnership = vi.fn(() => { events.push("retire-pdf"); });
   const activatePdfOwnership = vi.fn((root: string) => { events.push(`activate-pdf:${root}`); });
   const closePdf = vi.fn(() => { events.push("close-pdf"); });
+  const pushToast = vi.fn();
 
   vi.doMock("./backend", () => ({ backend: () => api }));
   vi.doMock("./ui", () => ({
@@ -90,7 +102,7 @@ async function loadHarness(
     },
     seedFavorites: vi.fn(),
     pruneSidebarBlocks: vi.fn(),
-    pushToast: vi.fn(),
+    pushToast,
     refreshJournalConflicts: vi.fn(async () => {}),
     refreshSyncConflicts: vi.fn(async () => {}),
     clearRecent: vi.fn(),
@@ -124,19 +136,82 @@ async function loadHarness(
   vi.doMock("./warmCache", () => ({ waitForWarmCache: vi.fn(async () => warm) }));
   vi.doMock("./lsShim", () => ({ CUSTOM_CSS_STYLE_ID: "test-css", ensureLsShimStyle: vi.fn() }));
   vi.doMock("./themeGallery", () => ({ ensureThemeStyle: vi.fn() }));
-  vi.doMock("./platform", () => ({ isMobile: () => false, platformKind: vi.fn(async () => "desktop") }));
+  vi.doMock("./platform", () => ({ isMobile: () => platform !== "desktop", platformKind: vi.fn(async () => platform) }));
   vi.doMock("./guide", () => ({ maybeShowGuideAnnouncement: vi.fn() }));
   vi.doMock("./editorController", () => ({ endEdit: vi.fn() }));
 
-  const { ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities } = await import("./graph");
+  const { ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, switchGraph } = await import("./graph");
   return {
-    ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, api, events, setAliasMap,
+    ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, switchGraph,
+    api, events, setAliasMap, pushToast,
     drainPdfWork, retirePdfOwnership, activatePdfOwnership, closePdf,
     applyTemplateVars, prepareTemplateVars,
     setMeta: (next: GraphMeta | null) => { meta = next; },
     bumpEpoch: () => { epoch += 1; },
   };
 }
+
+describe("mobile graph folder picker", () => {
+  it("opens a picked graph from Tine's iOS Documents container", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      true,
+      "ios",
+      { status: "picked", path: META.root }
+    );
+
+    await expect(harness.switchGraph()).resolves.toEqual({ kind: "loaded", root: META.root });
+    expect(harness.api.pickGraphFolder).toHaveBeenCalledOnce();
+    expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
+  });
+
+  it("shows a clear refusal when iOS returns an outside-container folder", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      false,
+      "ios",
+      { status: "refused" }
+    );
+
+    await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
+    expect(harness.api.loadGraph).not.toHaveBeenCalled();
+    expect(harness.pushToast).toHaveBeenCalledWith(
+      "Tine can only open folders inside On My iPhone → Tine.",
+      "info"
+    );
+  });
+
+  it("keeps a partial-provider picked graph failure sticky and retries the same target", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      false,
+      "android",
+      { status: "picked", path: META.root }
+    );
+    harness.api.loadGraph.mockRejectedValue(
+      new Error(
+        "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
+      )
+    );
+
+    await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
+    expect(harness.pushToast).toHaveBeenCalledWith(
+      "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.",
+      "error",
+      expect.objectContaining({ sticky: true, action: expect.objectContaining({ label: "Retry" }) })
+    );
+    const options = harness.pushToast.mock.calls.at(-1)![2]!;
+    options.action.run();
+    await vi.waitFor(() => expect(harness.api.loadGraph).toHaveBeenCalledTimes(2));
+    expect(harness.api.loadGraph).toHaveBeenLastCalledWith(META.root);
+  });
+});
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -371,7 +446,12 @@ describe("PDF graph ownership", () => {
     const nextMeta = { ...META, root: "/tmp/other-graph" };
     harness.api.loadGraph.mockImplementationOnce(async () => {
       harness.events.push("load-next");
-      return { kind: "loaded" as const, meta: nextMeta, binding_generation: 2 };
+      return {
+        kind: "loaded" as const,
+        meta: nextMeta,
+        binding_generation: 2,
+        application_page_admission: { binding_generation: 2, authority: "direct" as const },
+      };
     });
 
     await harness.loadGraphPath(nextMeta.root);
@@ -406,7 +486,12 @@ describe("PDF graph ownership", () => {
     harness.events.length = 0;
     (harness.api.loadGraph as any).mockImplementationOnce(async () => {
       harness.events.push("load-refresh");
-      return { kind: "already_current" as const, meta: META, binding_generation: 1 };
+      return {
+        kind: "already_current" as const,
+        meta: META,
+        binding_generation: 1,
+        application_page_admission: DIRECT_ADMISSION,
+      };
     });
 
     await harness.loadGraphPath(META.root, { forceRefresh: true });

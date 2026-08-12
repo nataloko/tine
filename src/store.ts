@@ -8,7 +8,7 @@
 
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
-import type { BlockDto, Format, PageDto, PageKind, RefGroup } from "./types";
+import type { ActivationIntent, BlockDto, EditorActivationHandle, Format, PageDto, PageKind, RefGroup } from "./types";
 import type { ClipboardBlock, ClipboardPayloadData, ClipboardPayloadSlot, ClipboardSourcePage } from "./clipboard";
 import {
   CLIPBOARD_PAYLOAD_MAX_BLOCKS,
@@ -19,6 +19,8 @@ import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
+import { managedStorageRuntime } from "./managedStorageRuntime";
+import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
   clearConflict,
@@ -54,23 +56,35 @@ import {
   restoreHistoryEditorContext,
   type HistoryEditorContext,
 } from "./editorController";
-import { notifyModeReset, notifyOutlineSelectionStarted } from "./modeHooks";
+import { notifyModeReset, notifyOutlineSelectionStarted, onGraphRebound } from "./modeHooks";
 import { sheetConfigFromRaw } from "./sheet/config";
 import { clearMatrixDimensionCache, invalidateAllMatrixDimensions } from "./sheet/matrix";
 import { applyMarkerTransition } from "./logbook";
 import { cycleMarkerSmart } from "./editor/repeat";
 import {
-  markDirty,
+  recordClipboardDirtyPageForTest,
+  recordClipboardPhaseForTest,
+  recordClipboardUndoSnapshotForTest,
+  recordClipboardWorkForTest,
+} from "./clipboardWorkProbe";
+import {
+  markDirty as markDirtyInner,
   isDirty,
   scheduleSave,
   flushPage,
+  flushPageToQuiescence,
   flushAll,
   forceSave,
+  canForceSave,
   addDirty,
   dirtyPages,
+  savingPages,
   setBaseRev,
-  tombstone,
+  tombstoneIfQuiescent,
   untombstone,
+  isTombstonedFile,
+  tombstoneCovers,
+  graphBinding,
   forgetSaveState,
   resetSaveState,
   isSaving,
@@ -81,7 +95,37 @@ import {
 } from "./persistence";
 // The debounced persistence engine lives in persistence.ts; re-exported here so
 // the rest of the app keeps importing the save API from the store.
-export { markDirty, isDirty, isSaving, scheduleSave, flushPage, flushAll, forceSave, trackAssetWrite };
+type StoreMutationObservation = { kind: "publication" | "dirty" | "undo-snapshot"; page?: string };
+let storeMutationObserverForTest: ((observation: StoreMutationObservation) => void) | null = null;
+
+/** Test-only observation seam for proving work shape at the actual store and
+ * persistence entry points. Production leaves this unset. */
+export function __setStoreMutationObserverForTest(
+  observer: ((observation: StoreMutationObservation) => void) | null,
+) {
+  storeMutationObserverForTest = observer;
+}
+
+/** Production keeps the exact persistence function identity and call path. Vitest
+ * selects the observing façade once at module initialization, never per edit. */
+export const markDirty: typeof markDirtyInner = import.meta.env.MODE === "test"
+  ? ((...args: Parameters<typeof markDirtyInner>) => {
+      storeMutationObserverForTest?.({ kind: "dirty", page: args[0] });
+      recordClipboardDirtyPageForTest(args[0]);
+      return markDirtyInner(...args);
+    }) as typeof markDirtyInner
+  : markDirtyInner;
+
+export {
+  isDirty,
+  isSaving,
+  scheduleSave,
+  flushPage,
+  flushAll,
+  forceSave,
+  canForceSave,
+  trackAssetWrite,
+};
 
 export interface Node {
   id: string;
@@ -130,21 +174,94 @@ interface DocState {
   loaded: boolean;
 }
 
-export const [doc, setDoc] = createStore<DocState>({ byId: {}, pages: [], feed: [], loaded: false });
+const [doc, setDocInner] = createStore<DocState>({ byId: {}, pages: [], feed: [], loaded: false });
+export { doc };
 
-function docHasBlockIdentity(id: string): boolean {
-  if (doc.byId[id]) return true;
-  const normalized = id.toLowerCase();
-  if (Object.keys(doc.byId).some((key) => key.toLowerCase() === normalized && !!doc.byId[key])) return true;
-  // setRaw updates a loaded node's raw synchronously without re-keying by a
-  // newly typed/pasted id property. Treat either Markdown or Org id syntax as
-  // live ownership so the final paste/redo checks fail closed in that window.
-  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rawIdentity = new RegExp(
-    `(?:^|\\r?\\n)[ \\t]*(?:id[ \\t]*::|:id:)[ \\t]*${escaped}(?=[ \\t]*(?:\\r?\\n|$))`,
-    "i",
-  );
-  return Object.values(doc.byId).some((node) => rawIdentity.test(node.raw));
+/** Production keeps Solid's original setter. Vitest chooses the observing
+ * façade once at module initialization, so there is no production wrapper or
+ * observer check on the editing hot path. */
+export const setDoc: typeof setDocInner = import.meta.env.MODE === "test"
+  ? ((...args: unknown[]) => {
+      storeMutationObserverForTest?.({ kind: "publication" });
+      return (setDocInner as (...innerArgs: unknown[]) => unknown)(...args);
+    }) as typeof setDocInner
+  : setDocInner;
+
+export interface LoadedIdentityWorkForTest {
+  loaded_identity_passes: number;
+  loaded_identity_nodes_scanned: number;
+  loaded_identity_raw_bytes_scanned: number;
+  incoming_identity_ids_checked: number;
+}
+
+const loadedIdentityWorkForTest: LoadedIdentityWorkForTest = {
+  loaded_identity_passes: 0,
+  loaded_identity_nodes_scanned: 0,
+  loaded_identity_raw_bytes_scanned: 0,
+  incoming_identity_ids_checked: 0,
+};
+
+/** Reset the F3 identity-work receipt. Test-only branches in the collision
+ * helper are dead-code-eliminated from production builds. */
+export function __resetLoadedIdentityWorkForTest(): void {
+  if (import.meta.env.MODE !== "test") return;
+  loadedIdentityWorkForTest.loaded_identity_passes = 0;
+  loadedIdentityWorkForTest.loaded_identity_nodes_scanned = 0;
+  loadedIdentityWorkForTest.loaded_identity_raw_bytes_scanned = 0;
+  loadedIdentityWorkForTest.incoming_identity_ids_checked = 0;
+}
+
+/** Snapshot the resettable F3 identity-work receipt for focused tests. */
+export function __loadedIdentityWorkForTest(): LoadedIdentityWorkForTest {
+  return { ...loadedIdentityWorkForTest };
+}
+
+// Keep the existing fail-closed coverage for a Markdown `id::` line and an Org
+// `:id:` property line. In particular, do not require an Org drawer here: the
+// previous safety check refused any matching loaded raw line, including one
+// introduced by setRaw before the byId key can be reconciled.
+const RAW_BLOCK_ID_PROPERTY_RE = /(?:^|\r?\n)[ \t]*(?:id[ \t]*::|:id:)[ \t]*([^\r\n]*?)[ \t]*(?=\r?\n|$)/gi;
+
+/**
+ * Does one candidate list collide with a live identity in the loaded document?
+ *
+ * The old per-id predicate re-scanned all loaded keys and raws for every
+ * candidate. Preserved cut paste and redo now build the loaded identity set
+ * once, then check the moving IDs in O(moved IDs). Raw properties remain part
+ * of the set so a synchronous setRaw cannot open a duplicate-id window.
+ */
+function hasLoadedIdentityCollision(incomingIds: readonly string[]): boolean {
+  if (import.meta.env.MODE === "test") {
+    loadedIdentityWorkForTest.incoming_identity_ids_checked += incomingIds.length;
+  }
+
+  // Reject an internally duplicated moved payload before consulting the loaded
+  // document. paste normally catches this earlier, but redo history can carry
+  // preserved IDs from an older snapshot and must be equally fail-closed.
+  const incoming = new Set<string>();
+  for (const id of incomingIds) {
+    const normalized = id.toLowerCase();
+    if (incoming.has(normalized)) return true;
+    incoming.add(normalized);
+  }
+
+  if (import.meta.env.MODE === "test") loadedIdentityWorkForTest.loaded_identity_passes++;
+  const loaded = new Set<string>();
+  for (const [key, node] of Object.entries(doc.byId)) {
+    loaded.add(key.toLowerCase());
+    const raw = node.raw;
+    if (import.meta.env.MODE === "test") {
+      loadedIdentityWorkForTest.loaded_identity_nodes_scanned++;
+      loadedIdentityWorkForTest.loaded_identity_raw_bytes_scanned += new TextEncoder().encode(raw).byteLength;
+    }
+    RAW_BLOCK_ID_PROPERTY_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = RAW_BLOCK_ID_PROPERTY_RE.exec(raw)) !== null) {
+      const identity = match[1].trim();
+      if (identity) loaded.add(identity.toLowerCase());
+    }
+  }
+  return incomingIds.some((id) => loaded.has(id.toLowerCase()));
 }
 
 // A generation identifies one exact loaded page instance. It is deliberately
@@ -153,6 +270,45 @@ function docHasBlockIdentity(id: string): boolean {
 // instance. Stage B uses this at its durable-retirement boundary.
 let pageInstanceClock = 0;
 const pageInstanceGenerations = new Map<string, number>();
+
+// Advances on every CONTENT edit, which `pageInstanceGeneration` deliberately
+// does not: that counter tracks page instances (install/retire), so `setRaw`
+// leaves it unchanged. An authority captured at a click therefore cannot use it
+// to tell "the user typed while my read was in flight" from "nothing happened" —
+// which is the difference between honouring a discard and destroying text the
+// user entered after asking for it. (GH #254 increment 3.)
+let editClock = 0;
+const editGenerations = new Map<string, number>();
+
+// Advances whenever a component-local editor transaction starts. Unlike the
+// content-edit generation above, this also covers input that intentionally has
+// not reached the store yet: a title-rename draft and an active IME composition.
+// A discard click captures both generations so it can authorise the state the
+// user saw without authorising a new local transaction begun during an await.
+let editorTransactionClock = 0;
+const editorTransactionGenerations = new Map<string, number>();
+
+/** Current content-edit generation for a page. */
+export function editGeneration(name: string): number {
+  return editGenerations.get(name) ?? 0;
+}
+
+export function bumpEditGeneration(name: string): void {
+  editGenerations.set(name, ++editClock);
+}
+
+/** Current component-local editor-transaction generation for a page. */
+export function editorTransactionGeneration(name: string): number {
+  return editorTransactionGenerations.get(name) ?? 0;
+}
+
+/** The page-instance generation WITHOUT creating one for a page that has none.
+ *
+ *  `pageInstanceGeneration` lazily activates, so reading it as a check would mint
+ *  a generation and mutate the identity cut retirement compares. */
+export function peekPageInstanceGeneration(name: string): number | undefined {
+  return pageInstanceGenerations.get(name);
+}
 
 function activatePageInstance(name: string): number {
   const generation = ++pageInstanceClock;
@@ -163,6 +319,7 @@ function activatePageInstance(name: string): number {
 function retirePageInstance(name: string): void {
   ++pageInstanceClock;
   pageInstanceGenerations.delete(name);
+  editorTransactionGenerations.delete(name);
 }
 
 /** Current exact loaded-page generation, or null when that page is absent. */
@@ -280,6 +437,118 @@ function flatten(
   });
 }
 
+/**
+ * Live editor activations, keyed by page name.
+ *
+ * Deliberately NOT a field of `FeedPage`. `clonePages` spread-copies every field
+ * of a page into history snapshots, so a token living on the page object would be
+ * carried into every snapshot and reinstalled by `applyEntry` — handing a restored
+ * editor a RETIRED activation, whose conflicts could then never be answered. An
+ * activation identifies a live editor instance, and a copy of a page is not one.
+ * (GH #254 increment 3; the failure was reproduced against a `FeedPage` field.)
+ */
+const editorActivations = new Map<string, number>();
+
+/** The activation for `pageName`, if this page currently has a live editor. */
+export function editorActivationFor(pageName: string): number | undefined {
+  return editorActivations.get(pageName);
+}
+
+/** Record a freshly minted activation for `pageName`. */
+export function setEditorActivation(pageName: string, activation: number): void {
+  editorActivations.set(pageName, activation);
+}
+
+/**
+ * Forget `pageName`'s activation locally, but only if it is still the one named.
+ *
+ * The local half of compare-and-retire: a retirement racing a newer activation
+ * must not drop the newer one. The core is told separately, and its own
+ * compare-and-retire is the authority.
+ */
+export function clearEditorActivation(pageName: string, activation?: number): boolean {
+  const live = editorActivations.get(pageName);
+  if (live === undefined) return false;
+  if (activation !== undefined && live !== activation) return false;
+  editorActivations.delete(pageName);
+  prospectiveTargets.delete(pageName);
+  return true;
+}
+
+/**
+ * Prospective targets for editors activated with no file yet.
+ *
+ * Kept beside the activation registry rather than written onto the page: writing
+ * it into the store mid-save was tried and reverted, because mutating the page
+ * while a save is building its snapshot disturbs cut retirement, which is
+ * authority-bound to the exact loaded instance. This is read at the DTO boundary
+ * instead, which is where the core actually needs it — its drift/re-resolve
+ * branch only runs for a pinned path. (GH #254 increment 3.)
+ */
+const prospectiveTargets = new Map<string, string>();
+
+export function setProspectiveTarget(pageName: string, target: string): void {
+  prospectiveTargets.set(pageName, target);
+}
+
+function recordEditorActivation(pageName: string, handle: EditorActivationHandle): void {
+  setEditorActivation(pageName, handle.activation);
+  // Keep the exact target beside a pathless editor after first creation too.
+  // The save response is the first authoritative place the frontend learns the
+  // resolved path, and `pageToDto` must keep pinning later saves to it.
+  prospectiveTargets.set(pageName, handle.target);
+}
+
+async function retireExactEditorActivation(
+  pageName: string,
+  target: string | undefined,
+  activation: number,
+): Promise<void> {
+  clearEditorActivation(pageName, activation);
+  if (!target) return;
+  await backend().retireEditorActivation(target, activation).catch(() => {});
+}
+
+async function retireMintedActivation(handle: EditorActivationHandle | null): Promise<void> {
+  if (!handle) return;
+  await backend().retireEditorActivation(handle.target, handle.activation).catch(() => {});
+}
+
+/** Drop every activation — graph reset and teardown. */
+export function clearAllEditorActivations(): void {
+  editorActivations.clear();
+  prospectiveTargets.clear();
+}
+
+// A backend reopen installs a FRESH `Graph` whose activation registry is empty,
+// so every token this side still holds names an editor the core has never heard
+// of. Keeping them produced conflicts nobody could resolve: the ordinary save
+// minted a banner carrying a retained token, and the matching force was refused
+// `conflict_authority.superseded`, so BOTH banner buttons only re-observed into
+// the same dead conflict. The registry has to be dropped with the graph that
+// issued it. (GH #254 increment 3, round 15.)
+onGraphRebound(clearAllEditorActivations);
+
+/**
+ * Retire `pageName`'s editor identity locally AND in the core.
+ *
+ * An activation that outlives its editor is not inert: with same-path activation
+ * idempotence, a stale live token would be handed to the NEXT editor of that path,
+ * which is exactly the cross-instance authority this increment exists to prevent.
+ * So retirement is driven by the same events that retire the frontend instance —
+ * eviction, `forgetPage`, reset — and is compare-and-retire on both sides, never a
+ * bare "retire this path": a retirement racing a newer activation must not revoke
+ * the newer editor. (GH #254 increment 3.)
+ */
+export function retireEditorFor(pageName: string, path?: string): void {
+  const activation = editorActivations.get(pageName);
+  if (activation === undefined) return;
+  const target = path
+    ?? doc.pages.find((p) => p.name === pageName)?.path
+    ?? prospectiveTargets.get(pageName);
+  void retireExactEditorActivation(pageName, target, activation);
+}
+
 function toFeedPage(dto: PageDto, byId: Record<string, Node>): FeedPage {
   const roots = flatten(dto.blocks, null, dto.name, byId, dto.format ?? "md");
   return {
@@ -314,7 +583,7 @@ function purgePageNodes(s: DocState, pageName: string) {
 /** Merge a page into the working set, replacing any prior copy of that page.
  *  Other loaded pages (and their nodes) are left untouched — so a page open in
  *  the sidebar survives navigating the main view elsewhere. */
-function upsertPage(dto: PageDto) {
+function upsertPage(dto: PageDto): boolean {
   // A real page with this name exists again → lift any delete tombstone so edits
   // to the freshly-(re)created page save normally.
   untombstone(dto.name);
@@ -329,13 +598,17 @@ function upsertPage(dto: PageDto) {
   // external change (content differs) still reloads + invalidates (data-safety #42).
   if (existing && pageContentMatches(dto, existing)) {
     setBaseRev(dto.name, dto.rev ?? null);
-    return;
+    return false;
   }
   // Replacing an already-loaded copy means the page's content changed under us
   // (a conflict-resolution / watcher reload). Any undo entry predating this reload
   // is stale — replaying it would clobber the just-loaded (external) version, so
   // drop those entries. (A first load has no prior entries → no-op.)
   const replacing = !!existing;
+  // Activation retirement is deliberately NOT done here. Editable DTOs enter
+  // through the two-phase installer below, which records B before compare-
+  // retiring exact A. Retiring by name from this mutation primitive can race a
+  // concurrent installer and destroy the activation it just installed.
   // Record the load baseline (the on-disk rev) so saves conflict against it.
   setBaseRev(dto.name, dto.rev ?? null);
   setDoc(
@@ -350,6 +623,7 @@ function upsertPage(dto: PageDto) {
   activatePageInstance(dto.name);
   invalidateAllMatrixDimensions();
   if (replacing) invalidateUndoForPage(dto.name);
+  return true;
 }
 
 /** Whether a reload DTO carries the SAME content (page-property pre-block + every
@@ -368,20 +642,168 @@ function pageContentMatches(dto: PageDto, page: FeedPage): boolean {
   return dto.blocks.length === page.roots.length && dto.blocks.every((b, i) => eq(b, page.roots[i]));
 }
 
-/** Load a page into the working set if it isn't already there (used by
- *  satellite surfaces — sidebar / query results / embeds — so they render the
- *  same live, editable nodes as the main view). Idempotent: never clobbers an
- *  already-loaded page's in-progress edits. */
-export function ensurePageLoaded(dto: PageDto) {
-  const existing = doc.pages.find((p) => p.name === dto.name);
-  if (existing && (existing.path ?? "") === (dto.path ?? "")) return;
-  // A path-pinned route may intentionally load a duplicate-day stray with the
-  // same logical title as the canonical journal. Replace the name slot with the
-  // exact requested file instead of silently keeping (and then editing/saving)
-  // the canonical file. Full simultaneous duplicate identity is tracked by the
-  // file-identity ADR; this closes the wrong-target write immediately.
+type CapturedEditorInstance = {
+  generation: number;
+  path?: string;
+  kind: PageKind;
+  activation?: number;
+  activationTarget?: string;
+};
+
+function captureEditorInstance(name: string): CapturedEditorInstance | null {
+  const page = pageByName(name);
+  const generation = pageInstanceGeneration(name);
+  if (!page || generation === null) return null;
+  return {
+    generation,
+    path: page.path,
+    kind: page.kind,
+    activation: editorActivationFor(name),
+    activationTarget: page.path || prospectiveTargets.get(name),
+  };
+}
+
+function isExactCapturedInstance(name: string, captured: CapturedEditorInstance | null): boolean {
+  const current = pageByName(name);
+  if (!captured) return !current && peekPageInstanceGeneration(name) === undefined;
+  return !!current
+    && current.kind === captured.kind
+    && current.path === captured.path
+    && peekPageInstanceGeneration(name) === captured.generation
+    && editorActivationFor(name) === captured.activation
+    && (current.path || prospectiveTargets.get(name)) === captured.activationTarget;
+}
+
+export type EditorInstallOptions = {
+  /** Binding captured before the read that produced the DTO. */
+  expectedGraphBinding?: number;
+  /** Explicit user-authorised discard; identity and binding still re-check. */
+  bypassReplacementGate?: boolean;
+  /** Surface/component ownership spanning the activation await. */
+  isRequestLive?: () => boolean;
+  /** Awaited only after disk read and replacement activation have succeeded.
+   * Returning false compare-retires the minted activation without installing. */
+  beforeInstall?: () => Promise<boolean>;
+};
+
+/** Load a page into the editable working set through the activation boundary.
+ *
+ * Replacement is a two-phase protocol: capture exact A under the synchronous
+ * full gate; await B's activation; re-check both the gate and exact A; install B
+ * and record it; then compare-retire A. A failed/stale activation never installs
+ * an editable DTO. Same-instance same-content hydration stays idempotent. */
+export async function ensurePageLoaded(
+  dto: PageDto,
+  options: EditorInstallOptions = {},
+): Promise<InstanceRefusal | null> {
+  const binding = options.expectedGraphBinding ?? graphBinding();
+  if (binding !== graphBinding() || options.isRequestLive?.() === false) {
+    return { reason: "stale-instance", page: dto.name };
+  }
+
+  const captured = captureEditorInstance(dto.name);
+  const incumbent = pageByName(dto.name);
+  const samePath = !!incumbent && (incumbent.path ?? "") === (dto.path ?? "");
+  const sameInstanceHydration = !!incumbent && samePath && pageContentMatches(dto, incumbent);
+  const replacing = !!captured && !sameInstanceHydration;
+
+  // Phase 1: the complete synchronous gate, before activation. A same-instance
+  // hydration does not replace anything, so a dirty editor may safely acquire
+  // the identity it already owns.
+  if (replacing && !options.bypassReplacementGate && !mayReplaceInstance(dto.name)) {
+    return { reason: "unsaved-changes", page: dto.name };
+  }
+
+  // Already active exact-instance hydration is the idempotent fast path.
+  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) return null;
+
+  let handle: EditorActivationHandle | null = null;
+  const editable = !dto.read_only && !dto.guide;
+  if (editable) {
+    try {
+      if (dto.path) {
+        // Reuse is only valid when this exact frontend instance already owns the
+        // activation, and that case returned through the fast path above.  With
+        // no local activation, mint a replacement even for a first installation:
+        // a best-effort retirement from an older destroyed editor may have failed,
+        // and inheriting that stale core record would cross editor episodes.
+        const intent: ActivationIntent = "replace";
+        handle = await backend().activateEditor(dto.path, intent, dto.rev ?? null);
+      } else {
+        handle = await backend().activateAbsentEditor(dto.name, dto.kind);
+      }
+    } catch {
+      return { reason: "activation-failed", page: dto.name };
+    }
+  }
+
+  // Presentation spends one-shot conflict authority, so identity must be
+  // re-checked after activation and BEFORE that fallible/consuming operation.
+  // The same check still runs again below after presentation, closing changes
+  // that race the presentation await itself.
+  if (
+    binding !== graphBinding()
+    || options.isRequestLive?.() === false
+    || !isExactCapturedInstance(dto.name, captured)
+  ) {
+    await retireMintedActivation(handle);
+    return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
+  }
+
+  if (options.beforeInstall) {
+    let proceed = false;
+    try {
+      proceed = await options.beforeInstall();
+    } catch {
+      proceed = false;
+    }
+    if (!proceed) {
+      await retireMintedActivation(handle);
+      return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
+    }
+  }
+
+  // Phase 3: both graph ownership and exact incumbent identity must survive the
+  // await. Then re-evaluate the full gate in the same synchronous turn as the
+  // install. A raced B is compare-retired; A/current remains untouched.
+  if (
+    binding !== graphBinding()
+    || options.isRequestLive?.() === false
+    || !isExactCapturedInstance(dto.name, captured)
+  ) {
+    await retireMintedActivation(handle);
+    return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
+  }
+  if (replacing && !options.bypassReplacementGate && !mayReplaceInstance(dto.name)) {
+    await retireMintedActivation(handle);
+    return { reason: "unsaved-changes", page: dto.name };
+  }
+
+  if (sameInstanceHydration) {
+    if (handle) recordEditorActivation(dto.name, handle);
+    return null;
+  }
+
+  // Phase 4: publish B's instance first, then its identity, then retire exact A.
+  // `clearEditorActivation` is compare-based, so retiring A cannot clear B.
   upsertPage(dto);
+  if (handle) recordEditorActivation(dto.name, handle);
+  if (captured?.activation !== undefined) {
+    await retireExactEditorActivation(
+      dto.name,
+      captured.activationTarget,
+      captured.activation,
+    );
+  }
   evictIfNeeded();
+  return null;
+}
+
+/** Install the isolated quick-capture scratch DTO without touching core.
+ * It is the sole C9 exception: local-only, never graph-persisted, and therefore
+ * deliberately has no editor activation. */
+export function installCaptureScratchPage(dto: PageDto): void {
+  upsertPage(dto);
 }
 
 /** Load a page selected by the main graph router. `ensurePageLoaded` also serves
@@ -389,9 +811,29 @@ export function ensurePageLoaded(dto: PageDto) {
  * scratch editor can never write the graph. A successfully resolved main route,
  * however, is sufficient to arm ordinary persistence even when an invalidated
  * Journals reload has not landed yet. */
-export function loadRoutedPage(dto: PageDto) {
-  ensurePageLoaded(dto);
+export async function loadRoutedPage(
+  dto: PageDto,
+  expectedGraphBinding = graphBinding(),
+): Promise<InstanceRefusal | null> {
+  const refusal = await ensurePageLoaded(dto, { expectedGraphBinding });
+  if (refusal) {
+    // A refused route must not leave the surface silently blank — that is a trap,
+    // not a safeguard. The route currently marks itself loaded after this call and
+    // its loader effect watches route/graph identity rather than the incumbent's
+    // save lifecycle, so nothing would retry on its own. Say what is holding the
+    // file and what resolves it, so the user can act and ask again.
+    // (GH #254 increment 3.)
+    const message = refusal.reason === "unsaved-changes"
+      ? `“${refusal.page}” has unsaved changes, so the other file with that name can't be shown yet. ` +
+        `Save or resolve it, then open the file again.`
+      : refusal.reason === "activation-failed"
+        ? `“${refusal.page}” could not be activated for editing. Open it again to retry.`
+        : `The request for “${refusal.page}” became stale. Open it again to retry.`;
+    pushToast(message, "error");
+    return refusal;
+  }
   setDoc("loaded", true);
+  return null;
 }
 
 /** Load/reload bundled Guide pages into the working set without making them the
@@ -414,6 +856,7 @@ export function isGuidePage(name: string): boolean {
  *  disk version"): otherwise the unsaved in-memory copy is left untracked — not
  *  dirty, not conflicted — and is silently lost at close. */
 export function forgetPage(name: string) {
+  retireEditorFor(name);
   forgetSaveState(name);
   clearConflict(name);
   // The page is leaving the working set; a stale undo snapshot must not be able to
@@ -429,6 +872,14 @@ export function forgetPage(name: string) {
     })
   );
   retirePageInstance(name);
+  // AFTER the dirty/conflict state is cleared and the page is gone — announcing
+  // at the top ran while `mayReplaceInstance` was still false, so the
+  // announcement was correctly dropped and then nothing swept again, stranding a
+  // waiting request forever. This is the externally-deleted "Use disk version"
+  // route and the successful `deletePage` route, which share this ordering.
+  // Swept, not named: the page no longer exists, and other watchers may have been
+  // freed by the same teardown. (GH #254 increment 3.)
+  sweepReplaceable();
   invalidateAllMatrixDimensions();
 }
 
@@ -441,24 +892,54 @@ export async function deletePage(name: string, kind: PageKind, expectedPath?: st
   const loaded = pageByName(name);
   if (expectedPath && loaded?.path !== expectedPath) return false;
   if (loaded?.readOnly || loaded?.guide) return false;
-  // Capture the current (possibly unsaved) content first, so the recoverable trash
-  // copy is the LATEST version — not the stale bytes on disk. A CONFLICTED page can
-  // never flush (its save stays refused until the conflict is resolved); blocking
-  // the delete on that flush made such a page *undeletable* — the user could neither
-  // save nor discard it. Deleting is itself a resolution ("I don't want this page"),
-  // and the on-disk version still lands in .tine-trash (recoverable), so a conflict
-  // must not veto the delete. For a merely-dirty page we still flush first (to trash
-  // the latest bytes) and abort only if that genuinely fails.
-  if (isDirty(name) && !isConflicted(name) && !(await flushPage(name))) return false;
-  // Tombstone first so any queued/in-flight save no-ops during the delete, but
-  // DON'T drop the in-memory page until the backend actually deletes it — if the
-  // delete fails, the page (and its unsaved edits) must survive.
-  tombstone(name);
+  // Capture the exact loaded instance before awaiting.  A replacement, graph
+  // reload, or path rebind must not let this delete tombstone a later editor that
+  // happens to reuse its logical name.
+  const captured = loaded && {
+    name: loaded.name,
+    kind: loaded.kind,
+    path: loaded.path,
+    generation: pageInstanceGeneration(name),
+  };
+  // A by-name delete may target an unloaded page. With no live instance or draft
+  // to protect, it can publish its name-wide tombstone synchronously below.
+  if (captured && (captured.kind !== kind || captured.generation === null)) return false;
+  const capturedConflicted = !!captured && isConflicted(name);
+  const stillCaptured = () => {
+    if (!captured) return false;
+    const current = pageByName(name);
+    return !!current
+      && current.name === captured.name
+      && current.kind === captured.kind
+      && current.path === captured.path
+      && pageInstanceGeneration(name) === captured.generation;
+  };
+
+  // A conflicted draft is deliberately not flushed: its current actor winner,
+  // not unrecoverable draft bytes, is what the warning says reaches trash.  For
+  // every other page, drain through quiescence rather than one save so a keystroke
+  // injected during that first save either becomes a second accepted snapshot or
+  // causes this delete to refuse with the draft still live.
+  if (
+    captured
+    && !capturedConflicted
+    && !(await flushPageToQuiescence(name))
+  ) return false;
+  // The identity proof and persistence retirement run back-to-back without a
+  // yield. tombstoneIfQuiescent re-checks dirty/saving/conflict state in the same
+  // synchronous turn that publishes the marker, closing the resolved-Promise
+  // handoff after flushPageToQuiescence.
+  if (
+    (captured && !stillCaptured())
+    || !tombstoneIfQuiescent(name, capturedConflicted, expectedPath)
+  ) return false;
   try {
     if (expectedPath) await backend().deletePage(name, kind, expectedPath);
     else await backend().deletePage(name, kind);
   } catch {
     untombstone(name); // delete failed — lift the tombstone; page + edits stay intact
+    // Anything that parked itself while this page looked deleted may proceed now.
+    notifyPageBecameReplaceable(name);
     return false;
   }
   forgetPage(name); // success — now drop it from the working set + feed
@@ -492,6 +973,13 @@ function pinnedPages(): Set<string> {
   // Conflicted pages hold unsaved edits that aren't in `dirty` (the save batch
   // removed them); evicting one would silently drop those edits.
   for (const name of conflicts()) pin.add(name);
+  // A page whose save is in flight is ALSO not in `dirty` — `doSave` removes it
+  // before awaiting the backend. Evicting it there loses the edit outright, and
+  // if that save then fails transiently `doSave` re-adds a name with no page
+  // behind it, which `pageToDto` cannot serialize: the name is stuck in `dirty`
+  // forever and `flushAll()` can never succeed again. (Direct Files data-safety
+  // audit, 2026-08-09, finding 6.)
+  for (const name of savingPages()) pin.add(name);
   const ed = editingId();
   if (ed && doc.byId[ed]) pin.add(doc.byId[ed].page);
   return pin;
@@ -500,8 +988,69 @@ function pinnedPages(): Set<string> {
 /** Replace a page in the working set from a fresh DTO (e.g. resolving a conflict
  *  with the disk version, or a watcher reload). Updates the main view and any
  *  satellite that shows it, since they share `byId`. */
-export function reloadPage(dto: PageDto) {
+export async function reloadPage(
+  dto: PageDto,
+  options: Pick<EditorInstallOptions, "isRequestLive" | "beforeInstall"> = {},
+): Promise<InstanceRefusal | null> {
+  return ensurePageLoaded(dto, { ...options, bypassReplacementGate: true });
+}
+
+/** Install the managed actor's current DTO after an explicit discard choice.
+ *
+ * Managed conflicts have revision authority of their own and deliberately do
+ * not mint Direct Files editor activations or observation epochs. Keep this
+ * narrow installer separate from the Direct read → activate → present protocol.
+ */
+export function installManagedConflictVersion(dto: PageDto): void {
   upsertPage(dto);
+  evictIfNeeded();
+}
+
+/** Apply a watcher-driven disk reload only if it is STILL safe at this instant.
+ *
+ *  `reloadDisposition` is correct, but the watcher sites read its verdict and
+ *  then `await backend().getPage(...)` before acting — tens to hundreds of ms on
+ *  a large graph, and a Syncthing burst fires many of these concurrently. If the
+ *  user clicks into a block and types inside that window, `commit()` writes into
+ *  the store synchronously; the resolved IPC then replaces the page, dropping the
+ *  typed text AND its undo history, with no conflict raised and nothing written
+ *  to disk. (Direct Files data-safety audit, 2026-08-09, finding 5.)
+ *
+ *  `upsertUnlessDirty` already re-checks at the moment of the upsert; only these
+ *  watcher sites skipped it. Re-checking here rather than at each call site means
+ *  a fifth site cannot reintroduce the hole. `reloadPage` itself stays a
+ *  deliberate clobber — "use disk version" is an explicit user decision.
+ *
+ *  Returns false when the reload was declined. */
+export async function reloadPageIfStillSafe(
+  name: string,
+  dto: PageDto,
+  expectedGraphBinding = graphBinding(),
+): Promise<boolean> {
+  // The full gate, not `reloadDisposition` alone: component-local uncommitted
+  // input (the title-rename draft, IME composition) is invisible to every store
+  // predicate, and this path deliberately replaces the working instance.
+  if (!mayReplaceInstance(name)) return false;
+  if (reloadDisposition(name) !== "reload") return false;
+  return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
+}
+
+const pendingHlsRefreshes = new Map<string, () => void>();
+
+function retryHlsRefreshWhenReplaceable(name: string, binding: number): void {
+  if (pendingHlsRefreshes.has(name)) return;
+  const stop = onPageBecameReplaceable(name, () => {
+    stop();
+    pendingHlsRefreshes.delete(name);
+    if (binding !== graphBinding()) return;
+    void reloadHlsIfLoaded(name);
+  });
+  pendingHlsRefreshes.set(name, stop);
+}
+
+function clearPendingHlsRefreshes(): void {
+  for (const stop of pendingHlsRefreshes.values()) stop();
+  pendingHlsRefreshes.clear();
 }
 
 /** After a PDF highlight write changed an `hls__` page on disk, refresh its
@@ -509,16 +1058,32 @@ export function reloadPage(dto: PageDto) {
  *  track disk — otherwise a later editor save would conflict against the highlight
  *  write. Skips a page with unsaved edits / an open conflict: the caller flushes
  *  those FIRST so they're on disk and merged in, rather than clobbered here. */
-export async function reloadHlsIfLoaded(name: string): Promise<void> {
-  if (!pageByName(name)) return;
-  if (isDirty(name) || isConflicted(name)) return;
+export async function reloadHlsIfLoaded(name: string): Promise<boolean> {
+  if (!pageByName(name)) return false;
+  // The FULL gate, and re-evaluated after the await. The old dirty-or-conflicted
+  // check missed uncommitted input the store cannot see — an IME composition on
+  // the notes page was reproduced being destroyed here while the store was clean
+  // — and checking only before the await let the page become dirty during it,
+  // since `reloadPage` is a deliberate clobber. Declining is safe: the next
+  // highlight write re-drives this. (GH #254 increment 3.)
+  const binding = graphBinding();
+  if (!mayReplaceInstance(name)) {
+    retryHlsRefreshWhenReplaceable(name, binding);
+    return false;
+  }
   const dto = await backend().getPage(name, "page");
-  if (dto) reloadPage(dto);
+  if (!dto || binding !== graphBinding()) return false;
+  const refusal = await ensurePageLoaded(dto, { expectedGraphBinding: binding });
+  if (refusal) {
+    if (refusal.reason === "unsaved-changes") retryHlsRefreshWhenReplaceable(name, binding);
+    return false;
+  }
+  return true;
 }
 function evictIfNeeded() {
   if (doc.pages.length <= WORKING_SET_CAP) return;
   const pin = pinnedPages();
-  const evicted: string[] = [];
+  const evicted: { name: string; path?: string }[] = [];
   setDoc(
     produce((s) => {
       // Oldest first (insertion order); stop once at the cap or only pinned left.
@@ -528,13 +1093,20 @@ function evictIfNeeded() {
           i++;
           continue;
         }
+        // Capture the path BEFORE the page leaves the working set. A retirement
+        // that has to look the page up afterwards finds nothing and silently
+        // retires nothing, leaking the native activation — which the next editor
+        // of that path would then inherit under same-path Reuse.
+        evicted.push({ name, path: s.pages[i].path });
         purgePageNodes(s, name);
         s.pages.splice(i, 1);
-        evicted.push(name);
       }
     })
   );
-  for (const name of evicted) retirePageInstance(name);
+  for (const { name, path } of evicted) {
+    retireEditorFor(name, path);
+    retirePageInstance(name);
+  }
   invalidateAllMatrixDimensions();
 }
 
@@ -543,6 +1115,13 @@ function evictIfNeeded() {
  *  cancels pending saves and clears dirty flags so nothing from the old graph
  *  can be written after a switch. */
 export function resetStore() {
+  // Every identity belongs to the graph being left. The core drops its own
+  // registry with the Graph, so clearing locally is sufficient and avoids a
+  // storm of per-page retirements against a graph that is going away.
+  clearAllEditorActivations();
+  clearAllEditorLeases();
+  clearPendingHlsRefreshes();
+  clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph
   // token, dirty/baseline/tombstone) so nothing from the old graph can be written
   // after the switch.
@@ -555,6 +1134,9 @@ export function resetStore() {
   // across the switch (audit P2).
   clearSeededFacets();
   clearMatrixDimensionCache();
+  // Linked/Unlinked References expand state is keyed by page identity, and every
+  // page identity is retired with the old graph (GH #272).
+  resetReferenceSectionState();
   for (const name of pageInstanceGenerations.keys()) retirePageInstance(name);
   setDoc({ byId: {}, pages: [], feed: [], loaded: false });
   endEdit("graph-switch");
@@ -567,11 +1149,11 @@ export function resetStore() {
 // nodes; the disk version would otherwise be served and the next save could write
 // it, silently dropping the edit. (reloadPage / "use disk version" still replace
 // explicitly via upsertPage.)
-function upsertUnlessDirty(dto: PageDto) {
-  // `isSaving` too — an in-flight save's edit isn't durable yet (audit H1).
-  if (pageByName(dto.name) && (isDirty(dto.name) || isConflicted(dto.name) || isSaving(dto.name)))
-    return;
-  upsertPage(dto);
+/** Install `dto` unless the loaded page holds unsaved work. Reports whether it
+ *  actually installed, so publication can follow installation rather than assume
+ *  it. (GH #254 increment 3.) */
+async function upsertUnlessDirty(dto: PageDto, expectedGraphBinding: number): Promise<boolean> {
+  return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
 }
 
 export type ReloadDisposition = "reload" | "conflict" | "skip";
@@ -583,8 +1165,9 @@ export type ReloadDisposition = "reload" | "conflict" | "skip";
  *  - `"skip"` — a block on it is being edited (don't yank the caret) or a block
  *    move is mid-flight (the textarea is transiently blurred): leave it alone.
  *  - `"reload"` — safe to replace the loaded copy with the disk version.
- *  (Navigation/flush-first paths — upsertUnlessDirty, reloadHlsIfLoaded — use a
- *  simpler dirty-only guard on purpose and do not go through this.) */
+ *  (Both `upsertUnlessDirty` and `reloadHlsIfLoaded` now compose this with the
+ *  editor-lease set via `mayReplaceInstance`; the old deliberately-weaker
+ *  dirty-only guard was what GH #304 cost.) */
 export function reloadDisposition(name: string): ReloadDisposition {
   // `isSaving` too: `doSave` clears `dirty` BEFORE the `await savePage`, so during the
   // save IPC the page is no longer dirty but its edit isn't durable. Reloading then
@@ -597,29 +1180,187 @@ export function reloadDisposition(name: string): ReloadDisposition {
   return "reload";
 }
 
+/**
+ * Component-local editors that currently hold uncommitted input.
+ *
+ * `reloadDisposition` only sees state that lives in the store, and not all
+ * uncommitted user input does. The page-title rename keeps its draft in local
+ * signals and an `<input>`, so replacing the page unmounts the input and the typed
+ * title is gone with nothing ever having been dirty. IME composition has the same
+ * shape. Enumerating those cases kept losing — each round of review found another
+ * one — so a component that holds uncommitted input DECLARES itself instead.
+ *
+ * The registry is keyed by page, then by a unique per-component handle, because
+ * one page can be mounted on several surfaces: cancelling transaction A must not
+ * clear transaction B's. (GH #254 increment 3.)
+ */
+const editorLeases = new Map<string, Set<symbol>>();
+
+/**
+ * Take a lease for uncommitted input on `pageName`. Returns its release, which is
+ * idempotent and MUST be wired to the component lifecycle (`onCleanup`), not only
+ * to commit and cancel: disposing a mounted page removes the title section without
+ * running either, and a literal registration would then outlive its component and
+ * its draft and refuse every later replacement forever.
+ */
+export function takeEditorLease(pageName: string): () => void {
+  const handle = Symbol("editor-lease");
+  editorTransactionGenerations.set(pageName, ++editorTransactionClock);
+  let leases = editorLeases.get(pageName);
+  if (!leases) {
+    leases = new Set();
+    editorLeases.set(pageName, leases);
+  }
+  leases.add(handle);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const live = editorLeases.get(pageName);
+    if (!live) return;
+    live.delete(handle);
+    if (live.size === 0) {
+      editorLeases.delete(pageName);
+      notifyPageBecameReplaceable(pageName);
+    }
+  };
+}
+
+/**
+ * Watchers waiting for a specific page to become replaceable.
+ *
+ * Keyed BY PAGE, so liveness does not depend on my enumeration of emission sites
+ * being complete — which is what kept failing. Explicit announcements make the
+ * common transitions prompt; `sweepReplaceable()` is the net that re-checks every
+ * watched page, so a route nobody thought to instrument delays a resume rather
+ * than stranding it forever. (GH #254 increment 3.)
+ */
+const replaceableWatchers = new Map<string, Set<(pageName: string) => void>>();
+
+export function onPageBecameReplaceable(
+  pageName: string,
+  listener: (pageName: string) => void,
+): () => void {
+  let set = replaceableWatchers.get(pageName);
+  if (!set) {
+    set = new Set();
+    replaceableWatchers.set(pageName, set);
+  }
+  set.add(listener);
+  let stopped = false;
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    const live = replaceableWatchers.get(pageName);
+    if (!live) return;
+    live.delete(listener);
+    if (live.size === 0) replaceableWatchers.delete(pageName);
+  };
+}
+
+/** Announce `pageName` if it is genuinely replaceable now. */
+export function notifyPageBecameReplaceable(pageName: string): void {
+  const set = replaceableWatchers.get(pageName);
+  if (!set || set.size === 0) return;
+  if (!mayReplaceInstance(pageName)) return;
+  for (const listener of [...set]) listener(pageName);
+}
+
+/** Re-check every watched page. The safety net behind the explicit sites. */
+export function sweepReplaceable(): void {
+  if (replaceableWatchers.size === 0) return;
+  for (const name of [...replaceableWatchers.keys()]) notifyPageBecameReplaceable(name);
+}
+
+export function clearReplaceableWatchers(): void {
+  replaceableWatchers.clear();
+}
+
+/** Does any component hold uncommitted input for this page? */
+export function hasEditorLease(pageName: string): boolean {
+  return (editorLeases.get(pageName)?.size ?? 0) > 0;
+}
+
+/** Drop every lease — graph reset and teardown. */
+export function clearAllEditorLeases(): void {
+  editorLeases.clear();
+  editorTransactionGenerations.clear();
+}
+
+/**
+ * May this page's loaded instance be REPLACED right now?
+ *
+ * The composed gate: the store's own disposition plus the component-local leases
+ * it cannot see. Both halves are required, and both must be re-evaluated
+ * synchronously at the final replacement boundary — every caller awaits a backend
+ * read first, and the incumbent can become dirty, start saving, or begin an
+ * uncommitted rename during that await. (GH #254 increment 3.)
+ */
+export function mayReplaceInstance(name: string): boolean {
+  return reloadDisposition(name) === "reload" && !hasEditorLease(name);
+}
+
+/** Why a replacement was refused, for the surface that asked for it. */
+export type InstanceRefusal = {
+  reason: "unsaved-changes" | "stale-instance" | "activation-failed";
+  /** The page holding the unsaved work — what the surface tells the user. */
+  page: string;
+};
+
 /** Load a single page and make it the main view. */
 export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
-  upsertUnlessDirty(dto);
+  // Legacy synchronous store seeding used by isolated/test surfaces. Production
+  // routed editors use `loadRoutedPage`, and feed editors use `loadFeed`; both go
+  // through activation before publication. A page seeded here still acquires its
+  // activation at the save boundary before any write.
+  if (pageByName(dto.name) && !mayReplaceInstance(dto.name)) return false;
+  upsertPage(dto);
   setDoc("feed", [dto.name]);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
+  return true;
 }
 
 /** Load the journals feed as the main view. */
-export function loadFeed(dtos: PageDto[], opts: { endEdit?: boolean } = {}) {
-  for (const d of dtos) upsertUnlessDirty(d);
-  setDoc("feed", dtos.map((d) => d.name));
+export async function loadFeed(
+  dtos: PageDto[],
+  opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
+) {
+  // Publication FOLLOWS installation. When the DTO is declined the name used to
+  // be published into the feed anyway, so the feed rendered a dirty path-pinned
+  // stray as though it were the requested canonical journal — no refusal, no
+  // path warning, and an edit saved to the wrong file. A page already present
+  // under that name stays published; one that never installed does not.
+  // (GH #254 increment 3.)
+  // Publication follows INSTALLATION. An earlier draft fell back to
+  // `|| pageByName(d.name)`, which reintroduced the exact defect: a dirty
+  // path-pinned stray already occupying the name made the declined canonical DTO
+  // publish anyway, so the feed rendered the stray as though it were the
+  // requested journal.
+  const binding = opts.expectedGraphBinding ?? graphBinding();
+  const installed: string[] = [];
+  for (const dto of dtos) {
+    if (await upsertUnlessDirty(dto, binding)) installed.push(dto.name);
+  }
+  if (binding !== graphBinding()) return;
+  setDoc("feed", installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
 }
 
 /** Append more pages to the journals feed (infinite scroll). */
-export function appendFeed(dtos: PageDto[]) {
+export async function appendFeed(
+  dtos: PageDto[],
+  expectedGraphBinding = graphBinding(),
+) {
+  const binding = expectedGraphBinding;
   for (const d of dtos) {
     if (doc.feed.includes(d.name)) continue;
-    upsertUnlessDirty(d);
+    // Publication follows installation — see `loadFeed`.
+    if (!(await upsertUnlessDirty(d, binding))) continue;
+    if (binding !== graphBinding()) return;
     setDoc("feed", [...doc.feed, d.name]);
   }
   evictIfNeeded();
@@ -646,11 +1387,14 @@ export function emptyPage(name: string, kind: "journal" | "page"): PageDto {
  *  (e.g. it was an OLDER day that got deleted). The placeholder is empty and
  *  writable — `upsertPage` lifts the delete tombstone, so the first keystroke saves
  *  a fresh file, exactly like reopening the journal. */
-export function restoreTodayJournalInFeed() {
+export async function restoreTodayJournalInFeed(): Promise<boolean> {
   const title = journalTitle(new Date());
-  if (doc.feed.includes(title)) return;
-  upsertUnlessDirty(emptyPage(title, "journal"));
+  if (doc.feed.includes(title)) return true;
+  const binding = graphBinding();
+  if (!(await upsertUnlessDirty(emptyPage(title, "journal"), binding))) return false;
+  if (binding !== graphBinding()) return false;
   setDoc("feed", [title, ...doc.feed]);
+  return true;
 }
 
 function toDto(id: string): BlockDto {
@@ -726,9 +1470,15 @@ export function pageToDto(pageName: string): PageDto | null {
     pre_block: preBlock,
     blocks,
     format: p.format,
-    // Pin the save to the exact file this page came from (#21). Absent for a
-    // brand-new page → the backend resolves the file by name, as before.
-    path: p.path,
+    // Which live editor is issuing this save. Read from the registry rather than
+    // carried on the page, so no clone or history snapshot can claim it.
+    // (GH #254 increment 3.)
+    activation: editorActivations.get(p.name),
+    // Pin the save to the exact file this page came from (#21). For an editor
+    // activated with no file yet, this is the prospective target it is live for —
+    // without it the DTO goes out unpinned and the core cannot recognise its own
+    // absent editor when the target drifts underneath it.
+    path: p.path || prospectiveTargets.get(p.name) || "",
     guide: p.guide,
     read_only: p.readOnly,
   };
@@ -933,6 +1683,193 @@ export function depthOf(id: string): number {
   return d;
 }
 
+export interface ManagedBulkInsertionPlan {
+  insertedDescendants: number;
+  removedOrReusedDescendants: number;
+  insertionRootDepth: number;
+  maximumInputRelativeDepth: number;
+  insertedRawTextUtf8Bytes: number;
+}
+
+interface ManagedBulkAdmissionLimits {
+  applicationSavePageBlocks: number;
+  applicationPageRequestTextBytes: number;
+  applicationPageMaxDepth: number;
+}
+
+type BulkOutlineLike = { raw: string; children: readonly BulkOutlineLike[] };
+
+/** Count only input already materialized by a selected caller. The limits cap
+ * this pure work: no PageDto clone, actor call, block-id allocation, or scan of
+ * any other page is involved. */
+export function managedBulkOutlinePlan(
+  nodes: readonly BulkOutlineLike[],
+  insertionRootDepth: number,
+  removedOrReusedDescendants: number,
+  limits: ManagedBulkAdmissionLimits,
+): ManagedBulkInsertionPlan {
+  const blockCap = limits.applicationSavePageBlocks + 1;
+  const textCap = limits.applicationPageRequestTextBytes + 1;
+  let insertedDescendants = 0;
+  let maximumInputRelativeDepth = 0;
+  let insertedRawTextUtf8Bytes = 0;
+  const stack = nodes.map((node) => ({ node, relativeDepth: 1 }));
+  while (stack.length) {
+    const { node, relativeDepth } = stack.pop()!;
+    insertedDescendants = Math.min(blockCap, insertedDescendants + 1);
+    maximumInputRelativeDepth = Math.max(maximumInputRelativeDepth, relativeDepth);
+    insertedRawTextUtf8Bytes = Math.min(
+      textCap,
+      insertedRawTextUtf8Bytes + new TextEncoder().encode(node.raw).byteLength,
+    );
+    if (insertedDescendants === blockCap || insertedRawTextUtf8Bytes === textCap) break;
+    for (let index = node.children.length - 1; index >= 0; index--) {
+      stack.push({ node: node.children[index], relativeDepth: relativeDepth + 1 });
+    }
+  }
+  return {
+    insertedDescendants,
+    removedOrReusedDescendants,
+    insertionRootDepth,
+    maximumInputRelativeDepth,
+    insertedRawTextUtf8Bytes,
+  };
+}
+
+const bulkInsertionAdmissionSeal = Symbol("bulk-insertion-admission");
+
+export interface BulkInsertionAdmission {
+  readonly [bulkInsertionAdmissionSeal]: true;
+}
+
+interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
+  consumed: boolean;
+  targetId: string | null;
+  targetNode: Node | null;
+  targetPage: string;
+  targetGeneration: number;
+  graphEpoch: number;
+  graphRoot: string;
+  bindingGeneration: number;
+  authority: "managed_writable";
+  plan: ManagedBulkInsertionPlan;
+}
+
+export type ManagedBulkInsertionPreflight =
+  | { kind: "direct" }
+  | { kind: "admitted"; token: BulkInsertionAdmission }
+  | { kind: "refused"; toast: string };
+
+const managedBulkOverflowToast = (limit: number): string =>
+  `Can't insert: this page would exceed Tine-managed storage's ${limit}-block or request-size limit. Nothing was changed.`;
+
+const managedBulkUnavailableToast =
+  "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
+
+function boundedPageBlockCount(page: FeedPage, cap: number): number {
+  let count = 0;
+  const stack = [...page.roots];
+  while (stack.length && count < cap) {
+    const id = stack.pop()!;
+    const node = doc.byId[id];
+    if (!node) continue;
+    count++;
+    for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
+  }
+  return count;
+}
+
+/**
+ * Advisory, side-effect-free preflight for one selected bulk route. Direct
+ * bindings return before the caller builds its plan; managed records only
+ * reject a known lower-bound overflow and leave the native actor authoritative.
+ */
+export function preflightManagedBulkInsertion(
+  targetId: string | null,
+  buildPlan: (limits: ManagedBulkAdmissionLimits) => ManagedBulkInsertionPlan,
+  targetPageName?: string,
+): ManagedBulkInsertionPreflight {
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (admission?.authority === "direct") return { kind: "direct" };
+  if (!admission) return { kind: "refused", toast: managedBulkUnavailableToast };
+  if (admission.authority !== "managed_writable") {
+    return { kind: "refused", toast: managedBulkUnavailableToast };
+  }
+
+  const target = targetId === null ? null : doc.byId[targetId];
+  if (targetId !== null && (!target || !blockWritable(targetId))) {
+    return { kind: "refused", toast: managedBulkUnavailableToast };
+  }
+  const pageName = target?.page ?? targetPageName;
+  if (!pageName || !pageWritable(pageName)) return { kind: "refused", toast: managedBulkUnavailableToast };
+  const page = pageByName(pageName);
+  const targetGeneration = pageInstanceGeneration(pageName);
+  if (!page || targetGeneration === null) return { kind: "refused", toast: managedBulkUnavailableToast };
+  const limits: ManagedBulkAdmissionLimits = {
+    applicationSavePageBlocks: admission.application_save_page_blocks,
+    applicationPageRequestTextBytes: admission.application_page_request_text_bytes,
+    applicationPageMaxDepth: admission.application_page_max_depth,
+  };
+  const plan = buildPlan(limits);
+  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
+  const exceedsBlockLimit =
+    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+      > limits.applicationSavePageBlocks;
+  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
+    && plan.insertionRootDepth + plan.maximumInputRelativeDepth - 1
+      > limits.applicationPageMaxDepth;
+  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
+  if (exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit) {
+    return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
+  }
+
+  const token: InternalBulkInsertionAdmission = {
+    [bulkInsertionAdmissionSeal]: true,
+    consumed: false,
+    targetId,
+    targetNode: target ? unwrap(target) : null,
+    targetPage: pageName,
+    targetGeneration,
+    graphEpoch: graphEpoch(),
+    graphRoot: graphMeta()?.root ?? "",
+    bindingGeneration: admission.binding_generation,
+    authority: admission.authority,
+    plan,
+  };
+  return { kind: "admitted", token };
+}
+
+/** Consume an admission immediately before its selected store publication. */
+export function consumeManagedBulkInsertionAdmission(
+  token: BulkInsertionAdmission,
+  targetId: string | null,
+): boolean {
+  const internal = token as InternalBulkInsertionAdmission;
+  if (!internal[bulkInsertionAdmissionSeal] || internal.consumed || internal.targetId !== targetId) return false;
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const target = targetId === null ? null : doc.byId[targetId];
+  if (
+    !admission
+    || admission.authority !== "managed_writable"
+    || admission.binding_generation !== internal.bindingGeneration
+    || internal.authority !== admission.authority
+    || (targetId === null
+      ? internal.targetNode !== null
+      : !target
+        || unwrap(target) !== internal.targetNode
+        || target.page !== internal.targetPage)
+    || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
+    || graphEpoch() !== internal.graphEpoch
+    || (graphMeta()?.root ?? "") !== internal.graphRoot
+  ) return false;
+  internal.consumed = true;
+  return true;
+}
+
+export function reportManagedBulkInsertionRefusal(toast: string): void {
+  pushToast(toast, "error");
+}
+
 // ---------------------------------------------------------------------------
 // Undo / redo (snapshot-based; typing in one block coalesces to one step)
 // ---------------------------------------------------------------------------
@@ -951,6 +1888,8 @@ interface SnapEntry {
   nodes: Record<string, Node>; // snapshot of nodes living on those pages
   dirty: string[]; // pages to re-save on undo/redo
   context: HistoryContext;
+  /** Page-instance generations this entry was recorded against (GH #305). */
+  instances: Record<string, number>;
   /** Identity-bearing clipboard paste whose redo must fail on a live conflict. */
   preservedIds?: string[];
 }
@@ -965,6 +1904,8 @@ interface RawEntry {
   headerRoot?: { node: Node; rootIndex: number };
   removeHeaderOnApply?: boolean;
   context: HistoryContext;
+  /** Page-instance generations this entry was recorded against (GH #305). */
+  instances: Record<string, number>;
   preservedIds?: string[];
 }
 type UndoEntry = SnapEntry | RawEntry;
@@ -972,6 +1913,107 @@ const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
 let undoSuppressionDepth = 0;
+
+/**
+ * Repeated selection moves have a deliberately narrower coalescing rule than
+ * ordinary structural commands. Every key repeat still changes the live Solid
+ * document immediately; this ledger only lets the repeats share their first
+ * page-scoped undo snapshot.
+ */
+interface MoveSelectionBurst {
+  /** Ordered top-level selection roots. A set is insufficient: order is state. */
+  roots: string[];
+  /** Sorted exact page-instance scope captured by the first nudge. */
+  pages: Array<{ name: string; instance: number }>;
+  /** Prevents reuse across Undo/Redo/history replacement. */
+  historyEpoch: number;
+  startedAt: number;
+  lastCommandAt: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+}
+
+let moveSelectionBurst: MoveSelectionBurst | null = null;
+let historyEpoch = 0;
+const MOVE_SELECTION_BURST_IDLE_MS = 400;
+const MOVE_SELECTION_BURST_MAX_MS = 3_000;
+
+function endMoveSelectionBurst(): void {
+  const idleTimer = moveSelectionBurst?.idleTimer;
+  if (idleTimer !== null && idleTimer !== undefined) clearTimeout(idleTimer);
+  moveSelectionBurst = null;
+}
+
+function advanceHistoryEpoch(): void {
+  historyEpoch++;
+}
+
+function armMoveSelectionBurstIdleTimer(burst: MoveSelectionBurst): void {
+  if (burst.idleTimer !== null) clearTimeout(burst.idleTimer);
+  burst.idleTimer = setTimeout(() => {
+    // A later repeat arms a different timer; an obsolete timer must not close it.
+    if (moveSelectionBurst !== burst) return;
+    if (Date.now() - burst.lastCommandAt >= MOVE_SELECTION_BURST_IDLE_MS) endMoveSelectionBurst();
+  }, MOVE_SELECTION_BURST_IDLE_MS);
+}
+
+function currentMoveSelectionScope(ids: readonly string[]): Array<{ name: string; instance: number }> | null {
+  const names = [...new Set(ids.map((id) => doc.byId[id]?.page).filter(Boolean) as string[])].sort();
+  const pages: Array<{ name: string; instance: number }> = [];
+  for (const name of names) {
+    const instance = pageInstanceGeneration(name);
+    if (instance === null) return null;
+    pages.push({ name, instance });
+  }
+  return pages;
+}
+
+function sameMoveSelectionScope(
+  left: readonly { name: string; instance: number }[],
+  right: readonly { name: string; instance: number }[],
+): boolean {
+  return left.length === right.length
+    && left.every((page, index) => page.name === right[index]?.name && page.instance === right[index]?.instance);
+}
+
+/**
+ * Start a fresh selection-move undo gesture, or reuse its first snapshot for a
+ * matching short repeat. Up and Down deliberately share this command family:
+ * reversing direction is still one continuous selection-move gesture.
+ */
+function beginOrContinueMoveSelectionUndo(ids: readonly string[]): string[] | null {
+  const pages = currentMoveSelectionScope(ids);
+  if (!pages?.length) return null;
+  const now = Date.now();
+  const current = moveSelectionBurst;
+  const matching = current
+    && current.historyEpoch === historyEpoch
+    && current.roots.length === ids.length
+    && current.roots.every((id, index) => id === ids[index])
+    && sameMoveSelectionScope(current.pages, pages)
+    && now - current.lastCommandAt < MOVE_SELECTION_BURST_IDLE_MS
+    && now - current.startedAt < MOVE_SELECTION_BURST_MAX_MS;
+  if (matching) {
+    current.lastCommandAt = now;
+    armMoveSelectionBurstIdleTimer(current);
+    return pages.map((page) => page.name);
+  }
+
+  endMoveSelectionBurst();
+  // This one call opts out of the generic undo reset below. It is the only
+  // structural command allowed to retain a previous snapshot.
+  pushUndo("move-sel", pages.map((page) => page.name), undefined, { keepMoveSelectionBurst: true });
+  const burst: MoveSelectionBurst = {
+    roots: [...ids],
+    pages,
+    historyEpoch,
+    startedAt: now,
+    lastCommandAt: now,
+    idleTimer: null,
+  };
+  moveSelectionBurst = burst;
+  armMoveSelectionBurstIdleTimer(burst);
+  return pages.map((page) => page.name);
+}
 
 // Session-scoped and global by default, matching OG's transient app-state flag
 // at `src/main/frontend/state.cljs:304-306` (OG commit 6e7afa8eb).
@@ -1027,6 +2069,8 @@ function captureHistoryContext(): HistoryContext {
 /** Discard all undo/redo history. Called on graph switch/reset so old-graph
  *  snapshots can't be replayed into a different graph. */
 export function clearUndoHistory() {
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
   undoStack.length = 0;
   redoStack = [];
   lastUndoTag = null;
@@ -1039,6 +2083,46 @@ export function clearUndoHistory() {
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
   return e.pages === null || e.pages.includes(name);
+}
+
+/** The page-instance generations an entry is being recorded against.
+ *
+ *  An undo entry describes ONE loaded instance of each page it touches. Eviction
+ *  deliberately keeps history, and re-opening the page installs a fresh instance
+ *  carrying whatever the file says NOW — so replaying the old entry would restore
+ *  pre-eviction content and mark the page dirty, and the save guard would accept
+ *  it, because the baseline it submits under genuinely matches disk. Nothing in
+ *  that path looks like a conflict. Stamping the generation makes the staleness
+ *  visible at replay time, and covers every other way an instance is swapped
+ *  (reload, rebind, forget) rather than only the reload-in-place path
+ *  `invalidateUndoForPage` already handles. (GH #305) */
+function captureInstances(names: readonly string[]): Record<string, number> {
+  const instances: Record<string, number> = {};
+  for (const name of names) {
+    const generation = pageInstanceGeneration(name);
+    if (generation !== null) instances[name] = generation;
+  }
+  return instances;
+}
+
+/** True when every page the entry describes is still the same loaded instance. */
+function entryIsReplayable(e: UndoEntry): boolean {
+  for (const name of Object.keys(e.instances)) {
+    // peek, never the lazily-activating reader: minting a generation here would
+    // make the check pass by inventing the identity it is supposed to compare.
+    if (peekPageInstanceGeneration(name) !== e.instances[name]) return false;
+  }
+  return true;
+}
+
+/** Drop the popped stale entry's whole page history and say so once. Silence
+ *  would read as "undo did nothing", which is how this class of bug hides. */
+function discardStaleHistory(e: UndoEntry): void {
+  for (const name of Object.keys(e.instances)) {
+    if (peekPageInstanceGeneration(name) !== e.instances[name]) invalidateUndoForPage(name);
+  }
+  lastUndoTag = null;
+  pushToast("Undo history for this page was discarded: the page was reloaded since those edits", "info");
 }
 
 /** The page owning the active editor wins over the focused pane's route. This is
@@ -1079,6 +2163,12 @@ function popHistoryEntry(stack: UndoEntry[]): UndoEntry | undefined {
  *  cost an unrelated co-snapshotted page its undo step, which is the safe tradeoff
  *  (lose an undo vs. clobber a file). */
 export function invalidateUndoForPage(name: string) {
+  // A page-instance replacement is a history boundary for the whole working
+  // set, not only for bursts whose snapshot named that page. An unrelated
+  // sidebar/watcher reload still changes the history episode; allowing an
+  // active move gesture to span it can reuse a pre-reload snapshot afterwards.
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
   for (let i = undoStack.length - 1; i >= 0; i--) {
     if (entryTouchesPage(undoStack[i], name)) undoStack.splice(i, 1);
   }
@@ -1102,6 +2192,11 @@ function clonePages(src: FeedPage[]): FeedPage[] {
   return src.map((p) => ({ ...p, roots: p.roots.slice() }));
 }
 function snapEntry(affected?: string[] | null, preservedIds?: readonly string[]): SnapEntry {
+  // Vite replaces MODE at build time, so this diagnostic is dead-code-eliminated
+  // from production snapshots rather than adding an observer check to undo.
+  if (import.meta.env.MODE === "test") {
+    storeMutationObserverForTest?.({ kind: "undo-snapshot" });
+  }
   const context = captureHistoryContext();
   // null/omitted → snapshot the whole working set (safe fallback). Otherwise just
   // the named pages: their FeedPage objects + every node living on them.
@@ -1125,6 +2220,12 @@ function snapEntry(affected?: string[] | null, preservedIds?: readonly string[])
     if (nameSet.has(p.name)) for (const r of p.roots) visit(r);
   }
   const pageObjs = clonePages(pages.filter((p) => nameSet.has(p.name)));
+  if (import.meta.env.MODE === "test") {
+    recordClipboardUndoSnapshotForTest(
+      Object.keys(nodes).length,
+      Object.values(nodes).reduce((total, node) => total + new TextEncoder().encode(node.raw).byteLength, 0),
+    );
+  }
   return {
     kind: "snap",
     pages: affected ?? null,
@@ -1132,6 +2233,7 @@ function snapEntry(affected?: string[] | null, preservedIds?: readonly string[])
     nodes,
     dirty: names,
     context,
+    instances: captureInstances(names),
     ...(preservedIds?.length ? { preservedIds: [...preservedIds] } : {}),
   };
 }
@@ -1142,8 +2244,15 @@ function snapEntry(affected?: string[] | null, preservedIds?: readonly string[])
  *  but O(loaded pages)). The affected set MUST include every page whose nodes the
  *  op changes, including a cross-page move's source AND destination, or undo
  *  would miss a page. `tag` resets the typing-coalesce marker. */
-function pushUndo(tag: string, affected?: string[], preservedIds?: readonly string[]) {
+function pushUndo(
+  tag: string,
+  affected?: string[],
+  preservedIds?: readonly string[],
+  opts: { keepMoveSelectionBurst?: boolean } = {},
+) {
   if (undoSuppressionDepth > 0) return;
+  if (!opts.keepMoveSelectionBurst) endMoveSelectionBurst();
+  advanceHistoryEpoch();
   undoStack.push(snapEntry(affected, preservedIds));
   if (undoStack.length > 200) undoStack.shift();
   redoStack = [];
@@ -1154,6 +2263,8 @@ function pushUndo(tag: string, affected?: string[], preservedIds?: readonly stri
  *  burst in one block coalesces to a single entry holding the pre-burst text. */
 function pushRawUndo(id: string, prevRaw: string) {
   if (undoSuppressionDepth > 0) return;
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
   const tag = `type:${id}`;
   if (tag === lastUndoTag) return; // mid-burst: keep the first (pre-burst) raw
   const node = doc.byId[id];
@@ -1166,6 +2277,7 @@ function pushRawUndo(id: string, prevRaw: string) {
     raw: prevRaw,
     page: node.page,
     context: captureHistoryContext(),
+    instances: captureInstances([node.page]),
     ...(rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
   });
   if (undoStack.length > 200) undoStack.shift();
@@ -1186,6 +2298,7 @@ function applyEntry(e: UndoEntry): UndoEntry {
       raw: node ? node.raw : "",
       page: e.page,
       context: captureHistoryContext(),
+      instances: captureInstances([e.page]),
       ...(node && rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
       ...(e.preservedIds?.length ? { preservedIds: [...e.preservedIds] } : {}),
     };
@@ -1281,8 +2394,11 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
 }
 
 export function undo() {
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
   const entry = popHistoryEntry(undoStack);
   if (!entry) return;
+  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
@@ -1291,9 +2407,12 @@ export function undo() {
 }
 
 export function redo() {
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
   const entry = popHistoryEntry(redoStack);
   if (!entry) return;
-  if (entry.preservedIds?.some(docHasBlockIdentity)) {
+  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
+  if (entry.preservedIds && hasLoadedIdentityCollision(entry.preservedIds)) {
     // The selected prerequisite is already popped. A later redo snapshot cannot
     // remain valid without it, including in page-only mode where the tagged
     // entry may have been selected from the middle of the global stack.
@@ -1770,6 +2889,71 @@ export function replaceEmptyBlockWithOutline(id: string, nodes: OutlineNode[]): 
   return lastId;
 }
 
+/** Replace a leaf slash-template trigger with its expanded outline in one
+ * publication. This is deliberately narrower than the generic insertion
+ * helpers: selected template admission has already accounted for reusing this
+ * host, so it must not first create an over-limit temporary sibling. */
+export function replaceTemplateTriggerWithOutline(id: string, nodes: OutlineNode[]): string {
+  const current = doc.byId[id];
+  if (!nodes.length || !current || current.children.length || !blockWritable(id)) return id;
+  const format = formatForBlock(id);
+  const hidden = splitProps(current.raw, isBuiltinHidden, format).hidden;
+  let lastId = id;
+  setDoc(produce((state) => {
+    const create = (outline: OutlineNode, parent: string | null, reuseId?: string): string => {
+      const created = reuseId ?? freshId();
+      const children = outline.children.map((child) => create(child, created));
+      const sourceRaw = reuseId ? joinProps(outline.raw, hidden, format) : outline.raw;
+      state.byId[created] = {
+        id: created,
+        raw: rawWithInheritedOrderListType(sourceRaw, format, id),
+        collapsed: false,
+        parent,
+        page: current.page,
+        children,
+      };
+      return created;
+    };
+    const created = nodes.map((node, index) => create(node, current.parent, index === 0 ? id : undefined));
+    const siblings = current.parent === null
+      ? state.pages[state.pages.findIndex((page) => page.name === current.page)].roots
+      : state.byId[current.parent].children;
+    siblings.splice(siblings.indexOf(id), 1, ...created);
+    lastId = created[created.length - 1];
+  }));
+  markDirty(current.page);
+  return lastId;
+}
+
+/** Materialize a parsed quick-capture outline as the first roots of an empty
+ * page. The caller owns one undo unit; no empty anchor is ever published. */
+function insertCaptureOutlineIntoEmptyPage(pageName: string, nodes: OutlineNode[]): string | null {
+  const page = pageByName(pageName);
+  if (!page || page.roots.length || !nodes.length || !pageWritable(pageName)) return null;
+  const format = formatForPage(pageName);
+  let lastId: string | null = null;
+  setDoc(produce((state) => {
+    const create = (outline: OutlineNode, parent: string | null): string => {
+      const id = freshId();
+      const children = outline.children.map((child) => create(child, id));
+      state.byId[id] = {
+        id,
+        raw: rawWithInheritedOrderListType(outline.raw, format, null),
+        collapsed: false,
+        parent,
+        page: pageName,
+        children,
+      };
+      return id;
+    };
+    const roots = nodes.map((node) => create(node, null));
+    state.pages[state.pages.findIndex((candidate) => candidate.name === pageName)].roots.push(...roots);
+    lastId = roots[roots.length - 1] ?? null;
+  }));
+  markDirty(pageName);
+  return lastId;
+}
+
 type ClipboardProperty = { key: string; value: string };
 
 function clipboardProperties(raw: string, format: Format): ClipboardProperty[] {
@@ -1860,11 +3044,20 @@ function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boo
     && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
 }
 
+function clipboardTargetReusesEmptyHost(target: Node, targetFormat: Format): boolean {
+  const visible = splitProps(target.raw, isBuiltinHidden, targetFormat).visible;
+  return target.children.length === 0
+    && visible.trim() === ""
+    && existingBlockId(target.raw, targetFormat) === null
+    && !liveDocReferences(target.id);
+}
+
 function insertClipboardBlocksSync(
   targetId: string,
   blocks: readonly ClipboardBlock[],
   preserveIds: boolean,
   preservedIds: readonly string[],
+  reuseEmptyHost?: boolean,
 ): string | null {
   const target = doc.byId[targetId];
   if (!blocks.length || !target || !blockWritable(targetId)) return null;
@@ -1875,6 +3068,7 @@ function insertClipboardBlocksSync(
     collapsed: boolean;
     children: ReturnType<typeof prepare>[];
   } {
+    if (import.meta.env.MODE === "test") recordClipboardWorkForTest("prepared_destination_nodes");
     const sourceIds = clipboardIdsForBlock(block);
     return {
       id: preserveIds && sourceIds.length === 1 ? sourceIds[0].toLowerCase() : freshId(),
@@ -1883,18 +3077,19 @@ function insertClipboardBlocksSync(
       children: block.children.map(prepare),
     };
   });
-  const visible = splitProps(target.raw, isBuiltinHidden, targetFormat).visible;
-  const replaceHost = target.children.length === 0
-    && visible.trim() === ""
-    && existingBlockId(target.raw, targetFormat) === null
-    && !liveDocReferences(targetId);
+  const replaceHost = reuseEmptyHost ?? clipboardTargetReusesEmptyHost(target, targetFormat);
   const parent = target.parent;
   const pageName = target.page;
   let lastId: string | null = null;
 
+  if (import.meta.env.MODE === "test") {
+    recordClipboardWorkForTest("target_insertion_phases");
+    recordClipboardPhaseForTest("target-insertion");
+  }
   pushUndo("clipboard-paste", [pageName], preserveIds ? preservedIds : []);
   setDoc(produce((state) => {
     const create = (block: typeof prepared[number], blockParent: string | null): string => {
+      if (import.meta.env.MODE === "test") recordClipboardWorkForTest("allocated_destination_nodes");
       const children = block.children.map((child) => create(child, block.id));
       state.byId[block.id] = {
         id: block.id,
@@ -1931,8 +3126,27 @@ export function pasteClipboardPayload(
   slot: ClipboardPayloadSlot,
 ): Promise<string | null> {
   const authority = captureClipboardPasteAuthority(targetId);
-  const grant = slot.op === "cut" ? consumeCutGrant(slot.generation) : null;
   if (!authority) return Promise.resolve(null);
+
+  let managedReuseEmptyHost: boolean | null = null;
+  const admission = preflightManagedBulkInsertion(targetId, (limits) => {
+    const target = doc.byId[targetId]!;
+    managedReuseEmptyHost = clipboardTargetReusesEmptyHost(target, formatForPage(target.page));
+    return managedBulkOutlinePlan(
+      slot.blocks,
+      depthOf(targetId) + 1,
+      managedReuseEmptyHost ? 1 : 0,
+      limits,
+    );
+  });
+  if (admission.kind === "refused") {
+    reportManagedBulkInsertionRefusal(admission.toast);
+    return Promise.resolve(null);
+  }
+
+  // This must remain after the initial synchronous admission: a known target
+  // overflow leaves a Cut grant intact for a smaller retry.
+  const grant = slot.op === "cut" ? consumeCutGrant(slot.generation) : null;
 
   const idLists: string[][] = [];
   const visit = (block: ClipboardBlock) => {
@@ -1953,11 +3167,19 @@ export function pasteClipboardPayload(
       && slot.graph === authority.root;
 
     if (preserveIds) {
+      if (import.meta.env.MODE === "test") {
+        recordClipboardWorkForTest("source_retirement_phases");
+        recordClipboardPhaseForTest("source-retirement");
+      }
       preserveIds = await flushCutSourcePages(grant!.sourcePages);
       if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
     }
     if (preserveIds) {
       try {
+        if (import.meta.env.MODE === "test") {
+          recordClipboardWorkForTest("resolve_blocks_phases");
+          recordClipboardPhaseForTest("resolve-blocks");
+        }
         const resolved = await backend().resolveBlocks(normalizedIds);
         preserveIds = resolved.length === normalizedIds.length && resolved.every((block) => block === null);
       } catch {
@@ -1969,10 +3191,26 @@ export function pasteClipboardPayload(
     // synchronous and insertion follows immediately with no await boundary.
     if (!clipboardPasteAuthorityCurrent(authority)) return null;
     if (preserveIds) {
+      if (import.meta.env.MODE === "test") {
+        recordClipboardWorkForTest("final_identity_guard_phases");
+        recordClipboardPhaseForTest("final-identity-guard");
+      }
       preserveIds = cutSourcePagesRetired(grant!.sourcePages)
-        && normalizedIds.every((id) => !docHasBlockIdentity(id));
+        && !hasLoadedIdentityCollision(normalizedIds);
     }
-    return insertClipboardBlocksSync(targetId, slot.blocks, preserveIds, preserveIds ? normalizedIds : []);
+    if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
+      return null;
+    }
+    const reuseEmptyHost = admission.kind === "admitted"
+      ? managedReuseEmptyHost!
+      : clipboardTargetReusesEmptyHost(doc.byId[targetId], formatForPage(doc.byId[targetId].page));
+    return insertClipboardBlocksSync(
+      targetId,
+      slot.blocks,
+      preserveIds,
+      preserveIds ? normalizedIds : [],
+      reuseEmptyHost,
+    );
   })();
 }
 
@@ -2006,34 +3244,42 @@ export async function captureToPage(title: string, markdown: string): Promise<bo
 async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNode[]): Promise<boolean> {
   if (!nodes.length) return false;
   if (!pageByName(name)) {
+    const binding = graphBinding();
     const dto: PageDto =
       (await backend().getPage(name, kind)) ??
       { name, kind, title: name, pre_block: null, blocks: [], rev: null };
-    ensurePageLoaded(dto);
+    // Stop on a refusal rather than falling through to `pageByName` for the name
+    // slot: that would append the capture into whichever editor is loaded under
+    // this name, which on a refusal is a DIFFERENT file. Returning false keeps
+    // the capture text where the caller can retry it. (GH #254 increment 3.)
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding })) return false;
   }
   const page = pageByName(name);
   if (!page || !pageWritable(name)) return false;
+  const insertionTarget = page.roots.length ? page.roots[page.roots.length - 1] : null;
+  const admission = preflightManagedBulkInsertion(
+    insertionTarget,
+    (limits) => managedBulkOutlinePlan(
+      nodes,
+      insertionTarget === null ? 1 : depthOf(insertionTarget) + 1,
+      0,
+      limits,
+    ),
+    name,
+  );
+  if (admission.kind === "refused") {
+    reportManagedBulkInsertionRefusal(admission.toast);
+    return false;
+  }
+  if (
+    admission.kind === "admitted"
+    && !consumeManagedBulkInsertionAdmission(admission.token, insertionTarget)
+  ) return false;
   if (page.roots.length) {
     // Append after the last top-level block (end of the page).
-    insertOutlineAfter(page.roots[page.roots.length - 1], nodes);
+    insertOutlineAfter(insertionTarget!, nodes);
   } else {
-    // Empty (or brand-new) page: seed an empty anchor root, append after it, then
-    // drop the anchor — reuses insertOutlineAfter's subtree creation rather than a
-    // bespoke root builder. One undo unit: the anchor/insert/delete sequence used
-    // to push three undo entries, so one undo left the anchor + row behind
-    // (Phase-6 review finding, validated).
-    withUndoUnit("capture", [name], () => {
-      const anchor = freshId();
-      setDoc(
-        produce((s) => {
-          s.byId[anchor] = { id: anchor, raw: "", collapsed: false, parent: null, page: name, children: [] };
-          s.pages[s.pages.findIndex((p) => p.name === name)].roots.push(anchor);
-        })
-      );
-      markDirty(name);
-      insertOutlineAfter(anchor, nodes);
-      deleteBlock(anchor);
-    });
+    withUndoUnit("capture", [name], () => insertCaptureOutlineIntoEmptyPage(name, nodes));
   }
   return await flushPage(name);
 }
@@ -2397,6 +3643,18 @@ const setMarkdownHeading = (raw: string, level: number): string => {
     : prefix + raw.trimStart();
 };
 
+/** Pure format-aware heading transition shared by single-block and selection
+ * commands so their Markdown/Org serialization cannot drift apart. */
+function rawWithHeading(raw: string, format: Format, state: HeadingState): string {
+  const level = typeof state === "number" && state >= 1 && state <= 6 ? state : null;
+  if (format === "org") {
+    return orgRawWithProperty(raw, "heading", state === true ? "true" : level === null ? null : String(level));
+  }
+  if (state === true) return markdownRawWithProperty(clearMarkdownHeading(raw), "heading", "true");
+  if (level !== null) return setMarkdownHeading(markdownRawWithProperty(raw, "heading", null), level);
+  return markdownRawWithProperty(clearMarkdownHeading(raw), "heading", null);
+}
+
 /** Switch between boolean automatic headings and explicit numeric headings.
  * Markdown writes ATX prefixes for numeric state and `heading:: true` for auto;
  * Org writes both states through its property drawer. Each transition clears the
@@ -2407,21 +3665,35 @@ const setMarkdownHeading = (raw: string, level: number): string => {
 export function setHeading(id: string, state: HeadingState) {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return;
-  const level = typeof state === "number" && state >= 1 && state <= 6 ? state : null;
-  let next: string;
-  if (formatForBlock(id) === "org") {
-    next = orgRawWithProperty(node.raw, "heading", state === true ? "true" : level === null ? null : String(level));
-  } else if (state === true) {
-    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", "true");
-  } else if (level !== null) {
-    next = setMarkdownHeading(markdownRawWithProperty(node.raw, "heading", null), level);
-  } else {
-    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", null);
-  }
+  const next = rawWithHeading(node.raw, formatForBlock(id), state);
   if (next === node.raw) return;
   pushUndo(`heading:${id}`, [node.page]);
   setDoc("byId", id, "raw", next);
   markDirty(node.page);
+}
+
+/** Apply a context heading command to the active selection, falling back to the
+ * pointer block only when no selection is active. The preflight makes a mixed
+ * writable/read-only selection an exact no-op. */
+export function setSelectionHeading(pointerId: string, state: HeadingState): boolean {
+  const selected = selectedIds();
+  const ids = selected.length ? selected : [pointerId];
+  if (!ids.length || ids.some((id) => !blockWritable(id))) return false;
+
+  const changes = ids.map((id) => ({
+    id,
+    page: doc.byId[id].page,
+    raw: rawWithHeading(doc.byId[id].raw, formatForBlock(id), state),
+  })).filter((change) => change.raw !== doc.byId[change.id].raw);
+  if (!changes.length) return true;
+
+  const pages = [...new Set(changes.map((change) => change.page))];
+  pushUndo("heading-selection", pages);
+  setDoc(produce((stateDoc) => {
+    for (const change of changes) stateDoc.byId[change.id].raw = change.raw;
+  }));
+  for (const page of pages) markDirty(page);
+  return true;
 }
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -2810,17 +4082,117 @@ export async function persistBlockRefTarget(
   path?: string,
 ): Promise<void> {
   const ref: LoadedBlockRef = { uuid, page, pageKind: kind, ...(path ? { path } : {}) };
+  // The GRAPH BINDING, not the render epoch: toggling typography or the journal
+  // format bumps the epoch without the graph moving, and dropping a committed
+  // reference's request because the user changed a display preference is loss
+  // with no safety benefit at all. (GH #254 increment 3, round 12.)
+  const epoch = graphBinding();
   if (!resolveBlockRef(ref)) {
     const dto = path
       ? await backend().getPageByPath(path)
       : await backend().getPage(page, kind);
-    if (dto) ensurePageLoaded(dto);
+    // A read that crossed a graph switch must not install into the NEW graph.
+    if (epoch !== graphBinding()) return;
+    // Nor may one that crossed a DELETION. This read may have been issued before
+    // the user deleted the page; installing its pre-delete bytes puts the page
+    // back, and `upsertPage` lifts the tombstone as it does so, after which the
+    // stamp's own save recreates the file the user just deleted — with stale
+    // content. Routing deletion through the store exists precisely to stop a
+    // queued write resurrecting a page, and this is the same hazard arriving by
+    // a different door. (GH #254 increment 3.)
+    // Path-aware, not name-level: two files legitimately share one page name, and
+    // deleting one must not refuse the other. Refusing by name loses the surviving
+    // owner's durable target — work lost rather than protected.
+    if (isTombstonedFile(page, dto?.path ?? path)) {
+      // RETAIN, don't discard. A tombstone is raised BEFORE the backend delete
+      // and lifted again if that delete fails (an ambiguous by-name delete of a
+      // duplicated page name is rejected by core). Dropping the request here
+      // threw away an already-committed reference's durable target on a delete
+      // that never happened. Retaining costs nothing: the retry re-checks the
+      // tombstone before it reads, so while the page stays deleted this waits
+      // silently, and it re-drives if the page comes back.
+      retainStamp({ uuid, page, kind, path, epoch });
+      return;
+    }
+    if (dto && await ensurePageLoaded(dto, { expectedGraphBinding: epoch })) {
+      // RETAIN the request. The user-visible mutation has already happened —
+      // autocomplete committed `((uuid))`, or the sidebar item is already open —
+      // and this stamp is what makes those survive a restart. Skipping it leaves
+      // a reference that resolves now and is gone after a restart; rolling it
+      // back would undo what the user just typed.
+      //
+      // Driven by the "became replaceable" transition, NOT by polling on
+      // unrelated saves: three poll-shaped designs were each reproduced failing,
+      // and the liveness half is why — a request stranded whenever the incumbent
+      // resolved through a route that produced no such save.
+      // (GH #254 increment 3, acceptance row C5.)
+      retainStamp({ uuid, page, kind, path, epoch });
+      return;
+    }
   }
   // Re-check: a concurrent navigation may have loaded the page meanwhile, or the
   // cache may have been rebuilt (external change) and reassigned the block a new
   // uuid — in which case there's nothing safe to stamp.
   const id = resolveBlockRef(ref);
-  if (id) ensureStableBlockId(id);
+  if (id) {
+    pendingBlockRefStamps.delete(uuid);
+    ensureStableBlockId(id);
+  }
+}
+
+/** Stamps deferred by a refused replacement, keyed by the referenced uuid. */
+const pendingBlockRefStamps = new Map<
+  string,
+  { uuid: string; page: string; kind: PageKind; path?: string; epoch: number }
+>();
+
+type PendingStamp = {
+  uuid: string;
+  page: string;
+  kind: PageKind;
+  path?: string;
+  epoch: number;
+};
+
+/** Stop-handles for the armed watchers, so re-retaining one request replaces its
+ *  watcher instead of stacking a second one that would re-read the same page. */
+const stampWatchers = new Map<string, () => void>();
+
+/** Is a deferred stamp still waiting? The distinction that matters is "retained"
+ *  versus "dropped": a retained request will resume, a dropped one is work the
+ *  user committed and silently lost. Nothing else can observe that difference. */
+export function hasPendingBlockRefStamp(uuid: string): boolean {
+  return pendingBlockRefStamps.has(uuid);
+}
+
+/** A retained stamp belongs to the graph that deferred it. */
+export function clearPendingBlockRefStamps(): void {
+  pendingBlockRefStamps.clear();
+  stampWatchers.clear();
+  clearReplaceableWatchers();
+}
+
+/** Hold a deferred stamp and (re-)arm exactly one watcher for it. */
+function retainStamp(req: PendingStamp) {
+  stampWatchers.get(req.uuid)?.();
+  pendingBlockRefStamps.set(req.uuid, req);
+  const stop = onPageBecameReplaceable(req.page, () => {
+    // Stay armed and read nothing only when the tombstone PROVABLY covers this
+    // request — which means the request itself names the deleted file. Anything
+    // weaker is unsound: a request that cannot name its file must READ, because
+    // nothing else can tell it the page came back. (Caching the file a previous
+    // read found looks like a cheap way to skip that read, and is wrong: an
+    // unloaded page recreated at a DIFFERENT path never upserts, so the
+    // tombstone is never lifted and the cached path refuses forever. Re-reading
+    // on each announcement is the price of not stranding the request.)
+    if (tombstoneCovers(req.page, req.path)) return;
+    stop();
+    stampWatchers.delete(req.uuid);
+    pendingBlockRefStamps.delete(req.uuid);
+    if (req.epoch !== graphBinding()) return;
+    void persistBlockRefTarget(req.uuid, req.page, req.kind, req.path);
+  });
+  stampWatchers.set(req.uuid, stop);
 }
 
 /** Serialize a block (and, normally, its subtree) to Logseq markdown.
@@ -2840,6 +4212,10 @@ export function blockSubtreeMarkdown(
 ): string {
   const n = doc.byId[id];
   if (!n) return "";
+  if (import.meta.env.MODE === "test") {
+    recordClipboardWorkForTest("public_markdown_visits");
+    recordClipboardWorkForTest("public_markdown_raw_bytes", new TextEncoder().encode(n.raw).byteLength);
+  }
   const format = formatForBlock(id);
   const strip = stripId || stripCollapsed;
   const raw = strip
@@ -2891,6 +4267,10 @@ export function buildClipboardPayload(ids: string[]): ClipboardPayloadData | nul
   const build = (id: string): ClipboardBlock | null => {
     const node = doc.byId[id];
     if (!node) return null;
+    if (import.meta.env.MODE === "test") {
+      recordClipboardWorkForTest("private_payload_visits");
+      recordClipboardWorkForTest("private_payload_raw_bytes", new TextEncoder().encode(node.raw).byteLength);
+    }
     blockCount++;
     rawBytes += encoder.encode(node.raw).byteLength;
     if (blockCount > CLIPBOARD_PAYLOAD_MAX_BLOCKS || rawBytes > CLIPBOARD_PAYLOAD_MAX_RAW_BYTES) return null;
@@ -3043,6 +4423,18 @@ export function ensureEmptyBlock(pageName: string, opts: { afterProperties?: boo
 const [selAnchor, setSelAnchor] = createSignal<string | null>(null);
 const [selFocus, setSelFocus] = createSignal<string | null>(null);
 
+/** Selection endpoints are part of the move gesture identity even when their
+ * normalized `topSelected()` roots happen to stay the same (for example moving
+ * focus from a selected child back to its selected parent). */
+function setSelectionAnchor(next: string | null): void {
+  if (selAnchor() !== next) endMoveSelectionBurst();
+  setSelAnchor(next);
+}
+function setSelectionFocus(next: string | null): void {
+  if (selFocus() !== next) endMoveSelectionBurst();
+  setSelFocus(next);
+}
+
 /** True when `ancestor` is a strict ancestor of `id` in the block tree. */
 function isAncestorId(ancestor: string, id: string): boolean {
   let p = doc.byId[id]?.parent ?? null;
@@ -3106,12 +4498,12 @@ export function selectBlock(id: string, scope: OutlineScope | null = null) {
   notifyOutlineSelectionStarted(id);
   activeSelectionScope = scope;
   selectAllHead = null;
-  setSelAnchor(id);
-  setSelFocus(id);
+  setSelectionAnchor(id);
+  setSelectionFocus(id);
 }
 export function clearSelection() {
-  setSelAnchor(null);
-  setSelFocus(null);
+  setSelectionAnchor(null);
+  setSelectionFocus(null);
   activeSelectionScope = null;
   selectAllHead = null;
 }
@@ -3121,11 +4513,11 @@ export function extendSelectionTo(id: string, scope: OutlineScope | null = activ
   notifyOutlineSelectionStarted(id);
   if (selAnchor() === null) {
     activeSelectionScope = scope;
-    setSelAnchor(id);
+    setSelectionAnchor(id);
   }
   if (activeSelectionScope && !scopedVisibleOrder(activeSelectionScope).includes(id)) return;
   selectAllHead = null;
-  setSelFocus(id);
+  setSelectionFocus(id);
 }
 export function hasSelection(): boolean {
   return selAnchor() !== null;
@@ -3139,8 +4531,8 @@ export function moveSelection(dir: 1 | -1, extend: boolean) {
   if (ni < 0 || ni >= order.length) return;
   const next = order[ni];
   selectAllHead = null;
-  setSelFocus(next);
-  if (!extend) setSelAnchor(next);
+  setSelectionFocus(next);
+  if (!extend) setSelectionAnchor(next);
   scrollBlockRowIntoView(next);
 }
 
@@ -3152,7 +4544,7 @@ export function selectBlockSubtree(id: string, scope: OutlineScope | null = null
   const order = selectionOrder(id);
   const idx = order.indexOf(id);
   if (idx < 0) return;
-  setSelFocus(order[subtreeEndIndex(order, idx)]);
+  setSelectionFocus(order[subtreeEndIndex(order, idx)]);
   selectAllHead = id;
 }
 
@@ -3182,14 +4574,14 @@ export function expandBlockSelection() {
       head = parent;
       idx = order.indexOf(head);
     } else {
-      setSelAnchor(order[0]);
-      setSelFocus(order[order.length - 1]);
+      setSelectionAnchor(order[0]);
+      setSelectionFocus(order[order.length - 1]);
       selectAllHead = null;
       return;
     }
   }
-  setSelAnchor(head);
-  setSelFocus(order[subtreeEndIndex(order, idx)]);
+  setSelectionAnchor(head);
+  setSelectionFocus(order[subtreeEndIndex(order, idx)]);
   selectAllHead = head;
 }
 /** Cycle every non-empty block in the active selection as one document
@@ -3258,6 +4650,98 @@ function reselectSurvivingBlock(id: string | null) {
   else clearSelection();
 }
 
+/**
+ * Confirm the assumptions that the old per-root `moveBlockInternal` loop made
+ * before we start the one-shot selection mutation. A normal visible selection
+ * always meets these; a stale or malformed tree instead remains a guarded
+ * no-op, rather than committing only a prefix of the selection.
+ */
+function canBatchMoveSelectionRoots(ids: readonly string[], destPage: string, newParent: string | null): boolean {
+  if (newParent !== null) {
+    const parent = doc.byId[newParent];
+    if (!parent || !blockWritable(newParent) || parent.page !== destPage) return false;
+  }
+
+  for (const id of ids) {
+    const node = doc.byId[id];
+    if (!node || !blockWritable(id) || node.page !== destPage || id === newParent) return false;
+    if (!rootsOf(id).includes(id)) return false;
+
+    // Keep the old "never make a block its own ancestor" guard, but fail
+    // closed on a malformed parent cycle instead of spinning forever.
+    const seen = new Set<string>();
+    let cursor = newParent;
+    while (cursor !== null) {
+      if (cursor === id || seen.has(cursor)) return false;
+      seen.add(cursor);
+      const ancestor = doc.byId[cursor];
+      if (!ancestor) return false;
+      cursor = ancestor.parent;
+    }
+  }
+  return true;
+}
+
+/** Remove every selected root from its actual present sibling array, then put
+ * them at one destination in visible/document order. This is deliberately one
+ * Solid/Immer publication: selection indent/outdent is one editor command, not
+ * N independent drag operations. */
+function moveSelectionRootsInOneMutation(
+  ids: readonly string[],
+  destPage: string,
+  destinationParent: string | null,
+  destinationIndex: (state: DocState) => number,
+  expandParent: string | null = null,
+) {
+  setDoc(
+    produce((state) => {
+      const siblingsFor = (id: string): string[] | null => {
+        const node = state.byId[id];
+        if (!node) return null;
+        if (node.parent === null) return state.pages.find((page) => page.name === node.page)?.roots ?? null;
+        return state.byId[node.parent]?.children ?? null;
+      };
+
+      // Gather every removal before changing any array. This matters when a
+      // visible selection crosses parent arrays: each root must leave its own
+      // original array exactly once.
+      const removals = ids.map((id) => {
+        const siblings = siblingsFor(id);
+        return siblings ? { siblings, index: siblings.indexOf(id) } : null;
+      });
+      if (removals.some((removal) => !removal || removal.index < 0)) return;
+
+      // Re-read each index while removing: multiple selected roots can share a
+      // sibling array, so their preflight indices shift after the first splice.
+      // We have already established every membership above, before any mutation.
+      for (const id of ids) {
+        const siblings = siblingsFor(id)!;
+        siblings.splice(siblings.indexOf(id), 1);
+      }
+
+      const destination = destinationParent === null
+        ? state.pages.find((page) => page.name === destPage)?.roots
+        : state.byId[destinationParent]?.children;
+      if (!destination) return;
+      const at = destinationIndex(state);
+      if (at < 0) return;
+
+      for (const id of ids) state.byId[id].parent = destinationParent;
+      destination.splice(Math.min(at, destination.length), 0, ...ids);
+
+      if (expandParent !== null) {
+        const target = state.byId[expandParent];
+        if (!target) return;
+        // One raw rewrite plus the structure move, rather than the old
+        // writeCollapsed() publication after every selected root had moved.
+        target.raw = rawWithCollapsed(target.raw, false, formatForBlock(expandParent));
+        target.collapsed = false;
+      }
+    })
+  );
+  markDirty(destPage);
+}
+
 export function indentSelection() {
   const ids = topSelected();
   if (!ids.length || ids.some((id) => !blockWritable(id))) return;
@@ -3274,10 +4758,15 @@ export function indentSelection() {
   // already on the target page.
   const destPage = doc.byId[newParent].page;
   const same = ids.filter((id) => doc.byId[id]?.page === destPage);
-  if (!same.length) return;
+  if (!same.length || !canBatchMoveSelectionRoots(same, destPage, newParent)) return;
   pushUndo("indent-sel", [destPage]);
-  for (const id of same) moveBlockInternal(id, newParent, doc.byId[newParent].children.length);
-  writeCollapsed(newParent, false);
+  moveSelectionRootsInOneMutation(
+    same,
+    destPage,
+    newParent,
+    (state) => state.byId[newParent].children.length,
+    newParent,
+  );
 }
 
 export function outdentSelection() {
@@ -3291,13 +4780,21 @@ export function outdentSelection() {
   // ids[0]'s page — so restrict to the blocks already on that page.
   const destPage = doc.byId[parentId].page;
   const same = ids.filter((id) => doc.byId[id]?.page === destPage);
-  if (!same.length) return;
+  if (!same.length || !canBatchMoveSelectionRoots(same, destPage, grand)) return;
+  if (!rootsOf(parentId).includes(parentId)) return;
   pushUndo("outdent-sel", [destPage]);
-  let after = parentId;
-  for (const id of same) {
-    moveBlockInternal(id, grand, indexInSiblings(after) + 1);
-    after = id;
-  }
+  moveSelectionRootsInOneMutation(
+    same,
+    destPage,
+    grand,
+    (state) => {
+      const siblings = grand === null
+        ? state.pages.find((page) => page.name === destPage)?.roots
+        : state.byId[grand]?.children;
+      const parentIndex = siblings?.indexOf(parentId) ?? -1;
+      return parentIndex < 0 ? -1 : parentIndex + 1;
+    },
+  );
 }
 
 export function deleteSelection() {
@@ -3348,48 +4845,6 @@ export function selectionMarkdown(): string {
   return topSelected()
     .map((id) => blockSubtreeMarkdown(id, 0, true, stripCollapsed, onlySel))
     .join("\n");
-}
-
-/** Move a block to be a child of `newParent` (or root of its page) at `index`.
- *  Used by drag-and-drop. */
-/** Move without pushing an undo entry (for batched selection ops). */
-function moveBlockInternal(id: string, newParent: string | null, index: number) {
-  const node = doc.byId[id];
-  if (!node || !blockWritable(id) || (newParent !== null && !blockWritable(newParent))) return;
-  let p = newParent;
-  while (p !== null) {
-    if (p === id) return;
-    p = doc.byId[p].parent;
-  }
-  const oldPage = node.page;
-  const newPage = newParent ? doc.byId[newParent].page : oldPage;
-  setDoc(
-    produce((s) => {
-      const oldArr =
-        node.parent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === oldPage)].roots
-          : s.byId[node.parent!].children;
-      const from = oldArr.indexOf(id);
-      oldArr.splice(from, 1);
-      s.byId[id].parent = newParent;
-      const newArr =
-        newParent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots
-          : s.byId[newParent].children;
-      let idx = index;
-      if (oldArr === newArr && from < idx) idx -= 1;
-      newArr.splice(Math.max(0, Math.min(idx, newArr.length)), 0, id);
-      if (newPage !== oldPage) {
-        const reassign = (bid: string) => {
-          s.byId[bid].page = newPage;
-          s.byId[bid].children.forEach(reassign);
-        };
-        reassign(id);
-      }
-    })
-  );
-  markDirty(oldPage);
-  if (newPage !== oldPage) markDirty(newPage);
 }
 
 /** Move a block under `newParent` (or, when `newParent` is null, to the roots of
@@ -3469,6 +4924,171 @@ export async function moveBlock(
   }
 }
 
+interface RelativeMovePlan {
+  roots: string[];
+  sourcePages: string[];
+  sourcePageByRoot: string[];
+  destinationPage: string;
+}
+
+/** Build the complete target-relative move plan without mutating. Captured IDs
+ * are stable-deduped, then descendants of another captured ID are subsumed. */
+function relativeMovePlan(capturedIds: readonly string[], targetId: string): RelativeMovePlan | null {
+  const unique = [...new Set(capturedIds)];
+  if (!unique.length || unique.some((id) => !doc.byId[id])) return null;
+  const captured = new Set(unique);
+  const roots: string[] = [];
+
+  for (const id of unique) {
+    const seen = new Set([id]);
+    let parent = doc.byId[id].parent;
+    let subsumed = false;
+    while (parent !== null) {
+      if (seen.has(parent)) return null;
+      seen.add(parent);
+      if (captured.has(parent)) {
+        subsumed = true;
+        break;
+      }
+      const ancestor = doc.byId[parent];
+      if (!ancestor) return null;
+      parent = ancestor.parent;
+    }
+    if (!subsumed) roots.push(id);
+  }
+  if (!roots.length) return null;
+
+  const target = doc.byId[targetId];
+  if (!target || !pageWritable(target.page)) return null;
+  const destinationParent = target.parent;
+  if (destinationParent !== null) {
+    const parent = doc.byId[destinationParent];
+    if (!parent || parent.page !== target.page || !blockWritable(destinationParent)) return null;
+  }
+  const targetSiblings = destinationParent === null
+    ? pageByName(target.page)?.roots
+    : doc.byId[destinationParent]?.children;
+  if (!targetSiblings || targetSiblings.filter((id) => id === targetId).length !== 1) return null;
+
+  const moved = new Set<string>();
+  const visit = (id: string, page: string, ancestry: Set<string>): boolean => {
+    const node = doc.byId[id];
+    if (!node || node.page !== page || moved.has(id) || ancestry.has(id)) return false;
+    moved.add(id);
+    const childSet = new Set(node.children);
+    if (childSet.size !== node.children.length) return false;
+    const nextAncestry = new Set(ancestry).add(id);
+    return node.children.every((childId) => {
+      const child = doc.byId[childId];
+      return !!child && child.parent === id && visit(childId, page, nextAncestry);
+    });
+  };
+
+  const sourcePageByRoot: string[] = [];
+  for (const id of roots) {
+    const node = doc.byId[id];
+    if (!blockWritable(id)) return null;
+    const siblings = node.parent === null
+      ? pageByName(node.page)?.roots
+      : doc.byId[node.parent]?.children;
+    if (!siblings || siblings.filter((sibling) => sibling === id).length !== 1) return null;
+    if (node.parent !== null) {
+      const parent = doc.byId[node.parent];
+      if (!parent || parent.page !== node.page) return null;
+    }
+    if (!visit(id, node.page, new Set())) return null;
+    sourcePageByRoot.push(node.page);
+  }
+  if (moved.has(targetId)) return null;
+
+  const sourcePages = [...new Set(sourcePageByRoot)];
+  if (sourcePages.some((page) => !pageWritable(page))) return null;
+  return {
+    roots,
+    sourcePages,
+    sourcePageByRoot,
+    destinationPage: target.page,
+  };
+}
+
+/** Move captured selection roots together before/after a live target ID. This is
+ * intentionally separate from same-page selection indent/outdent and never loops
+ * over moveBlock: arbitrary source sibling arrays and pages form one transaction. */
+export async function moveBlocksRelative(
+  capturedIds: readonly string[],
+  targetId: string,
+  position: "before" | "after",
+): Promise<boolean> {
+  let plan = relativeMovePlan(capturedIds, targetId);
+  if (!plan) return false;
+
+  const crossSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
+  if (crossSources.length) {
+    if (!(await prepareCrossPageSources(crossSources))) {
+      pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
+      return false;
+    }
+    const rebuilt = relativeMovePlan(capturedIds, targetId);
+    if (!rebuilt) return false;
+    // Every non-destination source in the rebuilt plan must be one we flushed
+    // while it still contained its roots. A concurrent cross-page reparent is a
+    // safe abort, not permission to mutate a newly unprepared source.
+    const rebuiltCross = rebuilt.sourcePages.filter((page) => page !== rebuilt.destinationPage);
+    if (rebuilt.destinationPage !== plan.destinationPage
+      || rebuilt.roots.length !== plan.roots.length
+      || rebuilt.roots.some((id, index) => id !== plan!.roots[index])
+      || rebuilt.sourcePageByRoot.some((page, index) => page !== plan!.sourcePageByRoot[index])
+      || rebuiltCross.length !== crossSources.length
+      || rebuiltCross.some((page, index) => page !== crossSources[index])) return false;
+    plan = rebuilt;
+  }
+
+  const destinationFormat = formatForPage(plan.destinationPage);
+  const movedRaw = new Map(plan.roots.map((id) => {
+    const sourceRaw = doc.byId[id].raw;
+    const raw = orderListTypeFromRaw(sourceRaw, formatForBlock(id)) !== null
+      ? sourceRaw
+      : rawWithInheritedOrderListType(sourceRaw, destinationFormat, targetId);
+    return [id, raw];
+  }));
+  const affectedPages = [...new Set([plan.destinationPage, ...plan.sourcePages])];
+  pushUndo("move-selection-relative", affectedPages);
+  setDoc(produce((state) => {
+    const siblingsFor = (id: string): string[] => {
+      const node = state.byId[id];
+      return node.parent === null
+        ? state.pages.find((page) => page.name === node.page)!.roots
+        : state.byId[node.parent].children;
+    };
+    for (const id of plan!.roots) {
+      const siblings = siblingsFor(id);
+      siblings.splice(siblings.indexOf(id), 1);
+    }
+
+    const target = state.byId[targetId];
+    const destination = target.parent === null
+      ? state.pages.find((page) => page.name === target.page)!.roots
+      : state.byId[target.parent].children;
+    const targetIndex = destination.indexOf(targetId);
+    for (const id of plan!.roots) {
+      state.byId[id].parent = target.parent;
+      state.byId[id].raw = movedRaw.get(id)!;
+    }
+    destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);
+
+    const reassign = (id: string) => {
+      state.byId[id].page = plan!.destinationPage;
+      for (const child of state.byId[id].children) reassign(child);
+    };
+    for (const id of plan!.roots) reassign(id);
+  }));
+
+  const persistenceSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
+  if (persistenceSources.length) persistCrossPage(plan.destinationPage, persistenceSources);
+  else markDirty(plan.destinationPage);
+  return true;
+}
+
 /** Move a block up/down among its siblings (mod+Up/Down). Keyed <For> keeps the
  *  DOM node — so if the block is being edited, the textarea + caret survive. */
 // During a block-move reorder the textarea momentarily blurs; this flag tells
@@ -3487,8 +5107,16 @@ export function isBlockMoving(page?: string): boolean {
   return blockMovingPage !== null && (page === undefined || blockMovingPage === page);
 }
 export function setBlockMoving(v: boolean, page?: string): void {
+  const ended = !v && blockMovingPage !== null;
   blockMovingPage = v ? (page ?? blockMovingPage ?? "") : null;
   setBlockMoveRev((n) => n + 1);
+  // A move in progress makes `reloadDisposition` return "skip", so it refuses
+  // replacement exactly like a dirty page does — but unlike every other refusal
+  // it announced nothing when it ended. A deferred stamp whose read landed
+  // during an unrelated drag then waited for a coincidental later sweep to
+  // resume, which may never come. Every state that can REFUSE has to announce
+  // when it stops refusing. (GH #254 increment 3, round 13.)
+  if (ended) sweepReplaceable();
 }
 
 export function moveItem(id: string, dir: 1 | -1) {
@@ -3657,8 +5285,8 @@ export async function moveSelectionItems(dir: 1 | -1) {
     // a 15-block nudge became 15 full clones, the visible jank. Going down, move
     // the bottom-most first so they don't collide; up, the top.
     const ordered = dir === 1 ? [...ids].reverse() : ids;
-    const pages = [...new Set(ordered.map((id) => doc.byId[id]?.page).filter(Boolean) as string[])];
-    pushUndo("move-sel", pages); // scope the undo to the touched pages, not the whole set
+    const pages = beginOrContinueMoveSelectionUndo(ids);
+    if (!pages) return;
     setDoc(
       produce((s) => {
         for (const id of ordered) {
@@ -3681,6 +5309,9 @@ export async function moveSelectionItems(dir: 1 | -1) {
   }
   // Boundary: cross the whole group into the adjacent day (only if every
   // selected block is a root block on the same feed day).
+  // This route awaits source durability and has its own cross-page snapshot;
+  // never let it borrow an in-page burst's inverse across that await.
+  endMoveSelectionBurst();
   const page = doc.byId[ids[0]]?.page;
   if (!page) return;
   if (ids.some((id) => doc.byId[id].parent !== null || doc.byId[id].page !== page)) return;
@@ -3798,6 +5429,38 @@ export function toggleCollapse(id: string) {
   pushUndo("collapse", [n.page]);
   writeCollapsed(id, !n.collapsed);
   markDirty(n.page);
+}
+
+/** Expand every collapsed ancestor of `id` so the block itself can render, as
+ *  one undo step. Returns true if anything changed.
+ *
+ *  Needed because a collapsed parent does not render its children into the DOM
+ *  at all (`Block.tsx`'s `<Show when={… && !collapsed()}>`), so "navigate to this
+ *  block, scroll to it and highlight it" silently does nothing when the target is
+ *  hidden — GH #258, reported against Ctrl+Shift+K block results.
+ *
+ *  The expansion is deliberately persistent, exactly like expanding by hand:
+ *  `collapsed::` is on-disk state, and leaving the outline visually expanded but
+ *  unsaved would revert under the user on the next load. One `withUndoUnit`
+ *  keeps the whole chain a single Ctrl+Z. */
+export function expandAncestors(id: string): boolean {
+  const target = doc.byId[id];
+  if (!target) return false;
+  const collapsedAncestors: string[] = [];
+  let parent = target.parent;
+  while (parent !== null && parent !== undefined) {
+    const node = doc.byId[parent];
+    if (!node) break;
+    if (node.collapsed) collapsedAncestors.push(parent);
+    parent = node.parent;
+  }
+  if (collapsedAncestors.length === 0) return false;
+  if (!collapsedAncestors.every((ancestor) => blockWritable(ancestor))) return false;
+  withUndoUnit("reveal-block", [target.page], () => {
+    for (const ancestor of collapsedAncestors) writeCollapsed(ancestor, false);
+  });
+  markDirty(target.page);
+  return true;
 }
 
 /** Explicitly collapse or expand a block (no-op if it has no children or is

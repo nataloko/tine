@@ -9,13 +9,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -32,7 +31,10 @@ use super::import::{
     InactiveBootstrapAcceptedAuthorityBinding, InactiveBootstrapPreparedPublication,
     InactiveBootstrapVerifiedPublication,
 };
-use super::migration_backup::{MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup};
+use super::migration_backup::{
+    MigrationBackupError, MigrationBackupRoot, SourceBackupBindingV1, SourceBackupPayloadAuthority,
+    VerifiedSourceBackup,
+};
 use super::object_store::{open_dir_nofollow, open_file_nofollow, sync_dir_required};
 #[cfg(test)]
 use super::plan_projection;
@@ -40,7 +42,9 @@ use super::projection::{
     plan_projection_adopting_exact_source, ExactSourceProjectionError,
     ExactSourceSemanticDifference, ProjectionPlan,
 };
-use super::sqlite::{OpenProjection, VerifiedBootstrapSqliteProjection};
+#[cfg(test)]
+use super::sqlite::OpenProjection;
+use super::sqlite::VerifiedBootstrapSqliteProjection;
 use super::{
     BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId, LineageDigest, ManagedPath,
     ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
@@ -59,11 +63,10 @@ use crate::model::{
     BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
 };
 
-const SHADOW_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const SHADOW_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const SHADOW_PROOF_SCHEMA_VERSION: u32 = 1;
 const SHADOW_COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
 const SHADOW_ROOT_DIRECTORY: &str = "inactive-shadow-projections-v1";
-const PAYLOAD_DIRECTORY: &str = "payload";
 const MANIFEST_FILE: &str = "manifest.bin";
 const PROOF_FILE: &str = "proof.bin";
 const PROOF_STAGE_FILE: &str = ".proof.bin.staging";
@@ -77,7 +80,7 @@ const CATALOG_PAGE_ROWS: usize = 128;
 const MAX_MANIFEST_ENTRY_BYTES: usize = BOOTSTRAP_SOURCE_MAX_FILE_BYTES as usize * 3;
 const MAX_MANIFEST_BYTES: u64 = BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES * 4;
 const MAX_SMALL_EVIDENCE_BYTES: u64 = 1024 * 1024;
-const PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION: u32 = 1;
+const PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION: u32 = 2;
 pub(crate) const MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]
@@ -147,10 +150,8 @@ thread_local! {
 pub(crate) enum ShadowProjectionCrashCut {
     AfterShadowBaseCreation,
     AfterShadowWorkspaceCreation,
-    PartialPayloadWrite,
-    AfterPayloadPublication,
+    AfterManifestFileSync,
     PartialManifestWrite,
-    AfterManifestPublication,
     AfterStagingRename,
     PartialProofWrite,
     AfterProofPublication,
@@ -163,10 +164,8 @@ impl ShadowProjectionCrashCut {
         match self {
             Self::AfterShadowBaseCreation => "after_shadow_base_creation",
             Self::AfterShadowWorkspaceCreation => "after_shadow_workspace_creation",
-            Self::PartialPayloadWrite => "partial_payload_write",
-            Self::AfterPayloadPublication => "after_payload_publication",
+            Self::AfterManifestFileSync => "after_manifest_file_sync",
             Self::PartialManifestWrite => "partial_manifest_write",
-            Self::AfterManifestPublication => "after_manifest_publication",
             Self::AfterStagingRename => "after_staging_rename",
             Self::PartialProofWrite => "partial_proof_write",
             Self::AfterProofPublication => "after_proof_publication",
@@ -401,6 +400,9 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) payload_bytes_read: u64,
     pub(crate) manifest_entries: u64,
     pub(crate) projection_plans: u64,
+    /// Complete live-graph source revalidations performed while constructing
+    /// one inactive shadow proof.
+    pub(crate) source_revalidations: u64,
     pub(crate) bulk_materialization_chunks: u64,
     pub(crate) bulk_pages_materialized: u64,
     pub(crate) peak_bulk_pages: u64,
@@ -456,6 +458,7 @@ pub(crate) struct PromotedBootstrapProjectionBindingV1 {
     staged_inventory_digest: ContentDigest,
     staged_file_count: u64,
     staged_total_bytes: u64,
+    source_backup: SourceBackupBindingV1,
 }
 
 impl PromotedBootstrapProjectionBindingV1 {
@@ -499,6 +502,7 @@ impl PromotedBootstrapProjectionBindingV1 {
             staged_inventory_digest: verified.staged_inventory_digest(),
             staged_file_count: verified.staged_file_count(),
             staged_total_bytes: verified.staged_total_bytes(),
+            source_backup: verified.source_backup().retained_binding(),
         };
         binding.binding_digest = binding.compute_binding_digest();
         binding.validate()?;
@@ -516,6 +520,7 @@ impl PromotedBootstrapProjectionBindingV1 {
                 "promoted bootstrap projection binding digest is invalid",
             ));
         }
+        self.source_backup.validate()?;
         if self.catalog_rows != self.staged_file_count
             || self.staged_total_bytes > BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES
             || self.catalog_rows > BOOTSTRAP_SOURCE_MAX_FILES
@@ -526,6 +531,18 @@ impl PromotedBootstrapProjectionBindingV1 {
         {
             return Err(ShadowProjectionError::CorruptOrConflicting(
                 "promoted bootstrap projection binding exceeds retained bounds",
+            ));
+        }
+        if self.source_backup.workspace_id() != self.workspace_id
+            || self.source_backup.graph_resource() != self.graph_resource_id
+            || self.source_backup.backup_root_identity() != self.backup_root_identity
+            || self.source_backup.publication_id() != self.bootstrap_publication_id
+            || self.source_backup.aggregate_digest() != self.bootstrap_aggregate_digest
+            || self.source_backup.file_count() < self.staged_file_count
+            || self.source_backup.total_bytes() < self.staged_total_bytes
+        {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "promoted projection and source backup bindings differ",
             ));
         }
         Ok(())
@@ -580,6 +597,13 @@ impl PromotedBootstrapProjectionBindingV1 {
             staged_inventory_digest: ContentDigest::of(b"synthetic empty inventory"),
             staged_file_count: 0,
             staged_total_bytes: 0,
+            source_backup: SourceBackupBindingV1::synthetic_for_test(
+                workspace_id,
+                graph_resource_id,
+                ContentDigest::of(b"synthetic backup root"),
+                bootstrap_publication_id,
+                bootstrap_aggregate_digest,
+            ),
         };
         binding.binding_digest = binding.compute_binding_digest();
         binding
@@ -624,6 +648,7 @@ impl PromotedBootstrapProjectionBindingV1 {
         }
         hasher.update(self.staged_file_count.to_be_bytes());
         hasher.update(self.staged_total_bytes.to_be_bytes());
+        hasher.update(self.source_backup.binding_digest().as_bytes());
         ContentDigest::from_bytes(hasher.finalize().into())
     }
 
@@ -689,6 +714,10 @@ impl PromotedBootstrapProjectionBindingV1 {
 
     pub(crate) const fn authority_digest(&self) -> ContentDigest {
         self.shadow_evidence_digest
+    }
+
+    pub(crate) const fn source_backup(&self) -> &SourceBackupBindingV1 {
+        &self.source_backup
     }
 }
 
@@ -1062,7 +1091,7 @@ impl BootstrapProjectionBaseline {
 pub(crate) struct BootstrapProjectionAuthority {
     binding: PromotedBootstrapProjectionBindingV1,
     publication: Dir,
-    payload: Dir,
+    source_backup: SourceBackupPayloadAuthority,
     locators: std::sync::Mutex<Option<BootstrapProjectionLocators>>,
     counters: std::sync::Arc<BootstrapProjectionRuntimeCounters>,
 }
@@ -1120,9 +1149,6 @@ impl BootstrapProjectionAuthority {
         let publication_name = hex(binding.publication_id.as_bytes());
         let publication = open_dir_nofollow(&workspace, &publication_name)
             .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
-        let payload = open_dir_nofollow(&publication, PAYLOAD_DIRECTORY)
-            .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
-
         let proof = read_capability_file(&publication, PROOF_FILE, MAX_SMALL_EVIDENCE_BYTES)?;
         if BlobDescription::of(&proof) != binding.proof {
             return Err(ShadowProjectionError::CorruptOrConflicting(
@@ -1141,11 +1167,13 @@ impl BootstrapProjectionAuthority {
             ));
         }
 
+        let source_backup = SourceBackupPayloadAuthority::reopen(roots, binding.source_backup())?;
+
         let counters = std::sync::Arc::new(BootstrapProjectionRuntimeCounters::default());
         Ok(Self {
             binding: binding.clone(),
             publication,
-            payload,
+            source_backup,
             locators: std::sync::Mutex::new(None),
             counters,
         })
@@ -1227,7 +1255,7 @@ impl BootstrapProjectionAuthority {
             ));
         }
         validate_promoted_entry(&self.binding, &evidence)?;
-        let source = read_payload_at(&self.payload, path, evidence.source)?;
+        let source = self.source_backup.read_at(path, evidence.source)?;
         self.counters
             .payload_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1520,63 +1548,12 @@ fn read_capability_file(
     Ok(bytes)
 }
 
-fn read_payload_at(
-    payload: &Dir,
-    path: &ManagedPath,
-    expected: BlobDescription,
-) -> Result<Vec<u8>, ShadowProjectionError> {
-    validate_managed_path_depth(path)?;
-    let mut components = path.as_str().split('/').peekable();
-    let mut directory = payload.try_clone()?;
-    let mut leaf = None;
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            leaf = Some(component);
-        } else {
-            directory = open_dir_nofollow(&directory, component)
-                .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
-        }
-    }
-    let leaf = leaf.ok_or(ShadowProjectionError::CorruptOrConflicting(
-        "promoted shadow payload path is empty",
-    ))?;
-    let mut file = open_file_nofollow(&directory, leaf)?;
-    let metadata = file.metadata()?;
-    if !metadata_is_real_file(&metadata) || metadata.len() != expected.byte_length() {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "promoted shadow payload has the wrong no-follow shape or length",
-        ));
-    }
-    enforce_limit(
-        "promoted shadow payload bytes",
-        metadata.len(),
-        BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
-    )?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(metadata.len() as usize)
-        .map_err(|_| ShadowProjectionError::ResourceLimit {
-            resource: "promoted shadow payload allocation",
-            observed: metadata.len(),
-            limit: BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
-        })?;
-    file.read_to_end(&mut bytes)?;
-    if BlobDescription::of(&bytes) != expected {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "promoted shadow payload digest changed",
-        ));
-    }
-    Ok(bytes)
-}
-
 #[derive(Clone, Copy)]
 struct SourceSummary {
     file_count: u64,
     chunk_count: u64,
     directory_count: u64,
     total_bytes: u64,
-    max_path_bytes: u64,
-    max_depth: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1599,8 +1576,9 @@ struct PublicationPaths {
 }
 
 /// Build or resume the exact-source inactive shadow projection and return a
-/// typed proof only after semantic equivalence plus fresh source, backup,
-/// SQLite, authority, root, and committed-byte rereads.
+/// typed proof after semantic equivalence, durable private publication, and a
+/// final live-source revalidation. Existing staged/final data is fully
+/// reverified on resume; freshly constructed data carries its adjacent proof.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     graph: &Graph,
@@ -1609,7 +1587,6 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     verified_publication: &InactiveBootstrapVerifiedPublication,
     source_backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
     verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
@@ -1619,7 +1596,6 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         verified_publication,
         source_backup,
         authority,
-        sqlite,
         sqlite_projection,
         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
     )
@@ -1633,10 +1609,22 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     verified_publication: &InactiveBootstrapVerifiedPublication,
     source_backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
     session_budget_bytes_per_root: usize,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+    let shadow_started = Instant::now();
+    let mut shadow_lap = shadow_started;
+    let trace_lap = |label: &str, lap: &mut Instant| {
+        if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            let now = Instant::now();
+            eprintln!(
+                "shadow projection: {label} took {} ms ({} ms cumulative)",
+                now.duration_since(*lap).as_millis(),
+                now.duration_since(shadow_started).as_millis(),
+            );
+            *lap = now;
+        }
+    };
     #[cfg(test)]
     {
         let mut calls = complete_shadow_verification_calls().lock().unwrap();
@@ -1650,9 +1638,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         verified_publication,
         source_backup,
         authority,
-        sqlite,
         sqlite_projection,
     )?;
+    trace_lap("input binding validation", &mut shadow_lap);
     let capture = prepared.source_capture();
     let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
         ShadowProjectionError::CorruptOrConflicting(
@@ -1660,7 +1648,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         )
     })?;
     let summary = summarize_source(capture, &authoritative_paths)?;
+    trace_lap("source selection and summary", &mut shadow_lap);
     let catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
+    trace_lap("accepted catalog traversal", &mut shadow_lap);
     let catalog_binding = catalog.binding;
     let publication_id = shadow_publication_id(
         roots,
@@ -1672,11 +1662,6 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         summary,
     )?;
     let paths = publication_paths(roots, authority.binding(), publication_id)?;
-
-    // This is deliberately the last live-source action before staging.
-    capture.verify_before_inactive_bootstrap_authoring(graph)?;
-
-    ensure_publication_parent(roots, authority.binding(), &paths)?;
     let mut instrumentation = ShadowProjectionInstrumentation {
         catalog_rows: catalog_binding.catalog_rows(),
         source_files: summary.file_count,
@@ -1684,6 +1669,14 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         peak_owned_catalog_rows: summary.file_count.min(CATALOG_PAGE_ROWS as u64),
         ..ShadowProjectionInstrumentation::default()
     };
+
+    // Do not reread the complete live graph before private construction. The
+    // manifest is built from the sealed capture, not from live paths, and the
+    // final revalidation below rejects every pre-existing or concurrent source
+    // change before the typed proof can escape this call. A second full scan
+    // here only failed earlier while doubling graph-wide observation work.
+
+    ensure_publication_parent(roots, authority.binding(), &paths)?;
     let final_exists = path_exists(&paths.final_directory)?;
     let stage_exists = path_exists(&paths.stage)?;
     if final_exists && stage_exists {
@@ -1704,9 +1697,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     let mut adjacent_construction = None;
     if !final_exists {
         ensure_real_directory_created(&paths.stage)?;
-        ensure_real_directory_created(&paths.stage.join(PAYLOAD_DIRECTORY))?;
-        let constructed = publish_payloads_and_manifest(
-            &paths.stage.join(PAYLOAD_DIRECTORY),
+        let constructed = publish_manifest_from_source(
             &paths.stage.join(MANIFEST_FILE),
             &header,
             prepared,
@@ -1715,23 +1706,22 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
             &mut instrumentation,
             session_budget_bytes_per_root,
         )?;
-        sync_tree(
-            &paths.stage.join(PAYLOAD_DIRECTORY),
-            summary,
-            &mut instrumentation,
-        )?;
-        inject_crash_cut(ShadowProjectionCrashCut::AfterPayloadPublication)?;
-        sync_file_and_parent(&paths.stage.join(MANIFEST_FILE))?;
-        inject_crash_cut(ShadowProjectionCrashCut::AfterManifestPublication)?;
-        validate_projection_root_entries(&paths.stage, false)?;
-        verify_projection_directory_against_proof(
-            &paths.stage,
-            false,
-            &header,
-            summary,
-            constructed,
-            &mut instrumentation,
-        )?;
+        trace_lap("semantic manifest construction", &mut shadow_lap);
+        inject_crash_cut(ShadowProjectionCrashCut::AfterManifestFileSync)?;
+        // A retained stage came from an interrupted earlier process and must
+        // earn fresh trust. A stage created by this call already has exact
+        // per-file construction evidence; rereading it would only defend
+        // against same-process substitution in the private runtime root.
+        if stage_exists {
+            verify_projection_directory_against_proof(
+                &paths.stage,
+                false,
+                &header,
+                summary,
+                constructed,
+            )?;
+            trace_lap("resumed staging manifest verification", &mut shadow_lap);
+        }
         sync_directory(&paths.stage)?;
         move_file_noreplace(&paths.stage, &paths.final_directory).map_err(|_| {
             ShadowProjectionError::CorruptOrConflicting(
@@ -1745,19 +1735,12 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         &paths.parent,
         ShadowProjectionDurabilityBarrier::PublicationParentAfterFinal,
     )?;
+    trace_lap("final rename and parent durability", &mut shadow_lap);
 
     let (manifest, staged) = if let Some(constructed) = adjacent_construction {
-        verify_projection_directory_against_proof(
-            &paths.final_directory,
-            true,
-            &header,
-            summary,
-            constructed,
-            &mut instrumentation,
-        )?;
         constructed
     } else {
-        verify_projection_directory(
+        let verified = verify_projection_directory(
             &paths.final_directory,
             true,
             &header,
@@ -1767,7 +1750,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
             summary,
             &mut instrumentation,
             session_budget_bytes_per_root,
-        )?
+        )?;
+        trace_lap("resumed semantic tree verification", &mut shadow_lap);
+        verified
     };
     let proof_bytes = proof_bytes(
         roots,
@@ -1789,6 +1774,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         ShadowProjectionCrashCut::PartialProofWrite,
         "shadow proof conflicts with existing evidence",
     )?;
+    trace_lap("proof publication", &mut shadow_lap);
     inject_crash_cut(ShadowProjectionCrashCut::AfterProofPublication)?;
     let (marker_bytes, evidence_digest) = commit_marker_bytes(
         roots,
@@ -1811,53 +1797,19 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         ShadowProjectionCrashCut::PartialCommitMarkerWrite,
         "shadow commit marker conflicts with existing evidence",
     )?;
+    trace_lap("commit marker publication", &mut shadow_lap);
     inject_crash_cut(ShadowProjectionCrashCut::AfterCommitMarkerPublication)?;
 
-    // Freshly reread all retained authorities and every committed staged byte.
-    sqlite
-        .database
-        .freshly_verify_inactive_bootstrap(authority, sqlite_projection)
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
-    roots.freshly_validate_retained_roots()?;
-    let final_catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
-    if final_catalog != catalog {
-        return Err(ShadowProjectionError::BindingMismatch(
-            "accepted current-path catalog changed during shadow projection",
-        ));
-    }
-    verify_projection_directory_against_proof(
-        &paths.final_directory,
-        true,
-        &header,
-        summary,
-        (manifest, staged),
-        &mut instrumentation,
-    )?;
-    compare_exact_small_file(
-        &paths.final_directory.join(PROOF_FILE),
-        &proof_bytes,
-        "shadow proof changed before final proof",
-    )?;
-    compare_exact_small_file(
-        &paths.final_directory.join(COMMIT_MARKER_FILE),
-        &marker_bytes,
-        "shadow commit marker changed before final proof",
-    )?;
-    validate_projection_root_entries(&paths.final_directory, true)?;
-    if !path_exists(&paths.final_directory.join(PROOF_FILE))?
-        || !path_exists(&paths.final_directory.join(COMMIT_MARKER_FILE))?
-        || path_exists(&paths.final_directory.join(PROOF_STAGE_FILE))?
-        || path_exists(&paths.final_directory.join(COMMIT_MARKER_STAGE_FILE))?
-    {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "committed shadow projection is missing final proof evidence",
-        ));
-    }
-    sync_directory(&paths.final_directory)?;
     // This is deliberately the final live-graph observation. No graph path is
     // opened for write anywhere in this module.
     before_final_source_verify_hook()?;
+    instrumentation.source_revalidations = checked_add(
+        instrumentation.source_revalidations,
+        1,
+        "shadow source revalidations",
+    )?;
     capture.verify_before_inactive_bootstrap_authoring(graph)?;
+    trace_lap("final source revalidation", &mut shadow_lap);
 
     Ok(VerifiedShadowProjection {
         directory: paths.final_directory,
@@ -1897,7 +1849,6 @@ fn validate_bindings(
     verified: &InactiveBootstrapVerifiedPublication,
     backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_proof: &VerifiedBootstrapSqliteProjection,
 ) -> Result<(), ShadowProjectionError> {
     roots.freshly_validate_retained_roots()?;
@@ -1948,10 +1899,7 @@ fn validate_bindings(
             "shadow projection inputs do not bind the same inactive bootstrap",
         ));
     }
-    sqlite
-        .database
-        .freshly_verify_inactive_bootstrap(authority, sqlite_proof)
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
+    Ok(())
 }
 
 fn summarize_source(
@@ -1965,8 +1913,6 @@ fn summarize_source(
     let mut captured_chunk_count = 0_u64;
     let mut directory_count = 0_u64;
     let mut total_bytes = 0_u64;
-    let mut max_path_bytes = 0_u64;
-    let mut max_depth = 0_usize;
     let mut previous_parents = Vec::<String>::new();
     while let Some(entry) = entries.next()? {
         validate_source_entry(&entry)?;
@@ -1992,7 +1938,6 @@ fn summarize_source(
             total_bytes,
             BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
         )?;
-        max_path_bytes = max_path_bytes.max(entry.path().as_str().len() as u64);
         let components = entry.path().as_str().split('/').collect::<Vec<_>>();
         let depth = components.len();
         enforce_limit(
@@ -2000,7 +1945,6 @@ fn summarize_source(
             depth as u64,
             BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH.saturating_add(1) as u64,
         )?;
-        max_depth = max_depth.max(depth);
         let parents = &components[..components.len().saturating_sub(1)];
         let common = parents
             .iter()
@@ -2032,8 +1976,6 @@ fn summarize_source(
         chunk_count,
         directory_count,
         total_bytes,
-        max_path_bytes,
-        max_depth,
     })
 }
 
@@ -2292,8 +2234,7 @@ fn require_exact_source_baseline(
     })
 }
 
-fn publish_payloads_and_manifest(
-    payload: &Path,
+fn publish_manifest_from_source(
     manifest_path: &Path,
     header: &[u8],
     prepared: &InactiveBootstrapPreparedPublication,
@@ -2337,7 +2278,6 @@ fn publish_payloads_and_manifest(
                 .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
         })
         .transpose()?;
-    let mut first_write = true;
     let mut inventory = Sha256::new();
     inventory.update(b"tine/inactive-shadow-projection-inventory/v1\0");
     let mut file_count = 0_u64;
@@ -2397,42 +2337,6 @@ fn publish_payloads_and_manifest(
             else {
                 continue;
             };
-            let destination = payload_path(payload, entry.path())?;
-            ensure_managed_parent_directories(payload, entry.path())?;
-            if first_write
-                && source.len() > 1
-                && take_crash_cut(ShadowProjectionCrashCut::PartialPayloadWrite)
-            {
-                let mut output = ResumableExactFile::open(
-                    &destination,
-                    "shadow payload conflicts with staged exact bytes",
-                )?;
-                let prefix = (source.len() / 2).clamp(1, source.len() - 1);
-                output.write_all(&source[..prefix]).map_err(|_| {
-                    ShadowProjectionError::CorruptOrConflicting(
-                        "shadow payload partial write failed",
-                    )
-                })?;
-                output.flush()?;
-                return Err(ShadowProjectionError::InjectedCrashCut(
-                    ShadowProjectionCrashCut::PartialPayloadWrite.label(),
-                ));
-            }
-            let mut payload_output = ResumableExactFile::open(
-                &destination,
-                "shadow payload conflicts with staged exact bytes",
-            )?;
-            payload_output.write_all(&source).map_err(|_| {
-                ShadowProjectionError::CorruptOrConflicting(
-                    "shadow payload conflicts with staged exact bytes",
-                )
-            })?;
-            let description = payload_output.finish_payload()?;
-            if description != entry.description() {
-                return Err(ShadowProjectionError::CorruptOrConflicting(
-                    "staged payload description differs from captured source",
-                ));
-            }
             emit_manifest_entry(&mut output, &entry, row.page_id(), &intent)?;
             instrumentation.manifest_entries =
                 checked_add(instrumentation.manifest_entries, 1, "manifest entries")?;
@@ -2449,17 +2353,7 @@ fn publish_payloads_and_manifest(
             };
             hash_file_evidence(&mut inventory, &evidence)?;
             file_count = checked_add(file_count, 1, "published shadow files")?;
-            total_bytes = checked_add(
-                total_bytes,
-                description.byte_length(),
-                "published shadow bytes",
-            )?;
-            instrumentation.payload_bytes_written = checked_add(
-                instrumentation.payload_bytes_written,
-                source.len() as u64,
-                "payload bytes written",
-            )?;
-            first_write = false;
+            total_bytes = checked_add(total_bytes, source.len() as u64, "published shadow bytes")?;
         }
     }
     if chunks.next()?.is_some() {
@@ -2612,7 +2506,7 @@ fn emit_manifest_entry(
 }
 
 /// Recheck durable shape and the compact authenticated inventory without
-/// replaying projection semantics or rereading every payload. The proof can
+/// replaying projection semantics or rereading source bytes. The proof can
 /// only be minted by the adjacent construction/semantic-recovery pass.
 fn verify_projection_directory_against_proof(
     directory: &Path,
@@ -2620,24 +2514,9 @@ fn verify_projection_directory_against_proof(
     header: &[u8],
     summary: SourceSummary,
     expected: (BlobDescription, StagedInventoryProof),
-    instrumentation: &mut ShadowProjectionInstrumentation,
 ) -> Result<(), ShadowProjectionError> {
     require_real_directory(directory, "shadow projection is not a real directory")?;
     validate_projection_root_entries(directory, final_directory)?;
-    let counts = traverse_tree_bounded(
-        &directory.join(PAYLOAD_DIRECTORY),
-        summary,
-        false,
-        instrumentation,
-    )?;
-    if counts.files != summary.file_count
-        || counts.directories != summary.directory_count
-        || counts.bytes != summary.total_bytes
-    {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "shadow payload changed after its semantic construction pass",
-        ));
-    }
     let manifest_path = directory.join(MANIFEST_FILE);
     if describe_regular_file(&manifest_path, MAX_MANIFEST_BYTES)? != expected.0 {
         return Err(ShadowProjectionError::CorruptOrConflicting(
@@ -2688,16 +2567,6 @@ fn verify_projection_directory(
 ) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
     require_real_directory(directory, "shadow projection is not a real directory")?;
     validate_projection_root_entries(directory, final_directory)?;
-    let payload = directory.join(PAYLOAD_DIRECTORY);
-    let counts = traverse_tree_bounded(&payload, summary, false, instrumentation)?;
-    if counts.files != summary.file_count
-        || counts.directories != summary.directory_count
-        || counts.bytes != summary.total_bytes
-    {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "shadow payload has missing or extra files or directories",
-        ));
-    }
     let manifest_path = directory.join(MANIFEST_FILE);
     let manifest = describe_regular_file(&manifest_path, MAX_MANIFEST_BYTES)?;
     let mut reader = ManifestReader::open(&manifest_path, summary.file_count, header.to_vec())?;
@@ -2793,16 +2662,13 @@ fn verify_projection_directory(
                     "shadow manifest per-file evidence differs from source and accepted authority",
                 ));
             }
-            let staged_path = payload_path(&payload, entry.path())?;
-            let staged = compare_regular_file_bytes(&staged_path, &source, instrumentation)?;
-            if staged != entry.description() {
-                return Err(ShadowProjectionError::CorruptOrConflicting(
-                    "shadow payload differs from source bytes",
-                ));
-            }
             hash_file_evidence(&mut inventory, &actual)?;
             file_count = checked_add(file_count, 1, "verified shadow files")?;
-            total_bytes = checked_add(total_bytes, staged.byte_length(), "verified shadow bytes")?;
+            total_bytes = checked_add(
+                total_bytes,
+                entry.description().byte_length(),
+                "verified shadow bytes",
+            )?;
         }
     }
     if chunks.next()?.is_some() || reader.next()?.is_some() {
@@ -3306,166 +3172,10 @@ fn validate_source_entry(entry: &BootstrapSourceEntry) -> Result<(), ShadowProje
     )
 }
 
-fn payload_path(root: &Path, path: &ManagedPath) -> Result<PathBuf, ShadowProjectionError> {
-    validate_managed_path_depth(path)?;
-    let joined = root.join(path.as_str());
-    if !joined.starts_with(root) {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "managed path escapes shadow payload root",
-        ));
-    }
-    Ok(joined)
-}
-
-fn validate_managed_path_depth(path: &ManagedPath) -> Result<(), ShadowProjectionError> {
-    enforce_limit(
-        "managed path bytes",
-        path.as_str().len() as u64,
-        BOOTSTRAP_SOURCE_MAX_PATH_BYTES as u64,
-    )?;
-    enforce_limit(
-        "managed path depth",
-        path.as_str().split('/').count() as u64,
-        BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH.saturating_add(1) as u64,
-    )
-}
-
-fn ensure_managed_parent_directories(
-    root: &Path,
-    path: &ManagedPath,
-) -> Result<(), ShadowProjectionError> {
-    let mut current = root.to_path_buf();
-    let component_count = path.as_str().split('/').count();
-    for component in path
-        .as_str()
-        .split('/')
-        .take(component_count.saturating_sub(1))
-    {
-        current.push(component);
-        ensure_real_directory_created(&current)?;
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct TreeCounts {
-    files: u64,
-    directories: u64,
-    bytes: u64,
-}
-
-struct TreeFrame {
-    path: PathBuf,
-    entries: fs::ReadDir,
-}
-
-fn traverse_tree_bounded(
-    root: &Path,
-    summary: SourceSummary,
-    sync: bool,
-    instrumentation: &mut ShadowProjectionInstrumentation,
-) -> Result<TreeCounts, ShadowProjectionError> {
-    require_real_directory(root, "shadow payload root is not a real directory")?;
-    let mut counts = TreeCounts::default();
-    let mut stack = vec![TreeFrame {
-        path: root.to_path_buf(),
-        entries: fs::read_dir(root)?,
-    }];
-    while !stack.is_empty() {
-        let next = stack
-            .last_mut()
-            .expect("bounded traversal has a frame")
-            .entries
-            .next();
-        let Some(entry) = next else {
-            let completed = stack.pop().expect("bounded traversal has a frame");
-            if sync {
-                sync_directory(&completed.path)?;
-            }
-            continue;
-        };
-        instrumentation.tree_entries_visited = checked_add(
-            instrumentation.tree_entries_visited,
-            1,
-            "tree entries visited",
-        )?;
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|_| {
-            ShadowProjectionError::CorruptOrConflicting("shadow traversal escaped its root")
-        })?;
-        let relative = relative
-            .to_str()
-            .ok_or(ShadowProjectionError::CorruptOrConflicting(
-                "shadow payload path is not UTF-8",
-            ))?;
-        enforce_limit(
-            "shadow tree path bytes",
-            relative.len() as u64,
-            summary.max_path_bytes,
-        )?;
-        enforce_limit(
-            "shadow tree depth",
-            relative.split(['/', '\\']).count() as u64,
-            summary.max_depth as u64,
-        )?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata_is_real_directory(&metadata) {
-            counts.directories = checked_add(counts.directories, 1, "shadow directories")?;
-            enforce_limit(
-                "shadow directories",
-                counts.directories,
-                summary.directory_count,
-            )?;
-            stack.push(TreeFrame {
-                entries: fs::read_dir(&path)?,
-                path,
-            });
-        } else if metadata_is_real_file(&metadata) {
-            counts.files = checked_add(counts.files, 1, "shadow files")?;
-            enforce_limit("shadow files", counts.files, summary.file_count)?;
-            counts.bytes = checked_add(counts.bytes, metadata.len(), "shadow bytes")?;
-            enforce_limit("shadow bytes", counts.bytes, summary.total_bytes)?;
-            if sync {
-                open_regular_for_sync(&path)?.sync_all()?;
-            }
-        } else {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "shadow tree contains a symlink, reparse point, or special entry",
-            ));
-        }
-    }
-    Ok(counts)
-}
-
-fn sync_tree(
-    root: &Path,
-    summary: SourceSummary,
-    instrumentation: &mut ShadowProjectionInstrumentation,
-) -> Result<(), ShadowProjectionError> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let _ = traverse_tree_bounded(root, summary, false, instrumentation)?;
-        let directory = open_directory_nofollow_ambient(root)?;
-        // SAFETY: the retained no-follow directory owns a live descriptor for
-        // the filesystem containing every independently staged payload.
-        let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = traverse_tree_bounded(root, summary, true, instrumentation)?;
-    }
-    Ok(())
-}
-
 fn validate_projection_root_entries(
     directory: &Path,
     final_directory: bool,
 ) -> Result<(), ShadowProjectionError> {
-    let mut payload = false;
     let mut manifest = false;
     let mut proof = false;
     let mut proof_stage = false;
@@ -3475,9 +3185,6 @@ fn validate_projection_root_entries(
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
         match entry.file_name().to_str() {
-            Some(PAYLOAD_DIRECTORY) if metadata_is_real_directory(&metadata) && !payload => {
-                payload = true
-            }
             Some(MANIFEST_FILE) if metadata_is_real_file(&metadata) && !manifest => manifest = true,
             Some(PROOF_FILE) if final_directory && metadata_is_real_file(&metadata) && !proof => {
                 proof = true
@@ -3504,12 +3211,7 @@ fn validate_projection_root_entries(
             }
         }
     }
-    if !payload
-        || !manifest
-        || (marker && !proof)
-        || (proof && proof_stage)
-        || (marker && marker_stage)
-    {
+    if !manifest || (marker && !proof) || (proof && proof_stage) || (marker && marker_stage) {
         return Err(ShadowProjectionError::CorruptOrConflicting(
             "shadow projection directory is missing required entries",
         ));
@@ -3561,51 +3263,6 @@ fn publish_small_file_atomic(
         .map_err(|_| ShadowProjectionError::CorruptOrConflicting(conflict))?;
     sync_directory(directory)?;
     Ok(description)
-}
-
-fn compare_regular_file_bytes(
-    path: &Path,
-    expected: &[u8],
-    instrumentation: &mut ShadowProjectionInstrumentation,
-) -> Result<BlobDescription, ShadowProjectionError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata_is_real_file(&metadata) || metadata.len() != expected.len() as u64 {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "shadow payload is missing, special, or has wrong length",
-        ));
-    }
-    let mut file = open_regular_readonly_nofollow(path)?;
-    let mut hasher = Sha256::new();
-    let mut offset = 0_usize;
-    let mut buffer = [0_u8; IO_BUFFER_BYTES];
-    while offset < expected.len() {
-        let wanted = (expected.len() - offset).min(buffer.len());
-        file.read_exact(&mut buffer[..wanted]).map_err(|_| {
-            ShadowProjectionError::CorruptOrConflicting("shadow payload is truncated")
-        })?;
-        if buffer[..wanted] != expected[offset..offset + wanted] {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "shadow payload bytes differ from captured source",
-            ));
-        }
-        hasher.update(&buffer[..wanted]);
-        offset += wanted;
-        instrumentation.payload_bytes_read = checked_add(
-            instrumentation.payload_bytes_read,
-            wanted as u64,
-            "payload bytes read",
-        )?;
-    }
-    let mut trailing = [0_u8; 1];
-    if file.read(&mut trailing)? != 0 {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "shadow payload has trailing bytes",
-        ));
-    }
-    Ok(BlobDescription::from_parts(
-        hasher.finalize().into(),
-        expected.len() as u64,
-    ))
 }
 
 fn compare_exact_small_file(
@@ -3712,16 +3369,6 @@ impl ResumableExactFile {
             self.hasher.clone().finalize().into(),
             self.expected_length,
         ))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn finish_payload(mut self) -> Result<BlobDescription, ShadowProjectionError> {
-        self.finish_unflushed()
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn finish_payload(self) -> Result<BlobDescription, ShadowProjectionError> {
-        self.finish()
     }
 }
 
@@ -3983,16 +3630,6 @@ fn create_new_regular_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
-fn open_regular_for_sync(path: &Path) -> io::Result<File> {
-    require_supported_exact_filesystem()?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    options.write(true);
-    configure_file_nofollow(&mut options);
-    validate_opened_regular(options.open(path)?)
-}
-
 fn open_directory_nofollow_ambient(path: &Path) -> Result<Dir, ShadowProjectionError> {
     require_supported_exact_filesystem()?;
     let name = path.file_name().and_then(|name| name.to_str()).ok_or(
@@ -4057,14 +3694,6 @@ fn path_exists(path: &Path) -> Result<bool, ShadowProjectionError> {
     }
 }
 
-fn sync_file_and_parent(path: &Path) -> Result<(), ShadowProjectionError> {
-    open_regular_for_sync(path)?.sync_all()?;
-    sync_directory(
-        path.parent()
-            .ok_or(ShadowProjectionError::BindingMismatch("file has no parent"))?,
-    )
-}
-
 fn sync_directory(path: &Path) -> Result<(), ShadowProjectionError> {
     let directory = open_directory_nofollow_ambient(path)?;
     sync_dir_required(&directory)
@@ -4112,8 +3741,8 @@ mod tests {
         ProjectionPageState, ProjectionStorageBinding,
     };
     use crate::oplog::import::{
-        prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
-        reopen_inactive_bootstrap_accepted_authority,
+        force_next_bootstrap_part_operation_limit, prepare_inactive_bootstrap_import,
+        publish_install_verify_inactive_bootstrap, reopen_inactive_bootstrap_accepted_authority,
     };
     use crate::oplog::migration_backup::verify_migration_source_backup;
     use crate::oplog::sqlite::{ApplicationRuntimeRoot, SqliteFrontier};
@@ -4261,7 +3890,6 @@ mod tests {
                 &self.verified,
                 &self.backup,
                 &self.authority,
-                &self.sqlite,
                 &self.sqlite_proof,
             )
         }
@@ -4277,7 +3905,6 @@ mod tests {
                 &self.verified,
                 &self.backup,
                 &self.authority,
-                &self.sqlite,
                 &self.sqlite_proof,
                 session_budget_bytes_per_root,
             )
@@ -4425,18 +4052,8 @@ mod tests {
         components.join("/")
     }
 
-    fn first_payload_file(root: &Path) -> PathBuf {
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(directory) = stack.pop() {
-            for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
-                if entry.file_type().unwrap().is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    return entry.path();
-                }
-            }
-        }
-        panic!("expected payload file")
+    fn backup_payload_path(proof: &VerifiedShadowProjection, path: &str) -> PathBuf {
+        proof.source_backup().directory().join("payload").join(path)
     }
 
     #[test]
@@ -4444,10 +4061,7 @@ mod tests {
         let zero = Fixture::new("zero", None, Vec::new());
         let zero_proof = zero.verify().unwrap();
         assert_eq!(zero_proof.file_count(), 0);
-        assert!(fs::read_dir(zero_proof.directory().join(PAYLOAD_DIRECTORY))
-            .unwrap()
-            .next()
-            .is_none());
+        assert!(!zero_proof.directory().join("payload").exists());
         zero.assert_graph_unchanged();
 
         let one = Fixture::new(
@@ -4458,9 +4072,10 @@ mod tests {
         let one_proof = one.verify().unwrap();
         assert_eq!(one_proof.file_count(), 1);
         assert_eq!(
-            fs::read(one_proof.directory().join("payload/pages/one.md")).unwrap(),
+            fs::read(backup_payload_path(&one_proof, "pages/one.md")).unwrap(),
             b"- one\n"
         );
+        assert!(!one_proof.directory().join("payload").exists());
         let mut cursor = one_proof.file_evidence_cursor().unwrap();
         let evidence = cursor.next().unwrap().unwrap();
         assert_eq!(evidence.path().as_str(), "pages/one.md");
@@ -4509,6 +4124,14 @@ mod tests {
         );
         assert!(proof.instrumentation().accepted_frontier_session_misses > 0);
         assert!(proof.instrumentation().external_exact_session_misses > 0);
+        assert!(!proof.directory().join("payload").exists());
+        assert_eq!(proof.instrumentation().payload_bytes_written, 0);
+        assert_eq!(proof.instrumentation().payload_bytes_read, 0);
+        assert_eq!(
+            proof.instrumentation().tree_entries_visited,
+            0,
+            "shadow verification must not construct or traverse a duplicate payload tree"
+        );
         assert!(
             proof
                 .instrumentation()
@@ -4526,13 +4149,7 @@ mod tests {
         let mut page_ids = BTreeMap::new();
         while let Some(evidence) = cursor.next().unwrap() {
             assert_eq!(
-                fs::read(
-                    proof
-                        .directory()
-                        .join("payload")
-                        .join(evidence.path().as_str())
-                )
-                .unwrap(),
+                fs::read(backup_payload_path(&proof, evidence.path().as_str())).unwrap(),
                 fs::read(rich.graph_root.join(evidence.path().as_str())).unwrap()
             );
             page_ids.insert(evidence.path().as_str().to_owned(), evidence.page_id());
@@ -4545,6 +4162,24 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn inactive_shadow_projection_replays_published_logseq_claim_root() {
+        let source = concat!(
+            "- anchored block\n",
+            "  id:: 00000000-0000-0000-0000-000000008205\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fixture = Fixture::new(
+            "logseq-claim-replay",
+            None,
+            vec![("pages/anchored.md".into(), source)],
+        );
+
+        assert_eq!(fixture.verify().unwrap().file_count(), 1);
+        fixture.assert_graph_unchanged();
     }
 
     #[test]
@@ -4570,12 +4205,7 @@ mod tests {
         let proof = fixture.verify().unwrap();
         assert_eq!(proof.file_count(), 1);
         assert_eq!(
-            fs::read(
-                proof
-                    .directory()
-                    .join("payload/pages/blank-continuation.md")
-            )
-            .unwrap(),
+            fs::read(backup_payload_path(&proof, "pages/blank-continuation.md")).unwrap(),
             source
         );
         fixture.assert_graph_unchanged();
@@ -4613,9 +4243,9 @@ mod tests {
         let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
         for (path, bytes) in expected {
             assert_eq!(
-                fs::read(verified.directory().join("payload").join(&path)).unwrap(),
+                fs::read(backup_payload_path(&verified, &path)).unwrap(),
                 bytes,
-                "shadow payload for {path} must be byte-exact source"
+                "retained backup payload for {path} must be byte-exact source"
             );
             let path = ManagedPath::parse(path).unwrap();
             let baseline = authority.baseline_at(&path).unwrap().unwrap();
@@ -4679,9 +4309,9 @@ mod tests {
 
         let verified = fixture.verify().unwrap();
         assert_eq!(
-            fs::read(verified.directory().join("payload").join(path)).unwrap(),
+            fs::read(backup_payload_path(&verified, path)).unwrap(),
             source,
-            "the shadow payload must remain the exact bootstrap source"
+            "the retained backup payload must remain the exact bootstrap source"
         );
         let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
         let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
@@ -4886,7 +4516,7 @@ mod tests {
     }
 
     #[test]
-    fn promoted_bootstrap_point_lookup_rejects_changed_payload_bytes() {
+    fn promoted_bootstrap_point_lookup_rejects_changed_backup_bytes() {
         let fixture = Fixture::new(
             "promoted-point-corruption",
             None,
@@ -4897,14 +4527,30 @@ mod tests {
         let path = ManagedPath::parse("pages/exact.md").unwrap();
         let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
         fs::write(
-            verified
-                .directory()
-                .join(PAYLOAD_DIRECTORY)
-                .join(path.as_str()),
+            backup_payload_path(&verified, path.as_str()),
             b"- corrupt byte\n",
         )
         .unwrap();
         assert!(authority.baseline_at(&path).is_err());
+    }
+
+    #[test]
+    fn promoted_bootstrap_reopen_authenticates_source_backup_evidence() {
+        for evidence in ["manifest.bin", "restore-proof.bin", "committed.bin"] {
+            let fixture = Fixture::new(
+                evidence,
+                None,
+                vec![("pages/exact.md".into(), b"- exact bytes\n".to_vec())],
+            );
+            let verified = fixture.verify().unwrap();
+            let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+            fs::write(
+                verified.source_backup().directory().join(evidence),
+                b"changed",
+            )
+            .unwrap();
+            assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).is_err());
+        }
     }
 
     #[test]
@@ -4928,8 +4574,6 @@ mod tests {
         let entry = manifest[header..].to_vec();
         manifest.extend_from_slice(&entry);
         fs::write(&manifest_path, &manifest).unwrap();
-        duplicate_binding.catalog_rows = 2;
-        duplicate_binding.staged_file_count = 2;
         duplicate_binding.manifest = BlobDescription::of(&manifest);
         duplicate_binding.binding_digest = duplicate_binding.compute_binding_digest();
         let authority =
@@ -4939,7 +4583,10 @@ mod tests {
             .baseline_at(&ManagedPath::parse("pages/exact.md").unwrap())
             .err()
             .expect("duplicate path must fail on first access");
-        assert!(error.to_string().contains("duplicated"), "{error}");
+        assert!(
+            error.to_string().contains("trailing") || error.to_string().contains("duplicated"),
+            "{error}"
+        );
 
         let (page_fixture, page_verified) = one("promoted-wrong-page");
         let mut page_binding =
@@ -5091,11 +4738,18 @@ mod tests {
             proof.total_bytes() < fixture.backup.total_bytes(),
             "the backup retains every physical source while projection grants only winner authority"
         );
-        let payload = proof.directory().join(PAYLOAD_DIRECTORY);
+        let mut cursor = proof.file_evidence_cursor().unwrap();
+        let mut manifested = BTreeMap::new();
+        while let Some(evidence) = cursor.next().unwrap() {
+            manifested.insert(evidence.path().clone(), evidence.source());
+        }
+        cursor.finish().unwrap();
         for path in &selected {
             assert_eq!(
-                fs::read(payload.join(path.as_str())).unwrap(),
-                fs::read(fixture.graph_root.join(path.as_str())).unwrap()
+                manifested.get(path),
+                Some(&BlobDescription::of(
+                    &fs::read(fixture.graph_root.join(path.as_str())).unwrap()
+                ))
             );
         }
         for loser in [
@@ -5105,7 +4759,7 @@ mod tests {
             "twins/Twin.md",
             "twins/Twin.org",
         ] {
-            assert!(!payload.join(loser).exists());
+            assert!(!manifested.contains_key(&ManagedPath::parse(loser).unwrap()));
         }
         fixture.assert_graph_unchanged();
     }
@@ -5176,6 +4830,7 @@ mod tests {
         for ordinal in 0..4096 {
             multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
         }
+        force_next_bootstrap_part_operation_limit(4096);
         let multipart = Fixture::new(
             "verified-local-4096",
             None,
@@ -5759,13 +5414,7 @@ mod tests {
         assert_eq!(accepted.backup.file_count(), 1);
         let proof = accepted.verify().unwrap();
         assert_eq!(
-            fs::read(
-                proof
-                    .directory()
-                    .join(PAYLOAD_DIRECTORY)
-                    .join(&accepted_path)
-            )
-            .unwrap(),
+            fs::read(backup_payload_path(&proof, &accepted_path)).unwrap(),
             b"- deepest accepted source\n"
         );
 
@@ -5829,7 +5478,7 @@ mod tests {
                 "retry after {cut:?} did not reach {expected_barrier:?}: {barriers:?}"
             );
             assert_eq!(
-                fs::read(proof.directory().join("payload/pages/barriers.md")).unwrap(),
+                fs::read(backup_payload_path(&proof, "pages/barriers.md")).unwrap(),
                 b"- barriers\n"
             );
         }
@@ -5846,10 +5495,8 @@ mod tests {
             )],
         );
         let cuts = [
-            ShadowProjectionCrashCut::PartialPayloadWrite,
-            ShadowProjectionCrashCut::AfterPayloadPublication,
+            ShadowProjectionCrashCut::AfterManifestFileSync,
             ShadowProjectionCrashCut::PartialManifestWrite,
-            ShadowProjectionCrashCut::AfterManifestPublication,
             ShadowProjectionCrashCut::AfterStagingRename,
             ShadowProjectionCrashCut::PartialProofWrite,
             ShadowProjectionCrashCut::AfterProofPublication,
@@ -5865,7 +5512,7 @@ mod tests {
             ));
             let proof = fixture.verify().unwrap();
             assert_eq!(
-                fs::read(proof.directory().join("payload/pages/cuts.md")).unwrap(),
+                fs::read(backup_payload_path(&proof, "pages/cuts.md")).unwrap(),
                 b"- deterministic crash recovery payload\n"
             );
             assert_eq!(
@@ -5884,7 +5531,7 @@ mod tests {
             vec![("pages/conflict.md".into(), b"- original bytes\n".to_vec())],
         );
         SHADOW_PROJECTION_CRASH_CUT
-            .with(|pending| pending.set(Some(ShadowProjectionCrashCut::PartialPayloadWrite)));
+            .with(|pending| pending.set(Some(ShadowProjectionCrashCut::PartialManifestWrite)));
         assert!(fixture.verify().is_err());
         let stage = fs::read_dir(
             fixture
@@ -5898,8 +5545,7 @@ mod tests {
         .find(|entry| entry.file_name().to_string_lossy().starts_with('.'))
         .unwrap()
         .path();
-        let partial = first_payload_file(&stage.join(PAYLOAD_DIRECTORY));
-        fs::write(&partial, b"x").unwrap();
+        fs::write(stage.join(MANIFEST_FILE), b"x").unwrap();
         assert!(matches!(
             fixture.verify(),
             Err(ShadowProjectionError::CorruptOrConflicting(_))
@@ -5907,41 +5553,30 @@ mod tests {
 
         fixture.reset_shadow();
         let proof = fixture.verify().unwrap();
-        let shadow_payload = proof.directory().join("payload/pages/conflict.md");
-        let backup_payload = fixture.backup.directory().join("payload/pages/conflict.md");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-
-            assert_ne!(
-                fs::metadata(&shadow_payload).unwrap().ino(),
-                fs::metadata(&backup_payload).unwrap().ino(),
-                "shadow and migration backup payloads must be independent files"
-            );
-        }
-        fs::write(&shadow_payload, b"- tampered bytes\n").unwrap();
+        assert!(!proof.directory().join("payload").exists());
+        let backup_payload = backup_payload_path(&proof, "pages/conflict.md");
         assert_eq!(fs::read(&backup_payload).unwrap(), b"- original bytes\n");
+        fs::write(proof.directory().join("extra.md"), b"- extra\n").unwrap();
         assert!(fixture.verify().is_err());
 
         fixture.reset_shadow();
         let proof = fixture.verify().unwrap();
-        assert_eq!(
-            fs::read(proof.directory().join("payload/pages/conflict.md")).unwrap(),
-            b"- original bytes\n"
-        );
-        fs::write(proof.directory().join("payload/extra.md"), b"- extra\n").unwrap();
-        assert!(fixture.verify().is_err());
-
-        fixture.reset_shadow();
-        let proof = fixture.verify().unwrap();
-        fs::remove_file(proof.directory().join("payload/pages/conflict.md")).unwrap();
-        assert!(fixture.verify().is_err());
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&proof).unwrap();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        fs::write(
+            backup_payload_path(&proof, "pages/conflict.md"),
+            b"- tampered bytes\n",
+        )
+        .unwrap();
+        assert!(authority
+            .baseline_at(&ManagedPath::parse("pages/conflict.md").unwrap())
+            .is_err());
         fixture.assert_graph_unchanged();
     }
 
     #[cfg(unix)]
     #[test]
-    fn inactive_shadow_projection_rejects_payload_symlink_retarget() {
+    fn promoted_baseline_rejects_backup_payload_symlink_retarget() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new(
@@ -5949,27 +5584,18 @@ mod tests {
             None,
             vec![("pages/symlink.md".into(), b"- protected bytes\n".to_vec())],
         );
-        SHADOW_PROJECTION_CRASH_CUT
-            .with(|pending| pending.set(Some(ShadowProjectionCrashCut::PartialPayloadWrite)));
-        assert!(fixture.verify().is_err());
-        let workspace_root = fixture
-            .roots
-            .canonical_root()
-            .join(SHADOW_ROOT_DIRECTORY)
-            .join(fixture.authority.binding().workspace_id().to_string());
-        let stage = fs::read_dir(workspace_root)
-            .unwrap()
-            .map(Result::unwrap)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with('.'))
-            .unwrap()
-            .path();
-        let partial = first_payload_file(&stage.join(PAYLOAD_DIRECTORY));
+        let proof = fixture.verify().unwrap();
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&proof).unwrap();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        let payload = backup_payload_path(&proof, "pages/symlink.md");
         let outside = fixture.root.path().join("outside.txt");
-        fs::write(&outside, b"outside remains unchanged").unwrap();
-        fs::remove_file(&partial).unwrap();
-        symlink(&outside, &partial).unwrap();
-        assert!(fixture.verify().is_err());
-        assert_eq!(fs::read(outside).unwrap(), b"outside remains unchanged");
+        fs::write(&outside, b"- protected bytes\n").unwrap();
+        fs::remove_file(&payload).unwrap();
+        symlink(&outside, &payload).unwrap();
+        assert!(authority
+            .baseline_at(&ManagedPath::parse("pages/symlink.md").unwrap())
+            .is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"- protected bytes\n");
         fixture.assert_graph_unchanged();
     }
 
@@ -6004,7 +5630,6 @@ mod tests {
             &first.verified,
             &second.backup,
             &first.authority,
-            &first.sqlite,
             &first.sqlite_proof,
         )
         .is_err());
@@ -6015,7 +5640,6 @@ mod tests {
             &first.verified,
             &first.backup,
             &first.authority,
-            &first.sqlite,
             &second.sqlite_proof,
         )
         .is_err());

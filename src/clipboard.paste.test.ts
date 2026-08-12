@@ -8,6 +8,13 @@ import {
   type ClipboardPayloadData,
 } from "./clipboard";
 import {
+  __clipboardWorkForTest,
+  __resetClipboardWorkForTest,
+} from "./clipboardWorkProbe";
+import {
+  __setStoreMutationObserverForTest,
+  __loadedIdentityWorkForTest,
+  __resetLoadedIdentityWorkForTest,
   buildClipboardPayload,
   deleteBlock,
   doc,
@@ -25,10 +32,16 @@ import {
   resetStore,
   setDoc,
   setRaw,
+  selectBlock,
+  extendSelectionTo,
+  selectedIds,
+  selectionMarkdown,
+  deleteSelection,
   toggleUndoRedoMode,
   undo,
 } from "./store";
 import { startEditing } from "./editorController";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { initParser } from "./render/parse";
 import type { BlockDto, Format, PageDto } from "./types";
 import {
@@ -43,6 +56,7 @@ import {
 const HOST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ID1 = "11111111-1111-4111-8111-111111111111";
 const ID2 = "22222222-2222-4222-8222-222222222222";
+const ID3 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 beforeAll(() => initParser());
 
@@ -66,13 +80,60 @@ function page(
   };
 }
 
-function seed(pages: PageDto[]): void {
-  loadFeed(pages);
+async function seed(pages: PageDto[]): Promise<void> {
+  await loadFeed(pages);
   setGraphMeta({ root: "/graph" } as any);
 }
 
 function roots(name: string): string[] {
   return [...pageByName(name)!.roots];
+}
+
+function generatedId(index: number): string {
+  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+function loadedRawBytes(): number {
+  return Object.values(doc.byId)
+    .reduce((total, node) => total + new TextEncoder().encode(node.raw).byteLength, 0);
+}
+
+function pageState(name: string): string {
+  const current = pageByName(name)!;
+  const ids = new Set<string>();
+  const visit = (id: string) => {
+    if (ids.has(id)) return;
+    ids.add(id);
+    doc.byId[id]?.children.forEach(visit);
+  };
+  current.roots.forEach(visit);
+  return JSON.stringify({
+    page: current,
+    nodes: [...ids].sort().map((id) => doc.byId[id]),
+  });
+}
+
+function blockRawBytes(blocks: readonly BlockDto[]): number {
+  return blocks.reduce(
+    (total, block) => total + new TextEncoder().encode(block.raw).byteLength + blockRawBytes(block.children),
+    0,
+  );
+}
+
+function pageNodeCount(name: string): number {
+  const seen = new Set<string>();
+  const visit = (id: string) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    doc.byId[id]?.children.forEach(visit);
+  };
+  pageByName(name)!.roots.forEach(visit);
+  return seen.size;
+}
+
+function rawIdentityOwners(id: string): string[] {
+  const property = new RegExp(`(?:^|\\n)\\s*(?:id\\s*::|:id:)\\s*${id}(?=\\s*(?:\\n|$))`, "i");
+  return Object.values(doc.byId).filter((node) => property.test(node.raw)).map((node) => node.id);
 }
 
 async function record(
@@ -89,7 +150,25 @@ async function paste(target = HOST): Promise<string | null> {
   return pasteClipboardPayload(target, slot!);
 }
 
+async function countStoreMutations<T>(run: () => T | Promise<T>) {
+  const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+  __setStoreMutationObserverForTest((observation) => {
+    if (observation.kind === "publication") counts.publications++;
+    else if (observation.kind === "dirty") counts.dirtyMarks++;
+    else if (observation.kind === "undo-snapshot") counts.snapshots++;
+  });
+  try {
+    await run();
+  } finally {
+    __setStoreMutationObserverForTest(null);
+  }
+  return counts;
+}
+
 beforeEach(() => {
+  // Legacy clipboard fixtures exercise Direct Files behavior explicitly. A
+  // missing route record is now intentionally fail-closed during transitions.
+  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   vi.spyOn(backend(), "writeRich").mockResolvedValue();
   vi.spyOn(backend(), "savePage").mockResolvedValue("saved-rev");
   vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map(() => null));
@@ -102,13 +181,207 @@ afterEach(() => {
   setGraphMeta(null);
   setGraphTransitioning(false);
   setGraphEpoch(0);
+  managedStorageRuntime.clear();
   setToasts([]);
   vi.restoreAllMocks();
 });
 
+function bindManagedWritable(): void {
+  managedStorageRuntime.bind(1);
+  managedStorageRuntime.receiveStatus({
+    state: "active",
+    runtime: null,
+    can_activate: false,
+    can_retry: false,
+    can_cancel: false,
+    cancel_reason: null,
+    binding_generation: 1,
+    application_page_admission: {
+      binding_generation: 1,
+      authority: "managed_writable",
+      application_save_page_blocks: 511,
+      application_page_request_text_bytes: 1_048_576,
+      application_page_max_depth: 128,
+    },
+  } as any);
+}
+
+function receiveManagedUnavailableRuntime(
+  lifecycle: "stopped_safe" | "stopped_crashed" | "terminal",
+): boolean {
+  return managedStorageRuntime.receiveRuntimeStatus({
+    binding_generation: 1,
+    runtime: {
+      lifecycle,
+      recovery: null,
+      watcher: {
+        latest_enqueue: 0,
+        acknowledged: 0,
+        drain_in_flight: false,
+        pending: false,
+        pending_requires_full_scan: false,
+        deferred: false,
+        quiescing: false,
+        sequence_exhausted: false,
+      },
+      last_tick: null,
+      detail: null,
+      shared_role: null,
+      shared_phase: null,
+      provider_pending: 0,
+    },
+    application_page_admission: {
+      binding_generation: 1,
+      authority: "managed_unavailable",
+    },
+  });
+}
+
 describe("clipboard payload insertion and identity validation", () => {
+  it("refuses a managed 512th clipboard block before it mutates the target", async () => {
+    const target = generatedId(99_999);
+    await seed([page("Paste", [
+      ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
+      block(target, "target"),
+    ])]);
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    const mutations = await countStoreMutations(() => paste(target));
+
+    expect(pageNodeCount("Paste")).toBe(511);
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+    ]);
+  });
+
+  it("keeps an initially refused Cut grant and every source action untouched", async () => {
+    const fullTarget = generatedId(99_998);
+    const retryTarget = generatedId(99_997);
+    await seed([
+      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+      page("Full", [
+        ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
+        block(fullTarget, "target"),
+      ]),
+      page("Retry", [block(retryTarget, "target")]),
+    ]);
+    const payload = buildClipboardPayload([ID1])!;
+    await record("cut", "- source", payload);
+    deleteBlock(ID1);
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    vi.clearAllMocks();
+
+    const mutations = await countStoreMutations(() => paste(fullTarget));
+
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
+    expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
+    expect(peekClipboardSlot()?.op).toBe("cut");
+
+    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+    await paste(retryTarget);
+
+    expect(peekClipboardSlot()?.op).toBe("copy");
+    expect(roots("Retry")).toEqual([retryTarget, ID1]);
+  });
+
+  it.each(["stopped_safe", "stopped_crashed", "terminal"] as const)(
+    "keeps a Cut grant untouched after a same-generation managed %s runtime event",
+    async (lifecycle) => {
+      await seed([
+        page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+        page("Target", [block(HOST, "target")]),
+      ]);
+      const payload = buildClipboardPayload([ID1])!;
+      await record("cut", "- source", payload);
+      deleteBlock(ID1);
+      bindManagedWritable();
+      expect(receiveManagedUnavailableRuntime(lifecycle)).toBe(true);
+      vi.clearAllMocks();
+
+      const mutations = await countStoreMutations(() => paste(HOST));
+
+      expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+      expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
+      expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
+      expect(peekClipboardSlot()?.op).toBe("cut");
+      expect(roots("Target")).toEqual([HOST]);
+      expect(toasts().map(({ message }) => message)).toEqual([
+        "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+      ]);
+    },
+  );
+
+  it("admits a small private copy through the active managed route", async () => {
+    await seed([page("Paste", [block(HOST, "target")])]);
+    bindManagedWritable();
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    await paste();
+
+    expect(roots("Paste")).toHaveLength(2);
+    expect(doc.byId[HOST].raw).toBe("target");
+  });
+
+  it("refuses a private clipboard paste while managed storage has no writable route", async () => {
+    await seed([page("Paste", [block(HOST, "target")])]);
+    managedStorageRuntime.bind(1);
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    const mutations = await countStoreMutations(() => paste());
+
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(roots("Paste")).toEqual([HOST]);
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+    ]);
+  });
+
   it("retires an immediate cut before the debounce and preserves identity", async () => {
-    seed([page("Paste", [
+    await seed([page("Paste", [
       block(ID1, `source\nid:: ${ID1}`),
       block(HOST, ""),
     ])]);
@@ -126,7 +399,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("retires every page in a multi-page cut before preserving all ids", async () => {
-    seed([
+    await seed([
       page("One", [block(ID1, `one\nid:: ${ID1}`)], { path: "pages/one.md" }),
       page("Two", [block(ID2, `two\nid:: ${ID2}`)], { path: "pages/two.md" }),
       page("Target", [block(HOST, "")], { path: "pages/target.md" }),
@@ -143,7 +416,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("strips identity when an unsaved raw acquires the cut id during validation", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Collision", [block("collision", "other")]),
       page("Target", [block(HOST, "")]),
@@ -179,7 +452,7 @@ describe("clipboard payload insertion and identity validation", () => {
       vi.mocked(backend().resolveBlocks).mockRejectedValue(new Error("offline"));
     }],
   ])("strips every id on %s", async (_label, expectedIds, arrange) => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -201,7 +474,7 @@ describe("clipboard payload insertion and identity validation", () => {
     for (const [index, sample] of cases.entries()) {
       resetStore();
       clearClipboardSlot();
-      seed([page("Source", [block(ID1, `old\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+      await seed([page("Source", [block(ID1, `old\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
       const payload = buildClipboardPayload([ID1])!;
       payload.blocks = [{ raw: sample.raw, sourceFormat: "md", children: sample.child ? [sample.child] : [] }];
       await record("cut", `- root ${index}`, payload);
@@ -219,7 +492,7 @@ describe("clipboard payload insertion and identity validation", () => {
     const run = async (arrange: () => void | Promise<void>) => {
       resetStore();
       clearClipboardSlot();
-      seed([
+      await seed([
         page("Source", [block(ID1, `source\nid:: ${ID1}`)], { path: "pages/source.md" }),
         page("Target", [block(HOST, "")]),
       ]);
@@ -234,15 +507,15 @@ describe("clipboard payload insertion and identity validation", () => {
     vi.mocked(backend().savePage).mockRejectedValueOnce(new Error("disk full"));
     await run(() => {});
     await run(() => forgetPage("Source"));
-    await run(() => {
+    await run(async () => {
       forgetPage("Source");
-      reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
+      await reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
     });
   });
 
   it("strips all ids after the actual working-set cap evicts the cut source", async () => {
     loadSingle(page("Target", [block(HOST, "")]));
-    ensurePageLoaded(page("Source", [
+    await ensurePageLoaded(page("Source", [
       block(ID1, `source\nid:: ${ID1}`, [block(ID2, `child\nid:: ${ID2}`)]),
     ]));
     setGraphMeta({ root: "/graph" } as any);
@@ -252,7 +525,7 @@ describe("clipboard payload insertion and identity validation", () => {
     expect(await flushPage("Source")).toBe(true);
 
     for (let i = 0; i < 79; i++) {
-      ensurePageLoaded(page(`Eviction ${i}`, [block(`eviction-${i}`, String(i))]));
+      await ensurePageLoaded(page(`Eviction ${i}`, [block(`eviction-${i}`, String(i))]));
     }
     expect(pageByName("Source")).toBeUndefined();
 
@@ -268,7 +541,7 @@ describe("clipboard payload insertion and identity validation", () => {
   it("strips the whole multi-page payload when only one source flush fails", async () => {
     resetStore();
     clearClipboardSlot();
-    seed([
+    await seed([
       page("One", [block(ID1, `one\nid:: ${ID1}`)]),
       page("Two", [block(ID2, `two\nid:: ${ID2}`)]),
       page("Target", [block(HOST, "")]),
@@ -290,7 +563,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("fails retirement when a source is rebound while its save is in flight", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)], { path: "pages/source.md" }),
       page("Target", [block(HOST, "")]),
     ]);
@@ -302,7 +575,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
     const pending = paste();
     await vi.waitFor(() => expect(backend().savePage).toHaveBeenCalled());
-    reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
+    await reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
     finishSave("stale-rev");
 
     await pending;
@@ -311,7 +584,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("consumes a cut grant up front and makes a second paste structural-only", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -328,7 +601,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("strips identity when undo restores the cut originals before paste", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -344,7 +617,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("copy-paste strips every id while preserving exact structure, raws, and collapse", async () => {
-    seed([page("Target", [block(HOST, "")])]);
+    await seed([page("Target", [block(HOST, "")])]);
     await record("copy", "- root", {
       blocks: [{
         raw: `root line\nsecond line\ncollapsed:: true\nid:: ${ID1}`,
@@ -367,7 +640,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
   it("keeps a same-format preserved raw byte-exact, including blank lines and trailing spaces", async () => {
     const exact = `first line  \n\nsecond line\t\nid:: ${ID1}`;
-    seed([page("Source", [block(ID1, exact)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, exact)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- first line", payload);
     deleteBlock(ID1);
@@ -380,7 +653,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("does not replace an empty host carrying identity or an incoming reference", async () => {
-    seed([page("Target", [
+    await seed([page("Target", [
       block(HOST, `id:: ${HOST}`),
       block("referrer", `((${ID2}))`),
       block(ID2, ""),
@@ -402,7 +675,7 @@ describe("clipboard payload insertion and identity validation", () => {
     ["md", "org", `body\nalpha:: one\nid:: ${ID1}\ncollapsed:: true`, `body\n:PROPERTIES:\n:alpha: one\n:id: ${ID1}\n:collapsed: true\n:END:`],
     ["org", "md", `body\n:PROPERTIES:\n:alpha: one\n:id: ${ID1}\n:collapsed: true\n:END:`, `body\nalpha:: one\nid:: ${ID1}\ncollapsed:: true`],
   ] as const)("translates ordered properties for %s → %s while preserving cut identity", async (sourceFormat, targetFormat, raw, expected) => {
-    seed([
+    await seed([
       page("Source", [block(ID1, raw)], { format: sourceFormat }),
       page("Target", [block(HOST, "")], { format: targetFormat }),
     ]);
@@ -417,7 +690,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("aborts entirely when graph authority changes during validation", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -435,7 +708,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("aborts when the target page instance reloads during validation", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -444,7 +717,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
     const pending = paste();
     await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
-    reloadPage(page("Target", [block(HOST, "reloaded")]))
+    await reloadPage(page("Target", [block(HOST, "reloaded")]));
     release([null]);
 
     await expect(pending).resolves.toBeNull();
@@ -453,7 +726,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("repeats the source clean-state check in the final no-await section", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -471,7 +744,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("rechecks the live doc after backend absence validation and strips on an in-app conflict", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -501,7 +774,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
 describe("identity-tagged redo", () => {
   async function preservedPaste(): Promise<void> {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Target", [block(HOST, "")]),
       page("Other", [block("other", "old")]),
@@ -563,7 +836,7 @@ describe("identity-tagged redo", () => {
   });
 
   it("clears mixed page-only redo entries when the tagged prerequisite is selected from the middle", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Target", [block(HOST, "")]),
       page("Other", [block("other", "old")]),
@@ -588,5 +861,374 @@ describe("identity-tagged redo", () => {
     redo();
     expect(doc.byId[ID1]).toBeUndefined();
     expect(doc.byId.other.raw).toBe("old");
+  });
+});
+
+describe("F3 batched loaded identity collision receipt", () => {
+  async function runLargePreservedPaste(incomingCount: number, loadedCount: number) {
+    resetStore();
+    clearClipboardSlot();
+    const ids = Array.from({ length: incomingCount }, (_, index) => generatedId(index + 1));
+    await seed([
+      page("Source", ids.map((id, index) => block(id, `source ${index}\nid:: ${id}`))),
+      page("Loaded", Array.from({ length: loadedCount }, (_, index) => block(`loaded-${index}`, `loaded ${index}`))),
+      page("Target", [block(HOST, "")]),
+    ]);
+    const payload = buildClipboardPayload(ids)!;
+    await record("cut", "- source", payload);
+    for (const id of ids) deleteBlock(id);
+
+    const expected = {
+      loaded_identity_passes: 1,
+      loaded_identity_nodes_scanned: Object.keys(doc.byId).length,
+      loaded_identity_raw_bytes_scanned: loadedRawBytes(),
+      incoming_identity_ids_checked: ids.length,
+    };
+    __resetLoadedIdentityWorkForTest();
+    await paste();
+
+    expect(roots("Target")).toEqual(ids);
+    expect(__loadedIdentityWorkForTest()).toEqual(expected);
+    return expected;
+  }
+
+  async function prepareLargeRedo(incomingCount: number, loadedCount: number) {
+    resetStore();
+    clearClipboardSlot();
+    const ids = Array.from({ length: incomingCount }, (_, index) => generatedId(index + 1));
+    await seed([
+      page("Source", ids.map((id, index) => block(id, `source ${index}\nid:: ${id}`))),
+      page("Loaded", Array.from({ length: loadedCount }, (_, index) => block(`loaded-${index}`, `loaded ${index}`))),
+      page("Target", [block(HOST, "")]),
+    ]);
+    const payload = buildClipboardPayload(ids)!;
+    await record("cut", "- source", payload);
+    for (const id of ids) deleteBlock(id);
+    await paste();
+    undo();
+
+    const expected = {
+      loaded_identity_passes: 1,
+      loaded_identity_nodes_scanned: Object.keys(doc.byId).length,
+      loaded_identity_raw_bytes_scanned: loadedRawBytes(),
+      incoming_identity_ids_checked: ids.length,
+    };
+    __resetLoadedIdentityWorkForTest();
+    redo();
+
+    expect(roots("Target")).toEqual(ids);
+    expect(__loadedIdentityWorkForTest()).toEqual(expected);
+  }
+
+  it("does one loaded-document pass for 200+ preserved-ID paste candidates", async () => {
+    const twoHundred = await runLargePreservedPaste(200, 40);
+    const fourHundred = await runLargePreservedPaste(400, 40);
+
+    expect(fourHundred.loaded_identity_passes).toBe(twoHundred.loaded_identity_passes);
+    expect(fourHundred.loaded_identity_nodes_scanned).toBe(twoHundred.loaded_identity_nodes_scanned);
+    expect(fourHundred.loaded_identity_raw_bytes_scanned).toBe(twoHundred.loaded_identity_raw_bytes_scanned);
+    expect(fourHundred.incoming_identity_ids_checked).toBe(twoHundred.incoming_identity_ids_checked * 2);
+  });
+
+  it("keeps incoming checks fixed while the loaded document grows", async () => {
+    const sparse = await runLargePreservedPaste(200, 20);
+    const dense = await runLargePreservedPaste(200, 40);
+
+    expect(dense.incoming_identity_ids_checked).toBe(sparse.incoming_identity_ids_checked);
+    expect(dense.loaded_identity_passes).toBe(sparse.loaded_identity_passes);
+    expect(dense.loaded_identity_nodes_scanned).toBeGreaterThan(sparse.loaded_identity_nodes_scanned);
+    expect(dense.loaded_identity_raw_bytes_scanned).toBeGreaterThan(sparse.loaded_identity_raw_bytes_scanned);
+  });
+
+  it("does one loaded-document pass for 200+ preserved-ID redo candidates", async () => {
+    await prepareLargeRedo(200, 40);
+  });
+
+  function clipboardForest(kind: "flat" | "deep"): {
+    roots: BlockDto[];
+    selected: string[];
+    selectionEnd: string;
+    nodes: number;
+  } {
+    let next = 1;
+    const nextBlock = (raw: string, children: BlockDto[] = []) => {
+      const id = generatedId(next++);
+      return block(id, `${raw}\nid:: ${id}`, children);
+    };
+    if (kind === "flat") {
+      const roots = Array.from({ length: 50 }, (_, index) => nextBlock(`flat ${index}`));
+      const selected = roots.map((node) => node.id);
+      return { roots, selected, selectionEnd: selected.at(-1)!, nodes: 50 };
+    }
+    const roots = Array.from({ length: 3 }, (_, root) => nextBlock(
+      `root ${root}`,
+      Array.from({ length: 100 }, (_, child) => nextBlock(`child ${root}-${child}`)),
+    ));
+    const selected = roots.map((node) => node.id);
+    return { roots, selected, selectionEnd: roots.at(-1)!.children.at(-1)!.id, nodes: 303 };
+  }
+
+  function selectClipboardRoots(ids: string[], end = ids.at(-1)!): void {
+    selectBlock(ids[0]);
+    if (ids.length > 1) extendSelectionTo(end);
+  }
+
+  it.each(["flat", "deep"] as const)("characterizes synchronous Copy for the %s cross-page fixture", async (kind) => {
+    const forest = clipboardForest(kind);
+    await seed([
+      page("Source", forest.roots),
+      page("Target", [block(HOST, "")]),
+    ]);
+    selectClipboardRoots(forest.selected, forest.selectionEnd);
+    const before = pageState("Source");
+    __resetClipboardWorkForTest("copy");
+
+    const text = selectionMarkdown();
+    const payload = buildClipboardPayload(selectedIds())!;
+    let releaseWrite!: () => void;
+    vi.mocked(backend().writeRich).mockReturnValue(new Promise<void>((resolve) => { releaseWrite = resolve; }));
+    const write = copyBlockOutline("copy", text, payload);
+
+    const slot = peekClipboardSlot()!;
+    expect(slot.op).toBe("copy");
+    expect(slot.sourcePages).toEqual([]); // Copy deliberately does not retain a cut grant.
+    expect(pageState("Source")).toBe(before);
+    if (kind === "deep") {
+      expect(text).toContain("child 0-0");
+      expect(payload.blocks).toHaveLength(3);
+      expect(payload.blocks.every((candidate) => candidate.children.length === 100)).toBe(true);
+    }
+    const work = __clipboardWorkForTest();
+    expect(work.public_markdown_visits).toBe(kind === "flat" ? 50 : 303);
+    expect(work.private_payload_visits).toBe(forest.nodes);
+    expect(work.public_markdown_raw_bytes).toBeGreaterThan(0);
+    expect(work.private_payload_raw_bytes).toBeGreaterThanOrEqual(work.public_markdown_raw_bytes);
+    releaseWrite();
+    await write;
+  });
+
+  it("characterizes 3x100 immediate structural copy-paste with one target mutation and save", async () => {
+    const forest = clipboardForest("deep");
+    await seed([
+      page("Source", forest.roots),
+      page("Target", [block(HOST, "")]),
+    ]);
+    selectClipboardRoots(forest.selected, forest.selectionEnd);
+    const before = pageState("Source");
+    __resetClipboardWorkForTest("copy-paste-3x100");
+
+    const payload = buildClipboardPayload(selectedIds())!;
+    await copyBlockOutline("copy", selectionMarkdown(), payload);
+    const mutation = await countStoreMutations(() => paste());
+
+    expect(mutation).toEqual({ publications: 1, dirtyMarks: 1, snapshots: 1 });
+    expect(roots("Target")).toHaveLength(3);
+    expect(pageNodeCount("Target")).toBe(forest.nodes);
+    expect(pageState("Source")).toBe(before);
+    expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
+    expect(__clipboardWorkForTest()).toMatchObject({
+      label: "copy-paste-3x100",
+      public_markdown_visits: 303,
+      private_payload_visits: 303,
+      prepared_destination_nodes: 303,
+      allocated_destination_nodes: 303,
+      distinct_dirty_pages: ["Target"],
+      undo_snapshots: 1,
+      undo_snapshot_nodes: 1,
+      undo_snapshot_raw_bytes: 0,
+      accepted_source_saves: [],
+      accepted_target_saves: [],
+      source_retirement_phases: 0,
+      resolve_blocks_phases: 0,
+      final_identity_guard_phases: 0,
+      target_insertion_phases: 1,
+    });
+
+    await flushPage("Target");
+    expect(vi.mocked(backend().savePage).mock.calls.map(([dto]) => dto.name)).toEqual(["Target"]);
+    expect(__clipboardWorkForTest()).toMatchObject({
+      accepted_target_saves: ["Target"],
+      phase_order: ["target-insertion", "accepted-target-save"],
+    });
+  });
+
+  it("characterizes 3x100 durable exact-ID cut-paste without optimistic target insertion", async () => {
+    const forest = clipboardForest("deep");
+    await seed([
+      page("Source", forest.roots),
+      page("Target", [block(HOST, "")]),
+    ]);
+    selectClipboardRoots(forest.selected, forest.selectionEnd);
+    __resetClipboardWorkForTest("cut-3x100");
+    const payload = buildClipboardPayload(selectedIds())!;
+    await copyBlockOutline("cut", selectionMarkdown(), payload);
+    expect(peekClipboardSlot()?.sourcePages.map((source) => source.name)).toEqual(["Source"]);
+    const deletion = await countStoreMutations(() => deleteSelection());
+    expect(deletion).toEqual({ publications: 1, dirtyMarks: 1, snapshots: 1 });
+    expect(pageNodeCount("Source")).toBe(0);
+    expect(__clipboardWorkForTest()).toMatchObject({
+      label: "cut-3x100",
+      public_markdown_visits: 303,
+      private_payload_visits: 303,
+      distinct_dirty_pages: ["Source"],
+      undo_snapshots: 1,
+      undo_snapshot_nodes: 303,
+      undo_snapshot_raw_bytes: blockRawBytes(forest.roots),
+      accepted_source_saves: [],
+      accepted_target_saves: [],
+    });
+
+    __resetClipboardWorkForTest("cut-paste-3x100");
+    const insertion = await countStoreMutations(() => paste());
+
+    expect(insertion).toEqual({ publications: 1, dirtyMarks: 1, snapshots: 1 });
+    expect(roots("Target")).toEqual(forest.selected);
+    expect(pageNodeCount("Target")).toBe(forest.nodes);
+    expect(__clipboardWorkForTest()).toMatchObject({
+      label: "cut-paste-3x100",
+      prepared_destination_nodes: 303,
+      allocated_destination_nodes: 303,
+      distinct_dirty_pages: ["Target"],
+      undo_snapshots: 1,
+      undo_snapshot_nodes: 1,
+      undo_snapshot_raw_bytes: 0,
+      accepted_source_saves: ["Source"],
+      accepted_target_saves: [],
+      source_retirement_phases: 1,
+      resolve_blocks_phases: 1,
+      final_identity_guard_phases: 1,
+      target_insertion_phases: 1,
+    });
+    expect(vi.mocked(backend().savePage).mock.calls.map(([dto]) => dto.name)).toEqual(["Source"]);
+
+    await flushPage("Target");
+    expect(vi.mocked(backend().savePage).mock.calls.map(([dto]) => dto.name).sort()).toEqual(["Source", "Target"]);
+    expect(__clipboardWorkForTest()).toMatchObject({
+      accepted_target_saves: ["Target"],
+      phase_order: [
+        "source-retirement",
+        "accepted-source-save",
+        "resolve-blocks",
+        "final-identity-guard",
+        "target-insertion",
+        "accepted-target-save",
+      ],
+    });
+  });
+
+  async function prepareSinglePreservedRedo(sourceId = ID3.toUpperCase(), ownerFormat: Format = "md") {
+    await seed([
+      page("Source", [block(sourceId, `source\nid:: ${sourceId}`)]),
+      page("Collision", [block("collision", "owner")], { format: ownerFormat }),
+      page("Target", [block(HOST, "")]),
+    ]);
+    const payload = buildClipboardPayload([sourceId])!;
+    await record("cut", "- source", payload);
+    deleteBlock(sourceId);
+    await paste();
+    undo();
+    return sourceId.toLowerCase();
+  }
+
+  function installKeyedCollision(id: string): void {
+    setDoc("byId", id, {
+      id,
+      raw: `keyed collision\nid:: ${id}`,
+      collapsed: false,
+      parent: null,
+      page: "Collision",
+      children: [],
+    });
+    setDoc("pages", (candidate) => candidate.name === "Collision", "roots", (ids) => [...ids, id]);
+  }
+
+  const rawCollisionCases = [
+    {
+      label: "mixed-case loaded key",
+      ownerFormat: "md",
+      introduce: (id: string) => installKeyedCollision(id.toLowerCase()),
+      introduceRedo: (id: string) => installKeyedCollision(id.toLowerCase()),
+      clear: (id: string) => {
+        setDoc("pages", (candidate) => candidate.name === "Collision", "roots", (ids) => ids.filter((candidate) => candidate !== id));
+        setDoc("byId", id, undefined!);
+      },
+    },
+    {
+      label: "Markdown-declared raw-only ownership",
+      ownerFormat: "md",
+      introduce: (id: string) => setRaw("collision", `owner\nid:: ${id.toLowerCase()}`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\nid:: ${id.toLowerCase()}`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Org-declared drawer raw-only ownership",
+      ownerFormat: "org",
+      introduce: (id: string) => setRaw("collision", `owner\r\n:PROPERTIES:\r\n :ID: ${id.toLowerCase()}\r\n:END:`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\r\n:PROPERTIES:\r\n :ID: ${id.toLowerCase()}\r\n:END:`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Org-declared outside-drawer raw-only ownership",
+      ownerFormat: "org",
+      introduce: (id: string) => setRaw("collision", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Markdown-declared outside-drawer Org-looking ownership",
+      ownerFormat: "md",
+      introduce: (id: string) => setRaw("collision", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Markdown-declared optional-space ownership",
+      ownerFormat: "md",
+      introduce: (id: string) => setRaw("collision", `owner\nid :: ${id.toLowerCase()}`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\nid :: ${id.toLowerCase()}`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Org-declared Markdown-looking optional-space ownership",
+      ownerFormat: "org",
+      introduce: (id: string) => setRaw("collision", `owner\nid :: ${id.toLowerCase()}`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\nid :: ${id.toLowerCase()}`),
+      clear: () => setRaw("collision", "owner"),
+    },
+  ] as const;
+
+  it.each(rawCollisionCases)("falls back to fresh IDs for $label on cut paste", async ({ introduce, ownerFormat }) => {
+    const sourceId = ID3.toUpperCase();
+    await seed([
+      page("Source", [block(sourceId, `source\nid:: ${sourceId}`)]),
+      page("Collision", [block("collision", "owner")], { format: ownerFormat }),
+      page("Target", [block(HOST, "")]),
+    ]);
+    const payload = buildClipboardPayload([sourceId])!;
+    await record("cut", "- source", payload);
+    deleteBlock(sourceId);
+    introduce(sourceId);
+
+    await paste();
+
+    const pasted = roots("Target")[0];
+    expect(pasted).not.toBe(sourceId.toLowerCase());
+    expect(doc.byId[pasted].raw).toBe("source");
+    expect(rawIdentityOwners(sourceId)).toHaveLength(1);
+  });
+
+  it.each(rawCollisionCases)("refuses Redo and clears dependent entries for $label", async ({ introduceRedo, clear, ownerFormat }) => {
+    const normalizedId = await prepareSinglePreservedRedo(ID3.toUpperCase(), ownerFormat);
+    introduceRedo(normalizedId);
+    const before = JSON.stringify(doc);
+
+    redo();
+
+    expect(JSON.stringify(doc)).toBe(before);
+    expect(toasts().at(-1)?.message).toBe("Redo skipped: a block with the same id now exists");
+    clear(normalizedId);
+    redo();
+    expect(doc.byId[normalizedId]).toBeUndefined();
+    expect(roots("Target")).toEqual([HOST]);
   });
 });

@@ -31,11 +31,12 @@ import {
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
 import { PdfExportDialog } from "./components/PdfExportDialog";
+import { StartupRecoveryLayer } from "./components/StartupRecovery";
 import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
-import { loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities } from "./graph";
+import { loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
 import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type QueryRoute } from "./router";
@@ -71,7 +72,6 @@ import {
   pageInventoryRev,
   bumpPageInventoryRev,
   installPaneTracker,
-  markConflict,
   pushToast,
   refreshSyncConflicts,
   graphEpoch,
@@ -91,10 +91,10 @@ import {
   captureToPage,
   pageByName,
   reloadDisposition,
-  reloadPage,
+  reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { divergedFromBaseline, isSaving } from "./persistence";
+import { applyDivergenceVerdict, graphBinding, isSaving, reconcileExternalChange } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -119,7 +119,7 @@ import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initLinkDefault } from "./editor/linkDefault";
-import { initDebug, dbg } from "./debug";
+import { initDebug } from "./debug";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 import { initNativeChrome, isMac, isMobilePlatform, osDrawsWindowControls } from "./nativeChrome";
 import {
@@ -137,9 +137,14 @@ import {
 import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
-import { installAndroidBackHandler, requestAndroidRootClose } from "./androidBack";
+import { installBackgroundFlush } from "./backgroundFlush";
+import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
+import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
+import { createStartupRecoveryController } from "./startupRecovery";
+import { writeClipboardTextResilient } from "./clipboard";
+import type { SparseV2CancelResult } from "./types";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -153,8 +158,10 @@ const safeClose = createSafeCloseCoordinator({
   },
   flushPdfWork: drainPdfWork,
   flushAll,
-  confirmDiscard: () => backend().confirm(
-    "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
+  confirmDiscard: (reason) => backend().confirm(
+    reason === "still-saving"
+      ? "Tine is still writing your changes and is taking longer than expected — a slow or network drive can do this.\n\nClosing now would lose whatever hasn't been written yet. Close anyway?"
+      : "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
     "Unsaved changes",
   ),
   flushSession,
@@ -162,20 +169,34 @@ const safeClose = createSafeCloseCoordinator({
   notifyPdfFailure: () => {
     pushToast("Couldn't save pending PDF changes. The graph remains open.", "error");
   },
+  notifyStillSaving: () => {
+    pushToast("Still saving your changes — closing in a moment.", "info");
+  },
   notifyConfirmationFailure: () => {
     pushToast("Couldn't confirm closing the window. Your unsaved changes are still open.", "error");
   },
 });
 
+const androidRootClose = createAndroidRootCloseCoordinator(safeClose, {
+  prepareNativeClose: () => backend().prepareQuit(),
+  finishActivity: async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("plugin:app|exit");
+  },
+  nativePrepareFailed: (failure) => pushToast(
+    failure.status === "refused" || failure.status === "partial"
+      ? "Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."
+      : "Couldn't close the app. Your graph remains open.",
+    "error",
+  ),
+  finishActivityFailed: () => pushToast(
+    "Tine safely stopped managed storage but couldn't close the Android activity. Tap Back to retry closing.",
+    "error",
+  ),
+});
+
 async function closeAndroidRootSafely(): Promise<void> {
-  await requestAndroidRootClose(
-    safeClose,
-    async () => {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("plugin:app|exit");
-    },
-    () => pushToast("Couldn't close the app. Your graph remains open.", "error"),
-  );
+  await androidRootClose.request();
 }
 
 /** Capture the actual live Journals surfaces that justified a watcher restart.
@@ -185,10 +206,12 @@ function journalsFeedOwner(
   routes: Array<{ paneId: string; route: ReturnType<PaneRouter["route"]> }>
 ): JournalsFeedOwner | null {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   const owners = routes.filter((p) => p.route.kind === "journals");
   if (!owners.length) return null;
   return {
     graphEpoch: epoch,
+    graphBinding: binding,
     isLive: () =>
       graphEpoch() === epoch && owners.some((p) =>
         layoutPaneIds().includes(p.paneId) && sameRoute(paneRouter(p.paneId).route(), p.route)
@@ -204,6 +227,7 @@ function requestJournalFeedWatcherRestart(
 }
 
 export async function handleGraphChange(c: GraphChange) {
+  const binding = graphBinding();
   // The backend watcher has already landed this transaction in its graph cache.
   // Invalidate every derived visible-entity view even when the changed page is
   // outside the bounded frontend working set (#166); loaded pages are refreshed
@@ -214,7 +238,10 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.removed) {
     const disp = reloadDisposition(c.name);
     if (disp === "conflict") {
-      markConflict(c.name);
+      // The file is gone under an unsaved edit. Let the guarded save decide and
+      // raise the banner: only its refusal carries the authority "Keep mine"
+      // must present (see `reconcileExternalChange`).
+      await reconcileExternalChange(c.name);
       if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -229,7 +256,7 @@ export async function handleGraphChange(c: GraphChange) {
       }
     }
     if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
-      restoreTodayJournalInFeed();
+      await restoreTodayJournalInFeed();
       requestJournalFeedWatcherRestart(routes);
     }
     return;
@@ -249,15 +276,15 @@ export async function handleGraphChange(c: GraphChange) {
     // conflict here blocks every subsequent save of the very edit it warns about.
     if (!isSaving(c.name)) {
       const current = await backend().getPage(c.name, c.kind);
-      if (divergedFromBaseline(c.name, { exists: !!current, rev: current?.rev ?? null }))
-        markConflict(c.name);
+      if (binding !== graphBinding()) return;
+      await applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
     return;
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPage(toLoadablePage(dto, c.name));
+    if (dto) await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding);
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
@@ -267,7 +294,7 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
     if (pageByName(c.name)) {
       const dto = await backend().getPage(c.name, c.kind);
-      if (dto) reloadPage(dto);
+      if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
       requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -279,11 +306,12 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPage(dto);
+    if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
   }
 }
 
 export async function handleSparseV2Changed() {
+  const binding = graphBinding();
   // Managed reconciliation reports one admitted aggregate epoch rather than
   // legacy per-file changes. Refresh only live surfaces and invalidate the
   // bounded inventory; unloaded pages remain demand-loaded from SQLite.
@@ -304,15 +332,16 @@ export async function handleSparseV2Changed() {
     // it with an aggregate epoch can only produce a verdict on staler evidence.
     if (disposition === "conflict" && isSaving(route.name)) continue;
     const dto = await backend().getPage(route.name, route.pageKind);
+    if (binding !== graphBinding()) return;
     if (disposition === "conflict") {
       // The page has an unsaved edit. Prove this page actually diverged before
       // blocking its saves — the epoch alone says only that SOMETHING was
-      // admitted, which is usually our own write coming back.
-      if (!divergedFromBaseline(route.name, { exists: !!dto, rev: dto?.rev ?? null })) continue;
-      markConflict(route.name);
+      // admitted, which is usually our own write coming back — and lift an
+      // existing conflict when the proof comes back negative.
+      await applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
       continue;
     }
-    if (dto) reloadPage(toLoadablePage(dto, route.name));
+    if (dto) await reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name), binding);
   }
   requestJournalFeedWatcherRestart(routes);
 }
@@ -564,6 +593,18 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
   return () => document.removeEventListener("click", onClick, true);
 }
 
+/** Install the native post-cancel route before publishing its status.  In
+ * particular, Direct Files must never briefly appear as a synthetic
+ * managed-unavailable binding during cold recovery. */
+export function acceptColdReturnManagedStorage(result: SparseV2CancelResult): void {
+  managedStorageRuntime.clear();
+  managedStorageRuntime.bind(
+    result.binding_generation,
+    result.status.application_page_admission,
+  );
+  managedStorageRuntime.receiveStatus(result.status);
+}
+
 export function App(): JSX.Element {
   let openCalendarJump = () => {};
   const topbarActions = {
@@ -574,28 +615,69 @@ export function App(): JSX.Element {
     back: () => goBack(),
     forward: () => goForward(),
   };
+  const startupRecovery = createStartupRecoveryController({
+    lookupGraphPath: (attempt) => backend().startupGraphPath(attempt),
+    injectedGraphPath: () => (window as any).__GRAPH_PATH__ ?? "",
+    persistedGraphPath,
+    openGraph: (path) => loadGraphPath(path),
+    pickGraph: switchGraph,
+    coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
+    acceptColdReturn: acceptColdReturnManagedStorage,
+    confirmColdReturn: (name) => backend().confirm(
+      `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
+      "Return to Direct Files?",
+    ),
+    copyText: writeClipboardTextResilient,
+    notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
+    completeFirstLoad: () => setFirstLoadDone(true),
+  });
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
   onMount(() => void initDebug());
 
-  // AppPlugin is the single Android native Back owner.  A drawer/transient is
-  // never represented by synthetic history; route history remains the fallback.
+  // The sparse runtime can tick while Settings is closed. Subscribe once at the
+  // app boundary; the shared bridge carries the matching graph generation into
+  // both this feedback and the panel without component-owned duplicate listeners.
+  onMount(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    void managedStorageRuntime.listen().then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    onCleanup(() => {
+      disposed = true;
+      unlisten();
+    });
+  });
+  createEffect(on(
+    () => managedStorageRuntime.snapshot().error,
+    (reason) => {
+      if (reason) pushToast(managedStorageRuntimeErrorMessage(reason), "error");
+    },
+    { defer: true },
+  ));
+
+  // SafeBackPlugin is the single Android native Back owner. A drawer/transient
+  // is never represented by synthetic history; route history remains the JS
+  // dispatch fallback once the native listener is explicitly ready.
   onMount(() => {
     if (!isTauri()) return;
     const uninstall = installAndroidBackHandler({
       platform: () => backend().appPlatform(),
       subscribe: async (handler) => {
-        const { onBackButtonPress } = await import("@tauri-apps/api/app");
-        return onBackButtonPress(handler);
+        const { addPluginListener } = await import("@tauri-apps/api/core");
+        return addPluginListener("safe-back", "android-safe-back", handler);
       },
       dismissTransient: () => dismissTopTransient("back"),
       dismissDrawer: () => dismissMobileDrawer("back"),
       restoreDrawerFocus: () => restoreDrawerFocus("back"),
       historyBack: () => window.history.back(),
       closeRoot: () => { void closeAndroidRootSafely(); },
-      // No JS listener means the inspected AppPlugin retains its native WebView
-      // history/activity fallback. Do not install a competing recovery owner.
-      setupFailed: (error) => console.warn("Android Back listener unavailable; using native fallback", error),
+      // Listener absence/rejection remains owned by the native SafeBackPlugin,
+      // which consumes Back rather than delegating to AppPlugin's unsafe
+      // WebView/activity fallback.
+      setupFailed: (error) => console.warn("Android SafeBack listener unavailable; native owner remains blocking", error),
     });
     onCleanup(uninstall);
   });
@@ -619,27 +701,41 @@ export function App(): JSX.Element {
     }
   });
 
+  // The normal app-data home was not writable, so this launch put settings, the
+  // session and the WebView store somewhere else rather than crashing on the way
+  // up. Sticky: the relocation lasts only as long as the permissions problem, so
+  // the user needs to know where their state went and why.
   onMount(async () => {
-    const injected = (window as any).__GRAPH_PATH__ ?? "";
-    let startup = "";
     try {
-      startup = (await backend().startupGraphPath()) ?? "";
+      const fallback = await backend().takeDataHomeFallbackNotice();
+      if (fallback) {
+        pushToast(
+          `Tine could not write its usual application-data folder, so this session is keeping settings and backups in ${fallback} instead. Fixing the permissions on that folder restores the normal location.`,
+          "warn",
+          { sticky: true }
+        );
+      }
     } catch {
-      startup = "";
+      // Non-Tauri/mock or an older backend without the command: nothing to notify.
     }
-    const graphPath = injected || startup || persistedGraphPath();
-    dbg(`loading graph: ${graphPath || "(default/configured)"}`);
-    try {
-      await loadGraphPath(graphPath);
-      dbg("graph load call returned");
-    } catch (e) {
-      // No graph configured (fresh install), or it failed to open. Fall through to
-      // the onboarding Welcome screen instead of leaving a blank app; don't toast
-      // on first run (the empty/`""` path legitimately has no graph yet).
-      dbg(`graph load failed: ${String(e)}`);
-    } finally {
-      setFirstLoadDone(true);
-    }
+  });
+
+  onMount(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    void backend().onStartupProgress(startupRecovery.receiveProgress).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {
+      // The watchdog remains independent of this subscription. If the native
+      // bridge itself is unavailable, the recovery panel still appears.
+    });
+    startupRecovery.start();
+    onCleanup(() => {
+      disposed = true;
+      unlisten();
+      startupRecovery.dispose();
+    });
   });
 
   // Warn (loudly) if the webview is painting on the CPU — Tine's whole pitch is
@@ -740,6 +836,17 @@ export function App(): JSX.Element {
   // would otherwise drop the last keystrokes typed right before quitting.
   // Hardened so it can NEVER wedge the window open: a re-entry guard, a timeout
   // cap on the flush, and a destroy()→close() fallback.
+  // GH #255: the OS can reclaim a backgrounded app without ever sending a close
+  // request, and everything inside the 400 ms save debounce is RAM-only until
+  // then. This is the only durability barrier on Android/iOS, and it also covers
+  // the desktop paths that skip a clean close. Installed unconditionally — it is
+  // a DOM listener, so it works in the browser dev shell too.
+  onMount(() => onCleanup(installBackgroundFlush({
+    endEdit: () => endEdit("graph-switch"),
+    flushAll,
+    closeInFlight: () => safeClose.inFlight(),
+  })));
+
   onMount(() => {
     if (!isTauri()) return;
     let unlisten = () => {};
@@ -1321,6 +1428,7 @@ export function App(): JSX.Element {
         optionalOpen={welcomeOpen()}
         onClose={closeWelcome}
       />
+      <StartupRecoveryLayer controller={startupRecovery} />
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
         <Toasts />
       </DrawerBackground>

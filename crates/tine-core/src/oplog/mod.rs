@@ -21,6 +21,10 @@ pub(crate) mod discovery;
 pub(crate) mod document_state;
 #[allow(dead_code)]
 pub(crate) mod enrollment;
+// The only keyed enrollment compatibility code.  Current enrollment state is
+// integrity-checked, while immutable v1/v5 history remains verifiable.
+pub(crate) mod enrollment_legacy_hmac;
+pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
 pub(crate) mod evidence_index;
 #[allow(dead_code)]
 pub(crate) mod exact_external_feed;
@@ -36,6 +40,10 @@ pub mod import;
 pub(crate) mod local_active;
 #[allow(dead_code)] // routed by the later sync-runtime lane
 pub(crate) mod local_journal_drain;
+// Schema-2 authority is deliberately inert until the managed-runtime rollover
+// packet wires this codec and selector into startup and mutation.
+#[allow(dead_code)]
+pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
 #[allow(dead_code)]
 pub(crate) mod migration_backup;
@@ -91,6 +99,26 @@ pub(crate) mod uuid_claim_index;
 #[allow(dead_code)]
 pub(crate) mod watcher_queue;
 
+/// Diagnostic trace gates, resolved once per process.
+///
+/// `std::env::var_os` walks the whole environment on every call, and these gates
+/// sit on per-document and per-batch paths. Resolving them once keeps the
+/// instrumentation free when it is off, which is the only way it is acceptable
+/// on a hot path at all. The trade is that toggling mid-process does nothing --
+/// correct for a diagnostic, wrong for a feature flag, so do not reuse these for
+/// behaviour.
+pub(crate) fn phase_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TINE_PHASE_TRACE").is_some())
+}
+
+/// Per-call-site `inspect_batch` attribution. Off, it costs one atomic load;
+/// on, it formats a `file:line` key and takes a global lock per call.
+pub(crate) fn inspect_site_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TINE_INSPECT_SITES").is_some())
+}
+
 pub use crate::graph_text_scope::{
     GraphTextScopeBinding, GraphTextScopeBindingError, GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION,
     GRAPH_TEXT_SCOPE_VERSION,
@@ -102,10 +130,13 @@ pub use batch::{
     MAX_OBJECT_BYTES, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
     OPLOG_PROTOCOL_VERSION,
 };
-pub(crate) use hot_engine::ProjectionTombstoneAuthorization;
+pub(crate) use hot_engine::{
+    append_managed_local_record, ManagedLocalAppendError, ManagedLocalAppendProof,
+    ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
+};
 pub use hot_engine::{
-    append_managed_local_record, decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence,
-    AuthorBatch, AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
+    decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
+    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
     CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
     EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
     ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,
@@ -118,6 +149,8 @@ pub use hot_engine::{
     ProjectionRequirementState, ProjectionWriteAuthorization, SemanticOperation, ShardedHotEngine,
     StageOutcome, WorkspaceStatus,
 };
+#[cfg(test)]
+pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 pub use identity::{
     BatchId, BlockId, CanonicalArchiveResourceId, CanonicalGraphResourceId, CrdtPeerId, DeviceId,
     DocumentId, ImportId, LogseqUuid, PageId, ProjectionEndpointId, ProjectionReceiptStoreId,
@@ -131,6 +164,11 @@ pub use import::{
     RawObservation, RejectedRawId, RejectedRawIdReason, MAX_IMPORT_CATALOG_ENTRIES,
     MAX_IMPORT_DEPTH, MAX_IMPORT_FILES, MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES,
     MAX_IMPORT_RAW_BYTES,
+};
+pub(crate) use local_journal_v2_anchor::{
+    classify_managed_local_anchor, managed_local_v2_anchor_name,
+    parse_managed_local_v2_anchor_name, ManagedLocalAnchorEncoding, ManagedLocalGenerationAnchorV2,
+    ManagedLocalJournal, ManagedLocalJournalProtocol, MANAGED_LOCAL_ANCHOR_V2_BYTES,
 };
 pub use object_store::{BatchInspection, ObjectStore, ObjectStoreStats, StoreError};
 pub use page_name_index::{

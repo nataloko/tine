@@ -27,8 +27,9 @@ use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
     ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, ObjectStore,
-    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore,
-    RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier, TailOverlay, TailReservation,
+    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
+    ProjectionReceiptStore, RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier,
+    TailOverlay, TailReservation,
 };
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
@@ -87,8 +88,22 @@ struct ResumeBudget {
 impl ResumeBudget {
     fn new() -> Self {
         Self {
-            remaining: RESUME_OPERATION_BUDGET,
+            remaining: Self::budget(),
         }
+    }
+
+    /// The per-slice operation budget. A converging 300-file import takes 168
+    /// continuation slices at ~277 ms each (F41), i.e. ~1.8 files per slice, and
+    /// the per-slice cost is almost all fixed overhead — so this constant sets
+    /// the import's total cost. `TINE_RESUME_BUDGET` exists to measure that
+    /// trade-off (total time vs per-slice latency and peak memory) rather than
+    /// to be tuned in production; the default is unchanged.
+    fn budget() -> usize {
+        std::env::var("TINE_RESUME_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(RESUME_OPERATION_BUDGET)
     }
 
     /// Charge `count` units to the phase that actually performed the work.
@@ -106,6 +121,12 @@ impl ResumeBudget {
                 phase,
                 "coordinator resume operation budget was exceeded",
             ));
+        }
+        // The budget is charged per phase, so this is the only place that knows
+        // which phase consumes an import's work. ~36 s of a 300-file import is
+        // irreducible work (F42) and it has never been attributed to a phase.
+        if super::phase_trace_enabled() {
+            eprintln!("PHASE CHARGE {phase:?} {count}");
         }
         self.remaining -= count;
         Ok(())
@@ -135,6 +156,7 @@ pub(crate) enum RetainedBlockReason {
     Quarantined,
     PublishedAuthentication,
     StableBinding,
+    GuardedProjectionConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +165,11 @@ pub(crate) struct OperationalCoordinatorError {
     detail: String,
     revocation: Option<RuntimeRevocation>,
     retained_block: Option<RetainedBlockReason>,
+    /// This "failure" is a bounded slice asking to be resumed, not something
+    /// that went wrong. It must not be charged against the transient-failure
+    /// retry budget: retrying cannot continue a slice, so a legitimate
+    /// multi-slice import would exhaust three attempts and wedge permanently.
+    continuation_required: bool,
 }
 
 impl OperationalCoordinatorError {
@@ -152,6 +179,19 @@ impl OperationalCoordinatorError {
             detail: detail.into(),
             revocation: None,
             retained_block: None,
+            continuation_required: false,
+        }
+    }
+
+    /// A bounded slice completed its portion and must be resumed. Distinct from
+    /// a failure so the caller can continue instead of retrying.
+    fn continuation_required(phase: OperationalPhase, detail: impl Into<String>) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+            revocation: None,
+            retained_block: None,
+            continuation_required: true,
         }
     }
 
@@ -161,6 +201,7 @@ impl OperationalCoordinatorError {
             detail: refusal.to_string(),
             revocation: refusal.revocation().cloned(),
             retained_block: None,
+            continuation_required: false,
         }
     }
 
@@ -174,6 +215,7 @@ impl OperationalCoordinatorError {
             detail: detail.into(),
             revocation: None,
             retained_block: Some(reason),
+            continuation_required: false,
         }
     }
 
@@ -195,6 +237,12 @@ impl OperationalCoordinatorError {
 
     pub(crate) const fn retained_block_reason(&self) -> Option<&RetainedBlockReason> {
         self.retained_block.as_ref()
+    }
+
+    /// True when this is a resume request from a bounded slice rather than a
+    /// failure. See `continuation_required`.
+    pub(crate) const fn is_continuation_required(&self) -> bool {
+        self.continuation_required
     }
 }
 
@@ -483,7 +531,33 @@ impl PublishedContinuationCore {
         }
     }
 
+    /// Timing wrapper. ~44s of a 50s import is inside `drain_one` but outside
+    /// `stage_archive_batch_bounded` (F44); this bisects whether it is inside
+    /// `resume` at all, or in `drain_one`'s other work (notably the
+    /// reconciliation scan). Instrumenting here covers every call site at once.
     fn resume(
+        &mut self,
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        database: &mut SqliteFrontier,
+        tail: &mut TailOverlay,
+    ) -> Result<BatchId, OperationalCoordinatorError> {
+        if !super::phase_trace_enabled() {
+            return self.resume_inner(admission, graph, receipts, engine, database, tail);
+        }
+        let started = std::time::Instant::now();
+        let outcome = self.resume_inner(admission, graph, receipts, engine, database, tail);
+        eprintln!(
+            "PHASE TIME coordinator.resume {:.1}ms ok={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            outcome.is_ok(),
+        );
+        outcome
+    }
+
+    fn resume_inner(
         &mut self,
         admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
@@ -537,6 +611,10 @@ impl PublishedContinuationCore {
                 WorkspaceAuthorityBoundary::ArchiveStage,
                 OperationalPhase::ArchiveStage,
             )?;
+            // ArchiveStage charges 77.5% of the slice budget (F43), but ops are
+            // not milliseconds, so time the call itself before concluding it
+            // dominates wall clock too.
+            let stage_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let stage = engine
                 .stage_archive_batch_bounded(self.batch_id, stage_limit)
                 .map_err(|error| {
@@ -545,6 +623,12 @@ impl PublishedContinuationCore {
                         error.to_string(),
                     )
                 })?;
+            if let Some(started) = stage_started {
+                eprintln!(
+                    "PHASE TIME ArchiveStage.stage_archive_batch_bounded {:.1}ms limit={stage_limit}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             budget.consume(stage.work(), OperationalPhase::ArchiveStage)?;
             fault(OperationalFaultPoint::AfterStage)?;
             require_accepted_stage_disposition(self.batch_id, &stage.outcome().disposition())?;
@@ -624,7 +708,7 @@ impl PublishedContinuationCore {
         }
         fault(OperationalFaultPoint::AfterTailAdmission)?;
         if stage_has_more {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::continuation_required(
                 OperationalPhase::ArchiveStage,
                 "bounded staging slice has durable ready/fanout continuation",
             ));
@@ -654,13 +738,19 @@ impl PublishedContinuationCore {
             OperationalCoordinatorError::new(OperationalPhase::SqliteDrain, error.to_string())
         })? != accepted_root
         {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::continuation_required(
                 OperationalPhase::SqliteDrain,
                 "SQLite bounded slice has durable accepted-sequence continuation",
             ));
         }
 
+        // ~39s of a 50s import is inside resume() but outside ArchiveStage
+        // (F45). This loop is the largest remaining block; time it as a whole
+        // rather than guessing which of its calls dominates.
+        let projection_started = super::phase_trace_enabled().then(std::time::Instant::now);
+        let mut projection_iterations = 0_u32;
         loop {
+            projection_iterations += 1;
             let work = {
                 let page = engine
                     .projection_work_index()
@@ -680,10 +770,25 @@ impl PublishedContinuationCore {
                 page.work().first().cloned()
             };
             let Some(work) = work else {
+                if let Some(started) = projection_started {
+                    eprintln!(
+                        "PHASE TIME ProjectionDrain.loop {:.1}ms iterations={projection_iterations}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 break;
             };
             if budget.remaining == 0 {
-                return Err(OperationalCoordinatorError::new(
+                // The loop normally leaves HERE, not via `break` -- budget
+                // exhaustion is the common exit, clean drain the rare one. A
+                // timer only on the break path caught 2 of 169 slices.
+                if let Some(started) = projection_started {
+                    eprintln!(
+                        "PHASE TIME ProjectionDrain.loop {:.1}ms iterations={projection_iterations} exit=continuation",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                return Err(OperationalCoordinatorError::continuation_required(
                     OperationalPhase::ProjectionDrain,
                     "projection bounded slice has ready-work continuation",
                 ));
@@ -694,18 +799,35 @@ impl PublishedContinuationCore {
                 OperationalPhase::ProjectionDrain,
             )?;
             fault(OperationalFaultPoint::BeforeProjection)?;
-            super::projection::execute_manifested_projection_work_under_handoff(
+            // ProjectionDrain is 58% of a managed import at ~1.45s per occurrence
+            // over ~1 iteration each (F45), so a single work item costs about a
+            // second. Split fetching the work from executing it.
+            let execute_started = super::phase_trace_enabled().then(std::time::Instant::now);
+            let executed = super::projection::execute_manifested_projection_work_under_handoff(
                 graph,
                 receipts,
                 engine,
                 &work,
                 &self.guard,
-            )
-            .map_err(|error| {
-                OperationalCoordinatorError::new(
+            );
+            if let Some(started) = execute_started {
+                eprintln!(
+                    "PHASE TIME ProjectionDrain.execute {:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            executed.map_err(|error| match error {
+                ProjectionError::GuardedConflict(error) => {
+                    OperationalCoordinatorError::retained_block(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                        RetainedBlockReason::GuardedProjectionConflict,
+                    )
+                }
+                error => OperationalCoordinatorError::new(
                     OperationalPhase::ProjectionDrain,
                     error.to_string(),
-                )
+                ),
             })?;
             budget.consume(1, OperationalPhase::ProjectionDrain)?;
             fault(OperationalFaultPoint::AfterProjection)?;
@@ -763,7 +885,7 @@ impl PublishedContinuationCore {
                 )
             })?;
             let Some(consumed) = consumed else {
-                return Err(OperationalCoordinatorError::new(
+                return Err(OperationalCoordinatorError::continuation_required(
                     OperationalPhase::ProjectionDrain,
                     "bounded receiver-local provider projection has durable continuation",
                 ));
@@ -782,9 +904,38 @@ fn require_accepted_stage_disposition(
 ) -> Result<(), OperationalCoordinatorError> {
     match disposition {
         BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => Ok(()),
-        BatchDisposition::IncompleteStaged { .. } => Err(OperationalCoordinatorError::new(
+        // Carry the counts the variant already holds. Without them this failure
+        // reads identically whether one object is missing or ten thousand, and
+        // whether it is waiting on a dependency batch or on object bytes -- which
+        // are different bugs with different fixes. The retry loop above surfaces
+        // only this string, so anything dropped here is unrecoverable downstream.
+        // `{0, []}` is the compact continuation sentinel a bounded slice returns
+        // when its work budget is spent (see hot_engine's
+        // `compact_incomplete_staged_disposition`): nothing is missing, there is
+        // simply more to do. Anything else is genuine incompleteness.
+        BatchDisposition::IncompleteStaged {
+            missing_objects: 0,
+            missing_dependencies,
+        } if missing_dependencies.is_empty() => {
+            Err(OperationalCoordinatorError::continuation_required(
+                OperationalPhase::ArchiveStage,
+                format!("bounded staging slice for {batch_id} needs another resume"),
+            ))
+        }
+        BatchDisposition::IncompleteStaged {
+            missing_objects,
+            missing_dependencies,
+        } => Err(OperationalCoordinatorError::new(
             OperationalPhase::ArchiveStage,
-            format!("bounded staging slice for {batch_id} retains dependency/work continuation"),
+            format!(
+                "bounded staging slice for {batch_id} retains dependency/work continuation: \
+                 {missing_objects} missing objects, {} missing dependencies{}",
+                missing_dependencies.len(),
+                match missing_dependencies.first() {
+                    Some(first) => format!(" (first: {first})"),
+                    None => String::new(),
+                }
+            ),
         )),
         BatchDisposition::Rejected { error } => Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::ArchiveStage,
@@ -1244,9 +1395,13 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
         #[cfg(test)]
-        reset_trusted_local_preparation_stage_timings();
+        {
+            reset_trusted_local_preparation_stage_timings();
+            super::hot_engine::reset_local_mutation_detail_timings();
+        }
         #[cfg(test)]
         let parts_started = Instant::now();
         let (admission, engine, _database, _tail, bootstrap) =
@@ -1266,6 +1421,7 @@ impl OperationalCoordinator {
             LocalDraftSource::Promoted,
             LocalPreparationBinding::TrustedLocal,
             transaction,
+            prepared_editor_projection,
         )
     }
 
@@ -1375,6 +1531,7 @@ impl OperationalCoordinator {
             LocalDraftSource::Raw(author),
             LocalPreparationBinding::TrustedLocal,
             transaction,
+            None,
         )
     }
 }
@@ -1440,6 +1597,7 @@ fn prepare_local_inner(
     source: LocalDraftSource,
     binding: LocalPreparationBinding,
     transaction: &OperationTransaction,
+    prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
 ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
     #[cfg(test)]
     let bindings_started = Instant::now();
@@ -1491,7 +1649,11 @@ fn prepare_local_inner(
             let author_device_id = authority.device_id();
             let author_session_id = authority.session_id();
             let (batch_id, draft) = engine
-                .draft_admitted_local_author_transaction(&authority, transaction)
+                .draft_admitted_local_author_transaction(
+                    &authority,
+                    transaction,
+                    prepared_editor_projection,
+                )
                 .map_err(|error| {
                     OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
                 })?;
@@ -1598,6 +1760,7 @@ fn execute_local_inner(
         source,
         LocalPreparationBinding::SlowPipeline,
         transaction,
+        None,
     )? {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
@@ -1900,8 +2063,15 @@ fn authenticate_published(
     manifest_digest: ContentDigest,
     retained_bytes: usize,
 ) -> Result<(), OperationalCoordinatorError> {
-    let inspection = archive
-        .inspect_batch(batch_id)
+    // This runs once per coordinator tick and asks only manifest questions:
+    // the batch id, the origin, the manifest digest, and the total retained
+    // byte count. Every one of those is answerable from the manifest and its
+    // descriptors, so reading the batch -- which reads, SHA-256s and decodes
+    // every object -- was the single largest source of the O(n^2) import:
+    // measured at 91 of 107 `inspect_batch` calls and 27,458 of 30,259 object
+    // reads on a 100-file import.
+    let manifest = archive
+        .read_manifest(batch_id)
         .map_err(|error| match error {
             super::StoreError::Io(error) => {
                 OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
@@ -1911,26 +2081,23 @@ fn authenticate_published(
                 stable.to_string(),
                 RetainedBlockReason::PublishedAuthentication,
             ),
-        })?;
-    let validated = match inspection {
-        BatchInspection::Ready(validated) => validated,
-        BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(OperationalCoordinatorError::retained_block(
+        })?
+        .ok_or_else(|| {
+            OperationalCoordinatorError::retained_block(
                 OperationalPhase::Publication,
                 "published mutation is not a complete immutable batch",
                 RetainedBlockReason::PublishedAuthentication,
-            ));
-        }
-    };
-    let encoded = validated.manifest().encode().map_err(|error| {
+            )
+        })?;
+    let encoded = manifest.encode().map_err(|error| {
         OperationalCoordinatorError::retained_block(
             OperationalPhase::Publication,
             error.to_string(),
             RetainedBlockReason::PublishedAuthentication,
         )
     })?;
-    if validated.manifest().batch_id() != batch_id
-        || validated.manifest().origin() != origin
+    if manifest.batch_id() != batch_id
+        || manifest.origin() != origin
         || ContentDigest::of(&encoded) != manifest_digest
     {
         return Err(OperationalCoordinatorError::retained_block(
@@ -1939,29 +2106,25 @@ fn authenticate_published(
             RetainedBlockReason::PublishedAuthentication,
         ));
     }
-    let actual = validated
-        .objects()
-        .iter()
-        .try_fold(encoded.len(), |total, object| {
-            object
-                .encode()
-                .map_err(|error| {
-                    OperationalCoordinatorError::retained_block(
-                        OperationalPhase::Publication,
-                        error.to_string(),
-                        RetainedBlockReason::PublishedAuthentication,
-                    )
-                })
-                .and_then(|bytes| {
-                    total.checked_add(bytes.len()).ok_or_else(|| {
+    // Identical arithmetic to the old per-object `encode().len()` fold: an
+    // object file is written, and read back, at exactly its descriptor's
+    // `encoded_byte_length`.
+    let actual =
+        manifest
+            .required_objects()
+            .iter()
+            .try_fold(encoded.len(), |total, descriptor| {
+                usize::try_from(descriptor.encoded_byte_length())
+                    .ok()
+                    .and_then(|length| total.checked_add(length))
+                    .ok_or_else(|| {
                         OperationalCoordinatorError::retained_block(
                             OperationalPhase::Publication,
                             "durable retained-byte count overflowed",
                             RetainedBlockReason::PublishedAuthentication,
                         )
                     })
-                })
-        })?;
+            })?;
     if actual != retained_bytes {
         return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Publication,

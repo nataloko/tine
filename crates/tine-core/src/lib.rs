@@ -3,7 +3,6 @@
 //! testable without the Tauri shell.
 
 pub mod config;
-pub mod crdt;
 pub mod date;
 pub mod doc;
 pub mod edn;
@@ -38,7 +37,11 @@ pub use config::{Config, Workflow};
 pub use date::JournalDate;
 pub use doc::{DocBlock, Document};
 pub use graph_text_scope::{
-    GraphTextScopeBinding, GraphTextScopeBindingError, GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION,
-    GRAPH_TEXT_SCOPE_VERSION,
+    GraphTextScope, GraphTextScopeBinding, GraphTextScopeBindingError,
+    GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION, GRAPH_TEXT_SCOPE_VERSION,
 };
-pub use model::{BlockDto, BlockPreview, Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
+pub use model::{
+    ActivationIntent, BlockDto, BlockPreview, ConflictOverride, ConflictPresentation,
+    EditorActivation, EditorActivationHandle, Graph, GraphMeta, PageDto, PageEntry, PageKind,
+    RefGroup, ReferencedPageNames,
+};

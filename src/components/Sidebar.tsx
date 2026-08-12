@@ -2,9 +2,9 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, onCl
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
 import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, moveFavorite } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
-import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, type LoadGraphPathOutcome } from "../graph";
+import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
 import { backend } from "../backend";
-import { allPages as allGraphPages, pageListLabel } from "../pages";
+import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
 import { NamespaceTree } from "./Namespace";
 import type { PageKind } from "../types";
@@ -90,6 +90,10 @@ export function Sidebar(props: {
       .filter((p) => p.kind === "page")
       .sort((a, b) => a.name.localeCompare(b.name))
   );
+  // Built once per page-list change. Asking each row to disambiguate itself
+  // scanned the whole list per row (perf audit F9: 21 ms at 5,000 pages,
+  // 39 ms at 20,000, for 300 visible rows).
+  const pageLabel = createMemo(() => pageListLabels(allPages()));
 
   // `path` disambiguates nested pages that share a basename (#21 Phase 2). It's
   // optional: favorites / recent are keyed by name only, so they match on name
@@ -280,7 +284,7 @@ export function Sidebar(props: {
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });
                   }}
                 >
-                  <EmojiText text={pageListLabel(p, allPages())} />
+                  <EmojiText text={pageLabel()(p)} />
                 </div>
               )}
             </For>
@@ -404,13 +408,14 @@ export function GraphSwitcher(props: {
                 onClick={(event) => {
                   const newWindow = event.shiftKey;
                   close();
-                  void props.actions.openKnown(graph.path, newWindow)
+                  const attempt = () => void props.actions.openKnown(graph.path, newWindow)
                     .then((outcome) => {
                       if (!newWindow && (outcome.kind === "loaded" || outcome.kind === "already_current")) {
                         props.onActiveNavigationComplete?.();
                       }
                     })
-                    .catch((error) => pushToast(`Couldn't open ${graph.name}. (${String(error)})`, "error"));
+                    .catch((error) => reportGraphOpenFailure(error, attempt));
+                  attempt();
                 }}
               >
                 <span class="graph-switch-row-name">{graph.name}</span>
@@ -442,7 +447,10 @@ export function GraphSwitcher(props: {
                 .then((outcome) => {
                   if (outcome.kind === "loaded" || outcome.kind === "already_current") props.onActiveNavigationComplete?.();
                 })
-                .catch((error) => pushToast(`Couldn't open the selected graph. (${String(error)})`, "error"));
+                // Target-specific failures are handled by switchGraph after
+                // the picker returns a path, so its Retry preserves that path.
+                // A rejection here is a picker failure and has no target to retry.
+                .catch((error) => pushToast(`Couldn't open the graph picker. (${String(error)})`, "error"));
             }}
           >
             Open graph…

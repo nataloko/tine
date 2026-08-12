@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,8 +13,11 @@ import {
   selectExactCiEvidence,
 } from "./ci-evidence-lib.mjs";
 import {
+  freeLoopbackPort,
+  selectWebdriverWindowWithSelector,
   tauriCapabilities,
   webdriverServerArgs,
+  windowsUserDataFolder,
   windowsWebviewProfileSnapshot,
 } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
@@ -36,6 +40,14 @@ const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-releas
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
+const windowsWebviewDriverInstaller = fs.readFileSync(
+  path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
+  "utf8"
+);
+const issue295Scenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const windowsScenarios = [
@@ -47,6 +59,42 @@ const windowsScenarios = [
   "e2e-print-security.mjs",
   "e2e-tab-overflow.mjs",
 ];
+
+const trackedPaths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
+  .split("\0")
+  .filter(Boolean);
+const pathOwners = new Map();
+const caseInsensitiveCollisions = [];
+for (const trackedPath of trackedPaths) {
+  const portableKey = trackedPath.normalize("NFC").toLowerCase();
+  const existing = pathOwners.get(portableKey);
+  if (existing && existing !== trackedPath) {
+    caseInsensitiveCollisions.push([existing, trackedPath]);
+  } else {
+    pathOwners.set(portableKey, trackedPath);
+  }
+}
+assert.deepEqual(
+  caseInsensitiveCollisions,
+  [],
+  "tracked paths must remain unique on case-insensitive filesystems"
+);
+assert.match(uiE2eWorkflow, /windows-issue-295:[\s\S]*?inputs\.windows_scenario == 'windows-page-reference-latency'/);
+assert.match(uiE2eWorkflow, /ref: \$\{\{ inputs\.linux_scenario \}\}[\s\S]*?path: candidate/);
+assert.match(uiE2eWorkflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
+assert.match(
+  uiE2eWorkflow,
+  /windows-issue-295:[\s\S]*?Install Tauri WebDriver bridge[\s\S]*?cargo install tauri-driver --locked[\s\S]*?Drive literal page-reference keys/,
+);
+assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
+assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
+assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
+assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
+assert.match(issue295Scenario, /await target\.click\(\)/);
+assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
+assert.match(issue295Scenario, /dispatchToSecondPaint/);
+assert.match(issue295Scenario, /quickSwitch/);
+assert.match(issue295Scenario, /directSave/);
 
 function yamlBlock(lines, key, indent) {
   const header = `${" ".repeat(indent)}${key}:`;
@@ -267,19 +315,16 @@ assert.equal(yamlScalar(yamlBlock(nextestInstall, "with", 8), "tool", 10), "next
 const windowsCoreCompile = yamlNamedStep(windowsCompile, "Windows core test targets compile (all; release gate)");
 assert.equal(yamlScalar(windowsCoreCompile, "if", 8), "inputs.windows_test_name == ''");
 assert.equal(yamlScalar(windowsCoreCompile, "run", 8), "cargo test -p tine-core --no-run");
-const windowsStorageCompile = yamlNamedStep(windowsCompile, "Windows storage test targets compile (all; release gate)");
-assert.equal(yamlScalar(windowsStorageCompile, "if", 8), "inputs.windows_test_name == ''");
-assert.equal(yamlScalar(windowsStorageCompile, "run", 8), "cargo test -p tine-storage --no-run");
 const windowsCoreSmoke = yamlNamedStep(
   windowsCompile,
-  "Windows core + storage smoke (isolated contract selections; release gate)"
+  "Windows core/storage integration smoke (isolated contract selection; release gate)"
 );
 assert.equal(yamlScalar(windowsCoreSmoke, "if", 8), "inputs.windows_test_name == ''");
 assert.equal(yamlScalar(windowsCoreSmoke, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke");
 assert.doesNotMatch(
-  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsStorageCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8)].join("\n"),
+  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8)].join("\n"),
   /continue-on-error|retries|--skip/,
-  "Windows release coverage masks a failed compile, smoke, or storage test"
+  "Windows release coverage masks a failed compile or integration smoke"
 );
 assert.doesNotMatch(
   windowsCompile.join("\n"),
@@ -374,23 +419,8 @@ assert.equal(
   yamlScalar(yamlBlock(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
   "nextest@0.9.143"
 );
-// tine-storage's suite was compiled but never executed by any job until
-// 2026-08-07. Assert the job exists, runs the whole package unpartitioned, and
-// is release-required — a job outside REQUIRED_FULL_CI_JOBS can go red without
-// blocking a tag, which is the same coverage hole in a different place.
-const linuxStorage = yamlBlock(ciJobs, "linux-storage-nextest", 2);
-assert.equal(yamlScalar(linuxStorage, "name", 4), "Full CI / Linux tine-storage nextest");
-assert.equal(yamlScalar(linuxStorage, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
-assert.equal(
-  yamlScalar(yamlNamedStep(linuxStorage, "Linux tine-storage nextest / complete semantic suite"), "run", 8),
-  "cargo nextest run --profile ci --package tine-storage"
-);
-assert.ok(
-  REQUIRED_FULL_CI_JOBS.includes("Full CI / Linux tine-storage nextest"),
-  "the Linux storage suite runs but is not required for exact-SHA release evidence"
-);
 assert.doesNotMatch(
-  [linuxCoreContract, linuxCoreShards, linuxStorage, windowsCompile].map((job) => job.join("\n")).join("\n"),
+  [linuxCoreContract, linuxCoreShards, windowsCompile].map((job) => job.join("\n")).join("\n"),
   /continue-on-error:/,
   "nextest release evidence hides a failed contract or test job"
 );
@@ -536,7 +566,7 @@ assert.throws(
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{ run: successfulFullCiRun, jobs: successfulFullCiJobs.slice(0, 1) }]),
-  /Full CI \/ Windows compile \+ storage smoke \+ core smoke concluded missing/
+  /Full CI \/ Windows core compile \+ integration smoke concluded missing/
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{
@@ -616,6 +646,23 @@ assert.doesNotMatch(
   uiE2eWorkflow,
   /name: Run Windows WebView2 smoke\n\s+continue-on-error:/,
   "the focused Windows workflow hides a 0\/N scenario result behind a green job"
+);
+assert.match(
+  uiE2eWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "focused Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(
+  releaseWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "release Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(windowsWebviewDriverInstaller, /Microsoft\\EdgeWebView\\Application/);
+assert.match(windowsWebviewDriverInstaller, /msedgewebview2\.exe/);
+assert.doesNotMatch(
+  windowsWebviewDriverInstaller,
+  /Microsoft\\Edge\\Application\\msedge\.exe/,
+  "the WebView2 driver installer must not infer its version from the independently updated desktop browser"
 );
 assert.match(
   releaseWorkflow,
@@ -754,6 +801,27 @@ assert.match(
   "release preflight cannot determine the previous release from a shallow checkout"
 );
 assert.match(preflight, /check-bench-policy\.mjs/, "release preflight omits the performance-baseline currency guard");
+assert.match(preflight, /check-storage-pin\.mjs/, "release preflight omits the certified storage-pin guard");
+assert.match(
+  releaseWorkflow,
+  /name: Certified tine-storage pin is current[\s\S]*?node scripts\/check-storage-pin\.mjs/,
+  "release workflow does not check the certified storage pin before packaging"
+);
+assert.match(
+  ciWorkflow,
+  /name: Certified tine-storage pin is current[\s\S]*?node scripts\/check-storage-pin\.mjs/,
+  "full CI does not check the certified storage pin"
+);
+assert.match(
+  ciWorkflow,
+  /name: Release and offline-source contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  "ordinary CI does not exercise the storage-pin negative fixtures"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Release pipeline contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  "release preflight does not exercise the storage-pin negative fixtures"
+);
 
 function makeInput(base) {
   const input = path.join(base, "input");
@@ -796,6 +864,21 @@ function assemble(input, output) {
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-pipeline-test-"));
 try {
+  const firstFreePort = await freeLoopbackPort();
+  const secondFreePort = await freeLoopbackPort(new Set([firstFreePort]));
+  assert.ok(Number.isInteger(firstFreePort));
+  assert.notEqual(secondFreePort, firstFreePort);
+  let selectedWindow = "capture";
+  const selected = await selectWebdriverWindowWithSelector({
+    async getWindowHandles() { return ["capture", "main"]; },
+    async switchToWindow(handle) { selectedWindow = handle; },
+    async getTitle() { return selectedWindow === "main" ? "Tine" : "Quick Capture"; },
+    async getUrl() { return selectedWindow; },
+    $(selector) {
+      return { isExisting: async () => selector === ".main-app" && selectedWindow === "main" };
+    },
+  }, ".main-app", 100);
+  assert.equal(selected, "main");
   const priorWebviewRoot = process.env.E2E_WEBVIEW_USER_DATA_ROOT;
   process.env.E2E_WEBVIEW_USER_DATA_ROOT = path.join(temporary, "webview2");
   const windowsCapabilities = tauriCapabilities("C:/Tine.exe", "fixture session", "win32");
@@ -805,6 +888,12 @@ try {
   );
   assert.equal(windowsCapabilities.browserName, "webview2");
   assert.equal(windowsCapabilities["ms:edgeOptions"].binary, "C:/Tine.exe");
+  assert.equal(
+    windowsUserDataFolder("explicit session", {
+      E2E_WEBVIEW_USER_DATA_ROOT: path.join(temporary, "explicit-webview2"),
+    }),
+    path.join(temporary, "explicit-webview2", "explicit-session"),
+  );
   const attachedCapabilities = tauriCapabilities(
     "C:/Tine.exe",
     "fixture session",

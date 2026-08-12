@@ -38,6 +38,8 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[cfg(windows)]
@@ -57,7 +59,9 @@ use tine_storage::sqlite::{
 };
 use uuid::Uuid;
 
-use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
+use super::hot_engine::{
+    AcceptedFrontierRoot, EngineAuthority, EngineError, RetainedScratchResumeFailure,
+};
 use super::import::{
     InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
     TerminalBootstrapConstructionMaterial,
@@ -67,10 +71,11 @@ use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
-    ObjectKind, ObjectStore, PageId, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1,
-    SemanticEffect, SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId,
-    WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
-    OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
+    ObjectKind, ObjectStore, OperationBatch, PageId, PreparedBatch, ReferenceFactV1,
+    ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest, ShardedHotEngine,
+    ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
+    MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
+    OPLOG_PROTOCOL_VERSION,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;
@@ -156,31 +161,34 @@ impl AcceptedBatchEvent {
         let evidence = engine
             .accepted_batch_evidence(batch_id)
             .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-        let validated = match store.inspect_batch(batch_id)? {
-            BatchInspection::Ready(validated) => validated,
-            BatchInspection::Absent => {
-                return Err(ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {batch_id} is absent from the object store"
-                )));
-            }
-            BatchInspection::Staged { .. } => {
-                return Err(ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {batch_id} is partial in the object store"
-                )));
-            }
-        };
-        if validated.manifest().lineage_digest() != engine.lineage_digest() {
+        // Read the manifest and the one object this event needs, not the whole
+        // batch. `inspect_batch` reads, SHA-256s and decodes every object the
+        // manifest requires; this runs once per coordinator slice, and an
+        // import takes ~n^0.6 slices, so a whole-batch read here is the second
+        // half of the O(n^2) the projection executor used to own.
+        //
+        // Batch completeness is not re-derived because it was established at
+        // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the
+        // archive only on `BatchInspection::Ready` -- and this constructor is
+        // reached only for a batch the engine reports as accepted (the
+        // `accepted_batch_evidence` lookup above). A missing manifest or object
+        // still fails closed.
+        let manifest = store.read_manifest(batch_id)?.ok_or_else(|| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {batch_id} is absent from the object store"
+            ))
+        })?;
+        if manifest.lineage_digest() != engine.lineage_digest() {
             return Err(ProjectionError::LineageMismatch {
                 expected: engine.lineage_digest(),
-                found: validated.manifest().lineage_digest(),
+                found: manifest.lineage_digest(),
             });
         }
-        let manifest_digest =
-            ContentDigest::of(&validated.manifest().encode().map_err(|error| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "cannot encode accepted manifest {batch_id}: {error}"
-                ))
-            })?);
+        let manifest_digest = ContentDigest::of(&manifest.encode().map_err(|error| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "cannot encode accepted manifest {batch_id}: {error}"
+            ))
+        })?);
         if manifest_digest != evidence.manifest_fingerprint() {
             return Err(ProjectionError::ManifestMismatch {
                 batch_id,
@@ -204,7 +212,35 @@ impl AcceptedBatchEvent {
                 }
             }
         }
-        Self::from_validated(&validated, &evidence)?.with_effective_view(engine)
+        let semantic_effect = Self::read_semantic_effect(store, &manifest)?;
+        Self::from_manifest_and_semantic(&manifest, semantic_effect, &evidence)?
+            .with_effective_view(engine)
+    }
+
+    /// Fetch just the batch's `SemanticEffect` payload, located through the
+    /// manifest's descriptors rather than by scanning decoded objects.
+    fn read_semantic_effect(
+        store: &ObjectStore,
+        manifest: &OperationBatch,
+    ) -> Result<Vec<u8>, ProjectionError> {
+        let descriptor = manifest
+            .required_objects()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ObjectKind::SemanticEffect)
+            .ok_or_else(|| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "accepted batch {} has no semantic effect",
+                    manifest.batch_id()
+                ))
+            })?;
+        let object = store.read_object(descriptor.content_digest())?;
+        if object.kind() != ObjectKind::SemanticEffect {
+            return Err(ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {} semantic effect object has the wrong kind",
+                manifest.batch_id()
+            )));
+        }
+        Ok(object.payload().to_vec())
     }
 
     fn from_indexed(
@@ -265,11 +301,33 @@ impl AcceptedBatchEvent {
         Self::from_validated(batch, evidence)
     }
 
+    /// Callers that already hold a fully validated batch. Everything this needs
+    /// from the objects is the one `SemanticEffect` payload; all other object
+    /// facts come from the manifest's descriptors, so both entry points share
+    /// [`Self::from_manifest_and_semantic`] and produce identical events.
     fn from_validated(
         batch: &ValidatedBatch,
         evidence: &super::AcceptedBatchEvidence,
     ) -> Result<Self, ProjectionError> {
         let manifest = batch.manifest();
+        let semantic = batch
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::SemanticEffect)
+            .ok_or_else(|| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "accepted batch {} has no semantic effect",
+                    manifest.batch_id()
+                ))
+            })?;
+        Self::from_manifest_and_semantic(manifest, semantic.payload().to_vec(), evidence)
+    }
+
+    fn from_manifest_and_semantic(
+        manifest: &OperationBatch,
+        semantic_effect: Vec<u8>,
+        evidence: &super::AcceptedBatchEvidence,
+    ) -> Result<Self, ProjectionError> {
         let manifest_bytes = manifest.encode().map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "cannot encode accepted manifest {}: {error}",
@@ -287,17 +345,6 @@ impl AcceptedBatchEvent {
                 found: manifest_digest,
             });
         }
-        let semantic = batch
-            .objects()
-            .iter()
-            .find(|object| object.kind() == ObjectKind::SemanticEffect)
-            .ok_or_else(|| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {} has no semantic effect",
-                    manifest.batch_id()
-                ))
-            })?;
-        let semantic_effect = semantic.payload().to_vec();
         let decoded = SemanticEffect::decode(&semantic_effect).map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {} has an invalid semantic effect: {error}",
@@ -337,27 +384,32 @@ impl AcceptedBatchEvent {
                 manifest.batch_id()
             )));
         }
-        let retained_bytes = batch.objects().iter().try_fold(
+        // Both of these are manifest metadata, not object payloads. Each
+        // `ObjectDescriptor` carries `document_id`, `kind`, `content_digest` and
+        // `encoded_byte_length`, and `inspect_batch` reads every object file at
+        // exactly `encoded_byte_length` bytes -- so summing the descriptors is
+        // the same number the old fold produced, without re-encoding every
+        // object of the batch on every call.
+        let retained_bytes = manifest.required_objects().iter().try_fold(
             manifest_bytes.len(),
-            |total, object| -> Result<usize, ProjectionError> {
-                let encoded = object.encode().map_err(|error| {
-                    ProjectionError::InvalidAcceptedEvent(format!(
-                        "cannot encode object for accepted batch {}: {error}",
-                        manifest.batch_id()
-                    ))
+            |total, descriptor| -> Result<usize, ProjectionError> {
+                let length = usize::try_from(descriptor.encoded_byte_length()).map_err(|_| {
+                    ProjectionError::InvalidAcceptedEvent(
+                        "accepted event retained-byte count overflowed".into(),
+                    )
                 })?;
-                total.checked_add(encoded.len()).ok_or_else(|| {
+                total.checked_add(length).ok_or_else(|| {
                     ProjectionError::InvalidAcceptedEvent(
                         "accepted event retained-byte count overflowed".into(),
                     )
                 })
             },
         )?;
-        let updated_documents = batch
-            .objects()
+        let updated_documents = manifest
+            .required_objects()
             .iter()
-            .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
-            .map(|object| object.document_id())
+            .filter(|descriptor| descriptor.kind() == ObjectKind::CrdtUpdate)
+            .map(|descriptor| descriptor.document_id())
             .collect::<BTreeSet<_>>();
         let evidenced_documents = evidence
             .affected_documents()
@@ -373,6 +425,11 @@ impl AcceptedBatchEvent {
         canonical_frontier_root_bytes(evidence.prior_frontier_root())?;
         canonical_frontier_root_bytes(evidence.post_frontier_root())?;
         canonical_affected_documents_bytes(evidence.affected_documents())?;
+        // The canonicity check above proved `decoded.encode() == semantic_effect`
+        // byte for byte, so re-encoding here produced a copy of bytes already in
+        // hand. `SemanticEffect` is capped at 64 MiB, so this was not a small
+        // duplicate.
+        let effective_semantic_effect = semantic_effect.clone();
         Ok(Self {
             workspace_id: manifest.workspace_id(),
             lineage_digest: manifest.lineage_digest(),
@@ -381,12 +438,7 @@ impl AcceptedBatchEvent {
             event_binding_digest,
             semantic_effect,
             semantic_effect_digest,
-            effective_semantic_effect: decoded.encode().map_err(|error| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "cannot encode initial effective semantic view for {}: {error}",
-                    manifest.batch_id()
-                ))
-            })?,
+            effective_semantic_effect,
             effective_transitions: Vec::new(),
             dependency_frontier: manifest.dependency_frontier().clone(),
             prior_frontier_root: evidence.prior_frontier_root().clone(),
@@ -1233,7 +1285,7 @@ fn materialize_accepted_event_with_stats(
     let mut materializer = (!affected_pages.is_empty())
         .then(|| engine.accepted_root_materializer(event.post_frontier_root()))
         .transpose()
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        .map_err(ProjectionError::materialization_from_engine)?;
     if materializer.is_some() {
         instrumentation.accepted_root_authentications = 1;
     }
@@ -1242,7 +1294,7 @@ fn materialize_accepted_event_with_stats(
             .as_mut()
             .expect("nonempty affected pages construct a materializer")
             .materialize_page(page_id)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            .map_err(ProjectionError::materialization_from_engine)?
         {
             Some(mut page) => {
                 if let Some(transition) = effective_transitions.get(&page_id) {
@@ -1331,7 +1383,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
                     event.post_frontier_root(),
                     session_budget_bytes_per_root,
                 )
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))
+                .map_err(ProjectionError::materialization_from_engine)
         })
         .transpose()?;
     let mut replacements = Vec::new();
@@ -1342,7 +1394,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
             .as_ref()
             .expect("nonempty affected pages construct a bulk materializer")
             .materialize_pages(page_ids)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         for (page_id, page) in page_ids.iter().copied().zip(pages) {
             match page {
                 Some(mut page) => {
@@ -1627,6 +1679,33 @@ fn collect_reference_source_rows(
     else {
         return Ok(false);
     };
+    append_reference_source_rows(posting, stamp, page_id, rows)?;
+    Ok(true)
+}
+
+fn collect_indexed_reference_source_rows(
+    engine: &ShardedHotEngine,
+    index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
+    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
+    page_id: PageId,
+    rows: &mut ReferenceCatalogSourceRows,
+) -> Result<bool, ProjectionError> {
+    let Some(posting) = engine
+        .reference_source_posting_from_index(index, page_id)
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    append_reference_source_rows(posting, stamp, page_id, rows)?;
+    Ok(true)
+}
+
+fn append_reference_source_rows(
+    posting: super::ReferenceSourcePostingV2,
+    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
+    page_id: PageId,
+    rows: &mut ReferenceCatalogSourceRows,
+) -> Result<(), ProjectionError> {
     rows.coverage
         .push(super::sqlite_materialization::SourceCoverageFacet {
             source_page_id: page_id,
@@ -1697,7 +1776,7 @@ fn collect_reference_source_rows(
             }
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn authenticated_reference_materialization(
@@ -1787,6 +1866,37 @@ thread_local! {
         RefCell::new(ProjectionOpenBreakdown::default());
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FullDigestScanInstrumentation {
+    pub(crate) semantic_projection_scans: usize,
+    pub(crate) materialized_row_scans: usize,
+}
+
+#[cfg(test)]
+static FULL_DIGEST_SCAN_INSTRUMENTATION: Mutex<
+    BTreeMap<WorkspaceId, FullDigestScanInstrumentation>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn reset_full_digest_scan_instrumentation(workspace: WorkspaceId) {
+    FULL_DIGEST_SCAN_INSTRUMENTATION
+        .lock()
+        .expect("full digest scan instrumentation lock")
+        .insert(workspace, FullDigestScanInstrumentation::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_full_digest_scan_instrumentation(
+    workspace: WorkspaceId,
+) -> FullDigestScanInstrumentation {
+    FULL_DIGEST_SCAN_INSTRUMENTATION
+        .lock()
+        .expect("full digest scan instrumentation lock")
+        .remove(&workspace)
+        .unwrap_or_default()
+}
+
 fn reset_projection_open_breakdown() {
     PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
 }
@@ -1831,6 +1941,16 @@ pub(crate) struct VerifiedBootstrapSqliteProjection {
 }
 
 impl VerifiedBootstrapSqliteProjection {
+    /// This proof with its wall-clock instrumentation zeroed, for comparing two
+    /// rebuilds of one authority. See
+    /// [`BootstrapSqliteRebuildInstrumentation::without_timings`].
+    #[cfg(test)]
+    pub(crate) fn evidence_only(&self) -> Self {
+        let mut copy = self.clone();
+        copy.bootstrap_rebuild = copy.bootstrap_rebuild.without_timings();
+        copy
+    }
+
     pub(crate) const fn claim(&self) -> ProjectionClaim {
         self.claim
     }
@@ -1868,9 +1988,17 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// One when this database was seeded from the retained terminal accepted
     /// state, zero when it replayed the archive parts.
     pub(crate) terminal_constructions: usize,
+    /// One when durable bootstrap parts were authenticated one at a time and
+    /// only their exact terminal profile was materialized into SQLite.
+    pub(crate) terminal_archive_replays: usize,
     /// Per-part intermediate page/reference materializations run through
     /// ordinary event DML. Terminal construction must leave this at zero.
     pub(crate) intermediate_page_materializations: usize,
+    /// Exact terminal document-frontier constructions. Terminal construction
+    /// must build this authenticated map once, never rewrite a tree path for
+    /// every document in every accepted part.
+    pub(crate) terminal_frontier_bulk_seeds: usize,
+    pub(crate) terminal_frontier_documents_seeded: usize,
     pub(crate) terminal_materializations: usize,
     pub(crate) terminal_pages_materialized: usize,
     pub(crate) terminal_materialization_chunks: usize,
@@ -1888,6 +2016,11 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// Catalog rows the terminal row seed authenticated through the paged
     /// current-path cursor.
     pub(crate) terminal_catalog_rows_authenticated: usize,
+    /// Complete Patricia facts-tree traversals used to seed terminal reference
+    /// rows. A nonempty terminal catalog is consumed by exactly one traversal,
+    /// never one root-to-leaf lookup per page.
+    pub(crate) terminal_reference_index_traversals: usize,
+    pub(crate) terminal_reference_index_entries: usize,
     /// Catalog-document shape proofs derived while seeding the terminal rows.
     ///
     /// Each one costs a read linear in the catalog's page entries, so this must
@@ -1910,6 +2043,28 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// One when retained terminal material was present but refused, so this
     /// activation discarded the private candidate and replayed the archive.
     pub(crate) terminal_construction_refusals: usize,
+}
+
+impl BootstrapSqliteRebuildInstrumentation {
+    /// The same instrumentation with every wall-clock measurement zeroed.
+    ///
+    /// The counters beside them are evidence — how many parts were read, how
+    /// many materializations ran — and two rebuilds of one authority must agree
+    /// on every one of them. The `_micros` fields are measurements of the
+    /// machine, and two runs never agree on those, so a test comparing whole
+    /// instrumentation for equality is asserting something that cannot hold.
+    /// Zero them explicitly rather than dropping the comparison: every count
+    /// stays compared.
+    #[cfg(test)]
+    pub(crate) const fn without_timings(mut self) -> Self {
+        self.terminal_materialization_micros = 0;
+        self.terminal_reference_micros = 0;
+        self.terminal_lowering_micros = 0;
+        self.terminal_insert_micros = 0;
+        self.terminal_catalog_cursor_micros = 0;
+        self.terminal_finish_micros = 0;
+        self
+    }
 }
 
 impl BootstrapSqliteRebuildInstrumentation {
@@ -1984,6 +2139,11 @@ impl BootstrapSqliteRebuildInstrumentation {
             assert_ne!(
                 self.terminal_catalog_document_validations, 0,
                 "a nonempty terminal catalog must be authenticated"
+            );
+            assert_eq!(self.terminal_reference_index_traversals, 1);
+            assert_eq!(
+                self.terminal_reference_index_entries, self.terminal_catalog_rows_authenticated,
+                "the one reference-catalog traversal must cover every terminal page"
             );
         }
         // The one graph-lifetime decoded-segment session is measured, not
@@ -3100,8 +3260,17 @@ impl SqliteFrontier {
     ///
     /// The process token separately binds `proof.authority_binding()` to the
     /// exact promotion state and retained candidate. This check proves the
-    /// reopened database still carries the same semantic rows, frontier, and
-    /// reference-catalog authority before writable runtime authority exists.
+    /// reopened database still carries the same cheap live bindings before
+    /// writable runtime authority exists.
+    ///
+    /// The complete semantic and materialized-row scans are the E-site proof:
+    /// they ran after candidate publication and reopen, and their digests live
+    /// in the process-bound `VerifiedBootstrapSqliteProjection`. Repeating
+    /// those graph-wide scans here would protect only against same-process
+    /// local database substitution, which is outside the managed-storage
+    /// threat model. This R-site consumes that typed proof and rechecks all
+    /// cheap live authority. A crash/restart has no such process proof and
+    /// continues through `freshly_verify_inactive_bootstrap` below.
     pub(crate) fn authenticate_same_process_bootstrap_reuse(
         &self,
         proof: &VerifiedBootstrapSqliteProjection,
@@ -3109,12 +3278,12 @@ impl SqliteFrontier {
         let frontier = self.frontier_root()?;
         let accepted_batch_count = u64::try_from(self.applied_batch_count()?)
             .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
+        let materialized = self.materialized_read()?;
         if self.claim != proof.claim()
             || frontier != *proof.frontier_root()
             || accepted_batch_count != proof.accepted_batch_count()
             || self.required_frontier_root != frontier
-            || self.semantic_projection_digest()? != proof.semantic_projection_digest()
-            || self.materialized_row_digest_for_harness()? != proof.materialized_row_digest()
+            || materialized.acceptance_sequence() != accepted_batch_count
             || (accepted_batch_count != 0
                 && self.authenticated_reference_catalog_root()?
                     != *frontier.reference_catalog_root())
@@ -3257,7 +3426,7 @@ impl SqliteFrontier {
         let binding = authority.binding();
         let claim = ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest());
         let source = RebuildSource::from_inactive_bootstrap(authority)?;
-        let (opened, bootstrap_rebuild) =
+        let (mut opened, bootstrap_rebuild) =
             Self::rebuild_fresh_inactive_bootstrap(path, claim, source, authorization, terminal)?;
         let frontier_root = opened.database.frontier_root()?;
         let accepted_batch_count = u64::try_from(opened.database.applied_batch_count()?)
@@ -3289,8 +3458,23 @@ impl SqliteFrontier {
                 "SQLite reference catalog does not agree with inactive bootstrap authority".into(),
             ));
         }
+        // E site: candidate publication, reopen, frontier/stamp/reference
+        // checks, and these two complete scans together establish the one
+        // process-bound proof consumed by uninterrupted promotion. Keep this
+        // after publication: proving the unpublished candidate as well would
+        // duplicate graph-wide work without strengthening any in-scope crash,
+        // corruption, or concurrency boundary.
+        opened.rebuild.reference_coverage_full_scans += 1;
         let semantic_projection_digest = opened.database.semantic_projection_digest()?;
+        opened.rebuild.final_semantic_equivalence_proofs += 1;
+        #[cfg(test)]
+        let row_digest_started = std::time::Instant::now();
         let materialized_row_digest = opened.database.materialized_row_digest_for_harness()?;
+        opened.rebuild.final_row_digest_equivalence_proofs += 1;
+        #[cfg(test)]
+        {
+            opened.rebuild.final_row_digest_proof_micros = row_digest_started.elapsed().as_micros();
+        }
         let proof = VerifiedBootstrapSqliteProjection {
             claim,
             frontier_root,
@@ -3608,7 +3792,14 @@ impl SqliteFrontier {
         if terminal.is_some() {
             match Self::build_candidate(path, claim, Arc::clone(&lease), source, terminal) {
                 Ok(built) => return Self::publish_candidate(path, claim, lease, source, built),
-                Err(_discarded) => refused = 1,
+                Err(discarded) => {
+                    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+                        eprintln!(
+                            "sqlite terminal construction refused; replaying archive: {discarded}"
+                        );
+                    }
+                    refused = 1;
+                }
             }
         }
         let mut built = Self::build_candidate(path, claim, Arc::clone(&lease), source, None)?;
@@ -4143,6 +4334,15 @@ impl SqliteFrontier {
     }
 
     pub fn semantic_projection_digest(&self) -> Result<ContentDigest, ProjectionError> {
+        #[cfg(test)]
+        {
+            FULL_DIGEST_SCAN_INSTRUMENTATION
+                .lock()
+                .expect("full digest scan instrumentation lock")
+                .entry(self.claim.workspace_id)
+                .or_default()
+                .semantic_projection_scans += 1;
+        }
         self.physical
             .semantic_projection_digest()
             .map_err(Into::into)
@@ -4154,6 +4354,15 @@ impl SqliteFrontier {
     pub(crate) fn materialized_row_digest_for_harness(
         &self,
     ) -> Result<ContentDigest, ProjectionError> {
+        #[cfg(test)]
+        {
+            FULL_DIGEST_SCAN_INSTRUMENTATION
+                .lock()
+                .expect("full digest scan instrumentation lock")
+                .entry(self.claim.workspace_id)
+                .or_default()
+                .materialized_row_scans += 1;
+        }
         let _gate = self.materialized_read()?;
         self.physical.materialized_row_digest().map_err(Into::into)
     }
@@ -4224,14 +4433,23 @@ impl SqliteFrontier {
         self.physical.begin_terminal_bootstrap_construction()?;
         let prefix_started = std::time::Instant::now();
         let mut provenance = Vec::with_capacity(material.accepted_events().len());
+        let mut terminal_documents = BTreeMap::new();
         for event in material.accepted_events() {
             instrumentation.accepted_events_validated += 1;
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
             authenticate_event_for_engine(engine, event)?;
-            let (_, apply_stats) =
-                self.apply_candidate_with_materialization_and_stats(event, ApplyFault::None, None)?;
+            let (_, apply_stats) = self.apply_terminal_prefix_candidate_with_stats(event)?;
+            for document in event.affected_documents() {
+                terminal_documents.insert(
+                    document.document_id().as_uuid().into_bytes(),
+                    storage_frontier::PhysicalFrontierDocument {
+                        document_id: document.document_id().as_uuid().into_bytes(),
+                        canonical_bytes: encode_frontier_document(document)?,
+                    },
+                );
+            }
             instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
@@ -4265,6 +4483,12 @@ impl SqliteFrontier {
                     .into(),
             ));
         }
+        let terminal_physical_root = lower_physical_frontier_root(&reached)?;
+        let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
+        self.physical
+            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+        bootstrap.terminal_frontier_bulk_seeds = 1;
+        bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
         trace_terminal_phase("accepted prefix seed", prefix_started);
         let _ = super::hot_engine::take_current_path_cursor_probe();
         let rows_started = std::time::Instant::now();
@@ -4292,8 +4516,17 @@ impl SqliteFrontier {
             || instrumentation.reference_coverage_inductive_checks != 0
             || instrumentation.reference_coverage_full_scans != 0
             || bootstrap.intermediate_page_materializations != 0
+            || bootstrap.terminal_frontier_bulk_seeds != 1
+            || bootstrap.terminal_frontier_documents_seeded
+                != usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
+                    ProjectionError::Rebuild(
+                        "terminal frontier document count exceeds platform usize".into(),
+                    )
+                })?
             || bootstrap.bootstrap_part_reads != 0
             || bootstrap.terminal_materializations != 1
+            || bootstrap.terminal_reference_index_traversals != 1
+            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
         {
             return Err(ProjectionError::Rebuild(
                 "terminal candidate structural accounting invariant failed".into(),
@@ -4333,6 +4566,164 @@ impl SqliteFrontier {
         Ok((instrumentation, bootstrap))
     }
 
+    /// Rebuild a fresh inactive bootstrap from durable parts without
+    /// materializing their intentionally incomplete intermediate reference
+    /// catalogs. Every part is still loaded, authenticated, and applied to the
+    /// accepted-prefix tables in order; page/reference rows are seeded once
+    /// from the exact authenticated terminal root.
+    fn terminal_archive_stream(
+        &mut self,
+        source: &RebuildSource<'_>,
+    ) -> Result<
+        (
+            RebuildInstrumentation,
+            BootstrapSqliteRebuildInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        if !matches!(
+            source.loader,
+            RebuildLoader::InactiveBootstrap { .. }
+                | RebuildLoader::PromotedBootstrapAnchored { .. }
+        ) {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive replay requires bootstrap-anchored authority".into(),
+            ));
+        }
+        let engine = source.engine;
+        let mut instrumentation = RebuildInstrumentation::default();
+        let writes_before = self.physical.write_instrumentation();
+        self.physical.begin_candidate_build()?;
+        self.physical.begin_terminal_bootstrap_construction()?;
+        let prefix_started = std::time::Instant::now();
+        let mut provenance = Vec::new();
+        let mut terminal_documents = BTreeMap::new();
+        let mut cursor = source.cursor()?;
+        while let Some(event) = cursor.next_event()? {
+            instrumentation.accepted_events_validated += 1;
+            instrumentation.max_live_events = instrumentation.max_live_events.max(1);
+            instrumentation.max_live_evidence_records =
+                instrumentation.max_live_evidence_records.max(1);
+            authenticate_event_for_engine(engine, &event)?;
+            let (_, apply_stats) = self.apply_terminal_prefix_candidate_with_stats(&event)?;
+            for document in event.affected_documents() {
+                terminal_documents.insert(
+                    document.document_id().as_uuid().into_bytes(),
+                    storage_frontier::PhysicalFrontierDocument {
+                        document_id: document.document_id().as_uuid().into_bytes(),
+                        canonical_bytes: encode_frontier_document(document)?,
+                    },
+                );
+            }
+            instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
+            instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
+            instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
+            instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
+            instrumentation.reference_coverage_inductive_checks +=
+                apply_stats.reference_coverage_inductive_checks;
+            instrumentation.reference_coverage_full_scans +=
+                apply_stats.reference_coverage_full_scans;
+            provenance.push(storage_frontier::PhysicalTerminalConstructionBatch {
+                acceptance_sequence: event.acceptance_sequence(),
+                batch_id: event.batch_id().as_uuid().into_bytes(),
+                input_digest: super::MaterializationChange::new(
+                    event.batch_id(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .and_then(|change| change.digest())?,
+            });
+            instrumentation.accepted_events_applied += 1;
+            maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
+        }
+        let (page_reads, page_bytes, max_page_bytes) = cursor.page_stats();
+        instrumentation.accepted_sequence_page_reads = page_reads;
+        instrumentation.accepted_sequence_bytes_read = page_bytes;
+        instrumentation.max_accepted_sequence_page_bytes = max_page_bytes;
+        let mut bootstrap = cursor.bootstrap_instrumentation();
+        bootstrap.terminal_archive_replays = 1;
+
+        let reached = read_frontier_root(&self.physical)?;
+        if reached != source.exact_frontier_root
+            || reached.acceptance_sequence() != source.accepted_batch_count
+        {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive prefix did not reach the authenticated frontier root".into(),
+            ));
+        }
+        let terminal_physical_root = lower_physical_frontier_root(&reached)?;
+        let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
+        self.physical
+            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+        bootstrap.terminal_frontier_bulk_seeds = 1;
+        bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
+        trace_terminal_phase("archive accepted prefix seed", prefix_started);
+
+        let _ = super::hot_engine::take_current_path_cursor_probe();
+        let rows_started = std::time::Instant::now();
+        let coverage_count = self.seed_terminal_rows(
+            engine,
+            &source.exact_frontier_root,
+            &provenance,
+            &mut instrumentation,
+            &mut bootstrap,
+        )?;
+        trace_terminal_phase("archive terminal row seed", rows_started);
+        let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
+        bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
+        bootstrap.terminal_catalog_document_validations = cursor_probe.catalog_document_validations;
+
+        self.reference_coverage = Some(InductiveReferenceCoverage {
+            applied_through: source.accepted_batch_count,
+            rows: coverage_count,
+        });
+        if instrumentation.cleanup_page_attempts != 0
+            || instrumentation.cleanup_owned_rows != 0
+            || instrumentation.cleanup_fts_rowids != 0
+            || instrumentation.reference_coverage_inductive_checks != 0
+            || instrumentation.reference_coverage_full_scans != 0
+            || bootstrap.intermediate_page_materializations != 0
+            || bootstrap.terminal_frontier_bulk_seeds != 1
+            || bootstrap.terminal_frontier_documents_seeded
+                != usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
+                    ProjectionError::Rebuild(
+                        "terminal frontier document count exceeds platform usize".into(),
+                    )
+                })?
+            || bootstrap.terminal_materializations != 1
+            || bootstrap.terminal_reference_index_traversals != 1
+            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
+        {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive structural accounting invariant failed".into(),
+            ));
+        }
+        let window_bound = bootstrap
+            .terminal_catalog_rows_authenticated
+            .div_ceil(TERMINAL_CATALOG_CURSOR_PAGE_ROWS)
+            .saturating_add(bootstrap.terminal_materialization_chunks)
+            .saturating_add(1);
+        if bootstrap.terminal_catalog_rows_authenticated != bootstrap.terminal_pages_materialized
+            || bootstrap.terminal_catalog_document_validations > window_bound
+        {
+            return Err(ProjectionError::Rebuild(format!(
+                "terminal archive catalog authority is not bounded by its read window: \
+                 rows {} pages {} validations {} bound {window_bound}",
+                bootstrap.terminal_catalog_rows_authenticated,
+                bootstrap.terminal_pages_materialized,
+                bootstrap.terminal_catalog_document_validations,
+            )));
+        }
+        self.finish_fresh_candidate(source, coverage_count, &mut instrumentation)?;
+        self.physical.finish_candidate_build()?;
+        record_candidate_write_instrumentation(
+            &mut instrumentation,
+            writes_before,
+            self.physical.write_instrumentation(),
+        );
+        Ok((instrumentation, bootstrap))
+    }
+
     /// Stream the complete terminal page and reference rows in bounded chunks.
     ///
     /// The page set is the engine's authenticated current-path catalog at the
@@ -4349,7 +4740,7 @@ impl SqliteFrontier {
     ) -> Result<u64, ProjectionError> {
         let binding = engine
             .current_path_catalog_binding()
-            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         if binding.workspace_id() != engine.workspace_id()
             || binding.lineage_digest() != engine.lineage_digest()
             || binding.accepted_frontier() != terminal_root.state_digest()
@@ -4364,6 +4755,17 @@ impl SqliteFrontier {
                 catalog_root.extractor_digest(),
                 catalog_root.policy_digest(),
             )?;
+        let reference_index = engine
+            .reference_source_posting_index_at(&catalog_root)
+            .map_err(ProjectionError::materialization_from_engine)?;
+        bootstrap.terminal_reference_index_traversals = 1;
+        bootstrap.terminal_reference_index_entries = reference_index.len();
+        if reference_index.len() as u64 != binding.catalog_rows() {
+            return Err(ProjectionError::Rebuild(
+                "terminal reference catalog does not cover the complete current-path catalog"
+                    .into(),
+            ));
+        }
         let materializer = (binding.catalog_rows() != 0)
             .then(|| {
                 engine
@@ -4371,7 +4773,7 @@ impl SqliteFrontier {
                         terminal_root,
                         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
                     )
-                    .map_err(|error| ProjectionError::Materialization(error.to_string()))
+                    .map_err(ProjectionError::materialization_from_engine)
             })
             .transpose()?;
         bootstrap.terminal_materializations = 1;
@@ -4380,7 +4782,7 @@ impl SqliteFrontier {
         let mut cursor = Some(
             engine
                 .begin_current_path_cursor()
-                .map_err(|error| ProjectionError::Rebuild(error.to_string()))?,
+                .map_err(ProjectionError::materialization_from_engine)?,
         );
         let mut pending: Vec<super::hot_engine::CurrentPathCatalogRow> = Vec::new();
         let mut observed_rows = 0_u64;
@@ -4393,7 +4795,7 @@ impl SqliteFrontier {
                     TERMINAL_CATALOG_CURSOR_PAGE_ROWS
                         .min(super::hot_engine::MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
                 )
-                .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+                .map_err(ProjectionError::materialization_from_engine)?;
             bootstrap.terminal_catalog_cursor_micros = bootstrap
                 .terminal_catalog_cursor_micros
                 .saturating_add(cursor_started.elapsed().as_micros());
@@ -4422,7 +4824,7 @@ impl SqliteFrontier {
                         )
                     })?,
                     engine,
-                    &catalog_root,
+                    &reference_index,
                     extractor_stamp,
                     &chunk_rows,
                     instrumentation,
@@ -4432,6 +4834,24 @@ impl SqliteFrontier {
         }
         if let Some(materializer) = materializer.as_ref() {
             let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
+            debug_assert_eq!(
+                instrumentation.exact_document_loads,
+                materializer.exact_document_loads()
+            );
+            instrumentation.record_materialization(EventMaterializationInstrumentation {
+                accepted_frontier_session_hits: accepted_frontier.hits,
+                accepted_frontier_session_misses: accepted_frontier.misses,
+                accepted_frontier_session_evictions: accepted_frontier.evictions,
+                accepted_frontier_session_oversize: accepted_frontier.oversize,
+                accepted_frontier_session_peak_resident_bytes: accepted_frontier
+                    .peak_resident_bytes,
+                external_exact_session_hits: external_exact.hits,
+                external_exact_session_misses: external_exact.misses,
+                external_exact_session_evictions: external_exact.evictions,
+                external_exact_session_oversize: external_exact.oversize,
+                external_exact_session_peak_resident_bytes: external_exact.peak_resident_bytes,
+                ..EventMaterializationInstrumentation::default()
+            });
             bootstrap.record_terminal_lookup_session(
                 seen_pages.len(),
                 accepted_frontier,
@@ -4440,7 +4860,7 @@ impl SqliteFrontier {
         }
         let current = engine
             .current_path_catalog_binding()
-            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         if current != binding
             || observed_rows != binding.catalog_rows()
             || seen_pages.len() as u64 != binding.catalog_rows()
@@ -4486,7 +4906,7 @@ impl SqliteFrontier {
         &mut self,
         materializer: &super::hot_engine::BootstrapBulkMaterializer<'_>,
         engine: &ShardedHotEngine,
-        catalog_root: &super::ReferenceCatalogRootV2,
+        reference_index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
         extractor_stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
         rows: &[super::hot_engine::CurrentPathCatalogRow],
         instrumentation: &mut RebuildInstrumentation,
@@ -4496,7 +4916,7 @@ impl SqliteFrontier {
         let materialize_started = std::time::Instant::now();
         let materialized = materializer
             .materialize_pages(&page_ids)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         bootstrap.terminal_materialization_micros = bootstrap
             .terminal_materialization_micros
             .saturating_add(materialize_started.elapsed().as_micros());
@@ -4518,9 +4938,9 @@ impl SqliteFrontier {
             }
             chunk.pages.push(materialized_page_input(page));
             let reference_started = std::time::Instant::now();
-            let posted = collect_reference_source_rows(
+            let posted = collect_indexed_reference_source_rows(
                 engine,
-                catalog_root,
+                reference_index,
                 extractor_stamp,
                 row.page_id(),
                 &mut reference_rows,
@@ -4564,9 +4984,12 @@ impl SqliteFrontier {
         seeded
     }
 
-    /// The two complete unpublished-candidate scans that close a fresh build's
-    /// semantic and materialized-row proof, shared by archive replay and
-    /// terminal construction.
+    /// Close a fresh build's semantic and materialized-row proof.
+    ///
+    /// Ordinary archive rebuilds have no later typed bootstrap proof, so they
+    /// retain both unpublished-candidate scans. Inactive bootstrap activation
+    /// performs its one complete proof after publication and reopen in
+    /// `open_or_rebuild_inactive_bootstrap_authorized` instead.
     fn finish_fresh_candidate(
         &mut self,
         source: &RebuildSource<'_>,
@@ -4580,17 +5003,19 @@ impl SqliteFrontier {
                 .source_count(),
             inductive_coverage_count,
         )?;
-        instrumentation.reference_coverage_full_scans += 1;
-        let _semantic_digest = self.semantic_projection_digest()?;
-        instrumentation.final_semantic_equivalence_proofs += 1;
-        #[cfg(test)]
-        let row_digest_started = std::time::Instant::now();
-        let _row_digest = self.materialized_row_digest_for_harness()?;
-        instrumentation.final_row_digest_equivalence_proofs += 1;
-        #[cfg(test)]
-        {
-            instrumentation.final_row_digest_proof_micros =
-                row_digest_started.elapsed().as_micros();
+        if !matches!(&source.loader, RebuildLoader::InactiveBootstrap { .. }) {
+            instrumentation.reference_coverage_full_scans += 1;
+            let _semantic_digest = self.semantic_projection_digest()?;
+            instrumentation.final_semantic_equivalence_proofs += 1;
+            #[cfg(test)]
+            let row_digest_started = std::time::Instant::now();
+            let _row_digest = self.materialized_row_digest_for_harness()?;
+            instrumentation.final_row_digest_equivalence_proofs += 1;
+            #[cfg(test)]
+            {
+                instrumentation.final_row_digest_proof_micros =
+                    row_digest_started.elapsed().as_micros();
+            }
         }
         Ok(())
     }
@@ -4605,6 +5030,13 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
+        if matches!(
+            source.loader,
+            RebuildLoader::InactiveBootstrap { .. }
+                | RebuildLoader::PromotedBootstrapAnchored { .. }
+        ) {
+            return self.terminal_archive_stream(source);
+        }
         let mut instrumentation = RebuildInstrumentation::default();
         let mut intermediate_page_materializations = 0_usize;
         let inactive_bulk = matches!(source.loader, RebuildLoader::InactiveBootstrap { .. });
@@ -4735,7 +5167,13 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
-        self.apply_with_materialization_transaction_policy(event, fault, materialization, false)
+        self.apply_with_materialization_transaction_policy(
+            event,
+            fault,
+            materialization,
+            false,
+            false,
+        )
     }
 
     fn apply_candidate_with_materialization_and_stats(
@@ -4750,7 +5188,32 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
-        self.apply_with_materialization_transaction_policy(event, fault, materialization, true)
+        self.apply_with_materialization_transaction_policy(
+            event,
+            fault,
+            materialization,
+            true,
+            false,
+        )
+    }
+
+    fn apply_terminal_prefix_candidate_with_stats(
+        &mut self,
+        event: &AcceptedBatchEvent,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        self.apply_with_materialization_transaction_policy(
+            event,
+            ApplyFault::None,
+            None,
+            true,
+            true,
+        )
     }
 
     fn apply_with_materialization_transaction_policy(
@@ -4759,6 +5222,7 @@ impl SqliteFrontier {
         fault: ApplyFault,
         materialization: Option<&super::MaterializationChange>,
         candidate_build: bool,
+        terminal_prefix: bool,
     ) -> Result<
         (
             ApplyDisposition,
@@ -4803,6 +5267,9 @@ impl SqliteFrontier {
                 .and_then(|coverage| coverage.prior_rows_for(event.acceptance_sequence)),
             fault: storage_frontier::ApplyFault::None,
         };
+        if terminal_prefix {
+            request.prior_reference_coverage_count = None;
+        }
         let preflight = match self.physical.preflight(&current_physical, &request) {
             Ok(disposition) => disposition,
             Err(storage_frontier::FrontierError::BatchCollision(_)) => {
@@ -4858,10 +5325,12 @@ impl SqliteFrontier {
                 ));
             }
             for document in &event.affected_documents {
-                let _ = self.physical.frontier_document(
-                    &current_physical,
-                    document.document_id().as_uuid().into_bytes(),
-                )?;
+                if !terminal_prefix {
+                    let _ = self.physical.frontier_document(
+                        &current_physical,
+                        document.document_id().as_uuid().into_bytes(),
+                    )?;
+                }
                 if !document.direct_dependency_heads().contains(&event.batch_id) {
                     return Err(ProjectionError::InvalidAcceptedEvent(format!(
                         "affected document {} does not name accepted batch {} as a direct head",
@@ -4891,7 +5360,10 @@ impl SqliteFrontier {
                 request.fault = storage_frontier::ApplyFault::ReturnAfterMaterialization;
             }
         }
-        let result = if candidate_build {
+        let result = if terminal_prefix {
+            self.physical
+                .apply_terminal_prefix_candidate(&current_physical, &request)?
+        } else if candidate_build {
             self.physical.apply_candidate(&current_physical, &request)?
         } else {
             self.physical.apply(&current_physical, &request)?
@@ -7571,6 +8043,10 @@ pub enum ProjectionError {
     },
     FrontierRegression,
     BatchCollision(BatchId),
+    /// A selected retained scratch accelerator became unreadable while this
+    /// SQLite open was materializing the current authenticated frontier.  It
+    /// remains typed so `local_active` can take the single safe replay retry.
+    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
     Materialization(String),
     Rebuild(String),
     InjectedFailure,
@@ -7648,9 +8124,34 @@ impl fmt::Display for ProjectionError {
                     "accepted batch {batch_id} collides with its SQLite record"
                 )
             }
+            Self::RetainedScratchResumeFailure(failure) => write!(
+                f,
+                "SQLite materialization failed: immutable archive error: {failure}"
+            ),
             Self::Materialization(error) => write!(f, "SQLite materialization failed: {error}"),
             Self::Rebuild(error) => write!(f, "SQLite rebuild failed: {error}"),
             Self::InjectedFailure => write!(f, "injected SQLite transaction failure"),
+        }
+    }
+}
+
+impl ProjectionError {
+    /// Preserve the only typed accelerator fault that may be recovered at the
+    /// promoted-runtime open boundary.  Every other engine failure remains an
+    /// ordinary materialization failure and must fail closed.
+    pub(crate) fn materialization_from_engine(error: EngineError) -> Self {
+        match error {
+            EngineError::RetainedScratchResumeFailure(failure) => {
+                Self::RetainedScratchResumeFailure(failure)
+            }
+            error => Self::Materialization(error.to_string()),
+        }
+    }
+
+    pub(crate) fn retained_scratch_resume_failure(&self) -> Option<&RetainedScratchResumeFailure> {
+        match self {
+            Self::RetainedScratchResumeFailure(failure) => Some(failure),
+            _ => None,
         }
     }
 }
@@ -8269,56 +8770,98 @@ impl FrontierReferenceQuery<'_> {
         new_name: super::LogicalPageName,
         new_path: super::ManagedPath,
     ) -> Result<FrontierRenamePlan, ProjectionError> {
-        let target_page_id = self
-            .engine
-            .resolve_logical_page_name(old_name)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-            .ok_or_else(|| {
-                ProjectionError::Materialization(
-                    "rename target has no authenticated exact page-name owner".into(),
-                )
-            })?;
-        let results = self.references_to_page_name_inner(
-            old_name,
-            super::MAX_MATERIALIZATION_QUERY_ROWS,
-            true,
-        )?;
-        let mut preamble_facts = BTreeMap::<PageId, Vec<super::PageNameReferenceFactV1>>::new();
+        self.plan_page_renames(&[(old_name.clone(), new_name, new_path)])
+    }
+
+    /// Build one atomic namespace-capable rename transaction. Every raw source
+    /// is rewritten once even when it refers to several renamed namespace
+    /// members, avoiding the lost-update bug of composing independent plans.
+    pub fn plan_page_renames(
+        &mut self,
+        requests: &[(
+            super::LogicalPageName,
+            super::LogicalPageName,
+            super::ManagedPath,
+        )],
+    ) -> Result<FrontierRenamePlan, ProjectionError> {
+        if requests.is_empty() {
+            return Err(ProjectionError::Materialization(
+                "rename request set is empty".into(),
+            ));
+        }
+        let mut page_changes = Vec::with_capacity(requests.len());
+        let mut primary_target_page_id = None;
+        let mut touched = BTreeSet::new();
+        let mut preamble_facts =
+            BTreeMap::<PageId, Vec<(super::PageNameReferenceFactV1, String)>>::new();
         let mut block_facts = BTreeMap::<
             (PageId, DocumentId, super::BlockId),
-            Vec<super::PageNameReferenceFactV1>,
+            Vec<(super::PageNameReferenceFactV1, String)>,
         >::new();
-        let mut touched = BTreeSet::from([target_page_id]);
-        for hit in &results.hits {
-            let ReferenceFactV1::PageName(fact) = &hit.fact else {
-                continue;
-            };
-            if matches!(
-                fact.kind,
-                super::PageReferenceKindV1::AliasDeclaration
-                    | super::PageReferenceKindV1::PropertyKeyPseudoPage
-            ) {
-                continue;
-            }
-            touched.insert(hit.source_page_id);
-            match fact.source {
-                ReferenceSourceLocatorV1::Preamble => {
-                    preamble_facts
-                        .entry(hit.source_page_id)
-                        .or_default()
-                        .push(fact.clone());
+        for (old_name, new_name, new_path) in requests {
+            let target_page_id = self
+                .engine
+                .resolve_logical_page_name(old_name)
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+                .ok_or_else(|| {
+                    ProjectionError::Materialization(
+                        "rename target has no authenticated exact page-name owner".into(),
+                    )
+                })?;
+            touched.insert(target_page_id);
+            primary_target_page_id.get_or_insert(target_page_id);
+            page_changes.push(super::PageRename {
+                page_id: target_page_id,
+                new_name: new_name.clone(),
+                new_path: new_path.clone(),
+            });
+            let results = self.references_to_page_name_inner(
+                old_name,
+                super::MAX_MATERIALIZATION_QUERY_ROWS,
+                true,
+            )?;
+            for hit in &results.hits {
+                let ReferenceFactV1::PageName(fact) = &hit.fact else {
+                    continue;
+                };
+                if matches!(
+                    fact.kind,
+                    super::PageReferenceKindV1::AliasDeclaration
+                        | super::PageReferenceKindV1::PropertyKeyPseudoPage
+                ) {
+                    continue;
                 }
-                ReferenceSourceLocatorV1::Block {
-                    block_id,
-                    home_document_id,
-                } => {
-                    block_facts
-                        .entry((hit.source_page_id, home_document_id, block_id))
-                        .or_default()
-                        .push(fact.clone());
+                touched.insert(hit.source_page_id);
+                let replacement = new_name.as_str().to_owned();
+                match fact.source {
+                    ReferenceSourceLocatorV1::Preamble => {
+                        preamble_facts
+                            .entry(hit.source_page_id)
+                            .or_default()
+                            .push((fact.clone(), replacement));
+                    }
+                    ReferenceSourceLocatorV1::Block {
+                        block_id,
+                        home_document_id,
+                    } => {
+                        block_facts
+                            .entry((hit.source_page_id, home_document_id, block_id))
+                            .or_default()
+                            .push((fact.clone(), replacement));
+                    }
                 }
             }
         }
+        page_changes.sort_unstable_by_key(|change| change.page_id);
+        if !page_changes
+            .windows(2)
+            .all(|pair| pair[0].page_id != pair[1].page_id)
+        {
+            return Err(ProjectionError::Materialization(
+                "rename request set names one page more than once".into(),
+            ));
+        }
+        let target_page_id = primary_target_page_id.expect("non-empty rename request set");
         let mut page_preamble_rewrites = Vec::new();
         let mut block_rewrites = Vec::new();
         for source_page_id in &touched {
@@ -8328,7 +8871,11 @@ impl FrontierReferenceQuery<'_> {
                 .materialize_page(*source_page_id)
                 .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
             if let Some(facts) = preamble_facts.get(source_page_id) {
-                verify_current_page_facts(&posting, facts)?;
+                let evidence = facts
+                    .iter()
+                    .map(|(fact, _)| fact.clone())
+                    .collect::<Vec<_>>();
+                verify_current_page_facts(&posting, &evidence)?;
                 let source = page.preamble.as_deref().ok_or_else(|| {
                     ProjectionError::Materialization(
                         "rename preamble candidate has no current source bytes".into(),
@@ -8336,14 +8883,18 @@ impl FrontierReferenceQuery<'_> {
                 })?;
                 page_preamble_rewrites.push(super::PagePreambleRewrite {
                     page_id: *source_page_id,
-                    new_preamble: Some(rewrite_raw_page_targets(source, facts, new_name.as_str())?),
+                    new_preamble: Some(rewrite_raw_page_targets_with_replacements(source, facts)?),
                 });
             }
             for ((page_id, home_document_id, block_id), facts) in block_facts
                 .iter()
                 .filter(|((page_id, _, _), _)| page_id == source_page_id)
             {
-                verify_current_page_facts(&posting, facts)?;
+                let evidence = facts
+                    .iter()
+                    .map(|(fact, _)| fact.clone())
+                    .collect::<Vec<_>>();
+                verify_current_page_facts(&posting, &evidence)?;
                 let block = page
                     .blocks
                     .iter()
@@ -8360,11 +8911,7 @@ impl FrontierReferenceQuery<'_> {
                         block_id: *block_id,
                         home_document_id: *home_document_id,
                     },
-                    new_content: rewrite_raw_page_targets(
-                        &block.content,
-                        facts,
-                        new_name.as_str(),
-                    )?,
+                    new_content: rewrite_raw_page_targets_with_replacements(&block.content, facts)?,
                 });
                 debug_assert_eq!(*page_id, *source_page_id);
             }
@@ -8375,11 +8922,7 @@ impl FrontierReferenceQuery<'_> {
         page_preamble_rewrites.sort_unstable_by_key(|rewrite| rewrite.page_id);
         let transaction = super::OperationTransaction::new(vec![
             super::SemanticOperation::RenamePagesAndRewriteReferrers {
-                page_changes: vec![super::PageRename {
-                    page_id: target_page_id,
-                    new_name,
-                    new_path,
-                }],
+                page_changes,
                 block_rewrites,
                 page_preamble_rewrites,
             },
@@ -8410,21 +8953,35 @@ fn verify_current_page_facts(
     Ok(())
 }
 
+#[cfg(test)]
 fn rewrite_raw_page_targets(
     source: &str,
     facts: &[super::PageNameReferenceFactV1],
     replacement: &str,
 ) -> Result<String, ProjectionError> {
+    let facts = facts
+        .iter()
+        .cloned()
+        .map(|fact| (fact, replacement.to_owned()))
+        .collect::<Vec<_>>();
+    rewrite_raw_page_targets_with_replacements(source, &facts)
+}
+
+fn rewrite_raw_page_targets_with_replacements(
+    source: &str,
+    facts: &[(super::PageNameReferenceFactV1, String)],
+) -> Result<String, ProjectionError> {
     let mut facts = facts.to_vec();
     facts.sort_unstable_by(|left, right| {
         right
+            .0
             .byte_start
-            .cmp(&left.byte_start)
-            .then_with(|| right.byte_end.cmp(&left.byte_end))
+            .cmp(&left.0.byte_start)
+            .then_with(|| right.0.byte_end.cmp(&left.0.byte_end))
     });
     let mut next_start = source.len();
     let mut rewritten = source.to_owned();
-    for fact in facts {
+    for (fact, replacement) in facts {
         let span_start = usize::try_from(fact.byte_start).map_err(|_| {
             ProjectionError::Materialization("reference source offset is invalid".into())
         })?;
@@ -8458,7 +9015,7 @@ fn rewrite_raw_page_targets(
         let end = start.checked_add(fact.raw_target.len()).ok_or_else(|| {
             ProjectionError::Materialization("reference source offset overflowed".into())
         })?;
-        rewritten.replace_range(start..end, replacement);
+        rewritten.replace_range(start..end, &replacement);
         next_start = span_start;
     }
     Ok(rewritten)

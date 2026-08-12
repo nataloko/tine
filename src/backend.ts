@@ -2,11 +2,18 @@
 // browser (Vite dev / Playwright screenshots) we fall back to an in-memory mock
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
+import { notifyGraphRebound } from "./modeHooks";
 import type {
+  ActivationExpectedRevision,
+  ActivationIntent,
+  ApplicationPageAdmission,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
   AssetInfo,
+  EditorActivationHandle,
+  SavePageResult,
+  PageKind,
   GraphMeta,
   GuideCopyResult,
   GuidePage,
@@ -22,18 +29,19 @@ import type {
   SyncConflictDiff,
   MergeDecision,
   PrintOpts,
-  ManagedSyncStatus,
-  SyncIdentityPlan,
-  ManagedSyncEnableResult,
   SparseV2Status,
   SparseV2CancelResult,
   SparseV2ActivationProgressEvent,
   SparseV2Tick,
+  SparseV2RuntimeStatusEvent,
+  SparseV2TickEvent,
+  SparseV2ErrorEvent,
   SparseV2QueryRequest,
   SparseV2QueryReply,
   SparseV2EditorLoadRequest,
   SparseV2EditorSaveRequest,
   SparseV2EditorOutcome,
+  StartupProgressEvent,
   PdfState,
   QueryExecution,
   QueryPageScope,
@@ -103,9 +111,16 @@ export interface GraphSourceFile {
   bytes: number;
 }
 
+/** The reference-name inventory, digest-gated. `names` is null exactly when the
+ *  digest the caller presented still describes the current set. */
+export interface ReferencedPageNames {
+  digest: number;
+  names: string[] | null;
+}
+
 export type GraphFolderPickResult =
   | { status: "picked"; path: string }
-  | { status: "permission-requested" | "permission-needed" | "cancelled"; path?: string };
+  | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
 
 export interface ClipboardAssetFile {
   path: string;
@@ -127,6 +142,14 @@ export interface MediaCaptureResult {
   path?: string | null;
   ext?: string | null;
 }
+
+/** Result of the process-wide native shutdown preparation. Android may request
+ * an Activity exit only after `safe`; partial native progress must remain
+ * shielded so retrying does not replay the frontend persistence transaction. */
+export type TineQuitPreparation =
+  | { status: "safe" }
+  | { status: "refused"; detail: string }
+  | { status: "partial"; safe_slots: string[]; detail: string };
 
 export interface KnownGraph {
   path: string;
@@ -160,7 +183,12 @@ export type PluginRegistryCacheLoad =
   | { kind: "unsafe"; reason: string };
 
 export type LoadGraphResult =
-  | { kind: "loaded" | "already_current"; meta: GraphMeta; binding_generation: number }
+  | {
+      kind: "loaded" | "already_current";
+      meta: GraphMeta;
+      binding_generation: number;
+      application_page_admission: ApplicationPageAdmission;
+    }
   | { kind: "focused_existing"; window_label: string };
 
 export interface CaptureGraphBindingResult {
@@ -178,7 +206,8 @@ export interface Backend {
   approveExternalAssets(graphRoot: string, assetsPath: string): Promise<void>;
   loadGraph(path: string): Promise<LoadGraphResult>;
   openGraphWindow(path: string): Promise<LoadGraphResult>;
-  startupGraphPath(): Promise<string | null>;
+  startupGraphPath(attempt: number): Promise<string | null>;
+  onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void>;
   captureTarget(): Promise<string>;
   /** Lease the graph selected for this Quick Capture show before issuing
    * graph-scoped reads from its independent WebView. */
@@ -210,6 +239,9 @@ export interface Backend {
    *  the caller MUST have flushed pending edits first. Does not resolve — the
    *  process exits. */
   quit(): Promise<void>;
+  /** Verify every managed runtime can stop cleanly without exiting the app.
+   * Android calls this before handing the final activity exit to SafeBack. */
+  prepareQuit(): Promise<TineQuitPreparation>;
   closeGraphWindow(): Promise<void>;
   /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
    *  debugging. No-op on a build without devtools compiled in. */
@@ -218,8 +250,12 @@ export interface Backend {
    *  the created graph's root path to then `loadGraph`. Creates the graph in
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
   createGraph(dir: string): Promise<string>;
-  /** Page names that exist only through references in the warmed graph cache. */
-  referencedPageNames(): Promise<string[]>;
+  /** Page names that exist only through references in the warmed graph cache.
+   *  Pass the digest of the set you already hold: the answer omits `names`
+   *  entirely when nothing changed, which is the usual case between saves and
+   *  saves several thousand strings of IPC and JSON parsing on the UI thread.
+   *  A `null` `names` means "keep what you have", never "the set is empty". */
+  referencedPageNames(knownDigest?: number | null): Promise<ReferencedPageNames>;
   listPages(): Promise<PageEntry[]>;
   journalFeedPage(limit: number, beforeDay: number | null): Promise<import("./types").JournalFeedPage>;
   /** Journal date-keys (yyyymmdd) whose page has real content. */
@@ -228,20 +264,27 @@ export interface Backend {
   /** Raw source text of every md/org file in the open graph (+journals when
    *  asked), for the "Help improve Tine" diff panel. Read-only, local. */
   graphSourceFiles(includeJournals: boolean): Promise<GraphSourceFile[]>;
-  /** Save a page. `baseRev` is the file hash the editor loaded; the backend
-   *  rejects with "conflict" if the file changed on disk since then (unless
-   *  `force`). Returns the new on-disk rev to use as the next baseline. */
-  savePage(page: PageDto, baseRev: string | null, force?: boolean): Promise<string>;
-  managedSyncStatus(): Promise<ManagedSyncStatus | null>;
-  managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
-  enableManagedSync(): Promise<ManagedSyncEnableResult>;
+  /** Save a page. `baseRev` is the revision the editor loaded. Direct Files
+   *  binds `force` to `conflictEpoch`; managed storage binds it to the exact
+   *  managed path and revision observed after refusal. */
+  savePage(
+    page: PageDto,
+    baseRev: string | null,
+    force?: boolean,
+    conflictEpoch?: number | null,
+    managedConflictObservation?: { path: string; revision: string } | null,
+  ): Promise<SavePageResult>;
   sparseV2Status(): Promise<SparseV2Status>;
+  onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
+  onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
+  onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void>;
   onSparseV2ActivationProgress(
     bindingGeneration: number,
     cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
   ): Promise<() => void>;
   activateSparseV2(): Promise<SparseV2Status>;
   cancelSparseV2(): Promise<SparseV2CancelResult>;
+  cancelSparseV2Cold(path: string, attempt: number): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
   joinSparseV2Shared(): Promise<SparseV2Status>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
@@ -287,6 +330,8 @@ export interface Backend {
   pageAliases(): Promise<[string, string][]>;
   /** `icon::` property for each named page that has one (page-name → icon). */
   pageIcons(names: string[]): Promise<Record<string, string>>;
+  /** The subset of `names` that already name a page, journal or alias. */
+  existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
@@ -346,6 +391,30 @@ export interface Backend {
   /** Load a page from a SPECIFIC file by its graph-root-relative path — reaches a
    *  duplicate-day stray that shares a (kind,name) with the canonical file (#21). */
   getPageByPath(path: string): Promise<PageDto | null>;
+  /** Activate an editor over an existing file. Deliberately separate from the
+   *  mixed-purpose reads above: an activation exists exactly when a live editor
+   *  does, so a read for export/preview/hydration cannot inherit an editor's
+   *  override authority. (GH #254 increment 3.) */
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ): Promise<EditorActivationHandle | null>;
+  /** Activate an editor for a page with no file yet, returning the prospective
+   *  target it is live for. Reserves nothing on disk. */
+  activateAbsentEditor(name: string, kind: PageKind): Promise<EditorActivationHandle | null>;
+  /** Compare-and-retire: retires only if `activation` is still the live one, and
+   *  reports whether it was. A retirement racing a newer activation must not
+   *  revoke the newer editor. */
+  retireEditorActivation(path: string, activation: number): Promise<boolean>;
+  /** Present a conflict observation and learn its fate WITHOUT writing. The
+   *  "Use disk version" half of the authority contract. */
+  presentConflictOverride(
+    path: string,
+    baseRev: string | null,
+    activation: number,
+    conflictEpoch: number,
+  ): Promise<"authorised" | "superseded" | "withdrawn">;
   /** Append the blocks of `src` (graph-root-relative path) onto `dst`, then trash
    *  `src` — fold a duplicate-day stray into the canonical day (#21). */
   mergePages(src: string, dst: string): Promise<void>;
@@ -488,8 +557,8 @@ export interface Backend {
   setWatchMode(mode: string): Promise<void>;
   /** Available snapshots for the current graph, newest first. */
   listBackups(): Promise<BackupInfo[]>;
-  /** Restore a snapshot (overwrites journals/pages/config; snapshots current
-   *  state first). Destructive — confirm before calling. */
+  /** Restore a snapshot (graph text at original paths, config, and sidecars;
+   *  snapshots current state first). Destructive — confirm before calling. */
   restoreBackup(stamp: string): Promise<void>;
   /** Load the persisted UI session JSON (open tabs / active tab / zoom), or null.
    *  Stored atomically in a backend file so structured session state is independent
@@ -506,6 +575,11 @@ export interface Backend {
    *  page.tine.Tine (so the UI can explain that some app-level prefs may need
    *  re-setting). Self-clears after the first call. */
   takeIdentifierMigrationNotice(): Promise<boolean>;
+  /** The directory this launch had to fall back to, exactly ONCE, when the
+   *  normal app-data home could not be written (Tauri would otherwise have
+   *  panicked before any window existed). `null` on every ordinary launch.
+   *  Self-clears after the first call. */
+  takeDataHomeFallbackNotice(): Promise<string | null>;
   /** What the backend knows about the rendering path, for the CPU-rendering
    *  warning (see `gpu.ts`). A silent driver fallback is detected in the webview
    *  (WebGL renderer); this just supplies why/where context for the message. */
@@ -610,6 +684,26 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/**
+ * Core commands that REOPEN the graph (`refresh_graph` on the Rust side), so the
+ * frontend's graph-scoped state — editor activations, resolved paths — belongs
+ * to a `Graph` that no longer exists once they return.
+ *
+ * Kept as an explicit list because it is a claim about the backend: each of
+ * these was verified to reach `refresh_graph`. Adding a command that reopens the
+ * graph without adding it here reintroduces the round-15 blockers.
+ */
+const REBINDING_COMMANDS = new Set([
+  "set_journal_title_format",
+  "set_preferred_format",
+  "set_timetracking_enabled",
+  "set_show_brackets",
+  "set_doc_mode_enter_for_new_block",
+  "set_logical_outdenting",
+  "set_guide_announced",
+  "restore_backup",
+]);
+
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   private convertFileSrc!: (path: string, protocol?: string) => string;
@@ -632,7 +726,19 @@ class TauriBackend implements Backend {
     const leasedArgs = bindingGeneration
       ? { ...(args ?? {}), bindingGeneration }
       : args;
-    return this.invoke<T>(cmd, leasedArgs);
+    const result = await this.invoke<T>(cmd, leasedArgs);
+    // A command that makes the core REBIND — `refresh_graph` installs a fresh
+    // `Graph`, with a fresh (empty) editor-activation registry — must announce
+    // it, or this side keeps tokens naming editors the core has never heard of
+    // and paths that may have been migrated.
+    //
+    // Announced HERE, at the one boundary every such command crosses, rather
+    // than at each call site: the frontend entry points are fire-and-forget
+    // `void backend().setX(...)`, six of the seven never announced, and the
+    // seventh only did because it happened to be the one under review.
+    // (GH #254 increment 3, round 15.)
+    if (REBINDING_COMMANDS.has(cmd)) notifyGraphRebound();
+    return result;
   }
 
   async loadGraph(path: string) {
@@ -649,8 +755,12 @@ class TauriBackend implements Backend {
   openGraphWindow(path: string) {
     return this.call<LoadGraphResult>("open_graph_window", { path });
   }
-  startupGraphPath() {
-    return this.call<string | null>("startup_graph_path");
+  startupGraphPath(attempt: number) {
+    return this.call<string | null>("startup_graph_path", { attempt });
+  }
+  async onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<StartupProgressEvent>("startup-progress", (event) => cb(event.payload));
   }
   captureTarget() {
     return this.call<string>("capture_target");
@@ -710,6 +820,9 @@ class TauriBackend implements Backend {
   quit() {
     return this.call<void>("tine_quit");
   }
+  prepareQuit() {
+    return this.call<TineQuitPreparation>("prepare_tine_quit");
+  }
   closeGraphWindow() {
     return this.call<void>("close_graph_window");
   }
@@ -722,8 +835,10 @@ class TauriBackend implements Backend {
   createGraph(dir: string) {
     return this.call<string>("create_graph", { dir });
   }
-  referencedPageNames() {
-    return this.call<string[]>("referenced_page_names");
+  referencedPageNames(knownDigest?: number | null) {
+    return this.call<ReferencedPageNames>("referenced_page_names", {
+      knownDigest: knownDigest ?? null,
+    });
   }
   listPages() {
     return this.call<PageEntry[]>("list_pages");
@@ -740,22 +855,37 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(page: PageDto, baseRev: string | null, force = false) {
+  savePage(
+    page: PageDto,
+    baseRev: string | null,
+    force = false,
+    conflictEpoch: number | null = null,
+    managedConflictObservation: { path: string; revision: string } | null = null,
+  ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<string>("save_page", { page, baseRev, force })
+      this.call<SavePageResult>("save_page", {
+        page,
+        baseRev,
+        force,
+        conflictEpoch,
+        managedConflictObservation,
+      })
     );
-  }
-  managedSyncStatus() {
-    return this.call<ManagedSyncStatus | null>("managed_sync_status");
-  }
-  managedSyncIdentityPlan() {
-    return this.call<SyncIdentityPlan>("managed_sync_identity_plan");
-  }
-  enableManagedSync() {
-    return this.call<ManagedSyncEnableResult>("enable_managed_sync");
   }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");
+  }
+  async onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SparseV2RuntimeStatusEvent>("sparse-v2-status", (event) => cb(event.payload));
+  }
+  async onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SparseV2TickEvent>("sparse-v2-tick", (event) => cb(event.payload));
+  }
+  async onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SparseV2ErrorEvent>("sparse-v2-error", (event) => cb(event.payload));
   }
   async onSparseV2ActivationProgress(
     bindingGeneration: number,
@@ -773,6 +903,11 @@ class TauriBackend implements Backend {
   }
   async cancelSparseV2() {
     const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async cancelSparseV2Cold(path: string, attempt: number) {
+    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path, attempt });
     this.bindingGeneration = result.binding_generation;
     return result;
   }
@@ -860,6 +995,9 @@ class TauriBackend implements Backend {
   }
   pageIcons(names: string[]) {
     return this.call<Record<string, string>>("page_icons", { names });
+  }
+  existingPageNames(names: string[]) {
+    return this.call<string[]>("existing_page_names", { names });
   }
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });
@@ -992,6 +1130,36 @@ class TauriBackend implements Backend {
   }
   getPageByPath(path: string) {
     return this.call<PageDto | null>("get_page_by_path", { path });
+  }
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ) {
+    return this.call<EditorActivationHandle | null>("activate_editor", {
+      path,
+      intent,
+      expectedRevision,
+    });
+  }
+  activateAbsentEditor(name: string, kind: PageKind) {
+    return this.call<EditorActivationHandle | null>("activate_absent_editor", { name, kind });
+  }
+  retireEditorActivation(path: string, activation: number) {
+    return this.call<boolean>("retire_editor_activation", { path, activation });
+  }
+  presentConflictOverride(
+    path: string,
+    baseRev: string | null,
+    activation: number,
+    conflictEpoch: number,
+  ) {
+    return this.call<"authorised" | "superseded" | "withdrawn">("present_conflict_override", {
+      path,
+      baseRev,
+      activation,
+      conflictEpoch,
+    });
   }
   mergePages(src: string, dst: string) {
     return this.call<void>("merge_pages", { src, dst });
@@ -1193,6 +1361,9 @@ class TauriBackend implements Backend {
   }
   takeIdentifierMigrationNotice() {
     return this.call<boolean>("take_identifier_migration_notice");
+  }
+  takeDataHomeFallbackNotice() {
+    return this.call<string | null>("take_data_home_fallback_notice");
   }
   gpuEnv() {
     return this.call<GpuEnv>("gpu_env");

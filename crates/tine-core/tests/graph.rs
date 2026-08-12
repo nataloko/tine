@@ -1,7 +1,22 @@
 //! Integration tests against the on-disk demo graph (standard layout).
 
 use std::path::PathBuf;
-use tine_core::Graph;
+use tine_core::{ActivationIntent, Graph, PageDto};
+
+/// Make `dto` an EDITOR's DTO, the way the frontend does.
+///
+/// Since GH #254 increment 3 a loaded page and a live editor are different
+/// things: reading alone mints no identity, so a read for export, preview or
+/// hydration cannot inherit an editor's override authority. A test that
+/// force-saves is modelling a user answering a conflict banner, so it has to
+/// activate like one. Works for an absent page too — activation resolves a
+/// prospective target and writes nothing.
+fn as_editor(graph: &Graph, dto: &mut PageDto) {
+    let handle = graph
+        .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
+        .expect("the target is inside the graph");
+    dto.activation = Some(handle.activation.as_u64());
+}
 
 fn demo_graph() -> Graph {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/demo-graph");
@@ -279,13 +294,56 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
             .load_by_path("external/deep/Exact.markdown")
             .unwrap()
             .unwrap();
-        identity_bound.blocks[0].raw = "must not replace a new inode".into();
+        identity_bound.blocks[0].raw = "keep mine over a republished inode".into();
+        as_editor(&graph, &mut identity_bound);
+        std::fs::write(&path, "- shown conflict\n").unwrap();
+        graph
+            .save_page(&identity_bound, identity_bound.rev.as_deref())
+            .unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&identity_bound)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
+
+        // A syncer republishes the SAME bytes by temp+rename: new inode, state
+        // the user was shown unchanged. "Keep mine" must go through. Refusing
+        // would be stricter than an ordinary save, which treats a same-byte
+        // republication as the state it already has (GH #254 increment 2).
         let replacement = root.join("external/deep/.replacement.markdown");
-        std::fs::write(&replacement, "- external winner\n").unwrap();
+        std::fs::write(&replacement, "- shown conflict\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        graph
+            .force_save_page_at_revision(&identity_bound, identity_bound.rev.as_deref(), shown)
+            .unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("keep mine over a republished inode"));
+
+        // A DIFFERENT-byte winner on a new inode is still refused, and the file
+        // is left exactly as that winner wrote it.
+        let mut second = graph
+            .load_by_path("external/deep/Exact.markdown")
+            .unwrap()
+            .unwrap();
+        second.blocks[0].raw = "must not replace a different winner".into();
+        // A live editor too, so the refusal below is the byte-binding refusal
+        // this test is about and not merely a missing activation.
+        as_editor(&graph, &mut second);
+        std::fs::write(&path, "- second shown conflict\n").unwrap();
+        graph.save_page(&second, second.rev.as_deref()).unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&second)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
+        let foreign = root.join("external/deep/.foreign.markdown");
+        std::fs::write(&foreign, "- different winner\n").unwrap();
+        std::fs::rename(&foreign, &path).unwrap();
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            graph.force_save_page(&identity_bound).unwrap_err().kind(),
+            graph
+                .force_save_page_at_revision(&second, second.rev.as_deref(), shown)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -459,6 +517,11 @@ fn portable_case_nfc_and_file_identity_aliases_are_readable_but_non_writable() {
             "external/extension.md",
         ),
         ("nfc", "external/Caf\u{e9}.md", "external/Cafe\u{301}.md"),
+        (
+            "ancestor-nfc",
+            "Ext\u{e9}rnal/Page.md",
+            "Exte\u{301}rnal/page.md",
+        ),
         (
             "german-sharp-s",
             "external/Straße.md",
@@ -929,6 +992,7 @@ fn search_cache_reflects_saves_and_deletes() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -975,6 +1039,7 @@ fn journal_template_bytes_survive_reopen_and_idempotent_resave() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
 
@@ -1028,6 +1093,7 @@ fn search_ignores_hidden_property_metadata() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -1217,7 +1283,8 @@ fn save_refuses_to_clobber_external_change() {
     let g = Graph::open(&root);
     // Build the cache (Tine now "knows" N = "- one"), then load it for editing.
     g.search("one", 10);
-    let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+    let mut dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+    as_editor(&g, &mut dto);
 
     // An external writer (another app / Syncthing) changes the file.
     std::fs::write(&path, "- EXTERNAL EDIT").unwrap();
@@ -1228,7 +1295,12 @@ fn save_refuses_to_clobber_external_change() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "- EXTERNAL EDIT");
 
     // "Keep mine" force-saves over it.
-    g.force_save_page(&dto).unwrap();
+    let shown = g
+        .outstanding_conflict_override(&dto)
+        .unwrap()
+        .expect("the refused save names the conflict shown to this editor");
+    g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+        .unwrap();
     assert!(std::fs::read_to_string(&path).unwrap().contains("one"));
 
     std::fs::remove_dir_all(&root).ok();
@@ -1310,6 +1382,7 @@ fn consecutive_self_saves_do_not_conflict() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     // 1) date picker inserts a SCHEDULED line (page is new — no baseline yet).
@@ -1394,6 +1467,7 @@ fn noop_save_does_not_bump_cache_generation() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     let r1 = g.save_page(&mk("hello"), None).unwrap();
@@ -1444,6 +1518,7 @@ fn self_write_marker_does_not_outlive_its_save() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap(); // sets, then self-removes, the marker
@@ -1487,6 +1562,7 @@ fn disk_rev_fast_path_is_fresh_and_detects_external_change() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap(); // populates disk_revs[R] (marker self-removed)
@@ -1545,6 +1621,7 @@ fn self_write_is_not_reported_as_external_change() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -2963,4 +3040,564 @@ fn checked_graph_open_rejects_a_managed_sync_symlink() {
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
+}
+
+/// Editing one block must not rewrite bytes belonging to blocks the user never
+/// touched. Direct Files data-safety audit, 2026-08-09.
+///
+/// The retention machinery in `doc.rs` existed but every production call site
+/// passed an empty identity slice, so it was inert on the ordinary save path.
+/// Measured consequence on a real-shaped 1,045-file graph: editing one block and
+/// reverting it failed to restore the bytes of 96 of 983 files (9.8%).
+mod untouched_bytes_survive_an_edit {
+    use super::*;
+
+    /// A scratch graph root; `tine-core`'s test deps do not include `tempfile`.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tine-untouched-bytes-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        root
+    }
+
+    fn edit_last_root(root: &std::path::Path, rel: &str, replacement: &str) -> String {
+        let graph = Graph::open(root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path(rel).unwrap().unwrap();
+        let last = page.blocks.len() - 1;
+        page.blocks[last].raw = replacement.into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        std::fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    /// The dominant shape: 88 of the 96 damaged files were a page-level
+    /// unbulleted `## Heading` that acquired a `- ` prefix.
+    #[test]
+    fn an_unbulleted_heading_keeps_its_missing_bullet() {
+        let root = scratch("unbulleted-heading");
+        let original = "- first bullet\n## Standalone heading\n- last bullet\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let after = edit_last_root(&root, "pages/Note.md", "last bullet edited");
+
+        assert_eq!(
+            after,
+            original.replace("- last bullet\n", "- last bullet edited\n"),
+            "editing the last block rewrote the untouched heading"
+        );
+    }
+
+    /// A heading living in a bullet's continuation body used to have the source
+    /// layout whitespace baked into its text (`\t  ## Section`) and gain a
+    /// nesting level. Both are gone; assert the text and the outline shape, not
+    /// the exact bytes — a whitespace-only separator line is still normalised to
+    /// an empty line, which is recorded as a follow-up.
+    #[test]
+    fn a_heading_inside_a_continuation_body_keeps_its_text_and_depth() {
+        let root = scratch("continuation-heading");
+        let original =
+            "- intro\n\t- body line one\n\t  \n\t  ## Section\n\t  \n\t  more prose\n- tail\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let after = edit_last_root(&root, "pages/Note.md", "tail edited");
+
+        assert!(
+            !after.contains("- \t  ##"),
+            "source layout whitespace was injected into the block text: {after:?}"
+        );
+        assert!(
+            after.contains("\t  ## Section"),
+            "the heading lost its original indentation: {after:?}"
+        );
+        assert_eq!(
+            after.matches("## Section").count(),
+            1,
+            "the heading was duplicated: {after:?}"
+        );
+        assert!(
+            !after.contains("\t\t- "),
+            "the block gained a nesting level: {after:?}"
+        );
+    }
+
+    /// Necessity guard the other way: a save that changes nothing must still be
+    /// a byte-exact no-op. Retention must not start inventing layout.
+    #[test]
+    fn an_unchanged_save_is_still_byte_exact() {
+        let root = scratch("unchanged-save");
+        let original = "- first bullet\n## Standalone heading\n- last bullet\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+            original
+        );
+    }
+}
+
+/// A content-only save must not throw away the physical page inventory.
+/// Direct Files perf audit, 2026-08-09, F1.
+///
+/// `list_pages` is memoized on `cache_gen`, and its only rebuild path re-reads
+/// and re-parses every file in the graph (~35 µs/file, linear to 8,006 pages).
+/// Every save bumped the generation unconditionally, so the first navigation or
+/// `[[` autocomplete after any typing pause paid a whole-graph disk walk —
+/// 243 ms on a real 5,225-file graph.
+mod page_inventory_survives_a_content_save {
+    use super::*;
+    use std::time::Instant;
+
+    fn graph_with(pages: usize, tag: &str) -> (PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-inventory-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        for i in 0..pages {
+            std::fs::write(
+                root.join(format!("pages/Page {i}.md")),
+                format!("- body of page {i}\n- second block\n"),
+            )
+            .unwrap();
+        }
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    fn save_first_block(graph: &Graph, rel: &str, raw: &str) {
+        let mut page = graph.load_by_path(rel).unwrap().unwrap();
+        page.blocks[0].raw = raw.into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+    }
+
+    /// Keeping the inventory warm must never keep it WRONG. Regression for a
+    /// defect I shipped with the optimization itself: the re-tag stamped a
+    /// cached list as current no matter how old it was, so a list captured
+    /// before a page was created got republished as authoritative — and since
+    /// `list_pages` is keyed on generation equality it never rebuilt, leaving a
+    /// page that exists on disk permanently unfindable.
+    #[test]
+    fn a_page_created_after_the_inventory_was_cached_is_still_found() {
+        let (root, graph) = graph_with(8, "created-after-cache");
+        graph.list_pages(); // cache the inventory WITHOUT the page below
+
+        std::fs::write(root.join("pages/Latecomer.md"), "- arrived late\n").unwrap();
+        graph.sync_file(&root.join("pages/Latecomer.md"));
+        // A content-only save on an unrelated page is what re-tags the cache.
+        save_first_block(&graph, "pages/Page 0.md", "edited body");
+
+        assert!(
+            graph.list_pages().iter().any(|p| p.name == "Latecomer"),
+            "a page created after the inventory was cached vanished from it"
+        );
+        assert!(
+            graph
+                .load_named("Latecomer", tine_core::model::PageKind::Page)
+                .unwrap()
+                .is_some(),
+            "the page exists on disk but cannot be loaded by name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The perf property, as a RATIO rather than an absolute bound: a shared box
+    /// makes absolute timings flaky, but a rebuild is ~350x a memo hit, so the
+    /// gap survives any load. The `title::` save is the control — it genuinely
+    /// changes the inventory and MUST still pay for a rebuild.
+    #[test]
+    fn a_content_only_save_keeps_the_inventory_warm() {
+        let (root, graph) = graph_with(400, "warm");
+        graph.list_pages();
+
+        save_first_block(&graph, "pages/Page 1.md", "edited body");
+        let start = Instant::now();
+        let after_content = graph.list_pages();
+        let content_only = start.elapsed();
+
+        save_first_block(&graph, "pages/Page 2.md", "title:: Renamed Page Two");
+        let start = Instant::now();
+        let after_title = graph.list_pages();
+        let identity_change = start.elapsed();
+
+        assert_eq!(after_content.len(), after_title.len());
+        assert!(
+            content_only * 5 < identity_change,
+            "a content-only save still paid for a whole-graph rebuild \
+             (content-only {content_only:?} vs identity-change {identity_change:?})"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard: keeping the memo must not make it stale. A `title::`
+    /// edit moves the page's identity and the inventory has to follow.
+    #[test]
+    fn a_title_property_edit_still_updates_the_inventory() {
+        let (root, graph) = graph_with(20, "title");
+        assert!(graph.list_pages().iter().any(|p| p.name == "Page 3"));
+
+        save_first_block(&graph, "pages/Page 3.md", "title:: Totally Different");
+
+        let names: Vec<_> = graph.list_pages().into_iter().map(|p| p.name).collect();
+        assert!(
+            names.iter().any(|n| n == "Totally Different"),
+            "the renamed page never appeared in the inventory: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard: a NEW file must appear even though the save that
+    /// preceded it was content-only.
+    #[test]
+    fn a_new_page_still_appears_in_the_inventory() {
+        let (root, graph) = graph_with(20, "new");
+        graph.list_pages();
+        save_first_block(&graph, "pages/Page 4.md", "edited body");
+        std::fs::write(root.join("pages/Brand New.md"), "- hello\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        assert!(graph.list_pages().iter().any(|p| p.name == "Brand New"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// GH #254: an external writer that publishes by `rename()` must not make the
+/// open page permanently unsaveable.
+///
+/// Syncthing, Dropbox, Verysync, Logseq OG, VS Code and Vim with
+/// `backupcopy=no` all publish temp-then-rename, which changes the inode. The
+/// ordinary save refused on that alone, BEFORE comparing bytes, with
+/// `path-pinned page does not match its captured exact owner` — a code the
+/// frontend classifies as transient and retries forever, so the page silently
+/// stopped saving. Direct Files data-safety audit, 2026-08-09, finding 2.
+///
+/// Increment 2 adds one-shot exact-snapshot authority to the conflict half;
+/// trusted journal projection remains deliberately separate.
+mod external_atomic_replacement {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tine-gh254-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        root
+    }
+
+    /// Replace `pages/Note.md` the way a syncing tool does: write a temp file in
+    /// the same directory, then rename it over the target. New inode.
+    fn deliver(root: &std::path::Path, bytes: &str) {
+        let tmp = root.join("pages/.delivery.tmp");
+        std::fs::write(&tmp, bytes).unwrap();
+        std::fs::rename(&tmp, root.join("pages/Note.md")).unwrap();
+    }
+
+    fn open_with(root: &std::path::Path, bytes: &str) -> (Graph, tine_core::model::PageDto) {
+        std::fs::write(root.join("pages/Note.md"), bytes).unwrap();
+        let graph = Graph::open(root);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        (graph, page)
+    }
+
+    /// The headline case. Identical bytes on a new inode are a republication of
+    /// the state the editor already has, not a conflict — and no watcher event
+    /// is needed for the save to work.
+    #[test]
+    fn a_same_byte_delivery_does_not_block_the_save() {
+        let root = scratch("same-bytes");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        deliver(&root, "- original\n");
+
+        page.blocks[0].raw = "mine".into();
+        graph
+            .save_page(&page, base.as_deref())
+            .expect("a same-byte atomic replacement must not block the save");
+        assert!(std::fs::read_to_string(root.join("pages/Note.md"))
+            .unwrap()
+            .contains("mine"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And it must keep working: the old refusal was permanent for the loaded
+    /// instance, which is what turned this into "my notes stopped saving".
+    #[test]
+    fn a_second_save_after_a_same_byte_delivery_also_works() {
+        let root = scratch("same-bytes-twice");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+        deliver(&root, "- original\n");
+
+        page.blocks[0].raw = "mine".into();
+        let rev = graph.save_page(&page, base.as_deref()).unwrap();
+        page.blocks[0].raw = "mine again".into();
+        graph
+            .save_page(&page, Some(rev.as_str()))
+            .expect("the page must not become permanently unsaveable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard, and the whole point of the byte comparison: DIFFERENT
+    /// bytes are a real conflict and must still refuse — with the literal
+    /// `conflict` code the frontend can actually resolve, not a physical-identity
+    /// message it retries forever.
+    #[test]
+    fn a_different_byte_delivery_is_a_resolvable_conflict() {
+        let root = scratch("diff-bytes");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        deliver(&root, "- from another device\n");
+
+        page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present",
+            "must be a resolvable minted-authority code"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+            "- from another device\n",
+            "the other device's bytes must survive"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same conflict delivered in place (same inode) must behave identically
+    /// — the two shapes were resolvable and unresolvable respectively, which is
+    /// how the inode was identified as the discriminator.
+    #[test]
+    fn an_in_place_different_byte_change_conflicts_the_same_way() {
+        let root = scratch("inplace-diff");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        std::fs::write(root.join("pages/Note.md"), "- edited in place\n").unwrap();
+
+        page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An external deletion is a resolvable `Absent` conflict. It must not be
+    /// resurrected until the user explicitly chooses Keep mine.
+    #[test]
+    fn an_external_delete_mints_absent_authority_without_resurrecting() {
+        let root = scratch("deleted");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+        as_editor(&graph, &mut page);
+
+        std::fs::remove_file(root.join("pages/Note.md")).unwrap();
+
+        page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_absent"
+        );
+        assert!(
+            !root.join("pages/Note.md").exists(),
+            "a deleted page must not be silently resurrected"
+        );
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
+        graph
+            .force_save_page_at_revision(&page, base.as_deref(), shown)
+            .unwrap();
+        assert!(std::fs::read_to_string(root.join("pages/Note.md"))
+            .unwrap()
+            .contains("mine"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// GH #270 at the boundary the reporter observed: the Unlinked References
+/// panel of a page, fed by `Graph::unlinked_refs`.
+mod unlinked_references_see_code_blocks {
+    use super::*;
+
+    fn graph_with(source: &str) -> (std::path::PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-gh270-{}-{}",
+            std::process::id(),
+            source.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Widget.md"), "- the page itself\n").unwrap();
+        std::fs::write(root.join("pages/Notes.md"), source).unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    #[test]
+    fn a_mention_inside_a_fenced_code_block_is_reported() {
+        let (root, graph) = graph_with("- how to build it\n  ```sh\n  make Widget\n  ```\n");
+        let groups = graph.unlinked_refs("Widget");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Notes"],
+            "the fenced mention never reached the panel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mention_inside_inline_code_or_math_is_reported() {
+        for source in [
+            "- run `Widget --help` first\n",
+            "- the model\n  $$\n  W = Widget(x)\n  $$\n",
+        ] {
+            let (root, graph) = graph_with(source);
+            assert_eq!(graph.unlinked_refs("Widget").len(), 1, "{source}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The complement is not "everything": an existing link is still a LINKED
+    /// reference, and clock entries are stripped exactly as Logseq strips them.
+    #[test]
+    fn linked_syntax_and_logbook_clock_lines_stay_out() {
+        let (root, graph) = graph_with("- see [[Widget]]\n  :LOGBOOK:\n  CLOCK: Widget\n  :END:\n");
+        assert!(
+            graph.unlinked_refs("Widget").is_empty(),
+            "an explicit link or a logbook line leaked into unlinked references"
+        );
+        assert_eq!(
+            graph.backlinks("Widget").len(),
+            1,
+            "the link is still linked"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Direct Files data-safety audit, finding 15. Two shadow-journal classifiers
+/// disagreed: the managed one asked every Logseq text extension, the direct one
+/// hard-coded `.md`/`.org`, though `.markdown` is first-class
+/// (`LOGSEQ_TEXT_EXTENSIONS`, and OG accepts it case-insensitively).
+///
+/// NOT a regression proof, and deliberately labelled as such: these three pass
+/// with and without the unification. The audit predicted that a `.markdown`
+/// canonical day would let a title-named leftover poison the (kind, name) cache,
+/// and it does not — `load_named` and `journals_desc` both still serve the
+/// canonical file, because later layers happen to mask the misclassification. So
+/// the divergence is real in the code and its predicted consequence is not
+/// reachable today. What these DO pin is the #21 rule itself, at the observation
+/// boundary, for every extension: whichever layer is currently masking it can
+/// move without silently taking the guarantee with it.
+mod shadow_journal_sees_every_text_extension {
+    use super::*;
+
+    fn graph_with_canonical(extension: &str) -> (std::path::PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-ds15-shadow-{}-{extension}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        // The canonical day, under a date-stem filename.
+        std::fs::write(
+            root.join(format!("journals/2026_06_26.{extension}")),
+            "- the canonical day\n",
+        )
+        .unwrap();
+        // …and a leftover whose NAME parses as that same day. Nothing on disk
+        // says which is authoritative, so the date-stem file wins by rule and
+        // this one must stay out of the (kind, name) cache.
+        std::fs::write(
+            root.join("pages/leftover.md"),
+            "title:: Jun 26th, 2026\n- the shadow's own text\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    fn day_resolves_to_the_canonical_file(extension: &str) {
+        let (root, graph) = graph_with_canonical(extension);
+        // Reading the leftover by PATH is the ordinary way it gets seen: opening
+        // the stray file, or a watcher event on it. That read reconciles the
+        // parsed document into the (kind, name) cache unless the shadow rule
+        // stops it — which is where the two classifiers disagreed.
+        let leftover = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == "pages/leftover.md")
+            .expect("the leftover is discovered");
+        let _ = graph.load_page(&leftover);
+
+        let loaded = graph
+            .load_named("Jun 26th, 2026", tine_core::PageKind::Journal)
+            .expect("load_named succeeds")
+            .expect("the day resolves to something");
+        let text = format!("{loaded:?}");
+        assert!(
+            text.contains("the canonical day"),
+            ".{extension}: the day resolved to the shadow instead of the canonical file"
+        );
+        assert!(
+            !text.contains("the shadow's own text"),
+            ".{extension}: the shadow leaked into the day's content"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_md_canonical_day_shadows_a_title_named_leftover() {
+        day_resolves_to_the_canonical_file("md");
+    }
+
+    #[test]
+    fn a_markdown_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("markdown");
+    }
+
+    #[test]
+    fn an_org_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("org");
+    }
 }

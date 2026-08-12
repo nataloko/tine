@@ -2,6 +2,8 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, crea
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
+import { writeClipboardTextResilient } from "../clipboard";
+import { safeManagedErrorDetail } from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -139,7 +141,9 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
+import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
+import { managedStorageRuntime } from "../managedStorageRuntime";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -174,6 +178,9 @@ const DATE_FORMATS = [
   "E, dd-MM-yyyy",
   "EEE, dd-MM-yyyy",
   "EEEE, dd-MM-yyyy",
+  "E, dd.MM.yyyy",
+  "EEE, dd.MM.yyyy",
+  "EEEE, dd.MM.yyyy",
   "EEE, MM/dd/yyyy",
   "EEEE, MM/dd/yyyy",
   "EEE, yyyy/MM/dd",
@@ -2400,7 +2407,8 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
 }
 
 function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
-  const [status, setStatus] = createSignal<SparseV2Status | null>(null);
+  const status = () => managedStorageRuntime.snapshot().status;
+  const runtimeError = () => managedStorageRuntime.snapshot().error;
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
@@ -2457,9 +2465,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const refresh = async () => {
     setLoading(true);
     try {
-      setStatus(await backend().sparseV2Status());
-    } catch {
-      pushToast("Couldn't read Tine-managed storage status. Try again.", "error");
+      await managedStorageRuntime.refresh();
+    } catch (error) {
+      reportManagedFailure("Couldn't read Tine-managed storage status", safeManagedErrorDetail(error));
     } finally {
       setLoading(false);
     }
@@ -2471,28 +2479,88 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     bumpGraphEpoch();
   };
 
-  const failureDetail = (value: SparseV2Status): string => {
-    if (value.state === "retryable") return "Setup can be retried.";
-    if (value.state === "refused") return "This graph cannot use Tine-managed storage.";
-    if (value.state === "blocked") return "Setup is waiting until it can continue safely.";
-    return "Tine-managed storage did not become active.";
+  // Status fields are structured, but some Rust producers still embed native
+  // paths in their detail. Treat every displayed field as untrusted text.
+  const failureDetail = (value: SparseV2Status): string | null => {
+    if (value.state === "retryable") return safeManagedErrorDetail(value.detail);
+    if (value.state === "refused") {
+      return safeManagedErrorDetail(value.detail ?? `reason code: ${value.reason_code}`);
+    }
+    if (value.state === "blocked") return safeManagedErrorDetail(`reason code: ${value.reason_code}`);
+    return null;
+  };
+
+  const reportManagedFailure = (summary: string, detail: string) => {
+    pushToast(`${summary}: ${detail}`, "error", { sticky: true });
+  };
+
+  const managedDiagnostics = () => {
+    const current = status();
+    const entries: string[] = [];
+    const statusDetail = current ? failureDetail(current) : null;
+    if (statusDetail) entries.push(`Setup: ${statusDetail}`);
+    if (current?.cancel_reason) {
+      entries.push(`Return to Direct files: ${safeManagedErrorDetail(current.cancel_reason)}`);
+    }
+    const liveError = runtimeError();
+    if (liveError) entries.push(`Runtime: ${safeManagedErrorDetail(liveError)}`);
+    return [...new Set(entries)];
+  };
+
+  const copyManagedDiagnostics = async () => {
+    const details = managedDiagnostics();
+    if (!details.length) return;
+    try {
+      await writeClipboardTextResilient(details.join("\n"));
+      pushToast("Managed storage details copied.", "success");
+    } catch (error) {
+      reportManagedFailure("Couldn't copy managed storage details", safeManagedErrorDetail(error));
+    }
+  };
+
+  const directFilesWarning = () => {
+    const current = status();
+    if (!current) return null;
+    const shared = Boolean(current.runtime?.shared_phase);
+    const pending = (current.runtime?.provider_pending ?? 0) > 0;
+    if (!current.cancel_reason && !shared && !pending) return null;
+    return (
+      "Warning: Tine reports shared, pending, or otherwise unverified managed-storage state. Its current Markdown files might not include every durable managed or sync change. " +
+      "Returning to Direct files is a recovery exit, not confirmation that every device and pending change has synchronized."
+    );
+  };
+
+  const directFilesConfirmation = () => {
+    const warning = directFilesWarning();
+    return (
+      "Return to Direct files?\n\n" +
+      "Tine first tries to save in-memory edits and drain pending managed work. If that cannot complete, continuing may omit in-memory managed edits that are not yet durable. " +
+      "Tine will archive the complete durable managed-storage and provider state before reopening Direct files." +
+      (warning ? `\n\n${warning}` : "")
+    );
   };
 
   const enable = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setEnabling(true);
     setActivationProgress(null);
     setGraphTransitioning(true);
     let unlisten: (() => void) | undefined;
     try {
-      if (!(await flushAll())) {
+      dbg("managed storage setup: flushing pending writes");
+      const flushed = await flushAll();
+      dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
+      if (!flushed) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
+      dbg("managed storage setup: awaiting native confirmation");
       const confirmed = await backend().confirm(
         `Enable Tine-managed storage for this graph?\n\n` +
           `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
           `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
       );
+      dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
       if (!confirmed) return;
       const generation = status()?.binding_generation;
       if (generation !== undefined) {
@@ -2506,16 +2574,21 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           // is unavailable in an older or closing WebView.
         }
       }
+      dbg("managed storage setup: invoking native activation");
       const result = await backend().activateSparseV2();
-      setStatus(result);
+      dbg(`managed storage setup: native activation returned (${result.state})`);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
       if (result.state === "active") {
         pushToast("Tine-managed storage is active.", "success");
       } else {
-        pushToast(`Tine-managed storage setup did not complete: ${failureDetail(result)}`, "error");
+        reportManagedFailure(
+          "Tine-managed storage setup did not complete",
+          failureDetail(result) ?? "Tine-managed storage did not become active."
+        );
       }
-    } catch {
-      pushToast("Tine-managed storage was not enabled. Retry setup.", "error");
+    } catch (error) {
+      reportManagedFailure("Tine-managed storage was not enabled", safeManagedErrorDetail(error));
     } finally {
       unlisten?.();
       setActivationProgress(null);
@@ -2525,6 +2598,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const prepareShare = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2537,16 +2611,15 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().prepareSparseV2Share();
-      setStatus(result);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
-      pushToast(
-        result.state === "active"
-          ? "Sync is ready to use on another device."
-          : `Sync setup did not complete: ${failureDetail(result)}`,
-        result.state === "active" ? "success" : "error"
-      );
-    } catch {
-      pushToast("Couldn't set up sync. Retry setup.", "error");
+      if (result.state === "active") {
+        pushToast("Sync is ready to use on another device.", "success");
+      } else {
+        reportManagedFailure("Sync setup did not complete", failureDetail(result) ?? "Tine-managed storage did not become active.");
+      }
+    } catch (error) {
+      reportManagedFailure("Couldn't set up sync", safeManagedErrorDetail(error));
     } finally {
       setGraphTransitioning(false);
       setSharing(false);
@@ -2554,6 +2627,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const joinShare = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2566,16 +2640,18 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().joinSparseV2Shared();
-      setStatus(result);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
-      pushToast(
-        result.state === "active"
-          ? "This device joined the synced graph."
-          : `Joining the synced graph did not complete: ${failureDetail(result)}`,
-        result.state === "active" ? "success" : "error"
-      );
-    } catch {
-      pushToast("Couldn't join the synced graph. Retry setup.", "error");
+      if (result.state === "active") {
+        pushToast("This device joined the synced graph.", "success");
+      } else {
+        reportManagedFailure(
+          "Joining the synced graph did not complete",
+          failureDetail(result) ?? "Tine-managed storage did not become active."
+        );
+      }
+    } catch (error) {
+      reportManagedFailure("Couldn't join the synced graph", safeManagedErrorDetail(error));
     } finally {
       setGraphTransitioning(false);
       setSharing(false);
@@ -2583,6 +2659,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const cancelSparse = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setCancelling(true);
     setGraphTransitioning(true);
     try {
@@ -2593,13 +2670,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         // repairs. Keep the store intact and retry after Direct files
         // has been restored.
       }
-      if (!(await backend().confirm(
-        "Return to Direct files?\n\n" +
-          "Tine preserves complete recovery state before switching this graph back to Direct files. " +
-          "Pending in-memory edits will be retried after Direct files returns."
-      ))) return;
+      if (!(await backend().confirm(directFilesConfirmation()))) return;
       const result = await backend().cancelSparseV2();
-      setStatus(result.status);
+      if (!managedStorageRuntime.transitionTo(result.status, expectedBinding)) return;
       let flushed = false;
       try {
         flushed = await flushAll();
@@ -2621,8 +2694,8 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           .replace(/^Direct files is active\./, "Direct file mode is active."),
         "success"
       );
-    } catch {
-      pushToast("Couldn't return to Direct files. Try again.", "error");
+    } catch (error) {
+      reportManagedFailure("Couldn't return to Direct files", safeManagedErrorDetail(error));
     } finally {
       setGraphTransitioning(false);
       setCancelling(false);
@@ -2715,32 +2788,26 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={refused()}>
                     <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
                   </Show>
-                  <Show
-                    when={
-                      current().state !== "legacy_default" && current().state !== "joinable"
-                    }
-                  >
-                    <Show
-                      when={current().can_cancel}
-                      fallback={
-                        <div class="settings-hint" style={{ "margin-top": "8px" }}>
-                          Return to Direct files is unavailable because safety could not be verified.
-                        </div>
-                      }
-                    >
-                      <div style={{ "margin-top": "8px" }}>
-                        <button
-                          class="settings-btn settings-btn-danger"
-                          disabled={cancelling()}
-                          onClick={() => void cancelSparse()}
-                        >
-                          {cancelling() ? "Returning..." : "Return to Direct files"}
-                        </button>
-                        <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                          Complete recovery state is preserved before returning to Direct files.
-                        </div>
+                  <Show when={current().state !== "legacy_default" && current().state !== "joinable"}>
+                    <div style={{ "margin-top": "8px" }}>
+                      <button
+                        class="settings-btn settings-btn-danger"
+                        disabled={cancelling()}
+                        onClick={() => void cancelSparse()}
+                      >
+                        {cancelling() ? "Returning..." : "Return to Direct files"}
+                      </button>
+                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                        Complete recovery state is preserved before returning to Direct files.
                       </div>
-                    </Show>
+                      <Show when={directFilesWarning()}>
+                        {(warning) => (
+                          <div class="settings-hint" role="note" style={{ "margin-top": "4px" }}>
+                            {warning()}
+                          </div>
+                        )}
+                      </Show>
+                    </div>
                   </Show>
                   <Show when={retryable()}>
                     <div class="settings-hint" style={{ "margin-top": "4px" }}>
@@ -2762,6 +2829,26 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                         </Show>
                       </>
                     )}
+                  </Show>
+                  <Show when={runtimeError()}>
+                    {(message) => (
+                      <div class="settings-hint" role="alert" style={{ "margin-top": "6px" }}>
+                        Managed storage needs attention: {safeManagedErrorDetail(message())}
+                      </div>
+                    )}
+                  </Show>
+                  <Show when={managedDiagnostics().length > 0}>
+                    <div class="settings-hint settings-block" role="alert" style={{ "margin-top": "8px" }}>
+                      <strong>Managed storage details</strong>
+                      <For each={managedDiagnostics()}>
+                        {(detail) => <div>{detail}</div>}
+                      </For>
+                      <div style={{ "margin-top": "6px" }}>
+                        <button class="settings-btn" onClick={() => void copyManagedDiagnostics()}>
+                          Copy details
+                        </button>
+                      </div>
+                    </div>
                   </Show>
                   <div class="settings-hint" style={{ "margin-top": "6px" }}>
                     Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
@@ -2827,7 +2914,7 @@ function BackupsTab(props: { search: string }): JSX.Element {
     if (
       !(await backend().confirm(
         `Restore the snapshot from ${when}?\n\n` +
-          `This overwrites journals/ and pages/ with the ${b.files} file(s) in that backup. ` +
+          `This restores the ${b.files} file(s) in that backup to their original locations. ` +
           `Your current state is snapshotted first, so this is reversible.`
       ))
     )

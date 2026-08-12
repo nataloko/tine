@@ -630,12 +630,16 @@ fn validate_replacements(
         return Err(ReferenceCatalogError::NonCanonical);
     }
     for replacement in replacements {
-        if replacement.post_posting.as_ref().is_some_and(|posting| {
-            posting.source_page_id != replacement.page_id
-                || posting.encoded_byte_length == 0
+        if let Some(posting) = &replacement.post_posting {
+            let inline_empty = posting.encoded_byte_length == 0
+                && posting.fact_count == 0
+                && posting.digest == empty_posting_digest(posting.source_page_id)?;
+            if posting.source_page_id != replacement.page_id
                 || posting.encoded_byte_length > MAX_REFERENCE_OBJECT_BYTES
-        }) {
-            return Err(ReferenceCatalogError::MalformedTransition);
+                || (posting.encoded_byte_length == 0 && !inline_empty)
+            {
+                return Err(ReferenceCatalogError::MalformedTransition);
+            }
         }
     }
     Ok(())
@@ -663,6 +667,23 @@ struct PostingManifestV2 {
     source_page_id: PageId,
     fact_count: u64,
     chunks: Vec<PostingChunkRefV2>,
+}
+
+fn empty_posting_manifest(
+    source_page_id: PageId,
+) -> Result<(Vec<u8>, ContentDigest), ReferenceCatalogError> {
+    let bytes = encode_canonical(&PostingManifestV2 {
+        schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+        source_page_id,
+        fact_count: 0,
+        chunks: Vec::new(),
+    })?;
+    let digest = ContentDigest::of(&bytes);
+    Ok((bytes, digest))
+}
+
+fn empty_posting_digest(source_page_id: PageId) -> Result<ContentDigest, ReferenceCatalogError> {
+    empty_posting_manifest(source_page_id).map(|(_, digest)| digest)
 }
 
 #[derive(Debug)]
@@ -729,6 +750,15 @@ impl ReferenceCatalogStore {
         posting: &ReferenceSourcePostingV2,
     ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
         posting.validate()?;
+        if posting.facts.is_empty() {
+            let (_, digest) = empty_posting_manifest(posting.source_page_id)?;
+            return Ok(ReferencePostingRefV2 {
+                source_page_id: posting.source_page_id,
+                digest,
+                encoded_byte_length: 0,
+                fact_count: 0,
+            });
+        }
         let mut chunks = Vec::new();
         let mut current = Vec::new();
         let mut estimated = 0usize;
@@ -834,6 +864,18 @@ impl ReferenceCatalogStore {
         &self,
         reference: &ReferencePostingRefV2,
     ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
+        if reference.encoded_byte_length == 0 {
+            if reference.fact_count != 0
+                || reference.digest != empty_posting_digest(reference.source_page_id)?
+            {
+                return Err(ReferenceCatalogError::MalformedPosting);
+            }
+            return Ok(ReferenceSourcePostingV2 {
+                schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+                source_page_id: reference.source_page_id,
+                facts: Vec::new(),
+            });
+        }
         let bytes = read_content_addressed(
             &self.postings,
             &posting_filename(reference.digest),
@@ -899,6 +941,14 @@ impl ReferenceCatalogStore {
         source_page_id: PageId,
         digest: ContentDigest,
     ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
+        if digest == empty_posting_digest(source_page_id)? {
+            return Ok(ReferencePostingRefV2 {
+                source_page_id,
+                digest,
+                encoded_byte_length: 0,
+                fact_count: 0,
+            });
+        }
         let filename = posting_filename(digest);
         let bytes =
             read_optional_regular(&self.postings, &filename, MAX_REFERENCE_OBJECT_BYTES, None)
@@ -958,6 +1008,90 @@ impl ReferenceCatalogStore {
                 self.read_posting(&reference)
             })
             .transpose()
+    }
+
+    fn posting_from_digest(
+        &self,
+        page_id: PageId,
+        digest: ContentDigest,
+    ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
+        let reference = self.posting_reference(page_id, digest)?;
+        self.read_posting(&reference)
+    }
+
+    fn posting_digest_index(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        let facts_root = PatriciaIndexRoot::from_digest(root.facts_root);
+        let mut digests = BTreeMap::new();
+        let mut validation_error = None;
+        self.patricia
+            .visit_all(facts_root, |key, value| {
+                let result = (|| {
+                    let page_id = page_id_key(key)?;
+                    let digest = digest_value(value)?;
+                    if digests.insert(page_id, digest).is_some() {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    validation_error = Some(error);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map_err(store_error)?;
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        if digests.len() as u64 != root.source_count {
+            return Err(ReferenceCatalogError::MalformedRoot);
+        }
+        Ok(ReferenceCatalogPostingDigestIndex {
+            root: root.clone(),
+            digests,
+        })
+    }
+
+    fn posting_digest_index_constructed(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        construction: &PatriciaIndexConstruction,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        let facts_root = PatriciaIndexRoot::from_digest(root.facts_root);
+        let mut digests = BTreeMap::new();
+        let mut validation_error = None;
+        self.patricia
+            .construction_visit_all(construction, facts_root, |key, value| {
+                let result = (|| {
+                    let page_id = page_id_key(key)?;
+                    let digest = digest_value(value)?;
+                    if digests.insert(page_id, digest).is_some() {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    validation_error = Some(error);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map_err(store_error)?;
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        if digests.len() as u64 != root.source_count {
+            return Err(ReferenceCatalogError::MalformedRoot);
+        }
+        Ok(ReferenceCatalogPostingDigestIndex {
+            root: root.clone(),
+            digests,
+        })
     }
 
     fn reverse_candidates(
@@ -1301,8 +1435,6 @@ pub(crate) struct ReferenceCatalogStateV2 {
     #[cfg(test)]
     full_delta_validations: Cell<usize>,
     #[cfg(test)]
-    final_catalog_validations: Cell<usize>,
-    #[cfg(test)]
     prepare_attribution: Cell<ReferenceCatalogPrepareAttributionStats>,
 }
 
@@ -1318,6 +1450,28 @@ pub(crate) struct AuthenticatedReferenceCatalogRootNodes {
     root: ReferenceCatalogRootV2,
 }
 
+/// Process-local index of the immutable posting objects named by one exact
+/// authenticated reference-catalog root.
+///
+/// Terminal projection construction consumes every source posting. Walking the
+/// Patricia tree once and retaining only `(page id, posting digest)` avoids an
+/// independent root-to-leaf traversal per page without retaining the posting
+/// facts themselves or creating another durable cache.
+pub(crate) struct ReferenceCatalogPostingDigestIndex {
+    root: ReferenceCatalogRootV2,
+    digests: BTreeMap<PageId, ContentDigest>,
+}
+
+impl ReferenceCatalogPostingDigestIndex {
+    pub(crate) fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    fn digest(&self, page_id: PageId) -> Option<ContentDigest> {
+        self.digests.get(&page_id).copied()
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReferenceCatalogConstructionWorkStats {
@@ -1325,7 +1479,6 @@ pub(crate) struct ReferenceCatalogConstructionWorkStats {
     pub(crate) buffer_flushes: usize,
     pub(crate) prepared_candidate_validations: usize,
     pub(crate) full_delta_validations: usize,
-    pub(crate) final_catalog_validations: usize,
     pub(crate) extraction_nanos: u128,
     pub(crate) posting_transition_publication_nanos: u128,
     pub(crate) facts_coverage_patricia_nanos: u128,
@@ -1381,7 +1534,6 @@ impl ReferenceCatalogStateV2 {
             #[cfg(test)]
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
-            final_catalog_validations: Cell::new(0),
             #[cfg(test)]
             prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
@@ -1402,13 +1554,27 @@ impl ReferenceCatalogStateV2 {
         &mut self,
         store: Arc<ReferenceCatalogStore>,
     ) -> Result<(), ReferenceCatalogError> {
+        self.attach_construction_store_with_budget(
+            store,
+            tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+        )
+    }
+
+    pub(crate) fn attach_construction_store_with_budget(
+        &mut self,
+        store: Arc<ReferenceCatalogStore>,
+        resident_budget_bytes: usize,
+    ) -> Result<(), ReferenceCatalogError> {
         if self.root.source_count != 0 {
             return Err(ReferenceCatalogError::AuthorityMismatch);
         }
         self.backend = ReferenceCatalogBackend::Construction {
             store,
             construction_id: uuid::Uuid::new_v4(),
-            patricia: RefCell::new(PatriciaIndexConstruction::default()),
+            patricia: RefCell::new(
+                PatriciaIndexConstruction::with_resident_budget(resident_budget_bytes)
+                    .map_err(|_| ReferenceCatalogError::Allocation)?,
+            ),
         };
         Ok(())
     }
@@ -1432,7 +1598,6 @@ impl ReferenceCatalogStateV2 {
             #[cfg(test)]
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
-            final_catalog_validations: Cell::new(0),
             #[cfg(test)]
             prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
@@ -1571,6 +1736,71 @@ impl ReferenceCatalogStateV2 {
         }
     }
 
+    /// Traverse the facts tree once for a caller that will consume the complete
+    /// catalog. The returned value retains only immutable posting digests; each
+    /// posting object is still read and digest-checked when consumed.
+    pub(crate) fn posting_digest_index_at_root(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        root.validate()?;
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store) => store.posting_digest_index(root),
+            ReferenceCatalogBackend::Construction {
+                store, patricia, ..
+            } => store.posting_digest_index_constructed(root, &patricia.borrow()),
+            ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
+                let digests = memory
+                    .postings
+                    .iter()
+                    .map(|(page_id, posting)| posting.digest().map(|digest| (*page_id, digest)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                if digests.len() as u64 != root.source_count {
+                    return Err(ReferenceCatalogError::MalformedRoot);
+                }
+                Ok(ReferenceCatalogPostingDigestIndex {
+                    root: root.clone(),
+                    digests,
+                })
+            }
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
+    pub(crate) fn posting_from_digest_index(
+        &self,
+        index: &ReferenceCatalogPostingDigestIndex,
+        page_id: PageId,
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
+        let Some(digest) = index.digest(page_id) else {
+            return Ok(None);
+        };
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::Construction { store, .. } => {
+                store.posting_from_digest(page_id, digest).map(Some)
+            }
+            ReferenceCatalogBackend::Memory(memory) if index.root == self.root => memory
+                .postings
+                .get(&page_id)
+                .cloned()
+                .ok_or(ReferenceCatalogError::MalformedRoot)
+                .and_then(|posting| {
+                    if posting.digest()? != digest {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(Some(posting))
+                }),
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
     pub(crate) fn reverse_candidates_at_root(
         &self,
         root: &ReferenceCatalogRootV2,
@@ -1657,7 +1887,6 @@ impl ReferenceCatalogStateV2 {
             buffer_flushes: patricia.flushes,
             prepared_candidate_validations: self.prepared_candidate_validations.get(),
             full_delta_validations: self.full_delta_validations.get(),
-            final_catalog_validations: self.final_catalog_validations.get(),
             extraction_nanos: attribution.extraction_nanos,
             posting_transition_publication_nanos: attribution.posting_transition_publication_nanos,
             facts_coverage_patricia_nanos: attribution.facts_coverage_patricia_nanos,
@@ -1720,6 +1949,54 @@ impl ReferenceCatalogStateV2 {
                 Err(ReferenceCatalogError::RecoveryRequired)
             }
         }
+    }
+
+    /// Advance only the authorities bound into the catalog root. Bootstrap V2
+    /// uses this for non-terminal physical parts: those parts change page-name
+    /// and UUID-claim authority, but the derived reference trees are built once
+    /// from the terminal graph state.
+    pub(crate) fn prepare_authority_binding(
+        &self,
+        page_names: &PageNameOwnershipRootV1,
+        external_uuid_claim_authority_root: ContentDigest,
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
+        self.ensure_ready()?;
+        let post_root = ReferenceCatalogRootV2::new(
+            &self.policy,
+            self.root.source_count,
+            self.root.source_coverage_root,
+            self.root.facts_root,
+            self.root.reverse_candidates_root,
+            page_names,
+            external_uuid_claim_authority_root,
+        )?;
+        let delta = ReferenceCatalogDeltaV2 {
+            schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+            prior_root: self.root.clone(),
+            post_root,
+            transition: ReferenceTransitionBindingV2::Empty,
+        };
+        delta.encode()?;
+        let construction = match &self.backend {
+            ReferenceCatalogBackend::Construction {
+                store,
+                construction_id,
+                ..
+            } => Some(ReferenceCatalogConstructionEvidenceV2 {
+                construction_id: *construction_id,
+                store: Arc::clone(store),
+                structurally_validated: Cell::new(false),
+            }),
+            ReferenceCatalogBackend::Memory(_) | ReferenceCatalogBackend::Store(_) => None,
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                return Err(ReferenceCatalogError::RecoveryRequired);
+            }
+        };
+        Ok(ReferenceCatalogCandidateV2 {
+            delta,
+            memory: None,
+            construction,
+        })
     }
 
     fn prepare_memory(
@@ -2065,12 +2342,12 @@ impl ReferenceCatalogStateV2 {
         let facts_coverage_reads_before = store.stats().reads;
         facts_root = store
             .patricia
-            .construction_insert_many(construction, facts_root, &fact_updates)
+            .construction_insert_many_bulk(construction, facts_root, &fact_updates)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         coverage_root = store
             .patricia
-            .construction_insert_many(construction, coverage_root, &coverage_updates)
+            .construction_insert_many_bulk(construction, coverage_root, &coverage_updates)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         facts_root = store
@@ -2241,13 +2518,6 @@ impl ReferenceCatalogStateV2 {
             | ReferenceCatalogBackend::Store(_)
             | ReferenceCatalogBackend::RecoveryRequired(_) => return Ok(None),
         };
-        // This is the sole construction-time full-catalog proof. It runs only
-        // after every staged node and posting is immutable-published, before
-        // the detached candidate can leave its authoring session.
-        store.validate_catalog_root(&self.root)?;
-        #[cfg(test)]
-        self.final_catalog_validations
-            .set(self.final_catalog_validations.get().saturating_add(1));
         self.backend = ReferenceCatalogBackend::Store(store);
         Ok(Some(completion))
     }
@@ -2744,6 +3014,32 @@ mod tests {
             ObjectStore::open(&path, WorkspaceId::from_uuid(Uuid::from_u128(0x100))).unwrap();
         let catalog = Arc::new(objects.open_reference_catalog().unwrap());
         (path, catalog)
+    }
+
+    #[test]
+    fn empty_posting_is_authenticated_without_an_immutable_file() {
+        let (_path, store) = store("inline-empty-posting");
+        let posting = extract_source_posting(
+            &ReferenceCatalogPolicyV1::default(),
+            source(page(1), "plain text without references"),
+        )
+        .unwrap();
+        assert!(posting.facts.is_empty());
+
+        let reference = store.publish_posting(&posting).unwrap();
+        assert_eq!(reference.encoded_byte_length, 0);
+        assert_eq!(reference.fact_count, 0);
+        assert!(!store
+            .postings
+            .try_exists(&posting_filename(reference.digest))
+            .unwrap());
+        assert_eq!(store.read_posting(&reference).unwrap(), posting);
+        assert_eq!(
+            store
+                .posting_reference(reference.source_page_id, reference.digest)
+                .unwrap(),
+            reference
+        );
     }
 
     fn dense_source(

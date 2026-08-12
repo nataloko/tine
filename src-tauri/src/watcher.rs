@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
-use tine_core::sync_runtime::{SyncRuntimeHandle, SyncRuntimeTick, SyncWatcherObservation};
+use tine_core::sync_runtime::{
+    SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncWatcherObservation,
+};
 use tine_core::{model::GraphTextExactFeedPathClass, model::PageKind, Graph};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -16,6 +18,48 @@ struct GraphChange {
     removed: bool,
 }
 
+/// Every sparse-runtime watcher event is scoped to the graph binding that
+/// produced it. A window can be rebound to another graph while a watcher cycle
+/// is in flight; the frontend must be able to drop that older cycle instead of
+/// showing its status or failure for the new graph.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2RuntimeStatusEvent {
+    binding_generation: u64,
+    runtime: crate::sync_runtime::SparseV2RuntimeStatusDto,
+    application_page_admission: crate::state::ApplicationPageAdmission,
+}
+
+/// Build the event from the one actor status observation that the watcher has
+/// already obtained. A second `handle.status()` call could observe a different
+/// lifecycle and briefly retain stale frontend write authority.
+fn sparse_v2_runtime_status_event(
+    binding_generation: u64,
+    status: SyncRuntimeStatusSnapshot,
+) -> SparseV2RuntimeStatusEvent {
+    let application_page_admission =
+        crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+            binding_generation,
+            &status.lifecycle,
+        );
+    SparseV2RuntimeStatusEvent {
+        binding_generation,
+        runtime: crate::sync_runtime::runtime_status(status),
+        application_page_admission,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2TickEvent {
+    binding_generation: u64,
+    tick: crate::sync_runtime::SparseV2TickDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2ErrorEvent {
+    binding_generation: u64,
+    message: String,
+}
+
 #[derive(Default)]
 struct Pending {
     paths: HashSet<PathBuf>,
@@ -24,33 +68,17 @@ struct Pending {
     notify_error: bool,
 }
 
-/// Resolve the filesystem watcher inputs for an existing legacy binding.
-/// Sparse-v2 bindings must later use their actor; they never fall back to a
-/// second legacy `Graph` or direct file watcher here.
-fn legacy_watch_paths(
-    slot: &GraphSlot,
-) -> Result<(LegacyGraphLease, PathBuf, [PathBuf; 2], PathBuf), String> {
+/// Resolve the filesystem watcher inputs for an existing Direct Files binding.
+/// Sparse-v2 bindings use their actor; they never fall back to a second Direct
+/// Files `Graph` or watcher here.
+fn direct_watch_paths(slot: &GraphSlot) -> Result<(LegacyGraphLease, PathBuf), String> {
     let graph = slot.legacy_graph_cloned()?;
     let root = slot.root_key.clone();
-    let dirs = [graph.journals_path(), graph.pages_path()];
-    let sync_dir = graph.managed_sync_store_path();
-    Ok((graph, root, dirs, sync_dir))
+    Ok((graph, root))
 }
 
 impl Pending {
     fn add_event(&mut self, event: notify::Event) {
-        // Managed-sync chunks and receipts use their own reconcile lane. A pull
-        // scans the immutable store, so even a backend rescan notification only
-        // needs to retain ownership of the concrete sync path.
-        let managed_sync_event = !event.paths.is_empty()
-            && event.paths.iter().all(|path| {
-                path.components()
-                    .any(|component| component.as_os_str() == ".tine-sync")
-            });
-        if managed_sync_event {
-            self.paths.extend(event.paths);
-            return;
-        }
         if event.need_rescan() {
             if event.paths.is_empty() {
                 self.need_full = true;
@@ -84,6 +112,34 @@ const RETRY_BACKOFF: [Duration; 6] = [
     Duration::from_secs(4),
     Duration::from_secs(8),
 ];
+
+/// How long the inotify branch may block while a graph root it WANTS to watch is
+/// still unwatched. Matches the poll branch's ceiling: this is a recovery cadence
+/// for a root the kernel refused, not a polling strategy.
+const UNWATCHED_ROOT_RETRY: Duration = Duration::from_secs(3);
+
+/// How long to wait for the next cycle in the inotify branch.
+///
+/// A root whose `watch()` failed is retried on the next cycle — it is never
+/// inserted into `watched` — but a cycle only begins when something wakes this
+/// thread, and in the inotify branch that means an event from a root that IS
+/// watched. With a single graph that is self-correcting: the failure leaves
+/// `watched` empty, which takes the bounded poll branch instead. With two graphs
+/// open it is not. inotify limits are per-user (`fs.inotify.max_user_watches`),
+/// so opening a second large graph is exactly how one root fails while the other
+/// is healthy — and then the failing graph stays invisible to external changes
+/// until the healthy one happens to change, which on a quiet graph is never.
+///
+/// So bound the wait whenever a desired root is unwatched. (Direct Files
+/// data-safety audit 2026-08-09, finding 16, in its reachable form: the blindness
+/// is not permanent and there IS a poll fallback, but only when EVERY root fails.)
+fn inotify_cycle_wait(retry_wait: Option<Duration>, unwatched_root: bool) -> Option<Duration> {
+    match (retry_wait, unwatched_root) {
+        (Some(wait), true) => Some(wait.min(UNWATCHED_ROOT_RETRY)),
+        (None, true) => Some(UNWATCHED_ROOT_RETRY),
+        (wait, false) => wait,
+    }
+}
 
 #[derive(Default)]
 struct RetrySchedule {
@@ -729,7 +785,7 @@ fn observe_legacy_graph_text_callback(app: &tauri::AppHandle, event: Option<&not
         Err(_) => return,
     };
     for (_, slot) in entries {
-        let Ok((graph, root, _, _)) = legacy_watch_paths(&slot) else {
+        let Ok((graph, root)) = direct_watch_paths(&slot) else {
             continue;
         };
         observe_legacy_graph_text_event(&graph, &root, event);
@@ -861,17 +917,16 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         struct WatchedGraph {
             legacy_graph: LegacyGraphLease,
             root: PathBuf,
-            dirs: [PathBuf; 2],
-            sync_dir: PathBuf,
             snap: HashMap<PathBuf, FileStamp>,
             baseline: bool,
-            last_sync_error: Option<String>,
+            last_reconcile_error: Option<String>,
             retry: RetrySchedule,
         }
 
         struct WatchedSparse {
             handle: SyncRuntimeHandle,
             root: PathBuf,
+            binding_generation: u64,
             last_error: Option<String>,
             retry: RetrySchedule,
             initial_tick: bool,
@@ -896,7 +951,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if let Some(handle) = slot.sparse_runtime().cloned() {
                     graphs.remove(&label);
                     match sparse_graphs.get_mut(&label) {
-                        Some(current) if current.root == slot.root_key => {
+                        Some(current)
+                            if current.root == slot.root_key
+                                && current.binding_generation == slot.binding_generation =>
+                        {
                             current.handle = handle;
                         }
                         _ => {
@@ -905,6 +963,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 WatchedSparse {
                                     handle,
                                     root: slot.root_key.clone(),
+                                    binding_generation: slot.binding_generation,
                                     last_error: None,
                                     retry: RetrySchedule::default(),
                                     initial_tick: true,
@@ -915,18 +974,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     continue;
                 }
                 sparse_graphs.remove(&label);
-                let Ok((legacy_graph, root, dirs, sync_dir)) = legacy_watch_paths(&slot) else {
+                let Ok((legacy_graph, root)) = direct_watch_paths(&slot) else {
                     // Sparse-v2 owns its actor in the slot. This legacy watcher
                     // must not retain or reopen a Graph for it.
                     graphs.remove(&label);
                     continue;
                 };
                 match graphs.get_mut(&label) {
-                    Some(current)
-                        if current.root == root
-                            && current.dirs == dirs
-                            && current.sync_dir == sync_dir =>
-                    {
+                    Some(current) if current.root == root => {
                         current.legacy_graph = legacy_graph;
                     }
                     _ => {
@@ -935,11 +990,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             WatchedGraph {
                                 legacy_graph,
                                 root,
-                                dirs,
-                                sync_dir,
                                 snap: HashMap::new(),
                                 baseline: false,
-                                last_sync_error: None,
+                                last_reconcile_error: None,
                                 retry: RetrySchedule::default(),
                             },
                         );
@@ -1056,41 +1109,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let owned = pending_for_graph(&paths, &graph.legacy_graph);
                 let full_owned = full_scan_owner_for_graph(&full_paths, &graph.legacy_graph);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
-                let sync_dirty = initial_cycle
-                    || need_full
-                    || paths.iter().any(|path| path.starts_with(&graph.sync_dir));
-                let mut sync_conflicts_dirty = false;
                 let mut cycle_failed = false;
                 let mut attempted = false;
-                if sync_dirty && graph.sync_dir.is_dir() {
-                    attempted = true;
-                    match graph.legacy_graph.pull_managed_sync() {
-                        Ok(pull) => {
-                            graph.last_sync_error = None;
-                            for change in pull.changes {
-                                let _ = app.emit_to(
-                                    label,
-                                    "graph-changed",
-                                    GraphChange {
-                                        name: change.entry.name,
-                                        kind: change.entry.kind,
-                                        created: change.created,
-                                        removed: change.removed,
-                                    },
-                                );
-                            }
-                            sync_conflicts_dirty = pull.conflicts_changed;
-                        }
-                        Err(error) => {
-                            cycle_failed = true;
-                            let message = error.to_string();
-                            if graph.last_sync_error.as_deref() != Some(&message) {
-                                let _ = app.emit_to(label, "managed-sync-error", &message);
-                                graph.last_sync_error = Some(message);
-                            }
-                        }
-                    }
-                }
                 if need_full || !owned.is_empty() {
                     attempted = true;
                     let (changes, conflicts_dirty, _, errors) = reconcile_pending(
@@ -1106,31 +1126,22 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     if !errors.is_empty() {
                         cycle_failed = true;
                         let message = errors.join("; ");
-                        if graph.last_sync_error.as_deref() != Some(&message) {
-                            // NOT `managed-sync-error`. This loop is the legacy
-                            // (Direct Markdown) lane -- a graph with a sparse
-                            // runtime is removed from `graphs` and handled in
-                            // `sparse_graphs`, so managed graphs never reach
-                            // here. Telling a Direct-mode user "Tine-managed
-                            // storage stopped, open Storage & sync to retry
-                            // setup" during a write incident pointed them at a
-                            // feature they are not using. This is a plain
-                            // reconcile failure of the folder watch.
+                        if graph.last_reconcile_error.as_deref() != Some(&message) {
+                            // This is a Direct Files reconcile failure. Sparse-v2
+                            // bindings are handled by their actor lane below.
                             let _ = app.emit_to(label, "graph-watch-error", &message);
-                            graph.last_sync_error = Some(message);
+                            graph.last_reconcile_error = Some(message);
                         }
                     }
-                    if conflicts_dirty || sync_conflicts_dirty {
+                    if conflicts_dirty {
                         let _ = app.emit_to(label, "conflicts-changed", ());
                     }
-                } else if sync_conflicts_dirty {
-                    let _ = app.emit_to(label, "conflicts-changed", ());
                 }
                 if cycle_failed {
                     graph.retry.failed(Instant::now());
                 } else if attempted {
                     graph.retry.succeeded();
-                    graph.last_sync_error = None;
+                    graph.last_reconcile_error = None;
                 }
             }
             for (label, graph) in sparse_graphs.iter_mut() {
@@ -1198,7 +1209,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         ) {
                             let message = format!("{tick:?}");
                             if graph.last_error.as_deref() != Some(&message) {
-                                let _ = app.emit_to(label, "sparse-v2-error", &message);
+                                let _ = app.emit_to(
+                                    label,
+                                    "sparse-v2-error",
+                                    SparseV2ErrorEvent {
+                                        binding_generation: graph.binding_generation,
+                                        message: message.clone(),
+                                    },
+                                );
                                 graph.last_error = Some(message);
                             }
                         } else {
@@ -1207,29 +1225,19 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         let _ = app.emit_to(
                             label,
                             "sparse-v2-tick",
-                            crate::sync_runtime::tick_dto(tick),
+                            SparseV2TickEvent {
+                                binding_generation: graph.binding_generation,
+                                tick: crate::sync_runtime::tick_dto(tick),
+                            },
                         );
                         if changed {
-                            // The oplog committed a batch and projected it onto
-                            // the tree. Any read-only view this binding opened
-                            // for backlinks/search/query is now parsed from
-                            // superseded bytes, so drop its cache before the
-                            // frontend refetches on `sparse-v2-changed`.
-                            if let Some(slot) = crate::state::slot_for_window(
-                                &app.state::<crate::state::AppState>(),
-                                label,
-                            )
-                            .ok()
-                            {
-                                slot.invalidate_derived_read_graph();
-                            }
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
                         if let Ok(status) = graph.handle.status() {
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
-                                crate::sync_runtime::runtime_status(status),
+                                sparse_v2_runtime_status_event(graph.binding_generation, status),
                             );
                         }
                     }
@@ -1237,7 +1245,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         graph.retry.failed(Instant::now());
                         let message = error.to_string();
                         if graph.last_error.as_deref() != Some(&message) {
-                            let _ = app.emit_to(label, "sparse-v2-error", &message);
+                            let _ = app.emit_to(
+                                label,
+                                "sparse-v2-error",
+                                SparseV2ErrorEvent {
+                                    binding_generation: graph.binding_generation,
+                                    message: message.clone(),
+                                },
+                            );
                             graph.last_error = Some(message);
                         }
                     }
@@ -1258,7 +1273,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             .filter_map(|graph| graph.retry.remaining(now)),
                     )
                     .min();
-                let woke_for_event = match retry_wait {
+                let wait_for =
+                    inotify_cycle_wait(retry_wait, desired.difference(&watched).next().is_some());
+                let woke_for_event = match wait_for {
                     Some(wait) => rx.recv_timeout(wait).is_ok(),
                     None => rx.recv().is_ok(),
                 };
@@ -1336,6 +1353,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tine_core::model::{BlockDto, Format, PageDto};
+    use tine_core::sync_runtime::SyncRuntimeLifecycle;
+
+    fn runtime_snapshot(lifecycle: SyncRuntimeLifecycle) -> SyncRuntimeStatusSnapshot {
+        SyncRuntimeStatusSnapshot {
+            lifecycle,
+            recovery: None,
+            watcher: Default::default(),
+            last_tick: None,
+            detail: None,
+            shared_role: None,
+            shared_phase: None,
+            provider_pending: 0,
+            managed_local_pending: 0,
+            managed_local_checkpointed_sequence: 0,
+            managed_local_next_sequence: 0,
+            managed_local_stage: None,
+        }
+    }
+
+    #[test]
+    fn sparse_status_event_derives_admission_from_its_single_status_observation() {
+        for (lifecycle, authority) in [
+            (SyncRuntimeLifecycle::Active, "managed_writable"),
+            (SyncRuntimeLifecycle::StoppedSafe, "managed_unavailable"),
+            (SyncRuntimeLifecycle::StoppedCrashed, "managed_unavailable"),
+            (SyncRuntimeLifecycle::Terminal, "managed_unavailable"),
+        ] {
+            let event = sparse_v2_runtime_status_event(73, runtime_snapshot(lifecycle));
+            let wire = serde_json::to_value(event).unwrap();
+            assert_eq!(wire["binding_generation"], 73);
+            assert_eq!(wire["application_page_admission"]["binding_generation"], 73);
+            assert_eq!(wire["application_page_admission"]["authority"], authority);
+        }
+    }
 
     #[test]
     fn atomic_page_save_temp_events_stay_incremental() {
@@ -1421,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_sync_store_events_use_the_dedicated_incremental_lane() {
+    fn hidden_sync_events_do_not_schedule_direct_files_reconciliation() {
         use notify::event::{CreateKind, EventKind};
 
         let chunk =
@@ -1435,7 +1486,7 @@ mod tests {
 
         assert!(!pending.need_full);
         assert!(pending.full_paths.is_empty());
-        assert_eq!(pending.paths, HashSet::from([chunk]));
+        assert!(pending.paths.is_empty());
     }
 
     #[test]
@@ -1608,6 +1659,43 @@ mod tests {
         assert!(retry.take_due(start + Duration::from_millis(10)));
     }
 
+    // Direct Files data-safety audit 2026-08-09, finding 16, in its reachable
+    // form. The blindness the audit predicted is not permanent and there IS a
+    // fallback — but only when EVERY root fails, which empties `watched` and
+    // takes the bounded poll branch. The reachable case is mixed: with two
+    // graphs open (inotify watch limits are per-user, so a second large graph is
+    // exactly how one root fails while the other is fine), the inotify branch
+    // blocked forever on an event from the HEALTHY root, and the failing graph
+    // stayed invisible until that other graph happened to change.
+    //
+    // Two gaps, stated rather than papered over. These cover the wait POLICY,
+    // not a real kernel `watch()` failure — exhausting fs.inotify.max_user_watches
+    // needs privileges this box does not have — and not the wiring that feeds
+    // `desired.difference(&watched)` into it. They are therefore a specification
+    // of the rule, not fail-before evidence: `inotify_cycle_wait` did not exist
+    // before this change, so there is no earlier build they could have failed
+    // against. Do not read them as a regression guard for the loop itself.
+    #[test]
+    fn an_unwatched_root_bounds_the_wait_so_its_retry_actually_runs() {
+        // Everything watched: block until the kernel says something, as before.
+        assert_eq!(inotify_cycle_wait(None, false), None);
+        // A root we want and do not have: never block indefinitely.
+        assert_eq!(inotify_cycle_wait(None, true), Some(UNWATCHED_ROOT_RETRY));
+    }
+
+    #[test]
+    fn an_unwatched_root_never_delays_a_sooner_scheduled_retry() {
+        let sooner = Duration::from_millis(250);
+        assert_eq!(inotify_cycle_wait(Some(sooner), true), Some(sooner));
+        assert_eq!(inotify_cycle_wait(Some(sooner), false), Some(sooner));
+        let later = UNWATCHED_ROOT_RETRY * 4;
+        assert_eq!(
+            inotify_cycle_wait(Some(later), true),
+            Some(UNWATCHED_ROOT_RETRY)
+        );
+        assert_eq!(inotify_cycle_wait(Some(later), false), Some(later));
+    }
+
     #[test]
     fn pending_paths_are_dispatched_only_to_the_owning_graph() {
         let a = TempGraph::new("owner-a");
@@ -1674,15 +1762,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_watch_paths_keep_the_bound_graph_root_and_existing_reconcile_paths() {
-        let temp = TempGraph::new("legacy-authority");
+    fn direct_watch_paths_keep_the_bound_graph_root() {
+        let temp = TempGraph::new("direct-authority");
         let slot = GraphSlot::new(Graph::open(&temp.root), temp.root.clone());
 
-        let (graph, root, dirs, sync_dir) = legacy_watch_paths(&slot).unwrap();
+        let (graph, root) = direct_watch_paths(&slot).unwrap();
         assert_eq!(graph.root, temp.root);
         assert_eq!(root, temp.root);
-        assert_eq!(dirs, graph_dirs(&graph));
-        assert_eq!(sync_dir, graph.managed_sync_store_path());
     }
 
     fn event(kind: notify::event::EventKind, paths: Vec<PathBuf>) -> notify::Event {
@@ -1695,6 +1781,7 @@ mod tests {
 
     fn new_page(name: &str) -> PageDto {
         PageDto {
+            activation: None,
             name: name.to_owned(),
             kind: PageKind::Page,
             title: name.to_owned(),
@@ -2152,10 +2239,6 @@ mod tests {
             assert!(!observation.uncertain, "{relative}");
             assert!(observation.exact_paths.is_empty(), "{relative}");
         }
-    }
-
-    fn graph_dirs(graph: &Graph) -> [PathBuf; 2] {
-        [graph.journals_path(), graph.pages_path()]
     }
 
     fn warm_cache(graph: &Graph) {

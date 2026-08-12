@@ -52,10 +52,11 @@ import {
   insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
+  replaceTemplateTriggerWithOutline,
   insertOutlineChildren,
   pasteClipboardPayload,
   deleteBlock,
-  moveBlock,
+  moveBlocksRelative,
   moveBlockFeed,
   moveItem,
   selectBlock,
@@ -63,6 +64,7 @@ import {
   extendSelectionTo,
   clearSelection,
   moveSelection,
+  selectedIds,
   isSelected,
   ensureBlockId,
   persistentBlockRef,
@@ -75,10 +77,15 @@ import {
   trackAssetWrite,
   formatForBlock,
   depthOf,
+  managedBulkOutlinePlan,
+  preflightManagedBulkInsertion,
+  consumeManagedBulkInsertionAdmission,
+  reportManagedBulkInsertionRefusal,
   setHeading,
   collapsibleDescendantIds,
   setCollapsedDescendants,
   blockExternalId,
+  takeEditorLease,
   type OutlineScope,
 } from "../store";
 import {
@@ -157,7 +164,7 @@ import {
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, fencedCodeBlock } from "../editor/properties";
 import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
-import { caretOnOpeningFence } from "../editor/fences";
+import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
 import { logbookInfo, type LogbookInfo } from "../logbook";
@@ -229,24 +236,17 @@ const [dragId, setDragId] = createSignal<string | null>(null);
 const [dropInd, setDropInd] = createSignal<{ id: string; before: boolean } | null>(null);
 let dragMoved = false;
 
-function siblingIndex(id: string): number {
-  const n = doc.byId[id];
-  if (!n) return -1;
-  const sibs =
-    n.parent === null
-      ? doc.pages.find((p) => p.name === n.page)?.roots ?? []
-      : doc.byId[n.parent].children;
-  return sibs.indexOf(id);
-}
-
 function beginDrag(id: string, e: MouseEvent) {
   const startX = e.clientX;
   const startY = e.clientY;
+  let capturedIds: string[] | null = null;
   dragMoved = false;
   const onMove = (ev: MouseEvent) => {
     if (!dragMoved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
     if (!dragMoved) {
       dragMoved = true;
+      const selected = selectedIds();
+      capturedIds = selected.length ? [...selected] : [id];
       setDragId(id);
       endEdit("drag-start");
     }
@@ -254,7 +254,7 @@ function beginDrag(id: string, e: MouseEvent) {
       ".ls-block"
     ) as HTMLElement | null;
     const tid = el?.dataset.blockId;
-    if (tid && tid !== id) {
+    if (tid) {
       const main = el!.querySelector(".block-main")!.getBoundingClientRect();
       setDropInd({ id: tid, before: ev.clientY < main.top + main.height / 2 });
     } else {
@@ -266,20 +266,7 @@ function beginDrag(id: string, e: MouseEvent) {
     document.removeEventListener("mouseup", onUp);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
-      const tgt = doc.byId[ind.id];
-      // can't drop onto own descendant
-      let p: string | null = ind.id;
-      let ok = true;
-      while (p !== null) {
-        if (p === id) {
-          ok = false;
-          break;
-        }
-        p = doc.byId[p].parent;
-      }
-      // Pass the target's page so a root-to-root drop across pages (e.g. between
-      // journal days) lands on the page it was dropped onto, not the source page.
-      if (ok) void moveBlock(id, tgt.parent, siblingIndex(ind.id) + (ind.before ? 0 : 1), tgt.page, ind.id);
+      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.before ? "before" : "after");
     }
     setDragId(null);
     setDropInd(null);
@@ -1216,6 +1203,20 @@ export function Editor(props: { id: string }): JSX.Element {
     setRaw(props.id, next, setRawOpts);
   };
 
+  const admitBulkOutlineInsertion = (
+    nodes: readonly OutlineNode[],
+    reusedHost: boolean,
+  ) => {
+    const admission = preflightManagedBulkInsertion(props.id, (limits) => managedBulkOutlinePlan(
+      nodes,
+      depthOf(props.id) + 1,
+      reusedHost ? 1 : 0,
+      limits,
+    ));
+    if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+    return admission;
+  };
+
   // Nest/un-nest an in-block list item by ±2 leading spaces (Tab/Shift-Tab when
   // the caret is on a `+`/`*`/ordered list line).
   const nudgeListItem = (ll: NonNullable<ReturnType<typeof listLineAt>>, delta: number) => {
@@ -2047,16 +2048,21 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     if (item.templateNodes) {
-      // Drop the "/name" trigger text, then insert the template's blocks (with
-      // dynamic vars resolved). If the host block is now empty, replace it.
+      // Expand before any host mutation. An admitted empty trigger is replaced
+      // in one store publication; it never temporarily becomes an extra block.
       const r = applyCompletion(ref.value, t.start, t.end, "");
-      commit(r.raw);
-      closeAc();
       const nodes = item.templateNodes.map((n) => templateToOutline(n, doc.byId[props.id]?.page));
       const wasEmpty =
-        doc.byId[props.id].raw.trim() === "" && doc.byId[props.id].children.length === 0;
-      const lastId = insertOutlineAfter(props.id, nodes);
-      if (wasEmpty) deleteBlock(props.id);
+        r.raw.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
+      const lastId = withUndoUnit("template-insert", [doc.byId[props.id].page], () => {
+        if (wasEmpty) return replaceTemplateTriggerWithOutline(props.id, nodes);
+        commit(r.raw);
+        return insertOutlineAfter(props.id, nodes);
+      });
+      closeAc();
       startEditing(lastId, doc.byId[lastId].raw.length);
       return;
     }
@@ -2436,14 +2442,35 @@ export function Editor(props: { id: string }): JSX.Element {
   // commit at compositionend instead.
   let compositionActive = false;
   let compositionEndValue: string | null = null;
-  const onCompositionStart = () => {
+  let releaseCompositionLease: (() => void) | null = null;
+  const dropCompositionLease = () => {
+    releaseCompositionLease?.();
+    releaseCompositionLease = null;
+  };
+  onCleanup(dropCompositionLease);
+  const beginComposition = () => {
+    if (!compositionActive) {
+      const pageName = doc.byId[props.id]?.page;
+      if (pageName) releaseCompositionLease = takeEditorLease(pageName);
+    }
+    // FORK: the live code-highlight overlay un-hides the textarea text while an
+    // IME composition is uncommitted. Set here, not only in oncompositionstart,
+    // so an IME that omits compositionstart still un-hides.
     setComposing(true);
     compositionActive = true;
     compositionEndValue = null;
     clearTimeout(acTimer);
   };
+  const onCompositionStart = () => beginComposition();
   const onInput = (e: InputEvent) => {
-    if (compositionActive || e.isComposing) return;
+    // Some supported IMEs omit compositionstart but mark their composing input.
+    // Enter the same transaction before returning DOM-local so an awaited page
+    // replacement cannot treat that not-yet-committed text as pre-click state.
+    if (e.isComposing) {
+      if (!compositionActive) beginComposition();
+      return;
+    }
+    if (compositionActive) return;
     // Chromium-family engines can emit one ordinary input after compositionend.
     // Its DOM value has already committed above; suppress only that duplicate,
     // never a subsequent real edit with different text.
@@ -2510,6 +2537,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     autosize();
     refreshAutocompleteAfterInput();
+    dropCompositionLease();
   };
 
   // Move the block up/down among siblings, keeping edit mode + caret (the DOM
@@ -3037,13 +3065,16 @@ export function Editor(props: { id: string }): JSX.Element {
       (!e.shiftKey || (docModeEnterForNewLine && !e.altKey))
     ) {
       const inFence = !isAnnot() && caretInFence(raw, start);
+      // GH #278: a multi-line `$$ … $$` environment behaves like a fence for
+      // Enter. See caretInDisplayMath — a deliberate divergence from OG.
+      const inMath = !isAnnot() && !inFence && caretInDisplayMath(raw, start);
       const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence || inPageProperties) && start === end) {
-        const kind = isCalc() ? "calc" : inFence ? "fence" : "properties";
+      if ((isCalc() || inFence || inMath || inPageProperties) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : "properties";
         const trimmed = multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
@@ -3076,7 +3107,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // — GH #66). caretInFence treats a still-unterminated fence (being typed) as
       // inside too, and returns false when the caret sits on a ``` delimiter line,
       // so Enter on the closing fence still exits the block.
-      if (!isAnnot() && (inFence || caretOnOpeningFence(raw, start))) {
+      if (!isAnnot() && (inFence || inMath || caretOnOpeningFence(raw, start))) {
         softNewlineCmd();
         return;
       }
@@ -3392,6 +3423,9 @@ export function Editor(props: { id: string }): JSX.Element {
     if (htmlNodes) {
       e.preventDefault();
       const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(htmlNodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("structured-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
@@ -3420,6 +3454,9 @@ export function Editor(props: { id: string }): JSX.Element {
       if (!nodes.length) return;
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("outline-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty

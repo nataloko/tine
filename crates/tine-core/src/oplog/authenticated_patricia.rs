@@ -14,6 +14,7 @@ use super::object_store::{
 pub(crate) use tine_storage::{
     PatriciaIndexConstruction, PatriciaIndexConstructionStats, PatriciaIndexReclamationError,
     PatriciaIndexReclamationReport, PatriciaIndexRoot, PatriciaIndexStats,
+    DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES, MAX_PATRICIA_CONSTRUCTION_BULK_RECORDS,
     MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
 
@@ -24,7 +25,6 @@ pub(crate) struct CompletedPatriciaConstruction {
 }
 
 impl CompletedPatriciaConstruction {
-    #[cfg(test)]
     pub(crate) const fn stats(&self) -> PatriciaIndexConstructionStats {
         self.physical.stats()
     }
@@ -154,10 +154,27 @@ impl PatriciaIndexStore {
     pub(crate) fn for_detached_bootstrap_construction(
         &self,
         publisher: DetachedBootstrapImmutablePublisher,
+        resident_budget_bytes: usize,
     ) -> Result<Self, StoreError> {
         let mut detached = self.for_detached_bootstrap(publisher)?;
-        detached.construction = Some(Mutex::new(Some(PatriciaIndexConstruction::default())));
+        detached.construction = Some(Mutex::new(Some(
+            PatriciaIndexConstruction::with_resident_budget(resident_budget_bytes)
+                .map_err(map_storage_error)?,
+        )));
         Ok(detached)
+    }
+
+    pub(crate) fn detached_construction_bulk_record_limit(
+        &self,
+    ) -> Result<Option<usize>, StoreError> {
+        let Some(construction) = self.construction_guard()? else {
+            return Ok(None);
+        };
+        construction
+            .as_ref()
+            .map(PatriciaIndexConstruction::bulk_record_limit)
+            .map(Some)
+            .ok_or(StoreError::MalformedLogseqClaimIndex)
     }
 
     fn construction_guard(
@@ -361,7 +378,7 @@ impl PatriciaIndexStore {
                 construction.set_live_roots([root]);
                 let next = self
                     .storage
-                    .construction_insert_many(construction, root, records)
+                    .construction_insert_many_bulk(construction, root, records)
                     .map_err(map_storage_error)?;
                 construction.set_live_roots([next]);
                 construction.checkpoint([next]);
@@ -390,6 +407,15 @@ impl PatriciaIndexStore {
             .map_err(map_storage_error)
     }
 
+    pub(crate) fn derive_complete_root(
+        &self,
+        records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<PatriciaIndexRoot, StoreError> {
+        self.storage
+            .derive_complete_root(records)
+            .map_err(map_storage_error)
+    }
+
     pub(crate) fn construction_lookup(
         &self,
         construction: &PatriciaIndexConstruction,
@@ -398,6 +424,17 @@ impl PatriciaIndexStore {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         self.storage
             .construction_lookup(construction, root, key)
+            .map_err(map_storage_error)
+    }
+
+    pub(crate) fn construction_visit_all(
+        &self,
+        construction: &PatriciaIndexConstruction,
+        root: PatriciaIndexRoot,
+        visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), StoreError> {
+        self.storage
+            .construction_visit_all(construction, root, visit)
             .map_err(map_storage_error)
     }
 
@@ -488,9 +525,6 @@ impl PatriciaIndexStore {
         let physical = self
             .storage
             .finish_construction(&mut pending)
-            .map_err(map_storage_error)?;
-        self.storage
-            .validate_root(root)
             .map_err(map_storage_error)?;
         Ok(Some(CompletedPatriciaConstruction { physical }))
     }
