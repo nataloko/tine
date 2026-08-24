@@ -75,8 +75,8 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `highlightFencedForOverlay`, the extras toggle, and the `.code-editing` /
   `.code-hl-overlay` CSS. The fork's `.code-block code` wrap override was also
   reverted to upstream's `white-space: pre`, since it existed only to match the
-  fork's wrapping editor. `feat/codeblock-editing` is now dead and can be
-  deleted.
+  fork's wrapping editor. `feat/codeblock-editing` was deleted at that sync
+  (tip was `fc0a73c0`; its commits remain ancestors of `mine`).
 
 ## Build and verification
 
