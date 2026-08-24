@@ -34,20 +34,35 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, and
   `src/sheet/config.ts`.
 - Bullet threading: `src/bulletThreading.ts` and `src/components/Block.tsx`.
-- Live code-highlight overlay and language picker: `src/editor/properties.ts`
-  (`fencedCodeBlock` and `isOpeningFenceLine`).
+- Live code-highlight overlay and language picker. Fork-only symbols:
+  `fencedCodeBlock` / `CodeFence` (`src/editor/properties.ts`),
+  `highlightFencedForOverlay` (`src/render/body.tsx`), the whole of
+  `src/codeHighlightSettings.ts`, and `src/render/codeOverlay.test.tsx`. It also
+  wires through `src/components/Block.tsx` (the `codeEdit` memo), `src/App.tsx`,
+  `src/components/Settings.tsx`, and `src/styles/app.css`. `loadHljs`
+  (`src/render/body.tsx`) and `codeLanguageItems` (`src/editor/autocomplete.ts`)
+  exist upstream too — use upstream's, don't re-add.
 - Git integration: `src-tauri/src/git.rs` and Settings.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
-- Notification-only updater: `src/update.ts` and `src/update.test.ts`. The
-  divergence is one line — `updateMode()` returns `"manual"` on every desktop
-  platform, where upstream returns `"self"` on Windows/Linux — so the Download
-  action opens the releases page and upstream's `check()` /
-  `downloadAndInstall()` block is never reached. Keep that block unedited so
-  upstream's fixes to it keep merging cleanly; the fork test asserts the
-  updater is never called, which conflicts whenever upstream edits its own
-  GH #241 test. Both edits carry `FORK:` comments. Note `REPO` deliberately
-  points at `martinkoutecky/tine`: the toast announces *upstream* releases,
-  which is the signal to run this sync.
+- Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
+  `src/components/AboutTab.tsx`. One behavior drives all of it — `updateMode()`
+  returns `"manual"` on every desktop platform, where upstream returns `"self"`
+  on Windows/Linux — so upstream's `check()` / `downloadAndInstall()` block is
+  never reached and the toast action opens the releases page instead. Keep that
+  block unedited so upstream's fixes to it keep merging cleanly. Three edits
+  follow from it, each carrying a `FORK:` comment:
+  - `offerUpdate()` labels its action `"Open releases"`; upstream labels it
+    `"Install update"`, which would be a lie here.
+  - The About tab reports "available upstream … Merge it into your fork."
+  - `update.test.ts` asserts the updater is never called and retargets both
+    action-label assertions. It conflicts whenever upstream edits its own
+    GH #241 test.
+
+  Upstream's doc comments in `update.ts` still name the old `"Download"` label
+  and the `"Install update"` action; they are deliberately left unedited, since
+  correcting them buys nothing and costs merge cleanliness. Note `REPO`
+  deliberately points at `martinkoutecky/tine`: the toast announces *upstream*
+  releases, which is the signal to run this sync.
 - Fork ADRs: `docs/adr/mine/` (its own numbering and README), not the upstream
   `docs/adr/` sequence.
 

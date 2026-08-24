@@ -21,15 +21,19 @@ when there's something to decide.
   fork ADR on an upstream-range number, move it to `mine/` and fix its cross-refs — never renumber
   into upstream's range.)
 - Releases: a **`mine-v*`** tag triggers `.github/workflows/personal-build.yml` (AppImage + Windows).
-- Fork feature surfaces (used by the overlap scan). **Shared** files exist upstream and carry
-  fork edits on top — these are the ones that can interact silently:
-  `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, `src/sheet/config.ts`,
-  `src/components/Block.tsx`, `src/editor/properties.ts`, `src/render/body.tsx`,
-  `src/components/Settings.tsx`, `src/update.ts`, `src/update.test.ts`, `src/styles/app.css`.
-  **Fork-only** files upstream has never seen, so they can never conflict:
-  `src/editor/queryFilter.ts`, `src/bulletThreading.ts`, `src/codeHighlightSettings.ts`,
-  `src-tauri/src/git.rs`. (Re-derive this split with
-  `git cat-file -e "$TAG:<path>"` when a surface is added or upstream absorbs one.)
+- Fork feature surfaces (used by the overlap scan). **Never hand-maintain this list** — it
+  went stale twice and both times a fork surface (`src/update.ts` in v0.6.91,
+  `src/components/AboutTab.tsx` / `src/mock.ts` / `src/persistence.ts` in v0.6.94) was missing
+  from it. Step 2 derives it. Two categories:
+  - **Shared** — exists upstream AND carries fork edits on top. These are the files that can
+    interact silently, so every one upstream touched must be read. Currently ~20 files, from
+    the obvious (`Block.tsx`, `Settings.tsx`, `update.ts`, `app.css`) to easily-forgotten ones
+    (`AboutTab.tsx`, `mock.ts`, `persistence.ts`, `backend.ts`, `ui.ts`, `App.tsx`,
+    `src-tauri/src/lib.rs`, `tauri.conf.json`).
+  - **Fork-only** — upstream has never seen these, so they can never conflict:
+    `src/editor/queryFilter.ts`(+test), `src/bulletThreading.ts`, `src/codeHighlightSettings.ts`,
+    `src/git.ts`(+test), `src/render/codeOverlay.test.tsx`, `src-tauri/src/git.rs`,
+    `src-tauri/nsis/installer.nsi`.
 
 ## Policy
 **Auto-proceed when clean; stop only when there's something to decide.** "Clean" = the merge
@@ -62,10 +66,11 @@ git merge-tree --write-tree --name-only mine "$TAG"
 comm -12 <(git diff --name-only "$BASE" mine | sort) <(git diff --name-only "$BASE" "$TAG" | sort)
 
 # Fork SHARED surfaces upstream touched this release (the possible *interaction* points).
+# DERIVED, never hand-listed: every file the fork edits that also exists upstream. `$BASE` is
+# the last upstream state `mine` was synced to, so `$BASE..mine` is exactly the fork's own work.
 # NOT a subset of the line above — it catches surfaces `comm` misses, so run both:
-SHARED="src/components/Macro.tsx src/components/QueryBuilder.tsx src/sheet/config.ts
-src/components/Block.tsx src/editor/properties.ts src/render/body.tsx
-src/components/Settings.tsx src/update.ts src/update.test.ts src/styles/app.css"
+SHARED=$(git diff --name-only "$BASE" mine -- src/ src-tauri/ \
+  | while read -r f; do git cat-file -e "$TAG:$f" 2>/dev/null && echo "$f"; done)
 git diff --stat "$BASE" "$TAG" -- $SHARED
 
 # Did upstream reimplement a fork feature? Any hit here needs reading in full:
