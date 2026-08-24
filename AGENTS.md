@@ -93,9 +93,24 @@ Run these gates before shipping:
 npx tsc --noEmit
 npm test
 npm run build
-nix-shell -p cargo rustc gcc pkg-config --run 'cargo test -p tine-core'
+# NOT `cargo test -p tine-core` — see the note below. This is upstream's release gate:
+PATH="<dir with cargo-nextest 0.9.143>:$PATH" nix-shell -p cargo rustc gcc pkg-config \
+  --run 'node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection'
 nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'
 ```
+
+**Never run bare `cargo test -p tine-core`.** The bare package still contains the
+pre-0.7 adversarial actor oracle: it is deterministically red and several of its
+scenarios never terminate, so the run hangs and prints no summary. Those reds are
+not a regression — they are named individually in
+`PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+`scripts/tine-core-nextest-contract.mjs`, and neither upstream CI nor their
+release ever runs them. Cross-check any failure against that list before calling
+it broken. The curated selection above is also stricter: one process per test, a
+5-minute per-test timeout, no retries. It needs cargo-nextest **exactly 0.9.143**
+(nixpkgs has 0.9.140, and the prebuilt binary needs `patchelf` on NixOS — see the
+`sync-upstream` skill for the one-time fix). At v0.6.95 it reports
+`1945 tests run: 1945 passed, 133 skipped`.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.

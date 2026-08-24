@@ -110,17 +110,34 @@ npm install                                  # if package.json changed
 node scripts/check-wasm-pin.mjs
 npx tsc --noEmit
 npm test
-nix-shell -p cargo rustc gcc pkg-config --run 'cargo test -p tine-core'
+# NOT `cargo test -p tine-core` — see the note below. This is upstream's release gate:
+PATH="<dir with cargo-nextest 0.9.143>:$PATH" nix-shell -p cargo rustc gcc pkg-config \
+  --run 'node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection'
 npm run build
 ```
 Any gate failure → **STOP and report** (this is where upstream changes to shared files like
 `facets.ts`/`store.ts`/`model.rs` surface a semantic break). Sanity-check the merge kept both
 sides: `grep -E '"version"|createUpdaterArtifacts|nataloko/tine' src-tauri/tauri.conf.json`.
 
-> Known non-fork noise: on this NixOS host `cargo test` runs under the nixpkgs toolchain, where the
-> `derived_cache_fuzz` test can diverge (a HashMap-ordering artifact, unrelated to the fork). If the
-> **192 unit tests pass** and only that fuzz test fails, treat it as green and note it; the
-> maintainer's pinned toolchain is the authority.
+> **Never run bare `cargo test -p tine-core`.** Upstream's `ci.yml` says why: the bare package
+> "still contains the pre-0.7 adversarial actor oracle: it is deterministically red, and several of
+> its scenarios never terminate." libtest has no per-test timeout, so it hangs — at v0.6.95 it wedged
+> on four `sync_runtime::tests::shared_join_*` tests, leaving 63 of 1869 tests unrun and printing NO
+> summary. Those reds are NOT a regression: they are named, one by one, in
+> `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in `scripts/tine-core-nextest-contract.mjs`, and neither
+> upstream CI nor their release ever runs them. Cross-check any failure against that list before
+> reporting it as broken. The curated selection is also the *stricter* gate: one process per test,
+> a 5-minute per-test timeout with `on-timeout = "fail"`, and no retries.
+>
+> It needs **cargo-nextest exactly 0.9.143** (pinned in `.config/nextest.toml`; the script refuses
+> any other version). nixpkgs has 0.9.140, and the official prebuilt binary is dynamically linked so
+> NixOS cannot exec it. Fix once with patchelf, then put that binary first on `PATH`:
+> ```bash
+> curl -sSL https://get.nexte.st/0.9.143/linux | tar xz -C ~/          # gives ~/cargo-nextest
+> nix-shell -p patchelf glibc gcc --run \
+>   'patchelf --set-interpreter $(cat $NIX_CC/nix-support/dynamic-linker) ~/cargo-nextest'
+> ```
+> Expected result at v0.6.95: `1945 tests run: 1945 passed, 133 skipped`.
 >
 > Known upstream slip: a patch release sometimes bumps `version` in `tauri.conf.json` but forgets the
 > Android `bundle.android.versionCode`, so `src/version-code.test.ts` fails (versionCode must equal
