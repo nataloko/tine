@@ -6,6 +6,8 @@
 //! archive, accepted-history, tail/SQLite, projection-receipt, authorship, and
 //! provider derivatives of that exact record.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use tine_storage::LocalJournalFrame;
 use uuid::Uuid;
@@ -17,8 +19,8 @@ use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBounda
 use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
-    DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManifestObjectRef,
-    ManifestProjectionTarget, ObjectStore, ProjectionEndpointBinding, ProjectionReceiptStore,
+    DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
+    ManifestObjectRef, ObjectStore, PageId, ProjectionEndpointBinding, ProjectionReceiptStore,
     ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
     TailOverlay, WorkspaceId,
 };
@@ -26,6 +28,74 @@ use crate::oplog::{
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const ENGINE_STAGE_WORK_PER_RESUME: usize = 8;
 const SQLITE_BATCHES_PER_RESUME: usize = 1;
+
+/// Exact point answer derived from the already decoded pending local journal.
+/// The index is rebuildable acceleration state; the journal and hot-prefix
+/// admission remain the authority checked by the drain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedLocalSuccessorObservation {
+    pub(crate) latest_sequence: Option<u64>,
+    pub(crate) current_matches_target: bool,
+}
+
+pub(crate) trait ManagedLocalSuccessorIndex {
+    fn observe_successor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        after_sequence: u64,
+        current: &[u8],
+    ) -> ManagedLocalSuccessorObservation;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ManagedLocalDrainStageTimings {
+    pub(crate) authenticate: std::time::Duration,
+    pub(crate) archive_publication: std::time::Duration,
+    pub(crate) engine_acceptance: std::time::Duration,
+    pub(crate) tail_and_sqlite: std::time::Duration,
+    pub(crate) projection_adoption: std::time::Duration,
+    pub(crate) authorship_receipt: std::time::Duration,
+    pub(crate) provider_publication: std::time::Duration,
+    pub(crate) checkpoint: std::time::Duration,
+    pub(crate) total: std::time::Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_DRAIN_STAGE_TIMINGS: std::cell::Cell<ManagedLocalDrainStageTimings> =
+        const { std::cell::Cell::new(ManagedLocalDrainStageTimings {
+            authenticate: std::time::Duration::ZERO,
+            archive_publication: std::time::Duration::ZERO,
+            engine_acceptance: std::time::Duration::ZERO,
+            tail_and_sqlite: std::time::Duration::ZERO,
+            projection_adoption: std::time::Duration::ZERO,
+            authorship_receipt: std::time::Duration::ZERO,
+            provider_publication: std::time::Duration::ZERO,
+            checkpoint: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
+        }) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_managed_local_drain_stage_timings() -> ManagedLocalDrainStageTimings {
+    LAST_DRAIN_STAGE_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn reset_managed_local_drain_stage_timings() {
+    LAST_DRAIN_STAGE_TIMINGS.set(ManagedLocalDrainStageTimings::default());
+}
+
+#[cfg(test)]
+fn note_managed_local_drain_stage(update: impl FnOnce(&mut ManagedLocalDrainStageTimings)) {
+    LAST_DRAIN_STAGE_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
 
 #[cfg(test)]
 thread_local! {
@@ -384,10 +454,11 @@ fn publication_conflict(error: &StoreError) -> bool {
 
 fn exact_work(
     record: &ManagedLocalRecord,
+    projection: &super::ManagedLocalProjection,
     endpoint: ProjectionEndpointBinding,
 ) -> Result<ProjectionWork, String> {
     let batch = record.prepared_batch();
-    let intent = record.projection().intent();
+    let intent = projection.intent();
     let descriptor = batch
         .manifest()
         .required_objects()
@@ -489,7 +560,7 @@ pub(crate) fn resume_clean_managed_local_journal_drain(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
@@ -502,7 +573,7 @@ pub(crate) fn resume_clean_managed_local_journal_drain(
         database,
         ManagedLocalSqliteMode::Direct,
         frame,
-        superseding_projection,
+        superseding_projections,
         checkpoint,
         continuation,
         publisher,
@@ -523,18 +594,24 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     database: &mut SqliteFrontier,
     sqlite_mode: ManagedLocalSqliteMode<'_>,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
 ) -> ManagedLocalDrainOutcome {
+    #[cfg(test)]
+    reset_managed_local_drain_stage_timings();
+    #[cfg(test)]
+    let drain_started = std::time::Instant::now();
+    #[cfg(test)]
+    let mut stage_started = std::time::Instant::now();
     let record = match decode_managed_local_record(frame) {
         Ok(record) => record,
         Err(error) => return conflict(ManagedLocalDrainStage::Authenticate, error.to_string()),
     };
     let mut work_done = ManagedLocalDrainWork {
         records: 1,
-        graph_target_point_reads: 1,
+        graph_target_point_reads: record.projections().len(),
         archive_objects: record.prepared_batch().objects().len(),
         ..ManagedLocalDrainWork::default()
     };
@@ -593,7 +670,10 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         }
     };
     if endpoint.device_id().as_uuid() != frame.device_id()
-        || endpoint.endpoint_id() != record.projection().intent().source_endpoint_id()
+        || record
+            .projections()
+            .iter()
+            .any(|projection| endpoint.endpoint_id() != projection.intent().source_endpoint_id())
         || receipts.workspace_id() != manifest.workspace_id()
         || receipts.endpoint_binding() != Some(endpoint)
         || !matches!(
@@ -606,71 +686,60 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             "journal projection authority differs from the enrolled graph/receipt endpoint",
         );
     }
-    let intent = record.projection().intent();
-    let exact_target = match intent.target() {
-        ManifestProjectionTarget::Present { bytes, .. } => bytes.as_slice(),
-        ManifestProjectionTarget::Absent => {
-            return conflict(
-                ManagedLocalDrainStage::Authenticate,
-                "managed-local drain does not accept deletion targets",
-            )
-        }
-    };
-    let projection_superseded = match graph.read_projection_input(intent.path()) {
-        Ok(Some(current)) if current == exact_target => false,
-        Ok(Some(current)) => {
-            let Some(successor_frame) = superseding_projection else {
+    let mut projection_superseded = BTreeMap::new();
+    for projection in record.projections() {
+        let intent = projection.intent();
+        let exact_target = intent.target().bytes();
+        let superseded = match graph.read_projection_input(intent.path()) {
+            Ok(Some(current)) => {
+                let current_matches_target = exact_target.is_some_and(|target| current == target);
+                let current_matches_base = projection
+                    .precondition_base()
+                    .is_some_and(|base| current == base.bytes());
+                let successor = superseding_projections
+                    .map(|index| {
+                        index.observe_successor(
+                            intent.path(),
+                            intent.page_id(),
+                            frame.sequence(),
+                            &current,
+                        )
+                    })
+                    .unwrap_or_default();
+                if successor.latest_sequence.is_some_and(|sequence| {
+                    sequence >= engine.managed_local_prefix_state().next_sequence
+                }) {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        "superseding journal index extends beyond the committed local prefix",
+                    );
+                }
+                if successor.latest_sequence.is_some()
+                    && (successor.current_matches_target
+                        || current_matches_target
+                        || current_matches_base)
+                {
+                    true
+                } else if current_matches_target || current_matches_base {
+                    false
+                } else {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        "graph target is neither the journal base, target, nor an authoritative successor",
+                    );
+                }
+            }
+            Ok(None) if exact_target.is_none() || projection.precondition_base().is_none() => false,
+            Ok(None) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
                     "graph target is not the exact journal-authorized bytes",
-                );
-            };
-            let successor = match decode_managed_local_record(successor_frame) {
-                Ok(successor) => successor,
-                Err(error) => {
-                    return conflict(
-                        ManagedLocalDrainStage::Authenticate,
-                        format!("superseding journal frame is invalid: {error}"),
-                    )
-                }
-            };
-            let successor_manifest = successor.prepared_batch().manifest();
-            let successor_intent = successor.projection().intent();
-            let successor_target = match successor_intent.target().bytes() {
-                Some(bytes) => bytes,
-                None => {
-                    return conflict(
-                        ManagedLocalDrainStage::Authenticate,
-                        "superseding journal frame is not a present-page projection",
-                    )
-                }
-            };
-            let successor_is_authoritative = successor_frame.device_id() == frame.device_id()
-                && successor_frame.sequence() > frame.sequence()
-                && successor.sequence() == successor_frame.sequence()
-                && engine.managed_local_prefix_state().next_sequence > successor_frame.sequence()
-                && successor_manifest.workspace_id() == manifest.workspace_id()
-                && successor_manifest.lineage_digest() == manifest.lineage_digest()
-                && successor_manifest.author_device_id() == manifest.author_device_id()
-                && successor_intent.path() == intent.path()
-                && successor_intent.page_id() == intent.page_id()
-                && current == successor_target;
-            if !successor_is_authoritative {
-                return conflict(
-                    ManagedLocalDrainStage::Authenticate,
-                    "graph target is not the exact current journal-authorized successor",
-                );
+                )
             }
-            true
-        }
-        Ok(None) => {
-            return conflict(
-                ManagedLocalDrainStage::Authenticate,
-                "graph target is not the exact journal-authorized bytes",
-            )
-        }
-        Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
-    };
+            Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
+        };
+        projection_superseded.insert(intent.path().as_str().to_owned(), superseded);
+    }
 
     let archive = match engine
         .archive_store()
@@ -683,6 +752,11 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Ok(archive) => archive,
         Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error),
     };
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| timings.authenticate = stage_started.elapsed());
+        stage_started = std::time::Instant::now();
+    }
 
     let direct_clean_runtime = matches!(&sqlite_mode, ManagedLocalSqliteMode::Direct);
     match exact_archive_batch(&record, &archive) {
@@ -720,6 +794,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             }
         }
         Err(error) => return conflict(ManagedLocalDrainStage::ArchivePublication, error),
+    }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| {
+            timings.archive_publication = stage_started.elapsed()
+        });
+        stage_started = std::time::Instant::now();
     }
 
     let batch_id = manifest.batch_id();
@@ -800,6 +881,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
         }
     }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| {
+            timings.engine_acceptance = stage_started.elapsed()
+        });
+        stage_started = std::time::Instant::now();
+    }
 
     if drain_fault!(BeforeTailAdmission) {
         return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
@@ -809,10 +897,17 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     {
         return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
     }
+    let event_started = super::phase_trace_enabled().then(std::time::Instant::now);
     let event = match AcceptedBatchEvent::from_accepted(engine, &archive, batch_id) {
         Ok(event) => event,
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
     };
+    if let Some(started) = event_started {
+        eprintln!(
+            "PHASE TIME ManagedLocal.accepted_event {:.3}ms",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     work_done.accepted_events = 1;
     match sqlite_mode {
         ManagedLocalSqliteMode::Tail(tail) => {
@@ -866,19 +961,33 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             if drain_fault!(BeforeSqliteCommit) {
                 return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
             }
+            let frontier_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let applied = match database.frontier_root() {
                 Ok(frontier) => frontier,
                 Err(error) => {
                     return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
                 }
             };
+            if let Some(started) = frontier_started {
+                eprintln!(
+                    "PHASE TIME ManagedLocal.sqlite_frontier_before {:.3}ms",
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             if applied.same_accepted_authority(event.prior_frontier_root()) {
+                let apply_started = super::phase_trace_enabled().then(std::time::Instant::now);
                 if let Err(error) = database.apply_engine_owned_accepted(&event, engine) {
                     return pending_with_detail(
                         ManagedLocalDrainStage::TailAndSqlite,
                         frame,
                         &record,
                         error.to_string(),
+                    );
+                }
+                if let Some(started) = apply_started {
+                    eprintln!(
+                        "PHASE TIME ManagedLocal.sqlite_apply {:.3}ms",
+                        started.elapsed().as_secs_f64() * 1_000.0,
                     );
                 }
                 work_done.sqlite_batches = 1;
@@ -890,6 +999,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             }
         }
     }
+    let verify_started = super::phase_trace_enabled().then(std::time::Instant::now);
     let accepted_frontier = match engine.accepted_frontier_root() {
         Ok(frontier) => frontier,
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
@@ -899,8 +1009,19 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Ok(_) => return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record),
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
     }
+    if let Some(started) = verify_started {
+        eprintln!(
+            "PHASE TIME ManagedLocal.sqlite_frontier_verify {:.3}ms",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     if drain_fault!(AfterSqliteCommit) {
         return pending(ManagedLocalDrainStage::ProjectionAdoption, frame, &record);
+    }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| timings.tail_and_sqlite = stage_started.elapsed());
+        stage_started = std::time::Instant::now();
     }
 
     if drain_fault!(BeforeProjectionAdoption) {
@@ -914,11 +1035,20 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             error.to_string(),
         );
     }
-    let expected_work = match exact_work(&record, endpoint) {
-        Ok(work) => work,
-        Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
-    };
-    if !projection_superseded {
+    for projection in record.projections() {
+        let intent = projection.intent();
+        let exact_target = intent.target().bytes();
+        let expected_work = match exact_work(&record, projection, endpoint) {
+            Ok(work) => work,
+            Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
+        };
+        if projection_superseded
+            .get(intent.path().as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if let Err(error) = crate::oplog::projection::execute_clean_manifested_projection_work(
             graph,
             receipts,
@@ -927,7 +1057,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             &expected_work,
         ) {
             let current = graph.read_projection_input(intent.path());
-            return if matches!(current, Ok(Some(bytes)) if bytes != exact_target) {
+            let conflicts = matches!(current, Ok(Some(bytes)) if exact_target.is_none_or(|target| bytes != target) && projection.precondition_base().is_none_or(|base| bytes != base.bytes()));
+            return if conflicts {
                 conflict(
                     ManagedLocalDrainStage::ProjectionAdoption,
                     error.to_string(),
@@ -942,8 +1073,16 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             };
         }
     }
+    work_done.projection_work_point_reads = record.projections().len();
     if drain_fault!(AfterProjectionAdoption) {
         return pending(ManagedLocalDrainStage::AuthorshipReceipt, frame, &record);
+    }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| {
+            timings.projection_adoption = stage_started.elapsed()
+        });
+        stage_started = std::time::Instant::now();
     }
 
     let manifest_digest = match manifest.encode() {
@@ -983,6 +1122,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     if drain_fault!(AfterAuthorship) {
         return pending(ManagedLocalDrainStage::ProviderPublication, frame, &record);
     }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| {
+            timings.authorship_receipt = stage_started.elapsed()
+        });
+        stage_started = std::time::Instant::now();
+    }
     if drain_fault!(BeforeProvider) {
         return pending(ManagedLocalDrainStage::ProviderPublication, frame, &record);
     }
@@ -1009,17 +1155,30 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     if drain_fault!(AfterProvider) {
         return pending(ManagedLocalDrainStage::Checkpoint, frame, &record);
     }
+    #[cfg(test)]
+    {
+        note_managed_local_drain_stage(|timings| {
+            timings.provider_publication = stage_started.elapsed()
+        });
+        stage_started = std::time::Instant::now();
+    }
 
     let next_checkpoint = match checkpoint_advance(checkpoint, frame, batch_id, &accepted_frontier)
     {
         Ok(checkpoint) => checkpoint,
         Err(error) => return recovery(ManagedLocalDrainStage::Checkpoint, error),
     };
-    ManagedLocalDrainOutcome::Complete(ManagedLocalDrainCompletion {
+    let outcome = ManagedLocalDrainOutcome::Complete(ManagedLocalDrainCompletion {
         batch_id,
         sequence: frame.sequence(),
         checkpoint: next_checkpoint,
         reclaimable_through_after_checkpoint: frame.sequence(),
         work: work_done,
-    })
+    });
+    #[cfg(test)]
+    note_managed_local_drain_stage(|timings| {
+        timings.checkpoint = stage_started.elapsed();
+        timings.total = drain_started.elapsed();
+    });
+    outcome
 }

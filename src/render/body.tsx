@@ -9,7 +9,6 @@ import type { Block as AstBlock, ListItem as AstListItem, Format } from "./ast";
 import { hiccupToHtml } from "./hiccup";
 import { coarseSpanAttrs, type SpanDomAttrs } from "./spans";
 import { evalCalc } from "../editor/calc";
-import type { CodeFence } from "../editor/properties";
 import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { graphMeta } from "../ui";
 import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "./block";
@@ -34,45 +33,6 @@ export function loadHljs() {
 }
 export type HljsInstance = Awaited<ReturnType<typeof loadHljs>>;
 
-/** Build the innerHTML for the live-editing highlight overlay `<pre>`: the SAME
- *  text as `fullText` line-for-line (so each glyph sits under the textarea's
- *  matching glyph), with the code region syntax-highlighted and the fence
- *  delimiter lines dimmed. highlight.js only inserts `<span>`s (never changes
- *  source characters), so per-line alignment holds. `h` may be undefined before
- *  highlight.js loads → escaped plain (still aligned), upgrades reactively.
- *  Mirrors CodeBlock's highlight + try/catch fallbacks. */
-export function highlightFencedForOverlay(
-  h: HljsInstance | undefined,
-  fence: CodeFence,
-  fullText: string
-): string {
-  const lines = fullText.split("\n");
-  const bodyEnd = fence.closeLine ?? lines.length;
-  let bodyHtml: string;
-  // Only single-language highlight in the LIVE overlay (never highlightAuto, which
-  // would tokenise against all ~190 languages every keystroke); an un-named or
-  // unknown-language fence stays escaped-plain here. The rendered block still
-  // auto-detects (one-time) in CodeBlock.
-  if (!h || !fence.lang || !h.getLanguage(fence.lang)) {
-    bodyHtml = escapeHtml(fence.codeText);
-  } else {
-    try {
-      bodyHtml = h.highlight(fence.codeText, { language: fence.lang }).value;
-    } catch {
-      bodyHtml = escapeHtml(fence.codeText);
-    }
-  }
-  const dim = (s: string) => `<span class="code-hl-fence">${escapeHtml(s)}</span>`;
-  const segs: string[] = [];
-  for (let i = 0; i < fence.openLine; i++) segs.push(escapeHtml(lines[i])); // leading blanks
-  segs.push(dim(lines[fence.openLine]));
-  if (bodyEnd > fence.openLine + 1) segs.push(bodyHtml); // one segment spanning the code lines
-  if (fence.closeLine !== null) {
-    segs.push(dim(lines[fence.closeLine]));
-    for (let i = fence.closeLine + 1; i < lines.length; i++) segs.push(escapeHtml(lines[i])); // trailing blanks
-  }
-  return segs.join("\n");
-}
 
 // A fenced code block: renders escaped (plain) immediately, then upgrades to
 // syntax-highlighted once highlight.js loads. The highlight result is memoized

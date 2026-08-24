@@ -17,7 +17,7 @@ import { blockDtoExternalId } from "../blockIdentity";
 
 // One selectable result row.
 type Item =
-  | { t: "page"; name: string; pageKind: PageKind; path?: string; spans?: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean }
+  | { t: "page"; name: string; pageKind: PageKind; path?: string; spans?: MatchSpan[]; matchedAlias?: string; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean }
   | { t: "create"; name: string }
   | { t: "command"; label: string; binding: string; run: () => void }
   | { t: "block"; page: string; pageKind: PageKind; path?: string; blockId: string; text: string; crumb: string[]; spans: MatchSpan[]; adaptiveClass: ObjectiveMatchClass; adaptiveIdentity: string; adaptiveFavorite: boolean };
@@ -166,6 +166,7 @@ export function QuickSwitcher(): JSX.Element {
         pageKind: hit.page.kind,
         path: hit.page.path,
         spans: hit.evidence.flatMap((evidence) => evidence.spans),
+        matchedAlias: hit.matched_alias ?? undefined,
         adaptiveClass: hit.match_class ?? "substring",
         adaptiveIdentity: `page:${hit.page.kind}:${hit.page.path || hit.page.name.toLocaleLowerCase()}`,
         adaptiveFavorite: isFavorite(hit.page.name),
@@ -515,7 +516,24 @@ export function QuickSwitcher(): JSX.Element {
                               swallowNextPaste = true;
                               setTimeout(() => (swallowNextPaste = false), 200);
                               openInBackground(it);
-                            } else if (e.button === 0) choose(it);
+                            } else if (e.button === 0) {
+                              // GH #288: pointer modifiers mirror the Enter-key
+                              // semantics — Ctrl/Cmd+click = background tab like
+                              // middle-click (no PRIMARY paste to swallow; the
+                              // switcher stays open), Alt+click = other pane,
+                              // Shift+click = right sidebar. Create/command rows
+                              // keep only their existing safe actions.
+                              const cmdCtrl = e.ctrlKey || e.metaKey;
+                              if (cmdCtrl && !e.altKey && !e.shiftKey && (it.t === "page" || it.t === "block")) {
+                                openInBackground(it);
+                              } else if (!switcherEmbryo() && e.shiftKey && !e.altKey && !cmdCtrl && (it.t === "page" || it.t === "block")) {
+                                chooseSidebar(it);
+                              } else if (!switcherEmbryo() && e.altKey) {
+                                void chooseOther(it);
+                              } else {
+                                choose(it);
+                              }
+                            }
                           }}
                         >
                           <Row item={it} />
@@ -615,6 +633,9 @@ function Row(props: { item: Item }): JSX.Element {
         <>
           <span class="switcher-kind">{it.pageKind === "journal" ? "journal" : "page"}</span>
           <span class="switcher-name"><EmojiText text={it.name} /></span>
+          {/* GH #353: why did "Research Hub" match "book"? Keep the matched
+              alias as display context; navigation still targets the owner. */}
+          <Show when={it.matchedAlias}><span class="switcher-alias">aka {it.matchedAlias}</span></Show>
         </>
       );
     case "create":

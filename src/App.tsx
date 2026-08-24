@@ -125,7 +125,6 @@ import {
   gitBadgeTitle,
   runGitBadgeAction,
 } from "./git";
-import { initCodeHlSettings } from "./codeHighlightSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import {
@@ -152,6 +151,7 @@ import {
   paneRouter,
   layoutPaneIds,
   setSplitRatio,
+  visibleLayoutNode,
   type LayoutNode,
 } from "./panes";
 import { paneSel, samePaneTarget } from "./paneSelect";
@@ -971,7 +971,6 @@ export function App(): JSX.Element {
   onMount(() => void initRefCompletionSettings());
   onMount(() => void initBulletThreading());
   // Live syntax highlighting while editing code blocks (default on).
-  onMount(() => void initCodeHlSettings());
   // Optional git integration (issue #33). Loads prefs; if enabled + pull-on-start,
   // pulls before any edits (clean reload through the watcher). Off by default.
   onMount(() => void initGit());
@@ -1606,7 +1605,7 @@ export function App(): JSX.Element {
           <DrawerBackground class="drawer-workspace" blockedBy="right">
           <PaneEdgeHighlights />
           <PaneSelectHint />
-          <PaneTree node={layoutRoot()} path={[]} />
+          <PaneTree node={visibleLayoutNode()} path={[]} />
           <Show when={pdfTarget()}>
         <div
           class="pdf-pane"

@@ -1,4 +1,4 @@
-import { Show, Switch, Match, For, createMemo, createSignal, createResource, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
+import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
 import { clearClipboardSlot, normalize, peekClipboardSlot, writeClipboardText } from "../clipboard";
@@ -131,8 +131,7 @@ import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/b
 import { effectiveHeadingLevel, facetsOf, EMPTY_FACETS, type Facets } from "../render/facets";
 import type { Format } from "../render/ast";
 import type { Node as StoreNode } from "../store";
-import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
-import { codeHlEnabled } from "../codeHighlightSettings";
+import { AstBody } from "../render/body";
 import { InlineText, CopyButton } from "../render/inline";
 import { editorOffsetFromRenderedRange } from "../render/spans";
 import {
@@ -147,6 +146,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
+import { codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
@@ -166,7 +166,7 @@ import {
   caretColumnOnVisualRow,
   caretOffsetOnLastRow,
 } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, fencedCodeBlock } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim } from "../editor/properties";
 import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
@@ -1177,11 +1177,13 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
-  // Generic ref/query surfaces intentionally return structural keyboard edits to
-  // the primary outline. An embed is a live editing surface: structural destinations
-  // (Enter, Arrow navigation, and empty-block merge/delete) must remain in the
-  // transclusion the user is looking at.
-  const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  // Ref/query arrow navigation stays in the rendered result surface (GH #341),
+  // while structural edits still target the source outline: a split/merge
+  // destination need not remain a query or backlink result. Embeds are true
+  // transclusions, so both navigation and structural destinations stay there.
+  const navigationSurface = () =>
+    surfaceKey.startsWith("ref:") || surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  const structuralSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   let pluginSlashInvocation = 0;
   let editorMounted = true;
@@ -1217,6 +1219,13 @@ export function Editor(props: { id: string }): JSX.Element {
   // other block hides just the built-in id::/collapsed::. One fence-aware splitter.
   const hideFn = () => (isAnnot() ? hideAll : sheetCell ? isSheetCellHidden : isBuiltinHidden);
   const editorValue = createMemo(() => splitProps(node().raw, hideFn(), pageFmt()).visible);
+  // GH #357: the rendered face of a whole-block code fence is a mono, no-wrap,
+  // padded card (.code-block). The editor was the ordinary proportional wrapped
+  // textarea, so clicking a code block re-laid every line — the visible "jump".
+  // While the buffer IS code-shaped, present the editor as the same card
+  // (honest raw text, fences included). Mixed content / ```calc keep their own
+  // modes. Re-derived per keystroke so typing a fence in or out flips live.
+  const codeEditing = createMemo(() => codeFenceOnly(editorValue(), pageFmt()) !== null);
   const editorHeadingLevel = createMemo(() => {
     const visible = editorValue();
     if (visible.includes("\n")) return null;
@@ -1249,21 +1258,6 @@ export function Editor(props: { id: string }): JSX.Element {
   });
   const isCalc = editingCalc;
   const calcRows = createMemo(() => (isCalc() ? evalCalc(calcLive() ?? "") : []));
-  // Live syntax highlighting while editing a fenced code block: a highlighted <pre>
-  // painted BEHIND the (still sole-owner) textarea, whose text goes transparent with
-  // a visible caret. Purely visual → ADR-0013-safe. `fencedCodeBlock` returns null
-  // for calc/mixed content, so this never collides with the calc path. Derived from
-  // `editorValue()` (committed, reactive) exactly like `calcLive`, so it updates live.
-  const codeEdit = createMemo(() => (codeHlEnabled() ? fencedCodeBlock(editorValue()) : null));
-  const isCodeEdit = () => codeEdit() !== null;
-  const [hljsOverlay] = createResource(loadHljs);
-  const codeOverlayHtml = createMemo(() => {
-    const f = codeEdit();
-    return f ? highlightFencedForOverlay(hljsOverlay(), f, editorValue()) : "";
-  });
-  // While an IME composition is active, the pre-commit string lives in the textarea
-  // (not yet in the overlay), so briefly un-hide the textarea text in code mode.
-  const [composing, setComposing] = createSignal(false);
   const commit = (text: string, opts?: { timetracking?: boolean; calc?: boolean }) => {
     const commitAsCalc = opts?.calc ?? isCalc();
     // For calc, `text` is the bare expressions the user sees — re-fence it.
@@ -2555,10 +2549,6 @@ export function Editor(props: { id: string }): JSX.Element {
       const pageName = doc.byId[props.id]?.page;
       if (pageName) releaseCompositionLease = takeEditorLease(pageName);
     }
-    // FORK: the live code-highlight overlay un-hides the textarea text while an
-    // IME composition is uncommitted. Set here, not only in oncompositionstart,
-    // so an IME that omits compositionstart still un-hides.
-    setComposing(true);
     compositionActive = true;
     compositionEndValue = null;
     clearTimeout(acTimer);
@@ -2645,7 +2635,6 @@ export function Editor(props: { id: string }): JSX.Element {
     refreshAutocompleteAfterInput();
   };
   const onCompositionEnd = () => {
-    setComposing(false);
     compositionActive = false;
     applyFullWidthRefReplace();
     compositionEndValue = ref.value;
@@ -2663,7 +2652,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
     startEditing(props.id, start);
-    const move = outlineScope
+    const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
     void move.then(() => {
@@ -2759,6 +2748,24 @@ export function Editor(props: { id: string }): JSX.Element {
     "editor/strike-through": (e) => { e.preventDefault(); applyInlineFormat("strikethrough"); return true; },
     "editor/highlight": (e) => { e.preventDefault(); applyInlineFormat("highlight"); return true; },
     "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt())); return true; },
+    // GH #279: embed counterpart of the builtin Mod+C block-ref copy. With a
+    // live selection decline (return false, no preventDefault) so the
+    // platform's ordinary copy keeps its meaning. Uses the same persistent
+    // block id:: as Mod+C and the shared clipboard facade.
+    "editor/copy-embed": (e) => {
+      if (ref.selectionStart !== ref.selectionEnd) return false;
+      e.preventDefault();
+      commit(ref.value);
+      void ensureBlockId(props.id).then((uuid) => {
+        if (uuid) {
+          void writeClipboardText(`{{embed ((${uuid}))}}`);
+          pushToast("Copied block embed", "success");
+        } else {
+          pushToast("Couldn't save the block id — embed not copied.", "error");
+        }
+      });
+      return true;
+    },
     "editor/clear-block": (e) => { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return true; },
     "editor/kill-line-before": (e) => { e.preventDefault(); applyEdit(killLineBefore(ref.value, ref.selectionStart)); return true; },
     "editor/kill-line-after": (e) => { e.preventDefault(); applyEdit(killLineAfter(ref.value, ref.selectionStart)); return true; },
@@ -2790,7 +2797,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // On an in-block list line, Tab nests the LIST ITEM (intra-block), not the block.
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
-      if (outlineScope?.roots.includes(props.id)) return true;
+      if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
       commit(ref.value); indentBlock(props.id, ref.selectionStart); return true;
     },
     "editor/outdent": (e) => {
@@ -3011,6 +3018,9 @@ export function Editor(props: { id: string }): JSX.Element {
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
     const raw = ref.value;
+    // A navOnly display-list scope must never act as a merge/structural
+    // topology — keep every structural read on page order in that case.
+    const structuralScope = outlineScope?.navOnly ? null : outlineScope;
 
     // Ctrl/Cmd+Shift+V is Logseq's universal raw-paste gesture.
     // ClipboardEvent does not expose modifier keys, so remember the preceding
@@ -3198,7 +3208,7 @@ export function Editor(props: { id: string }): JSX.Element {
             commit(trimmed);
             newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
           });
-          startEditing(newId, 0, null, editSurface());
+          startEditing(newId, 0, null, structuralSurface());
           return;
         }
       }
@@ -3252,10 +3262,10 @@ export function Editor(props: { id: string }): JSX.Element {
         // adds a new sibling bullet below, which the user can Tab to nest as a
         // note under the highlight.
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-        startEditing(newId, 0, null, editSurface());
+        startEditing(newId, 0, null, structuralSurface());
       } else {
         const zoomRoot = outlineScope?.forceExpandedRoot === props.id;
-        splitBlock(props.id, start, zoomRoot, zoomRoot, editSurface());
+        splitBlock(props.id, start, zoomRoot, zoomRoot, structuralSurface());
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both
@@ -3292,16 +3302,16 @@ export function Editor(props: { id: string }): JSX.Element {
           return;
         }
         commit(raw);
-        if (mergeWithPrev(props.id, outlineScope, editSurface())) {
+        if (mergeWithPrev(props.id, structuralScope, structuralSurface())) {
           e.preventDefault();
           return;
         }
         const n = doc.byId[props.id];
-        const next = nextVisible(props.id, outlineScope);
+        const next = nextVisible(props.id, structuralScope);
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
-          startEditing(next, 0, null, editSurface());
+          startEditing(next, 0, null, structuralSurface());
         }
       }
     } else if (e.key === "Delete" && end === start && start === raw.length) {
@@ -3310,12 +3320,12 @@ export function Editor(props: { id: string }): JSX.Element {
       // calc block itself (same rule as Backspace), and never absorb an
       // annotation/calc block's raw text into this one.
       if (isAnnot() || isCalc()) return;
-      const next = nextVisible(props.id, outlineScope);
+      const next = nextVisible(props.id, structuralScope);
       if (next) {
         const nextRaw = doc.byId[next]?.raw ?? "";
         if (isAnnotationBlock(nextRaw) || calcSource(nextRaw) !== null) return;
         commit(raw);
-        if (mergeWithNext(props.id, outlineScope, editSurface())) {
+        if (mergeWithNext(props.id, structuralScope, structuralSurface())) {
           e.preventDefault();
           const caretAt = start; // join point = the block's pre-merge end
           queueMicrotask(() => {
@@ -3333,7 +3343,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // "End of the previous block": a number caret clamps to the new editor's
           // full text length at mount (focusNow Math.min), whichever it is.
-          startEditing(prev, Number.MAX_SAFE_INTEGER, null, editSurface());
+          startEditing(prev, Number.MAX_SAFE_INTEGER, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowRight" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -3342,7 +3352,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, 0, null, editSurface());
+          startEditing(next, 0, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowUp" && !e.shiftKey) {
@@ -3368,7 +3378,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, editSurface());
+          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -3383,7 +3393,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, { col, edge: "first" }, null, editSurface());
+          startEditing(next, { col, edge: "first" }, null, navigationSurface());
         } else {
           // No next LOADED block. In the journal feed, pull in the next day so
           // Down-arrow keeps going past the loaded window (previously only a
@@ -3393,7 +3403,7 @@ export function Editor(props: { id: string }): JSX.Element {
             e.preventDefault();
             commit(raw);
             void nextVisibleOrExtend(props.id).then((n) =>
-              n && startEditing(n, { col, edge: "first" }, null, editSurface())
+              n && startEditing(n, { col, edge: "first" }, null, navigationSurface())
             );
           }
         }
@@ -3653,15 +3663,7 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   return (
-    <div class="editor-wrap" classList={{ "calc-wrap": isCalc(), "code-wrap": isCodeEdit() }}>
-      {/* Live code-highlight overlay: painted BEHIND the textarea (first child →
-          lower paint order), purely visual (aria-hidden, pointer-events:none).
-          Its text is byte-for-byte the editor value, so glyphs sit under the caret. */}
-      <Show when={isCodeEdit()}>
-        <pre class="code-hl-overlay" aria-hidden="true">
-          <code class="hljs" innerHTML={codeOverlayHtml()} />
-        </pre>
-      </Show>
+    <div class="editor-wrap" classList={{ "calc-wrap": isCalc() }}>
       <Show when={isCalc()}>
         <div class="calc-gutter" aria-hidden="true">
           <For each={calcRows()}>{(_, i) => <div class="calc-lineno">{i() + 1}</div>}</For>
@@ -3670,8 +3672,9 @@ export function Editor(props: { id: string }): JSX.Element {
       <textarea
         ref={ref}
         class="block-editor"
-        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-editing": isCodeEdit(), composing: composing() }}
-        spellcheck={isCodeEdit() ? false : spellcheckEnabled()}
+        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-edit": codeEditing() }}
+        spellcheck={spellcheckEnabled()}
+        wrap={codeEditing() ? "off" : "soft"}
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}

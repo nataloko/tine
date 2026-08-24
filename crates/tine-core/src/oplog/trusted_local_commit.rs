@@ -148,6 +148,42 @@ pub(crate) enum TrustedLocalCommitOutcome {
     CommittedRecoveryRequired(TrustedLocalCommittedRecovery),
 }
 
+/// A journal-durable bounded multi-page mutation whose semantic hot overlay is
+/// visible. Markdown projection, accepted history, SQLite and provider work are
+/// deliberately left to the managed-local derivative queue.
+pub(crate) struct TrustedLocalCompoundCommitted {
+    prepared: PreparedManagedLocalRecord,
+    post_pages: std::collections::BTreeMap<super::PageId, MaterializedPage>,
+}
+
+impl TrustedLocalCompoundCommitted {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.prepared.batch_id()
+    }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.prepared.sequence()
+    }
+
+    pub(crate) const fn prepared_record(&self) -> &PreparedManagedLocalRecord {
+        &self.prepared
+    }
+
+    pub(crate) const fn post_pages(
+        &self,
+    ) -> &std::collections::BTreeMap<super::PageId, MaterializedPage> {
+        &self.post_pages
+    }
+}
+
+pub(crate) enum TrustedLocalCompoundOutcome {
+    Committed(TrustedLocalCompoundCommitted),
+    CommittedRecoveryRequired {
+        prepared: PreparedManagedLocalRecord,
+        last_error: ManagedLocalRecordError,
+    },
+}
+
 /// Parser-owned application response evidence, created at the same boundary
 /// that parses the requested exact target.  It is intentionally crate-private
 /// and may be retained only by an immediately durable trusted commit.
@@ -421,6 +457,53 @@ impl TrustedLocalCommittedRecovery {
 }
 
 impl TrustedLocalCommitCoordinator {
+    /// Commit one already-finalized bounded multi-page mutation at the same
+    /// journal-first boundary as an ordinary editor save. No graph projection,
+    /// accepted-history expansion or SQLite work occurs in this call.
+    pub(crate) fn commit_compound<J: ManagedLocalJournalAppend>(
+        journal: &mut J,
+        engine: &mut ShardedHotEngine,
+        prepared: PreparedLocalMutation,
+    ) -> Result<TrustedLocalCompoundOutcome, TrustedLocalCommitError> {
+        #[cfg(test)]
+        reset_commit_stage_timings();
+        let batch = prepared.into_trusted_batch();
+        let sequence = engine.managed_local_prefix_state().next_sequence;
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let mut prepared = engine
+            .prepare_managed_local_record(batch, sequence)
+            .map_err(TrustedLocalCommitError::ManagedRecord)?;
+        #[cfg(test)]
+        note_commit_stage(|timings| timings.prepared_record = stage_started.elapsed());
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let append = append_managed_local_record(journal, &prepared)
+            .map_err(TrustedLocalCommitError::JournalAppend)?;
+        #[cfg(test)]
+        note_commit_stage(|timings| timings.journal_append = stage_started.elapsed());
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let applied = engine.apply_appended_managed_local_record(&append, &mut prepared);
+        #[cfg(test)]
+        note_commit_stage(|timings| timings.hot_overlay_apply = stage_started.elapsed());
+        match applied {
+            Ok(ManagedLocalApplyOutcome::Applied { batch_id, pages }) => {
+                debug_assert_eq!(batch_id, prepared.batch_id());
+                Ok(TrustedLocalCompoundOutcome::Committed(
+                    TrustedLocalCompoundCommitted {
+                        prepared,
+                        post_pages: pages,
+                    },
+                ))
+            }
+            Err(last_error) => Ok(TrustedLocalCompoundOutcome::CommittedRecoveryRequired {
+                prepared,
+                last_error,
+            }),
+        }
+    }
+
     pub(crate) fn commit<J: ManagedLocalJournalAppend>(
         graph: &Graph,
         journal: &mut J,
@@ -493,7 +576,14 @@ impl TrustedLocalCommitCoordinator {
             });
         }
         let projection = prepared.record().projection();
-        let expected_base = projection.precondition_base().bytes();
+        let expected_base = projection
+            .precondition_base()
+            .ok_or_else(|| {
+                TrustedLocalCommitError::InvalidPreparedInput(
+                    "existing-page trusted commit has an absent projection precondition".into(),
+                )
+            })?
+            .bytes();
         let exact_target = projection.intent().target().bytes().ok_or_else(|| {
             TrustedLocalCommitError::InvalidPreparedInput(
                 "eligible prepared record unexpectedly has an absent target".into(),
@@ -592,7 +682,14 @@ impl TrustedLocalCommitCoordinator {
         record: &ManagedLocalRecord,
     ) -> Result<TrustedLocalRestartProjectionInput, TrustedLocalCommitError> {
         let projection = record.projection();
-        let expected_base = projection.precondition_base().bytes();
+        let expected_base = projection
+            .precondition_base()
+            .ok_or_else(|| {
+                TrustedLocalCommitError::InvalidPreparedInput(
+                    "existing-page projection restart has an absent precondition".into(),
+                )
+            })?
+            .bytes();
         let exact_target = projection.intent().target().bytes().ok_or_else(|| {
             TrustedLocalCommitError::InvalidPreparedInput(
                 "decoded managed-local record has an absent target".into(),
@@ -673,7 +770,9 @@ fn prepared_page_mismatch(
         PageKind::Journal => ManagedTextKind::Journal,
     };
     if projection.intent().path().as_str() != page.path
-        || projection.precondition_base().source_path().as_str() != page.path
+        || projection
+            .precondition_base()
+            .is_none_or(|base| base.source_path().as_str() != page.path)
         || post_page.path.as_str() != page.path
         || post_page.name.as_str() != page.name
         || post_page.kind != expected_kind
@@ -752,8 +851,12 @@ fn finish_committed_state(
     #[cfg(test)]
     note_commit_stage(|timings| timings.hot_overlay_apply = overlay_started.elapsed());
     let post_page = match applied {
-        Ok(ManagedLocalApplyOutcome::Applied { batch_id, page }) => {
+        Ok(ManagedLocalApplyOutcome::Applied { batch_id, pages }) => {
             debug_assert_eq!(batch_id, prepared.batch_id());
+            let page = pages
+                .into_values()
+                .next()
+                .expect("single-page trusted commit retains its post-page");
             debug_assert!(materialized_page_semantics_equal(
                 &page,
                 prepared.post_page()

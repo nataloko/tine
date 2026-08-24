@@ -86,7 +86,6 @@ import {
   threadAnimation,
   setThreadAnimation,
 } from "../bulletThreading";
-import { codeHlEnabled, setCodeHlEnabled } from "../codeHighlightSettings";
 import type { GitStatus } from "../backend";
 import {
   gitEnabled,
@@ -271,7 +270,6 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "graph", label: "Graph", description: "folder export publish" },
   { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
   { tab: "extras", label: "Bullet threading", description: "thread active path outline depth rainbow accent colour animate flow" },
-  { tab: "extras", label: "Live code highlighting", description: "syntax highlight fenced code block overlay" },
   { tab: "extras", label: "Git integration", description: "commit push pull auto version control repository branch" },
   {
     tab: "backups",
@@ -301,6 +299,17 @@ function experimentalMatch(tab: Tab, query: string): boolean {
 export function Settings(): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("appearance");
   const [settingsQuery, setSettingsQuery] = createSignal("");
+  const [settingsPlatform] = createResource(async () => {
+    try {
+      return await platformKind();
+    } catch {
+      // Unknown native platforms fail closed: do not reveal a package host whose
+      // platform policy could not be established.
+      return undefined;
+    }
+  });
+  const pluginsAvailable = () => settingsPlatform() === "desktop" || settingsPlatform() === "android";
+  const availableTabs = createMemo(() => pluginsAvailable() ? TABS : TABS.filter((entry) => entry.id !== "plugins"));
   const matches = createMemo(() => {
     const query = settingsQuery();
     return query.trim() ? SETTING_SEARCH.filter((entry) => settingMatches(entry, query)) : [];
@@ -335,10 +344,15 @@ export function Settings(): JSX.Element {
   };
 
   createEffect(() => {
+    if (!settingsPlatform.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
+  });
+
+  createEffect(() => {
     if (!settingsOpen()) return;
     const requested = settingsTabRequest();
     if (!requested) return;
-    setTab(requested);
+    if (requested === "plugins" && settingsPlatform.loading) return;
+    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested);
     clearSettingsTabRequest();
   });
 
@@ -347,6 +361,15 @@ export function Settings(): JSX.Element {
   // Settings owns its semantic Escape rungs.  Registering here (rather than in
   // App) keeps shortcut recording/search/disclosures from being skipped by a
   // blanket modal close and ensures disposal follows this component lifetime.
+  // Transient maximize (GH #287): a pure geometry toggle on the dialog, so the
+  // selected page and scroll position ride through untouched, and closing the
+  // modal always restores the default size for the next open.
+  const [maximized, setMaximized] = createSignal(false);
+  createEffect(() => {
+    if (settingsOpen()) return;
+    setMaximized(false);
+  });
+
   createEffect(() => {
     if (!settingsOpen()) return;
     const unregister = registerTransientLayer({
@@ -386,11 +409,11 @@ export function Settings(): JSX.Element {
 
   return (
     <Show when={settingsOpen()}>
-      <div class="modal-overlay" onClick={closeSettings}>
+      <div class="modal-overlay" classList={{ "settings-maximized": maximized() }} onClick={closeSettings}>
         <div class="settings-modal" onClick={(e) => e.stopPropagation()}>
           <aside class="settings-nav">
             <div class="settings-nav-title">Settings</div>
-            <For each={TABS}>
+            <For each={availableTabs()}>
               {(t) => (
                 <button
                   class="settings-nav-item"
@@ -406,7 +429,7 @@ export function Settings(): JSX.Element {
 
           <div class="settings-pane">
             <div class="settings-pane-head">
-              <span>{TABS.find((t) => t.id === tab())?.label}</span>
+              <span>{availableTabs().find((t) => t.id === tab())?.label}</span>
               <input
                 class="settings-search-input"
                 type="search"
@@ -422,6 +445,29 @@ export function Settings(): JSX.Element {
                   }
                 }}
               />
+              {/* Desktop-only near-viewport toggle (hidden ≤480px by CSS, where
+                  the sheet already owns the viewport) — GH #287. */}
+              <button
+                class="icon-btn settings-maximize"
+                type="button"
+                title={maximized() ? "Restore settings size" : "Maximize settings"}
+                aria-label={maximized() ? "Restore settings size" : "Maximize settings"}
+                aria-pressed={maximized()}
+                onClick={() => setMaximized(!maximized())}
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2">
+                  {maximized() ? (
+                    <>
+                      {/* restore: two overlapping squares while maximized. */}
+                      <rect x="7" y="3" width="14" height="14" rx="1.5" />
+                      <path d="M3 10v9.5A1.5 1.5 0 0 0 4.5 21H14" />
+                    </>
+                  ) : (
+                    /* maximize: one empty square */
+                    <rect x="3.5" y="3.5" width="17" height="17" rx="1.5" />
+                  )}
+                </svg>
+              </button>
               <button class="icon-btn" onClick={closeSettings}>
                 ✕
               </button>
@@ -465,7 +511,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "extras"}>
                 <ExtrasTab />
               </Show>
-              <Show when={tab() === "plugins"}>
+              <Show when={tab() === "plugins" && pluginsAvailable()}>
                 <PluginsTab />
               </Show>
               <Show when={tab() === "improve"}>
@@ -1504,7 +1550,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
 
       <Field
         label="Auto-pair brackets & quotes"
-        hint="Typing ( [ { &quot; ` inserts the matching closer with the caret between, wraps a selection, types through a closer, and Backspace on an empty pair clears both. (Page-ref `[[ ]]` always auto-closes.) Off by default — turn it on if you like it."
+        hint="Typing ( [ { &quot; ` inserts the matching closer with the caret between, wraps a selection, types through a closer, and Backspace on an empty pair clears both — the Logseq behaviour, ON by default. (Page-ref `[[ ]]` always auto-closes either way.) Turn it off if you dislike pairing."
       >
         <Toggle on={autoPairing()} onClick={() => setAutoPairing(!autoPairing())} />
       </Field>
@@ -1718,12 +1764,6 @@ function ExtrasTab(): JSX.Element {
           </div>
         </Field>
       </Show>
-      <Field
-        label="Live code highlighting"
-        hint="Syntax-highlight fenced code blocks (and colour them) WHILE you edit, in a box that looks like the rendered block. On by default; turn it off if the caret is hard to see on your system."
-      >
-        <Toggle on={codeHlEnabled()} onClick={() => setCodeHlEnabled(!codeHlEnabled())} />
-      </Field>
       <GitSection />
     </>
   );
@@ -2547,7 +2587,21 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
-    pushToast(`${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`, "error", { sticky: true });
+    const message = `${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`;
+    pushToast(message, "error", {
+      sticky: true,
+      action: {
+        label: "Copy details",
+        run: () => {
+          void writeClipboardTextResilient(message)
+            .then(() => pushToast("Managed storage details copied.", "success"))
+            .catch((error) => pushToast(
+              `Couldn't copy managed storage details: ${safeManagedErrorDetail(error)}`,
+              "error",
+            ));
+        },
+      },
+    });
   };
 
   /**
@@ -3024,7 +3078,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       <div class="settings-section">Storage &amp; sync</div>
       <ExperimentalSection forceOpen={props.forceOpen}>
         <div class="settings-experimental-warning" role="note">
-          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
+          <strong>Known to be buggy.</strong> Tine-managed storage does not yet fully work in our own testing; we're actively working on it. Use it only on a graph you are comfortable testing. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
         </div>
         <Show
           when={!loading()}

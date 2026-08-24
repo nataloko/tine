@@ -1,6 +1,6 @@
 {
   "name": "tine",
-  "version": "0.6.94",
+  "version": "0.6.95",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "app": "tauri dev",
+    "ios:prepare-project": "node scripts/prepare-ios-project.mjs",
     "test": "vitest run && vitest run --config vitest.render.config.ts",
     "test:render": "vitest run --config vitest.render.config.ts",
     "build:wasm": "node scripts/build-wasm.mjs",

@@ -898,6 +898,62 @@ cleanup, not permission to forget it: reopen selects the greatest authenticated
 generation and retries removal of every older tuple before advancing derivative
 work.
 
+Cross-page subtree movement uses the same foreground boundary as a page save.
+The source and destination CRDT updates and exact projections are one compound
+journal record; once that record is durable, both pages enter the hot overlay
+atomically and the application may return them without waiting for archive,
+SQLite, receipt, or provider derivatives. A subsequent move composes with the
+latest pending `(page, path)` projection through an exact in-memory index; it
+must not scan the pending journal prefix. Pending records are decoded once on
+recovery or append; derivative turns point-query `(path, page, sequence)` target
+and digest postings, and uncertain move retries point-query the pending batch
+identity. The derivative may read only the affected page identities and
+materialize those pages from the retained accepted catalog proof. It must not
+decode or validate the graph-sized catalog merely to apply a bounded move.
+
+Page rename discovery follows the same bounded-work rule. An ordinary rename
+may point-read the exact normalized source and target names and range-read the
+source namespace descendants; it must not enumerate the graph page inventory.
+Collision-rename/merge uses the identical name and namespace indexes before its
+reference rewrite. Work may scale with the renamed namespace and actual
+referrers, never with unrelated pages.
+
+Likewise, admission tracks its exact live staged set. Final status history may
+remain available for point answers, but an ordinary drain turn must never scan
+that lifetime map merely to rediscover the handful of currently staged batches.
+
+Advancing the clean runtime's authenticated accepted-frontier roots follows the
+same rule. The document overlay and accepted-batch maps are persistent
+path-copying authenticated trees: one accepted operation updates only its
+changed document keys and its one new batch key. It must not clone, sort, or
+rehash every document touched earlier in the run or every earlier accepted
+batch. The incrementally maintained root is required to be byte-identical to a
+canonical complete rebuild; the complete rebuild remains only a differential
+oracle and an explicit rebuild operation.
+
+Provider frontier publication likewise consumes an incrementally maintained
+set of direct frontier tips rather than materializing every document frontier.
+Clean projection attach rebuilds an exact path-to-latest-batch map during
+accepted replay and decodes only current path heads after the endpoint becomes
+available; it must not replay all accepted manifests merely to locate terminal
+projection work. While a later foreground suffix remains application-visible,
+projection of its accepted prefix is authorized against accepted state, not
+against those later journal-only catalog heads.
+
+A block-only peer operation is also page-local at this boundary. A receiver may
+have concurrently advanced the catalog by adding or renaming an unrelated page;
+that graph-wide frontier difference must not refuse the peer operation. The
+receiver authenticates the exact current identity rows for every affected page
+and holds their name, path, home, and kind to the manifested projection. A
+conflict on one of those rows remains a refusal; an unrelated catalog advance
+does not.
+
+These are work-shape requirements, not thread-placement advice. Moving an
+O(graph), O(history), or O(pending-prefix) operation to a background turn does
+not satisfy the contract. The 100/10,000-page move receipt and forbidden-work
+counters enforce graph-size-invariant foreground work and the absence of a
+whole-catalog derivative validation.
+
 The clean baseline-plus-manifest runtime and the retired legacy coordinator are
 two **distinct** retained-publication state machines, and a request may never be
 routed from one into the other.

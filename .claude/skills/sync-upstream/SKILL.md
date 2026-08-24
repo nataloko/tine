@@ -31,9 +31,8 @@ when there's something to decide.
     (`AboutTab.tsx`, `mock.ts`, `persistence.ts`, `backend.ts`, `ui.ts`, `App.tsx`,
     `src-tauri/src/lib.rs`, `tauri.conf.json`).
   - **Fork-only** — upstream has never seen these, so they can never conflict:
-    `src/editor/queryFilter.ts`(+test), `src/bulletThreading.ts`, `src/codeHighlightSettings.ts`,
-    `src/git.ts`(+test), `src/render/codeOverlay.test.tsx`, `src-tauri/src/git.rs`,
-    `src-tauri/nsis/installer.nsi`.
+    `src/editor/queryFilter.ts`(+test), `src/bulletThreading.ts`, `src/git.ts`(+test),
+    `src-tauri/src/git.rs`, `src-tauri/nsis/installer.nsi`.
 
 ## Policy
 **Auto-proceed when clean; stop only when there's something to decide.** "Clean" = the merge

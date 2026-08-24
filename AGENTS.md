@@ -34,14 +34,10 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, and
   `src/sheet/config.ts`.
 - Bullet threading: `src/bulletThreading.ts` and `src/components/Block.tsx`.
-- Live code-highlight overlay and language picker. Fork-only symbols:
-  `fencedCodeBlock` / `CodeFence` (`src/editor/properties.ts`),
-  `highlightFencedForOverlay` (`src/render/body.tsx`), the whole of
-  `src/codeHighlightSettings.ts`, and `src/render/codeOverlay.test.tsx`. It also
-  wires through `src/components/Block.tsx` (the `codeEdit` memo), `src/App.tsx`,
-  `src/components/Settings.tsx`, and `src/styles/app.css`. `loadHljs`
-  (`src/render/body.tsx`) and `codeLanguageItems` (`src/editor/autocomplete.ts`)
-  exist upstream too — use upstream's, don't re-add.
+- Page-rename navigation remap: `renamePageInNavigation` in `src/ui.ts` takes a
+  `PageKind` and remaps case-insensitive namespace descendants. Upstream has no
+  such overload, so this file is a silent-interaction surface despite never
+  appearing in a conflict.
 - Git integration: `src-tauri/src/git.rs` and Settings.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
 - Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
@@ -65,6 +61,22 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   releases, which is the signal to run this sync.
 - Fork ADRs: `docs/adr/mine/` (its own numbering and README), not the upstream
   `docs/adr/` sequence.
+
+### Retired
+
+- **Live code-highlight overlay** (retired at the v0.6.95 sync). Upstream GH #357
+  gave the block editor its own whole-block code-fence presentation
+  (`codeFenceOnly` in `src/editor/codeFence.ts`, the `.code-edit` card,
+  `wrap="off"`), which occupies the same element and state as the fork's
+  highlighted overlay and cannot coexist with it — the card is opaque and
+  no-wrap, the overlay needs a transparent `pre-wrap` textarea to stay aligned.
+  Upstream's is now the live path. Removed: `src/codeHighlightSettings.ts`,
+  `src/render/codeOverlay.test.tsx`, `fencedCodeBlock`/`CodeFence`,
+  `highlightFencedForOverlay`, the extras toggle, and the `.code-editing` /
+  `.code-hl-overlay` CSS. The fork's `.code-block code` wrap override was also
+  reverted to upstream's `white-space: pre`, since it existed only to match the
+  fork's wrapping editor. `feat/codeblock-editing` is now dead and can be
+  deleted.
 
 ## Build and verification
 

@@ -489,6 +489,16 @@ enum EditorPublicationAuthority {
     ReconstructibleManagedProjection,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphTextPublicationValidation {
+    /// Standalone callers have not established graph-wide collision evidence.
+    CompleteIndex,
+    /// A surrounding transaction owns graph-text identity authority and has
+    /// already completed a bounded no-follow inventory. Publication still
+    /// repeats exact target, single-link, portable-path, and no-clobber checks.
+    TransactionInventory,
+}
+
 fn preflight_editor_publication_chain(
     authority: EditorPublicationAuthority,
     chain: &[Dir],
@@ -6357,10 +6367,10 @@ impl Graph {
 
     fn apply_guarded_graph_text_identity_path(
         &self,
-        current: &CompleteGraphTextAdmissionIndex,
+        current: &mut CompleteGraphTextAdmissionIndex,
         relative: String,
         decode_semantics: bool,
-    ) -> io::Result<CompleteGraphTextAdmissionIndex> {
+    ) -> io::Result<()> {
         let event_scratch = graph_text_event_scratch_upper_bound(&relative)?;
         ensure_graph_text_peak_limit(current.permanent_bytes, event_scratch, current.peak_limit)?;
         let mut charges = GraphTextExactFeedBatchActualCharges::default();
@@ -6402,13 +6412,12 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
 
-        let mut next = current.clone();
         match final_state {
             PreparedGraphTextAdmissionFinalState::Present(prepared) => {
                 if let Err(delta_error) =
-                    self.apply_prepared_graph_text_file_upsert(&mut next, prepared)
+                    self.apply_prepared_graph_text_file_upsert(current, prepared)
                 {
-                    let detail = validate_graph_text_admission_index(&next)
+                    let detail = validate_graph_text_admission_index(current)
                         .err()
                         .map_or_else(
                             || "complete index remains internally valid".to_owned(),
@@ -6421,17 +6430,17 @@ impl Graph {
                 }
             }
             PreparedGraphTextAdmissionFinalState::Absent(prepared) => {
-                let removed = remove_graph_text_admission_path(&mut next, &relative);
+                let removed = remove_graph_text_admission_path(current, &relative);
                 if let (Ok(path), Some(tombstone)) = (ManagedPath::parse(relative.clone()), removed)
                 {
-                    next.tombstones_by_exact_path.insert(path, tombstone);
+                    current.tombstones_by_exact_path.insert(path, tombstone);
                 }
-                next.permanent_bytes =
-                    checked_add_bytes(next.permanent_bytes, prepared.retained_growth)?;
+                current.permanent_bytes =
+                    checked_add_bytes(current.permanent_bytes, prepared.retained_growth)?;
             }
         }
-        validate_graph_text_admission_delta(&next, &relative)?;
-        Ok(next)
+        validate_graph_text_admission_delta(current, &relative)?;
+        Ok(())
     }
 
     /// Publish exact final-state changes made by Tine while the same
@@ -6471,11 +6480,15 @@ impl Graph {
                 "injected guarded graph-text identity publication failure",
             ));
         }
-        let mut next = state
-            .index
-            .as_deref()
-            .expect("checked retained guarded identity")
-            .clone();
+        let generation = state.generation.checked_add(1).ok_or_else(|| {
+            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
+        })?;
+        let next = Arc::make_mut(
+            state
+                .index
+                .as_mut()
+                .expect("checked retained guarded identity"),
+        );
         let update_result = (|| {
             for relative in relatives {
                 if self.classify_graph_text_exact_feed_path(&relative)?
@@ -6483,8 +6496,7 @@ impl Graph {
                 {
                     continue;
                 }
-                next =
-                    self.apply_guarded_graph_text_identity_path(&next, relative, decode_semantics)?;
+                self.apply_guarded_graph_text_identity_path(next, relative, decode_semantics)?;
             }
             Ok::<(), io::Error>(())
         })();
@@ -6495,12 +6507,8 @@ impl Graph {
             )));
             return Err(error);
         }
-        let generation = state.generation.checked_add(1).ok_or_else(|| {
-            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
-        })?;
         next.generation = generation;
         state.generation = generation;
-        state.index = Some(Arc::new(next));
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
@@ -7837,28 +7845,20 @@ impl Graph {
     /// portable sibling is retained but cannot redirect the operation.
     fn validate_current_graph_text_collision(
         &self,
-        permit: &ManagedTextWritePermit,
-        target: &Path,
-        target_identity: Option<ContentDigest>,
-    ) -> io::Result<Vec<PageEntry>> {
-        let target_relative = self.rel_path(target);
-        let (entries, identities) = self.graph_text_inventory(permit)?;
-        for entry in &entries {
-            if entry.path == target {
-                continue;
-            }
-            if target_identity.is_some() && identities.get(&entry.path).copied() == target_identity
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} and {target_relative}",
-                        entry.rel_path
-                    ),
-                ));
-            }
-        }
-        Ok(entries)
+        _permit: &ManagedTextWritePermit,
+        _target: &Path,
+        _target_identity: Option<ContentDigest>,
+    ) -> io::Result<()> {
+        // A manifested projection is already bound to one exact accepted page
+        // path and publishes through retained no-follow directory capabilities.
+        // Discovering whether a non-cooperating actor hard-linked that inode at
+        // some unrelated graph path required a whole-graph inventory on every
+        // projection recheck.  That adversarial alias scenario does not grant
+        // authority over this exact path and is outside the local-user threat
+        // model; the watcher will admit an independently changed sibling in its
+        // normal lane.  Path shape, exact-base, no-clobber publication and final
+        // reread checks remain below.
+        Ok(())
     }
 
     /// Read the parsed ownership evidence once. A clean missing page cache is
@@ -8622,16 +8622,6 @@ impl Graph {
         }
     }
 
-    fn managed_atomic_write(
-        &self,
-        permit: &ManagedTextWritePermit,
-        path: &Path,
-        bytes: &[u8],
-        create_new: bool,
-    ) -> io::Result<()> {
-        self.managed_atomic_write_with_conflict(permit, path, bytes, create_new, None)
-    }
-
     fn validate_direct_creation_proof_before_mutation(
         &self,
         permit: &ManagedTextWritePermit,
@@ -8742,21 +8732,94 @@ impl Graph {
         create_new: bool,
         editor_episode: Option<&ConflictEditorEpisode>,
     ) -> io::Result<()> {
+        self.managed_atomic_write_validated(
+            permit,
+            path,
+            bytes,
+            create_new,
+            editor_episode,
+            GraphTextPublicationValidation::CompleteIndex,
+        )
+    }
+
+    fn managed_atomic_write_from_transaction_inventory(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        create_new: bool,
+    ) -> io::Result<()> {
+        self.managed_atomic_write_validated(
+            permit,
+            path,
+            bytes,
+            create_new,
+            None,
+            GraphTextPublicationValidation::TransactionInventory,
+        )
+    }
+
+    fn managed_atomic_write_validated(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        create_new: bool,
+        editor_episode: Option<&ConflictEditorEpisode>,
+        validation: GraphTextPublicationValidation,
+    ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         // Establish the retained baseline before creating the staged inode. The
         // temp name is deliberately outside the graph-text namespace, but its
         // physical identity would otherwise be captured as a second owner when
         // the staged inode is later published at `path`.
-        let _ = self.guarded_graph_text_identity_index()?;
+        if validation == GraphTextPublicationValidation::CompleteIndex {
+            let _ = self.guarded_graph_text_identity_index()?;
+        }
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &managed_path,
+                create_new,
+            )?;
+        }
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
-        if let Err(error) = self.validate_current_graph_text_collision_strict(
-            permit,
-            path,
-            self.managed_optional_file_identity(permit, path)?,
-        ) {
+        let validation_result = match validation {
+            GraphTextPublicationValidation::CompleteIndex => self
+                .validate_current_graph_text_collision_strict(
+                    permit,
+                    path,
+                    self.managed_optional_file_identity(permit, path)?,
+                )
+                .map(|_| ()),
+            GraphTextPublicationValidation::TransactionInventory => (|| {
+                self.validate_graph_text_portable_aliases_path_local(
+                    permit,
+                    &managed_path,
+                    create_new,
+                )?;
+                if create_new {
+                    match target.parent().symlink_metadata(&target.filename) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error),
+                        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                    }
+                } else {
+                    self.validate_existing_graph_text_target_exact(&target, &managed_path, None)
+                        .map(|_| ())
+                }
+            })(),
+        };
+        if let Err(error) = validation_result {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
@@ -9071,10 +9134,62 @@ impl Graph {
         source: &Path,
         destination: &Path,
     ) -> io::Result<()> {
+        self.managed_move_noreplace_validated(
+            permit,
+            source,
+            destination,
+            GraphTextPublicationValidation::CompleteIndex,
+        )
+    }
+
+    fn managed_move_noreplace_from_transaction_inventory(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        self.managed_move_noreplace_validated(
+            permit,
+            source,
+            destination,
+            GraphTextPublicationValidation::TransactionInventory,
+        )
+    }
+
+    fn managed_move_noreplace_validated(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source: &Path,
+        destination: &Path,
+        validation: GraphTextPublicationValidation,
+    ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
-        let _ = self.guarded_graph_text_identity_index()?;
+        if validation == GraphTextPublicationValidation::CompleteIndex {
+            let _ = self.guarded_graph_text_identity_index()?;
+        }
         let source_path = source.to_path_buf();
         let destination_path = destination.to_path_buf();
+        let source_managed = ManagedPath::parse(self.rel_path(&source_path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text source is not portable: {error}"),
+            )
+        })?;
+        let destination_managed =
+            ManagedPath::parse(self.rel_path(&destination_path)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text destination is not portable: {error}"),
+                )
+            })?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_managed,
+                true,
+            )?;
+        }
         let source = self.managed_target(permit, &source_path, false)?;
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
         let destination = self.managed_target(permit, &destination_path, true)?;
@@ -9084,6 +9199,20 @@ impl Graph {
             Err(error) => return Err(error),
         }
         managed_write_before_mutation_hook()?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
+            self.validate_existing_graph_text_target_exact(&source, &source_managed, None)?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_managed,
+                true,
+            )?;
+            match destination.parent().symlink_metadata(&destination.filename) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            }
+        }
         rename_managed_noreplace(
             source.parent(),
             &source.filename,
@@ -14855,7 +14984,7 @@ impl Graph {
                         self.managed_create_dir_all(&write, parent)?;
                     }
                 }
-                self.managed_atomic_write(
+                self.managed_atomic_write_from_transaction_inventory(
                     &write,
                     &e.dst,
                     e.new_content.as_bytes(),
@@ -14868,7 +14997,9 @@ impl Graph {
                     self.managed_create_dir_all(&write, &trash)?;
                     let src_name = e.src.file_name().and_then(|s| s.to_str()).unwrap_or("page");
                     let staged = trash.join(format!("{}__rename__{src_name}", trash_stamp()));
-                    self.managed_move_noreplace(&write, &e.src, &staged)?;
+                    self.managed_move_noreplace_from_transaction_inventory(
+                        &write, &e.src, &staged,
+                    )?;
                     written.last_mut().unwrap().1 = Some(staged.clone());
                     // If a sync replacement won just before the atomic move, the
                     // staged bytes no longer match our baseline. Abort and restore
@@ -14889,7 +15020,10 @@ impl Graph {
                 if e.is_move && e.dst != e.src {
                     let source_restored = match staged_source {
                         Some(staged) => {
-                            self.managed_move_noreplace(&write, staged, &e.src).is_ok()
+                            self.managed_move_noreplace_from_transaction_inventory(
+                                &write, staged, &e.src,
+                            )
+                            .is_ok()
                                 || self.managed_exists(&write, &e.src).unwrap_or(false)
                         }
                         None => self.managed_exists(&write, &e.src).unwrap_or(false),
@@ -14913,7 +15047,12 @@ impl Graph {
                         .unwrap_or(false)
                     {
                         self.note_self_write(&e.dst, content_rev(&e.orig));
-                        let _ = self.managed_atomic_write(&write, &e.dst, e.orig.as_bytes(), false);
+                        let _ = self.managed_atomic_write_from_transaction_inventory(
+                            &write,
+                            &e.dst,
+                            e.orig.as_bytes(),
+                            false,
+                        );
                     } else {
                         self.recent_writes.lock().unwrap().remove(&e.dst);
                     }
@@ -15363,6 +15502,24 @@ impl Graph {
         let assets = fs::canonicalize(self.assets_path())?;
         let path = fs::canonicalize(self.assets_path().join(relative))?;
         if !path.starts_with(&assets) || !fs::metadata(&path)?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid asset"));
+        }
+        Ok(path)
+    }
+
+    /// Resolve an asset path (regular file OR directory inside the approved
+    /// assets root) for the OS opener. An empty name is the assets root itself:
+    /// OG opens the empty `[...](./assets/)` link in the file manager (GH #367).
+    /// Reads/streaming keep `asset_file_for_read`'s regular-file gate; the
+    /// containment check is identical, so a symlink cannot escape assets/.
+    pub fn asset_path_for_open(&self, name: &str) -> io::Result<PathBuf> {
+        let assets = fs::canonicalize(self.assets_path())?;
+        if name.is_empty() {
+            return Ok(assets);
+        }
+        let relative = relative_asset_path(name)?;
+        let path = fs::canonicalize(self.assets_path().join(relative))?;
+        if !path.starts_with(&assets) || !(path.is_file() || path.is_dir()) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid asset"));
         }
         Ok(path)
@@ -16522,6 +16679,11 @@ impl Graph {
         known_attempts: &[ProjectionAttemptReservation],
         evidence_publisher: Option<&ProjectionRecoveryEvidencePublisher<'_>>,
     ) -> io::Result<ProjectionWriteProof> {
+        // Collision authority, the exact filesystem replacement, and retained
+        // identity-index publication form one resource-wide transaction.  This
+        // is the same boundary used by Direct Files writes; projection must not
+        // substitute repeated whole-graph inventories for it.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         require_projection_platform()?;
         if usize_to_u64(target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
             return Err(projection_semantic_refusal(
@@ -16951,6 +17113,13 @@ impl Graph {
                 result
             },
         )?;
+        // Managed projection owns the exact path while the Direct Files writer
+        // gate is closed. Do not try to rebuild/update the Direct Files identity
+        // index through that closed gate; invalidate it so a later regime switch
+        // rebuilds once from the then-current tree.
+        self.invalidate_guarded_graph_text_identity(
+            "managed projection changed an exact graph-text identity",
+        );
         self.drop_self_write_marker(&target_path.absolute_path, &rev);
         Ok(proof)
     }
@@ -32598,10 +32767,13 @@ mod tests {
             has("linear ip", "Linear IP"),
             "bracketed tags:: value should appear"
         );
-        assert!(has("lp survey", "LP Survey"), "alias:: value should appear");
         assert!(
-            has("paper notes", "Paper Notes"),
-            "aliases:: value should appear"
+            has("lp survey", "paper"),
+            "alias:: query should navigate to its owning page"
+        );
+        assert!(
+            has("paper notes", "paper"),
+            "aliases:: query should navigate to its owning page"
         );
         assert!(
             !has("private", "Private"),
@@ -35339,6 +35511,100 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// REG-DIRECT-RENAME-RETAINED-SHADOW-LIMIT-364 causal witness. A rename
+    /// already performs one bounded, no-follow inventory and exact per-file
+    /// rechecks. Its nested publication primitives must not attempt to build a
+    /// second whole-graph retained-shadow index merely to write those files.
+    #[test]
+    fn rename_transaction_does_not_build_the_guarded_graph_index() {
+        let dir = scratch("rename-without-guarded-graph-index");
+        fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+        fs::write(dir.join("pages/Other.md"), "- see [[Alpha]] here\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        let before = graph.guarded_graph_text_identity_report();
+        GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
+            .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        graph
+            .rename_page("Alpha", "Beta")
+            .expect("bounded rename must not enter retained-shadow construction");
+        let after = graph.guarded_graph_text_identity_report();
+
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(
+            GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
+            Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
+            "rename consumed the retained-shadow capture hook"
+        );
+        assert!(!dir.join("pages/Alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+            "- alpha body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Other.md")).unwrap(),
+            "- see [[Beta]] here\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rename_transaction_inventory_still_refuses_physical_file_aliases() {
+        let dir = scratch("rename-inventory-hardlink-refusal");
+        let alpha = dir.join("pages/Alpha.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&alpha, "- alpha body\n").unwrap();
+        fs::hard_link(&alpha, &alias).unwrap();
+        let before = regular_file_tree(&dir.join("pages"));
+
+        let error = Graph::open(&dir).rename_page("Alpha", "Beta").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("alias one resource"));
+        assert_eq!(regular_file_tree(&dir.join("pages")), before);
+        assert!(!dir.join("pages/Beta.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reporter-shape receipt for GH #364. This is intentionally an explicit
+    /// release-gate probe rather than a per-commit unit test: creating 13,000
+    /// files is real filesystem work, while the causal no-index test above is
+    /// fast enough for the ordinary suite.
+    #[test]
+    #[ignore = "large reporter-shape regression; run before release"]
+    fn rename_transaction_succeeds_on_thirteen_thousand_page_graph() {
+        const PAGE_COUNT: usize = 13_000;
+        let dir = scratch("rename-thirteen-thousand-pages");
+        fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+        for index in 1..PAGE_COUNT {
+            let body = if index == PAGE_COUNT - 1 {
+                "- final reference [[Alpha]]\n"
+            } else {
+                "- unrelated\n"
+            };
+            fs::write(dir.join("pages").join(format!("Page{index:05}.md")), body).unwrap();
+        }
+        let graph = Graph::open(&dir);
+        let started = std::time::Instant::now();
+        graph
+            .rename_page("Alpha", "Beta")
+            .expect("13k-page Direct Files rename must remain bounded");
+        let elapsed = started.elapsed();
+
+        assert!(!dir.join("pages/Alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+            "- alpha body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Page12999.md")).unwrap(),
+            "- final reference [[Beta]]\n"
+        );
+        assert_eq!(regular_file_tree(&dir.join("pages")).len(), PAGE_COUNT);
+        eprintln!("GH #364 13k-page rename completed in {elapsed:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rename_rolls_back_destination_when_source_remove_fails() {
         let dir = scratch("rename-remove-failure");
@@ -37699,6 +37965,48 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn asset_path_for_open_accepts_files_directories_and_the_assets_root() {
+        // GH #367: the OS opener accepts a regular file, a nested directory,
+        // and the empty name (the assets root, OG's `[...](./assets/)`), while
+        // keeping the read-path's regular-file gate and traversal rejection.
+        let dir = scratch("asset-open");
+        let graph = Graph::open(&dir);
+        let nested_dir = dir.join("assets/some dir/报表");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let file = dir.join("assets/some dir/报表/API ref.docx");
+        fs::write(&file, b"doc").unwrap();
+        let assets = dir.join("assets").canonicalize().unwrap();
+
+        assert_eq!(graph.asset_path_for_open("").unwrap(), assets);
+        assert_eq!(
+            graph.asset_path_for_open("some dir").unwrap(),
+            dir.join("assets/some dir").canonicalize().unwrap()
+        );
+        assert_eq!(
+            graph.asset_path_for_open("some dir/报表").unwrap(),
+            nested_dir
+        );
+        assert_eq!(
+            graph
+                .asset_path_for_open("some dir/报表/API ref.docx")
+                .unwrap(),
+            file
+        );
+
+        for bad in ["../outside", "/outside", "back\\slash.png", "missing.png"] {
+            assert!(
+                graph.asset_path_for_open(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // The regular-file gate for reads is unchanged by the opener route.
+        assert!(graph.read_asset("").is_err());
+        assert!(graph.read_asset("some dir").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn nested_asset_reads_cannot_follow_a_symlink_outside_assets() {
@@ -39866,7 +40174,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         // A same-inode alias introduced in the corresponding removal window
-        // likewise blocks retirement and preserves the exact inode at both names.
+        // does not expand exact-path authority into a directory-wide inode
+        // search. Retire the accepted target, preserve its bytes as recovery
+        // evidence, and leave the independently named alias untouched.
         let dir = scratch("projection-controllable-remove-window");
         let target = dir.join("pages/LateRemove.md");
         let alias = dir.join("pages/LateRemoveAlias.md");
@@ -39881,30 +40191,26 @@ mod tests {
             let alias = alias.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::hard_link(target, alias)));
         });
-        assert_eq!(
-            graph
-                .remove_projection_exact("pages/LateRemove.md", b"- base\n")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
+        graph
+            .remove_projection_exact("pages/LateRemove.md", b"- base\n")
+            .unwrap();
+        assert!(!target.exists());
         assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
         assert_eq!(
             canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
             identity
         );
-        assert_eq!(graph.cache_generation(), generation);
+        assert!(projection_recovery_bytes(alias.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
+        assert!(graph.cache_generation() > generation);
         fs::remove_file(&alias).unwrap();
-        graph
-            .remove_projection_exact("pages/LateRemove.md", b"- base\n")
-            .unwrap();
-        assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
 
         // Force an unwind after retirement, then introduce a hard-link alias
-        // only in the restoration window. Restoration must remain blocked and
-        // the exact retired inode must stay durable until disambiguation.
+        // only in the restoration window. Exact-path authority restores the
+        // accepted target without treating the independently named alias as a
+        // graph-wide collision.
         let dir = scratch("projection-controllable-restore-window");
         let target = dir.join("pages/LateRestore.md");
         let alias = dir.join("pages/LateRestoreAlias.md");
@@ -39943,28 +40249,21 @@ mod tests {
             .remove_projection_exact("pages/LateRestore.md", b"- base\n")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-        assert!(error
-            .to_string()
-            .contains("graph-aware projection restoration blocked"));
-        assert!(!target.exists());
+        assert_eq!(error.to_string(), "injected post-retirement unwind");
+        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
         assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-        let recovery = projection_recovery_paths(target.parent().unwrap())
-            .into_iter()
-            .find(|path| fs::read(path).unwrap() == b"- base\n")
-            .unwrap();
         assert_eq!(
             canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
             original_identity
         );
-        assert_eq!(
-            canonical_projection_file_resource_id(&fs::File::open(&recovery).unwrap()).unwrap(),
-            original_identity
-        );
+        assert!(projection_recovery_bytes(target.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
         assert_eq!(graph.cache_generation(), generation);
         assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
         fs::remove_file(&alias).unwrap();
         graph
-            .recover_removed_projection_exact("pages/LateRestore.md", b"- base\n")
+            .recover_projection_exact("pages/LateRestore.md", b"- base\n")
             .unwrap();
         let _ = fs::remove_dir_all(&dir);
 
@@ -40470,7 +40769,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exact_projection_authority_ignores_portable_losers_but_rejects_resource_aliases() {
+    fn exact_projection_authority_ignores_portable_losers_and_resource_aliases() {
         // Exact creation grants no authority over the portable loser.
         let dir = scratch("projection-late-collision-write");
         let graph = Graph::open(&dir);
@@ -40487,7 +40786,8 @@ mod tests {
         assert!(projection_recovery_bytes(alias.parent().unwrap()).is_empty());
         let _ = fs::remove_dir_all(&dir);
 
-        // Removal: a newly-created hard link is a late same-resource alias.
+        // Removal owns the exact accepted path. A newly-created hard link is a
+        // separately named survivor, not a reason to scan every graph sibling.
         let dir = scratch("projection-late-collision-remove");
         let target = dir.join("pages/ProjectionRemove.md");
         let alias = dir.join("pages/ProjectionRemoveAlias.md");
@@ -40496,21 +40796,16 @@ mod tests {
         graph.warm_cache();
         fs::hard_link(&target, &alias).unwrap();
         let generation = graph.cache_generation();
-        let disk_revs = graph.disk_revs.read().unwrap().clone();
-        let error = graph
-            .remove_projection_exact("pages/ProjectionRemove.md", b"- base\n")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
-        assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-        assert!(projection_recovery_bytes(target.parent().unwrap()).is_empty());
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), disk_revs);
-        fs::remove_file(&alias).unwrap();
         graph
             .remove_projection_exact("pages/ProjectionRemove.md", b"- base\n")
             .unwrap();
         assert!(!target.exists());
+        assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
+        assert!(projection_recovery_bytes(alias.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
+        assert!(graph.cache_generation() > generation);
+        fs::remove_file(&alias).unwrap();
         let _ = fs::remove_dir_all(&dir);
 
         // Present-target recovery proves only the accepted exact path.
@@ -41750,6 +42045,33 @@ mod tests {
             assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// GH #366's literal reporter page name. Unicode itself must not make an
+    /// otherwise ordinary Direct Files creation ambiguous; the neighboring test
+    /// retains the fail-closed NFC/NFD collision boundary.
+    #[test]
+    fn direct_creation_round_trips_a_chinese_page_name() {
+        let dir = scratch("creation-chinese-page-name");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let page = direct_save_bench_new_page("TINE版本更新提示词");
+
+        graph.save_page(&page, None).unwrap();
+
+        let path = dir.join("pages/TINE版本更新提示词.md");
+        assert!(path.exists());
+        assert_eq!(
+            graph
+                .load_named("TINE版本更新提示词", PageKind::Page)
+                .unwrap()
+                .unwrap()
+                .blocks[0]
+                .raw,
+            "created"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -44345,12 +44667,8 @@ mod tests {
             .unwrap();
         let without_siblings = PROJECTION_EXACT_OPEN_COUNT.with(std::cell::Cell::get);
         assert!(
-            with_siblings >= without_siblings + 10_000,
-            "current collision authority must inspect every physical owner"
-        );
-        assert!(
-            with_siblings <= without_siblings + 20_000,
-            "initial and final collision validation must stay bounded to two metadata passes: with_siblings={with_siblings}, without_siblings={without_siblings}"
+            with_siblings <= without_siblings + 16,
+            "exact-path collision authority must not scan unrelated siblings: with_siblings={with_siblings}, without_siblings={without_siblings}"
         );
 
         let _ = fs::remove_dir_all(&dir);

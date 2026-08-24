@@ -5,6 +5,7 @@ import { openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
+import { internalLinkDest } from "../linkGesture";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 import {
   classifyReferenceLoadError,
@@ -242,7 +243,13 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
           const entry = rootEntry(g, b);
           const facets = new Set(entry.facets.map(norm));
           const contentMatches = !searching || matcherMatches(parsed, entry.normalizedText, entry.text);
-          return contentMatches && ins.every((i) => facets.has(i)) && outs.every((o) => !facets.has(o));
+          // GH #273: positive include chips OR — a backlink stays when ANY
+          // included page/tag is present, and zero positive chips leaves the
+          // facet side unconstrained (today's behavior). Exclude chips stay
+          // cumulative and the text filter stays conjunctive with the facets.
+          return contentMatches
+            && (ins.length === 0 || ins.some((i) => facets.has(i)))
+            && outs.every((o) => !facets.has(o));
         }),
       }))
       .map((g) => {
@@ -420,7 +427,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                     type="button"
                     class="reference-page"
                     onClick={(e) => {
-                      if (e.shiftKey) openPageInSidebar(group().page, group().kind);
+                      const dest = internalLinkDest(e);
+                      if (dest === "sidebar") openPageInSidebar(group().page, group().kind);
+                      else if (dest === "background") openPageInNewTab(group().page, group().kind);
                       else openPage(group().page, group().kind);
                     }}
                     onAuxClick={(e) => {
