@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -218,6 +218,9 @@ const NAMED: PageDto[] = [
     name: "Tine",
     kind: "page",
     title: "Tine",
+    // Explicit path so the `?conflicts` VCS-marker demo entry below can
+    // reference this page (the banner matches by loaded file path).
+    path: "pages/Tine.md",
     pre_block: "title:: Tine\ntags:: project, tooling",
     blocks: [
       b("A fast clone of [[Logseq]] built with **Tauri** + *SolidJS*.", [
@@ -742,10 +745,10 @@ export function mockBackend(): Backend {
     async openGraphWindow() {
       return { kind: "focused_existing" as const, window_label: "main" };
     },
-    async startupGraphPath(_attempt: number) {
+    async startupGraphPath() {
       return "/mock/graph";
     },
-    async onStartupProgress() {
+    async onStorageTransition() {
       return () => {};
     },
     async captureTarget() {
@@ -901,6 +904,58 @@ export function mockBackend(): Backend {
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
       return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
     },
+    async moveManagedApplicationSubtrees(
+      bindingGeneration: number,
+      request: ManagedApplicationMoveSubtreesRequest,
+    ): Promise<ManagedApplicationMoveSubtreesResult> {
+      return {
+        binding_generation: bindingGeneration,
+        application_page_admission: { binding_generation: bindingGeneration, authority: "direct" },
+        outcome: {
+          status: "no_commit",
+          episode_id: request.episode_id,
+          reason: "admission_changed",
+        },
+      };
+    },
+    async recoverManagedApplicationSubtrees(
+      bindingGeneration: number,
+      request: ManagedApplicationMoveSubtreesRequest,
+    ): Promise<ManagedApplicationMoveSubtreesRecoveryResult> {
+      const applicationPageAdmission = {
+        binding_generation: bindingGeneration,
+        authority: "managed_unavailable" as const,
+      };
+      return {
+        previous_binding_generation: bindingGeneration,
+        binding_generation: bindingGeneration,
+        status: {
+          ...sparseV2,
+          binding_generation: bindingGeneration,
+          application_page_admission: applicationPageAdmission,
+        },
+        application_page_admission: applicationPageAdmission,
+        episode_id: request.episode_id,
+        outcome: {
+          status: "no_commit",
+          episode_id: request.episode_id,
+          reason: "admission_changed",
+        },
+      };
+    },
+    async preflightManagedPageMutation(page, baseRevision, bindingGeneration) {
+      if (sparseV2.application_page_admission.authority !== "managed_writable"
+          || sparseV2.binding_generation !== bindingGeneration) {
+        return { status: "refused" as const };
+      }
+      return {
+        status: "accepted" as const,
+        binding_generation: bindingGeneration,
+        page_name: page.name,
+        page_path: page.path ?? "",
+        base_revision: baseRevision,
+      };
+    },
     async sparseV2Status() {
       return sparseV2;
     },
@@ -937,6 +992,7 @@ export function mockBackend(): Backend {
           shared_role: null,
           shared_phase: null,
           provider_pending: 0,
+          provider_runnable: false,
         },
         can_activate: false,
         can_retry: false,
@@ -1018,6 +1074,27 @@ export function mockBackend(): Backend {
         },
       };
       return sparseV2;
+    },
+    async adoptSparseV2Shared() {
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "joiner",
+          shared_phase: "active",
+        },
+      };
+      return {
+        status: sparseV2,
+        binding_generation: sparseV2.binding_generation,
+        archive_location: "/mock/app-data/managed-recovery/graph-0",
+        adoption_statement:
+          "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived and was not merged.",
+      };
+    },
+    async sparseV2RecoveryLocation() {
+      return "/mock/app-data/managed-recovery";
     },
     async sparseV2Query() {
       return { kind: "pages", value: [] };
@@ -1595,6 +1672,23 @@ export function mockBackend(): Backend {
         },
       ];
     },
+    async rescanGraphNow(): Promise<number> {
+      // no backend watcher in the browser mock
+      return 1;
+    },
+    async onGraphRescanComplete(_cb: (sequence: number) => void): Promise<() => void> {
+      return () => {};
+    },
+    async listJournalFilenameMigrations() {
+      // Same demo gate as the duplicate-day list: only under `?conflicts`.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        { from: "journals/Thursday, 25-06-2026.org", to: "journals/2026_06_25.org" },
+      ];
+    },
+    async applyJournalFilenameMigrations(): Promise<number> {
+      return 1;
+    },
     async trashJournalFile(): Promise<void> {
       // no-op in the browser mock
     },
@@ -1664,34 +1758,188 @@ export function mockBackend(): Backend {
       if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
       return [
         {
-          path: "pages/Project Plan.sync-conflict-20260705-141233-A1B2C3D.md",
+          path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
           base_name: "Project Plan",
           base_path: "pages/Project Plan.md",
           kind: "page" as const,
-          tag: "sync-conflict-20260705-141233-A1B2C3D",
+          tag: "sync-conflict-20260705-141233-A2B2C3D",
           preview: "Milestones for the launch",
+        },
+      ];
+    },
+    async listVcsMarkerConflicts() {
+      // Same `?conflicts` demo flag as listSyncConflicts above.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        {
+          path: "pages/Tine.md",
+          name: "Tine",
+          kind: "page" as const,
+          markers: ["<<<<<<<", "=======", ">>>>>>>"],
         },
       ];
     },
     async syncConflictDiff() {
       const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      // A 3-way diff (Concord base ledger): only the copy edited row 1, mine
+      // added row 2, the copy added row 3 — each row carries the suggestion
+      // the base justifies, which the modal pre-selects (never auto-applies).
       return {
         base_rev: "mock-sync-diff-rev",
         conflict_rev: "mock-sync-copy-rev",
         rows: [
           { id: "0", kind: "unchanged" as const, mine: v("Milestones for the launch"), theirs: v("Milestones for the launch"), children: [] },
-          { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [] },
-          { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [] },
-          { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [] },
+          { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+          { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
+          { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
         ],
-        mine_pre: "title:: Project Plan",
-        theirs_pre: "title:: Project Plan",
-        pre_differs: false,
+        // The page's OWN properties differ too, so the resolver shows its
+        // pre-block choice — the one thing the retired Settings modal used to
+        // own exclusively (Concord P5).
+        mine_pre: "title:: Project Plan\ntags:: launch",
+        theirs_pre: "title:: Project Plan\ntags:: launch, marketing",
+        pre_differs: true,
         blocks_identical: false,
+        three_way: true,
       };
     },
-    async resolveSyncConflict(): Promise<void> {
+    async textBlockDiff(mine: string, theirs: string) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const same = mine === theirs;
+      return {
+        base_rev: "mock-text-diff-mine",
+        conflict_rev: "mock-text-diff-theirs",
+        rows: [{ id: "0", kind: same ? ("unchanged" as const) : ("modified" as const), mine: v(mine), theirs: v(theirs), children: [] }],
+        mine_pre: null,
+        theirs_pre: null,
+        pre_differs: false,
+        blocks_identical: same,
+      };
+    },
+    async textBlockDiff3(base: string, mine: string, theirs: string) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const same = mine === theirs;
+      const mineChanged = mine !== base;
+      const theirsChanged = theirs !== base;
+      const suggestion = same || (mineChanged && theirsChanged) ? undefined : mineChanged ? ("mine" as const) : ("theirs" as const);
+      return {
+        base_rev: "mock-text-diff-mine",
+        conflict_rev: "mock-text-diff-theirs",
+        rows: [{ id: "0", kind: same ? ("unchanged" as const) : ("modified" as const), mine: v(mine), theirs: v(theirs), children: [], suggestion }],
+        mine_pre: null,
+        theirs_pre: null,
+        pre_differs: false,
+        blocks_identical: same,
+        three_way: true,
+      };
+    },
+    async liveSaveConflictDiff(page: PageDto) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const mine = page.blocks[0]?.raw ?? "";
+      return {
+        base_rev: "mock-live-disk",
+        conflict_rev: "mock-live-draft",
+        rows: [{ id: "0", kind: "modified" as const, mine: v(mine), theirs: v("Changed on disk"), children: [] }],
+        mine_pre: page.pre_block,
+        theirs_pre: page.pre_block,
+        pre_differs: false,
+        blocks_identical: false,
+        three_way: true,
+      };
+    },
+    async captureLiveSaveConflict(page: PageDto) {
+      const diff = await this.liveSaveConflictDiff(page, null, 1);
+      return { diff, base_text: null, disk_rev: diff.conflict_rev };
+    },
+    async durableLiveSaveConflictDiff(page: PageDto) {
+      return this.liveSaveConflictDiff(page, null, 1);
+    },
+    async resolveDurableLiveSaveConflict(page) {
+      return { ...page, rev: "mock-live-resolved" };
+    },
+    async resolveLiveSaveConflict(page) {
+      return { ...page, rev: "mock-live-resolved" };
+    },
+    async conflictQueue() {
+      // Same `?conflicts` demo flag as the two listings above; the queue is
+      // derived from exactly them, so the demo stays consistent.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        {
+          id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+          source: "sync-copy" as const,
+          page_name: "Project Plan",
+          page_path: "pages/Project Plan.md",
+          kind: "page" as const,
+          sides: [
+            { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
+            {
+              role: "theirs" as const,
+              label: "sync-conflict-20260705-141233-A2B2C3D",
+              path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            },
+            { role: "base" as const, label: "Last agreed version" },
+          ],
+          block_conflicts: 3,
+        },
+        {
+          id: "markers:pages/Tine.md",
+          source: "vcs-markers" as const,
+          page_name: "Tine",
+          page_path: "pages/Tine.md",
+          kind: "page" as const,
+          sides: [
+            { role: "mine" as const, label: "HEAD" },
+            { role: "theirs" as const, label: "feature/concord" },
+          ],
+          block_conflicts: 1,
+          markers: ["<<<<<<<", "=======", ">>>>>>>"],
+        },
+      ];
+    },
+    async vcsMarkerConflictDiff(path: string) {
+      if (path !== "pages/Tine.md") return null;
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      return {
+        mine_label: "HEAD",
+        theirs_label: "feature/concord",
+        regions: 1,
+        // A diff3-style marker block: it carried its own common ancestor, so
+        // rows only one side touched arrive already decided, and only the row
+        // both sides rewrote still needs a real choice (→ keep-both).
+        diff: {
+          base_rev: "mock-marker-rev",
+          conflict_rev: "mock-marker-rev",
+          rows: [
+            { id: "0", kind: "unchanged" as const, mine: v("A local-first outliner"), theirs: v("A local-first outliner"), children: [] },
+            { id: "1", kind: "modified" as const, mine: v("Fast on very big graphs"), theirs: v("Fast on big graphs"), children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
+            { id: "2", kind: "modified" as const, mine: v("Reads a real Logseq graph"), theirs: v("Reads a real Logseq graph, Markdown and Org"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+            { id: "3", kind: "modified" as const, mine: v("Written in Rust and SolidJS"), theirs: v("Built on Tauri"), children: [], verdict: "both-changed" as const },
+          ],
+          // The page's own properties diverged too, so the resolver shows its
+          // pre-block choice — the one capability the retired Settings modal
+          // used to own exclusively (Concord P5).
+          mine_pre: "title:: Tine\ntags:: outliner",
+          theirs_pre: "title:: Tine\ntags:: outliner, concord",
+          pre_differs: true,
+          blocks_identical: false,
+          three_way: true,
+        },
+      };
+    },
+    async resolveVcsMarkerConflict(): Promise<void> {
       // no-op in the browser mock
+    },
+    async resolveSyncConflict(winner: string): Promise<PageDto> {
+      return {
+        name: winner.split("/").pop()?.replace(/\.(md|org)$/i, "") ?? "Resolved",
+        kind: "page",
+        title: "Resolved",
+        pre_block: null,
+        path: winner,
+        rev: "mock-resolved-rev",
+        blocks: [],
+      };
     },
     async trashSyncConflict(): Promise<void> {
       // no-op in the browser mock
@@ -1746,6 +1994,9 @@ export function mockBackend(): Backend {
     },
     async onGraphChanged(): Promise<() => void> {
       return () => {}; // no external watcher in the browser mock
+    },
+    async onGraphChangedBulk(): Promise<() => void> {
+      return () => {};
     },
     async onSparseV2Changed(): Promise<() => void> {
       return () => {};

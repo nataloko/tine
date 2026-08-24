@@ -1,14 +1,18 @@
 use crate::settings::{settings_path, update_settings};
 use crate::state::{AppState, GraphSlot, LegacyGraphLease};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{
     SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncWatcherObservation,
 };
-use tine_core::{model::GraphTextExactFeedPathClass, model::PageKind, Graph};
+use tine_core::{
+    model::GraphTextExactFeedPathClass, model::GraphTextExternalObservationTicket, model::PageKind,
+    Graph,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct GraphChange {
@@ -16,6 +20,52 @@ struct GraphChange {
     kind: PageKind,
     created: bool,
     removed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Bulk external revisions (Concord P2, GH #337 / spec L6)
+// ---------------------------------------------------------------------------
+// A VCS checkout, branch switch, or first big sync under a running Tine dumps
+// one file event per touched page. Two per-file costs amplify that: the
+// incremental reconcile branch pays two full reads + a parse per evented path
+// (deliberately no stat shortcut, see `incremental_reconcile`), and the emit
+// side sends one `graph-changed` per changed page, which the frontend answers
+// with one dataRev bump and up to one `getPage` IPC each. Above the threshold
+// both stop scaling per-file: the drained batch escalates to the stat-diff
+// full branch (one consistent snapshot; an unchanged file costs one stat), and
+// the changed pages are announced as ONE `graph-changed-bulk` event.
+
+/// Boundary between "a burst of ordinary edits" and "an external revision".
+///
+/// Sizing: one atomic save produces at most 2 paths; a human-scale sync delta
+/// (Syncthing propagating a session of edits) is single digits to low tens; a
+/// checkout or big sync is typically hundreds. 32 sits between those clusters,
+/// inside the 24–64 band the P2 design allows. The cost of escalating a batch
+/// of 33 is one stat per unwatched-change file (microseconds each, ~2 ms even
+/// on a 1,000-file graph) — cheaper than a single page's double-read — so the
+/// exact value only needs to keep ordinary edits per-file, not be optimal.
+const BULK_CHANGE_THRESHOLD: usize = 32;
+
+/// Does a drained batch of this many owned event paths escalate to the full
+/// stat-diff branch?
+fn burst_escalates(owned_paths: usize) -> bool {
+    owned_paths > BULK_CHANGE_THRESHOLD
+}
+
+/// Does a reconcile cycle that changed this many pages coalesce its frontend
+/// notification into one aggregate event? Same boundary as `burst_escalates`,
+/// deliberately: below it nothing about today's behavior changes.
+fn emit_as_bulk(changed_pages: usize) -> bool {
+    changed_pages > BULK_CHANGE_THRESHOLD
+}
+
+/// One aggregate frontend notification for a reconcile cycle that changed more
+/// than `BULK_CHANGE_THRESHOLD` pages. Carries the full per-page change list so
+/// the frontend can reload visible pages, run the dirty-page safety machinery,
+/// and summarize the rest — without N events.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct GraphChangedBulk {
+    changes: Vec<GraphChange>,
 }
 
 /// Every sparse-runtime watcher event is scoped to the graph binding that
@@ -64,8 +114,19 @@ struct SparseV2ErrorEvent {
 struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
+    /// Highest raw-callback frontier admitted into this pending batch for each
+    /// Direct graph root. The callback records this while holding the same
+    /// mutex used to add its notify event, so a drained batch can never
+    /// acknowledge an event that is still waiting to enter the queue.
+    legacy_observation_epochs: HashMap<PathBuf, GraphTextExternalObservationTicket>,
     need_full: bool,
     notify_error: bool,
+    /// When the FIRST notify callback of the batch currently accumulating
+    /// arrived (monotonic). Taken together with the paths at drain time, so a
+    /// latency receipt can attribute callback→reconcile time (the coalescing
+    /// window plus any scheduling delay). One `Instant` per batch — per-path
+    /// stamps would allocate on the hot path for no diagnostic gain.
+    first_event_at: Option<Instant>,
 }
 
 /// Resolve the filesystem watcher inputs for an existing Direct Files binding.
@@ -78,7 +139,14 @@ fn direct_watch_paths(slot: &GraphSlot) -> Result<(LegacyGraphLease, PathBuf), S
 }
 
 impl Pending {
+    fn note_event_arrival(&mut self) {
+        if self.first_event_at.is_none() {
+            self.first_event_at = Some(Instant::now());
+        }
+    }
+
     fn add_event(&mut self, event: notify::Event) {
+        self.note_event_arrival();
         if event.need_rescan() {
             if event.paths.is_empty() {
                 self.need_full = true;
@@ -99,9 +167,203 @@ impl Pending {
     }
 
     fn add_notify_error(&mut self) {
+        self.note_event_arrival();
         self.need_full = true;
         self.notify_error = true;
     }
+
+    fn add_legacy_observations(
+        &mut self,
+        observations: Vec<(PathBuf, GraphTextExternalObservationTicket)>,
+    ) {
+        for (root, ticket) in observations {
+            self.legacy_observation_epochs
+                .entry(root)
+                .and_modify(|current| {
+                    *current = current.later_for_same_instance(ticket).unwrap_or(ticket)
+                })
+                .or_insert(ticket);
+        }
+    }
+
+    fn take_legacy_observation_epochs(
+        &mut self,
+    ) -> HashMap<PathBuf, GraphTextExternalObservationTicket> {
+        std::mem::take(&mut self.legacy_observation_epochs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watcher latency receipts (GH #337 diagnosis)
+// ---------------------------------------------------------------------------
+// The reported 5–20 s external-change latency on Windows is unexplained by a
+// pipeline whose design floor is ~200 ms (inotify coalescing) / 3 s (poll), and
+// nothing measured the pipeline. These receipts are cheap and always on: one
+// monotonic stamp when the first notify callback of a batch arrives, one when
+// its post-debounce reconcile starts, one when its `graph-changed` events have
+// been emitted. Each external-change batch logs one structured line (via
+// `debug::diag`, so `--debug` captures it in the log file a reporter can send)
+// and lands in a small in-memory ring the `watcher_latency_recent` command
+// returns. No extra reads, no per-path allocation.
+
+/// One external-change batch, as the reconcile loop experienced it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct WatcherLatencyReceipt {
+    /// Monotonically increasing receipt number (process-wide).
+    seq: u64,
+    /// Wall-clock time the receipt was recorded (Unix ms) — to correlate with
+    /// the reporter's "I saved the file at ...".
+    at_unix_ms: u64,
+    /// Graph label the batch was reconciled for.
+    graph: String,
+    /// "inotify" or "poll".
+    mode: &'static str,
+    /// `graph-changed` events emitted for this batch.
+    pages: usize,
+    /// Exact event paths this graph owned in the batch (0 for a pure full diff).
+    event_paths: usize,
+    /// Whether the full stat-diff branch was taken (poll cycle, unclassifiable
+    /// event, kernel queue overflow, retry, or a burst-escalated batch above
+    /// `BULK_CHANGE_THRESHOLD`).
+    full_diff: bool,
+    /// Reconcile errors in this batch (each schedules a backoff retry — a
+    /// latency source worth seeing in a receipt trail).
+    errors: usize,
+    /// First notify callback → reconcile start (debounce + scheduling). `None`
+    /// when no callback stamp exists for the batch: poll mode, or a cycle
+    /// triggered by retry/control rather than an OS event.
+    event_to_reconcile_ms: Option<u64>,
+    /// Reconcile start → last `graph-changed` emitted (read + parse + emit).
+    reconcile_ms: u64,
+    /// First notify callback → last emit; the number GH #337 reports as 5–20 s.
+    event_to_emit_ms: Option<u64>,
+}
+
+/// Concord L0's reload-on-focus fallback. Some filesystems and sync clients
+/// deliver no inotify edge at all (network mounts, a suspended app, a client
+/// that writes through a path the kernel doesn't report), so the ONE thing the
+/// user can always do — come back to the window — has to be able to ask.
+///
+/// This asks the watcher for one full stat-diff pass on its next cycle. It does
+/// NOT invent a second freshness path: whatever the diff finds is emitted as
+/// ordinary `graph-changed` / `graph-changed-bulk` events, so a page being
+/// edited is deferred by the P1 replay machinery exactly as for a live event,
+/// and a caret is never stolen.
+static FULL_RESCAN_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static FULL_RESCAN_COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct GraphRescanComplete {
+    sequence: u64,
+}
+
+/// Request that one full rescan. Pair with `state::poke_watcher` — this only
+/// arms the flag; the poke is what wakes the loop to read it.
+pub(crate) fn request_full_rescan() -> u64 {
+    FULL_RESCAN_REQUESTED.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Snapshot the newest explicit request not yet completed. Several focus and
+/// visibility notifications may arrive before one watcher turn; one full pass
+/// satisfies all of them and publishes the newest sequence.
+fn pending_full_rescan() -> Option<u64> {
+    let requested = FULL_RESCAN_REQUESTED.load(Ordering::SeqCst);
+    (requested > FULL_RESCAN_COMPLETED.load(Ordering::SeqCst)).then_some(requested)
+}
+
+fn complete_full_rescan(app: &tauri::AppHandle, sequence: u64) {
+    FULL_RESCAN_COMPLETED.fetch_max(sequence, Ordering::SeqCst);
+    // Broadcast rather than target one graph window: a request can race a graph
+    // rebind, and every frontend matches the exact sequence it requested.
+    let _ = app.emit("graph-rescan-complete", GraphRescanComplete { sequence });
+}
+
+const LATENCY_RECEIPT_CAP: usize = 64;
+
+static LATENCY_RECEIPTS: OnceLock<Mutex<VecDeque<WatcherLatencyReceipt>>> = OnceLock::new();
+static LATENCY_RECEIPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn latency_receipts() -> &'static Mutex<VecDeque<WatcherLatencyReceipt>> {
+    LATENCY_RECEIPTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(LATENCY_RECEIPT_CAP)))
+}
+
+/// Pure builder so the duration arithmetic is unit-testable. `seq` and
+/// `at_unix_ms` are stamped by `record_latency_receipt`.
+#[allow(clippy::too_many_arguments)]
+fn latency_receipt(
+    graph: &str,
+    inotify: bool,
+    pages: usize,
+    event_paths: usize,
+    full_diff: bool,
+    errors: usize,
+    first_event_at: Option<Instant>,
+    reconcile_started: Instant,
+    emitted_at: Instant,
+) -> WatcherLatencyReceipt {
+    let since = |earlier: Instant, later: Instant| {
+        later.saturating_duration_since(earlier).as_millis() as u64
+    };
+    WatcherLatencyReceipt {
+        seq: 0,
+        at_unix_ms: 0,
+        graph: graph.to_string(),
+        mode: if inotify { "inotify" } else { "poll" },
+        pages,
+        event_paths,
+        full_diff,
+        errors,
+        event_to_reconcile_ms: first_event_at.map(|at| since(at, reconcile_started)),
+        reconcile_ms: since(reconcile_started, emitted_at),
+        event_to_emit_ms: first_event_at.map(|at| since(at, emitted_at)),
+    }
+}
+
+fn push_latency_receipt(
+    ring: &mut VecDeque<WatcherLatencyReceipt>,
+    receipt: WatcherLatencyReceipt,
+) {
+    while ring.len() >= LATENCY_RECEIPT_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(receipt);
+}
+
+fn record_latency_receipt(mut receipt: WatcherLatencyReceipt) {
+    receipt.seq = LATENCY_RECEIPT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    receipt.at_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let stage =
+        |value: Option<u64>| value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"));
+    crate::debug::diag(format!(
+        "watcher-latency seq={} graph={} mode={} pages={} event_paths={} full_diff={} errors={} event->reconcile={} reconcile={}ms event->emit={}",
+        receipt.seq,
+        receipt.graph,
+        receipt.mode,
+        receipt.pages,
+        receipt.event_paths,
+        receipt.full_diff,
+        receipt.errors,
+        stage(receipt.event_to_reconcile_ms),
+        receipt.reconcile_ms,
+        stage(receipt.event_to_emit_ms),
+    ));
+    if let Ok(mut ring) = latency_receipts().lock() {
+        push_latency_receipt(&mut ring, receipt);
+    }
+}
+
+/// Debug command for bug reports: the last 64 external-change latency receipts,
+/// oldest first. A reporter runs it from the devtools console and pastes the
+/// result; no UI surface beyond that.
+#[tauri::command]
+pub(crate) fn watcher_latency_recent() -> Vec<WatcherLatencyReceipt> {
+    latency_receipts()
+        .lock()
+        .map(|ring| ring.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 const RETRY_BACKOFF: [Duration; 6] = [
@@ -214,6 +476,66 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
         && is_page_file_path(Path::new(page_name))
 }
 
+/// Directories whose churn a graph's watcher must never be woken by (Concord
+/// P5). A repository or sync client parked inside the graph tree generates
+/// thousands of events that CANNOT describe graph text — a `git gc`, an index
+/// lock taken and dropped per command, a `.stversions` sweep — and every one of
+/// them used to cross the channel, take the app-state read lock, lease each
+/// graph and run two scope classifications before being discarded.
+///
+/// The scope is deliberately an explicit NAME LIST rather than "anything the
+/// graph-text scope excludes": `.tine-sync` is also excluded from graph text,
+/// but it is Tine's OWN provider tree and the managed lane's observations
+/// depend on those events. A name here must be provably outside graph text on
+/// its own — `vcs_and_tool_noise_dirs_can_never_hold_graph_text` asserts
+/// exactly that against `GraphTextScope`, so this list can never hide a page.
+///
+/// Matched against components of the path RELATIVE to a watched graph root, so
+/// a graph that itself lives under (say) `/repo/.git/notes` is unaffected.
+const VCS_AND_TOOL_NOISE_DIRS: &[&str] = &[
+    ".bzr",
+    ".git",
+    ".hg",
+    ".jj",
+    ".stfolder",
+    ".stversions",
+    ".svn",
+    // NOT `_darcs`: it carries no leading dot and is not in the core's fixed
+    // exclusions, so `_darcs/Page.md` IS eligible graph text. The guard test
+    // below caught it on the first run — which is the whole reason this list is
+    // asserted against `GraphTextScope` rather than assumed.
+    "node_modules",
+];
+
+fn path_is_tool_noise(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        let Some(name) = component.as_os_str().to_str() else {
+            return false;
+        };
+        VCS_AND_TOOL_NOISE_DIRS.contains(&name)
+    })
+}
+
+/// True when EVERY path this event reports is tool noise under some watched
+/// root — the only case it is safe to drop the event outright.
+///
+/// Never true for a rescan-required event (a kernel queue overflow says nothing
+/// about which paths were lost) or a pathless one, and never true for a
+/// multi-path event with even one ordinary path: a rename that moves a file OUT
+/// of `.git` reports both sides and must still be seen.
+fn watch_event_is_tool_noise(event: &notify::Event, roots: &HashSet<PathBuf>) -> bool {
+    if event.need_rescan() || event.paths.is_empty() || roots.is_empty() {
+        return false;
+    }
+    event
+        .paths
+        .iter()
+        .all(|path| roots.iter().any(|root| path_is_tool_noise(root, path)))
+}
+
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 
@@ -316,9 +638,26 @@ struct GraphTextSnapshot {
 }
 
 fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
+    collect_scoped_text_files(
+        &graph.root,
+        &|path| graph.graph_text_watch_descend(path),
+        &|path| graph.graph_text_watch_relevant(path),
+    )
+}
+
+/// The stat sweep both regimes gate their poll cycle on.
+///
+/// `descend`/`relevant` are the only scope authority; the Direct lane passes the
+/// graph's own `GraphTextScope` predicates and the managed lane passes the
+/// deliberately widest ones (see `collect_managed_text_files`).
+fn collect_scoped_text_files(
+    root: &Path,
+    descend: &dyn Fn(&Path) -> bool,
+    relevant: &dyn Fn(&Path) -> bool,
+) -> GraphTextSnapshot {
     let mut files: HashMap<PathBuf, FileStamp> = HashMap::new();
     let mut complete = true;
-    let mut stack = vec![graph.root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
         let Ok(read_dir) = std::fs::read_dir(&directory) else {
             complete = false;
@@ -339,12 +678,12 @@ fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
                 continue;
             };
             if file_type.is_dir() {
-                if graph.graph_text_watch_descend(&path) {
+                if descend(&path) {
                     stack.push(path);
                 }
                 continue;
             }
-            if !file_type.is_file() || !graph.graph_text_watch_relevant(&path) {
+            if !file_type.is_file() || !relevant(&path) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -360,6 +699,80 @@ fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
         }
     }
     GraphTextSnapshot { files, complete }
+}
+
+/// The managed lane has no `Graph` lease here — sparse-v2 owns its graph inside
+/// the actor — so the poll gate cannot ask `Graph::graph_text_watch_relevant`
+/// for the scope. It uses an **unconfigured** `GraphTextScope` instead, which is
+/// a deliberate superset of every configured one: hidden prefixes only ever
+/// remove paths, so a sweep with none configured covers every path any real
+/// configuration could make eligible. Provider conflict copies are folded in for
+/// the same reason the Direct predicate admits them.
+///
+/// A gate that is a superset can only over-arm a rescan. It cannot miss a change
+/// the Direct lane's gate would catch, which is the one thing it must not do.
+fn managed_poll_scope() -> &'static tine_core::graph_text_scope::GraphTextScope {
+    static SCOPE: OnceLock<tine_core::graph_text_scope::GraphTextScope> = OnceLock::new();
+    SCOPE.get_or_init(|| tine_core::graph_text_scope::GraphTextScope::new(&[], false))
+}
+
+fn managed_poll_relative(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let relative = relative.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
+fn managed_poll_descend(root: &Path, path: &Path) -> bool {
+    managed_poll_relative(root, path)
+        .is_some_and(|relative| managed_poll_scope().should_descend(&relative))
+}
+
+fn managed_poll_relevant(root: &Path, path: &Path) -> bool {
+    let Some(relative) = managed_poll_relative(root, path) else {
+        return false;
+    };
+    if managed_poll_scope().is_eligible(&relative) {
+        return true;
+    }
+    if !tine_core::model::path_is_sync_conflict(path) {
+        return false;
+    }
+    let (parent, filename) = match relative.rsplit_once('/') {
+        Some((parent, filename)) => (parent, filename),
+        None => ("", relative.as_str()),
+    };
+    managed_poll_scope().should_descend(parent)
+        && filename.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+                || extension.eq_ignore_ascii_case("org")
+        })
+}
+
+fn collect_managed_text_files(root: &Path) -> GraphTextSnapshot {
+    collect_scoped_text_files(root, &|path| managed_poll_descend(root, path), &|path| {
+        managed_poll_relevant(root, path)
+    })
+}
+
+/// One managed poll cycle's gate decision.
+///
+/// Returns true when this cycle must arm `RescanRequired`. The snapshot is
+/// advanced in place exactly as `full_diff_reconcile` advances the Direct lane's,
+/// so a delta is reported once and then becomes the new baseline.
+fn managed_poll_rescan_required(
+    root: &Path,
+    snap: &mut HashMap<PathBuf, FileStamp>,
+    baseline: &mut bool,
+) -> bool {
+    let current = collect_managed_text_files(root);
+    // No baseline yet, or a walk that could not be read in full: arm. A partial
+    // sweep must never be mistaken for "nothing changed" — same reason
+    // `GraphTextSnapshot::complete` exists for the Direct lane.
+    let armed = !*baseline || !current.complete || current.files != *snap;
+    *snap = current.files;
+    *baseline = true;
+    armed
 }
 
 fn file_snapshot(path: &Path) -> Option<FileStamp> {
@@ -540,11 +953,22 @@ fn publish_poll_observation(
     snap: &HashMap<PathBuf, FileStamp>,
     snapshot: &GraphTextSnapshot,
 ) {
-    let changed = changed_since_snapshot(snap, &snapshot.files);
-    let _ = graph.observe_graph_text_external_paths(
-        changed.iter().map(PathBuf::as_path),
+    let (changed, uncertain) = poll_observation(snap, snapshot);
+    let _ =
+        graph.observe_graph_text_external_paths(changed.iter().map(PathBuf::as_path), uncertain);
+}
+
+/// Reduce a poll scan to the literal observation published to `tine-core`.
+/// Keeping this calculation pure lets the watcher crate prove its routing
+/// contract without requiring access to the core's private retained index.
+fn poll_observation(
+    snap: &HashMap<PathBuf, FileStamp>,
+    snapshot: &GraphTextSnapshot,
+) -> (Vec<PathBuf>, bool) {
+    (
+        changed_since_snapshot(snap, &snapshot.files),
         !snapshot.complete,
-    );
+    )
 }
 
 fn reconcile_pending(
@@ -554,7 +978,7 @@ fn reconcile_pending(
     need_full: bool,
     poll_mode: bool,
 ) -> (Vec<GraphChange>, bool, bool, Vec<String>) {
-    if need_full || paths.is_empty() {
+    if need_full || paths.is_empty() || burst_escalates(paths.len()) {
         let snapshot = collect_graph_text_files(graph);
         if poll_mode {
             publish_poll_observation(graph, snap, &snapshot);
@@ -764,32 +1188,48 @@ fn observe_legacy_graph_text_event(
     if !observation.relevant {
         return false;
     }
-    if observation.uncertain || !observation.exact_paths.is_empty() {
-        let _ = graph.observe_graph_text_external_paths(
-            observation.exact_paths.iter().map(PathBuf::as_path),
-            observation.uncertain,
-        );
+    // The raw platform callback is only an admission barrier. Reading and
+    // semantically parsing an exact path here defeated debounce: reconciliation
+    // read/parsed the same final file again 200 ms later, and a burst paid once
+    // per raw event before bulk coalescing even began. A relevant text event
+    // publishes an O(1) pending epoch so name-only creation refuses during the
+    // debounce window. Only genuinely ambiguous events invalidate the retained
+    // identity index; exact events remain eligible for one exact-path update by
+    // the debounced reconciler.
+    if observation.uncertain {
+        graph.note_graph_text_external_observation();
+        let _ = graph.observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
+    } else if !observation.exact_paths.is_empty() {
+        graph.note_graph_text_external_observation();
     }
     true
 }
 
 /// Linearize a platform callback with guarded graph-text writes before the
-/// watcher's debounce/reconciliation delay. The callback does not mutate the
-/// cache; it only advances the core-owned retained identity generation (or
-/// marks it uncertain) under the same resource-scoped mutation authority that
-/// `Graph::save_page` uses.
-fn observe_legacy_graph_text_callback(app: &tauri::AppHandle, event: Option<&notify::Event>) {
+/// watcher's debounce/reconciliation delay. The callback performs no content
+/// I/O: it publishes an admission epoch (and invalidates retained identity only
+/// when the event is ambiguous) under the same resource-scoped mutation
+/// authority that `Graph::save_page` uses. Debounced reconciliation captures
+/// each final path once.
+fn observe_legacy_graph_text_callback(
+    app: &tauri::AppHandle,
+    event: Option<&notify::Event>,
+) -> Vec<(PathBuf, GraphTextExternalObservationTicket)> {
     let state = app.state::<AppState>();
     let entries = match state.graphs.read() {
         Ok(graphs) => graphs.entries(),
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
+    let mut observations = Vec::new();
     for (_, slot) in entries {
         let Ok((graph, root)) = direct_watch_paths(&slot) else {
             continue;
         };
-        observe_legacy_graph_text_event(&graph, &root, event);
+        if observe_legacy_graph_text_event(&graph, &root, event) {
+            observations.push((root, graph.graph_text_external_observation_ticket()));
+        }
     }
+    observations
 }
 
 fn sparse_observations(
@@ -890,6 +1330,172 @@ fn sparse_provider_observations(
     (exact, imprecise)
 }
 
+fn sparse_provider_lane_is_active(
+    shared_phase: Option<tine_core::sync_runtime::SyncSharedPhase>,
+) -> bool {
+    shared_phase == Some(tine_core::sync_runtime::SyncSharedPhase::Active)
+}
+
+/// Does this watcher turn owe the shared provider an imprecise observation?
+///
+/// Exact notify paths are sufficient while the app is running. They are not
+/// sufficient for the first turn after a SharedActive actor is installed: a
+/// file-sync provider may have delivered bytes while Tine was stopped, before
+/// an inotify watch existed. That first turn must therefore scan the provider
+/// namespace just as poll mode does. Local-only managed storage deliberately
+/// remains outside the provider lane even if another device's namespace is
+/// present in the graph.
+fn sparse_provider_rescan_required(
+    provider_lane_active: bool,
+    initial_tick: bool,
+    provider_imprecise: bool,
+    provider_poll: bool,
+) -> bool {
+    provider_lane_active && (initial_tick || provider_imprecise || provider_poll)
+}
+
+/// A graph reconciliation and a provider rescan may be queued in the same
+/// watcher turn. The actor deliberately admits graph bytes first, so an
+/// `Admitted*` result from that turn does not mean the provider obligation was
+/// consumed. Schedule exactly one continuation; once provider work begins its
+/// ordinary `Recovering` result owns subsequent continuation turns.
+///
+/// `actor_has_runnable_work` is the durable half of that rule
+/// (`SyncRuntimeStatusSnapshot::has_runnable_work`): work the actor already
+/// KNOWS about — a newer watcher epoch queued behind a completed scan, or
+/// provider evidence another device delivered as bytes on disk — is itself a
+/// runnable work source. One tick's result describes only the lane that tick
+/// took, so a receiving device whose tick settled a watcher epoch can still be
+/// holding delivered provider manifests. Nothing on a quiet graph will produce a
+/// later filesystem edge to wake them, so a scheduler that consulted only the
+/// tick result slept forever with the peer's edit undelivered.
+fn sparse_tick_needs_continuation(
+    tick: &SyncRuntimeTick,
+    provider_rescan_queued: bool,
+    actor_has_runnable_work: bool,
+) -> bool {
+    actor_has_runnable_work
+        || matches!(
+            tick,
+            SyncRuntimeTick::LocalMutation(_)
+                | SyncRuntimeTick::ProviderMutation { .. }
+                | SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+        )
+        || (provider_rescan_queued
+            && matches!(
+                tick,
+                SyncRuntimeTick::Idle
+                    | SyncRuntimeTick::AdmittedNoop { .. }
+                    | SyncRuntimeTick::AdmittedComplete { .. }
+            ))
+}
+
+/// The anti-hot-loop half of the same contract.
+///
+/// The provider lane reports `Idle` when its ready queue is empty but pending
+/// batches remain blocked on causal dependencies whose bytes have not been
+/// delivered yet (`tick_provider`'s `ready_front()` miss). That is known work no
+/// tick can advance right now, so the 10ms progress cadence would become a poll
+/// loop against the disk. Retry it on the ordinary backoff schedule instead —
+/// bounded polling, never permanent sleep, and identical to how a
+/// `RecoveryBlocked` provider turn is already paced.
+fn sparse_tick_is_blocked_without_progress(
+    tick: &SyncRuntimeTick,
+    actor_has_runnable_work: bool,
+) -> bool {
+    actor_has_runnable_work && matches!(tick, SyncRuntimeTick::Idle)
+}
+
+/// Has the condition the last emitted error described actually ended?
+///
+/// One tick settles ONE lane. A blocked provider lane and a healthy local lane
+/// therefore interleave: `RecoveryBlocked`, `Idle`, `RecoveryBlocked`, … Reading
+/// any non-blocked tick as "the failure is over" reset the repeat suppression
+/// on every cycle, so ONE permanently blocked condition emitted a fresh
+/// `sparse-v2-error` — and a fresh red toast — for as long as it lasted. The
+/// frontend's own notice de-duplication (`managedStorageRuntime.ts`) cannot see
+/// past this: it is handed genuinely new error events and correctly reports
+/// each one.
+///
+/// `actor_has_runnable_work` is the durable signal that the actor still knows
+/// about work it has not been able to finish, which is exactly the state a
+/// blocked lane holds. A graph that truly recovered drains to no runnable work,
+/// and the next failure after that reports again.
+fn sparse_error_condition_ended(tick: &SyncRuntimeTick, actor_has_runnable_work: bool) -> bool {
+    !matches!(
+        tick,
+        SyncRuntimeTick::RecoveryBlocked(_)
+            | SyncRuntimeTick::Blocked(_)
+            | SyncRuntimeTick::Terminal(_)
+            | SyncRuntimeTick::Failed(_)
+    ) && !actor_has_runnable_work
+}
+
+fn take_sparse_initial_tick(pending: &mut bool) -> bool {
+    std::mem::take(pending)
+}
+
+struct WatchedGraph {
+    legacy_graph: LegacyGraphLease,
+    root: PathBuf,
+    snap: HashMap<PathBuf, FileStamp>,
+    baseline: bool,
+    last_reconcile_error: Option<String>,
+    retry: RetrySchedule,
+    /// Frontier already drained from `Pending` but not yet reconciled
+    /// successfully. It survives retry cycles and is acknowledged only after
+    /// the matching graph batch succeeds.
+    pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
+}
+
+fn route_drained_direct_frontiers(
+    graphs: &mut HashMap<String, WatchedGraph>,
+    latest_entries: Vec<(String, Arc<GraphSlot>)>,
+    drained: &HashMap<PathBuf, GraphTextExternalObservationTicket>,
+) {
+    for (label, slot) in latest_entries {
+        let Ok((latest_graph, root)) = direct_watch_paths(&slot) else {
+            continue;
+        };
+        let Some(ticket) = drained.get(&root).copied() else {
+            continue;
+        };
+        if !latest_graph.owns_graph_text_external_observation_ticket(ticket) {
+            continue;
+        }
+        match graphs.get_mut(&label) {
+            Some(current) if current.root == root => {
+                if !current
+                    .legacy_graph
+                    .owns_graph_text_external_observation_ticket(ticket)
+                {
+                    current.legacy_graph = latest_graph;
+                    current.snap.clear();
+                    current.baseline = false;
+                    current.last_reconcile_error = None;
+                    current.retry = RetrySchedule::default();
+                    current.pending_observation_epoch = None;
+                }
+            }
+            _ => {
+                graphs.insert(
+                    label,
+                    WatchedGraph {
+                        legacy_graph: latest_graph,
+                        root,
+                        snap: HashMap::new(),
+                        baseline: false,
+                        last_reconcile_error: None,
+                        retry: RetrySchedule::default(),
+                        pending_observation_epoch: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -910,26 +1516,27 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
     use notify::Watcher;
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let pending = Arc::new(Mutex::new(Pending::default()));
+    // The roots the OS watcher currently covers, shared with its callback so
+    // the callback can drop VCS/tool noise before it costs anything. Written by
+    // the loop each cycle, read once per event.
+    let watched_roots: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
     if let Ok(mut slot) = app.state::<AppState>().watch_ctl.lock() {
         *slot = Some(tx.clone());
     }
     std::thread::spawn(move || {
-        struct WatchedGraph {
-            legacy_graph: LegacyGraphLease,
-            root: PathBuf,
-            snap: HashMap<PathBuf, FileStamp>,
-            baseline: bool,
-            last_reconcile_error: Option<String>,
-            retry: RetrySchedule,
-        }
-
         struct WatchedSparse {
             handle: SyncRuntimeHandle,
             root: PathBuf,
             binding_generation: u64,
             last_error: Option<String>,
             retry: RetrySchedule,
-            initial_tick: bool,
+            initial_tick_pending: bool,
+            // The managed twin of `WatchedGraph::snap`/`baseline`. Poll mode
+            // used to push `RescanRequired` every cycle unconditionally; it now
+            // arms on the same (mtime, len) stat diff the Direct lane has always
+            // used.
+            snap: HashMap<PathBuf, FileStamp>,
+            baseline: bool,
         }
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
@@ -966,7 +1573,15 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     binding_generation: slot.binding_generation,
                                     last_error: None,
                                     retry: RetrySchedule::default(),
-                                    initial_tick: true,
+                                    // Activation has already proved the exact
+                                    // managed inventory. Start the mandatory
+                                    // watcher-handoff scan immediately; the
+                                    // actor now advances it in bounded turns,
+                                    // so application and enrollment work can
+                                    // run between those turns.
+                                    initial_tick_pending: true,
+                                    snap: HashMap::new(),
+                                    baseline: false,
                                 },
                             );
                         }
@@ -982,6 +1597,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 };
                 match graphs.get_mut(&label) {
                     Some(current) if current.root == root => {
+                        if current.pending_observation_epoch.is_some_and(|ticket| {
+                            !legacy_graph.owns_graph_text_external_observation_ticket(ticket)
+                        }) {
+                            current.pending_observation_epoch = None;
+                        }
                         current.legacy_graph = legacy_graph;
                     }
                     _ => {
@@ -994,6 +1614,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 baseline: false,
                                 last_reconcile_error: None,
                                 retry: RetrySchedule::default(),
+                                pending_observation_epoch: None,
                             },
                         );
                     }
@@ -1013,6 +1634,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 .iter()
                 .map(|(_, root)| root.clone())
                 .collect();
+            if let Ok(mut roots) = watched_roots.lock() {
+                if *roots != desired {
+                    roots.clone_from(&desired);
+                }
+            }
 
             // Bring the OS watcher in line with the current mode + graph roots.
             if inotify {
@@ -1020,13 +1646,28 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     let txc = tx.clone();
                     let pendingc = pending.clone();
                     let appc = app.clone();
+                    let rootsc = watched_roots.clone();
                     watcher =
                         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                            match &res {
-                                Ok(event) => observe_legacy_graph_text_callback(&appc, Some(event)),
-                                Err(_) => observe_legacy_graph_text_callback(&appc, None),
+                            // A repository's own churn is not a graph change.
+                            // Dropped here, before the app-state lock, the graph
+                            // leases, the scope classifications and the wake.
+                            if let Ok(event) = &res {
+                                if rootsc
+                                    .lock()
+                                    .is_ok_and(|roots| watch_event_is_tool_noise(event, &roots))
+                                {
+                                    return;
+                                }
                             }
                             if let Ok(mut p) = pendingc.lock() {
+                                let observations = match &res {
+                                    Ok(event) => {
+                                        observe_legacy_graph_text_callback(&appc, Some(event))
+                                    }
+                                    Err(_) => observe_legacy_graph_text_callback(&appc, None),
+                                };
+                                p.add_legacy_observations(observations);
                                 match res {
                                     Ok(event) => p.add_event(event),
                                     Err(_) => p.add_notify_error(),
@@ -1079,22 +1720,82 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
-            let (paths, full_paths, event_need_full, notify_error) = if inotify {
+            let (
+                paths,
+                full_paths,
+                drained_observation_epochs,
+                event_need_full,
+                notify_error,
+                first_event_at,
+            ) = if inotify {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
+                    let observation_epochs = p.take_legacy_observation_epochs();
                     let need_full = p.need_full;
                     let notify_error = p.notify_error;
+                    let first_event_at = p.first_event_at.take();
                     p.need_full = false;
                     p.notify_error = false;
-                    (paths, full_paths, need_full, notify_error)
+                    (
+                        paths,
+                        full_paths,
+                        observation_epochs,
+                        need_full,
+                        notify_error,
+                        first_event_at,
+                    )
                 } else {
-                    (HashSet::new(), HashSet::new(), true, true)
+                    (
+                        HashSet::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        true,
+                        true,
+                        None,
+                    )
                 }
             } else {
-                (HashSet::new(), HashSet::new(), false, false)
+                (
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                    false,
+                    false,
+                    None,
+                )
             };
+            // The callback reads AppState independently from this loop. A
+            // same-root refresh can therefore publish a ticket for the new
+            // Graph after this cycle took its initial slot snapshot but before
+            // it drained Pending. Re-read only when a Direct frontier was
+            // drained and route it to the exact instance that minted it. A
+            // stale WatchedGraph must never consume the path while silently
+            // discarding the replacement's ticket.
+            if !drained_observation_epochs.is_empty() {
+                let latest_entries = app.state::<AppState>().graphs.read().unwrap().entries();
+                route_drained_direct_frontiers(
+                    &mut graphs,
+                    latest_entries,
+                    &drained_observation_epochs,
+                );
+            }
+            // A focus-driven rescan demands the same full stat diff a kernel
+            // rescan does, for the Direct lane and the managed lane alike.
+            let explicit_rescan = pending_full_rescan();
+            let event_need_full = event_need_full || explicit_rescan.is_some();
             for (label, graph) in graphs.iter_mut() {
+                if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
+                    if graph
+                        .legacy_graph
+                        .owns_graph_text_external_observation_ticket(epoch)
+                    {
+                        graph.pending_observation_epoch =
+                            Some(graph.pending_observation_epoch.map_or(epoch, |pending| {
+                                pending.later_for_same_instance(epoch).unwrap_or(epoch)
+                            }));
+                    }
+                }
                 let initial_cycle = !graph.baseline;
                 if initial_cycle {
                     // No baseline yet, so nothing about the graph's text identity
@@ -1113,15 +1814,45 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
                     attempted = true;
-                    let (changes, conflicts_dirty, _, errors) = reconcile_pending(
+                    let reconcile_started = Instant::now();
+                    let (changes, conflicts_dirty, used_full, errors) = reconcile_pending(
                         &graph.legacy_graph,
                         &mut graph.snap,
                         &owned,
                         need_full,
                         !inotify,
                     );
-                    for change in changes {
-                        let _ = app.emit_to(label, "graph-changed", change);
+                    let pages = changes.len();
+                    if emit_as_bulk(pages) {
+                        // One epoch, one notification: the frontend answers with
+                        // one dataRev bump and reloads only visible pages,
+                        // instead of N events → N bumps → up to N getPage IPCs.
+                        let _ =
+                            app.emit_to(label, "graph-changed-bulk", GraphChangedBulk { changes });
+                    } else {
+                        for change in changes {
+                            let _ = app.emit_to(label, "graph-changed", change);
+                        }
+                    }
+                    // Receipts only for batches that surfaced something: a
+                    // change reaching the frontend, or an error scheduling a
+                    // backoff retry (itself a latency source). Quiet cycles —
+                    // echo-suppressed self-writes, poll scans that found
+                    // nothing — would drown the 64-slot ring in no-ops.
+                    if pages > 0 || !errors.is_empty() {
+                        record_latency_receipt(latency_receipt(
+                            label,
+                            inotify,
+                            pages,
+                            owned.len(),
+                            // The branch actually taken — a burst-escalated
+                            // batch reads as full_diff in the receipt trail.
+                            used_full,
+                            errors.len(),
+                            if initial_cycle { None } else { first_event_at },
+                            reconcile_started,
+                            Instant::now(),
+                        ));
                     }
                     if !errors.is_empty() {
                         cycle_failed = true;
@@ -1142,12 +1873,50 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 } else if attempted {
                     graph.retry.succeeded();
                     graph.last_reconcile_error = None;
+                    if let Some(epoch) = graph.pending_observation_epoch.take() {
+                        graph
+                            .legacy_graph
+                            .acknowledge_graph_text_external_observations(epoch);
+                    }
                 }
             }
             for (label, graph) in sparse_graphs.iter_mut() {
                 let retry_due = graph.retry.take_due(Instant::now());
-                let initial_tick = std::mem::take(&mut graph.initial_tick);
+                let initial_tick = take_sparse_initial_tick(&mut graph.initial_tick_pending);
                 let poll_cycle = !inotify && !retry_due;
+                // The managed poll gate. Before this, every poll cycle armed a
+                // whole-graph `RescanRequired` whether or not anything on disk
+                // had changed, so a quiet graph paid a full actor-lane rescan
+                // every cycle. The Direct lane thirty lines above has always
+                // gated on a (mtime, len) stat diff; this is that same contract,
+                // not a second mechanism. Kept unconditional on `initial_tick`,
+                // on `event_need_full` (which carries the `rescan_graph_now`
+                // focus refresh), and on an incomplete sweep.
+                let poll_rescan = if inotify {
+                    // Poll snapshots go stale the moment the OS watcher owns the
+                    // graph; drop the baseline so a later switch back to poll
+                    // re-arms once instead of trusting a stale sweep.
+                    graph.baseline = false;
+                    graph.snap.clear();
+                    false
+                } else {
+                    managed_poll_rescan_required(&graph.root, &mut graph.snap, &mut graph.baseline)
+                };
+                // A graph may contain another device's shared provider tree
+                // while this device has enabled only local managed storage.
+                // Provider callbacks are advisory and belong exclusively to a
+                // SharedActive actor; routing poll/event noise to a local-only
+                // actor makes the actor correctly refuse it, but then turns a
+                // harmless on-disk namespace into an endless retry/toast loop.
+                // Ignore provider observations until this device has actually
+                // joined or initiated sharing. The SharedActive transition
+                // schedules its own initial provider scan, and later poll or
+                // exact events continue through this lane.
+                let provider_lane_active = graph
+                    .handle
+                    .status()
+                    .map(|status| sparse_provider_lane_is_active(status.shared_phase))
+                    .unwrap_or(false);
                 // The actor's startup scan can finish before this thread has
                 // replaced the legacy directory watches with the recursive
                 // graph-root watch. One scan after watch installation closes
@@ -1156,12 +1925,18 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     &graph.root,
                     &paths,
                     &full_paths,
-                    event_need_full || initial_tick || poll_cycle,
+                    event_need_full || initial_tick || poll_rescan,
                     notify_error,
                 );
                 let (provider_paths, provider_imprecise) =
                     sparse_provider_observations(&graph.root, &paths, &full_paths);
-                let provider_poll = poll_cycle;
+                let provider_poll = poll_cycle && provider_lane_active;
+                let provider_rescan = sparse_provider_rescan_required(
+                    provider_lane_active,
+                    initial_tick,
+                    provider_imprecise,
+                    provider_poll,
+                );
                 if observations.is_empty()
                     && provider_paths.is_empty()
                     && !provider_imprecise
@@ -1174,11 +1949,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
 
                 let result = (|| {
-                    if !provider_paths.is_empty() || provider_imprecise || provider_poll {
-                        graph.handle.observe_provider_paths(
-                            provider_paths,
-                            provider_imprecise || provider_poll,
-                        )?;
+                    if provider_lane_active && (!provider_paths.is_empty() || provider_rescan) {
+                        graph
+                            .handle
+                            .observe_provider_paths(provider_paths, provider_rescan)?;
                     }
                     if !observations.is_empty() {
                         graph.handle.observe_watcher(observations)?;
@@ -1191,12 +1965,36 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         // a content change. `AdmittedNoop` is, by its own name,
                         // the step that took no completed batch.
                         let changed = tick.committed_observable_change();
+                        // A bounded tick settles one lane. The tick result
+                        // describes only that lane, so continuation must also
+                        // consult the actor's post-tick status: a newer watcher
+                        // epoch can be queued behind a completed full scan, and
+                        // provider evidence another device delivered as bytes on
+                        // disk is work this device never performed and no
+                        // inotify edge will announce again. Otherwise a quiet
+                        // graph sleeps holding a peer's edit forever.
+                        let status = graph.handle.status().ok();
+                        let actor_has_runnable_work = status
+                            .as_ref()
+                            .is_some_and(SyncRuntimeStatusSnapshot::has_runnable_work);
                         match &tick {
-                            SyncRuntimeTick::LocalMutation(_)
-                            | SyncRuntimeTick::Recovering
-                            | SyncRuntimeTick::RetryFull => graph.retry.progressed(Instant::now()),
                             SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
                                 graph.retry.failed(Instant::now())
+                            }
+                            tick if sparse_tick_is_blocked_without_progress(
+                                tick,
+                                actor_has_runnable_work,
+                            ) =>
+                            {
+                                graph.retry.failed(Instant::now())
+                            }
+                            tick if sparse_tick_needs_continuation(
+                                tick,
+                                provider_rescan,
+                                actor_has_runnable_work,
+                            ) =>
+                            {
+                                graph.retry.progressed(Instant::now())
                             }
                             _ => graph.retry.succeeded(),
                         }
@@ -1219,7 +2017,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 );
                                 graph.last_error = Some(message);
                             }
-                        } else {
+                        } else if sparse_error_condition_ended(&tick, actor_has_runnable_work) {
                             graph.last_error = None;
                         }
                         let _ = app.emit_to(
@@ -1233,7 +2031,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         if changed {
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
-                        if let Ok(status) = graph.handle.status() {
+                        if let Some(status) = status {
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
@@ -1255,8 +2053,35 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             );
                             graph.last_error = Some(message);
                         }
+                        // The success arm is not the only place the frontend's
+                        // page admission may move. Without this, a persistently
+                        // failing actor emits nothing at all after its first
+                        // error — the repeat suppression above sees to that —
+                        // and the last `managed_writable` admission stays live
+                        // indefinitely, letting bulk edits accumulate behind a
+                        // writer that cannot save them (GH #324). The status
+                        // call is the authority on writability and fails closed
+                        // on its own when no application handle is active; the
+                        // frontend additionally revokes writability the moment
+                        // it sees the error, so a status this call cannot obtain
+                        // does not leave the old one standing.
+                        if let Ok(status) = graph.handle.status() {
+                            let _ = app.emit_to(
+                                label,
+                                "sparse-v2-status",
+                                sparse_v2_runtime_status_event(graph.binding_generation, status),
+                            );
+                        }
                     }
                 }
+            }
+
+            // This is the focus-freshness boundary: every graph lane has
+            // finished the requested full pass and all ordinary change events
+            // were emitted before this completion marker. The frontend still
+            // waits for its asynchronous handlers before admitting edits.
+            if let Some(sequence) = explicit_rescan {
+                complete_full_rescan(&app, sequence);
             }
 
             // --- wait for the next cycle ---
@@ -1305,9 +2130,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 }
 
 /// How the file-watcher detects external changes (device-local, in
-/// tine-settings.json): "inotify" (default on desktop) → a real OS watcher, no
-/// idle wakeups; "poll" (default on Android) → a 3s mtime scan for filesystems
-/// where inotify is flaky (some NFS, Android shared storage). See `start_watcher`.
+/// tine-settings.json): "inotify" (the default) → a real OS watcher, no idle
+/// wakeups; "poll" → a 3s mtime scan for filesystems where native events are
+/// unavailable or unreliable. Both feed the same full-diff reconciliation.
 fn watch_mode(app: &tauri::AppHandle) -> String {
     settings_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1317,13 +2142,11 @@ fn watch_mode(app: &tauri::AppHandle) -> String {
                 .and_then(|x| x.as_str().map(String::from))
         })
         .filter(|m| m == "poll" || m == "inotify")
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "android") {
-                "poll".to_string()
-            } else {
-                "inotify".to_string()
-            }
-        })
+        .unwrap_or_else(|| default_watch_mode().to_string())
+}
+
+fn default_watch_mode() -> &'static str {
+    "inotify"
 }
 
 #[tauri::command]
@@ -1352,6 +2175,11 @@ pub(crate) fn set_watch_mode(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn unset_watch_mode_prefers_native_events_on_every_platform() {
+        assert_eq!(default_watch_mode(), "inotify");
+    }
     use tine_core::model::{BlockDto, Format, PageDto};
     use tine_core::sync_runtime::SyncRuntimeLifecycle;
 
@@ -1365,11 +2193,75 @@ mod tests {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
         }
+    }
+
+    /// One permanently blocked lane must report ONCE. The desktop repeated
+    /// `RecoveryBlocked("unsafe provider entry: enrollment: …")` because the
+    /// local lane's healthy ticks kept clearing the repeat suppression between
+    /// two identical failures (GH: desktop pairing, 2026-08-18).
+    #[test]
+    fn a_healthy_tick_from_another_lane_does_not_re_arm_a_live_failure() {
+        let blocked = SyncRuntimeTick::RecoveryBlocked("unsafe provider entry: enrollment".into());
+        let healthy = [
+            SyncRuntimeTick::Idle,
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::AdmittedNoop { epoch: 4 },
+            SyncRuntimeTick::AdmittedComplete { epoch: 5 },
+        ];
+
+        for tick in &healthy {
+            assert!(
+                !sparse_error_condition_ended(tick, true),
+                "{tick:?} settled one lane while the actor still holds work it cannot finish"
+            );
+        }
+        for tick in &healthy {
+            assert!(
+                sparse_error_condition_ended(tick, false),
+                "{tick:?} on a drained actor is a real recovery and must report again"
+            );
+        }
+        for runnable in [false, true] {
+            assert!(
+                !sparse_error_condition_ended(&blocked, runnable),
+                "a blocked tick never ends its own condition"
+            );
+        }
+
+        // The emission rule the watcher loop applies, replayed over the tick
+        // sequence a stuck provider lane actually produces.
+        let mut last_error: Option<String> = None;
+        let mut emitted = Vec::new();
+        for (tick, runnable) in [
+            (&blocked, true),
+            (&healthy[0], true),
+            (&blocked, true),
+            (&healthy[0], true),
+            (&blocked, true),
+        ] {
+            if matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_)
+                    | SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+            ) {
+                let message = format!("{tick:?}");
+                if last_error.as_deref() != Some(&message) {
+                    emitted.push(message.clone());
+                    last_error = Some(message);
+                }
+            } else if sparse_error_condition_ended(tick, runnable) {
+                last_error = None;
+            }
+        }
+        assert_eq!(emitted.len(), 1, "one condition, one report: {emitted:?}");
     }
 
     #[test]
@@ -1426,6 +2318,128 @@ mod tests {
     }
 
     #[test]
+    fn pending_stamps_the_first_event_of_a_batch_once() {
+        use notify::event::{CreateKind, EventKind};
+
+        let mut pending = Pending::default();
+        assert!(pending.first_event_at.is_none());
+        pending.add_event(notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/pages/one.md")],
+            attrs: Default::default(),
+        });
+        let first = pending
+            .first_event_at
+            .expect("first event stamps the batch");
+        pending.add_event(notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/pages/two.md")],
+            attrs: Default::default(),
+        });
+        assert_eq!(
+            pending.first_event_at,
+            Some(first),
+            "later events in the same batch must not move the batch stamp"
+        );
+        pending.add_notify_error();
+        assert_eq!(pending.first_event_at, Some(first));
+    }
+
+    #[test]
+    fn latency_receipt_measures_the_three_stages() {
+        let first = Instant::now();
+        let reconcile_started = first + Duration::from_millis(200);
+        let emitted_at = reconcile_started + Duration::from_millis(35);
+
+        let receipt = latency_receipt(
+            "graph-a",
+            true,
+            3,
+            4,
+            false,
+            1,
+            Some(first),
+            reconcile_started,
+            emitted_at,
+        );
+
+        assert_eq!(receipt.graph, "graph-a");
+        assert_eq!(receipt.mode, "inotify");
+        assert_eq!(receipt.pages, 3);
+        assert_eq!(receipt.event_paths, 4);
+        assert!(!receipt.full_diff);
+        assert_eq!(receipt.errors, 1);
+        assert_eq!(receipt.event_to_reconcile_ms, Some(200));
+        assert_eq!(receipt.reconcile_ms, 35);
+        assert_eq!(receipt.event_to_emit_ms, Some(235));
+    }
+
+    #[test]
+    fn latency_receipt_without_a_callback_stamp_reports_only_reconcile_time() {
+        let reconcile_started = Instant::now();
+        let emitted_at = reconcile_started + Duration::from_millis(12);
+
+        let receipt = latency_receipt(
+            "graph-a",
+            false,
+            2,
+            0,
+            true,
+            0,
+            None,
+            reconcile_started,
+            emitted_at,
+        );
+
+        assert_eq!(receipt.mode, "poll");
+        assert!(receipt.full_diff);
+        assert_eq!(receipt.event_to_reconcile_ms, None);
+        assert_eq!(receipt.event_to_emit_ms, None);
+        assert_eq!(receipt.reconcile_ms, 12);
+    }
+
+    #[test]
+    fn latency_receipt_ring_keeps_the_newest_sixty_four() {
+        let now = Instant::now();
+        let mut ring = VecDeque::new();
+        for seq in 1..=(LATENCY_RECEIPT_CAP as u64 + 6) {
+            let mut receipt = latency_receipt("graph-a", true, 1, 1, false, 0, None, now, now);
+            receipt.seq = seq;
+            push_latency_receipt(&mut ring, receipt);
+        }
+        assert_eq!(ring.len(), LATENCY_RECEIPT_CAP);
+        assert_eq!(ring.front().map(|receipt| receipt.seq), Some(7));
+        assert_eq!(
+            ring.back().map(|receipt| receipt.seq),
+            Some(LATENCY_RECEIPT_CAP as u64 + 6)
+        );
+    }
+
+    /// The receipt is a diagnostic wire format a reporter pastes into an issue;
+    /// its field names are part of that contract.
+    #[test]
+    fn latency_receipt_wire_shape_is_stable() {
+        let now = Instant::now();
+        let receipt = latency_receipt("graph-a", true, 1, 1, false, 0, Some(now), now, now);
+        let wire = serde_json::to_value(&receipt).unwrap();
+        for key in [
+            "seq",
+            "at_unix_ms",
+            "graph",
+            "mode",
+            "pages",
+            "event_paths",
+            "full_diff",
+            "errors",
+            "event_to_reconcile_ms",
+            "reconcile_ms",
+            "event_to_emit_ms",
+        ] {
+            assert!(wire.get(key).is_some(), "missing receipt field {key}");
+        }
+    }
+
+    #[test]
     fn explicit_unmanaged_file_events_do_not_schedule_graph_scans() {
         use notify::event::{CreateKind, EventKind, RemoveKind};
 
@@ -1469,6 +2483,167 @@ mod tests {
         assert_eq!(pending.paths, paths.into_iter().collect());
         assert!(pending.full_paths.is_empty());
         assert!(!pending.need_full);
+    }
+
+    /// Concord P5: what the watcher admits from `.git/**` and its equivalents,
+    /// stated explicitly and tested. A repository parked in the graph tree is
+    /// the loudest event source a Direct Files user has; none of its churn can
+    /// describe graph text, so none of it may cost anything.
+    #[test]
+    fn vcs_and_tool_churn_never_wakes_the_watcher() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
+
+        let roots = HashSet::from([PathBuf::from("/graphs/a")]);
+        let noise: &[(EventKind, &str)] = &[
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.git/index.lock",
+            ),
+            (
+                EventKind::Remove(RemoveKind::File),
+                "/graphs/a/.git/index.lock",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "/graphs/a/.git/objects/ab/cdef0123456789",
+            ),
+            (
+                EventKind::Create(CreateKind::Any),
+                "/graphs/a/.git/refs/heads/main",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                "/graphs/a/.hg/store/data/page.md.i",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.jj/repo/op_store/x",
+            ),
+            (EventKind::Create(CreateKind::File), "/graphs/a/.svn/wc.db"),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.stversions/pages/Note~20260818.md",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "/graphs/a/.stfolder/marker",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/node_modules/pkg/readme.md",
+            ),
+        ];
+        for (kind, path) in noise {
+            let event = notify::Event {
+                kind: *kind,
+                paths: vec![PathBuf::from(path)],
+                attrs: Default::default(),
+            };
+            assert!(
+                watch_event_is_tool_noise(&event, &roots),
+                "{path} must not wake the watcher"
+            );
+        }
+
+        // Everything else still gets through, including the cases a name list
+        // is most likely to over-reach on.
+        let admitted: &[(EventKind, Vec<&str>)] = &[
+            // Tine's own provider tree is hidden from graph text too, but the
+            // managed lane's observations are made of exactly these events.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/graphs/a/.tine-sync/v2/shared/outbox/0001"],
+            ),
+            // An ordinary page, and configuration.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/graphs/a/pages/Note.md"],
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                vec!["/graphs/a/logseq/config.edn"],
+            ),
+            // A rename OUT of .git reports both sides: one ordinary path is
+            // enough to keep the whole event.
+            (
+                EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+                vec!["/graphs/a/.git/tmp_obj_x", "/graphs/a/pages/Note.md"],
+            ),
+            // A path under no watched root is not ours to judge.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/elsewhere/.git/index"],
+            ),
+        ];
+        for (kind, paths) in admitted {
+            let event = notify::Event {
+                kind: *kind,
+                paths: paths.iter().map(PathBuf::from).collect(),
+                attrs: Default::default(),
+            };
+            assert!(
+                !watch_event_is_tool_noise(&event, &roots),
+                "{paths:?} must still be seen"
+            );
+        }
+
+        // A kernel queue overflow says nothing about which paths were lost, so
+        // its rescan demand survives even when its paths look like noise.
+        let mut overflow = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/.git/objects")],
+            attrs: Default::default(),
+        };
+        overflow = overflow.set_flag(notify::event::Flag::Rescan);
+        assert!(!watch_event_is_tool_noise(&overflow, &roots));
+
+        // With no watched root there is nothing to strip a prefix against.
+        let event = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/.git/index.lock")],
+            attrs: Default::default(),
+        };
+        assert!(!watch_event_is_tool_noise(&event, &HashSet::new()));
+    }
+
+    /// The list is only safe because every name on it is provably outside graph
+    /// text on its own authority — the core's `GraphTextScope`, which discovery
+    /// and the full-diff walk also use. If a name ever became page-bearing,
+    /// dropping its events would hide pages; this fails first.
+    #[test]
+    fn vcs_and_tool_noise_dirs_can_never_hold_graph_text() {
+        let scope = tine_core::graph_text_scope::GraphTextScope::new(&[], false);
+        for name in VCS_AND_TOOL_NOISE_DIRS {
+            assert!(
+                !scope.should_descend(name),
+                "{name} must be outside graph text"
+            );
+            assert!(
+                !scope.is_eligible(&format!("{name}/Page.md")),
+                "{name}/Page.md must never be a page"
+            );
+            assert!(
+                !scope.is_eligible(&format!("pages/{name}/Page.md")),
+                "pages/{name}/Page.md must never be a page"
+            );
+        }
+        // ...and the one Tine-owned hidden tree that is deliberately NOT here.
+        assert!(!VCS_AND_TOOL_NOISE_DIRS.contains(&".tine-sync"));
+    }
+
+    /// A graph that itself lives inside a repository's directory must not have
+    /// every one of its own events dropped.
+    #[test]
+    fn a_graph_under_a_noise_directory_is_judged_relative_to_its_root() {
+        use notify::event::{CreateKind, EventKind};
+
+        let roots = HashSet::from([PathBuf::from("/repo/.git/notes")]);
+        let event = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/repo/.git/notes/pages/Note.md")],
+            attrs: Default::default(),
+        };
+        assert!(!watch_event_is_tool_noise(&event, &roots));
     }
 
     #[test]
@@ -1616,6 +2791,352 @@ mod tests {
             sparse_provider_observations(&root, &HashSet::new(), &HashSet::new());
         assert!(provider_paths.is_empty());
         assert!(!imprecise);
+    }
+
+    #[test]
+    fn shared_actor_first_watcher_turn_rescans_provider_bytes_delivered_while_stopped() {
+        assert!(sparse_provider_rescan_required(true, true, false, false));
+        assert!(sparse_provider_rescan_required(true, false, true, false));
+        assert!(sparse_provider_rescan_required(true, false, false, true));
+
+        assert!(
+            !sparse_provider_rescan_required(false, true, true, true),
+            "local-only managed storage must not adopt a graph-local provider namespace",
+        );
+        assert!(
+            !sparse_provider_rescan_required(true, false, false, false),
+            "a steady exact-event turn must not broaden into a full provider scan",
+        );
+
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::AdmittedNoop { epoch: 7 },
+            true,
+            false,
+        ));
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::AdmittedComplete { epoch: 8 },
+            true,
+            false,
+        ));
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::ProviderMutation {
+                batch_id: tine_core::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(8)),
+            },
+            false,
+            false,
+        ));
+        assert!(
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 9 },
+                false,
+                false,
+            ),
+            "ordinary quiet graph admission must not become an idle hot loop",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 9 },
+                false,
+                true,
+            ),
+            "work the actor still names must drain without another filesystem edge",
+        );
+        assert!(
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::RecoveryBlocked("waiting for provider bytes".into()),
+                true,
+                false,
+            ),
+            "blocked provider work keeps the existing backoff policy",
+        );
+    }
+
+    fn shared_active_snapshot(
+        watcher_pending: bool,
+        provider_runnable: bool,
+    ) -> SyncRuntimeStatusSnapshot {
+        let mut snapshot = runtime_snapshot(SyncRuntimeLifecycle::Active);
+        snapshot.shared_role = Some(tine_core::sync_runtime::SyncSharedRole::Initiator);
+        snapshot.shared_phase = Some(tine_core::sync_runtime::SyncSharedPhase::Active);
+        snapshot.watcher.pending = watcher_pending;
+        // The broad protocol inventory a receiving device really reported at the
+        // observed failure: three delivered provider items behind an idle
+        // watcher. It is deliberately NOT what the scheduler reads.
+        snapshot.provider_pending = if provider_runnable { 3 } else { 0 };
+        snapshot.provider_runnable = provider_runnable;
+        snapshot
+    }
+
+    /// The exact device-A failure state from the two-device journey: the peer's
+    /// edit was delivered as provider bytes on disk, the receiving actor knows
+    /// about it, the watcher epochs are settled, and no further filesystem event
+    /// is coming. The scheduler must schedule the work anyway.
+    #[test]
+    fn delivered_provider_work_is_its_own_runnable_work_source() {
+        let delivered = shared_active_snapshot(false, true);
+        assert!(
+            delivered.has_runnable_work(),
+            "an idle watcher over delivered provider evidence is not an idle actor",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 2 },
+                false,
+                delivered.has_runnable_work(),
+            ),
+            "a tick that settled a watcher epoch while provider evidence remains \
+             delivered must schedule its own continuation: nothing on a quiet \
+             graph will produce a later filesystem event for bytes another \
+             device wrote",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedComplete { epoch: 2 },
+                false,
+                delivered.has_runnable_work(),
+            ),
+            "an admitted local change must not consume the provider obligation",
+        );
+    }
+
+    /// Provider arrival while the receiving actor is already busy with its own
+    /// lanes: the drain must continue across every non-terminal tick shape until
+    /// the actor itself reports no runnable work.
+    #[test]
+    fn provider_drain_continues_until_the_actor_reports_no_runnable_work() {
+        for remaining in [
+            SyncRuntimeTick::AdmittedNoop { epoch: 4 },
+            SyncRuntimeTick::AdmittedComplete { epoch: 4 },
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::ProviderMutation {
+                batch_id: tine_core::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(9)),
+            },
+        ] {
+            assert!(
+                sparse_tick_needs_continuation(&remaining, false, true),
+                "{remaining:?} left runnable provider work behind",
+            );
+        }
+        let drained = shared_active_snapshot(false, false);
+        assert!(
+            !drained.has_runnable_work(),
+            "a drained shared actor names no runnable work",
+        );
+        assert!(
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 5 },
+                false,
+                drained.has_runnable_work(),
+            ),
+            "the last provider item draining to zero must return the scheduler to sleep",
+        );
+    }
+
+    /// The anti-hot-loop direction, at the schedule rather than the predicate:
+    /// with both lanes empty the scheduler must arm no timer at all, so the
+    /// inotify branch blocks on the kernel instead of polling.
+    #[test]
+    fn an_empty_watcher_and_empty_provider_lane_arm_no_timer() {
+        let quiet = shared_active_snapshot(false, false);
+        assert!(!quiet.has_runnable_work());
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        match &(SyncRuntimeTick::AdmittedNoop { epoch: 6 }) {
+            tick if sparse_tick_is_blocked_without_progress(tick, quiet.has_runnable_work()) => {
+                retry.failed(now)
+            }
+            tick if sparse_tick_needs_continuation(tick, false, quiet.has_runnable_work()) => {
+                retry.progressed(now)
+            }
+            _ => retry.succeeded(),
+        }
+        assert_eq!(
+            retry.remaining(now),
+            None,
+            "a genuinely quiet shared graph must sleep, not poll",
+        );
+    }
+
+    /// Known-but-unadvanceable provider work — pending batches blocked on causal
+    /// dependencies whose bytes have not arrived — must be paced by backoff, not
+    /// by the 10ms progress cadence, while still never sleeping forever.
+    #[test]
+    fn provider_work_that_cannot_advance_backs_off_instead_of_polling() {
+        assert!(
+            sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Idle, true),
+            "an Idle tick that left runnable provider work made no progress",
+        );
+        assert!(
+            !sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Idle, false),
+            "an Idle tick over an empty actor is ordinary quiescence",
+        );
+        assert!(
+            !sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Recovering, true),
+            "a Recovering provider turn is progress and keeps the fast cadence",
+        );
+
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        retry.failed(now);
+        let backoff = retry.remaining(now).expect("blocked work stays scheduled");
+        assert!(
+            backoff >= Duration::from_millis(250),
+            "blocked provider work must not be retried at the progress cadence: {backoff:?}",
+        );
+    }
+
+    /// Ordinary page reads and saves share the actor's serialized request lane
+    /// with provider work. The scheduler must therefore keep handing the actor
+    /// bounded turns rather than one unbounded drain, so an application request
+    /// is never queued behind a whole provider backlog.
+    #[test]
+    fn provider_continuations_stay_bounded_single_turns() {
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        retry.progressed(now);
+        let gap = retry
+            .remaining(now)
+            .expect("a provider continuation stays scheduled");
+        assert!(
+            gap <= Duration::from_millis(10),
+            "provider continuation must resume promptly: {gap:?}",
+        );
+        assert!(
+            retry.take_due(now + Duration::from_millis(10)),
+            "each continuation is one further bounded turn, not a drain loop",
+        );
+        assert_eq!(
+            retry.remaining(now + Duration::from_millis(10)),
+            None,
+            "a consumed continuation must not re-arm itself without another tick result",
+        );
+    }
+
+    /// The managed poll cycle arms a whole-graph rescan only when the graph
+    /// actually changed — the same stat-diff contract the Direct lane has always
+    /// used, not a second mechanism.
+    ///
+    /// Before this, `sparse_observations` was handed `need_full = poll_cycle`,
+    /// so poll mode (the Android default) pushed `RescanRequired` every 3 s
+    /// whether or not anything on disk had moved, and a quiet 1,000-page graph
+    /// paid a whole-graph actor rescan every cycle on the one lane every read
+    /// needs.
+    #[test]
+    fn a_quiet_managed_graph_does_not_arm_a_poll_rescan() {
+        let graph = TempGraph::new("managed-poll-gate");
+        graph.write("pages/Quiet.md", "- quiet\n");
+        graph.write("journals/2026_08_18.md", "- journal\n");
+        let mut snap = HashMap::new();
+        let mut baseline = false;
+
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "the first cycle has no baseline and must arm"
+        );
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a quiet graph must not arm a whole-graph rescan"
+        );
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "and must keep not arming"
+        );
+    }
+
+    /// Everything the Direct lane's gate catches, the managed gate must catch.
+    /// A gate that is a superset can only over-arm; one that is a subset loses
+    /// external changes, which is the one outcome forbidden here.
+    #[test]
+    fn the_managed_poll_gate_arms_on_every_shape_the_direct_gate_catches() {
+        let graph = TempGraph::new("managed-poll-gate-shapes");
+        graph.write("pages/Existing.md", "- existing\n");
+        let mut snap = HashMap::new();
+        let mut baseline = false;
+        assert!(managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A create, anywhere an eligible document can live -- including outside
+        // the configured page/journal roots (GH #268).
+        graph.write("notes/Created.md", "- created\n");
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a create outside pages/ and journals/ must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // An edit that changes length.
+        graph.write("pages/Existing.md", "- existing, edited externally\n");
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "an external edit must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A delete.
+        std::fs::remove_file(graph.path("notes/Created.md")).unwrap();
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a delete must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A provider conflict copy: never eligible text, but its appearance
+        // still has to reach reconciliation, exactly as on the Direct lane.
+        graph.write(
+            "pages/Existing.sync-conflict-20260818-000000-ABCDEFG.md",
+            "- conflict copy\n",
+        );
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a sync conflict copy must arm"
+        );
+
+        // Excluded trees must NOT arm: an image drop cannot cost a rescan.
+        graph.write("assets/note.md", "- not graph text\n");
+        graph.write("logseq/bak/pages/Existing.md", "- backup\n");
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "excluded trees must not arm a whole-graph rescan"
+        );
+    }
+
+    #[test]
+    fn managed_slot_handoff_scan_is_scheduled_exactly_once_without_a_timer_guess() {
+        let mut pending = true;
+        assert!(take_sparse_initial_tick(&mut pending));
+        assert!(!pending);
+        assert!(!take_sparse_initial_tick(&mut pending));
+    }
+
+    #[test]
+    fn provider_events_are_routed_only_after_this_device_activates_sharing() {
+        use tine_core::sync_runtime::SyncSharedPhase;
+
+        assert!(!sparse_provider_lane_is_active(None));
+        assert!(!sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::SharePrepared
+        )));
+        assert!(!sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::Joining
+        )));
+        assert!(sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::Active
+        )));
     }
 
     #[test]
@@ -1799,7 +3320,9 @@ mod tests {
         }
     }
 
-    fn warm_guarded_identity(graph: &Graph) {
+    /// Warm the parsed page cache and exercise one ordinary Direct save. This
+    /// deliberately does not build the core's optional complete identity index.
+    fn warm_direct_graph(graph: &Graph) {
         warm_cache(graph);
         let mut anchor = graph.load_by_path("pages/Anchor.md").unwrap().unwrap();
         anchor.blocks[0].raw = "warm guarded identity".to_owned();
@@ -1808,67 +3331,101 @@ mod tests {
             .expect("warm guarded identity save");
     }
 
-    /// F2, poll half. A poll-mode cycle used to invalidate the whole guarded
-    /// admission index unconditionally, so a user on NFS/SMB could never hold a
-    /// warm index: every save rebuilt it from the entire graph, every time.
     #[test]
-    fn quiet_poll_cycles_keep_the_admission_index_warm() {
+    fn drained_frontier_routes_to_a_same_root_replacement_instance() {
+        let graph_dir = TempGraph::new("watcher-drained-frontier-refresh");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+
+        let old_slot = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone());
+        let old_graph = old_slot.legacy_graph_cloned().unwrap();
+        warm_direct_graph(&old_graph);
+        let old_ticket = old_graph.note_graph_text_external_observation();
+        let mut graphs = HashMap::from([(
+            "main".to_owned(),
+            WatchedGraph {
+                legacy_graph: old_graph,
+                root: graph_dir.root.clone(),
+                snap: HashMap::new(),
+                baseline: true,
+                last_reconcile_error: Some("retired retry".to_owned()),
+                retry: RetrySchedule::default(),
+                pending_observation_epoch: Some(old_ticket),
+            },
+        )]);
+
+        let replacement_slot = Arc::new(GraphSlot::new(
+            Graph::open(&graph_dir.root),
+            graph_dir.root.clone(),
+        ));
+        let replacement = replacement_slot.legacy_graph_cloned().unwrap();
+        warm_direct_graph(&replacement);
+        graph_dir.write(
+            "pages/Replacement Event.md",
+            "- external replacement event\n",
+        );
+        let external = graph_dir.path("pages/Replacement Event.md");
+        let replacement_ticket = replacement.note_graph_text_external_observation();
+        let drained = HashMap::from([(graph_dir.root.clone(), replacement_ticket)]);
+
+        route_drained_direct_frontiers(
+            &mut graphs,
+            vec![("main".to_owned(), replacement_slot)],
+            &drained,
+        );
+
+        let routed = graphs.get_mut("main").unwrap();
+        assert!(routed
+            .legacy_graph
+            .owns_graph_text_external_observation_ticket(replacement_ticket));
+        assert!(!routed.baseline);
+        assert!(routed.last_reconcile_error.is_none());
+        assert!(routed.pending_observation_epoch.is_none());
+
+        routed.pending_observation_epoch = Some(replacement_ticket);
+        routed.legacy_graph.sync_file_checked(&external).unwrap();
+        let reconciled = routed.pending_observation_epoch.take().unwrap();
+        assert!(routed
+            .legacy_graph
+            .acknowledge_graph_text_external_observations(reconciled));
+        routed
+            .legacy_graph
+            .save_page(&new_page("Creation After Refresh"), None)
+            .unwrap();
+        assert!(graph_dir.path("pages/Creation After Refresh.md").exists());
+    }
+
+    /// A quiet poll must publish an exact empty observation rather than an
+    /// uncertain one. Whether that preserves a live guarded index belongs to
+    /// `tine-core` and is tested beside the private index builder there.
+    #[test]
+    fn quiet_poll_cycles_publish_an_exact_empty_observation() {
         let tg = TempGraph::new("poll-warm");
         tg.write("pages/Anchor.md", "- anchor\n");
         tg.write("Root note.md", "- root\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-
-        let before = graph.guarded_graph_text_identity_report();
-        assert!(
-            !before.invalidated && before.complete_builds >= 1,
-            "the save should have left a live index: {before:?}"
-        );
-
-        let mut snap = collect_graph_text_files(&graph).files;
+        let snap = collect_graph_text_files(&graph).files;
         for _ in 0..3 {
-            reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
+            let current = collect_graph_text_files(&graph);
+            let (changed, uncertain) = poll_observation(&snap, &current);
+            assert!(changed.is_empty());
+            assert!(!uncertain);
         }
-
-        let after = graph.guarded_graph_text_identity_report();
-        assert!(
-            !after.invalidated,
-            "a poll cycle that found nothing must not invalidate the index: {after:?}"
-        );
-        assert_eq!(
-            after.complete_builds, before.complete_builds,
-            "a poll cycle must not force the next save to rebuild the whole graph"
-        );
     }
 
-    /// The other half of the same policy: a poll cycle that DID observe an
-    /// external change must publish it, or the index would still claim a page
-    /// exists after it was deleted.
+    /// The other half of the same policy: a poll cycle that did observe an
+    /// external change must publish its exact path. Applying that path to a
+    /// live guarded index is tested inside `tine-core`.
     #[test]
-    fn a_poll_cycle_publishes_what_it_actually_observed() {
+    fn a_poll_cycle_reports_what_it_actually_observed() {
         let tg = TempGraph::new("poll-observe");
         tg.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-        let before = graph.guarded_graph_text_identity_report();
-
-        // An external creation the poll cycle is about to find.
+        let snap = collect_graph_text_files(&graph).files;
         tg.write("Root note.md", "title:: Root note\n\n- external\n");
-        let mut snap = collect_graph_text_files(&graph).files;
-        snap.remove(&tg.path("Root note.md"));
-        reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
-
-        let after = graph.guarded_graph_text_identity_report();
-        assert!(
-            !after.invalidated,
-            "an exactly-observed change must not fall back to invalidation: {after:?}"
-        );
-        assert!(
-            after.exact_updates > before.exact_updates,
-            "the observed path must reach the index as an exact update: {after:?}"
-        );
-        // And the index now owns that name, so a colliding create is refused.
-        assert_new_page_refused(&graph, "Root note");
+        let current = collect_graph_text_files(&graph);
+        let (changed, uncertain) = poll_observation(&snap, &current);
+        assert!(!uncertain);
+        assert_eq!(changed, vec![tg.path("Root note.md")]);
     }
 
     /// The fallback half. If the rescan could not read part of the graph, what
@@ -1876,21 +3433,16 @@ mod tests {
     /// invalidated rather than exactly updated -- otherwise a save would trust
     /// an index that is missing whatever lives behind the unreadable directory.
     #[test]
-    fn an_incomplete_poll_scan_invalidates_instead_of_publishing() {
+    fn an_incomplete_poll_scan_publishes_uncertainty() {
         let tg = TempGraph::new("poll-incomplete");
         tg.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-        assert!(!graph.guarded_graph_text_identity_report().invalidated);
-
-        let mut complete = collect_graph_text_files(&graph);
-        complete.complete = false;
-        publish_poll_observation(&graph, &complete.files.clone(), &complete);
-
-        assert!(
-            graph.guarded_graph_text_identity_report().invalidated,
-            "a scan that could not read the whole graph must not leave the index trusted"
-        );
+        let snap = collect_graph_text_files(&graph).files;
+        let mut incomplete = collect_graph_text_files(&graph);
+        incomplete.complete = false;
+        let (changed, uncertain) = poll_observation(&snap, &incomplete);
+        assert!(changed.is_empty());
+        assert!(uncertain);
     }
 
     /// The same thing end to end, where the walk itself decides. Root ignores
@@ -1930,6 +3482,22 @@ mod tests {
         );
     }
 
+    fn assert_new_page_waits_for_reconciliation(graph: &Graph, name: &str) {
+        assert_eq!(
+            graph.save_page(&new_page(name), None).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "{name} creation must not race the watcher debounce window"
+        );
+    }
+
+    fn reconcile_external_path(graph: &Graph, path: &Path) {
+        let epoch = graph.graph_text_external_observation_ticket();
+        graph
+            .sync_file_checked(path)
+            .expect("debounced exact-path reconciliation");
+        graph.acknowledge_graph_text_external_observations(epoch);
+    }
+
     #[test]
     fn legacy_graph_root_text_create_delete_rename_and_semantics_reach_guarded_identity() {
         use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
@@ -1938,7 +3506,7 @@ mod tests {
             let graph_dir = TempGraph::new(&format!("root-text-{extension}"));
             graph_dir.write("pages/Anchor.md", "- anchor\n");
             let graph = Graph::open(&graph_dir.root);
-            warm_guarded_identity(&graph);
+            warm_direct_graph(&graph);
 
             let created_rel = format!("nonstandard/deep/Physical Name.{extension}");
             graph_dir.write(
@@ -1953,6 +3521,8 @@ mod tests {
                     vec![graph_dir.path(&created_rel)],
                 )),
             ));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Created {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&created_rel));
             assert_new_page_refused(&graph, &format!("Created {extension}"));
 
             let deleted_rel = format!("nonstandard/deep/Delete {extension}.{extension}");
@@ -1965,6 +3535,8 @@ mod tests {
                     vec![graph_dir.path(&deleted_rel)],
                 )),
             );
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&deleted_rel));
             assert_new_page_refused(&graph, &format!("Delete {extension}"));
             graph_dir.remove(&deleted_rel);
             let delete_event = event(
@@ -1976,6 +3548,12 @@ mod tests {
             assert!(!deletion.uncertain);
             assert_eq!(deletion.exact_paths, vec![graph_dir.path(&deleted_rel)]);
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
+            let delete_epoch = graph.graph_text_external_observation_ticket();
+            graph
+                .sync_deleted_file(&graph_dir.path(&deleted_rel))
+                .expect("debounced deletion reconciliation");
+            graph.acknowledge_graph_text_external_observations(delete_epoch);
 
             let old_rel = format!("nonstandard/deep/Old {extension}.{extension}");
             let new_rel = format!("nonstandard/deep/New {extension}.{extension}");
@@ -1988,6 +3566,8 @@ mod tests {
                     vec![graph_dir.path(&old_rel)],
                 )),
             );
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Old {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&old_rel));
             assert_new_page_refused(&graph, &format!("Old {extension}"));
             graph_dir.rename(&old_rel, &new_rel);
             let rename_event = event(
@@ -2002,12 +3582,75 @@ mod tests {
                 vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)]
             );
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("New {extension}"));
+            let rename_epoch = graph.graph_text_external_observation_ticket();
+            graph
+                .sync_deleted_file(&graph_dir.path(&old_rel))
+                .expect("debounced rename source reconciliation");
+            graph
+                .sync_file_checked(&graph_dir.path(&new_rel))
+                .expect("debounced rename destination reconciliation");
+            graph.acknowledge_graph_text_external_observations(rename_epoch);
             assert_new_page_refused(&graph, &format!("New {extension}"));
         }
     }
 
+    /// A callback arriving after batch A was drained belongs to batch B. Batch
+    /// A must acknowledge only its captured frontier, never the graph's newer
+    /// global epoch, or creation could race B before B is reconciled.
     #[test]
-    fn legacy_uncertain_graph_root_events_advance_the_shared_resource_epoch() {
+    fn drained_batch_cannot_acknowledge_a_callback_in_the_next_batch() {
+        use notify::event::{CreateKind, EventKind};
+
+        let graph_dir = TempGraph::new("watcher-drain-frontier-race");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&graph_dir.root);
+        warm_direct_graph(&graph);
+        let mut pending = Pending::default();
+
+        graph_dir.write("pages/External A.md", "- external A\n");
+        let path_a = graph_dir.path("pages/External A.md");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&event(
+                EventKind::Create(CreateKind::File),
+                vec![path_a.clone()],
+            )),
+        ));
+        pending.add_legacy_observations(vec![(
+            graph_dir.root.clone(),
+            graph.graph_text_external_observation_ticket(),
+        )]);
+        let batch_a = pending.take_legacy_observation_epochs();
+
+        graph_dir.write("pages/External B.md", "- external B\n");
+        let path_b = graph_dir.path("pages/External B.md");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&event(
+                EventKind::Create(CreateKind::File),
+                vec![path_b.clone()],
+            )),
+        ));
+        pending.add_legacy_observations(vec![(
+            graph_dir.root.clone(),
+            graph.graph_text_external_observation_ticket(),
+        )]);
+
+        graph.sync_file_checked(&path_a).unwrap();
+        graph.acknowledge_graph_text_external_observations(batch_a[&graph_dir.root]);
+        assert_new_page_waits_for_reconciliation(&graph, "Still Blocked By B");
+
+        let batch_b = pending.take_legacy_observation_epochs();
+        graph.sync_file_checked(&path_b).unwrap();
+        graph.acknowledge_graph_text_external_observations(batch_b[&graph_dir.root]);
+        graph.save_page(&new_page("Now Reconciled"), None).unwrap();
+    }
+
+    #[test]
+    fn legacy_uncertain_graph_root_events_block_creation_until_reconciliation() {
         use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
         use notify::event::{EventAttributes, Flag};
 
@@ -2020,9 +3663,8 @@ mod tests {
         ] {
             let graph_dir = TempGraph::new(&format!("uncertain-{case}"));
             graph_dir.write("pages/Anchor.md", "- anchor\n");
-            let observer = Graph::open(&graph_dir.root);
-            let guarded = Graph::open(&graph_dir.root);
-            warm_guarded_identity(&guarded);
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
             graph_dir.write(
                 "nonstandard/deep/Physical.md",
                 &format!("title:: Epoch {case}\n\n- external\n"),
@@ -2064,15 +3706,15 @@ mod tests {
                 _ => unreachable!(),
             };
             let observation =
-                legacy_graph_text_observation(&observer, &graph_dir.root, event.as_ref());
+                legacy_graph_text_observation(&graph, &graph_dir.root, event.as_ref());
             assert!(observation.relevant, "{case}");
             assert!(observation.uncertain, "{case}");
             assert!(observe_legacy_graph_text_event(
-                &observer,
+                &graph,
                 &graph_dir.root,
                 event.as_ref(),
             ));
-            assert_new_page_refused(&guarded, &format!("Epoch {case}"));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Epoch {case}"));
         }
     }
 
@@ -2093,7 +3735,7 @@ mod tests {
         let graph_dir = TempGraph::new("windows-any-kinds");
         graph_dir.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&graph_dir.root);
-        warm_guarded_identity(&graph);
+        warm_direct_graph(&graph);
 
         graph_dir.write("pages/External.md", "- external\n");
         let path = graph_dir.path("pages/External.md");
@@ -2147,7 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_graph_root_observation_excludes_other_open_graphs() {
+    fn legacy_graph_root_observation_routes_only_to_the_owning_graph() {
         use notify::event::{CreateKind, EventKind};
 
         let graph_a_dir = TempGraph::new("root-owner-a");
@@ -2156,7 +3798,6 @@ mod tests {
         graph_b_dir.write("pages/Anchor.md", "- anchor B\n");
         let graph_a = Graph::open(&graph_a_dir.root);
         let graph_b = Graph::open(&graph_b_dir.root);
-        warm_guarded_identity(&graph_b);
 
         graph_b_dir.write(
             "nonstandard/deep/Stale.md",
@@ -2172,25 +3813,25 @@ mod tests {
             &graph_a_dir.root,
             Some(&event_a),
         ));
+        let graph_b_observation =
+            legacy_graph_text_observation(&graph_b, &graph_b_dir.root, Some(&event_a));
+        assert!(!graph_b_observation.relevant);
+        assert!(!graph_b_observation.uncertain);
+        assert!(graph_b_observation.exact_paths.is_empty());
         assert!(!observe_legacy_graph_text_event(
             &graph_b,
             &graph_b_dir.root,
             Some(&event_a),
         ));
-        graph_b
-            .save_page(&new_page("Must Stay Stale"), None)
-            .expect("an event owned by graph A must not invalidate graph B");
     }
 
     #[test]
-    fn excluded_private_text_and_exact_non_text_events_are_harmless() {
+    fn excluded_private_text_and_exact_non_text_events_are_not_published() {
         use notify::event::{CreateKind, EventKind};
 
         let graph_dir = TempGraph::new("excluded-private");
         graph_dir.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&graph_dir.root);
-        warm_guarded_identity(&graph);
-
         for (relative, claimed) in [
             (".tine-sync/private/Sync.md", "Excluded Sync"),
             ("assets/private/Asset.org", "Excluded Asset"),
@@ -2206,10 +3847,11 @@ mod tests {
             assert!(observation.relevant, "{relative}");
             assert!(!observation.uncertain, "{relative}");
             assert!(observation.exact_paths.is_empty(), "{relative}");
-            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&event));
-            graph
-                .save_page(&new_page(claimed), None)
-                .expect("excluded text must not become a retained graph-text owner");
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event)
+            ));
         }
 
         graph_dir.write(
@@ -2224,10 +3866,11 @@ mod tests {
         let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&non_text));
         assert!(!observation.uncertain);
         assert!(observation.exact_paths.is_empty());
-        observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&non_text));
-        graph
-            .save_page(&new_page("Exact Non Text Is Harmless"), None)
-            .expect("an exact non-text event must not invalidate retained identity");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&non_text)
+        ));
 
         for relative in [".tine-sync", "assets", "logseq/bak", ".hidden"] {
             let private_directory = event(
@@ -2609,6 +4252,203 @@ mod tests {
                     ],
                 )
             },
+        );
+    }
+
+    #[test]
+    fn bulk_threshold_boundary_is_exclusive_on_both_sides() {
+        assert!(!burst_escalates(0));
+        assert!(!burst_escalates(BULK_CHANGE_THRESHOLD));
+        assert!(burst_escalates(BULK_CHANGE_THRESHOLD + 1));
+        assert!(!emit_as_bulk(BULK_CHANGE_THRESHOLD));
+        assert!(emit_as_bulk(BULK_CHANGE_THRESHOLD + 1));
+    }
+
+    /// `graph-changed-bulk` is a frontend wire contract: the aggregate carries
+    /// the same per-page change shape the `graph-changed` event carries.
+    #[test]
+    fn graph_changed_bulk_wire_shape_is_stable() {
+        let wire = serde_json::to_value(GraphChangedBulk {
+            changes: vec![GraphChange {
+                name: "Page".to_owned(),
+                kind: PageKind::Page,
+                created: true,
+                removed: false,
+            }],
+        })
+        .unwrap();
+        let changes = wire.get("changes").and_then(|value| value.as_array());
+        let first = changes.and_then(|list| list.first()).expect("one change");
+        for key in ["name", "kind", "created", "removed"] {
+            assert!(first.get(key).is_some(), "missing bulk change field {key}");
+        }
+    }
+
+    #[test]
+    fn a_drained_batch_above_the_threshold_escalates_to_the_full_branch() {
+        // Concord P2 (GH #337 / spec L6): a VCS checkout or first big sync dumps
+        // N file events; processing them per-file costs two reads + a parse per
+        // path with deliberately no stat shortcut. Above the threshold the batch
+        // must take the stat-diff full branch instead.
+        let tg = TempGraph::new("burst-escalation");
+        tg.write("pages/Seed.md", "- seed\n");
+        let graph = Graph::open(&tg.root);
+        warm_cache(&graph);
+        let mut snap = collect_graph_text_files(&graph).files;
+
+        let mut paths = HashSet::new();
+        for index in 0..(BULK_CHANGE_THRESHOLD + 1) {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk {index}\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let (changes, _, used_full, errors) =
+            reconcile_pending(&graph, &mut snap, &paths, false, false);
+        assert!(
+            used_full,
+            "a batch of {} paths (> {BULK_CHANGE_THRESHOLD}) must escalate to the full stat-diff branch",
+            paths.len()
+        );
+        assert!(errors.is_empty());
+        assert_eq!(changes.len(), BULK_CHANGE_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn a_drained_batch_at_the_threshold_stays_incremental() {
+        // The complement: ordinary bursts (a save, a small sync delta) keep the
+        // per-file branch, whose explicit-event semantics deliberately bypass
+        // the stat shortcut (see `explicit_event_reconciles_even_when_snapshot_
+        // metadata_is_equal`).
+        let tg = TempGraph::new("burst-no-escalation");
+        tg.write("pages/Seed.md", "- seed\n");
+        let graph = Graph::open(&tg.root);
+        warm_cache(&graph);
+        let mut snap = collect_graph_text_files(&graph).files;
+
+        let mut paths = HashSet::new();
+        for index in 0..BULK_CHANGE_THRESHOLD {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk {index}\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let (changes, _, used_full, errors) =
+            reconcile_pending(&graph, &mut snap, &paths, false, false);
+        assert!(
+            !used_full,
+            "a batch of exactly {BULK_CHANGE_THRESHOLD} paths must keep the incremental branch"
+        );
+        assert!(errors.is_empty());
+        assert_eq!(changes.len(), BULK_CHANGE_THRESHOLD);
+    }
+
+    /// The correctness invariant behind the escalation: whichever branch a burst
+    /// takes, the result is the same. Same family as
+    /// `incremental_burst_union_matches_full_diff`, sized across the threshold.
+    #[test]
+    fn incremental_burst_above_threshold_union_matches_full_diff() {
+        assert_incremental_matches_full(
+            "burst-union-above-threshold",
+            |tg| {
+                for index in 0..BULK_CHANGE_THRESHOLD {
+                    tg.write(&format!("pages/Edit {index}.md"), "- before\n");
+                }
+                tg.write("pages/Delete.md", "- delete\n");
+                tg.write("pages/Keep.md", "- keep\n");
+            },
+            |tg| {
+                std::thread::sleep(Duration::from_millis(20));
+                let mut rels: Vec<String> = Vec::new();
+                for index in 0..BULK_CHANGE_THRESHOLD {
+                    let rel = format!("pages/Edit {index}.md");
+                    tg.write(&rel, "- after\n");
+                    rels.push(rel);
+                }
+                tg.remove("pages/Delete.md");
+                rels.push("pages/Delete.md".to_owned());
+                for index in 0..4 {
+                    let rel = format!("pages/sub/Created {index}.md");
+                    tg.write(&rel, "- created\n");
+                    rels.push(rel);
+                }
+                rels.iter().map(|rel| tg.path(rel)).collect()
+            },
+        );
+    }
+
+    /// Bulk-change measurement + generous regression gate (Concord P2).
+    ///
+    /// Ignored: the fixture is a few hundred generated files — deliberately NOT
+    /// part of the fast unit corpus. Run explicitly:
+    ///   cargo nextest run -p tine --run-ignored ignored-only -E 'test(bulk_reconcile)'
+    ///
+    /// Measures a checkout-shaped change (many files replaced at once under a
+    /// running watcher) through both reconcile branches, prints the numbers, and
+    /// asserts only an order-of-magnitude ceiling — never a tight timing bound.
+    #[test]
+    #[ignore = "bulk fixture (hundreds of generated files); run explicitly"]
+    fn bulk_reconcile_bench_and_gate() {
+        const TOTAL: usize = 800;
+        const CHANGED: usize = 400;
+
+        let tg = TempGraph::new("bulk-bench");
+        for index in 0..TOTAL {
+            tg.write(
+                &format!("pages/Bulk {index}.md"),
+                &format!("- bulk page {index}\n- second line {index}\n"),
+            );
+        }
+        let inc_graph = Graph::open(&tg.root);
+        let full_graph = Graph::open(&tg.root);
+        warm_cache(&inc_graph);
+        warm_cache(&full_graph);
+        let mut inc_snap = collect_graph_text_files(&inc_graph).files;
+        let mut full_snap = inc_snap.clone();
+
+        // The external revision: a checkout replaces CHANGED files' contents.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut paths = HashSet::new();
+        for index in 0..CHANGED {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk page {index} switched\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let incremental_started = Instant::now();
+        let (inc_changes, _, inc_errors) = incremental_reconcile(&inc_graph, &mut inc_snap, &paths);
+        let incremental_elapsed = incremental_started.elapsed();
+
+        let full_started = Instant::now();
+        let snapshot = collect_graph_text_files(&full_graph);
+        let (full_changes, _, full_errors) =
+            full_diff_reconcile(&full_graph, &mut full_snap, snapshot.files);
+        let full_elapsed = full_started.elapsed();
+
+        assert!(inc_errors.is_empty());
+        assert!(full_errors.is_empty());
+        assert_eq!(inc_changes.len(), CHANGED);
+        assert_eq!(full_changes.len(), CHANGED);
+        println!(
+            "bulk-reconcile bench: {CHANGED} changed of {TOTAL} files — \
+             incremental branch {}ms, full stat-diff branch {}ms",
+            incremental_elapsed.as_millis(),
+            full_elapsed.as_millis(),
+        );
+
+        // Generous gate: the escalated (full) branch reconciling a 400-file
+        // change over an 800-file graph measured 95 ms on the 2026-08 dev box
+        // (incremental branch: 94 ms — the branches cost the same for genuinely
+        // changed files; escalation buys one consistent snapshot and one
+        // aggregate emit, not reconcile speed). 10 s ≈ 100× measured: it catches
+        // an order-of-magnitude regression (e.g. an accidental whole-graph
+        // reparse per changed file) without ever flaking under load.
+        let ceiling = Duration::from_secs(10);
+        assert!(
+            full_elapsed < ceiling,
+            "escalated bulk reconcile took {}ms (ceiling {}ms)",
+            full_elapsed.as_millis(),
+            ceiling.as_millis(),
         );
     }
 

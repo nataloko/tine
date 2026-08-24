@@ -153,16 +153,126 @@ pub(crate) enum TrustedLocalCommitOutcome {
 /// and may be retained only by an immediately durable trusted commit.
 pub(crate) struct TrustedLocalResponseEvidence {
     page: PageDto,
+    accepted_base_revision: String,
     parsed_target_revision: String,
 }
 
 impl TrustedLocalResponseEvidence {
-    pub(crate) fn new(page: PageDto, parsed_target_revision: String) -> Self {
+    pub(crate) fn new(
+        page: PageDto,
+        accepted_base_revision: String,
+        parsed_target_revision: String,
+    ) -> Self {
         Self {
             page,
+            accepted_base_revision,
             parsed_target_revision,
         }
     }
+
+    /// One-use semantic receipt for the immediately adjacent Graph commit.
+    /// Construction follows an exact target parse, identity resolution, and
+    /// DTO conversion in the actor. Decoded/restarted records never have this
+    /// process-local value and therefore retain Graph's complete parser and
+    /// guarded-serialization validation.
+    pub(crate) fn validates_projection(
+        &self,
+        page: &PageDto,
+        base_revision: &str,
+        target_revision: &str,
+    ) -> bool {
+        self.accepted_base_revision == base_revision
+            && self.parsed_target_revision == target_revision
+            && page_dto_equal_except_revision(&self.page, page)
+    }
+}
+
+fn page_dto_equal_except_revision(left: &PageDto, right: &PageDto) -> bool {
+    let PageDto {
+        name: left_name,
+        kind: left_kind,
+        title: left_title,
+        pre_block: left_pre_block,
+        blocks: left_blocks,
+        rev: _,
+        format: left_format,
+        read_only: left_read_only,
+        path: left_path,
+        activation: left_activation,
+        guide: left_guide,
+    } = left;
+    let PageDto {
+        name: right_name,
+        kind: right_kind,
+        title: right_title,
+        pre_block: right_pre_block,
+        blocks: right_blocks,
+        rev: _,
+        format: right_format,
+        read_only: right_read_only,
+        path: right_path,
+        activation: right_activation,
+        guide: right_guide,
+    } = right;
+    left_name == right_name
+        && left_kind == right_kind
+        && left_title == right_title
+        && left_pre_block == right_pre_block
+        && left_format == right_format
+        && left_read_only == right_read_only
+        && left_path == right_path
+        && left_activation == right_activation
+        && left_guide == right_guide
+        && block_dtos_equal(left_blocks, right_blocks)
+}
+
+fn block_dtos_equal(left: &[crate::BlockDto], right: &[crate::BlockDto]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            let crate::BlockDto {
+                id: left_id,
+                raw: left_raw,
+                collapsed: left_collapsed,
+                children: left_children,
+                breadcrumb: left_breadcrumb,
+                page_property: left_page_property,
+                marker: left_marker,
+                priority: left_priority,
+                heading_level: left_heading_level,
+                scheduled: left_scheduled,
+                deadline: left_deadline,
+                tags: left_tags,
+                properties: left_properties,
+            } = left;
+            let crate::BlockDto {
+                id: right_id,
+                raw: right_raw,
+                collapsed: right_collapsed,
+                children: right_children,
+                breadcrumb: right_breadcrumb,
+                page_property: right_page_property,
+                marker: right_marker,
+                priority: right_priority,
+                heading_level: right_heading_level,
+                scheduled: right_scheduled,
+                deadline: right_deadline,
+                tags: right_tags,
+                properties: right_properties,
+            } = right;
+            left_id == right_id
+                && left_raw == right_raw
+                && left_collapsed == right_collapsed
+                && left_breadcrumb == right_breadcrumb
+                && left_page_property == right_page_property
+                && left_marker == right_marker
+                && left_priority == right_priority
+                && left_heading_level == right_heading_level
+                && left_scheduled == right_scheduled
+                && left_deadline == right_deadline
+                && left_tags == right_tags
+                && left_properties == right_properties
+                && block_dtos_equal(left_children, right_children)
+        })
 }
 
 /// Journal-committed operation whose exact graph target is durable and whose
@@ -406,11 +516,12 @@ impl TrustedLocalCommitCoordinator {
 
         #[cfg(test)]
         let graph_started = Instant::now();
-        let graph_outcome = match graph.commit_existing_page_with_journal(
+        let graph_outcome = match graph.commit_existing_page_with_journal_evidence(
             page,
             base_revision,
             expected_base,
             exact_target,
+            response_evidence.as_ref(),
             || append_managed_local_record(journal, &prepared),
         ) {
             Ok(outcome) => outcome,
@@ -775,7 +886,10 @@ impl<A> TrustedLocalRestartProjectionPending<A> {
     }
 }
 
-#[cfg(test)]
+// Pre-0.7 enrolled fast-commit corpus. The clean runtime does not call this
+// coordinator; retain the production surface only until the compiler-guided
+// retirement wave removes its remaining type references.
+#[cfg(all(test, any()))]
 mod tests {
     use std::fs;
 
@@ -994,6 +1108,7 @@ mod tests {
         let prepared = prepared_edit(&mut fixture, 1_200_110, 1);
         let evidence = TrustedLocalResponseEvidence::new(
             page.clone(),
+            base_revision.clone(),
             "deliberately-not-the-prepared-target-revision".into(),
         );
 

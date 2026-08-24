@@ -1,19 +1,21 @@
 //! Exact, read-only external inventory and conservative identity matching.
 //!
 //! This module plans reconciliation only. It does not publish semantic
-//! operations, write a graph, consult SQLite, or activate managed sync.
+//! operations, write a graph, or activate managed sync. The clean runtime
+//! reads its disposable SQLite path ownership instead of recreating a native
+//! path index beside SQLite.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
 use cap_std::{ambient_authority, fs::Dir};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -23,43 +25,58 @@ use super::bootstrap_import::{
     BootstrapPartDescriptorV1, BootstrapPartSpanIndexV1, BootstrapPartitionProfileV1,
     FullObjectDescriptorV1, OperationDigestV1, OperationLeafV1, OperationRootV1,
     PayloadObjectDescriptorV1, PayloadObjectRootV1, SourceBlobChunkDescriptorV1,
-    SourceBlobChunkDigestV1, SourceBlobChunkRootBuilderV1, SourceBlobChunkRootV1,
-    SourceBlobIndexBuilderV1, SourceContentDigestV1, SourceInventoryIndexBuilderV1,
-    SourceInventoryRootBuilderV1, SourceInventoryRootV1, SourceLeafDigestV1, SourceLeafV1,
-    SourceSpanRootV1, SourceSpanV1, MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART, MAX_BOOTSTRAP_PARTS,
+    SourceBlobChunkRootBuilderV1, SourceBlobChunkRootV1, SourceBlobIndexBuilderV1,
+    SourceContentDigestV1, SourceInventoryIndexBuilderV1, SourceInventoryRootV1,
+    SourceLeafDigestV1, SourceLeafV1, SourceSpanRootV1, SourceSpanV1,
+    MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART, MAX_BOOTSTRAP_PARTS,
     MAX_OPERATIONS_PER_BOOTSTRAP_PART, MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART,
     MAX_PARSED_NODES_PER_SOURCE_FILE, MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART,
     MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_INDEX_PAGES,
-    MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART, MAX_TOTAL_SOURCE_BYTES,
+    MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART,
+};
+#[cfg(test)]
+use super::bootstrap_import::{
+    SourceBlobChunkDigestV1, SourceInventoryRootBuilderV1, MAX_TOTAL_SOURCE_BYTES,
 };
 use super::external_import::{
     ExternalImportObservationEntry, ExternalImportObservationMaterial,
     ExternalImportObservationMaterialError, ExternalImportObservationState,
 };
 use super::hot_engine::{
-    AcceptedFrontierRoot, AuthorBatch, DetachedBootstrapAcceptedEngineMaterial,
-    DetachedBootstrapAuthoringSession, DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity,
-    ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
+    AcceptedFrontierRoot, AuthorBatch, CleanImportProjectionPredecessor,
+    DetachedBootstrapAcceptedEngineMaterial, DetachedBootstrapAuthoringSession,
+    DetachedBootstrapCandidate, LazyGenesisCheckpointBuilder, MAX_TRANSACTION_OPERATIONS,
 };
+#[cfg(test)]
+use super::hot_engine::{DetachedBootstrapReplayIdentity, ProjectionStorageBinding};
+#[cfg(test)]
 use super::identity::BootstrapPartId;
-use super::object_store::{
-    BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
-    BootstrapPublicationInspectionV1, ControlDirectoryIdentity, DurablyStagedBootstrapPrefix,
-    EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
-    ValidatedBootstrapPublicationV1,
+use super::lazy_genesis::{
+    publish_activation_marker, read_activation_marker, LazyGenesisActivationMarkerV1,
+    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder,
+    LazyGenesisPageInput,
 };
+#[cfg(test)]
+use super::object_store::{
+    BootstrapAggregateHistoryBindingV1, BootstrapPublicationInspectionV1,
+    DurablyStagedBootstrapPrefix, EngineHistoryBinding, ObjectStore,
+    PreparedBootstrapHistoryRecordV1, ValidatedBootstrapPublicationV1,
+};
+use super::object_store::{BootstrapAuthoringCapability, ControlDirectoryIdentity, StoreError};
 use super::receipt::ImportIdDerivation;
-use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     plan_projection, AcceptedBatchEvent, AnnotatedIdentity, BatchId, BatchOrigin, BlobDescription,
     BlockId, BlockLocation, ContentDigest, CrdtPeerId, CurrentPageAtPath, DeviceId, DocumentId,
     ImportId, ImportInventoryEntry, ImportInventoryState, ImportLocator, LineageDigest,
     LogicalCompletionId, LogicalPageName, LogseqIdentityMutation, LogseqUuid, ManagedPath,
-    ManagedTextKind, ObjectKind, OperationBatch, OperationObject, OperationTransaction, PageId,
-    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
-    ProjectionStoreError, ReferenceCatalogPolicyV1, SemanticOperation, SessionId, ShardedHotEngine,
-    StructuralLocator, StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
+    ManagedTextKind, ObjectKind, OperationTransaction, PageId, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore, ProjectionStoreError,
+    ProjectionWorkId, ProjectionWorkTarget, ReferenceCatalogPolicyV1, SemanticOperation, SessionId,
+    ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
+    DIFF_SCHEMA_VERSION,
 };
+#[cfg(test)]
+use super::{OperationBatch, OperationObject};
 use crate::model::{
     path_is_sync_conflict, resolve_external_document_identity, AcceptedExternalDocumentIdentity,
     BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation, BootstrapSourceChunk,
@@ -72,12 +89,23 @@ thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static POST_FRONTIER_OVERRIDE:
         std::cell::RefCell<Option<AcceptedFrontierRoot>> = const { std::cell::RefCell::new(None) };
+    static POST_CLEAN_PREDECESSOR_OVERRIDE:
+        std::cell::RefCell<Option<CatalogAuthority>> = const { std::cell::RefCell::new(None) };
+    static DERANGE_NEXT_CLEAN_PREDECESSOR_PATH:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT:
         std::cell::Cell<Option<InactiveBootstrapOrchestrationCut>> =
             const { std::cell::Cell::new(None) };
     static NEXT_BOOTSTRAP_PART_OPERATION_LIMIT:
         std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT:
+        std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT:
+        std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL:
+        std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
+            const { std::cell::RefCell::new(None) };
+    static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING:
         std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
             const { std::cell::RefCell::new(None) };
 }
@@ -85,11 +113,37 @@ thread_local! {
 /// Force the operations-per-part limit of exactly the next bootstrap
 /// preparation, so a small deterministic fixture can be genuinely multipart.
 ///
-/// It changes only how the operation spool is partitioned; every part is
+/// It changes only how the operation sequence is partitioned; every part is
 /// authored, published, installed, and replayed through the ordinary path.
 #[cfg(test)]
 pub(crate) fn force_next_bootstrap_part_operation_limit(operations: u32) {
     NEXT_BOOTSTRAP_PART_OPERATION_LIMIT.with(|limit| limit.set(Some(operations)));
+}
+
+#[cfg(test)]
+fn force_next_bootstrap_operation_memory_limit(bytes: usize) {
+    NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT.with(|limit| limit.set(Some(bytes)));
+}
+
+fn bootstrap_operation_memory_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT.with(|limit| limit.take()) {
+        return limit;
+    }
+    BOOTSTRAP_OPERATION_MEMORY_BYTES
+}
+
+#[cfg(test)]
+fn force_next_activation_page_record_memory_limit(bytes: usize) {
+    NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT.with(|limit| limit.set(Some(bytes)));
+}
+
+fn activation_page_record_memory_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT.with(|limit| limit.take()) {
+        return limit;
+    }
+    MAX_TERMINAL_PROJECTION_HINT_BYTES
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,28 +198,39 @@ pub const MAX_IMPORT_STRUCTURAL_KEY_WORK: usize = 64_000_000;
 /// file corpus peaks below 3 MiB per sorter; 32 MiB leaves ample headroom while
 /// keeping simultaneous sorters bounded on mobile-class processes.
 const BOOTSTRAP_STREAM_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// Canonical encoded operations below this bound stay in memory through
+/// partitioning and detached authoring. Larger imports fall back to the exact
+/// external-sort/spool path. The bound is on retained encoded bytes rather
+/// than page count because block content, identities, and paths dominate the
+/// actual footprint.
+pub(crate) const BOOTSTRAP_OPERATION_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
-const BOOTSTRAP_STREAM_DIRECTORY: &str = "inactive-bootstrap-publication-v1";
-const BOOTSTRAP_STREAM_SEAL: &str = "sealed.commit";
-const BOOTSTRAP_STREAM_AGGREGATE: &str = "aggregate.bin";
-const BOOTSTRAP_STREAM_COMMIT: &str = "commit.bin";
-const BOOTSTRAP_STREAM_INVENTORY_PAGES: &str = "source-inventory-pages";
-const BOOTSTRAP_STREAM_BLOB_PAGES: &str = "source-blob-pages";
-const BOOTSTRAP_STREAM_PARTS: &str = "parts";
-const BOOTSTRAP_STREAM_PART_MANIFEST: &str = "manifest.bin";
-const BOOTSTRAP_STREAM_PART_EVIDENCE: &str = "evidence.bin";
-const BOOTSTRAP_STREAM_PART_SPANS: &str = "spans.bin";
-const BOOTSTRAP_STREAM_PART_OBJECTS: &str = "objects.frames";
-const BOOTSTRAP_STREAM_OPERATION_SPOOL: &str = "operations.sorted";
-const BOOTSTRAP_STREAM_BOUNDARY_SPOOL: &str = "part-boundaries.frames";
+const BOOTSTRAP_STREAM_LAZY_GENESIS: &str = "lazy-genesis";
+#[cfg(test)]
+use super::sync_layout::BOOTSTRAP_STREAM_DIR as BOOTSTRAP_STREAM_DIRECTORY;
+use super::sync_layout::{
+    BOOTSTRAP_STREAM_AGGREGATE_FILE as BOOTSTRAP_STREAM_AGGREGATE,
+    BOOTSTRAP_STREAM_BLOB_PAGES_DIR as BOOTSTRAP_STREAM_BLOB_PAGES,
+    BOOTSTRAP_STREAM_BOUNDARY_SPOOL_FILE as BOOTSTRAP_STREAM_BOUNDARY_SPOOL,
+    BOOTSTRAP_STREAM_COMMIT_FILE as BOOTSTRAP_STREAM_COMMIT,
+    BOOTSTRAP_STREAM_INVENTORY_PAGES_DIR as BOOTSTRAP_STREAM_INVENTORY_PAGES,
+    BOOTSTRAP_STREAM_OPERATION_SPOOL_FILE as BOOTSTRAP_STREAM_OPERATION_SPOOL,
+    BOOTSTRAP_STREAM_PARTS_DIR as BOOTSTRAP_STREAM_PARTS,
+    BOOTSTRAP_STREAM_PART_EVIDENCE_FILE as BOOTSTRAP_STREAM_PART_EVIDENCE,
+    BOOTSTRAP_STREAM_PART_MANIFEST_FILE as BOOTSTRAP_STREAM_PART_MANIFEST,
+    BOOTSTRAP_STREAM_PART_OBJECTS_FILE as BOOTSTRAP_STREAM_PART_OBJECTS,
+    BOOTSTRAP_STREAM_PART_SPANS_FILE as BOOTSTRAP_STREAM_PART_SPANS,
+    BOOTSTRAP_STREAM_SEAL_FILE as BOOTSTRAP_STREAM_SEAL,
+};
 const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART;
 /// Fixed per-operation allowance for the before/after and membership fields
 /// added by the existing semantic-effect encoder. The operation's own
 /// canonical bytes are charged separately. Exact prepared bytes are still
 /// checked before the authoritative detached pass.
 const BOOTSTRAP_STREAM_SEMANTIC_EFFECT_OVERHEAD: u64 = 1024;
+const MAX_TERMINAL_PROJECTION_HINT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BootstrapStreamingImportInstrumentation {
@@ -184,6 +249,11 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) max_part_manifest_bytes: u64,
     pub(crate) max_part_payload_descriptors: u64,
     pub(crate) operation_spool_bytes: u64,
+    pub(crate) operation_builder_retained_bytes: u64,
+    pub(crate) operation_builder_spilled: bool,
+    pub(crate) terminal_projection_hint_pages: u64,
+    pub(crate) terminal_projection_hint_bytes: u64,
+    pub(crate) terminal_projection_hint_spilled: bool,
     pub(crate) prepared_bytes: u64,
     pub(crate) external_sort_runs: u64,
     pub(crate) capture_passes: u64,
@@ -216,6 +286,8 @@ pub(crate) struct BootstrapPreparationSummary {
     pub(crate) operations: u64,
     pub(crate) parts: u32,
     pub(crate) prepared_bytes: u64,
+    pub(crate) operation_builder_retained_bytes: u64,
+    pub(crate) operation_builder_spilled: bool,
     pub(crate) source_protocol_micros: u64,
     pub(crate) operation_spool_micros: u64,
     pub(crate) partition_micros: u64,
@@ -232,6 +304,8 @@ impl From<&BootstrapStreamingImportInstrumentation> for BootstrapPreparationSumm
             operations: instrumentation.operations,
             parts: instrumentation.parts,
             prepared_bytes: instrumentation.prepared_bytes,
+            operation_builder_retained_bytes: instrumentation.operation_builder_retained_bytes,
+            operation_builder_spilled: instrumentation.operation_builder_spilled,
             source_protocol_micros: instrumentation.source_protocol_micros,
             operation_spool_micros: instrumentation.operation_spool_micros,
             partition_micros: instrumentation.partition_micros,
@@ -254,6 +328,7 @@ pub(crate) enum BootstrapStreamingImportError {
     Protocol(BootstrapImportError),
     Store(StoreError),
     Engine(super::hot_engine::EngineError),
+    Projection(super::sqlite::ProjectionError),
     InvalidSource(String),
     InvalidOperation(String),
     ResourceLimit {
@@ -272,6 +347,7 @@ impl fmt::Display for BootstrapStreamingImportError {
             Self::Protocol(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::Engine(error) => error.fmt(formatter),
+            Self::Projection(error) => error.fmt(formatter),
             Self::InvalidSource(detail) | Self::InvalidOperation(detail) => {
                 formatter.write_str(detail)
             }
@@ -322,6 +398,12 @@ impl From<super::hot_engine::EngineError> for BootstrapStreamingImportError {
     }
 }
 
+impl From<super::sqlite::ProjectionError> for BootstrapStreamingImportError {
+    fn from(error: super::sqlite::ProjectionError) -> Self {
+        Self::Projection(error)
+    }
+}
+
 /// Inactive ownership of a complete, sealed bootstrap preparation. It carries
 /// no object-store, history, graph-writer, projection, SQLite, enrollment, or
 /// runtime capability.
@@ -333,13 +415,13 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     commit: BootstrapAggregateCommitV1,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    /// The archive whose durable authenticated reference catalog this
-    /// preparation's accepted roots were built in. Installation must target
-    /// exactly that archive.
-    reference_catalog_archive_identity: ControlDirectoryIdentity,
+    /// The archive whose durable identity indexes this preparation's accepted
+    /// roots were built in. Installation must target exactly that archive.
+    bootstrap_index_archive_identity: ControlDirectoryIdentity,
     candidate: Rc<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     terminal_construction: Option<TerminalBootstrapConstructionMaterial>,
+    lazy_genesis_commit: LazyGenesisCommitV1,
     instrumentation: BootstrapStreamingImportInstrumentation,
 }
 
@@ -376,6 +458,10 @@ impl InactiveBootstrapPreparedPublication {
 
     pub(crate) const fn source_capture(&self) -> &BootstrapSourceCapture {
         &self.source_capture
+    }
+
+    pub(crate) const fn lazy_genesis_commit(&self) -> LazyGenesisCommitV1 {
+        self.lazy_genesis_commit
     }
 
     pub(crate) fn aggregate_bytes(&self) -> Result<Vec<u8>, BootstrapStreamingImportError> {
@@ -488,6 +574,7 @@ impl InactiveBootstrapPreparedPublication {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
     pub(crate) source_inventory_pages: u32,
     pub(crate) source_blob_pages: u32,
@@ -508,6 +595,7 @@ pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
 /// Fully reopened proof of one inactive bootstrap installation. It contains
 /// immutable identities and read-only frontier values only.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapVerifiedPublication {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -530,6 +618,7 @@ pub(crate) struct InactiveBootstrapVerifiedPublication {
     instrumentation: InactiveBootstrapOrchestrationInstrumentation,
 }
 
+#[cfg(test)]
 impl InactiveBootstrapVerifiedPublication {
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -561,6 +650,7 @@ impl InactiveBootstrapVerifiedPublication {
         self.part_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn predecessor_terminal(&self) -> Option<BootstrapPartId> {
         self.predecessor_terminal
     }
@@ -569,6 +659,7 @@ impl InactiveBootstrapVerifiedPublication {
         &self.accepted_frontier
     }
 
+    #[cfg(test)]
     pub(crate) const fn engine_binding(&self) -> &EngineHistoryBinding {
         &self.engine_binding
     }
@@ -597,20 +688,24 @@ impl InactiveBootstrapVerifiedPublication {
         self.cold_record_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn instrumentation(&self) -> &InactiveBootstrapOrchestrationInstrumentation {
         &self.instrumentation
     }
 
+    #[cfg(test)]
     pub(crate) const fn catalog_document_id(&self) -> DocumentId {
         self.catalog_document_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn reference_catalog_policy(&self) -> &ReferenceCatalogPolicyV1 {
         &self.reference_catalog_policy
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapAcceptedAuthorityBinding {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -630,6 +725,7 @@ pub(crate) struct InactiveBootstrapAcceptedAuthorityBinding {
     cold_record_count: u64,
 }
 
+#[cfg(test)]
 impl InactiveBootstrapAcceptedAuthorityBinding {
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -703,6 +799,7 @@ impl InactiveBootstrapAcceptedAuthorityBinding {
 /// All fields are private and the only constructor freshly reopens the exact
 /// archive, publication, durable history, and detached replay. Keeping the
 /// candidate alive also keeps its scratch-backed accepted indexes alive.
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapAcceptedAuthority {
     store: ObjectStore,
     publication: ValidatedBootstrapPublicationV1,
@@ -716,38 +813,47 @@ pub(crate) struct InactiveBootstrapAcceptedAuthority {
 /// This handle is intentionally neither `Clone` nor serializable. It carries
 /// no writable authority and exposes no engine directly; promotion can only
 /// consume it through the durable-binding migration path.
+#[cfg(test)]
 pub(crate) struct RetainedBootstrapPromotionCandidate {
     candidate: Rc<DetachedBootstrapCandidate>,
     binding: InactiveBootstrapAcceptedAuthorityBinding,
 }
 
+#[cfg(test)]
 impl RetainedBootstrapPromotionCandidate {
     pub(crate) fn candidate(&self) -> &DetachedBootstrapCandidate {
         &self.candidate
     }
 
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
         &self.binding
     }
 }
 
+#[cfg(test)]
 impl InactiveBootstrapAcceptedAuthority {
+    #[cfg(test)]
     pub(crate) const fn store(&self) -> &ObjectStore {
         &self.store
     }
 
+    #[cfg(test)]
     pub(crate) const fn publication(&self) -> &ValidatedBootstrapPublicationV1 {
         &self.publication
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_engine(&self) -> &ShardedHotEngine {
         self.candidate.accepted_engine()
     }
 
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
         &self.binding
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_promotion_candidate(&self) -> RetainedBootstrapPromotionCandidate {
         RetainedBootstrapPromotionCandidate {
             candidate: Rc::clone(&self.candidate),
@@ -761,17 +867,464 @@ impl InactiveBootstrapAcceptedAuthority {
     }
 }
 
+const ACTIVATION_PAGE_RECORD_SCHEMA_VERSION: u32 = 2;
+const MAX_ACTIVATION_PAGE_RECORD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Source-only facts needed by the temporary old-operation oracle but not by
+/// SQLite. Keeping them beside the terminal page makes one parsed page record
+/// sufficient for both consumers during the genesis differential phase.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationBlockSourceV1 {
+    span: StructuralSpan,
+    raw_ids: Vec<String>,
+}
+
+/// One parser-owned page record for the activation fan-out.
+///
+/// The record is process-only in Packet 1. It is neither managed authority nor
+/// a durable format commitment; the later genesis packet will choose the
+/// durable capsule codec. Its strict schema and bounds nevertheless make the
+/// shadow differential exercise the same streaming boundary production will
+/// consume.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActivationPageRecordV1 {
+    schema_version: u32,
+    source_leaf: [u8; 32],
+    exact_source_bytes: Vec<u8>,
+    full_span: Option<StructuralSpan>,
+    page: super::MaterializedPageInput,
+    block_sources: Vec<ActivationBlockSourceV1>,
+}
+
+impl ActivationPageRecordV1 {
+    fn new(
+        source_leaf: SourceLeafDigestV1,
+        exact_source_bytes: Vec<u8>,
+        full_span: Option<StructuralSpan>,
+        page: super::MaterializedPageInput,
+        block_sources: Vec<ActivationBlockSourceV1>,
+    ) -> Result<Self, BootstrapStreamingImportError> {
+        let record = Self {
+            schema_version: ACTIVATION_PAGE_RECORD_SCHEMA_VERSION,
+            source_leaf: *source_leaf.as_bytes(),
+            exact_source_bytes,
+            full_span,
+            page,
+            block_sources,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), BootstrapStreamingImportError> {
+        if self.schema_version != ACTIVATION_PAGE_RECORD_SCHEMA_VERSION
+            || self.page.blocks.len() != self.block_sources.len()
+            || self
+                .full_span
+                .map(|span| span.end().saturating_sub(span.start()))
+                != (!self.exact_source_bytes.is_empty())
+                    .then_some(self.exact_source_bytes.len() as u64)
+        {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "activation page record shape is malformed".into(),
+            ));
+        }
+        if let Some(full) = self.full_span {
+            for source in &self.block_sources {
+                if source.span.start() < full.start() || source.span.end() > full.end() {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "activation block span escapes its source page".into(),
+                    ));
+                }
+            }
+        } else if !self.block_sources.is_empty() {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "nonempty activation page has no exact source span".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, BootstrapStreamingImportError> {
+        self.validate()?;
+        let bytes = postcard::to_allocvec(self)
+            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+        if bytes.len() > MAX_ACTIVATION_PAGE_RECORD_BYTES {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: bytes.len() as u64,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, BootstrapStreamingImportError> {
+        if bytes.len() > MAX_ACTIVATION_PAGE_RECORD_BYTES {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: bytes.len() as u64,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        let record: Self = postcard::from_bytes(bytes)
+            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn sqlite_page(&self) -> super::MaterializedPageInput {
+        let mut page = self.page.clone();
+        for (block, source) in page.blocks.iter_mut().zip(&self.block_sources) {
+            let logseq_uuid = (source.raw_ids.len() == 1)
+                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
+                .flatten();
+            block.logseq_uuid = logseq_uuid;
+            block.logseq_identity_origin =
+                logseq_uuid.map(|_| super::LogseqIdentityOrigin::ExternalImported);
+        }
+        page
+    }
+}
+
+enum ActivationPageRecordBuildMode {
+    Memory {
+        records: Vec<ActivationPageRecordV1>,
+        encoded_bytes: usize,
+    },
+    Spilled {
+        writer: BufWriter<File>,
+        path: PathBuf,
+        index: BTreeMap<PageId, (u64, u64)>,
+        encoded_bytes: usize,
+    },
+    Transitioning,
+}
+
+struct ActivationPageRecordBuilder {
+    memory_limit: usize,
+    mode: ActivationPageRecordBuildMode,
+    path_order: Vec<PageId>,
+}
+
+impl ActivationPageRecordBuilder {
+    fn new() -> Self {
+        Self {
+            memory_limit: activation_page_record_memory_limit(),
+            mode: ActivationPageRecordBuildMode::Memory {
+                records: Vec::new(),
+                encoded_bytes: 0,
+            },
+            path_order: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        record: ActivationPageRecordV1,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        let encoded = record.encode()?;
+        let transition = match &self.mode {
+            ActivationPageRecordBuildMode::Memory { encoded_bytes, .. } => encoded_bytes
+                .checked_add(encoded.len())
+                .is_none_or(|next| next > self.memory_limit),
+            _ => false,
+        };
+        if transition {
+            self.spill_memory_records()?;
+        }
+        let page_id = record.page.page_id;
+        let result = match &mut self.mode {
+            ActivationPageRecordBuildMode::Memory {
+                records,
+                encoded_bytes,
+            } => {
+                *encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "activation page record byte count overflow".into(),
+                    )
+                })?;
+                records.push(record);
+                Ok(())
+            }
+            ActivationPageRecordBuildMode::Spilled {
+                writer,
+                index,
+                encoded_bytes,
+                ..
+            } => {
+                write_activation_page_record_frame(writer, index, &record, &encoded)?;
+                *encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "activation page record byte count overflow".into(),
+                    )
+                })?;
+                Ok(())
+            }
+            ActivationPageRecordBuildMode::Transitioning => unreachable!(),
+        };
+        if result.is_ok() {
+            self.path_order.push(page_id);
+        }
+        result
+    }
+
+    fn spill_memory_records(&mut self) -> Result<(), BootstrapStreamingImportError> {
+        let ActivationPageRecordBuildMode::Memory {
+            records,
+            encoded_bytes,
+        } = std::mem::replace(&mut self.mode, ActivationPageRecordBuildMode::Transitioning)
+        else {
+            unreachable!("activation page records spill only once")
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tine-activation-page-records-{}.spool",
+            Uuid::new_v4().simple()
+        ));
+        let prepared = (|| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            let mut writer = BufWriter::new(file);
+            let mut index = BTreeMap::new();
+            for record in records {
+                let encoded = record.encode()?;
+                write_activation_page_record_frame(&mut writer, &mut index, &record, &encoded)?;
+            }
+            Ok::<_, BootstrapStreamingImportError>((writer, index))
+        })();
+        let (writer, index) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        self.mode = ActivationPageRecordBuildMode::Spilled {
+            writer,
+            path,
+            index,
+            encoded_bytes,
+        };
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ActivationPageRecordStore, BootstrapStreamingImportError> {
+        let Self {
+            mode, path_order, ..
+        } = self;
+        match mode {
+            ActivationPageRecordBuildMode::Memory {
+                mut records,
+                encoded_bytes,
+            } => {
+                records.sort_unstable_by_key(|record| record.page.page_id);
+                if records
+                    .windows(2)
+                    .any(|pair| pair[0].page.page_id == pair[1].page.page_id)
+                {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "activation page records repeat a page identity".into(),
+                    ));
+                }
+                Ok(ActivationPageRecordStore::Memory {
+                    records,
+                    encoded_bytes,
+                    path_order,
+                })
+            }
+            ActivationPageRecordBuildMode::Spilled {
+                mut writer,
+                path,
+                index,
+                encoded_bytes,
+            } => {
+                if let Err(error) = writer.flush() {
+                    drop(writer);
+                    let _ = fs::remove_file(&path);
+                    return Err(error.into());
+                }
+                let file = match writer.into_inner() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        let failure =
+                            io::Error::new(error.error().kind(), error.error().to_string());
+                        drop(error.into_inner());
+                        let _ = fs::remove_file(&path);
+                        return Err(failure.into());
+                    }
+                };
+                Ok(ActivationPageRecordStore::Spilled(
+                    SpilledActivationPageRecords {
+                        file: RefCell::new(Some(file)),
+                        path,
+                        index,
+                        encoded_bytes,
+                        path_order,
+                    },
+                ))
+            }
+            ActivationPageRecordBuildMode::Transitioning => unreachable!(),
+        }
+    }
+}
+
+fn write_activation_page_record_frame(
+    writer: &mut BufWriter<File>,
+    index: &mut BTreeMap<PageId, (u64, u64)>,
+    record: &ActivationPageRecordV1,
+    encoded: &[u8],
+) -> Result<(), BootstrapStreamingImportError> {
+    let start = writer.stream_position()?;
+    let length = u64::try_from(encoded.len()).map_err(|_| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "activation page record length cannot be represented".into(),
+        )
+    })?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(encoded)?;
+    let offset = start.checked_add(8).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "activation page record offset overflow".into(),
+        )
+    })?;
+    if index
+        .insert(record.page.page_id, (offset, length))
+        .is_some()
+    {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "activation page records repeat a page identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) enum ActivationPageRecordStore {
+    Memory {
+        records: Vec<ActivationPageRecordV1>,
+        encoded_bytes: usize,
+        path_order: Vec<PageId>,
+    },
+    Spilled(SpilledActivationPageRecords),
+}
+
+impl ActivationPageRecordStore {
+    pub(crate) fn page_count(&self) -> usize {
+        match self {
+            Self::Memory { records, .. } => records.len(),
+            Self::Spilled(spilled) => spilled.index.len(),
+        }
+    }
+
+    pub(crate) fn path_order(&self) -> &[PageId] {
+        match self {
+            Self::Memory { path_order, .. } => path_order,
+            Self::Spilled(spilled) => &spilled.path_order,
+        }
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        match self {
+            Self::Memory { encoded_bytes, .. } => *encoded_bytes,
+            Self::Spilled(spilled) => spilled.encoded_bytes,
+        }
+    }
+
+    fn spilled(&self) -> bool {
+        matches!(self, Self::Spilled(_))
+    }
+
+    fn page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ActivationPageRecordV1>, BootstrapStreamingImportError> {
+        match self {
+            Self::Memory { records, .. } => Ok(records
+                .binary_search_by_key(&page_id, |record| record.page.page_id)
+                .ok()
+                .map(|index| records[index].clone())),
+            Self::Spilled(spilled) => spilled.page(page_id),
+        }
+    }
+
+    /// Return the parser-owned terminal page for SQLite construction.
+    ///
+    /// Every syntactically valid single `id::` claim is retained here,
+    /// including graph-wide ambiguity. The immutable CRDT baseline separately
+    /// installs only a uniquely claimed UUID; SQLite must preserve all
+    /// claimants so the application can make that decision without Patricia.
+    pub(crate) fn sqlite_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<super::MaterializedPageInput>, BootstrapStreamingImportError> {
+        let Some(record) = self.page(page_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(record.sqlite_page()))
+    }
+}
+
+pub(crate) struct SpilledActivationPageRecords {
+    file: RefCell<Option<File>>,
+    path: PathBuf,
+    index: BTreeMap<PageId, (u64, u64)>,
+    encoded_bytes: usize,
+    path_order: Vec<PageId>,
+}
+
+impl SpilledActivationPageRecords {
+    fn page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ActivationPageRecordV1>, BootstrapStreamingImportError> {
+        let Some(&(offset, length)) = self.index.get(&page_id) else {
+            return Ok(None);
+        };
+        if length > MAX_ACTIVATION_PAGE_RECORD_BYTES as u64 {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: length,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        let mut file = self.file.borrow_mut();
+        let file = file.as_mut().ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "activation page record spool is closed".into(),
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; length as usize];
+        file.read_exact(&mut bytes)?;
+        let record = ActivationPageRecordV1::decode(&bytes)?;
+        if record.page.page_id != page_id {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "activation page record index points to another page".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+}
+
+impl Drop for SpilledActivationPageRecords {
+    fn drop(&mut self) {
+        self.file.get_mut().take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// One-shot, process-local capability that lets an uninterrupted fresh
 /// activation build its SQLite projection from the terminal accepted state it
 /// just authored, instead of reloading and replaying every physical bootstrap
 /// part.
 ///
-/// It retains only values this preparation already produced: the existing
-/// operation spool file and the already-typed accepted event of each authored
-/// part. It is deliberately neither `Clone` nor serializable, is never sealed,
-/// fsynced, or named by any durable artifact, and removes its relocated spool
-/// on drop. Crash residue is ordinary incomplete-preparation garbage that a new
-/// process ignores.
+/// It retains only the already-typed accepted event of each authored part. It
+/// is deliberately neither `Clone` nor serializable and is never sealed,
+/// fsynced, or named by any durable artifact.
 ///
 /// It is an optimization capability, never an authority: every consumer must
 /// independently bind it to the retained candidate, aggregate, durable history
@@ -781,10 +1334,11 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     import_id: ImportId,
-    operations: PathBuf,
     operation_count: u64,
     declaration_count: u64,
     accepted_events: Vec<AcceptedBatchEvent>,
+    activation_pages: Option<ActivationPageRecordStore>,
+    lazy_genesis: Option<LazyGenesisCandidate>,
 }
 
 #[allow(dead_code)]
@@ -813,23 +1367,33 @@ impl TerminalBootstrapConstructionMaterial {
         self.declaration_count
     }
 
-    /// Reopen the retained operation spool. Chunk 2's manifest-intent sink is
-    /// this handle's other consumer; chunk 1 only proves the spool survived the
-    /// working-directory removal so the capability stays one artifact.
-    pub(crate) fn open_operations(
+    pub(crate) fn terminal_projection_page(
         &self,
-    ) -> Result<BootstrapOperationSpoolReader, BootstrapStreamingImportError> {
-        Ok(BootstrapOperationSpoolReader::open(&self.operations)?)
+        page_id: PageId,
+    ) -> Result<Option<super::MaterializedPageInput>, BootstrapStreamingImportError> {
+        Ok(self
+            .activation_pages
+            .as_ref()
+            .map(|pages| pages.page(page_id))
+            .transpose()?
+            .flatten()
+            .map(|record| record.page))
     }
 
-    pub(crate) fn operations_path(&self) -> &Path {
-        &self.operations
+    pub(crate) fn lazy_genesis_page_count(&self) -> Option<usize> {
+        self.lazy_genesis
+            .as_ref()
+            .map(LazyGenesisCandidate::page_count)
     }
-}
 
-impl Drop for TerminalBootstrapConstructionMaterial {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.operations);
+    pub(crate) fn lazy_genesis_block_count(&self) -> Option<u64> {
+        self.lazy_genesis
+            .as_ref()
+            .map(LazyGenesisCandidate::block_count)
+    }
+
+    pub(crate) fn lazy_genesis_root(&self) -> Option<ContentDigest> {
+        self.lazy_genesis.as_ref().map(LazyGenesisCandidate::root)
     }
 }
 
@@ -871,6 +1435,7 @@ impl InactiveBootstrapPreparedPartCursor {
     }
 }
 
+#[cfg(test)]
 fn invalid_bootstrap_orchestration(detail: impl Into<String>) -> BootstrapStreamingImportError {
     BootstrapStreamingImportError::InvalidOperation(detail.into())
 }
@@ -879,6 +1444,7 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn validate_inactive_bootstrap_preparation(
     prepared: &InactiveBootstrapPreparedPublication,
     store: &ObjectStore,
@@ -919,20 +1485,18 @@ fn validate_inactive_bootstrap_preparation(
         || prepared.candidate.part_count() != aggregate.parts().len() as u32
         || prepared.candidate.last_part() != aggregate.final_frontier().last_part()
         || prepared.engine_materials.len() != aggregate.parts().len()
-        || prepared.candidate.index_archive_identity()
-            != prepared.reference_catalog_archive_identity
+        || prepared.candidate.index_archive_identity() != prepared.bootstrap_index_archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
             "workspace, graph, capture, candidate, or aggregate identity mismatch",
         ));
     }
-    // Every accepted cold record about to be installed binds a reference
-    // catalog root that was built in one exact archive's durable authenticated
-    // store. Installing that history into any other archive would bind a root
-    // that archive cannot open.
-    if store.canonical_archive_identity()? != prepared.reference_catalog_archive_identity {
+    // Every accepted cold record about to be installed binds identity roots
+    // built in one exact archive's authenticated stores. Installing that
+    // history into another archive would bind roots it cannot open.
+    if store.canonical_archive_identity()? != prepared.bootstrap_index_archive_identity {
         return Err(invalid_bootstrap_orchestration(
-            "bootstrap preparation was authored against a different archive's reference catalog",
+            "bootstrap preparation was authored against another archive's identity indexes",
         ));
     }
 
@@ -947,8 +1511,6 @@ fn validate_inactive_bootstrap_preparation(
             ));
         }
     }
-    let reference_catalog = store.open_reference_catalog()?;
-
     for (ordinal, (descriptor, material)) in aggregate
         .parts()
         .iter()
@@ -978,18 +1540,6 @@ fn validate_inactive_bootstrap_preparation(
                 "prepared part, manifest, descriptor, or engine material mismatch",
             ));
         }
-        // This exact record is about to be installed as durable history that
-        // names `reference_catalog_root`. Authoring built that root in this
-        // archive's durable catalog; prove the archive holds it before any
-        // history record can name it.
-        reference_catalog
-            .require_catalog_root_nodes(material.reference_catalog_root())
-            .map_err(|error| {
-                invalid_bootstrap_orchestration(format!(
-                    "archive is missing the durable reference catalog this bootstrap part binds: \
-                     {error}"
-                ))
-            })?;
         spans.validate_part(descriptor.evidence())?;
         let span_bytes = spans.encode()?;
         let payload_descriptors = manifest
@@ -1057,6 +1607,7 @@ fn validate_inactive_bootstrap_preparation(
     ))
 }
 
+#[cfg(test)]
 fn publish_inactive_bootstrap_prefix(
     prepared: &InactiveBootstrapPreparedPublication,
     store: &ObjectStore,
@@ -1103,6 +1654,7 @@ fn publish_inactive_bootstrap_prefix(
 /// Publish, install, freshly reopen, and verify one complete bootstrap while
 /// leaving graph, projection, enrollment, SQLite, and runtime authority
 /// untouched.
+#[cfg(test)]
 pub(crate) fn publish_install_verify_inactive_bootstrap(
     prepared: &InactiveBootstrapPreparedPublication,
     store: ObjectStore,
@@ -1326,6 +1878,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
 /// across publication and SQLite construction. Durable aggregate/history roots
 /// are freshly reopened here, but semantic payloads are not replayed into a
 /// second engine. A new process still uses the full replaying reopen below.
+#[cfg(test)]
 pub(crate) fn retain_inactive_bootstrap_accepted_authority(
     prepared: &InactiveBootstrapPreparedPublication,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -1334,7 +1887,7 @@ pub(crate) fn retain_inactive_bootstrap_accepted_authority(
     let archive_identity = store.canonical_archive_identity()?;
     if store.workspace_id() != verified.workspace_id
         || archive_identity != verified.archive_identity
-        || prepared.reference_catalog_archive_identity != archive_identity
+        || prepared.bootstrap_index_archive_identity != archive_identity
         || prepared.candidate.index_archive_identity() != archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
@@ -1408,6 +1961,7 @@ pub(crate) fn retain_inactive_bootstrap_accepted_authority(
 
 /// Freshly reopen and retain the exact accepted authority described by a
 /// previously minted inactive-bootstrap publication proof.
+#[cfg(test)]
 pub(crate) fn reopen_inactive_bootstrap_accepted_authority(
     verified: &InactiveBootstrapVerifiedPublication,
     store: ObjectStore,
@@ -2056,6 +2610,7 @@ struct BootstrapSourceProtocolPreparation {
     source_count: u32,
 }
 
+#[cfg(test)]
 fn prepare_bootstrap_source_protocol(
     workspace_id: WorkspaceId,
     capture: &BootstrapSourceCapture,
@@ -2491,10 +3046,381 @@ impl BootstrapOperationRecord {
     }
 }
 
+enum BootstrapOperationStorage {
+    Memory(Vec<SortRecord>),
+    File(PathBuf),
+}
+
+enum SortRecordStorageReader<'a> {
+    Memory(std::slice::Iter<'a, SortRecord>),
+    File(SortRecordReader),
+}
+
+impl<'a> SortRecordStorageReader<'a> {
+    fn open(storage: &'a BootstrapOperationStorage) -> io::Result<Self> {
+        match storage {
+            BootstrapOperationStorage::Memory(records) => Ok(Self::Memory(records.iter())),
+            BootstrapOperationStorage::File(path) => Ok(Self::File(SortRecordReader::open(path)?)),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<Option<SortRecord>> {
+        match self {
+            Self::Memory(records) => Ok(records.next().cloned()),
+            Self::File(records) => records.next(),
+        }
+    }
+}
+
+struct AcceptedIdentityCursor<'a> {
+    records: SortRecordStorageReader<'a>,
+    pending: Option<SortRecord>,
+}
+
+impl<'a> AcceptedIdentityCursor<'a> {
+    fn open(storage: &'a BootstrapOperationStorage) -> io::Result<Self> {
+        Ok(Self {
+            records: SortRecordStorageReader::open(storage)?,
+            pending: None,
+        })
+    }
+
+    fn assignments_for(
+        &mut self,
+        path: &ManagedPath,
+    ) -> Result<BTreeMap<BlockId, LogseqUuid>, BootstrapStreamingImportError> {
+        let mut assignments = BTreeMap::new();
+        loop {
+            if self.pending.is_none() {
+                self.pending = self.records.next()?;
+            }
+            let Some(record) = self.pending.as_ref() else {
+                break;
+            };
+            let record_path = page_capsule_key_path(&record.key)?;
+            match record_path.cmp(path) {
+                std::cmp::Ordering::Less => {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "accepted identity stream precedes the canonical page stream".into(),
+                    ));
+                }
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {}
+            }
+            let record = self
+                .pending
+                .take()
+                .expect("accepted identity record exists");
+            let operation = BootstrapOperationRecord::decode(&record.value)?;
+            let SemanticOperation::MutateBlockLogseqIdentity {
+                block,
+                mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+            } = operation.operation
+            else {
+                return Err(BootstrapStreamingImportError::InvalidOperation(
+                    "accepted identity stream contains a non-assignment operation".into(),
+                ));
+            };
+            if assignments.insert(block.block_id, logseq_uuid).is_some() {
+                return Err(BootstrapStreamingImportError::InvalidOperation(
+                    "accepted identity stream repeats a block assignment".into(),
+                ));
+            }
+        }
+        Ok(assignments)
+    }
+
+    fn finish(mut self) -> Result<(), BootstrapStreamingImportError> {
+        if self.pending.is_some() || self.records.next()?.is_some() {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "accepted identity stream contains an unknown page".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn page_capsule_key_path(key: &[u8]) -> Result<ManagedPath, BootstrapStreamingImportError> {
+    if key.len() < 9 || key[key.len() - 9] != 0 {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "accepted identity has a malformed page-capsule key".into(),
+        ));
+    }
+    let path = std::str::from_utf8(&key[..key.len() - 9]).map_err(|_| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "accepted identity page-capsule path is not UTF-8".into(),
+        )
+    })?;
+    ManagedPath::parse(path).map_err(|error| {
+        BootstrapStreamingImportError::InvalidOperation(format!(
+            "accepted identity page-capsule path is invalid: {error}"
+        ))
+    })
+}
+
 struct BootstrapOperationSpool {
-    path: PathBuf,
+    storage: BootstrapOperationStorage,
     operation_count: u64,
     declaration_count: u64,
+    activation_pages: Option<ActivationPageRecordStore>,
+    lazy_genesis: Option<LazyGenesisCandidate>,
+}
+
+enum BootstrapOperationCollectionMode {
+    Memory {
+        content: Vec<SortRecord>,
+        identities: Vec<SortRecord>,
+        retained_bytes: usize,
+    },
+    Streaming {
+        content: ExternalSort,
+        identities: ExternalSort,
+    },
+    Transitioning,
+}
+
+struct BootstrapOperationCollector {
+    working: PathBuf,
+    memory_limit: usize,
+    peak_retained_bytes: usize,
+    mode: BootstrapOperationCollectionMode,
+}
+
+#[derive(Clone, Copy)]
+enum BootstrapOperationCollectionTarget {
+    Content,
+    Identity,
+}
+
+impl BootstrapOperationCollector {
+    fn new(working: &Path) -> Self {
+        Self {
+            working: working.to_path_buf(),
+            memory_limit: bootstrap_operation_memory_limit(),
+            peak_retained_bytes: 0,
+            mode: BootstrapOperationCollectionMode::Memory {
+                content: Vec::new(),
+                identities: Vec::new(),
+                retained_bytes: 0,
+            },
+        }
+    }
+
+    fn push_content(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        self.push(BootstrapOperationCollectionTarget::Content, key, value)
+    }
+
+    fn push_identity(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        self.push(BootstrapOperationCollectionTarget::Identity, key, value)
+    }
+
+    fn push(
+        &mut self,
+        target: BootstrapOperationCollectionTarget,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        let record_bytes = key
+            .len()
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or_else(|| {
+                BootstrapStreamingImportError::InvalidOperation(
+                    "in-memory bootstrap operation length overflow".into(),
+                )
+            })?;
+        let must_spill = matches!(
+            &self.mode,
+            BootstrapOperationCollectionMode::Memory { retained_bytes, .. }
+                if retained_bytes.saturating_add(record_bytes) > self.memory_limit
+        );
+        if must_spill {
+            self.spill_to_streaming()?;
+        }
+        match &mut self.mode {
+            BootstrapOperationCollectionMode::Memory {
+                content,
+                identities,
+                retained_bytes,
+            } => {
+                *retained_bytes = retained_bytes.saturating_add(record_bytes);
+                self.peak_retained_bytes = self.peak_retained_bytes.max(*retained_bytes);
+                let records = match target {
+                    BootstrapOperationCollectionTarget::Content => content,
+                    BootstrapOperationCollectionTarget::Identity => identities,
+                };
+                records.push(SortRecord { key, value });
+                Ok(())
+            }
+            BootstrapOperationCollectionMode::Streaming {
+                content,
+                identities,
+            } => match target {
+                BootstrapOperationCollectionTarget::Content => content.push(key, value),
+                BootstrapOperationCollectionTarget::Identity => identities.push(key, value),
+            },
+            BootstrapOperationCollectionMode::Transitioning => unreachable!(),
+        }
+    }
+
+    fn spill_to_streaming(&mut self) -> Result<(), BootstrapStreamingImportError> {
+        let previous = std::mem::replace(
+            &mut self.mode,
+            BootstrapOperationCollectionMode::Transitioning,
+        );
+        let BootstrapOperationCollectionMode::Memory {
+            content,
+            identities,
+            retained_bytes,
+        } = previous
+        else {
+            self.mode = previous;
+            return Ok(());
+        };
+        self.peak_retained_bytes = self.peak_retained_bytes.max(retained_bytes);
+        let mut content_sort = ExternalSort::new(&self.working, "phase-content")?;
+        let mut identity_sort = ExternalSort::new(&self.working, "identity-candidates")?;
+        for record in content {
+            content_sort.push(record.key, record.value)?;
+        }
+        for record in identities {
+            identity_sort.push(record.key, record.value)?;
+        }
+        self.mode = BootstrapOperationCollectionMode::Streaming {
+            content: content_sort,
+            identities: identity_sort,
+        };
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        instrumentation: &mut BootstrapStreamingImportInstrumentation,
+    ) -> Result<
+        (BootstrapOperationStorage, BootstrapOperationStorage, u64),
+        BootstrapStreamingImportError,
+    > {
+        instrumentation.operation_builder_retained_bytes = instrumentation
+            .operation_builder_retained_bytes
+            .max(self.peak_retained_bytes as u64);
+        match self.mode {
+            BootstrapOperationCollectionMode::Memory {
+                mut content,
+                mut identities,
+                retained_bytes,
+            } => {
+                instrumentation.operation_builder_retained_bytes = instrumentation
+                    .operation_builder_retained_bytes
+                    .max(retained_bytes as u64);
+                content.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                identities.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                let mut identity_count = 0_u64;
+                let mut accepted_identities = Vec::new();
+                let mut start = 0;
+                while start < identities.len() {
+                    let mut end = start + 1;
+                    while end < identities.len() && identities[end].key == identities[start].key {
+                        end += 1;
+                    }
+                    if end == start + 1 {
+                        let unique = &identities[start];
+                        let (key, value) = decode_identity_candidate(&unique.value)?;
+                        let accepted = SortRecord { key, value };
+                        content.push(accepted.clone());
+                        accepted_identities.push(accepted);
+                        identity_count = identity_count.saturating_add(1);
+                    }
+                    start = end;
+                }
+                content.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                accepted_identities.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                Ok((
+                    BootstrapOperationStorage::Memory(content),
+                    BootstrapOperationStorage::Memory(accepted_identities),
+                    identity_count,
+                ))
+            }
+            BootstrapOperationCollectionMode::Streaming {
+                content,
+                identities,
+            } => {
+                instrumentation.operation_builder_spilled = true;
+                let content_path = self.working.join("phase-content.sorted");
+                let capsule_path = self.working.join("phase-capsule.sorted");
+                let identity_candidates_path = self.working.join("identity-candidates.sorted");
+                let identity_path = self.working.join("phase-identity.sorted");
+                for (sort, destination) in [
+                    (content, &content_path),
+                    (identities, &identity_candidates_path),
+                ] {
+                    let receipt = sort.finish(destination)?;
+                    record_sort_receipt(instrumentation, receipt);
+                }
+                let identity_count = collapse_unique_identity_candidates(
+                    &identity_candidates_path,
+                    &identity_path,
+                    &self.working,
+                    instrumentation,
+                )?;
+                merge_sort_runs(
+                    &[content_path.clone(), identity_path.clone()],
+                    &capsule_path,
+                )?;
+                let operation_path = self.working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
+                let mut output = BufWriter::new(create_new_file(&operation_path)?);
+                let mut input = File::open(&capsule_path)?;
+                io::copy(&mut input, &mut output)?;
+                output.flush()?;
+                instrumentation.operation_spool_bytes = instrumentation
+                    .operation_spool_bytes
+                    .saturating_add(operation_path.metadata()?.len());
+                Ok((
+                    BootstrapOperationStorage::File(operation_path),
+                    BootstrapOperationStorage::File(identity_path),
+                    identity_count,
+                ))
+            }
+            BootstrapOperationCollectionMode::Transitioning => unreachable!(),
+        }
+    }
+}
+
+fn decode_identity_candidate(
+    value: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), BootstrapStreamingImportError> {
+    if value.len() < 4 {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "truncated identity candidate".into(),
+        ));
+    }
+    let key_length = u32::from_be_bytes(value[..4].try_into().unwrap()) as usize;
+    let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "identity capsule key length overflow".into(),
+        )
+    })?;
+    if key_end > value.len() {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "truncated identity capsule key".into(),
+        ));
+    }
+    Ok((value[4..key_end].to_vec(), value[key_end..].to_vec()))
 }
 
 fn page_capsule_sort_key(path: &ManagedPath, sequence: u64) -> Vec<u8> {
@@ -2505,36 +3431,123 @@ fn page_capsule_sort_key(path: &ManagedPath, sequence: u64) -> Vec<u8> {
     key
 }
 
-fn spool_bootstrap_operations(
+fn emit_activation_page_operations(
+    record: &ActivationPageRecordV1,
+    collector: &mut BootstrapOperationCollector,
+    operation_count: &mut u64,
+    declaration_count: &mut u64,
+) -> Result<(), BootstrapStreamingImportError> {
+    record.validate()?;
+    let source_leaf = SourceLeafDigestV1::from_bytes(record.source_leaf);
+    let page = &record.page;
+    let logical_name = LogicalPageName::parse(page.name.clone())
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let page_operation = BootstrapOperationRecord::new(
+        SemanticOperation::CreatePage {
+            page_id: page.page_id,
+            home_document_id: page.home_document_id,
+            name: logical_name,
+            path: page.path.clone(),
+            kind: page.kind,
+        },
+        source_leaf,
+        record.full_span,
+    )?;
+    collector.push_content(
+        page_capsule_sort_key(&page.path, 0),
+        page_operation.encode()?,
+    )?;
+    *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+    *declaration_count = declaration_count.checked_add(1).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "bootstrap declaration count overflow".into(),
+        )
+    })?;
+    if page.preamble.is_some() {
+        let preamble = BootstrapOperationRecord::new(
+            SemanticOperation::SetPagePreamble {
+                page_id: page.page_id,
+                preamble: page.preamble.clone(),
+            },
+            source_leaf,
+            record.full_span,
+        )?;
+        collector.push_content(page_capsule_sort_key(&page.path, 1), preamble.encode()?)?;
+        *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+    }
+    for (index, (block, source)) in page.blocks.iter().zip(&record.block_sources).enumerate() {
+        let operation = BootstrapOperationRecord::new(
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                },
+                page_id: page.page_id,
+                parent: block.parent,
+                order: block.order.clone(),
+                content: block.content.clone(),
+            },
+            source_leaf,
+            Some(source.span),
+        )?;
+        let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
+        collector.push_content(
+            page_capsule_sort_key(&page.path, block_sequence),
+            operation.encode()?,
+        )?;
+        *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+
+        if source.raw_ids.len() == 1 {
+            if let Ok(logseq_uuid) = LogseqUuid::parse(source.raw_ids[0].trim()) {
+                let identity = BootstrapOperationRecord::new(
+                    SemanticOperation::MutateBlockLogseqIdentity {
+                        block: BlockLocation {
+                            block_id: block.block_id,
+                            home_document_id: block.home_document_id,
+                        },
+                        mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+                    },
+                    source_leaf,
+                    Some(source.span),
+                )?;
+                let content_key = page_capsule_sort_key(&page.path, block_sequence + 1);
+                let key_length = u32::try_from(content_key.len()).map_err(|_| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "page capsule key length cannot be represented".into(),
+                    )
+                })?;
+                let mut value = Vec::with_capacity(4 + content_key.len() + 128);
+                value.extend_from_slice(&key_length.to_be_bytes());
+                value.extend_from_slice(&content_key);
+                value.extend_from_slice(&identity.encode()?);
+                collector.push_identity(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse each authoritative source page exactly once into the regime-neutral
+/// terminal record consumed by both the clean baseline pack and SQLite. This
+/// function deliberately knows nothing about semantic operations, parts,
+/// receipts, or accepted history. The legacy bootstrap oracle translates the
+/// returned records afterwards; the production redesign does not.
+fn capture_activation_page_records(
     capture: &BootstrapSourceCapture,
     import_id: ImportId,
     workspace_id: WorkspaceId,
-    working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
-) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
+) -> Result<ActivationPageRecordStore, BootstrapStreamingImportError> {
     let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
-    let content_path = working.join("phase-content.sorted");
-    let capsule_path = working.join("phase-capsule.sorted");
-    let identity_candidates_path = working.join("identity-candidates.sorted");
-    let identity_path = working.join("phase-identity.sorted");
-    let mut content_sort = ExternalSort::new(working, "phase-content")?;
-    let mut identity_candidates = ExternalSort::new(working, "identity-candidates")?;
     let mut source_reader = BootstrapSourceReader::new(capture)?;
     let mut entries = capture.entries_cursor()?;
-    let mut operation_count = 0_u64;
-    let mut declaration_count = 0_u64;
+    let mut activation_pages = ActivationPageRecordBuilder::new();
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
         if !authoritative_paths.contains(entry.path()) {
             continue;
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| {
-            BootstrapStreamingImportError::InvalidSource(format!(
-                "captured source {} is not UTF-8",
-                entry.path()
-            ))
-        })?;
         let logical_name = LogicalPageName::parse(entry.logical_name().to_owned())
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
         let leaf = SourceLeafV1::new(
@@ -2553,14 +3566,9 @@ fn spool_bootstrap_operations(
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
 
         let mut parser_instrumentation = ImportInstrumentation::default();
-        let tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
-            .map_err(|block| {
-                BootstrapStreamingImportError::InvalidSource(format!(
-                    "{}: {}",
-                    entry.path(),
-                    block.detail
-                ))
-            })?;
+        let captured_page = capture.read_activation_page(&entry)?;
+        let mut tree =
+            decode_captured_activation_page_record(entry.path(), captured_page.as_slice())?;
         if tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
             return Err(BootstrapStreamingImportError::ResourceLimit {
                 resource: "parser nodes per source file",
@@ -2570,23 +3578,8 @@ fn spool_bootstrap_operations(
         }
         // Source admission and parsing complete before the first semantic
         // operation for this external document is constructible.
-        let page_operation = BootstrapOperationRecord::new(
-            SemanticOperation::CreatePage {
-                page_id,
-                home_document_id,
-                name: logical_name,
-                path: entry.path().clone(),
-                kind: entry.kind(),
-            },
-            source_leaf,
-            full_span,
-        )?;
-        content_sort.push(
-            page_capsule_sort_key(entry.path(), 0),
-            page_operation.encode()?,
-        )?;
-        operation_count = checked_bootstrap_operation_count(operation_count)?;
-        declaration_count += 1;
+        let page_name = logical_name.as_str().to_owned();
+        let page_name_key = logical_name.canonical_key();
         instrumentation.parser_nodes = instrumentation
             .parser_nodes
             .checked_add(tree.nodes.len() as u64)
@@ -2598,19 +3591,9 @@ fn spool_bootstrap_operations(
         instrumentation.peak_owned_parser_nodes = instrumentation
             .peak_owned_parser_nodes
             .max(tree.nodes.len() as u64);
-        if tree.preamble.is_some() {
-            let preamble = BootstrapOperationRecord::new(
-                SemanticOperation::SetPagePreamble {
-                    page_id,
-                    preamble: tree.preamble.clone(),
-                },
-                source_leaf,
-                full_span,
-            )?;
-            content_sort.push(page_capsule_sort_key(entry.path(), 1), preamble.encode()?)?;
-            operation_count = checked_bootstrap_operation_count(operation_count)?;
-        }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
+        let mut terminal_blocks = Vec::with_capacity(tree.nodes.len());
+        let mut activation_block_sources = Vec::with_capacity(tree.nodes.len());
         for index in 0..tree.nodes.len() {
             let locator = materialize_locator(&tree, index, &mut parser_instrumentation).map_err(
                 |block| {
@@ -2625,95 +3608,969 @@ fn spool_bootstrap_operations(
                 import_id.unmatched_block_id(&ImportLocator::block(entry.path().clone(), locator));
             let parent = tree.nodes[index].parent.map(|parent| node_ids[parent]);
             node_ids.push(block_id);
-            let span = Some(tree.nodes[index].span);
-            let operation = BootstrapOperationRecord::new(
-                SemanticOperation::CreateBlock {
-                    block: BlockLocation {
-                        block_id,
-                        home_document_id,
-                    },
-                    page_id,
-                    parent,
-                    order: imported_order(tree.nodes[index].sibling_position),
-                    content: tree.nodes[index].raw.clone(),
-                },
-                source_leaf,
-                span,
-            )?;
-            let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
-            content_sort.push(
-                page_capsule_sort_key(entry.path(), block_sequence),
-                operation.encode()?,
-            )?;
-            operation_count = checked_bootstrap_operation_count(operation_count)?;
-
-            if tree.nodes[index].raw_ids.len() == 1 {
-                if let Ok(logseq_uuid) = LogseqUuid::parse(tree.nodes[index].raw_ids[0].trim()) {
-                    let identity = BootstrapOperationRecord::new(
-                        SemanticOperation::MutateBlockLogseqIdentity {
-                            block: BlockLocation {
-                                block_id,
-                                home_document_id,
-                            },
-                            mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
-                        },
-                        source_leaf,
-                        span,
-                    )?;
-                    let content_key = page_capsule_sort_key(entry.path(), block_sequence + 1);
-                    let key_length = u32::try_from(content_key.len()).map_err(|_| {
-                        BootstrapStreamingImportError::InvalidOperation(
-                            "page capsule key length cannot be represented".into(),
-                        )
-                    })?;
-                    let mut value = Vec::with_capacity(4 + content_key.len() + 128);
-                    value.extend_from_slice(&key_length.to_be_bytes());
-                    value.extend_from_slice(&content_key);
-                    value.extend_from_slice(&identity.encode()?);
-                    identity_candidates.push(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
-                }
-            }
+            let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
+            terminal_blocks.push(super::MaterializedBlockInput {
+                block_id,
+                home_document_id,
+                parent,
+                order: imported_order(tree.nodes[index].sibling_position),
+                content: std::mem::take(&mut tree.nodes[index].raw),
+                searchable_text: facets.searchable_text,
+                heading_level: facets.heading_level,
+                collapsed: facets.collapsed,
+                logseq_uuid: None,
+                logseq_identity_origin: None,
+                references: Vec::new(),
+                properties: facets.properties,
+                tags: facets.tags,
+                task: facets.task,
+            });
+            activation_block_sources.push(ActivationBlockSourceV1 {
+                span: tree.nodes[index].span,
+                raw_ids: std::mem::take(&mut tree.nodes[index].raw_ids),
+            });
         }
-        let _ = text;
+        let is_org = super::reference_catalog::reference_source_is_org(entry.path());
+        let (preamble_search, _, _, properties, tags, _) = tree
+            .preamble
+            .as_deref()
+            .map(|preamble| super::sqlite::document_facets(preamble, is_org))
+            .unwrap_or_default();
+        let mut searchable = page_name.clone();
+        if !preamble_search.is_empty() {
+            searchable.push(' ');
+            searchable.push_str(&preamble_search);
+        }
+        let record = ActivationPageRecordV1::new(
+            source_leaf,
+            bytes,
+            full_span,
+            super::MaterializedPageInput {
+                page_id,
+                home_document_id,
+                name: page_name,
+                name_key: page_name_key,
+                path: entry.path().clone(),
+                kind: entry.kind(),
+                preamble: tree.preamble,
+                searchable_text: searchable,
+                references: Vec::new(),
+                properties,
+                tags,
+                blocks: terminal_blocks,
+            },
+            activation_block_sources,
+        )?;
+        activation_pages.push(record)?;
     }
     source_reader.finish()?;
+    activation_pages.finish()
+}
 
-    for (sort, destination) in [
-        (content_sort, &content_path),
-        (identity_candidates, &identity_candidates_path),
-    ] {
-        let receipt = sort.finish(destination)?;
-        record_sort_receipt(instrumentation, receipt);
+#[cfg(test)]
+fn spool_bootstrap_operations(
+    capture: &BootstrapSourceCapture,
+    import_id: ImportId,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    working: &Path,
+    instrumentation: &mut BootstrapStreamingImportInstrumentation,
+) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
+    let activation_pages =
+        capture_activation_page_records(capture, import_id, workspace_id, instrumentation)?;
+    let mut collector = BootstrapOperationCollector::new(working);
+    let mut operation_count = 0_u64;
+    let mut declaration_count = 0_u64;
+    for page_id in activation_pages.path_order() {
+        let record = activation_pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        emit_activation_page_operations(
+            &record,
+            &mut collector,
+            &mut operation_count,
+            &mut declaration_count,
+        )?;
     }
-    let identity_count = collapse_unique_identity_candidates(
-        &identity_candidates_path,
-        &identity_path,
-        working,
-        instrumentation,
-    )?;
+
+    let (storage, accepted_identity_storage, identity_count) = collector.finish(instrumentation)?;
     operation_count = operation_count.checked_add(identity_count).ok_or_else(|| {
         BootstrapStreamingImportError::InvalidOperation("bootstrap operation count overflow".into())
     })?;
     require_bootstrap_operation_limit(operation_count)?;
-    merge_sort_runs(
-        &[content_path.clone(), identity_path.clone()],
-        &capsule_path,
-    )?;
-
-    let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
-    let mut output = BufWriter::new(create_new_file(&operation_path)?);
-    let mut input = File::open(&capsule_path)?;
-    io::copy(&mut input, &mut output)?;
-    output.flush()?;
     instrumentation.operations = operation_count;
-    instrumentation.operation_spool_bytes = instrumentation
-        .operation_spool_bytes
-        .saturating_add(operation_path.metadata()?.len());
+    let mut accepted_identities = AcceptedIdentityCursor::open(&accepted_identity_storage)?;
+    let mut lazy_genesis = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        capture.capture_identity()?,
+        working,
+    )?;
+    let mut lazy_checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    for page_id in activation_pages.path_order() {
+        let record = activation_pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let accepted = accepted_identities.assignments_for(&record.page.path)?;
+        let mut genesis_page = lazy_genesis_page_input(&record);
+        let (checkpoint, dependencies) = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
+        genesis_page.document_checkpoint = checkpoint;
+        genesis_page.document_dependencies = Some(dependencies);
+        lazy_genesis.push(genesis_page)?;
+    }
+    accepted_identities.finish()?;
+    let (catalog_checkpoint, catalog_dependencies) = lazy_checkpoints.finish()?;
+    let lazy_genesis = lazy_genesis.finish(catalog_checkpoint, catalog_dependencies)?;
+    instrumentation.terminal_projection_hint_pages = activation_pages.page_count() as u64;
+    instrumentation.terminal_projection_hint_bytes = activation_pages.encoded_bytes() as u64;
+    instrumentation.terminal_projection_hint_spilled = activation_pages.spilled();
     Ok(BootstrapOperationSpool {
-        path: operation_path,
+        storage,
         operation_count,
         declaration_count,
+        activation_pages: Some(activation_pages),
+        lazy_genesis: Some(lazy_genesis),
     })
+}
+
+fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageInput {
+    let blocks = record
+        .page
+        .blocks
+        .iter()
+        .zip(&record.block_sources)
+        .map(|(block, source)| {
+            let external_uuid_claims = if source.raw_ids.len() == 1 {
+                LogseqUuid::parse(source.raw_ids[0].trim())
+                    .ok()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            LazyGenesisBlockInput {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order.clone(),
+                content: block.content.clone(),
+                external_uuid_claims,
+            }
+        })
+        .collect();
+    LazyGenesisPageInput {
+        source_leaf: record.source_leaf,
+        exact_source_bytes: record.exact_source_bytes.clone(),
+        page_id: record.page.page_id,
+        home_document_id: record.page.home_document_id,
+        name: record.page.name.clone(),
+        path: record.page.path.clone(),
+        kind: record.page.kind,
+        preamble: record.page.preamble.clone(),
+        blocks,
+        document_checkpoint: Vec::new(),
+        document_dependencies: None,
+    }
+}
+
+/// Resolve the only graph-wide decision needed while constructing baseline
+/// page checkpoints: an external Logseq UUID is installed when and only when
+/// exactly one block claims it. Ambiguous claims remain visible in SQLite but
+/// do not become CRDT block identity. This is the same deterministic policy as
+/// the legacy identity-operation collapse, expressed without manufacturing an
+/// operation.
+fn unique_baseline_external_uuids(
+    pages: &ActivationPageRecordStore,
+) -> Result<BTreeMap<BlockId, LogseqUuid>, BootstrapStreamingImportError> {
+    let mut claims = BTreeMap::<LogseqUuid, Option<BlockId>>::new();
+    for page_id in pages.path_order() {
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        for (block, source) in record.page.blocks.iter().zip(&record.block_sources) {
+            let Some(logseq_uuid) = (source.raw_ids.len() == 1)
+                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
+                .flatten()
+            else {
+                continue;
+            };
+            match claims.entry(logseq_uuid) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(block.block_id));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    Ok(claims
+        .into_iter()
+        .filter_map(|(logseq_uuid, block_id)| block_id.map(|block_id| (block_id, logseq_uuid)))
+        .collect())
+}
+
+/// Construct the immutable baseline directly from terminal activation records.
+/// It does not create semantic operations, batches, receipts, parts, or a
+/// Patricia identity index. The record store may be memory-backed or spilled;
+/// source pages are never reparsed.
+fn build_lazy_genesis_from_activation_records(
+    pages: &ActivationPageRecordStore,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    source_capture: BlobDescription,
+    working: &Path,
+) -> Result<LazyGenesisCandidate, BootstrapStreamingImportError> {
+    let accepted_external_uuids = unique_baseline_external_uuids(pages)?;
+    let mut lazy_genesis = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        source_capture,
+        working,
+    )?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    for page_id in pages.path_order() {
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let page_assignments = record
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                accepted_external_uuids
+                    .get(&block.block_id)
+                    .copied()
+                    .map(|logseq_uuid| (block.block_id, logseq_uuid))
+            })
+            .collect();
+        let mut page = lazy_genesis_page_input(&record);
+        let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
+        page.document_checkpoint = checkpoint;
+        page.document_dependencies = Some(dependencies);
+        lazy_genesis.push(page)?;
+    }
+    let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
+    lazy_genesis
+        .finish(catalog_checkpoint, catalog_dependencies)
+        .map_err(Into::into)
+}
+
+/// The two unpublished products of one parser-owned activation-record pass.
+/// Neither value is authority; dropping either removes its private candidate.
+pub(crate) struct CleanActivationCandidates {
+    baseline: LazyGenesisCandidate,
+    sqlite: super::sqlite::CleanGenesisSqliteCandidate,
+    accepted_frontier: AcceptedFrontierRoot,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanActivationInstrumentation {
+    pub(crate) source_files: u64,
+    pub(crate) source_bytes: u64,
+    pub(crate) parser_nodes: u64,
+    pub(crate) activation_record_bytes: u64,
+    pub(crate) activation_records_spilled: bool,
+    /// Largest source page observed while deriving the canonical activation
+    /// inventory.  This is retained so the application readiness proof can
+    /// exercise a worst-shaped page without walking the source tree again.
+    pub(crate) largest_source_path: Option<String>,
+    pub(crate) identity_scan_micros: u64,
+    pub(crate) activation_record_micros: u64,
+    pub(crate) candidate_fanout_micros: u64,
+    pub(crate) candidate: CleanCandidateFanoutInstrumentation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanCandidateFanoutInstrumentation {
+    pub(crate) identity_claim_scan_micros: u64,
+    pub(crate) record_and_input_micros: u64,
+    pub(crate) checkpoint: super::hot_engine::LazyGenesisCheckpointInstrumentation,
+    pub(crate) baseline_pack_micros: u64,
+    pub(crate) sqlite_push_micros: u64,
+    pub(crate) sqlite: super::sqlite::CleanGenesisProjectionInstrumentation,
+    pub(crate) checkpoint_finish_micros: u64,
+    pub(crate) baseline_finish_micros: u64,
+    pub(crate) frontier_finish_micros: u64,
+    pub(crate) sqlite_finish_micros: u64,
+}
+
+/// Move-only clean activation preparation. It retains the exact initial source
+/// capture beside both unpublished products so the final source comparison
+/// cannot accidentally verify a different activation episode.
+pub(crate) struct CleanActivationPreparation {
+    capture: BootstrapSourceCapture,
+    candidates: CleanActivationCandidates,
+    instrumentation: CleanActivationInstrumentation,
+}
+
+impl CleanActivationPreparation {
+    pub(crate) const fn capture(&self) -> &BootstrapSourceCapture {
+        &self.capture
+    }
+
+    pub(crate) const fn candidates(&self) -> &CleanActivationCandidates {
+        &self.candidates
+    }
+
+    pub(crate) const fn instrumentation(&self) -> &CleanActivationInstrumentation {
+        &self.instrumentation
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        BootstrapSourceCapture,
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisSqliteCandidate,
+        AcceptedFrontierRoot,
+    ) {
+        let (baseline, sqlite, accepted_frontier) = self.candidates.into_parts();
+        (self.capture, baseline, sqlite, accepted_frontier)
+    }
+}
+
+impl CleanActivationCandidates {
+    pub(crate) const fn baseline(&self) -> &LazyGenesisCandidate {
+        &self.baseline
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisSqliteCandidate,
+        AcceptedFrontierRoot,
+    ) {
+        (self.baseline, self.sqlite, self.accepted_frontier)
+    }
+}
+
+/// Fan every canonical activation record into the immutable baseline and the
+/// disposable SQLite projection in one pass. The preliminary UUID-claim scan
+/// is the only graph-wide decision and retains only a bounded identity map; it
+/// performs no parsing and emits no semantic operation.
+fn build_clean_activation_candidates(
+    pages: &ActivationPageRecordStore,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    source_capture: BlobDescription,
+    working: &Path,
+    database_path: &Path,
+    policy: &ReferenceCatalogPolicyV1,
+) -> Result<
+    (
+        CleanActivationCandidates,
+        CleanCandidateFanoutInstrumentation,
+    ),
+    BootstrapStreamingImportError,
+> {
+    let mut instrumentation = CleanCandidateFanoutInstrumentation::default();
+    let identity_started = Instant::now();
+    let accepted_external_uuids = unique_baseline_external_uuids(pages)?;
+    instrumentation.identity_claim_scan_micros = elapsed_micros(identity_started);
+    let mut baseline = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        source_capture,
+        working,
+    )?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    let mut sqlite = super::sqlite::CleanGenesisProjectionBuilder::new(
+        database_path,
+        super::ProjectionClaim::current(workspace_id, lineage_digest),
+        pages.page_count(),
+    )?;
+
+    for page_id in pages.path_order() {
+        let record_started = Instant::now();
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let page_assignments = record
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                accepted_external_uuids
+                    .get(&block.block_id)
+                    .copied()
+                    .map(|logseq_uuid| (block.block_id, logseq_uuid))
+            })
+            .collect();
+        let mut capsule = lazy_genesis_page_input(&record);
+        instrumentation.record_and_input_micros = instrumentation
+            .record_and_input_micros
+            .saturating_add(elapsed_micros(record_started));
+        let (checkpoint, dependencies) = checkpoints.push_page_with_instrumentation(
+            &capsule,
+            &page_assignments,
+            &mut instrumentation.checkpoint,
+        )?;
+        capsule.document_checkpoint = checkpoint;
+        capsule.document_dependencies = Some(dependencies);
+        let baseline_started = Instant::now();
+        baseline.push(capsule)?;
+        instrumentation.baseline_pack_micros = instrumentation
+            .baseline_pack_micros
+            .saturating_add(elapsed_micros(baseline_started));
+        let sqlite_started = Instant::now();
+        sqlite.push_page(record.sqlite_page(), policy)?;
+        instrumentation.sqlite_push_micros = instrumentation
+            .sqlite_push_micros
+            .saturating_add(elapsed_micros(sqlite_started));
+    }
+    let checkpoint_finish_started = Instant::now();
+    let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
+    instrumentation.checkpoint_finish_micros = elapsed_micros(checkpoint_finish_started);
+    let baseline_finish_started = Instant::now();
+    let baseline = baseline.finish(catalog_checkpoint, catalog_dependencies)?;
+    instrumentation.baseline_finish_micros = elapsed_micros(baseline_finish_started);
+    let frontier_finish_started = Instant::now();
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline)?;
+    instrumentation.frontier_finish_micros = elapsed_micros(frontier_finish_started);
+    let sqlite_finish_started = Instant::now();
+    let sqlite = sqlite.finish(&accepted_frontier)?;
+    instrumentation.sqlite_finish_micros = elapsed_micros(sqlite_finish_started);
+    instrumentation.sqlite = sqlite.instrumentation();
+    Ok((
+        CleanActivationCandidates {
+            baseline,
+            sqlite,
+            accepted_frontier,
+        },
+        instrumentation,
+    ))
+}
+
+fn derive_clean_activation_import_id(
+    capture: &BootstrapSourceCapture,
+    workspace_id: WorkspaceId,
+) -> Result<(ImportId, Option<String>), BootstrapStreamingImportError> {
+    let source_count = usize::try_from(capture.source_file_count()).map_err(|_| {
+        BootstrapStreamingImportError::ResourceLimit {
+            resource: "source files",
+            observed: capture.source_file_count(),
+            limit: u64::from(super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES),
+        }
+    })?;
+    if source_count > super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES as usize {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "source files",
+            observed: capture.source_file_count(),
+            limit: u64::from(super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES),
+        });
+    }
+    let mut derivation =
+        ImportIdDerivation::new(workspace_id, 0, source_count, DIFF_SCHEMA_VERSION)
+            .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    derivation
+        .begin_inventory()
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let mut entries = capture.entries_cursor()?;
+    let mut observed = 0_usize;
+    let mut largest_source: Option<(u64, String)> = None;
+    while let Some(entry) = entries.next()? {
+        observed = observed.checked_add(1).ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidSource("source count overflow".into())
+        })?;
+        derivation
+            .push_inventory(&ImportInventoryEntry::with_kind(
+                entry.kind(),
+                entry.path().clone(),
+                ImportInventoryState::Present(entry.description()),
+            ))
+            .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+        let path = entry.path().as_str().to_owned();
+        let bytes = entry.description().byte_length();
+        if largest_source
+            .as_ref()
+            .is_none_or(|(largest, largest_path)| {
+                bytes > *largest || (bytes == *largest && path < *largest_path)
+            })
+        {
+            largest_source = Some((bytes, path));
+        }
+    }
+    if observed != source_count {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "sealed source entry count differs from its capture".into(),
+        ));
+    }
+    let import_id = derivation
+        .finish()
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    Ok((import_id, largest_source.map(|(_, path)| path)))
+}
+
+/// Prepare the new operation-free activation episode. Source metadata is
+/// scanned once to derive stable imported identities, each source page is then
+/// parsed exactly once into a terminal activation record, and that record is
+/// fanned out to the baseline pack and SQLite in one pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_clean_activation(
+    graph: &Graph,
+    capture: BootstrapSourceCapture,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    scratch_parent: &Path,
+    database_path: &Path,
+    policy: &ReferenceCatalogPolicyV1,
+) -> Result<CleanActivationPreparation, BootstrapStreamingImportError> {
+    fs::create_dir_all(scratch_parent)?;
+    let canonical_scratch = fs::canonicalize(scratch_parent)?;
+    let canonical_graph = fs::canonicalize(&graph.root)?;
+    if canonical_scratch == canonical_graph || canonical_scratch.starts_with(&canonical_graph) {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation scratch must be outside the graph".into(),
+        ));
+    }
+    let working = canonical_scratch.join(format!("clean-activation-{}", Uuid::new_v4().simple()));
+    create_private_directory(&working)?;
+    let mut legacy_instrumentation = BootstrapStreamingImportInstrumentation::default();
+    record_capture_instrumentation(&mut legacy_instrumentation, capture.instrumentation());
+
+    let started = Instant::now();
+    let (import_id, largest_source_path) =
+        derive_clean_activation_import_id(&capture, workspace_id)?;
+    let identity_scan_micros = elapsed_micros(started);
+
+    let started = Instant::now();
+    let pages = capture_activation_page_records(
+        &capture,
+        import_id,
+        workspace_id,
+        &mut legacy_instrumentation,
+    )?;
+    let activation_record_micros = elapsed_micros(started);
+
+    let started = Instant::now();
+    let (candidates, candidate) = build_clean_activation_candidates(
+        &pages,
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        capture.portable_capture_identity()?,
+        &working,
+        database_path,
+        policy,
+    )?;
+    let candidate_fanout_micros = elapsed_micros(started);
+    let instrumentation = CleanActivationInstrumentation {
+        source_files: capture.source_file_count(),
+        source_bytes: legacy_instrumentation.source_bytes_read,
+        parser_nodes: legacy_instrumentation.parser_nodes,
+        activation_record_bytes: pages.encoded_bytes() as u64,
+        activation_records_spilled: pages.spilled(),
+        largest_source_path,
+        identity_scan_micros,
+        activation_record_micros,
+        candidate_fanout_micros,
+        candidate,
+    };
+    Ok(CleanActivationPreparation {
+        capture,
+        candidates,
+        instrumentation,
+    })
+}
+
+/// Same-process ownership of a clean activation after the marker has made the
+/// baseline authoritative. No fallible work occurs between marker publication
+/// and construction of this receipt.
+pub(crate) struct CommittedCleanActivation {
+    baseline: LazyGenesisCandidate,
+    projection: super::sqlite::CleanGenesisPhysicalProjection,
+    accepted_frontier: AcceptedFrontierRoot,
+    marker: LazyGenesisActivationMarkerV1,
+    final_scan: BootstrapSourceCaptureInstrumentation,
+}
+
+impl CommittedCleanActivation {
+    pub(crate) const fn baseline(&self) -> &LazyGenesisCandidate {
+        &self.baseline
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) const fn final_scan(&self) -> &BootstrapSourceCaptureInstrumentation {
+        &self.final_scan
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisPhysicalProjection,
+        AcceptedFrontierRoot,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (
+            self.baseline,
+            self.projection,
+            self.accepted_frontier,
+            self.marker,
+        )
+    }
+}
+
+/// Publish both completed candidates, compare the live source bytes one final
+/// time without parsing, and write the authority marker last. A failure before
+/// the marker removes the disposable baseline and SQLite file set.
+pub(crate) fn commit_clean_activation(
+    graph: &Graph,
+    preparation: CleanActivationPreparation,
+    baseline_destination: &Path,
+    enrollment_root: &Path,
+) -> Result<CommittedCleanActivation, BootstrapStreamingImportError> {
+    let (capture, baseline, sqlite, accepted_frontier) = preparation.into_parts();
+    let database_path = sqlite.target_path().to_path_buf();
+    let (baseline, _) = baseline.publish_durable(baseline_destination)?;
+    let projection = sqlite.publish()?;
+
+    let watcher_fence = graph.cache_generation();
+    let final_scan = match capture.verify_before_inactive_bootstrap_authoring(graph) {
+        Ok(scan) if graph.cache_generation() == watcher_fence => scan,
+        Ok(_) => {
+            drop(projection);
+            super::sqlite::remove_disposable_projection(&database_path)?;
+            return Err(BootstrapStreamingImportError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "graph watcher generation changed during the final activation comparison",
+            )));
+        }
+        Err(error) => {
+            drop(projection);
+            super::sqlite::remove_disposable_projection(&database_path)?;
+            return Err(error.into());
+        }
+    };
+    let marker = LazyGenesisActivationMarkerV1::new(
+        baseline.workspace_id(),
+        baseline.lineage_digest(),
+        baseline.root(),
+        baseline.source_capture(),
+        super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?,
+        watcher_fence,
+    )?;
+    if let Err(error) = publish_activation_marker(enrollment_root, marker) {
+        drop(projection);
+        super::sqlite::remove_disposable_projection(&database_path)?;
+        return Err(error.into());
+    }
+    // The marker makes the baseline's exact source bytes authoritative. The
+    // sealed capture is now only a disposable construction duplicate. Cleanup
+    // is best-effort because no post-marker failure may revoke the committed
+    // activation; a later private-state sweep may remove any residue.
+    let _ = capture.discard();
+    Ok(CommittedCleanActivation {
+        baseline: baseline.retain_as_authoritative(),
+        projection,
+        accepted_frontier,
+        marker,
+        final_scan,
+    })
+}
+
+/// Cold-opened clean baseline and its matching disposable projection. This
+/// proof deliberately stops before mutation authority; the runtime cutover
+/// separately binds the workspace writer lease and ordinary operation tail.
+pub(crate) struct OpenedCleanActivation {
+    engine: ShardedHotEngine,
+    projection: super::sqlite::CleanGenesisPhysicalProjection,
+    marker: LazyGenesisActivationMarkerV1,
+}
+
+/// Cold-opened clean authority before choosing how to reconstruct its
+/// disposable SQLite projection.  Keeping this boundary projection-free is
+/// load bearing: a runtime with an accepted operation tail must rebuild SQLite
+/// once at the final frontier, not first rebuild sequence zero and immediately
+/// replace that temporary database with a second full rebuild.
+pub(crate) struct OpenedCleanActivationAuthority {
+    engine: ShardedHotEngine,
+    baseline: std::sync::Arc<LazyGenesisCandidate>,
+    marker: LazyGenesisActivationMarkerV1,
+}
+
+impl OpenedCleanActivationAuthority {
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ShardedHotEngine,
+        std::sync::Arc<LazyGenesisCandidate>,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (self.engine, self.baseline, self.marker)
+    }
+}
+
+/// Authenticate and open only the immutable clean authority. SQLite is a
+/// disposable projection and is deliberately left unopened until the caller
+/// has replayed the committed tail and knows the exact frontier it needs.
+pub(crate) fn open_clean_activation_authority(
+    enrollment_root: &Path,
+    baseline_directory: &Path,
+    catalog_document_id: DocumentId,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<Option<OpenedCleanActivationAuthority>, BootstrapStreamingImportError> {
+    let Some(marker) = read_activation_marker(enrollment_root)? else {
+        return Ok(None);
+    };
+    let baseline = std::sync::Arc::new(LazyGenesisCandidate::open_sealed_for_marker(
+        baseline_directory,
+        marker,
+    )?);
+    if baseline.catalog_document_id() != catalog_document_id {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker names a different catalog document".into(),
+        ));
+    }
+    let mut engine = ShardedHotEngine::new(
+        marker.workspace_id(),
+        marker.lineage_digest(),
+        catalog_document_id,
+    );
+    engine.configure_reference_catalog_policy(policy)?;
+    engine.install_lazy_genesis_baseline(std::sync::Arc::clone(&baseline))?;
+    let accepted_frontier = engine.accepted_frontier_root()?;
+    if super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?
+        != marker.accepted_frontier_digest()
+    {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker accepted frontier differs from its baseline".into(),
+        ));
+    }
+    Ok(Some(OpenedCleanActivationAuthority {
+        engine,
+        baseline,
+        marker,
+    }))
+}
+
+impl OpenedCleanActivation {
+    pub(crate) const fn engine(&self) -> &ShardedHotEngine {
+        &self.engine
+    }
+
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ShardedHotEngine,
+        super::sqlite::CleanGenesisPhysicalProjection,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (self.engine, self.projection, self.marker)
+    }
+}
+
+pub(crate) fn open_clean_activation(
+    enrollment_root: &Path,
+    baseline_directory: &Path,
+    database_path: &Path,
+    catalog_document_id: DocumentId,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<Option<OpenedCleanActivation>, BootstrapStreamingImportError> {
+    let Some(opened) = open_clean_activation_authority(
+        enrollment_root,
+        baseline_directory,
+        catalog_document_id,
+        policy.clone(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let (engine, baseline, marker) = opened.into_parts();
+    let projection = open_or_rebuild_clean_genesis_projection(
+        database_path,
+        super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
+        &baseline,
+        policy,
+    )?;
+    Ok(Some(OpenedCleanActivation {
+        engine,
+        projection,
+        marker,
+    }))
+}
+
+pub(crate) fn open_or_rebuild_clean_genesis_projection(
+    database_path: &Path,
+    claim: super::ProjectionClaim,
+    baseline: &LazyGenesisCandidate,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
+    match super::sqlite::open_clean_genesis_projection(database_path, claim, &accepted_frontier) {
+        Ok(projection) => {
+            super::sqlite::record_projection_open_test_observation(
+                claim.workspace_id(),
+                "opened-existing",
+                "",
+                super::sqlite::RebuildInstrumentation::default(),
+            );
+            Ok(projection)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let projection =
+                rebuild_clean_genesis_projection(database_path, claim, baseline, policy)?;
+            super::sqlite::record_projection_open_test_observation(
+                claim.workspace_id(),
+                "rebuilt-missing",
+                &reason,
+                super::sqlite::RebuildInstrumentation::default(),
+            );
+            Ok(projection)
+        }
+    }
+}
+
+fn materialize_lazy_genesis_page(
+    page: LazyGenesisPageInput,
+) -> Result<super::MaterializedPageInput, BootstrapStreamingImportError> {
+    let mut parser_instrumentation = ImportInstrumentation::default();
+    let mut tree = parse_nodes(
+        &page.path,
+        &page.exact_source_bytes,
+        &mut parser_instrumentation,
+    )
+    .map_err(|block| {
+        BootstrapStreamingImportError::InvalidSource(format!("{}: {}", page.path, block.detail))
+    })?;
+    if tree.nodes.len() != page.blocks.len() || tree.preamble != page.preamble {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "lazy genesis source bytes differ from their semantic capsule".into(),
+        ));
+    }
+    let mut blocks = Vec::with_capacity(page.blocks.len());
+    for index in 0..tree.nodes.len() {
+        let stored = &page.blocks[index];
+        let expected_parent = tree.nodes[index]
+            .parent
+            .map(|parent| page.blocks[parent].block_id);
+        let expected_order = imported_order(tree.nodes[index].sibling_position);
+        if stored.home_document_id != page.home_document_id
+            || stored.parent != expected_parent
+            || stored.order != expected_order
+            || stored.content != tree.nodes[index].raw
+        {
+            return Err(BootstrapStreamingImportError::InvalidSource(
+                "lazy genesis block identity differs from its exact source bytes".into(),
+            ));
+        }
+        let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
+        let logseq_uuid = if stored.external_uuid_claims.len() == 1 {
+            Some(stored.external_uuid_claims[0])
+        } else {
+            None
+        };
+        blocks.push(super::MaterializedBlockInput {
+            block_id: stored.block_id,
+            home_document_id: stored.home_document_id,
+            parent: stored.parent,
+            order: stored.order.clone(),
+            content: stored.content.clone(),
+            searchable_text: facets.searchable_text,
+            heading_level: facets.heading_level,
+            collapsed: facets.collapsed,
+            logseq_uuid,
+            logseq_identity_origin: logseq_uuid
+                .map(|_| super::LogseqIdentityOrigin::ExternalImported),
+            references: Vec::new(),
+            properties: facets.properties,
+            tags: facets.tags,
+            task: facets.task,
+        });
+    }
+    let is_org = super::reference_catalog::reference_source_is_org(&page.path);
+    let (preamble_search, _, _, properties, tags, _) = page
+        .preamble
+        .as_deref()
+        .map(|preamble| super::sqlite::document_facets(preamble, is_org))
+        .unwrap_or_default();
+    let logical_name = LogicalPageName::parse(page.name.clone())
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let mut searchable = page.name.clone();
+    if !preamble_search.is_empty() {
+        searchable.push(' ');
+        searchable.push_str(&preamble_search);
+    }
+    Ok(super::MaterializedPageInput {
+        page_id: page.page_id,
+        home_document_id: page.home_document_id,
+        name: page.name,
+        name_key: logical_name.canonical_key(),
+        path: page.path,
+        kind: page.kind,
+        preamble: page.preamble,
+        searchable_text: searchable,
+        references: Vec::new(),
+        properties,
+        tags,
+        blocks,
+    })
+}
+
+fn rebuild_clean_genesis_projection(
+    database_path: &Path,
+    claim: super::ProjectionClaim,
+    baseline: &LazyGenesisCandidate,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
+    super::sqlite::remove_disposable_projection(database_path)?;
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
+    let mut builder = super::sqlite::CleanGenesisProjectionBuilder::new(
+        database_path,
+        claim,
+        baseline.page_count(),
+    )?;
+    for page_id in baseline.page_ids() {
+        let page = baseline.page(page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidSource(
+                "lazy genesis manifest page disappeared during SQLite rebuild".into(),
+            )
+        })?;
+        builder.push_page(materialize_lazy_genesis_page(page)?, &policy)?;
+    }
+    builder
+        .finish(&accepted_frontier)?
+        .publish()
+        .map_err(Into::into)
 }
 
 fn collapse_unique_identity_candidates(
@@ -2735,27 +4592,8 @@ fn collapse_unique_identity_candidates(
             Some(_) => {
                 if !duplicate {
                     let unique = pending.take().expect("pending identity exists");
-                    if unique.value.len() < 4 {
-                        return Err(BootstrapStreamingImportError::InvalidOperation(
-                            "truncated identity candidate".into(),
-                        ));
-                    }
-                    let key_length =
-                        u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
-                    let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
-                        BootstrapStreamingImportError::InvalidOperation(
-                            "identity capsule key length overflow".into(),
-                        )
-                    })?;
-                    if key_end > unique.value.len() {
-                        return Err(BootstrapStreamingImportError::InvalidOperation(
-                            "truncated identity capsule key".into(),
-                        ));
-                    }
-                    output_sort.push(
-                        unique.value[4..key_end].to_vec(),
-                        unique.value[key_end..].to_vec(),
-                    )?;
+                    let (key, value) = decode_identity_candidate(&unique.value)?;
+                    output_sort.push(key, value)?;
                     count = count.saturating_add(1);
                 }
                 pending = Some(record);
@@ -2766,26 +4604,8 @@ fn collapse_unique_identity_candidates(
     }
     if let Some(unique) = pending {
         if !duplicate {
-            if unique.value.len() < 4 {
-                return Err(BootstrapStreamingImportError::InvalidOperation(
-                    "truncated identity candidate".into(),
-                ));
-            }
-            let key_length = u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
-            let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
-                BootstrapStreamingImportError::InvalidOperation(
-                    "identity capsule key length overflow".into(),
-                )
-            })?;
-            if key_end > unique.value.len() {
-                return Err(BootstrapStreamingImportError::InvalidOperation(
-                    "truncated identity capsule key".into(),
-                ));
-            }
-            output_sort.push(
-                unique.value[4..key_end].to_vec(),
-                unique.value[key_end..].to_vec(),
-            )?;
+            let (key, value) = decode_identity_candidate(&unique.value)?;
+            output_sort.push(key, value)?;
             count = count.saturating_add(1);
         }
     }
@@ -2815,22 +4635,30 @@ fn require_bootstrap_operation_limit(count: u64) -> Result<(), BootstrapStreamin
     }
 }
 
-pub(crate) struct BootstrapOperationSpoolReader {
-    records: SortRecordReader,
+enum BootstrapOperationSpoolReader<'a> {
+    Memory(std::slice::Iter<'a, SortRecord>),
+    File(SortRecordReader),
 }
 
-impl BootstrapOperationSpoolReader {
-    fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            records: SortRecordReader::open(path)?,
-        })
+impl<'a> BootstrapOperationSpoolReader<'a> {
+    fn open(operations: &'a BootstrapOperationSpool) -> io::Result<Self> {
+        match &operations.storage {
+            BootstrapOperationStorage::Memory(records) => Ok(Self::Memory(records.iter())),
+            BootstrapOperationStorage::File(path) => Ok(Self::File(SortRecordReader::open(path)?)),
+        }
     }
 
     fn next(&mut self) -> Result<Option<BootstrapOperationRecord>, BootstrapStreamingImportError> {
-        self.records
-            .next()?
-            .map(|record| BootstrapOperationRecord::decode(&record.value))
-            .transpose()
+        let value = match self {
+            Self::Memory(records) => records.next().map(|record| record.value.as_slice()),
+            Self::File(records) => {
+                return records
+                    .next()?
+                    .map(|record| BootstrapOperationRecord::decode(&record.value))
+                    .transpose();
+            }
+        };
+        value.map(BootstrapOperationRecord::decode).transpose()
     }
 }
 
@@ -2861,7 +4689,7 @@ fn partition_bootstrap_operation_spool(
         split_continuation: bool,
     }
 
-    let mut reader = BootstrapOperationSpoolReader::open(&operations.path)?;
+    let mut reader = BootstrapOperationSpoolReader::open(operations)?;
     let mut units = Vec::new();
     let mut observed_operations = 0_u64;
     let mut current: Option<Unit> = None;
@@ -3052,7 +4880,7 @@ fn author_bootstrap_parts(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     import_id: ImportId,
     operation_spool: &BootstrapOperationSpool,
     part_count: u32,
@@ -3070,7 +4898,7 @@ fn author_bootstrap_parts(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
     )?;
     let author_device_id = DeviceId::for_external_import_author(workspace_id);
     let author_session_id = SessionId::for_external_import_author(workspace_id, import_id);
@@ -3089,7 +4917,7 @@ fn author_bootstrap_parts(
         &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
         std::mem::size_of::<u32>(),
     )?;
-    let mut operations = BootstrapOperationSpoolReader::open(&operation_spool.path)?;
+    let mut operations = BootstrapOperationSpoolReader::open(operation_spool)?;
     let mut predecessor = None;
     let mut archive_frontier = ArchiveLocalFrontierBindingV1::initial(import_id, profile_digest);
     let mut descriptors = Vec::with_capacity(part_count as usize);
@@ -3453,13 +5281,12 @@ fn write_prepared_bootstrap_part(
 /// outside the graph. Only the final `sealed.commit` file marks a reusable
 /// preparation; all UUID-named work directories are non-authoritative residue.
 ///
-/// `reference_catalog` must be the durable capability of the exact archive this
-/// preparation will be installed into. Authoring binds a `reference_catalog_root`
-/// into every accepted cold record; building it anywhere else would produce a
-/// root the installed archive could never open. The preparation retains that
-/// archive's control-directory identity so installation cannot later be pointed
-/// at a different archive.
+/// `bootstrap_indexes` must be the durable capability of the exact archive this
+/// preparation will be installed into. The preparation retains that archive's
+/// control-directory identity so installation cannot later be pointed at a
+/// different archive.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prepare_inactive_bootstrap_import(
     graph: &Graph,
     capture: BootstrapSourceCapture,
@@ -3467,7 +5294,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     scratch: &Path,
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
     prepare_inactive_bootstrap_import_with_progress(
@@ -3477,13 +5304,14 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
         scratch,
         |_| {},
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     graph: &Graph,
     capture: BootstrapSourceCapture,
@@ -3491,13 +5319,13 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     scratch: &Path,
     mut progress: impl FnMut(BootstrapPreparationProgress),
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
-    if reference_catalog.workspace_id() != workspace_id {
+    if bootstrap_indexes.workspace_id() != workspace_id {
         return Err(invalid_bootstrap_orchestration(
-            "bootstrap reference-catalog capability belongs to another workspace",
+            "bootstrap index capability belongs to another workspace",
         ));
     }
     prepare_bootstrap_scratch(graph, scratch)?;
@@ -3528,10 +5356,12 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         BootstrapPreparationSubphase::OperationSpool,
     ));
     let phase_started = Instant::now();
-    let operations = spool_bootstrap_operations(
+    let mut operations = spool_bootstrap_operations(
         &capture,
         source.import_id,
         workspace_id,
+        lineage_digest,
+        catalog_document_id,
         &working,
         &mut instrumentation,
     )?;
@@ -3539,7 +5369,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     #[cfg(test)]
     if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
         eprintln!(
-            "bootstrap operation spool: {} ms",
+            "bootstrap semantic lowering: {} ms",
             instrumentation.operation_spool_micros / 1_000
         );
     }
@@ -3559,10 +5389,10 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     }
     let graph_resource = graph.canonical_resource_id()?;
 
-    // This is deliberately the final source action. Everything below owns only
-    // sealed spools and detached engine/scratch capabilities.
-    let final_capture = capture.verify_before_inactive_bootstrap_authoring(graph)?;
-    record_capture_instrumentation(&mut instrumentation, &final_capture);
+    // Everything below owns only sealed spools and detached engine/scratch
+    // capabilities. The one final live-source comparison happens immediately
+    // before promotion, after every pre-promotion construction phase.
+    inactive_bootstrap_preparation_before_detached_authoring_hook()?;
     let retained_reference_catalog_policy = reference_catalog_policy.clone();
     progress(BootstrapPreparationProgress::Subphase(
         BootstrapPreparationSubphase::DetachedAuthoring,
@@ -3577,9 +5407,9 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
         source.import_id,
-        &operations,
+        &mut operations,
         part_count,
         &working,
         &mut instrumentation,
@@ -3627,6 +5457,13 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         &aggregate_bytes,
     )?;
     write_exact_new(&artifacts.join(BOOTSTRAP_STREAM_COMMIT), &commit_bytes)?;
+    let lazy_genesis = operations.lazy_genesis.take().ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "bootstrap preparation lost its lazy genesis candidate".into(),
+        )
+    })?;
+    let staged_lazy_path = artifacts.join(BOOTSTRAP_STREAM_LAZY_GENESIS);
+    let (staged_lazy_genesis, lazy_genesis_commit) = lazy_genesis.stage_into(&staged_lazy_path)?;
 
     progress(BootstrapPreparationProgress::Subphase(
         BootstrapPreparationSubphase::Sealing,
@@ -3647,6 +5484,14 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     )?;
     let decoded_commit = BootstrapAggregateCommitV1::decode(&sealed_commit)?;
     decoded_commit.validate_aggregate(&aggregate)?;
+    let sealed_lazy_path = sealed_directory.join(BOOTSTRAP_STREAM_LAZY_GENESIS);
+    let sealed_lazy_genesis = if staged_lazy_path.exists() {
+        drop(staged_lazy_genesis);
+        LazyGenesisCandidate::open_sealed(&sealed_lazy_path, lazy_genesis_commit)?
+    } else {
+        staged_lazy_genesis.relocate_after_parent_move(&sealed_lazy_path)?
+    };
+    operations.lazy_genesis = Some(sealed_lazy_genesis);
     instrumentation.preparation_sealing_micros = elapsed_micros(phase_started);
     #[cfg(test)]
     if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
@@ -3655,16 +5500,11 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
             instrumentation.preparation_sealing_micros / 1_000
         );
     }
-    // Move the existing operation spool out of the working directory before it
-    // is removed, under a fresh random name in the same preparation prefix. The
-    // relocation is a rename of a file this preparation already wrote; it is
-    // never fsynced or sealed, and the handle removes it on drop.
     let terminal_construction = retain_terminal_construction_material(
         workspace_id,
         lineage_digest,
         source.import_id,
-        &root,
-        &operations,
+        &mut operations,
         authored.accepted_events,
     );
     let _ = fs::remove_dir_all(&working);
@@ -3672,7 +5512,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         BootstrapPreparationSummary::from(&instrumentation),
     ));
 
-    if authored.candidate.index_archive_identity() != reference_catalog.archive_identity() {
+    if authored.candidate.index_archive_identity() != bootstrap_indexes.archive_identity() {
         return Err(invalid_bootstrap_orchestration(
             "detached candidate durability proof belongs to another archive",
         ));
@@ -3685,37 +5525,50 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         commit,
         catalog_document_id,
         reference_catalog_policy: retained_reference_catalog_policy,
-        reference_catalog_archive_identity: reference_catalog.archive_identity(),
+        bootstrap_index_archive_identity: bootstrap_indexes.archive_identity(),
         candidate: Rc::from(authored.candidate),
         engine_materials: authored.engine_materials,
         terminal_construction,
+        lazy_genesis_commit,
         instrumentation,
     })
 }
 
-/// Retain the process-only terminal construction capability, or `None` if the
-/// spool could not be relocated. `None` is not a failure: it only means this
-/// activation takes the existing archive replay path.
+#[cfg(test)]
+fn inactive_bootstrap_preparation_before_detached_authoring_hook() -> io::Result<()> {
+    INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING.with(|hook| {
+        match hook.borrow_mut().take() {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn inactive_bootstrap_preparation_before_detached_authoring_hook() -> io::Result<()> {
+    Ok(())
+}
+
+/// Retain the process-only terminal construction capability. Detached
+/// authoring has already produced the authenticated accepted events consumed
+/// by SQLite; the operation sequence itself is no longer needed after that
+/// pass and must not be persisted merely to keep this optimization alive.
 fn retain_terminal_construction_material(
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     import_id: ImportId,
-    root: &Path,
-    operations: &BootstrapOperationSpool,
+    operations: &mut BootstrapOperationSpool,
     accepted_events: Vec<AcceptedBatchEvent>,
 ) -> Option<TerminalBootstrapConstructionMaterial> {
-    let retained = root.join(format!(".terminal-{}", Uuid::new_v4().simple()));
-    if fs::rename(&operations.path, &retained).is_err() {
-        return None;
-    }
     Some(TerminalBootstrapConstructionMaterial {
         workspace_id,
         lineage_digest,
         import_id,
-        operations: retained,
         operation_count: operations.operation_count,
         declaration_count: operations.declaration_count,
         accepted_events,
+        activation_pages: operations.activation_pages.take(),
+        lazy_genesis: operations.lazy_genesis.take(),
     })
 }
 
@@ -3787,58 +5640,18 @@ fn inactive_bootstrap_preparation_before_seal_hook() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
-    let directory = File::open(path)?;
-    // SAFETY: the opened directory descriptor names the filesystem containing
-    // the complete authenticated preparation prefix.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(invalid_bootstrap_data(
-                "bootstrap preparation tree contains a symlink",
-            ));
-        }
-        if metadata.is_dir() {
-            flush_bootstrap_preparation_tree(&child)?;
-        } else if metadata.is_file() {
-            sync_bootstrap_preparation_regular_file(&child)?;
-        } else {
-            return Err(invalid_bootstrap_data(
-                "bootstrap preparation tree contains a non-file entry",
-            ));
-        }
-    }
-    sync_bootstrap_preparation_directory(path)
-}
-
-#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
-fn sync_bootstrap_preparation_regular_file(path: &Path) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    // `sync_all` maps to `FlushFileBuffers` on Windows. That API requires a
-    // write-capable handle; a `File::open` read handle fails with
-    // `ERROR_ACCESS_DENIED` even when the artifact itself is writable.
-    #[cfg(windows)]
-    options.write(true);
-    options.open(path)?.sync_all()
+    crate::filesystem_durability::sync_private_tree(path)
 }
 
 fn sync_bootstrap_preparation_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    tine_storage::sync_dir_required(&directory)
+    crate::filesystem_durability::sync_reconstructible_directory(&directory)
+}
+
+#[cfg(test)]
+fn sync_bootstrap_preparation_regular_file(path: &Path) -> io::Result<()> {
+    crate::filesystem_durability::sync_regular_file(path)
 }
 
 fn copy_bootstrap_tree_exact(
@@ -4314,7 +6127,7 @@ pub fn inventory_initial_shadow(graph: &Graph) -> Result<RawInventory, Inventory
     )
 }
 
-/// Sealed import base. Only `capture_import_scope` can mint one after the
+/// Sealed import base. Only `capture_clean_import_scope` can mint one after the
 /// enrolled receipt store and accepted engine jointly authenticate it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReceiptBackedPage {
@@ -4322,6 +6135,7 @@ struct ReceiptBackedPage {
     completion: ProjectionCompletion,
     replayed_target: ExactBytes,
     page: super::MaterializedPage,
+    source: ReceiptBaseSource,
 }
 
 impl ReceiptBackedPage {
@@ -4391,6 +6205,25 @@ struct AffectedReceiptEntry {
     bootstrap_base: Option<ExactBytes>,
     intent: ProjectionIntent,
     completion: ProjectionCompletion,
+    source: ReceiptBaseSource,
+}
+
+/// In-memory provenance for a sealed import predecessor.  The correlated
+/// Blocked variant is deliberately not serialized and can only be created
+/// from the registry-gated hot-engine packet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceiptBaseSource {
+    Completed,
+    Bootstrap,
+    CleanBaseline,
+    CleanManifest,
+    CorrelatedBlocked {
+        work_id: ProjectionWorkId,
+        observed: BlobDescription,
+    },
+    CorrelatedReady {
+        work_id: ProjectionWorkId,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -4876,27 +6709,25 @@ impl From<ExternalImportObservationMaterialError> for ImportExecutionError {
     }
 }
 
-pub fn plan_affected_import(
+/// Plan one exact external reconciliation against the clean
+/// baseline-plus-manifest runtime.  This preserves the established structural
+/// page/block matcher, but obtains every predecessor from the immutable clean
+/// baseline or accepted manifests rather than the persistent Patricia
+/// `ProjectionWorkIndex` and completed-receipt catalog.
+pub(crate) fn plan_clean_affected_import(
     graph: &Graph,
-    receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    requested_paths: &[&str],
-) -> ImportPlan {
-    plan_affected_import_with_bootstrap(graph, receipts, engine, None, requested_paths)
-}
-
-pub(crate) fn plan_affected_import_with_bootstrap(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    bootstrap: Option<&BootstrapProjectionAuthority>,
+    database: &SqliteFrontier,
     requested_paths: &[&str],
 ) -> ImportPlan {
     let mut instrumentation = ImportInstrumentation {
         requested_paths: requested_paths.len(),
         ..ImportInstrumentation::default()
     };
-    let paths = match parse_requested_paths(requested_paths) {
+    let paths = match parse_requested_paths_with_portable_policy(
+        requested_paths,
+        PortablePathPolicy::SelectFirstExactPath,
+    ) {
         Ok(paths) => paths,
         Err(error) => return blocked_inventory_error(error, instrumentation),
     };
@@ -4912,39 +6743,25 @@ pub(crate) fn plan_affected_import_with_bootstrap(
                     error.to_string(),
                 ),
                 instrumentation,
-            );
+            )
         }
     };
-    let (catalog, catalog_authority) =
-        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
-            Ok(snapshot) => snapshot,
-            Err(block) => return blocked_authority_error(None, block, instrumentation),
-        };
     let (inventory, inventory_fingerprints, first_raw_bytes) =
         match capture_inventory(graph, &paths, true, 0, &mut instrumentation) {
             Ok((Some(inventory), fingerprints, raw_bytes)) => (inventory, fingerprints, raw_bytes),
             Ok((None, _, _)) => unreachable!("retaining capture returns inventory"),
             Err(error) => return blocked_inventory_error(error, instrumentation),
         };
-    let scope = match capture_import_scope(
+    let (scope, predecessor_authority) = match capture_clean_import_scope(
         graph,
-        receipts,
         engine,
+        database,
         &paths,
         &inventory,
-        catalog,
         &mut instrumentation,
     ) {
         Ok(scope) => scope,
-        Err(mut block) => {
-            if block.observation.is_none() {
-                block.observation = block
-                    .paths
-                    .first()
-                    .and_then(|path| inventory_observation(&inventory, path));
-            }
-            return blocked_authority_error(Some(inventory), block, instrumentation);
-        }
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
     };
     snapshot_revalidation_hook();
     let (_, second_fingerprints, _) =
@@ -4955,16 +6772,13 @@ pub(crate) fn plan_affected_import_with_bootstrap(
                     Some(inventory),
                     authority_block(ImportBlockReason::StaleScope, None, error.to_string()),
                     instrumentation,
-                );
+                )
             }
         };
-    let (_, post_catalog_authority) =
-        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
-            Ok(snapshot) => snapshot,
-            Err(mut block) => {
-                block.reason = ImportBlockReason::StaleScope;
-                return blocked_authority_error(Some(inventory), block, instrumentation);
-            }
+    let post_predecessor_authority =
+        match post_clean_import_predecessor_authority(engine, database, &paths) {
+            Ok(authority) => authority,
+            Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
         };
     let post_frontier = match post_snapshot_frontier(engine) {
         Ok(root) => root,
@@ -4973,11 +6787,11 @@ pub(crate) fn plan_affected_import_with_bootstrap(
                 Some(inventory),
                 authority_block(ImportBlockReason::StaleScope, None, error.to_string()),
                 instrumentation,
-            );
+            )
         }
     };
     if inventory_fingerprints != second_fingerprints
-        || catalog_authority != post_catalog_authority
+        || predecessor_authority != post_predecessor_authority
         || accepted_frontier != post_frontier
     {
         return blocked_authority_error(
@@ -4985,15 +6799,42 @@ pub(crate) fn plan_affected_import_with_bootstrap(
             authority_block(
                 ImportBlockReason::StaleScope,
                 None,
-                "inventory, exact affected receipt authority, or accepted frontier changed between snapshot passes",
+                "inventory, clean manifest predecessor, or accepted frontier changed between snapshot passes",
             ),
             instrumentation,
         );
-    };
-    // Equal bounded collections detect stale diagnostic input only under the
-    // explicit quiescent-writer boundary. They are neither a portable atomic
-    // filesystem snapshot nor authority for later publication.
-    plan_import(graph, inventory, scope, engine, instrumentation)
+    }
+    plan_import(
+        graph,
+        inventory,
+        scope,
+        engine,
+        Some(database),
+        instrumentation,
+    )
+}
+
+#[cfg(test)]
+fn post_clean_import_predecessor_authority(
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
+    paths: &[ManagedPath],
+) -> Result<CatalogAuthority, ImportBlock> {
+    POST_CLEAN_PREDECESSOR_OVERRIDE
+        .with(|authority| authority.borrow_mut().take())
+        .map_or_else(
+            || clean_import_predecessor_authority(engine, database, paths),
+            Ok,
+        )
+}
+
+#[cfg(not(test))]
+fn post_clean_import_predecessor_authority(
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
+    paths: &[ManagedPath],
+) -> Result<CatalogAuthority, ImportBlock> {
+    clean_import_predecessor_authority(engine, database, paths)
 }
 
 #[cfg(test)]
@@ -5024,7 +6865,31 @@ fn post_snapshot_frontier(
     engine.accepted_frontier_root()
 }
 
+/// What a requested set does with two exact paths that fold to one portable
+/// identity (`Caf\u{e9}.md` and `Cafe\u{301}.md`, `Foo.md` and `foo.md`).
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PortablePathPolicy {
+    /// The authenticated engine keeps ONE Patricia entry per portable path, so
+    /// a requested set that folds is refused rather than half-applied.
+    Refuse,
+    /// Clean managed storage has no such index: activation already accepts a
+    /// graph holding both spellings and selects the first exact path as its one
+    /// authoritative source (`bootstrap_authoritative_source_paths`). The
+    /// reconciler makes the SAME selection, because refusing the requested set
+    /// denied every path in the graph for as long as both files existed — and
+    /// two spellings of one name is the ordinary result of syncing a graph
+    /// between a normalizing or case-folding filesystem and this one.
+    SelectFirstExactPath,
+}
+
 fn parse_requested_paths(requested_paths: &[&str]) -> Result<Vec<ManagedPath>, InventoryError> {
+    parse_requested_paths_with_portable_policy(requested_paths, PortablePathPolicy::Refuse)
+}
+
+fn parse_requested_paths_with_portable_policy(
+    requested_paths: &[&str],
+    portable: PortablePathPolicy,
+) -> Result<Vec<ManagedPath>, InventoryError> {
     if requested_paths.len() > MAX_IMPORT_FILES {
         return Err(InventoryError::ResourceBudgetExceeded {
             resource: "requested managed path count",
@@ -5051,8 +6916,14 @@ fn parse_requested_paths(requested_paths: &[&str]) -> Result<Vec<ManagedPath>, I
         }
         paths.push(path);
     }
-    require_portable_unique(&paths)?;
     paths.sort_unstable();
+    match portable {
+        PortablePathPolicy::Refuse => require_portable_unique(&paths)?,
+        PortablePathPolicy::SelectFirstExactPath => {
+            let mut selected = BTreeSet::new();
+            paths.retain(|path| selected.insert(path.portable_key()));
+        }
+    }
     Ok(paths)
 }
 
@@ -5127,277 +6998,163 @@ fn capture_inventory(
     Ok((inventory, fingerprints, raw_bytes))
 }
 
-/// Capture only the durable receipts reachable from the enrolled completed-work
-/// mapping for the requested exact paths.  The work index's authenticated
-/// Patricia root supplies the path-to-intent ids; the receipt store then makes
-/// the matching immutable point reads.  No receipt directory is enumerated.
-fn capture_affected_catalog(
-    receipts: &ProjectionReceiptStore,
+fn clean_sqlite_path_owner(
+    read: &super::SqliteMaterializedRead<'_>,
+    path: &ManagedPath,
+) -> Result<Option<PageId>, ImportBlock> {
+    let owners = read.pages_by_path(path, 2).map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            Some(path),
+            format!("clean SQLite path lookup failed: {error}"),
+        )
+    })?;
+    match owners.as_slice() {
+        [] => Ok(None),
+        [owner] => Ok(Some(owner.page_id)),
+        _ => Err(authority_block(
+            ImportBlockReason::CorruptBase,
+            Some(path),
+            "clean SQLite contains more than one exact path owner",
+        )),
+    }
+}
+
+fn clean_import_predecessor_authority(
     engine: &ShardedHotEngine,
-    bootstrap: Option<&BootstrapProjectionAuthority>,
+    database: &SqliteFrontier,
+    paths: &[ManagedPath],
+) -> Result<CatalogAuthority, ImportBlock> {
+    let read = database.materialized_read().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            format!("clean SQLite predecessor authority is unavailable: {error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/clean-import-predecessor-snapshot/v1\0");
+    for path in paths {
+        hasher.update((path.as_str().len() as u64).to_be_bytes());
+        hasher.update(path.as_str().as_bytes());
+        let sqlite_owner = clean_sqlite_path_owner(&read, path)?;
+        let predecessor = engine
+            .clean_import_projection_predecessor(path, sqlite_owner, &read)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("clean projection predecessor is unavailable: {error}"),
+                )
+            })?;
+        match predecessor {
+            None => hasher.update(b"unowned\0"),
+            Some(CleanImportProjectionPredecessor::Present {
+                page,
+                bytes,
+                intent,
+                completion,
+                from_baseline,
+            }) => {
+                hasher.update(if from_baseline {
+                    b"baseline-present\0".as_slice()
+                } else {
+                    b"manifest-present\0".as_slice()
+                });
+                hasher.update(page.page_id.as_uuid().as_bytes());
+                hasher.update(BlobDescription::of(&bytes).sha256());
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                let intent = intent.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                let completion = completion.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                hasher.update((intent.len() as u64).to_be_bytes());
+                hasher.update(intent);
+                hasher.update((completion.len() as u64).to_be_bytes());
+                hasher.update(completion);
+            }
+            Some(CleanImportProjectionPredecessor::Released {
+                prior_page_id,
+                intent,
+                completion,
+            }) => {
+                hasher.update(b"manifest-released\0");
+                hasher.update(prior_page_id.as_uuid().as_bytes());
+                let intent = intent.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                let completion = completion.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                hasher.update((intent.len() as u64).to_be_bytes());
+                hasher.update(intent);
+                hasher.update((completion.len() as u64).to_be_bytes());
+                hasher.update(completion);
+            }
+        }
+    }
+    Ok(CatalogAuthority {
+        digest: ContentDigest::from_bytes(hasher.finalize().into()),
+    })
+}
+
+fn capture_clean_import_scope(
+    graph: &Graph,
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
     requested_paths: &[ManagedPath],
+    inventory: &RawInventory,
     instrumentation: &mut ImportInstrumentation,
-) -> Result<(AffectedReceiptCatalog, CatalogAuthority), ImportBlock> {
-    let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
+) -> Result<(ImportScopeSnapshot, CatalogAuthority), ImportBlock> {
+    let read = database.materialized_read().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            format!("clean SQLite scope authority is unavailable: {error}"),
+        )
+    })?;
+    let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            "clean import authority has no projection endpoint",
+        )
+    })?;
+    if graph.canonical_resource_id().map_err(|error| {
         authority_block(
             ImportBlockReason::AuthorityUnavailable,
             None,
             error.to_string(),
         )
-    })?;
-    if work_index.receipt_store_id() != receipts.store_id() {
-        return Err(authority_block(
-            ImportBlockReason::AuthorityUnavailable,
-            None,
-            "enrolled work index is not bound to the receipt store",
-        ));
-    }
-
-    let mut catalog = AffectedReceiptCatalog::default();
-    let mut captured_entries = 0usize;
-    let mut hasher = Sha256::new();
-    hasher.update(b"tine/import-affected-receipt-snapshot/v2\0");
-    hasher.update(receipts.store_id().as_bytes());
-    for path in requested_paths {
-        hasher.update((path.as_str().len() as u64).to_be_bytes());
-        hasher.update(path.as_str().as_bytes());
-        let completed = work_index
-            .completed_receipts_for_path(path)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::CorruptBase,
-                    Some(path),
-                    format!("authenticated completed-work path lookup failed: {error}"),
-                )
-            })?;
-        if completed.len() > MAX_IMPORT_CATALOG_ENTRIES.saturating_sub(captured_entries) {
-            return Err(authority_block(
-                ImportBlockReason::ResourceLimit,
-                Some(path),
-                format!(
-                    "affected completed-work entry budget exceeded: observed {} after {}, limit {}",
-                    completed.len(),
-                    captured_entries,
-                    MAX_IMPORT_CATALOG_ENTRIES
-                ),
-            ));
-        }
-        let mut entries = Vec::with_capacity(completed.len());
-        for completed in completed {
-            let (intent, completion) =
-                receipts
-                    .load_completed_receipt(&completed)
-                    .map_err(|error| {
-                        let reason =
-                            if matches!(error, ProjectionStoreError::MissingPriorCompletion) {
-                                ImportBlockReason::MissingBase
-                            } else {
-                                ImportBlockReason::CorruptBase
-                            };
-                        authority_block(
-                            reason,
-                            Some(path),
-                            format!("durable exact receipt lookup is invalid: {error}"),
-                        )
-                    })?;
-            let intent_bytes = intent.encode().map_err(|error| {
-                authority_block(
-                    ImportBlockReason::CorruptBase,
-                    Some(path),
-                    error.to_string(),
-                )
-            })?;
-            let completion_bytes = completion.encode().map_err(|error| {
-                authority_block(
-                    ImportBlockReason::CorruptBase,
-                    Some(path),
-                    error.to_string(),
-                )
-            })?;
-            instrumentation.catalog_entries = instrumentation.catalog_entries.saturating_add(1);
-            instrumentation.catalog_bytes_hashed = instrumentation
-                .catalog_bytes_hashed
-                .saturating_add(intent_bytes.len() as u64)
-                .saturating_add(completion_bytes.len() as u64);
-            hasher.update(completed.intent_id().as_bytes());
-            hasher.update((intent_bytes.len() as u64).to_be_bytes());
-            hasher.update(intent_bytes);
-            hasher.update((completion_bytes.len() as u64).to_be_bytes());
-            hasher.update(completion_bytes);
-            entries.push(AffectedReceiptEntry {
-                completed: Some(completed),
-                bootstrap_base: None,
-                intent,
-                completion,
-            });
-            captured_entries = captured_entries.saturating_add(1);
-        }
-        if entries.is_empty() {
-            if let Some(bootstrap) = bootstrap {
-                let baseline = bootstrap.baseline_at(path).map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::CorruptBase,
-                        Some(path),
-                        format!("aggregate bootstrap baseline lookup failed: {error}"),
-                    )
-                })?;
-                if let Some(baseline) = baseline {
-                    if captured_entries == MAX_IMPORT_CATALOG_ENTRIES {
-                        return Err(authority_block(
-                            ImportBlockReason::ResourceLimit,
-                            Some(path),
-                            "affected aggregate baseline entry budget exceeded",
-                        ));
-                    }
-                    let owner = engine
-                        .current_path_catalog_row_at_path(path)
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::AuthorityUnavailable,
-                                Some(path),
-                                format!("aggregate bootstrap current-path lookup failed: {error}"),
-                            )
-                        })?
-                        .ok_or_else(|| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                "aggregate bootstrap path has no current accepted owner",
-                            )
-                        })?;
-                    let state = engine
-                        .materialize_page_for_projection(owner.page_id())
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::AuthorityUnavailable,
-                                Some(path),
-                                format!("aggregate bootstrap page materialization failed: {error}"),
-                            )
-                        })?;
-                    if owner.path() != path
-                        || owner.kind() != baseline.kind()
-                        || state.page.page_id != owner.page_id()
-                        || state.page.path != *path
-                        || state.page.kind != baseline.kind()
-                    {
-                        return Err(authority_block(
-                            ImportBlockReason::ConflictingLocalTail,
-                            Some(path),
-                            "aggregate bootstrap owner identity changed",
-                        ));
-                    }
-                    let rebound = baseline
-                        .rebind_semantic_successor(engine.workspace_id(), &state)
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                format!(
-                                    "aggregate bootstrap source does not match current accepted semantics: {error:?}"
-                                ),
-                            )
-                        })?;
-                    let intent = rebound.intent().clone();
-                    let base = ExactBytes::from_description(
-                        baseline.source_bytes().to_vec(),
-                        BlobDescription::of(baseline.source_bytes()),
-                    );
-                    let completion =
-                        ProjectionCompletion::for_intent(&intent, baseline.source_bytes())
-                            .map_err(|error| {
-                                authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    format!("aggregate bootstrap completion is invalid: {error}"),
-                                )
-                            })?;
-                    let intent_bytes = intent.encode().map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            error.to_string(),
-                        )
-                    })?;
-                    let completion_bytes = completion.encode().map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            error.to_string(),
-                        )
-                    })?;
-                    instrumentation.catalog_entries =
-                        instrumentation.catalog_entries.saturating_add(1);
-                    instrumentation.catalog_bytes_hashed = instrumentation
-                        .catalog_bytes_hashed
-                        .saturating_add(intent_bytes.len() as u64)
-                        .saturating_add(completion_bytes.len() as u64)
-                        .saturating_add(32);
-                    hasher.update(b"aggregate-bootstrap-baseline\0");
-                    hasher.update(baseline.owner_binding().as_bytes());
-                    hasher.update((intent_bytes.len() as u64).to_be_bytes());
-                    hasher.update(intent_bytes);
-                    hasher.update((completion_bytes.len() as u64).to_be_bytes());
-                    hasher.update(completion_bytes);
-                    entries.push(AffectedReceiptEntry {
-                        completed: None,
-                        bootstrap_base: Some(base),
-                        intent,
-                        completion,
-                    });
-                    captured_entries = captured_entries.saturating_add(1);
-                }
-            }
-        }
-        catalog.by_path.insert(path.clone(), entries);
-    }
-    Ok((
-        catalog,
-        CatalogAuthority {
-            digest: ContentDigest::from_bytes(hasher.finalize().into()),
-        },
-    ))
-}
-
-fn capture_import_scope(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    requested_paths: &[ManagedPath],
-    inventory: &RawInventory,
-    catalog: AffectedReceiptCatalog,
-    instrumentation: &mut ImportInstrumentation,
-) -> Result<ImportScopeSnapshot, ImportBlock> {
-    let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
-        authority_block(
-            ImportBlockReason::AuthorityUnavailable,
-            None,
-            "import authority requires an enrolled projection endpoint",
-        )
-    })?;
-    if engine.workspace_id() != receipts.workspace_id()
-        || receipts.endpoint_binding() != Some(endpoint)
-        || engine.projection_receipt_store_id() != Some(receipts.store_id())
-        || graph.canonical_resource_id().map_err(|error| {
-            authority_block(
-                ImportBlockReason::AuthorityUnavailable,
-                None,
-                error.to_string(),
-            )
-        })? != endpoint.graph_resource_id
+    })? != endpoint.graph_resource_id()
+        || engine
+            .require_index_free_clean_projection_runtime()
+            .is_err()
     {
         return Err(authority_block(
             ImportBlockReason::AuthorityUnavailable,
             None,
-            "graph, engine, receipt workspace, or endpoint binding differs",
+            "graph or clean index-free engine binding differs",
         ));
     }
-    let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
-        authority_block(
-            ImportBlockReason::AuthorityUnavailable,
-            None,
-            format!("import authority has no enrolled completed-path index: {error}"),
-        )
-    })?;
 
     let mut paths = BTreeMap::new();
     let mut path_identities = BTreeMap::new();
@@ -5411,411 +7168,147 @@ fn capture_import_scope(
                     format!("managed path cannot be decoded with Graph loading semantics: {error}"),
                 )
             })?;
-        let name = LogicalPageName::parse(entry.name).map_err(|error| {
+        let decoded_name = LogicalPageName::parse(entry.name).map_err(|error| {
             authority_block(
                 ImportBlockReason::UnsafeInput,
                 Some(path),
                 format!("managed path has an invalid logical page name: {error}"),
             )
         })?;
-        let kind = match entry.kind {
+        let decoded_kind = match entry.kind {
             PageKind::Page => ManagedTextKind::Page,
             PageKind::Journal => ManagedTextKind::Journal,
         };
-        path_identities.insert(path.clone(), ImportedPathIdentity { name, kind });
         instrumentation.catalog_path_lookups =
             instrumentation.catalog_path_lookups.saturating_add(1);
-        let catalog_entries = catalog.by_path.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        let current_owner = engine.current_page_at_path(path).map_err(|error| {
-            authority_block(
-                ImportBlockReason::AuthorityUnavailable,
-                Some(path),
-                error.to_string(),
-            )
-        })?;
-        let page_id = match current_owner {
-            CurrentPageAtPath::ExactOwner(occupied) => occupied.page_id(),
-            CurrentPageAtPath::Released(release) => {
-                // Bytes at a released path authenticate a GUARDED CONFLICT — an
-                // external replacement written where a page used to live. An
-                // ordinary completed deletion leaves the path absent, and that
-                // is the common case, so their absence is not an error here:
-                // `authorize_projected_release` prefers the absent-completion
-                // route and only needs an observation on the conflict route.
-                let observed = inventory
-                    .entries()
-                    .get(path)
-                    .and_then(RawObservation::description);
-                let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
+        let sqlite_owner = clean_sqlite_path_owner(&read, path)?;
+        let predecessor = engine
+            .clean_import_projection_predecessor(path, sqlite_owner, &read)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("clean projection predecessor is unavailable: {error}"),
+                )
+            })?;
+        #[cfg(test)]
+        let mut predecessor = predecessor;
+        #[cfg(test)]
+        DERANGE_NEXT_CLEAN_PREDECESSOR_PATH.with(|derange| {
+            if derange.replace(false) {
+                let Some(CleanImportProjectionPredecessor::Present { page, .. }) =
+                    predecessor.as_mut()
+                else {
+                    panic!("clean predecessor derangement requires a present page");
+                };
+                page.path = ManagedPath::parse("pages/semantically-wrong.md").unwrap();
+            }
+        });
+        match predecessor {
+            None => {
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: decoded_name,
+                        kind: decoded_kind,
+                    },
+                );
+                paths.insert(path.clone(), ScopedPathEvidence::New);
+            }
+            Some(CleanImportProjectionPredecessor::Released {
+                prior_page_id: _,
+                intent,
+                completion,
+            }) => {
+                completion.validate_against(&intent).map_err(|error| {
                     authority_block(
-                        ImportBlockReason::AuthorityUnavailable,
+                        ImportBlockReason::CorruptBase,
                         Some(path),
                         error.to_string(),
                     )
                 })?;
-                let release_authority = engine
-                    .authorize_projected_release(&work_index, &release, observed)
-                    .map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::ConflictingLocalTail,
-                            Some(path),
-                            format!("released path lacks completed durable work: {error}"),
-                        )
-                    })?;
-                let completion_id = match release_authority {
-                    super::hot_engine::ProjectedReleaseAuthority::GuardedConflict {
-                        work,
-                        intent_id,
-                    } => {
-                        let intent = receipts
-                            .load_intent(intent_id)
-                            .map_err(|error| {
-                                authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    format!("guarded conflict intent is invalid: {error}"),
-                                )
-                            })?
-                            .ok_or_else(|| {
-                                authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    "guarded conflict lacks its immutable projection intent",
-                                )
-                            })?;
-                        if intent.id().ok() != Some(intent_id)
-                            || intent.workspace_id() != engine.workspace_id()
-                            || intent.page_id() != release.prior_page_id()
-                            || intent.path() != path
-                            || intent.frontier() != work.post_frontier()
-                            || intent.target() != BlobDescription::of(&[])
-                        {
-                            return Err(authority_block(
-                                ImportBlockReason::CorruptBase,
-                                Some(path),
-                                "guarded conflict intent does not match the released path",
-                            ));
-                        }
-                        ProjectionCompletion::for_intent(&intent, &[])
-                            .map_err(|error| {
-                                authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    format!("guarded conflict dependency is invalid: {error}"),
-                                )
-                            })?
-                            .logical_completion_id()
-                    }
-                    super::hot_engine::ProjectedReleaseAuthority::Completed(completed) => {
-                        let mut completion_id = None;
-                        for entry in catalog_entries {
-                            if entry.intent.workspace_id() != engine.workspace_id()
-                                || entry.intent.page_id() != release.prior_page_id()
-                                || entry.intent.path() != path
-                                || entry.intent.frontier() != completed.frontier()
-                                || entry.intent.target() != BlobDescription::of(&[])
-                                || entry.completed.as_ref().is_none_or(|entry| {
-                                    entry.page_id() != completed.page_id()
-                                        || entry.frontier() != completed.frontier()
-                                        || entry.target() != super::ProjectionWorkTarget::Absent
-                                })
-                            {
-                                continue;
-                            }
-                            let logical = entry.completion.logical_completion_id();
-                            if completion_id.replace(logical).is_some() {
-                                return Err(authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    "multiple completed receipts claim one authenticated path release",
-                                ));
-                            }
-                        }
-                        completion_id.ok_or_else(|| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                "authenticated path release has no exact completed receipt",
-                            )
-                        })?
-                    }
-                };
-                paths.insert(path.clone(), ScopedPathEvidence::Released(completion_id));
-                continue;
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: decoded_name,
+                        kind: decoded_kind,
+                    },
+                );
+                paths.insert(
+                    path.clone(),
+                    ScopedPathEvidence::Released(completion.logical_completion_id()),
+                );
             }
-            CurrentPageAtPath::Unowned => {
-                if !catalog_entries.is_empty() {
+            Some(CleanImportProjectionPredecessor::Present {
+                page,
+                bytes,
+                intent,
+                completion,
+                from_baseline,
+            }) => {
+                completion.validate_against(&intent).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                if intent.workspace_id() != engine.workspace_id()
+                    || intent.page_id() != page.page_id
+                    || intent.path() != path
+                    || intent.target() != BlobDescription::of(&bytes)
+                    || page.path != *path
+                {
                     return Err(authority_block(
                         ImportBlockReason::ConflictingLocalTail,
                         Some(path),
-                        "receipt-backed path is no longer owned at the accepted engine frontier",
+                        "clean projection predecessor differs from current accepted page",
                     ));
                 }
-                paths.insert(path.clone(), ScopedPathEvidence::New);
-                continue;
-            }
-            CurrentPageAtPath::PortableCollision(occupied) => {
-                return Err(authority_block(
-                    ImportBlockReason::PortablePathCollision,
-                    Some(path),
-                    format!(
-                        "requested path collides with engine-owned {} for page {}",
-                        occupied.exact_path(),
-                        occupied.page_id()
-                    ),
-                ));
-            }
-            CurrentPageAtPath::ReleasedPortableCollision(release) => {
-                return Err(authority_block(
-                    ImportBlockReason::PortablePathCollision,
-                    Some(path),
-                    format!(
-                        "requested path collides with authenticated released spelling {} for page {}",
-                        release.prior_exact_path(),
-                        release.prior_page_id()
-                    ),
-                ));
-            }
-        };
-
-        let accepted_identity = engine
-            .current_path_catalog_row_at_path(path)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::AuthorityUnavailable,
-                    Some(path),
-                    format!("accepted current-path identity is invalid: {error}"),
-                )
-            })?
-            .ok_or_else(|| {
-                authority_block(
-                    ImportBlockReason::AuthorityUnavailable,
-                    Some(path),
-                    "exact path owner has no accepted current-path identity",
-                )
-            })?;
-        if accepted_identity.page_id() != page_id {
-            return Err(authority_block(
-                ImportBlockReason::AuthorityUnavailable,
-                Some(path),
-                "portable-path owner and accepted current-path PageId disagree",
-            ));
-        }
-        let current = engine
-            .authorize_projection_write(page_id)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::AuthorityUnavailable,
-                    Some(path),
-                    format!("accepted Ready projection authority is unavailable: {error}"),
-                )
-            })?;
-        if current.state().page.path != *path {
-            return Err(authority_block(
-                ImportBlockReason::ConflictingLocalTail,
-                Some(path),
-                "portable-path ownership and materialized page path disagree",
-            ));
-        }
-        if accepted_identity.kind() != current.state().page.kind
-            || accepted_identity.accepted_name_digest()
-                != ContentDigest::of(current.state().page.name.as_str().as_bytes())
-        {
-            return Err(authority_block(
-                ImportBlockReason::AuthorityUnavailable,
-                Some(path),
-                "accepted current-path name or kind disagrees with materialized PageId state",
-            ));
-        }
-        // Exact accepted path ownership is the rename boundary. A reopened
-        // Graph may decode the same filename differently after config.edn
-        // changes, but configuration is not authority to rename an oplog page
-        // or change Page versus Journal. Preserve the accepted catalog identity
-        // here; an unowned destination in an actual external path move still
-        // uses the current Graph decoder above.
-        path_identities.insert(
-            path.clone(),
-            ImportedPathIdentity {
-                name: current.state().page.name.clone(),
-                kind: current.state().page.kind,
-            },
-        );
-
-        // A late watcher callback may observe the exact bytes Tine itself
-        // projected after its journal record was drained and compacted.  Do
-        // not reconstruct an old receipt base with the current serializer:
-        // the immutable completed-path row plus this retained raw inventory
-        // can prove the live bytes are still the accepted projection directly.
-        let live_predecessor = match inventory.entries().get(path) {
-            Some(RawObservation::Present(live)) => {
-                super::projection::receipt_backed_live_projection_predecessor(
-                    engine.workspace_id(),
-                    endpoint,
-                    receipts,
-                    &work_index,
-                    current.state(),
-                    live.bytes(),
-                )
-                .map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::AuthorityUnavailable,
-                        Some(path),
-                        format!("live completed-path predecessor is invalid: {error}"),
-                    )
-                })?
-            }
-            Some(RawObservation::Absent) => None,
-            None => {
-                return Err(authority_block(
-                    ImportBlockReason::StaleScope,
-                    Some(path),
-                    "requested path is absent from the retained raw inventory",
-                ));
-            }
-        };
-        if let Some(live) = live_predecessor {
-            let matching = catalog_entries
-                .iter()
-                .filter(|entry| {
-                    entry.completed.as_ref() == Some(live.completed())
-                        && entry.intent == *live.intent()
-                        && entry.completion == *live.completion()
-                })
-                .count();
-            if matching != 1 {
-                return Err(authority_block(
-                    ImportBlockReason::CorruptBase,
-                    Some(path),
-                    "live completed-path predecessor is not uniquely present in the sealed receipt catalog",
-                ));
-            }
-            let bytes = inventory
-                .entries()
-                .get(path)
-                .and_then(|observation| match observation {
-                    RawObservation::Present(bytes) => Some(bytes.bytes().to_vec()),
-                    RawObservation::Absent => None,
-                })
-                .expect("live completed-path predecessor requires a present retained observation");
-            paths.insert(
-                path.clone(),
-                ScopedPathEvidence::Existing(ReceiptBackedPage {
-                    intent: live.intent().clone(),
-                    completion: live.completion().clone(),
-                    replayed_target: ExactBytes::from_description(bytes, live.intent().target()),
-                    page: current.state().page.clone(),
-                }),
-            );
-            continue;
-        }
-
-        let mut exact = None;
-        let mut replay_cache =
-            BTreeMap::<Option<BlobDescription>, (ProjectionIntent, Vec<u8>)>::new();
-        for entry in catalog_entries {
-            if entry.intent.workspace_id() != engine.workspace_id()
-                || entry.intent.page_id() != page_id
-                || entry.intent.path() != path
-            {
-                continue;
-            }
-            let base_key = match entry.intent.precondition() {
-                super::ProjectionPrecondition::Absent => None,
-                super::ProjectionPrecondition::Base(description) => Some(*description),
-            };
-            if let std::collections::btree_map::Entry::Vacant(slot) = replay_cache.entry(base_key) {
-                let declared_base_bytes = base_key.map_or(0, BlobDescription::byte_length);
-                reserve_base_replay(
-                    instrumentation,
-                    declared_base_bytes,
-                    IMPORT_REPLAY_LIMITS,
-                    path,
-                )?;
-                let base = match &entry.bootstrap_base {
-                    Some(base) => Some(super::BaseBlob::new(base.bytes().to_vec())),
-                    None => receipts.load_base(&entry.intent).map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            format!("canonical base evidence is unavailable: {error}"),
-                        )
-                    })?,
-                };
-                let replay = plan_projection(
-                    engine.workspace_id(),
-                    current.state(),
-                    base.as_ref().map(super::BaseBlob::bytes),
-                )
-                .map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::AuthorityUnavailable,
-                        Some(path),
-                        format!("accepted state cannot be replayed canonically: {error}"),
-                    )
-                })?;
-                retain_rendered_target(
-                    instrumentation,
-                    replay.target().len() as u64,
-                    IMPORT_REPLAY_LIMITS,
-                    path,
-                )?;
-                slot.insert(replay.into_intent_and_target());
-            }
-            let (replayed_intent, _) = &replay_cache[&base_key];
-            if entry.intent.matches_replay_except_frontier(replayed_intent)
-                && (entry.bootstrap_base.is_none()
-                    || entry.intent.frontier() == &current.state().frontier)
-            {
-                if exact.is_some() {
-                    return Err(authority_block(
-                        ImportBlockReason::CorruptBase,
-                        Some(path),
-                        "multiple durable receipt rows claim one current accepted path/frontier",
-                    ));
-                }
-                exact = Some((entry, base_key));
+                instrumentation.catalog_entries = instrumentation.catalog_entries.saturating_add(1);
+                instrumentation.catalog_bytes_hashed = instrumentation
+                    .catalog_bytes_hashed
+                    .saturating_add(bytes.len() as u64);
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: page.name.clone(),
+                        kind: page.kind,
+                    },
+                );
+                paths.insert(
+                    path.clone(),
+                    ScopedPathEvidence::Existing(ReceiptBackedPage {
+                        replayed_target: ExactBytes::from_description(bytes, intent.target()),
+                        page,
+                        source: if from_baseline {
+                            ReceiptBaseSource::CleanBaseline
+                        } else {
+                            ReceiptBaseSource::CleanManifest
+                        },
+                        intent,
+                        completion,
+                    }),
+                );
             }
         }
-        let Some((entry, base_key)) = exact else {
-            return Err(authority_block(
-                ImportBlockReason::ConflictingLocalTail,
-                Some(path),
-                "no durable completion/base exactly matches the current accepted affected frontier",
-            ));
-        };
-        let replayed_target = replay_cache
-            .remove(&base_key)
-            .expect("exact replay key remains cached")
-            .1;
-        let completion = entry.completion.clone();
-        completion
-            .validate_against(&entry.intent)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::CorruptBase,
-                    Some(path),
-                    error.to_string(),
-                )
-            })?;
-        paths.insert(
-            path.clone(),
-            ScopedPathEvidence::Existing(ReceiptBackedPage {
-                intent: entry.intent.clone(),
-                completion,
-                replayed_target: ExactBytes::from_description(
-                    replayed_target,
-                    entry.intent.target(),
-                ),
-                page: current.state().page.clone(),
-            }),
-        );
     }
-
-    Ok(ImportScopeSnapshot {
-        workspace_id: engine.workspace_id(),
-        paths,
-        path_identities,
-    })
+    if paths.len() != inventory.entries().len() {
+        return Err(authority_block(
+            ImportBlockReason::StaleScope,
+            None,
+            "clean predecessor and retained inventory path sets differ",
+        ));
+    }
+    let authority = clean_import_predecessor_authority(engine, database, requested_paths)?;
+    Ok((
+        ImportScopeSnapshot {
+            workspace_id: engine.workspace_id(),
+            paths,
+            path_identities,
+        },
+        authority,
+    ))
 }
 
 fn authority_block(
@@ -5840,6 +7333,7 @@ fn plan_import(
     inventory: RawInventory,
     mut scope: ImportScopeSnapshot,
     engine: &ShardedHotEngine,
+    clean_database: Option<&SqliteFrontier>,
     mut instrumentation: ImportInstrumentation,
 ) -> ImportPlan {
     if scope.paths.len() != inventory.entries().len()
@@ -6004,7 +7498,7 @@ fn plan_import(
         }
     };
 
-    let page_transition = match build_desired_page_transition(
+    let mut page_transition = match build_desired_page_transition(
         &inventory,
         &matches,
         &scope,
@@ -6016,7 +7510,15 @@ fn plan_import(
             return blocked_authority_error(Some(inventory), block, instrumentation);
         }
     };
-    if let Err(block) = preflight_desired_page_names(&inventory, &page_transition, engine) {
+    let authority = match PageNameAuthority::open(engine, clean_database) {
+        Ok(authority) => authority,
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+    };
+    let deduplicated = match retain_authoritative_desired_pages(&mut page_transition, &authority) {
+        Ok(deduplicated) => deduplicated,
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+    };
+    if let Err(block) = preflight_desired_page_names(&inventory, &page_transition, &authority) {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
 
@@ -6032,7 +7534,12 @@ fn plan_import(
             Some(RawObservation::Present(bytes)) if bytes.description() == page.description()
         )
     }) || inventory.entries().iter().any(|(path, observation)| {
-        matches!(observation, RawObservation::Present(_)) && !completed_paths.contains(path)
+        matches!(observation, RawObservation::Present(_))
+            && !completed_paths.contains(path)
+            // A source this transaction deliberately does not import is not
+            // evidence of a change. Without this it would be "new" on every
+            // pass, and every quiet tick would author an empty batch.
+            && !deduplicated.contains(path)
     });
     drop(completed);
     scope.path_identities = resolved_path_identities;
@@ -6091,6 +7598,122 @@ fn plan_import(
     }
 }
 
+/// The one current owner of a canonical page name, read from whichever
+/// authority this runtime keeps it in.
+///
+/// Clean managed storage deliberately has no second resident page-name index.
+/// Its disposable SQLite projection is the current name authority, just as it
+/// is for path ownership. Consulting the empty run-local fallback there used to
+/// let an ordinary collision pass preflight and fail only after authoring,
+/// poisoning the actor with an unpublished manifest.
+struct PageNameAuthority<'a> {
+    clean: Option<super::SqliteMaterializedRead<'a>>,
+    engine: &'a ShardedHotEngine,
+}
+
+impl<'a> PageNameAuthority<'a> {
+    fn open(
+        engine: &'a ShardedHotEngine,
+        clean_database: Option<&'a SqliteFrontier>,
+    ) -> Result<Self, ImportBlock> {
+        let clean = clean_database
+            .map(SqliteFrontier::materialized_read)
+            .transpose()
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    None,
+                    format!("clean SQLite page-name authority is unavailable: {error}"),
+                )
+            })?;
+        Ok(Self { clean, engine })
+    }
+
+    fn owner(
+        &self,
+        name: &LogicalPageName,
+        path: &ManagedPath,
+    ) -> Result<Option<PageId>, ImportBlock> {
+        match self.clean.as_ref() {
+            Some(read) => Ok(read
+                .causal_page_name_identity_record(name.key_digest())
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("clean SQLite logical page-name lookup failed: {error}"),
+                    )
+                })?
+                .and_then(|record| record.occupied().map(|owner| owner.page_id()))),
+            None => self
+                .engine
+                .current_page_for_logical_name(name)
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("authenticated logical page-name lookup failed: {error}"),
+                    )
+                }),
+        }
+    }
+}
+
+/// Apply activation's deterministic source selection to the affected set, so a
+/// graph that already holds two physical files for one canonical page name
+/// keeps reconciling instead of refusing every path in the transaction.
+///
+/// `bootstrap_authoritative_source_paths` selects ONE authoritative source per
+/// canonical page name and per portable path at activation, matching OG's
+/// "retain the first, skip the later collision"
+/// (`frontend.handler.repo/parse-files-and-load-to-db!`). Every later member
+/// stays on disk as ordinary graph text with no page of its own. Reconciliation
+/// then met that same file as a brand-new page whose decoded name was already
+/// owned, and refused the whole transaction — for every path, on every tick,
+/// with no way for the user to make progress (GH: Android, 2026-08-18).
+///
+/// A source that carries no accepted page identity and cannot acquire the name
+/// it decodes to therefore acquires no identity at all here either. Its exact
+/// bytes stay on disk and are still observed; only the semantic page is
+/// withheld. An accepted page is never withdrawn this way: it keeps whatever
+/// identity it already has, and a real title change into a taken name remains
+/// the visible ambiguity the preflight below refuses.
+fn retain_authoritative_desired_pages(
+    transition: &mut DesiredPageTransition,
+    authority: &PageNameAuthority<'_>,
+) -> Result<BTreeSet<ManagedPath>, ImportBlock> {
+    let mut claimed = BTreeMap::<super::PageNameKeyDigest, PageId>::new();
+    let mut deduplicated = BTreeSet::new();
+    for (path, page) in transition
+        .pages
+        .iter()
+        .filter(|(_, page)| page.acquires_name)
+    {
+        let key = page.name.key_digest();
+        let claimant = claimed
+            .get(&key)
+            .copied()
+            .filter(|claimant| *claimant != page.page_id);
+        // An authority that cannot answer is never read as "the name is free".
+        let owner = authority.owner(&page.name, path)?.filter(|owner| {
+            *owner != page.page_id && !transition.released_name_owners.contains(owner)
+        });
+        match claimant.or(owner) {
+            Some(_) if !page.existing => {
+                deduplicated.insert(path.clone());
+            }
+            Some(_) => {}
+            None => {
+                claimed.insert(key, page.page_id);
+            }
+        }
+    }
+    for path in &deduplicated {
+        transition.pages.remove(path);
+    }
+    Ok(deduplicated)
+}
+
 /// Refuse a transaction before authoring when two affected files would acquire
 /// one logical page name, or when an affected destination name is already
 /// owned by another authenticated page.  Paths are deliberately not used as a
@@ -6099,10 +7722,14 @@ fn plan_import(
 fn preflight_desired_page_names(
     inventory: &RawInventory,
     transition: &DesiredPageTransition,
-    engine: &ShardedHotEngine,
+    authority: &PageNameAuthority<'_>,
 ) -> Result<(), ImportBlock> {
     let mut desired = BTreeMap::new();
-    for (path, page) in &transition.pages {
+    for (path, page) in transition
+        .pages
+        .iter()
+        .filter(|(_, page)| page.acquires_name)
+    {
         if let Some((prior_path, prior_page_id, prior_name)) = desired.insert(
             page.name.key_digest(),
             (path.clone(), page.page_id, page.name.clone()),
@@ -6123,24 +7750,37 @@ fn preflight_desired_page_names(
         }
     }
     for (_, (path, page_id, name)) in desired {
-        let owner = engine
-            .current_page_for_logical_name(&name)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::AuthorityUnavailable,
-                    Some(&path),
-                    format!("authenticated logical page-name lookup failed: {error}"),
-                )
-            })?;
+        let owner = authority.owner(&name, &path)?;
         if owner.is_some_and(|owner| {
             owner != page_id && !transition.released_name_owners.contains(&owner)
         }) {
+            // Said in the user's words, because this is the text a device
+            // showed the user once per tick: a page name and a UUID, neither of
+            // which appears anywhere in the app. Page names fold case and
+            // Unicode normalization here exactly as they do in Logseq
+            // (`canonical_page_name_key`), so "differ by more than
+            // capitalisation, accent spelling, or # vs %23" is the action that
+            // actually resolves it. The escape case is not hypothetical: a
+            // reported graph held one title twice, once with a literal `#` and
+            // once with `%23`, both files written by Logseq years earlier — so
+            // a message naming only capitalisation would read as "not my
+            // problem" to the person actually hitting it. The sentence is the
+            // same on a filesystem that folds those names into
+            // one file (`docs/storage-sync-contract.md` §2.10d). The owning
+            // page id stays at the end for diagnosis.
             return Err(authority_block(
                 ImportBlockReason::ConflictingLocalTail,
                 Some(&path),
                 format!(
-                    "decoded destination logical page name {} is already owned by page {}",
+                    "another file in this graph is already the page \u{201c}{}\u{201d}, so \
+                     {} cannot take that name too — the two file names differ only in a way \
+                     Tine and Logseq both ignore when they read a page name: capitalisation, \
+                     accent spelling, or writing a character literally where the other escapes \
+                     it (a title containing # can be stored as # or as %23). Rename one file \
+                     if you meant two different pages (decoded destination logical page name \
+                     is already owned by page {})",
                     name.as_str(),
+                    path.as_str(),
                     owner.expect("checked above")
                 ),
             ));
@@ -6163,6 +7803,7 @@ struct DesiredImportPage {
     path: ManagedPath,
     kind: ManagedTextKind,
     existing: bool,
+    acquires_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6323,6 +7964,7 @@ fn build_desired_page_transition(
                     path: path.clone(),
                     kind: path_identity.kind,
                     existing: true,
+                    acquires_name: current.name != path_identity.name,
                 }
             }
             None => {
@@ -6346,6 +7988,7 @@ fn build_desired_page_transition(
                     path: path.clone(),
                     kind: path_identity.kind,
                     existing: false,
+                    acquires_name: true,
                 }
             }
         };
@@ -6499,14 +8142,39 @@ fn build_execution_material(
         let state = match observation {
             RawObservation::Absent => ExternalImportObservationState::Absent,
             RawObservation::Present(bytes) => {
+                let Some(page) = desired_pages.get(path) else {
+                    // A source this transaction deliberately does not import:
+                    // another physical file already owns its canonical page
+                    // name, exactly as activation decided
+                    // (`retain_authoritative_desired_pages`). Its exact bytes
+                    // are still observed, so the transaction still proves what
+                    // was on disk; no block identity is assigned to them and no
+                    // operation touches the file.
+                    observation_entries.push(
+                        ExternalImportObservationEntry::new(
+                            path.clone(),
+                            kind,
+                            ExternalImportObservationState::present(
+                                bytes.bytes().to_vec(),
+                                Vec::new(),
+                            )
+                            .map_err(|error| {
+                                ImportExecutionError::Observation(
+                                    ExternalImportObservationMaterialError::Observation(error),
+                                )
+                            })?,
+                        )
+                        .map_err(|error| {
+                            ImportExecutionError::Observation(
+                                ExternalImportObservationMaterialError::Observation(error),
+                            )
+                        })?,
+                    );
+                    continue;
+                };
                 let tree = trees.get(path).ok_or_else(|| {
                     ImportExecutionError::InvalidMaterial(
                         "sealed present inventory path has no parsed tree".into(),
-                    )
-                })?;
-                let page = desired_pages.get(path).ok_or_else(|| {
-                    ImportExecutionError::InvalidMaterial(
-                        "sealed present inventory path has no desired page".into(),
                     )
                 })?;
                 let mut annotations = Vec::with_capacity(tree.nodes.len());
@@ -7120,6 +8788,8 @@ fn match_pages(
     Ok(matches)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParsedNode {
     parent: Option<usize>,
     sibling_position: u32,
@@ -7128,8 +8798,22 @@ struct ParsedNode {
     span: StructuralSpan,
     raw: String,
     raw_ids: Vec<String>,
+    projection_facets: ParsedBlockProjectionFacets,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedBlockProjectionFacets {
+    searchable_text: String,
+    heading_level: Option<u8>,
+    collapsed: bool,
+    properties: Vec<super::MaterializedProperty>,
+    tags: Vec<String>,
+    task: Option<super::MaterializedTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParsedTree {
     path: ManagedPath,
     preamble: Option<String>,
@@ -7142,6 +8826,115 @@ struct ParsedExternalTree {
     explicit_title: Option<String>,
     filename_fallback: PageEntry,
     effective: PageEntry,
+}
+
+const CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION: u32 = 1;
+const MAX_CAPTURED_ACTIVATION_PAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Parser-owned, process-local handoff from the exact source capture to the
+/// activation constructor. This is deliberately not the durable genesis
+/// capsule codec: it may change with the parser and disappears with an
+/// uncommitted activation episode.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedActivationPageV1 {
+    schema_version: u32,
+    tree: ParsedTree,
+}
+
+pub(crate) struct CapturedActivationPageRecord {
+    encoded: Vec<u8>,
+    logical_name: String,
+    kind: ManagedTextKind,
+    node_count: usize,
+}
+
+impl CapturedActivationPageRecord {
+    pub(crate) fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub(crate) fn logical_name(&self) -> &str {
+        &self.logical_name
+    }
+
+    pub(crate) fn kind(&self) -> ManagedTextKind {
+        self.kind
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.node_count
+    }
+}
+
+pub(crate) fn capture_activation_page_record(
+    graph: &Graph,
+    path: &ManagedPath,
+    bytes: &[u8],
+) -> io::Result<CapturedActivationPageRecord> {
+    let mut instrumentation = ImportInstrumentation::default();
+    let parsed =
+        parse_external_nodes(graph, path, bytes, &mut instrumentation).map_err(|block| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {}", path, block.detail),
+            )
+        })?;
+    let logical_name = parsed.effective.name.clone();
+    let kind = match parsed.effective.kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    };
+    let node_count = parsed.tree.nodes.len();
+    let record = CapturedActivationPageV1 {
+        schema_version: CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION,
+        tree: parsed.tree,
+    };
+    let encoded = postcard::to_allocvec(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if encoded.len() > MAX_CAPTURED_ACTIVATION_PAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "captured activation page exceeds its fixed record cap",
+        ));
+    }
+    Ok(CapturedActivationPageRecord {
+        encoded,
+        logical_name,
+        kind,
+        node_count,
+    })
+}
+
+fn decode_captured_activation_page_record(
+    expected_path: &ManagedPath,
+    bytes: &[u8],
+) -> Result<ParsedTree, BootstrapStreamingImportError> {
+    if bytes.len() > MAX_CAPTURED_ACTIVATION_PAGE_BYTES {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "captured activation page bytes",
+            observed: bytes.len() as u64,
+            limit: MAX_CAPTURED_ACTIVATION_PAGE_BYTES as u64,
+        });
+    }
+    let record: CapturedActivationPageV1 = postcard::from_bytes(bytes)
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    if record.schema_version != CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION
+        || &record.tree.path != expected_path
+    {
+        return Err(BootstrapStreamingImportError::InvalidSource(format!(
+            "captured activation page does not bind {}",
+            expected_path
+        )));
+    }
+    if record.tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "parser nodes per source file",
+            observed: record.tree.nodes.len() as u64,
+            limit: u64::from(MAX_PARSED_NODES_PER_SOURCE_FILE),
+        });
+    }
+    Ok(record.tree)
 }
 
 impl std::ops::Deref for ParsedExternalTree {
@@ -7393,7 +9186,6 @@ fn parse_external_nodes(
     bytes: &[u8],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedExternalTree, ImportBlock> {
-    let is_org = path.is_org();
     let parsed = graph
         .parse_external_document(path, bytes, true)
         .map_err(|error| {
@@ -7404,17 +9196,6 @@ fn parse_external_nodes(
             )
         })?;
     enforce_outline_limits(path, &parsed.parsed, instrumentation.parsed_nodes)?;
-    if parsed.source_round_trips != Some(true) {
-        return Err(authority_block(
-            ImportBlockReason::UnsafeInput,
-            Some(path),
-            if is_org {
-                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
-            } else {
-                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
-            },
-        ));
-    }
     let tree = flatten_document(path, parsed.parsed, instrumentation)?;
     Ok(ParsedExternalTree {
         tree,
@@ -7444,22 +9225,10 @@ fn parse_nodes(
         )
     })?;
     enforce_outline_limits(path, &parsed, instrumentation.parsed_nodes)?;
-    let source_admitted = if is_org {
-        crate::org::org_editable_parsed(text, &parsed)
-    } else {
-        crate::doc::markdown_structurally_round_trips_parsed(text, &parsed)
-    };
-    if !source_admitted {
-        return Err(authority_block(
-            ImportBlockReason::UnsafeInput,
-            Some(path),
-            if is_org {
-                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
-            } else {
-                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
-            },
-        ));
-    }
+    // Parseable sources are admissible even when Tine's serializer cannot
+    // reproduce their structure. The exact-source projection preserves their
+    // bytes, and the application DTO marks either Markdown or Org read-only at
+    // the parser boundary so no editor/save path can reserialize them.
     flatten_document(path, parsed, instrumentation)
 }
 
@@ -7541,6 +9310,8 @@ fn flatten_document(
                 (crate::doc::property_key_norm(&key) == "id").then_some(value)
             })
             .collect();
+        let (searchable_text, heading_level, collapsed, properties, tags, task) =
+            super::sqlite::document_facets_from_parsed_block(block);
         let index = nodes.len();
         let span = spans.get(index).copied().ok_or_else(|| {
             authority_block(
@@ -7557,6 +9328,14 @@ fn flatten_document(
             span,
             raw: block.raw.clone(),
             raw_ids,
+            projection_facets: ParsedBlockProjectionFacets {
+                searchable_text,
+                heading_level,
+                collapsed,
+                properties,
+                tags,
+                task,
+            },
         });
         instrumentation.parsed_nodes = instrumentation.parsed_nodes.saturating_add(1);
         instrumentation.max_depth = instrumentation.max_depth.max(depth);
@@ -8261,13 +10040,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::oplog::local_active::CleanLocalRuntime;
+    use crate::oplog::operational_coordinator::{
+        fail_next_clean_after_manifest_for_harness, CleanExternalMutationState,
+        CleanLocalMutationState, OperationalCoordinator,
+    };
+    use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
-        execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
-        AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
-        LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot,
-        ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionRecovery,
-        RebuildSource, SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
-        MAX_MATERIALIZATION_QUERY_ROWS,
+        AcceptedBatchEvent, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
+        BatchOrigin, BlockLocation, CrdtPeerId, DeviceId, DocumentId, LineageDigest,
+        ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot, PreparedBatch,
+        ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
+        ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation, SessionId,
+        SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
     struct TestRoot(PathBuf);
@@ -8309,17 +10094,20 @@ mod tests {
         );
     }
 
-    struct SnapshotFixture {
+    /// The clean baseline-plus-manifest composition used by the import corpus.
+    /// Source files are the genesis; no enrolled projection index, scratch
+    /// store, history store, or recovery-replay block participates.
+    struct CleanSnapshotFixture {
         _root: TestRoot,
         graph_root: PathBuf,
         graph: Graph,
         receipts: ProjectionReceiptStore,
-        engine: ShardedHotEngine,
-        intents: Vec<ProjectionIntent>,
-        empty_history_head: Vec<u8>,
+        runtime: CleanLocalRuntime,
+        page_ids: Vec<PageId>,
+        database: PathBuf,
     }
 
-    impl SnapshotFixture {
+    impl CleanSnapshotFixture {
         fn new(label: &str, paths: &[&str]) -> Self {
             Self::new_with_initial_uuid_and_config(label, paths, None, None, None, None, None)
         }
@@ -8389,6 +10177,7 @@ mod tests {
             )
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn new_with_initial_uuid_and_config(
             label: &str,
             paths: &[&str],
@@ -8398,21 +10187,138 @@ mod tests {
             contents: Option<&[&str]>,
             preambles: Option<&[&str]>,
         ) -> Self {
-            assert!(names.is_none_or(|names| names.len() == paths.len()));
-            assert!(contents.is_none_or(|contents| contents.len() == paths.len()));
-            assert!(preambles.is_none_or(|preambles| preambles.len() == paths.len()));
-            let root = TestRoot::new(label);
+            assert!(names.is_none_or(|values| values.len() == paths.len()));
+            assert!(contents.is_none_or(|values| values.len() == paths.len()));
+            assert!(preambles.is_none_or(|values| values.len() == paths.len()));
+            let root = TestRoot::new(&format!("{label}-clean"));
             let graph_root = root.path().join("graph");
             if let Some(config) = config {
                 fs::create_dir_all(graph_root.join("logseq")).unwrap();
                 fs::write(graph_root.join("logseq/config.edn"), config).unwrap();
             }
             let graph = Graph::open(&graph_root);
-            for path in paths {
-                let parent = graph_root.join(path).parent().unwrap().to_path_buf();
-                fs::create_dir_all(parent).unwrap();
+            for (index, path) in paths.iter().enumerate() {
+                let target = graph_root.join(path);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                let content = contents
+                    .map(|values| values[index].to_owned())
+                    .unwrap_or_else(|| format!("page {index}"));
+                let explicit_preamble = preambles.map(|values| values[index]);
+                let provisional = clean_snapshot_source(
+                    path,
+                    explicit_preamble,
+                    &content,
+                    (index == 0).then_some(initial_uuid).flatten(),
+                );
+                fs::write(&target, provisional).unwrap();
+                if explicit_preamble.is_none() {
+                    let decoded = graph
+                        .managed_entry_for_managed_path(
+                            &ManagedPath::parse((*path).to_owned()).unwrap(),
+                        )
+                        .unwrap()
+                        .name;
+                    let desired = names
+                        .map(|values| values[index].to_owned())
+                        .unwrap_or_else(|| format!("Snapshot Page {index}"));
+                    if decoded != desired {
+                        let generated_preamble = if path.ends_with(".org") {
+                            format!("#+TITLE: {desired}")
+                        } else {
+                            format!("title:: {desired}")
+                        };
+                        fs::write(
+                            &target,
+                            clean_snapshot_source(
+                                path,
+                                Some(&generated_preamble),
+                                &content,
+                                (index == 0).then_some(initial_uuid).flatten(),
+                            ),
+                        )
+                        .unwrap();
+                    }
+                }
             }
+
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+            let lineage = LineageDigest::of(b"snapshot-test");
+            let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
+            let database = root.path().join("clean-projection.sqlite");
+            let archive = root.path().join("clean-archive");
+            let enrollment = root.path().join("clean-enrollment");
+            fs::create_dir(&archive).unwrap();
+            let capture_root = root.path().join("clean-capture");
+            fs::create_dir(&capture_root).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_root)
+                .unwrap();
+            let preparation = prepare_clean_activation(
+                &graph,
+                capture,
+                workspace,
+                lineage,
+                catalog,
+                &root.path().join("clean-preparation"),
+                &database,
+                &ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap();
+            let page_ids = paths
+                .iter()
+                .map(|path| {
+                    preparation
+                        .candidates()
+                        .baseline()
+                        .page_ids()
+                        .find(|page_id| {
+                            preparation
+                                .candidates()
+                                .baseline()
+                                .page(*page_id)
+                                .unwrap()
+                                .is_some_and(|page| page.path.as_str() == *path)
+                        })
+                        .unwrap_or_else(|| panic!("clean baseline has no {path}"))
+                })
+                .collect::<Vec<_>>();
+            let committed = commit_clean_activation(
+                &graph,
+                preparation,
+                &archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &enrollment,
+            )
+            .unwrap();
+            let (baseline, physical, baseline_frontier, _) = committed.into_parts();
+            drop(physical);
+            drop(baseline);
+            let reopened = open_clean_activation(
+                &enrollment,
+                &archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &database,
+                catalog,
+                ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap()
+            .expect("published clean snapshot activation reopens");
+            let (mut engine, projection, _) = reopened.into_parts();
+            let operations = archive.join("operations");
+            engine
+                .attach_clean_archive_store(ObjectStore::open(&operations, workspace).unwrap())
+                .unwrap();
+            let store = ObjectStore::open(&operations, workspace).unwrap();
+            let lease = WorkspaceRuntimeLease::acquire(&store, workspace).unwrap();
+            let projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+                lease,
+                &database,
+                ProjectionClaim::current(workspace, lineage),
+                &baseline_frontier,
+                &store,
+                &engine,
+                projection,
+            )
+            .map_err(|(_, error)| error)
+            .unwrap();
             let endpoint = ProjectionEndpointBinding::enroll_graph(
                 &graph,
                 ProjectionEndpointId::from_uuid(Uuid::from_u128(2)),
@@ -8420,137 +10326,70 @@ mod tests {
             )
             .unwrap();
             let receipts = ProjectionReceiptStore::open_for_endpoint(
-                &root.path().join("receipts"),
+                &root.path().join("clean-receipts"),
                 workspace,
                 endpoint,
             )
             .unwrap();
-            let lineage = LineageDigest::of(b"snapshot-test");
-            let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
-            let archive = root.path().join("archive");
-            let author = ShardedHotEngine::with_enrolled_projection(
-                ObjectStore::open(&archive, workspace).unwrap(),
-                lineage,
-                catalog,
-                &graph,
-                &receipts,
-            );
-            let mut operations = Vec::new();
-            let mut page_ids = Vec::new();
-            for (index, path) in paths.iter().enumerate() {
-                let seed = 100 + index as u128 * 10;
-                let page_id = PageId::from_uuid(Uuid::from_u128(seed));
-                let home = DocumentId::from_uuid(Uuid::from_u128(seed + 1));
-                let managed_path = ManagedPath::parse((*path).to_owned()).unwrap();
-                let kind = graph.classify_managed_text_path(&managed_path).unwrap();
-                page_ids.push(page_id);
-                operations.push(SemanticOperation::CreatePage {
-                    page_id,
-                    home_document_id: home,
-                    name: crate::oplog::LogicalPageName::parse(
-                        names
-                            .map(|names| names[index].to_owned())
-                            .unwrap_or_else(|| format!("Snapshot Page {index}")),
-                    )
-                    .unwrap(),
-                    path: managed_path,
-                    kind,
-                });
-                operations.push(SemanticOperation::CreateBlock {
-                    block: BlockLocation {
-                        block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
-                        home_document_id: home,
-                    },
-                    page_id,
-                    parent: None,
-                    order: "a".into(),
-                    content: contents
-                        .map(|contents| contents[index].to_owned())
-                        .unwrap_or_else(|| match (index, initial_uuid) {
-                            (0, Some(logseq_uuid)) => {
-                                format!("page {index}\nid:: {logseq_uuid}")
-                            }
-                            _ => format!("page {index}"),
-                        }),
-                });
-                if let Some(preambles) = preambles {
-                    operations.push(SemanticOperation::SetPagePreamble {
-                        page_id,
-                        preamble: Some(preambles[index].to_owned()),
-                    });
-                }
-                if index == 0 {
-                    if let Some(logseq_uuid) = initial_uuid {
-                        operations.push(SemanticOperation::MutateBlockLogseqIdentity {
-                            block: BlockLocation {
-                                block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
-                                home_document_id: home,
-                            },
-                            mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
-                        });
-                    }
-                }
-            }
-            let transaction = OperationTransaction::new(operations).unwrap();
-            let batch_id = BatchId::from_uuid(Uuid::from_u128(5));
-            let draft = author
-                .draft_author_transaction(
-                    AuthorBatch {
-                        batch_id,
-                        author_device_id: endpoint.device_id,
-                        author_session_id: SessionId::from_uuid(Uuid::from_u128(7)),
-                        crdt_peer_id: CrdtPeerId::from_u64(8),
-                    },
-                    BatchOrigin::LocalMutation,
-                    &transaction,
-                )
+            engine
+                .attach_clean_projection_endpoint(&graph, &receipts)
                 .unwrap();
-            let prepared = author
-                .finalize_author_transaction(draft, &graph, &receipts, endpoint)
-                .unwrap();
-            drop(author);
-            ObjectStore::open(&archive, workspace)
-                .unwrap()
-                .publish_prepared(&prepared)
-                .unwrap();
-            let mut engine = ShardedHotEngine::with_enrolled_projection(
-                ObjectStore::open(&archive, workspace).unwrap(),
-                lineage,
-                catalog,
-                &graph,
-                &receipts,
-            );
-            let empty_history_head = fs::read(
-                archive
-                    .join("engine-history")
-                    .join(endpoint.endpoint_id.to_string())
-                    .join("engine-history.head"),
+            let runtime = CleanLocalRuntime::from_open_parts(
+                SessionId::from_uuid(Uuid::from_u128(7)),
+                endpoint,
+                engine,
+                projection,
             )
             .unwrap();
-            engine.stage_archive_batch(batch_id).unwrap();
-            let intents = page_ids
-                .into_iter()
-                .map(|page_id| {
-                    write_projection_exact(&graph, &receipts, &engine, page_id, None)
-                        .unwrap()
-                        .plan
-                        .intent()
-                        .clone()
-                })
-                .collect();
             Self {
                 _root: root,
                 graph_root,
                 graph,
                 receipts,
-                engine,
-                intents,
-                empty_history_head,
+                runtime,
+                page_ids,
+                database,
             }
         }
 
         fn plan(&self, paths: &[&str]) -> ImportPlan {
-            plan_affected_import(&self.graph, &self.receipts, &self.engine, paths)
+            plan_clean_affected_import(
+                &self.graph,
+                self.runtime.engine(),
+                self.runtime.database(),
+                paths,
+            )
+        }
+
+        fn engine(&self) -> &ShardedHotEngine {
+            self.runtime.engine()
+        }
+
+        fn page_id(&self, index: usize) -> PageId {
+            self.page_ids[index]
+        }
+
+        fn apply_external_paths(&mut self, paths: &[&str]) -> BatchId {
+            let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+            match OperationalCoordinator::execute_clean_external(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                paths,
+            )
+            .unwrap()
+            {
+                CleanExternalMutationState::Complete(batch_id) => batch_id,
+                CleanExternalMutationState::Noop => {
+                    panic!("clean external reconciliation unexpectedly became a no-op")
+                }
+                CleanExternalMutationState::DurablePending(pending) => {
+                    panic!(
+                        "clean external reconciliation remained pending: {}",
+                        pending.failure()
+                    )
+                }
+            }
         }
 
         fn reopen_after_config_change(self) -> Self {
@@ -8559,106 +10398,156 @@ mod tests {
                 graph_root,
                 graph,
                 receipts,
-                engine,
-                intents,
-                empty_history_head,
+                runtime,
+                page_ids,
+                database,
             } = self;
             drop(graph);
-            drop(engine);
+            drop(runtime);
             let graph = Graph::open(&graph_root);
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
-            let mut engine = ShardedHotEngine::with_enrolled_projection(
-                ObjectStore::open(&_root.path().join("archive"), workspace).unwrap(),
-                LineageDigest::of(b"snapshot-test"),
-                DocumentId::from_uuid(Uuid::from_u128(4)),
-                &graph,
-                &receipts,
-            );
-            engine.prepare_operational_recovery_replay().unwrap();
-            let manifests = ObjectStore::open(&_root.path().join("archive"), workspace)
-                .unwrap()
-                .committed_manifests()
+            let lineage = LineageDigest::of(b"snapshot-test");
+            let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
+            let archive = _root.path().join("clean-archive");
+            let enrollment = _root.path().join("clean-enrollment");
+            let reopened = open_clean_activation(
+                &enrollment,
+                &archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &database,
+                catalog,
+                ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap()
+            .expect("published clean snapshot activation reopens after config change");
+            let (mut engine, baseline_projection, _) = reopened.into_parts();
+            let operations = archive.join("operations");
+            engine
+                .attach_clean_archive_store(ObjectStore::open(&operations, workspace).unwrap())
                 .unwrap();
-            for manifest in manifests {
-                engine
-                    .stage_archive_batch_for_recovery(manifest.batch_id())
-                    .unwrap();
-            }
-            engine.finish_operational_recovery_replay().unwrap();
+            let baseline_root = engine.accepted_frontier_root().unwrap();
+            let baseline_claim_source = crate::oplog::sqlite::clean_genesis_materialized_read(
+                &baseline_projection,
+                &baseline_root,
+            )
+            .unwrap();
+            let replayed = engine
+                .replay_clean_committed_tail(&baseline_claim_source)
+                .unwrap();
+            drop(baseline_claim_source);
+            let store = ObjectStore::open(&operations, workspace).unwrap();
+            let lease = WorkspaceRuntimeLease::acquire(&store, workspace).unwrap();
+            let projection = if replayed == 0 {
+                let expected = engine.accepted_frontier_root().unwrap();
+                LeasedWorkspaceProjection::adopt_clean_genesis(
+                    lease,
+                    &database,
+                    ProjectionClaim::current(workspace, lineage),
+                    &expected,
+                    &store,
+                    &engine,
+                    baseline_projection,
+                )
+                .map_err(|(_, error)| error)
+                .unwrap()
+            } else {
+                drop(baseline_projection);
+                let application_runtime = ApplicationRuntimeRoot::open_for_test(
+                    &_root.path().join("clean-application-runtime"),
+                )
+                .unwrap();
+                let source = RebuildSource::new(&engine, &store).unwrap();
+                LeasedWorkspaceProjection::open_under(lease, |slot| {
+                    let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+                        &database,
+                        &application_runtime,
+                        ProjectionClaim::current(workspace, lineage),
+                        source,
+                        slot,
+                    )?;
+                    Ok::<_, crate::oplog::SqliteProjectionError>((opened, ()))
+                })
+                .map(|(projection, ())| projection)
+                .map_err(|(_, error)| error)
+                .unwrap()
+            };
+            let endpoint = ProjectionEndpointBinding::enroll_graph(
+                &graph,
+                ProjectionEndpointId::from_uuid(Uuid::from_u128(2)),
+                DeviceId::from_uuid(Uuid::from_u128(3)),
+            )
+            .unwrap();
+            engine
+                .attach_clean_projection_endpoint(&graph, &receipts)
+                .unwrap();
+            let runtime = CleanLocalRuntime::from_open_parts(
+                SessionId::from_uuid(Uuid::from_u128(7)),
+                endpoint,
+                engine,
+                projection,
+            )
+            .unwrap();
             Self {
                 _root,
                 graph_root,
                 graph,
                 receipts,
-                engine,
-                intents,
-                empty_history_head,
+                runtime,
+                page_ids,
+                database,
             }
-        }
-
-        fn apply_external_plan(&mut self, plan: ImportPlan, seed: u128) -> BatchId {
-            let endpoint = self.engine.projection_endpoint_binding().unwrap();
-            let material = plan.into_execution_material().unwrap();
-            let batch_id = material.batch_id();
-            let draft = self
-                .engine
-                .draft_external_import_transaction(
-                    AuthorBatch {
-                        batch_id,
-                        author_device_id: endpoint.device_id,
-                        author_session_id: SessionId::from_uuid(Uuid::from_u128(seed)),
-                        crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 1),
-                    },
-                    material,
-                )
-                .unwrap();
-            let captured = self
-                .engine
-                .capture_external_author_transaction(
-                    draft,
-                    &self.graph,
-                    &self.receipts,
-                    endpoint,
-                    None,
-                )
-                .unwrap();
-            let prepared = self
-                .engine
-                .finalize_captured_author_transaction(captured, &self.receipts)
-                .unwrap();
-            ObjectStore::open(
-                &self._root.path().join("archive"),
-                self.engine.workspace_id(),
-            )
-            .unwrap()
-            .publish_prepared(&prepared)
-            .unwrap();
-            let disposition = self
-                .engine
-                .stage_archive_batch(batch_id)
-                .unwrap()
-                .disposition()
-                .clone();
-            assert!(
-                matches!(disposition, BatchDisposition::Accepted { .. }),
-                "{disposition:?}"
-            );
-            batch_id
         }
     }
 
-    fn completion_name(intent: &ProjectionIntent) -> String {
-        let mut value = String::new();
-        for byte in intent.id().unwrap().as_bytes() {
-            use std::fmt::Write as _;
-            write!(&mut value, "{byte:02x}").unwrap();
+    fn clean_snapshot_source(
+        path: &str,
+        preamble: Option<&str>,
+        content: &str,
+        initial_uuid: Option<LogseqUuid>,
+    ) -> Vec<u8> {
+        let mut content = content.to_owned();
+        if let Some(logseq_uuid) = initial_uuid {
+            let uuid = logseq_uuid.to_string();
+            if !content.contains(&uuid) {
+                content.push_str("\nid:: ");
+                content.push_str(&uuid);
+            }
         }
-        format!("{value}.completion")
+        let mut source = String::new();
+        if let Some(preamble) = preamble {
+            source.push_str(preamble);
+            source.push_str("\n\n");
+        }
+        let mut lines = content.lines();
+        let first = lines.next().unwrap_or_default();
+        if path.ends_with(".org") {
+            source.push_str("* ");
+            source.push_str(first);
+            source.push('\n');
+            if let Some(logseq_uuid) = initial_uuid {
+                source.push_str(":PROPERTIES:\n:id: ");
+                source.push_str(&logseq_uuid.to_string());
+                source.push_str("\n:END:\n");
+            }
+            for line in lines.filter(|line| !line.starts_with("id::")) {
+                source.push_str(line);
+                source.push('\n');
+            }
+        } else {
+            source.push_str("- ");
+            source.push_str(first);
+            source.push('\n');
+            for line in lines {
+                source.push_str("  ");
+                source.push_str(line);
+                source.push('\n');
+            }
+        }
+        source.into_bytes()
     }
 
     #[test]
-    fn snapshot_revalidation_rejects_content_replacement_between_passes() {
-        let fixture = SnapshotFixture::new("content", &["pages/a.md"]);
+    fn snapshot_revalidation_rejects_content_replacement_between_passes_clean() {
+        let fixture = CleanSnapshotFixture::new("content", &["pages/a.md"]);
         let target = fixture.graph_root.join("pages/a.md");
         SNAPSHOT_REVALIDATION_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
@@ -8671,34 +10560,46 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_blocks_non_round_tripping_org_before_material() {
+    fn source_admission_accepts_non_round_tripping_org_as_exact_read_only_source_clean() {
         for (label, path, source) in [(
             "skipped-org-admission",
             "pages/a.org",
             "* changed\n*** skipped\n",
         )] {
-            let fixture = SnapshotFixture::new(label, &[path]);
+            let fixture = CleanSnapshotFixture::new(label, &[path]);
             let target = fixture.graph_root.join(path);
             fs::write(&target, source).unwrap();
             let plan = fixture.plan(&[path]);
             assert_eq!(
                 plan.status(),
-                ImportPlanStatus::Blocked,
+                ImportPlanStatus::Reconcile,
                 "{label}: {plan:?}"
             );
-            assert_eq!(plan.blocks()[0].reason, ImportBlockReason::UnsafeInput);
             assert!(
-                plan.execution_material().is_err(),
-                "{label} exposed semantic execution material"
+                plan.execution_material().is_ok(),
+                "{label} did not expose semantic execution material"
             );
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
     }
 
     #[test]
-    fn source_admission_accepts_structurally_round_tripping_markdown_before_material() {
+    fn source_admission_accepts_non_round_tripping_markdown_as_exact_read_only_source_clean() {
+        let source = "- root\r  ```\r  - fake\r  ```";
+        let fixture = CleanSnapshotFixture::new("non-round-tripping-markdown", &["pages/a.md"]);
+        let target = fixture.graph_root.join("pages/a.md");
+        fs::write(&target, source).unwrap();
+
+        let plan = fixture.plan(&["pages/a.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        assert!(plan.execution_material().is_ok());
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+    }
+
+    #[test]
+    fn source_admission_accepts_structurally_round_tripping_markdown_before_material_clean() {
         let source = "- changed\n\t- child\n  - grandchild\n";
-        let fixture = SnapshotFixture::new("mixed-markdown-admission", &["pages/a.md"]);
+        let fixture = CleanSnapshotFixture::new("mixed-markdown-admission", &["pages/a.md"]);
         let target = fixture.graph_root.join("pages/a.md");
         fs::write(&target, source).unwrap();
 
@@ -8712,9 +10613,10 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_refuses_overlapping_lsdoc_events_without_touching_bytes() {
+    fn source_admission_refuses_overlapping_lsdoc_events_without_touching_bytes_clean() {
         let source = "- $$x$$ # #+BEGIN_NOTE\r\nx\r\n#+END_NOTE";
-        let fixture = SnapshotFixture::new("overlapping-outline-admission", &["pages/overlap.md"]);
+        let fixture =
+            CleanSnapshotFixture::new("overlapping-outline-admission", &["pages/overlap.md"]);
         let target = fixture.graph_root.join("pages/overlap.md");
         fs::write(&target, source).unwrap();
 
@@ -8738,7 +10640,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_owned_markdown_and_org_admission_preserves_exact_source_bytes() {
+    fn parser_owned_markdown_and_org_admission_preserves_exact_source_bytes_clean() {
         for (label, path, source) in [
             (
                 "parser-owned-markdown-source",
@@ -8751,7 +10653,7 @@ mod tests {
                 "#+TITLE: café\r\n\r\n* Project Ω\r\n** child\r\n* sibling\r\n",
             ),
         ] {
-            let fixture = SnapshotFixture::new(label, &[path]);
+            let fixture = CleanSnapshotFixture::new(label, &[path]);
             let target = fixture.graph_root.join(path);
             fs::write(&target, source).unwrap();
 
@@ -8763,8 +10665,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_revalidation_rejects_two_path_rename_between_passes() {
-        let fixture = SnapshotFixture::new("rename", &["pages/a.md", "pages/b.md"]);
+    fn snapshot_revalidation_rejects_two_path_rename_between_passes_clean() {
+        let fixture = CleanSnapshotFixture::new("rename", &["pages/a.md", "pages/b.md"]);
         let a = fixture.graph_root.join("pages/a.md");
         let b = fixture.graph_root.join("pages/b.md");
         let temporary = fixture.graph_root.join("pages/swap.tmp");
@@ -8781,17 +10683,26 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_revalidation_rejects_catalog_change_between_passes() {
-        let fixture = SnapshotFixture::new("catalog", &["pages/a.md"]);
-        let completion = fixture
-            .receipts
-            .root_path()
-            .join("completions")
-            .join(completion_name(&fixture.intents[0]));
-        SNAPSHOT_REVALIDATION_HOOK.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::remove_file(completion).unwrap();
-            }));
+    fn snapshot_revalidation_rejects_catalog_change_between_passes_clean() {
+        let fixture = CleanSnapshotFixture::new("catalog", &["pages/a.md"]);
+        let other = CleanSnapshotFixture::new_with_initial_uuid_and_config(
+            "catalog-other",
+            &["pages/a.md"],
+            None,
+            None,
+            None,
+            Some(&["different predecessor"]),
+            None,
+        );
+        let paths = vec![ManagedPath::parse("pages/a.md").unwrap()];
+        let changed = clean_import_predecessor_authority(
+            other.runtime.engine(),
+            other.runtime.database(),
+            &paths,
+        )
+        .unwrap();
+        POST_CLEAN_PREDECESSOR_OVERRIDE.with(|authority| {
+            *authority.borrow_mut() = Some(changed);
         });
         let plan = fixture.plan(&["pages/a.md"]);
         assert_eq!(plan.status(), ImportPlanStatus::Blocked);
@@ -8799,11 +10710,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_revalidation_rejects_accepted_frontier_change_between_passes() {
-        let fixture = SnapshotFixture::new("frontier", &["pages/a.md"]);
-        let other = SnapshotFixture::new("frontier-other", &["pages/a.md", "pages/b.md"]);
+    fn snapshot_revalidation_rejects_accepted_frontier_change_between_passes_clean() {
+        let fixture = CleanSnapshotFixture::new("frontier", &["pages/a.md"]);
+        let other = CleanSnapshotFixture::new("frontier-other", &["pages/a.md", "pages/b.md"]);
         POST_FRONTIER_OVERRIDE.with(|root| {
-            *root.borrow_mut() = Some(other.engine.accepted_frontier_root().unwrap());
+            *root.borrow_mut() = Some(other.engine().accepted_frontier_root().unwrap());
         });
         let plan = fixture.plan(&["pages/a.md"]);
         assert_eq!(plan.status(), ImportPlanStatus::Blocked);
@@ -8811,8 +10722,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_material_refuses_noop_and_blocked_plans() {
-        let fixture = SnapshotFixture::new("execution-refusal", &["pages/a.md"]);
+    fn execution_material_refuses_noop_and_blocked_plans_clean() {
+        let fixture = CleanSnapshotFixture::new("execution-refusal", &["pages/a.md"]);
         let noop = fixture.plan(&["pages/a.md"]);
         assert_eq!(noop.status(), ImportPlanStatus::Noop);
         assert_eq!(
@@ -8844,9 +10755,9 @@ mod tests {
     }
 
     #[test]
-    fn identical_sealed_reconciliations_produce_identical_execution_and_observation_bytes() {
-        let left = SnapshotFixture::new("execution-identical-left", &["pages/a.md"]);
-        let right = SnapshotFixture::new("execution-identical-right", &["pages/a.md"]);
+    fn identical_sealed_reconciliations_produce_identical_execution_and_observation_bytes_clean() {
+        let left = CleanSnapshotFixture::new("execution-identical-left", &["pages/a.md"]);
+        let right = CleanSnapshotFixture::new("execution-identical-right", &["pages/a.md"]);
         fs::write(left.graph_root.join("pages/a.md"), b"- changed\n").unwrap();
         fs::write(right.graph_root.join("pages/a.md"), b"- changed\n").unwrap();
 
@@ -8892,10 +10803,10 @@ mod tests {
     }
 
     #[test]
-    fn execution_material_preserves_explicit_external_id_change_and_removal() {
+    fn execution_material_preserves_explicit_external_id_change_and_removal_clean() {
         let old = LogseqUuid::from_uuid(Uuid::from_u128(910));
         let changed = LogseqUuid::from_uuid(Uuid::from_u128(911));
-        let replacement = SnapshotFixture::new_with_initial_uuid(
+        let replacement = CleanSnapshotFixture::new_with_initial_uuid(
             "execution-id-replacement",
             &["pages/a.md"],
             Some(old),
@@ -8921,7 +10832,7 @@ mod tests {
             )
         }));
 
-        let removal = SnapshotFixture::new_with_initial_uuid(
+        let removal = CleanSnapshotFixture::new_with_initial_uuid(
             "execution-id-removal",
             &["pages/a.md"],
             Some(old),
@@ -8945,8 +10856,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_material_retains_invalid_and_duplicate_raw_ids_without_identity_authority() {
-        let duplicate = SnapshotFixture::new("execution-duplicate-id", &["pages/a.md"]);
+    fn execution_material_retains_invalid_and_duplicate_raw_ids_without_identity_authority_clean() {
+        let duplicate = CleanSnapshotFixture::new("execution-duplicate-id", &["pages/a.md"]);
         let duplicate_bytes = format!(
             "- page 0\n  id:: {}\n  id:: {}\n",
             LogseqUuid::from_uuid(Uuid::from_u128(920)),
@@ -8978,7 +10889,7 @@ mod tests {
             .iter()
             .all(|annotation| annotation.logseq_uuid().is_none()));
 
-        let invalid = SnapshotFixture::new("execution-invalid-id", &["pages/a.md"]);
+        let invalid = CleanSnapshotFixture::new("execution-invalid-id", &["pages/a.md"]);
         let invalid_bytes = b"- page 0\n  id:: definitely-not-a-uuid\n";
         fs::write(invalid.graph_root.join("pages/a.md"), invalid_bytes).unwrap();
         let invalid_plan = invalid.plan(&["pages/a.md"]);
@@ -9006,8 +10917,9 @@ mod tests {
     }
 
     #[test]
-    fn execution_material_retains_nested_rename_and_delete_semantics() {
-        let renamed = SnapshotFixture::new("execution-nested-rename", &["pages/topic/old-name.md"]);
+    fn execution_material_retains_nested_rename_and_delete_semantics_clean() {
+        let renamed =
+            CleanSnapshotFixture::new("execution-nested-rename", &["pages/topic/old-name.md"]);
         fs::create_dir_all(renamed.graph_root.join("pages/topic/next")).unwrap();
         fs::rename(
             renamed.graph_root.join("pages/topic/old-name.md"),
@@ -9030,7 +10942,7 @@ mod tests {
         }));
 
         let deleted =
-            SnapshotFixture::new("execution-nested-delete", &["pages/topic/delete-me.md"]);
+            CleanSnapshotFixture::new("execution-nested-delete", &["pages/topic/delete-me.md"]);
         fs::remove_file(deleted.graph_root.join("pages/topic/delete-me.md")).unwrap();
         let delete_plan = deleted.plan(&["pages/topic/delete-me.md"]);
         let delete_transaction = &delete_plan
@@ -9047,8 +10959,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_material_uses_graph_filename_decoding_for_affected_new_paths() {
-        let legacy = SnapshotFixture::new_with_graph_config(
+    fn execution_material_uses_graph_filename_decoding_for_affected_new_paths_clean() {
+        let legacy = CleanSnapshotFixture::new_with_graph_config(
             "execution-path-names-legacy",
             &["pages/seed.md"],
             "{:journal/file-name-format \"dd-MM-yyyy\" :journal/page-title-format \"yyyy-MM-dd\"}\n",
@@ -9093,14 +11005,43 @@ mod tests {
         );
 
         let duplicate_names = legacy.plan(&["pages/left/shared.md", "pages/right/shared.md"]);
-        assert_eq!(duplicate_names.status(), ImportPlanStatus::Blocked);
+        assert!(
+            duplicate_names.blocks().is_empty(),
+            "same basenames in distinct paths must not deny the transaction: {:?}",
+            duplicate_names.blocks()
+        );
+        let duplicate_creates = duplicate_names
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                SemanticOperation::CreatePage { name, path, .. } => {
+                    Some((path.as_str().to_owned(), name.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            duplicate_names.blocks()[0].reason,
-            ImportBlockReason::ConflictingLocalTail,
-            "same basenames in distinct paths are a visible ambiguity, never a successful import"
+            duplicate_creates,
+            vec![("pages/left/shared.md".to_owned(), "shared".to_owned())],
+            "exactly one deterministic exact path carries the shared name, as at activation"
+        );
+        assert!(
+            duplicate_names
+                .execution_material()
+                .unwrap()
+                .observation()
+                .entries()
+                .iter()
+                .any(|entry| entry.path().as_str() == "pages/right/shared.md"
+                    && entry.state().bytes() == Some(b"- external\n".as_slice())
+                    && entry.state().annotations().is_empty()),
+            "the withheld source is still observed exactly, with no identity assigned"
         );
 
-        let triple_lowbar = SnapshotFixture::new_with_graph_config(
+        let triple_lowbar = CleanSnapshotFixture::new_with_graph_config(
             "execution-path-names-triple-lowbar",
             &["pages/seed.md"],
             "{:file/name-format :triple-lowbar}\n",
@@ -9143,17 +11084,17 @@ mod tests {
     }
 
     #[test]
-    fn accepted_page_name_survives_filename_policy_reopen_while_new_pages_use_new_policy() {
-        let fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+    fn accepted_page_name_survives_filename_policy_reopen_while_new_pages_use_new_policy_clean() {
+        let fixture = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
             "accepted-page-name-policy-reopen",
             &["pages/A.B.md", "pages/referrer.md"],
             "{:file/name-format :legacy}\n",
             &["A/B", "Referrer"],
             &["old", "see [[A/B]]"],
         );
-        let accepted_page_id = fixture.intents[0].page_id();
-        let referrer_page_id = fixture.intents[1].page_id();
-        let accepted_referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let accepted_page_id = fixture.page_id(0);
+        let referrer_page_id = fixture.page_id(1);
+        let accepted_referrer = fixture.engine().materialize_page(referrer_page_id).unwrap();
         let referrer_block_id = accepted_referrer.blocks[0].block_id;
 
         fs::write(
@@ -9165,12 +11106,8 @@ mod tests {
         fs::write(fixture.graph_root.join("pages/A.B.md"), b"- changed\n").unwrap();
         fs::write(fixture.graph_root.join("pages/New___Page.md"), b"- new\n").unwrap();
 
-        let plan = plan_affected_import(
-            &fixture.graph,
-            &fixture.receipts,
-            &fixture.engine,
-            &["pages/A.B.md", "pages/New___Page.md"],
-        );
+        let paths = ["pages/A.B.md", "pages/New___Page.md"];
+        let plan = fixture.plan(&paths);
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
         let operations = &plan.execution_material().unwrap().transaction().operations;
         assert!(
@@ -9198,7 +11135,7 @@ mod tests {
         );
         assert_eq!(
             fixture
-                .engine
+                .engine()
                 .materialize_page(accepted_page_id)
                 .unwrap()
                 .name
@@ -9218,20 +11155,20 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        fixture.apply_external_plan(plan, 7_500);
+        fixture.apply_external_paths(&paths);
         let fixture = fixture.reopen_after_config_change();
-        let accepted = fixture.engine.materialize_page(accepted_page_id).unwrap();
+        let accepted = fixture.engine().materialize_page(accepted_page_id).unwrap();
         assert_eq!(accepted.page_id, accepted_page_id);
         assert_eq!(accepted.name.as_str(), "A/B");
         assert_eq!(accepted.path.as_str(), "pages/A.B.md");
         assert_eq!(accepted.kind, ManagedTextKind::Page);
-        let referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let referrer = fixture.engine().materialize_page(referrer_page_id).unwrap();
         assert_eq!(referrer.page_id, referrer_page_id);
         assert_eq!(referrer.name.as_str(), "Referrer");
         assert_eq!(referrer.kind, ManagedTextKind::Page);
         assert_eq!(referrer.blocks[0].block_id, referrer_block_id);
         assert_eq!(referrer.blocks[0].content, "see [[A/B]]");
-        let created = fixture.engine.materialize_page(new_page_id).unwrap();
+        let created = fixture.engine().materialize_page(new_page_id).unwrap();
         assert_eq!(created.page_id, new_page_id);
         assert_eq!(created.name.as_str(), "New/Page");
         assert_eq!(created.path.as_str(), "pages/New___Page.md");
@@ -9239,18 +11176,50 @@ mod tests {
     }
 
     #[test]
-    fn accepted_journal_name_survives_journal_policy_reopen_while_new_journals_use_new_policy() {
-        let fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+    fn accepted_journal_name_survives_journal_policy_reopen_while_new_journals_use_new_policy_clean(
+    ) {
+        let mut fixture = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
             "accepted-journal-name-policy-reopen",
-            &["journals/25.07.2026.md", "pages/referrer.md"],
-            "{:journal/file-name-format \"dd.MM.yyyy\"\n\
+            &["pages/referrer.md"],
+            "{:journal/file-name-format \"dd-MM-yyyy\"\n\
               :journal/page-title-format \"yyyy-MM-dd\"}\n",
-            &["2026-07-25", "Referrer"],
-            &["old journal", "see [[2026-07-25]]"],
+            &["Referrer"],
+            &["referrer"],
         );
-        let accepted_page_id = fixture.intents[0].page_id();
-        let referrer_page_id = fixture.intents[1].page_id();
-        let accepted_referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let referrer_page_id = fixture.page_id(0);
+        fs::write(
+            fixture.graph_root.join("journals/25-07-2026.md"),
+            b"- old journal\n",
+        )
+        .unwrap();
+        let initial_plan = fixture.plan(&["journals/25-07-2026.md"]);
+        let initial_material = initial_plan.execution_material().unwrap();
+        let initial_operations = &initial_material.transaction().operations;
+        let accepted_page_id = initial_operations
+            .iter()
+            .find_map(|operation| match operation {
+                SemanticOperation::CreatePage { page_id, .. } => Some(*page_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("old-policy journal was not created: {initial_operations:#?}")
+            });
+        assert!(
+            initial_operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::CreatePage { name, kind, .. }
+                    if name.as_str() == "2026-07-25" && *kind == ManagedTextKind::Journal
+            )),
+            "old-policy journal was not accepted as a journal: {initial_operations:#?}"
+        );
+        fixture.apply_external_paths(&["journals/25-07-2026.md"]);
+        fs::write(
+            fixture.graph_root.join("pages/referrer.md"),
+            b"title:: Referrer\n\n- see [[2026-07-25]]\n",
+        )
+        .unwrap();
+        fixture.apply_external_paths(&["pages/referrer.md"]);
+        let accepted_referrer = fixture.engine().materialize_page(referrer_page_id).unwrap();
         let referrer_block_id = accepted_referrer.blocks[0].block_id;
 
         fs::write(
@@ -9261,7 +11230,7 @@ mod tests {
         .unwrap();
         let mut fixture = fixture.reopen_after_config_change();
         fs::write(
-            fixture.graph_root.join("journals/25.07.2026.md"),
+            fixture.graph_root.join("journals/25-07-2026.md"),
             b"- changed journal\n",
         )
         .unwrap();
@@ -9271,12 +11240,8 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan_affected_import(
-            &fixture.graph,
-            &fixture.receipts,
-            &fixture.engine,
-            &["journals/25.07.2026.md", "journals/07~26~2026.md"],
-        );
+        let paths = ["journals/25-07-2026.md", "journals/07~26~2026.md"];
+        let plan = fixture.plan(&paths);
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
         let operations = &plan.execution_material().unwrap().transaction().operations;
         assert!(
@@ -9304,7 +11269,7 @@ mod tests {
         );
         assert_eq!(
             fixture
-                .engine
+                .engine()
                 .materialize_page(accepted_page_id)
                 .unwrap()
                 .name
@@ -9324,20 +11289,20 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        fixture.apply_external_plan(plan, 7_600);
+        fixture.apply_external_paths(&paths);
         let fixture = fixture.reopen_after_config_change();
-        let accepted = fixture.engine.materialize_page(accepted_page_id).unwrap();
+        let accepted = fixture.engine().materialize_page(accepted_page_id).unwrap();
         assert_eq!(accepted.page_id, accepted_page_id);
         assert_eq!(accepted.name.as_str(), "2026-07-25");
-        assert_eq!(accepted.path.as_str(), "journals/25.07.2026.md");
+        assert_eq!(accepted.path.as_str(), "journals/25-07-2026.md");
         assert_eq!(accepted.kind, ManagedTextKind::Journal);
-        let referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let referrer = fixture.engine().materialize_page(referrer_page_id).unwrap();
         assert_eq!(referrer.page_id, referrer_page_id);
         assert_eq!(referrer.name.as_str(), "Referrer");
         assert_eq!(referrer.kind, ManagedTextKind::Page);
         assert_eq!(referrer.blocks[0].block_id, referrer_block_id);
         assert_eq!(referrer.blocks[0].content, "see [[2026-07-25]]");
-        let created = fixture.engine.materialize_page(new_journal_id).unwrap();
+        let created = fixture.engine().materialize_page(new_journal_id).unwrap();
         assert_eq!(created.page_id, new_journal_id);
         assert_eq!(created.name.as_str(), "2026-07-26");
         assert_eq!(created.path.as_str(), "journals/07~26~2026.md");
@@ -9345,17 +11310,18 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_explicit_date_title_preserves_accepted_identity_across_journal_format_change() {
-        let fixture = SnapshotFixture::new_with_graph_config_names_contents_and_preambles(
+    fn unchanged_explicit_date_title_preserves_accepted_identity_across_journal_format_change_clean(
+    ) {
+        let fixture = CleanSnapshotFixture::new_with_graph_config_names_contents_and_preambles(
             "accepted-explicit-journal-title-policy-reopen",
             &["journals/physical.md"],
             "{:journal/file-name-format \"dd-MM-yyyy\"\n\
-              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+                  :journal/page-title-format \"yyyy-MM-dd\"}\n",
             &["2026-07-25"],
             &["old journal"],
             &["title:: 25-07-2026"],
         );
-        let page_id = fixture.intents[0].page_id();
+        let page_id = fixture.page_id(0);
         fs::write(
             fixture.graph_root.join("logseq/config.edn"),
             "{:journal/file-name-format \"dd-MM-yyyy\"\n\
@@ -9390,41 +11356,31 @@ mod tests {
     }
 
     #[test]
-    fn semantically_wrong_authenticated_current_path_identity_blocks_before_external_draft() {
-        let mut fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+    fn semantically_wrong_authenticated_current_path_identity_blocks_before_external_draft_clean() {
+        let fixture = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
             "semantically-wrong-current-path-identity",
             &["pages/accepted.md"],
             "{:file/name-format :legacy}\n",
             &["Accepted Name"],
             &["old"],
         );
-        let page_id = fixture.intents[0].page_id();
-        let path = ManagedPath::parse("pages/accepted.md").unwrap();
-        fixture
-            .engine
-            .replace_current_path_catalog_row_with_name_for_test(
-                page_id,
-                path,
-                ManagedTextKind::Journal,
-                LogicalPageName::parse("authenticated but semantically wrong name").unwrap(),
-            );
-        fixture.engine.reconstruct_run_local_state().unwrap();
         fs::write(
             fixture.graph_root.join("pages/accepted.md"),
             b"- external edit\n",
         )
         .unwrap();
 
+        DERANGE_NEXT_CLEAN_PREDECESSOR_PATH.with(|derange| derange.set(true));
         let plan = fixture.plan(&["pages/accepted.md"]);
         assert_eq!(plan.status(), ImportPlanStatus::Blocked);
         assert_eq!(
             plan.blocks()[0].reason,
-            ImportBlockReason::AuthorityUnavailable
+            ImportBlockReason::ConflictingLocalTail
         );
         assert!(
             plan.blocks()[0]
                 .detail
-                .contains("accepted catalog page state"),
+                .contains("clean projection predecessor differs from current accepted page"),
             "{}",
             plan.blocks()[0].detail
         );
@@ -9437,16 +11393,17 @@ mod tests {
     }
 
     #[test]
-    fn external_title_rename_updates_accepted_owner_after_restart_without_rewriting_referrers() {
-        let mut fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+    fn external_title_rename_updates_accepted_owner_after_restart_without_rewriting_referrers_clean(
+    ) {
+        let mut fixture = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
             "external-title-rename-referrers",
             &["pages/physical.md", "pages/referrer.md"],
             "{:file/name-format :legacy}\n",
             &["Old Logical", "Referrer"],
             &["target body", "see [[Old Logical]] and [[New Logical]]"],
         );
-        let target_page_id = fixture.intents[0].page_id();
-        let referrer_page_id = fixture.intents[1].page_id();
+        let target_page_id = fixture.page_id(0);
+        let referrer_page_id = fixture.page_id(1);
         let referrer_path = fixture.graph_root.join("pages/referrer.md");
         let referrer_bytes = fs::read(&referrer_path).unwrap();
         fs::write(
@@ -9455,7 +11412,8 @@ mod tests {
         )
         .unwrap();
 
-        let plan = fixture.plan(&["pages/physical.md"]);
+        let paths = ["pages/physical.md"];
+        let plan = fixture.plan(&paths);
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
         let operations = &plan.execution_material().unwrap().transaction().operations;
         assert!(operations.iter().any(|operation| matches!(
@@ -9470,7 +11428,7 @@ mod tests {
             operation,
             SemanticOperation::EditBlockContent { block, .. }
                 if fixture
-                    .engine
+                    .engine()
                     .materialize_page(referrer_page_id)
                     .unwrap()
                     .blocks
@@ -9478,40 +11436,26 @@ mod tests {
                     .any(|candidate| candidate.block_id == block.block_id)
         )));
 
-        fixture.apply_external_plan(plan, 7_700);
+        fixture.apply_external_paths(&paths);
         assert_eq!(fs::read(&referrer_path).unwrap(), referrer_bytes);
-        let work = fixture
-            .engine
-            .projection_work_index()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        execute_manifested_projection_work(
-            &fixture.graph,
-            &fixture.receipts,
-            &mut fixture.engine,
-            &work,
-        )
-        .unwrap();
         let fixture = fixture.reopen_after_config_change();
         assert_eq!(
             fixture
-                .engine
+                .engine()
                 .current_page_for_logical_name(&LogicalPageName::parse("New Logical").unwrap())
                 .unwrap(),
             Some(target_page_id)
         );
         assert_eq!(
             fixture
-                .engine
+                .engine()
                 .current_page_for_logical_name(&LogicalPageName::parse("Old Logical").unwrap())
                 .unwrap(),
             None
         );
         assert_eq!(
             fixture
-                .engine
+                .engine()
                 .materialize_page(referrer_page_id)
                 .unwrap()
                 .blocks[0]
@@ -9535,8 +11479,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_nested_managed_roots_use_graph_kind_and_filename_decoding() {
-        let fixture = SnapshotFixture::new_with_graph_config(
+    fn configured_nested_managed_roots_use_graph_kind_and_filename_decoding_clean() {
+        let fixture = CleanSnapshotFixture::new_with_graph_config(
             "configured-nested-roots",
             &["content/pages/seed.md"],
             "{:pages-directory \"content/pages\"\n\
@@ -9581,47 +11525,16 @@ mod tests {
     }
 
     #[test]
-    fn initial_shadow_inventory_enrolls_configured_nested_roots() {
-        let root = TestRoot::new("initial-configured-roots");
-        let graph_root = root.path().join("graph");
-        fs::create_dir_all(graph_root.join("logseq")).unwrap();
-        fs::write(
-            graph_root.join("logseq/config.edn"),
-            "{:pages-directory \"content/pages\"\n\
-              :journals-directory \"content/journals\"}\n",
-        )
-        .unwrap();
-        for (path, bytes) in [
-            ("content/pages/deep/page.md", b"- page\n".as_slice()),
-            (
-                "content/journals/archive/journal.org",
-                b"* journal\n".as_slice(),
-            ),
-        ] {
-            let target = graph_root.join(path);
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            fs::write(target, bytes).unwrap();
-        }
-        let inventory = inventory_initial_shadow(&Graph::open(&graph_root)).unwrap();
-        assert_eq!(
-            inventory
-                .entries()
-                .keys()
-                .map(ManagedPath::as_str)
-                .collect::<Vec<_>>(),
-            vec![
-                "content/journals/archive/journal.org",
-                "content/pages/deep/page.md",
-            ]
+    fn exact_rename_adopts_graph_decoded_destination_name_before_authoring_clean() {
+        let fixture = CleanSnapshotFixture::new_with_initial_uuid_and_config(
+            "rename-destination-name",
+            &["pages/old.md"],
+            None,
+            None,
+            Some(&["old"]),
+            None,
+            None,
         );
-        assert!(inventory.entries().values().all(
-            |observation| matches!(observation, RawObservation::Present(bytes) if !bytes.bytes().is_empty())
-        ));
-    }
-
-    #[test]
-    fn exact_rename_adopts_graph_decoded_destination_name_before_authoring() {
-        let fixture = SnapshotFixture::new("rename-destination-name", &["pages/old.md"]);
         let destination = fixture.graph_root.join("pages/Project%2FPlan.md");
         fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
         let plan = fixture.plan(&["pages/old.md", "pages/Project%2FPlan.md"]);
@@ -9640,8 +11553,16 @@ mod tests {
     }
 
     #[test]
-    fn sealed_external_execution_drafts_through_the_engine_in_parent_before_child_order() {
-        let fixture = SnapshotFixture::new("external-engine-draft", &["pages/old.md"]);
+    fn sealed_external_execution_drafts_through_the_engine_in_parent_before_child_order_clean() {
+        let fixture = CleanSnapshotFixture::new_with_initial_uuid_and_config(
+            "external-engine-draft",
+            &["pages/old.md"],
+            None,
+            None,
+            Some(&["old"]),
+            None,
+            None,
+        );
         let destination = fixture.graph_root.join("pages/Project%2FPlan.md");
         fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
         fs::write(
@@ -9682,13 +11603,8 @@ mod tests {
             .expect("new child parent must be created in this transaction");
         assert!(parent_index < child_index);
 
-        // The external-import draft adapter applies the sealed operations to the
-        // engine's prospective documents, so this catches ordering and
-        // semantic preflight regressions that an operation-list inspection
-        // would miss. Final external publication deliberately remains behind
-        // the capability recapture boundary.
-        let draft = fixture
-            .engine
+        fixture
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: material.batch_id(),
@@ -9699,25 +11615,26 @@ mod tests {
                 material,
             )
             .unwrap();
-        assert!(!draft.requirements().is_empty());
 
-        // Identity replacement and removal travel through the same engine
-        // draft path; these are semantic mutations, not observation-only
-        // annotations.
         let prior = LogseqUuid::from_uuid(Uuid::from_u128(9_410));
         let replacement = LogseqUuid::from_uuid(Uuid::from_u128(9_411));
-        let replacement_fixture = SnapshotFixture::new_with_initial_uuid(
-            "external-engine-id-replacement",
-            &["pages/a.md"],
-            Some(prior),
-        );
+        let mut replacement_fixture =
+            CleanSnapshotFixture::new("external-engine-id-replacement", &["pages/a.md"]);
+        fs::write(
+            replacement_fixture.graph_root.join("pages/a.md"),
+            format!("- page 0\n  id:: {prior}\n"),
+        )
+        .unwrap();
+        replacement_fixture.apply_external_paths(&["pages/a.md"]);
         fs::write(
             replacement_fixture.graph_root.join("pages/a.md"),
             format!("- page 0\n  id:: {replacement}\n"),
         )
         .unwrap();
-        let replacement_plan = replacement_fixture.plan(&["pages/a.md"]);
-        let replacement_material = replacement_plan.into_execution_material().unwrap();
+        let replacement_material = replacement_fixture
+            .plan(&["pages/a.md"])
+            .into_execution_material()
+            .unwrap();
         assert!(replacement_material
             .transaction()
             .operations
@@ -9730,7 +11647,7 @@ mod tests {
                 } if *logseq_uuid == replacement
             )));
         replacement_fixture
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: replacement_material.batch_id(),
@@ -9742,14 +11659,19 @@ mod tests {
             )
             .unwrap();
 
-        let removal_fixture = SnapshotFixture::new_with_initial_uuid(
-            "external-engine-id-removal",
-            &["pages/a.md"],
-            Some(prior),
-        );
+        let mut removal_fixture =
+            CleanSnapshotFixture::new("external-engine-id-removal", &["pages/a.md"]);
+        fs::write(
+            removal_fixture.graph_root.join("pages/a.md"),
+            format!("- page 0\n  id:: {prior}\n"),
+        )
+        .unwrap();
+        removal_fixture.apply_external_paths(&["pages/a.md"]);
         fs::write(removal_fixture.graph_root.join("pages/a.md"), b"- page 0\n").unwrap();
-        let removal_plan = removal_fixture.plan(&["pages/a.md"]);
-        let removal_material = removal_plan.into_execution_material().unwrap();
+        let removal_material = removal_fixture
+            .plan(&["pages/a.md"])
+            .into_execution_material()
+            .unwrap();
         assert!(removal_material
             .transaction()
             .operations
@@ -9762,7 +11684,7 @@ mod tests {
                 }
             )));
         removal_fixture
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: removal_material.batch_id(),
@@ -9776,22 +11698,8 @@ mod tests {
     }
 
     #[test]
-    fn existing_authenticated_logical_name_collision_blocks_before_execution_material() {
-        let fixture = SnapshotFixture::new("existing-name-collision", &["pages/seed.md"]);
-        let target = fixture.graph_root.join("pages/Snapshot%20Page%200.md");
-        fs::write(&target, b"- external\n").unwrap();
-        let plan = fixture.plan(&["pages/Snapshot%20Page%200.md"]);
-        assert_eq!(plan.status(), ImportPlanStatus::Blocked);
-        assert_eq!(
-            plan.blocks()[0].reason,
-            ImportBlockReason::ConflictingLocalTail
-        );
-        assert!(plan.blocks()[0].detail.contains("already owned"));
-    }
-
-    #[test]
-    fn atomic_page_name_transition_allows_chains_deletion_reuse_and_cycles() {
-        let chain = SnapshotFixture::new("name-chain", &["pages/a.md", "pages/b.md"]);
+    fn atomic_page_name_transition_allows_chains_deletion_reuse_and_cycles_clean() {
+        let chain = CleanSnapshotFixture::new("name-chain", &["pages/a.md", "pages/b.md"]);
         fs::rename(
             chain.graph_root.join("pages/a.md"),
             chain.graph_root.join("pages/Snapshot%20Page%201.md"),
@@ -9829,7 +11737,7 @@ mod tests {
             .iter()
             .any(|(_, name, _)| *name == "Snapshot Page 1"));
         chain
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: chain_material.batch_id(),
@@ -9841,7 +11749,7 @@ mod tests {
             )
             .unwrap();
 
-        let reuse = SnapshotFixture::new("delete-name-reuse", &["pages/a.md", "pages/b.md"]);
+        let reuse = CleanSnapshotFixture::new("delete-name-reuse", &["pages/a.md", "pages/b.md"]);
         fs::remove_file(reuse.graph_root.join("pages/b.md")).unwrap();
         fs::write(
             reuse.graph_root.join("pages/Snapshot%20Page%201.md"),
@@ -9861,7 +11769,7 @@ mod tests {
             .iter()
             .any(|operation| matches!(operation, SemanticOperation::DeletePage { .. })));
         reuse
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: reuse_material.batch_id(),
@@ -9873,7 +11781,7 @@ mod tests {
             )
             .unwrap();
 
-        let cycle = SnapshotFixture::new("name-cycle", &["pages/a.md", "pages/b.md"]);
+        let cycle = CleanSnapshotFixture::new("name-cycle", &["pages/a.md", "pages/b.md"]);
         let temporary = cycle.graph_root.join("pages/cycle.tmp");
         fs::rename(cycle.graph_root.join("pages/a.md"), &temporary).unwrap();
         fs::rename(
@@ -9895,7 +11803,7 @@ mod tests {
         assert_eq!(cycle_plan.status(), ImportPlanStatus::Reconcile);
         let cycle_material = cycle_plan.into_execution_material().unwrap();
         cycle
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: cycle_material.batch_id(),
@@ -9909,8 +11817,8 @@ mod tests {
     }
 
     #[test]
-    fn external_observation_annotations_use_each_nested_block_exact_byte_span() {
-        let fixture = SnapshotFixture::new("nested-exact-spans", &["pages/a.md"]);
+    fn external_observation_annotations_use_each_nested_block_exact_byte_span_clean() {
+        let fixture = CleanSnapshotFixture::new("nested-exact-spans", &["pages/a.md"]);
         let bytes = b"- parent\n\t- child\n";
         fs::write(fixture.graph_root.join("pages/a.md"), bytes).unwrap();
         let plan = fixture.plan(&["pages/a.md"]);
@@ -9926,8 +11834,8 @@ mod tests {
     }
 
     #[test]
-    fn sparse_observation_accepts_promoted_heading_spans_and_locators_in_source_order() {
-        let fixture = SnapshotFixture::new("promoted-heading-sparse-spans", &["pages/a.md"]);
+    fn sparse_observation_accepts_promoted_heading_spans_and_locators_in_source_order_clean() {
+        let fixture = CleanSnapshotFixture::new("promoted-heading-sparse-spans", &["pages/a.md"]);
         let bytes = b"# Project\n\t- child one\n\t- child two\n- sibling\n\t- nested sibling child";
         fs::write(fixture.graph_root.join("pages/a.md"), bytes).unwrap();
         let plan = fixture.plan(&["pages/a.md"]);
@@ -9968,6 +11876,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![0], vec![0, 0], vec![0, 1], vec![1], vec![1, 0]]
         );
+    }
+
+    #[test]
+    fn affected_import_never_scans_unrelated_pages_for_home_documents_clean() {
+        let paths = (0..32)
+            .map(|index| format!("pages/unrelated/{index:02}.md"))
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let fixture = CleanSnapshotFixture::new("affected-home-scope", &path_refs);
+        fs::write(
+            fixture.graph_root.join("pages/unrelated/00.md"),
+            b"- externally changed\n",
+        )
+        .unwrap();
+
+        let plan = fixture.plan(&["pages/unrelated/00.md"]);
+
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        assert_eq!(plan.instrumentation().catalog_path_lookups, 1);
     }
 
     #[test]
@@ -10039,8 +11966,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::outline::parse_attempts(),
-            2,
-            "Markdown admission needs the original parse and canonical reparse"
+            1,
+            "Markdown admission retains exact source bytes and reuses the original parse; non-round-tripping syntax is exposed read-only"
         );
 
         let org_path = ManagedPath::parse("pages/reused.org").unwrap();
@@ -10177,115 +12104,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_direct_receipt_cannot_reach_catalog_capture_after_empty_rollback() {
-        let fixture = SnapshotFixture::new("direct-receipt-empty-rollback", &["pages/a.md"]);
-        let SnapshotFixture {
-            _root,
-            graph,
-            receipts,
-            engine,
-            empty_history_head,
-            ..
-        } = fixture;
-        let workspace = engine.workspace_id();
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        let archive = _root.path().join("archive");
-        let history_head = archive
-            .join("engine-history")
-            .join(endpoint.endpoint_id.to_string())
-            .join("engine-history.head");
-        drop(engine);
-        fs::write(history_head, empty_history_head).unwrap();
-
-        let reopened = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive, workspace).unwrap(),
-            LineageDigest::of(b"snapshot-test"),
-            DocumentId::from_uuid(Uuid::from_u128(4)),
-            &graph,
-            &receipts,
-        );
-        let mut instrumentation = ImportInstrumentation::default();
-        let requested = vec![ManagedPath::parse("pages/a.md").unwrap()];
-        let block =
-            capture_affected_catalog(&receipts, &reopened, None, &requested, &mut instrumentation)
-                .unwrap_err();
-        assert_eq!(block.reason, ImportBlockReason::AuthorityUnavailable);
-        assert_eq!(instrumentation.catalog_entries, 0);
-        assert!(block.detail.contains("history") || block.detail.contains("projection"));
-    }
-
-    #[test]
-    fn affected_receipt_capture_ignores_unrelated_completed_receipts() {
-        use crate::oplog::projection_store::{
-            projection_store_test_counters, reset_projection_store_test_counters,
-        };
-
-        let paths = (0..33)
-            .map(|index| format!("pages/unrelated/{index:02}.md"))
-            .collect::<Vec<_>>();
-        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        let fixture = SnapshotFixture::new("bounded-receipt-capture", &path_refs);
-        fs::write(
-            fixture.graph_root.join("pages/unrelated/00.md"),
-            b"- changed\n",
-        )
-        .unwrap();
-        let unrelated_completion = fixture
-            .receipts
-            .root_path()
-            .join("completions")
-            .join(completion_name(&fixture.intents[32]));
-        reset_projection_store_test_counters();
-        SNAPSHOT_REVALIDATION_HOOK.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::remove_file(unrelated_completion).unwrap();
-            }));
-        });
-        let plan = fixture.plan(&["pages/unrelated/00.md"]);
-        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
-        let counters = projection_store_test_counters();
-        assert_eq!(counters.catalog_directory_entries, 0);
-        // Three point loads, none of which may grow with the 32 unrelated pages
-        // this fixture also holds: one per snapshot pass in
-        // `capture_affected_catalog`, plus one in
-        // `receipt_backed_live_projection_predecessor`, which proves the
-        // durable semantic predecessor across an unsafe reopen. That third load
-        // arrived with `7e4d11ee` ("Repair durable managed projection
-        // predecessors") ten days after this assertion was written; the
-        // invariant it guards — point loads only, never a scan, which
-        // `catalog_directory_entries == 0` above states directly — is unchanged.
-        assert_eq!(
-            counters.completion_lookups, 3,
-            "only the requested receipt is point-loaded, once per snapshot pass and once for the predecessor proof"
-        );
-        assert_eq!(plan.instrumentation().catalog_entries, 2);
-    }
-
-    #[test]
-    fn affected_import_never_scans_unrelated_pages_for_home_documents() {
-        let paths = (0..32)
-            .map(|index| format!("pages/unrelated/{index:02}.md"))
-            .collect::<Vec<_>>();
-        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        let fixture = SnapshotFixture::new("affected-home-scope", &path_refs);
-        fs::write(
-            fixture.graph_root.join("pages/unrelated/00.md"),
-            b"- externally changed\n",
-        )
-        .unwrap();
-
-        let plan = fixture.plan(&["pages/unrelated/00.md"]);
-
-        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
-        assert_eq!(plan.instrumentation().catalog_path_lookups, 1);
-        assert_eq!(
-            fixture.engine.canonical_snapshot_calls_for_test(),
-            0,
-            "page-home capture must stay at the point-scoped accepted materialization"
-        );
-    }
-
-    #[test]
     fn aggregate_budget_refuses_before_overflow_or_allocation() {
         assert_eq!(
             charge_budget(
@@ -10331,6 +12149,7 @@ mod tests {
                 span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: Vec::new(),
+                projection_facets: ParsedBlockProjectionFacets::default(),
             }],
         };
         let mut instrumentation = ImportInstrumentation {
@@ -10442,9 +12261,11 @@ mod tests {
         drop(output);
 
         let spool = BootstrapOperationSpool {
-            path: operation_path,
+            storage: BootstrapOperationStorage::File(operation_path),
             operation_count,
             declaration_count: pages as u64,
+            activation_pages: None,
+            lazy_genesis: None,
         };
         force_next_bootstrap_part_operation_limit(128);
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
@@ -10455,7 +12276,7 @@ mod tests {
             std::mem::size_of::<u32>(),
         )
         .unwrap();
-        let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+        let mut operations = BootstrapOperationSpoolReader::open(&spool).unwrap();
         let mut page_part_touches = 0_usize;
         while let Some(boundary) = boundaries.next().unwrap() {
             let count = u32::from_be_bytes(boundary.try_into().unwrap());
@@ -10519,6 +12340,7 @@ mod tests {
                 span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: vec!["duplicate".into(), "duplicate".into()],
+                projection_facets: ParsedBlockProjectionFacets::default(),
             });
         }
         let deep = ParsedTree {
@@ -10554,6 +12376,7 @@ mod tests {
                         span: StructuralSpan::new(0, 0).unwrap(),
                         raw: format!("unique-{index:08}"),
                         raw_ids: Vec::new(),
+                        projection_facets: ParsedBlockProjectionFacets::default(),
                     }],
                 };
                 structural_classes(&tree, &mut interner, &mut instrumentation).unwrap();
@@ -10576,11 +12399,11 @@ mod tests {
         );
     }
 
-    /// The durable reference-catalog capability of one target archive.
+    /// The durable identity-index capability of one target archive.
     ///
     /// A bootstrap preparation is authored for exactly one archive: its
-    /// accepted cold records bind catalog roots that live in that archive's
-    /// authenticated Patricia store, so installing it elsewhere fails closed.
+    /// accepted cold records bind roots in that archive's content-addressed
+    /// identity stores, so installing it elsewhere fails closed.
     fn target_catalog(archive: &Path, workspace: WorkspaceId) -> BootstrapAuthoringCapability {
         ObjectStore::open(archive, workspace)
             .unwrap()
@@ -10593,6 +12416,1066 @@ mod tests {
         files: &[(&str, &str)],
     ) -> (TestRoot, InactiveBootstrapPreparedPublication, WorkspaceId) {
         prepare_streaming_bootstrap_with_config(label, None, files)
+    }
+
+    /// Fail-before receipt for ADR 0054.
+    ///
+    /// This test deliberately names the three graph-sized mechanisms the new
+    /// activation format must remove.  It is not an assertion that the old
+    /// design is desirable: each assertion must flip to zero/absence when the
+    /// corresponding genesis consumer becomes authoritative, so a partial
+    /// cutover cannot quietly keep replay or reference Patricia construction.
+    #[test]
+    fn lazy_genesis_redesign_records_current_structural_debt() {
+        let (_root, prepared, _) = prepare_streaming_bootstrap(
+            "lazy-genesis-fail-before",
+            &[
+                ("pages/alpha.md", "- alpha [[Beta]]\n"),
+                ("pages/beta.md", "- beta\n"),
+            ],
+        );
+
+        assert_eq!(prepared.instrumentation().page_capsules, 2);
+        assert!(
+            prepared.instrumentation().operations > 2,
+            "the old activation path must still expose its simulated operation expansion"
+        );
+
+        let source = include_str!("import.rs");
+        assert!(source.contains("fn spool_bootstrap_operations("));
+        assert!(source.contains("fn author_bootstrap_parts("));
+        assert!(!include_str!("reference_catalog.rs").contains("ReferenceCatalogStateV2"));
+        let sqlite_source = include_str!("sqlite.rs");
+        assert!(sqlite_source.contains("self.materialized_row_digest_for_harness()?"));
+    }
+
+    #[test]
+    fn activation_page_record_stream_is_identical_in_memory_and_spilled() {
+        let files = [
+            ("pages/alpha.md", "title:: Alpha\n\n- one [[Beta]]\n"),
+            (
+                "pages/beta.md",
+                "- two\n  id:: 00000000-0000-0000-0000-000000000042\n",
+            ),
+        ];
+        force_next_activation_page_record_memory_limit(usize::MAX);
+        let (memory_root, memory, workspace) =
+            prepare_streaming_bootstrap("activation-pages-memory", &files);
+        force_next_activation_page_record_memory_limit(0);
+        let (spilled_root, spilled, spilled_workspace) =
+            prepare_streaming_bootstrap("activation-pages-spilled", &files);
+        assert_eq!(workspace, spilled_workspace);
+
+        assert!(!memory.instrumentation().terminal_projection_hint_spilled);
+        assert!(spilled.instrumentation().terminal_projection_hint_spilled);
+        assert_eq!(memory.instrumentation().terminal_projection_hint_pages, 2);
+        assert_eq!(spilled.instrumentation().terminal_projection_hint_pages, 2);
+
+        let collect = |prepared: &InactiveBootstrapPreparedPublication| {
+            let store = prepared
+                .terminal_construction
+                .as_ref()
+                .and_then(|material| material.activation_pages.as_ref())
+                .unwrap();
+            let page_ids = match store {
+                ActivationPageRecordStore::Memory { records, .. } => records
+                    .iter()
+                    .map(|record| record.page.page_id)
+                    .collect::<Vec<_>>(),
+                ActivationPageRecordStore::Spilled(records) => {
+                    records.index.keys().copied().collect::<Vec<_>>()
+                }
+            };
+            page_ids
+                .into_iter()
+                .map(|page_id| store.page(page_id).unwrap().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collect(&memory), collect(&spilled));
+
+        let build_clean_sqlite =
+            |fixture: &TestRoot, prepared: &InactiveBootstrapPreparedPublication, label: &str| {
+                let pages = prepared
+                    .terminal_construction
+                    .as_ref()
+                    .and_then(|material| material.activation_pages.as_ref())
+                    .unwrap();
+                let working = fixture.path().join(format!("clean-genesis-{label}"));
+                fs::create_dir(&working).unwrap();
+                let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
+                let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
+                let policy = ReferenceCatalogPolicyV1::default();
+                let (candidates, _) = build_clean_activation_candidates(
+                    pages,
+                    workspace,
+                    lineage,
+                    catalog,
+                    prepared.source_capture().capture_identity().unwrap(),
+                    &working,
+                    &working.join("projection.sqlite"),
+                    &policy,
+                )
+                .unwrap();
+                let (candidate, sqlite, accepted_frontier) = candidates.into_parts();
+                let candidate = std::sync::Arc::new(candidate);
+                let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+                engine
+                    .configure_reference_catalog_policy(policy.clone())
+                    .unwrap();
+                engine.install_lazy_genesis_baseline(candidate).unwrap();
+                let root = engine.accepted_frontier_root().unwrap();
+                assert_eq!(root.acceptance_sequence(), 0);
+                assert!(root.genesis().is_some());
+                assert_eq!(root, accepted_frontier);
+                let physical = sqlite.publish().unwrap();
+                assert!(physical.load_all_batches().unwrap().is_empty());
+                assert_eq!(physical.diagnostic_row_counts().unwrap(), (0, 0));
+                physical
+                    .materialized_row_digests_by_table()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(table, _)| *table != "materialization_stamp")
+                    .collect::<Vec<_>>()
+            };
+        assert_eq!(
+            build_clean_sqlite(&memory_root, &memory, "memory"),
+            build_clean_sqlite(&spilled_root, &spilled, "spilled"),
+            "memory and spilled activation records must build the same operation-free SQLite projection"
+        );
+
+        let spill_path = match spilled
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .unwrap()
+        {
+            ActivationPageRecordStore::Spilled(records) => records.path.clone(),
+            ActivationPageRecordStore::Memory { .. } => panic!("forced spill stayed in memory"),
+        };
+        assert!(spill_path.exists());
+        drop(spilled);
+        assert!(!spill_path.exists());
+    }
+
+    #[test]
+    fn operation_free_sqlite_genesis_matches_legacy_bootstrap_projection_rows() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "clean-sqlite-legacy-differential",
+            &[
+                (
+                    "pages/alpha.md",
+                    "title:: Alpha\nalias:: A\n\n- TODO [#A] one [[Beta]] #work\n  id:: 00000000-0000-0000-0000-000000000041\n  - nested child\n- root sibling\n",
+                ),
+                (
+                    "pages/beta.md",
+                    "- two ((00000000-0000-0000-0000-000000000041))\n  property:: value\n",
+                ),
+            ],
+        );
+        let pages = prepared
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .unwrap();
+        let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
+        let working = root.path().join("clean-sqlite-differential");
+        fs::create_dir(&working).unwrap();
+        let policy = ReferenceCatalogPolicyV1::default();
+        let (candidates, _) = build_clean_activation_candidates(
+            pages,
+            workspace,
+            lineage,
+            catalog,
+            prepared.source_capture().capture_identity().unwrap(),
+            &working,
+            &working.join("clean.sqlite"),
+            &policy,
+        )
+        .unwrap();
+        let (candidate, clean_sqlite, candidate_root) = candidates.into_parts();
+        let candidate = std::sync::Arc::new(candidate);
+        let mut clean_engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        clean_engine
+            .configure_reference_catalog_policy(policy.clone())
+            .unwrap();
+        clean_engine
+            .install_lazy_genesis_baseline(candidate)
+            .unwrap();
+        let clean_root = clean_engine.accepted_frontier_root().unwrap();
+        assert_eq!(clean_root, candidate_root);
+        let clean = clean_sqlite.publish().unwrap();
+
+        let (_, _, legacy_authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x5ac0, "archive");
+        let runtime =
+            ApplicationRuntimeRoot::open_for_test(&root.path().join("legacy-runtime")).unwrap();
+        let (legacy, _) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &root.path().join("legacy.sqlite"),
+            &runtime,
+            &legacy_authority,
+        )
+        .unwrap();
+
+        let projection_rows = |rows: Vec<(&'static str, ContentDigest)>| {
+            rows.into_iter()
+                .filter(|(table, _)| {
+                    !matches!(*table, "materialization_stamp" | "materialization_batches")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            projection_rows(clean.materialized_row_digests_by_table().unwrap()),
+            projection_rows(
+                legacy
+                    .database
+                    .materialized_row_digests_by_table_for_test()
+                    .unwrap()
+            ),
+            "operation-free genesis must change construction provenance, not query-visible SQLite rows"
+        );
+        assert!(clean.load_all_batches().unwrap().is_empty());
+        assert!(clean_engine
+            .status()
+            .accepted_batch_ids()
+            .unwrap()
+            .is_empty());
+        assert!(legacy.database.applied_batch_count().unwrap() > 0);
+    }
+
+    /// One page name, two physical files, and the whole graph stops reconciling.
+    ///
+    /// Reported from a physical Android device (2026-08-18): managed storage
+    /// reports that it enabled, then every tick fails with
+    /// `clean external reconciliation failed during Planning: decoded
+    /// destination logical page name <name> is already owned by page <uuid>`.
+    ///
+    /// Activation deliberately selects ONE authoritative source per canonical
+    /// page name and per portable path (`bootstrap_authoritative_source_paths`,
+    /// matching OG's "retain the first, skip the later collision"). The skipped
+    /// twin stays on disk as ordinary graph text with no page in the clean
+    /// SQLite projection, so the very next external reconciliation sees it as a
+    /// brand-new page whose decoded name is already owned — and refuses the
+    /// whole transaction, for every path, forever.
+    ///
+    /// The fixture uses the reported shape: a non-ASCII character and an inline
+    /// hashtag in the page name. `encode_page_name` escapes `#` as `%23`, while
+    /// an outside editor writes it literally, so one title has two ordinary
+    /// physical spellings that `decode_page_name` maps back to one name.
+    #[test]
+    fn clean_reconciliation_admits_a_name_twin_activation_deduplicated() {
+        // "Želva sample page #alpha" written twice: once with the literal `#` an
+        // outside editor produces, once with the `%23` Tine's own filename
+        // encoder produces for the same title. Both decode to one page name.
+        const PRECOMPOSED: &str = "pages/\u{17d}elva sample page #alpha.md";
+        const ENCODED: &str = "pages/\u{17d}elva sample page %23alpha.md";
+        // The same title again, this time as a decomposed FILE NAME: one
+        // portable path identity, two exact spellings, which is what syncing a
+        // graph between a decomposing and a precomposing filesystem produces.
+        const DECOMPOSED: &str = "pages/Z\u{30c}elva sample page #alpha.md";
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-duplicate-name-twin",
+            &[
+                ("pages/alpha.md", "- alpha\n"),
+                (PRECOMPOSED, "- precomposed twin\n"),
+                (ENCODED, "- encoded twin\n"),
+                (DECOMPOSED, "- decomposed twin\n"),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let scratch = root.path().join("clean-preparation");
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"clean-duplicate-name-twin"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5b02)),
+            &scratch,
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            preparation.instrumentation().source_files,
+            4,
+            "every physical source file is retained by the capture"
+        );
+        assert_eq!(
+            preparation.candidates().baseline().page_count(),
+            2,
+            "activation selects one authoritative page per canonical name"
+        );
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        let committed = commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .unwrap();
+        let (baseline, physical, baseline_frontier, _) = committed.into_parts();
+        drop(physical);
+        drop(baseline);
+
+        let reopened = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5b02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("published marker opens clean activation");
+        let (mut clean_engine, clean_projection, _) = reopened.into_parts();
+        let operation_archive_path = clean_archive.join("operations");
+        clean_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        let runtime_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&runtime_store, workspace).unwrap();
+        let mut leased_projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &database,
+            ProjectionClaim::current(workspace, LineageDigest::of(b"clean-duplicate-name-twin")),
+            &baseline_frontier,
+            &runtime_store,
+            &clean_engine,
+            clean_projection,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        let (database_handle, lease_identity) = leased_projection.database_and_lease_identity();
+        lease_identity.revalidate().unwrap();
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5b21)),
+            DeviceId::from_uuid(Uuid::from_u128(0x5b22)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.path().join("clean-receipts"),
+            workspace,
+            endpoint,
+        )
+        .unwrap();
+        clean_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+
+        // Exactly what a cold clean open queues: one full comparison of every
+        // eligible graph-text path.
+        let full_scan = plan_clean_affected_import(
+            &graph,
+            &clean_engine,
+            database_handle,
+            &["pages/alpha.md", PRECOMPOSED, ENCODED, DECOMPOSED],
+        );
+        assert_ne!(
+            full_scan.status(),
+            ImportPlanStatus::Blocked,
+            "an activation-deduplicated name twin must not deny reconciliation for the whole \
+             graph, but planning was blocked: {:?}",
+            full_scan.blocks(),
+        );
+
+        // The same refusal reaches the user through a single watcher path too.
+        let exact = plan_clean_affected_import(&graph, &clean_engine, database_handle, &[ENCODED]);
+        assert_ne!(
+            exact.status(),
+            ImportPlanStatus::Blocked,
+            "an exact watcher observation of the deduplicated twin must not be a refusal: {:?}",
+            exact.blocks(),
+        );
+
+        // Nothing was moved, rewritten, or removed to reach that.
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(DECOMPOSED)).unwrap(),
+            "- decomposed twin\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(PRECOMPOSED)).unwrap(),
+            "- precomposed twin\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(ENCODED)).unwrap(),
+            "- encoded twin\n"
+        );
+    }
+
+    #[test]
+    fn clean_activation_prepares_both_candidates_and_final_scan_without_operations() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-activation-entry",
+            &[
+                (
+                    "pages/alpha.md",
+                    "- alpha [[Beta]] ((00000000-0000-0000-0000-000000000042)) ((00000000-0000-0000-0000-000000000043))\n",
+                ),
+                (
+                    "pages/beta.md",
+                    "- beta\n  id:: 00000000-0000-0000-0000-000000000042\n  collapsed:: true\n  - nested child\n",
+                ),
+                (
+                    "pages/gamma.md",
+                    "- gamma\n  id:: 00000000-0000-0000-0000-000000000043\n",
+                ),
+                (
+                    "pages/delta.md",
+                    "- delta\n  id:: 00000000-0000-0000-0000-000000000043\n",
+                ),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let scratch = root.path().join("clean-preparation");
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            &scratch,
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+
+        assert_eq!(preparation.instrumentation().source_files, 4);
+        assert_eq!(preparation.candidates().baseline().page_count(), 4);
+        let first_page = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .next()
+            .expect("clean baseline has a page");
+        let first_page = preparation
+            .candidates()
+            .baseline()
+            .page(first_page)
+            .unwrap()
+            .expect("clean baseline page remains addressable");
+        let first_block = first_page
+            .blocks
+            .first()
+            .expect("clean baseline page has a block");
+        let edited_block = BlockLocation {
+            block_id: first_block.block_id,
+            home_document_id: first_block.home_document_id,
+        };
+        let beta_page_id = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .find(|page_id| {
+                preparation
+                    .candidates()
+                    .baseline()
+                    .page(*page_id)
+                    .unwrap()
+                    .is_some_and(|page| page.path.as_str() == "pages/beta.md")
+            })
+            .expect("clean baseline contains beta");
+        let duplicate_uuid_pages = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .filter(|page_id| {
+                preparation
+                    .candidates()
+                    .baseline()
+                    .page(*page_id)
+                    .unwrap()
+                    .is_some_and(|page| {
+                        matches!(page.path.as_str(), "pages/gamma.md" | "pages/delta.md")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_uuid_pages.len(), 2);
+        assert_eq!(
+            preparation
+                .candidates()
+                .accepted_frontier()
+                .acceptance_sequence(),
+            0
+        );
+        let final_scan = preparation
+            .capture()
+            .verify_before_inactive_bootstrap_authoring(&graph)
+            .unwrap();
+        assert_eq!(final_scan.parser_calls, 0);
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        let committed = commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .unwrap();
+        assert_eq!(committed.final_scan().parser_calls, 0);
+        assert_eq!(
+            crate::oplog::lazy_genesis::read_activation_marker(&clean_enrollment).unwrap(),
+            Some(committed.marker())
+        );
+        let (baseline, physical, baseline_frontier, marker) = committed.into_parts();
+        assert_eq!(
+            crate::oplog::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline).unwrap(),
+            baseline_frontier
+        );
+        assert_eq!(baseline.root(), marker.baseline_root());
+        assert!(physical.load_all_batches().unwrap().is_empty());
+        let original_projection_rows = physical.materialized_row_digests_by_table().unwrap();
+        drop(physical);
+        drop(baseline);
+
+        let reopened = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("published marker opens clean activation");
+        assert_eq!(reopened.marker(), marker);
+        assert_eq!(
+            reopened.engine().accepted_frontier_root().unwrap(),
+            baseline_frontier,
+            "cold open derives the exact sequence-zero frontier from the baseline"
+        );
+        assert_eq!(
+            reopened
+                .engine()
+                .lazy_genesis_resident_page_documents_for_test(),
+            0,
+            "cold open must not hydrate every page checkpoint"
+        );
+        let (mut clean_engine, clean_projection, _) = reopened.into_parts();
+        let operation_archive_path = clean_archive.join("operations");
+        clean_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !clean_engine.has_native_semantic_index_stores_for_test(),
+            "clean runtime must not open native semantic Patricia stores"
+        );
+        let runtime_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&runtime_store, workspace).unwrap();
+        let mut leased_projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &database,
+            ProjectionClaim::current(
+                workspace,
+                LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            ),
+            &baseline_frontier,
+            &runtime_store,
+            &clean_engine,
+            clean_projection,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        assert_eq!(
+            leased_projection.database().frontier_root().unwrap(),
+            baseline_frontier,
+            "lease-bound clean projection must retain the exact baseline frontier"
+        );
+        let (database_handle, lease_identity) = leased_projection.database_and_lease_identity();
+        lease_identity.revalidate().unwrap();
+        assert_eq!(
+            database_handle
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            0
+        );
+
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5a21)),
+            DeviceId::from_uuid(Uuid::from_u128(0x5a22)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.path().join("clean-receipts"),
+            workspace,
+            endpoint,
+        )
+        .unwrap();
+        clean_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+
+        // A second physical file for one canonical page name is withheld from
+        // the semantic graph, exactly as activation withholds it, instead of
+        // refusing the transaction and with it every other affected path.
+        let colliding_path = root.path().join("graph/pages/beta-copy.md");
+        fs::write(&colliding_path, "title:: Beta\n\n- colliding page\n").unwrap();
+        let collision = plan_clean_affected_import(
+            &graph,
+            &clean_engine,
+            database_handle,
+            &["pages/beta-copy.md"],
+        );
+        assert!(
+            collision.blocks().is_empty(),
+            "a duplicate canonical page name must not deny clean reconciliation: {:?}",
+            collision.blocks()
+        );
+        assert_eq!(collision.status(), ImportPlanStatus::Noop);
+        assert_eq!(
+            fs::read_to_string(&colliding_path).unwrap(),
+            "title:: Beta\n\n- colliding page\n",
+            "the withheld source keeps its exact bytes"
+        );
+        fs::remove_file(colliding_path).unwrap();
+
+        let claim_source = database_handle.materialized_read().unwrap();
+        clean_engine
+            .clean_import_projection_predecessor(
+                &ManagedPath::parse("pages/beta.md").unwrap(),
+                Some(beta_page_id),
+                &claim_source,
+            )
+            .expect("first clean watcher scan can authorize an unchanged id:: page");
+        drop(claim_source);
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: edited_block,
+            content: "edited after clean activation".into(),
+        }])
+        .unwrap();
+        let mut clean_runtime = CleanLocalRuntime::from_open_parts(
+            SessionId::from_uuid(Uuid::from_u128(0x5a23)),
+            endpoint,
+            clean_engine,
+            leased_projection,
+        )
+        .unwrap();
+        let projection_fault =
+            crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
+        let state = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &graph,
+                &receipts,
+                &transaction,
+            )
+            .unwrap()
+        };
+        let pending = match state {
+            CleanLocalMutationState::DurablePending(pending) => pending,
+            CleanLocalMutationState::Complete(_) => {
+                panic!("injected projection failure unexpectedly completed clean mutation")
+            }
+        };
+        drop(projection_fault);
+        let first_batch = pending.batch_id();
+        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 1);
+        assert_eq!(
+            clean_runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1,
+            "SQLite is applied before the deliberately failed Markdown projection"
+        );
+        let retry = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::retry_clean_local(&mut session, &graph, &receipts, pending)
+        };
+        match retry {
+            CleanLocalMutationState::Complete(batch_id) => assert_eq!(batch_id, first_batch),
+            CleanLocalMutationState::DurablePending(pending) => {
+                panic!(
+                    "clean continuation retry remained pending: {}",
+                    pending.failure()
+                )
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- edited after clean activation\n",
+            "the clean runtime continuation must finish the exact durable operation"
+        );
+
+        let interrupted = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: edited_block,
+            content: "edited after clean runtime crash".into(),
+        }])
+        .unwrap();
+        fail_next_clean_after_manifest_for_harness();
+        let state = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &graph,
+                &receipts,
+                &interrupted,
+            )
+            .unwrap()
+        };
+        let pending = match state {
+            CleanLocalMutationState::DurablePending(pending) => pending,
+            CleanLocalMutationState::Complete(_) => {
+                panic!("post-manifest cut unexpectedly completed clean projection")
+            }
+        };
+        let edit_batch = pending.batch_id();
+        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 2);
+        assert_eq!(
+            clean_runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1,
+            "the second deliberate cut is immediately after manifest commit and before SQLite"
+        );
+        let clean_work = clean_runtime
+            .engine()
+            .clean_projection_work_for_batch(edit_batch)
+            .unwrap();
+        assert_eq!(
+            clean_work.len(),
+            1,
+            "the accepted manifest itself must derive the one local projection row"
+        );
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- edited after clean activation\n",
+            "the second cut leaves the prior committed projection visible"
+        );
+        drop(pending);
+        drop(clean_runtime);
+        drop(graph);
+        let graph = Graph::open(&root.path().join("graph"));
+        fs::write(&database, b"corrupt disposable SQLite after durable edit").unwrap();
+        let rebuilt = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("corrupt SQLite rebuilds from the baseline");
+        assert_eq!(rebuilt.marker(), marker);
+        assert_eq!(
+            rebuilt.engine().accepted_frontier_root().unwrap(),
+            baseline_frontier
+        );
+        assert_eq!(
+            rebuilt
+                .engine()
+                .lazy_genesis_resident_page_documents_for_test(),
+            0
+        );
+        let (mut rebuilt_engine, rebuilt_projection, _) = rebuilt.into_parts();
+        assert_eq!(
+            rebuilt_projection
+                .materialized_row_digests_by_table()
+                .unwrap(),
+            original_projection_rows,
+            "the clean activation opener first reconstructs the exact sequence-zero projection"
+        );
+        rebuilt_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        let baseline_claim_source = crate::oplog::sqlite::clean_genesis_materialized_read(
+            &rebuilt_projection,
+            &baseline_frontier,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt_engine
+                .replay_clean_committed_tail(&baseline_claim_source)
+                .unwrap(),
+            2
+        );
+        drop(baseline_claim_source);
+        drop(rebuilt_projection);
+        assert_eq!(
+            rebuilt_engine
+                .accepted_frontier_root()
+                .unwrap()
+                .acceptance_sequence(),
+            2,
+            "cold replay derives accepted state from manifests without a history Patricia"
+        );
+        let rebuilt_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let first_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, first_batch)
+                .unwrap();
+        let replayed_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, edit_batch).unwrap();
+        assert_eq!(
+            replayed_event.prior_frontier_root(),
+            first_event.post_frontier_root(),
+            "cold manifest replay must retain the first committed edit as the second event's F"
+        );
+        let cold_materialization =
+            crate::oplog::sqlite::materialize_accepted_event(&rebuilt_engine, &replayed_event)
+                .unwrap();
+        assert_eq!(
+            cold_materialization
+                .replacements()
+                .iter()
+                .map(|page| page.page_id)
+                .collect::<Vec<_>>(),
+            vec![clean_work[0].page_id()],
+            "cold manifest replay must rematerialize the edited baseline-backed page"
+        );
+        assert!(cold_materialization.deletions().is_empty());
+        let rebuilt_lease = WorkspaceRuntimeLease::acquire(&rebuilt_store, workspace).unwrap();
+        let application_runtime =
+            ApplicationRuntimeRoot::open_for_test(&root.path().join("clean-runtime")).unwrap();
+        let rebuilt_source = RebuildSource::new(&rebuilt_engine, &rebuilt_store).unwrap();
+        let (mut rebuilt_projection, ()) =
+            LeasedWorkspaceProjection::open_under(rebuilt_lease, |slot| {
+                let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &database,
+                    &application_runtime,
+                    ProjectionClaim::current(
+                        workspace,
+                        LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+                    ),
+                    rebuilt_source,
+                    slot,
+                )?;
+                Ok::<_, crate::oplog::sqlite::ProjectionError>((opened, ()))
+            })
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert_eq!(
+            rebuilt_projection
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            2,
+            "missing/corrupt SQLite rebuilds through the manifest-committed edit"
+        );
+        let rebuilt_read = rebuilt_projection.database().materialized_read().unwrap();
+        for page_id in duplicate_uuid_pages {
+            assert_eq!(
+                rebuilt_read
+                    .blocks_on_page(page_id, 2)
+                    .unwrap()
+                    .into_iter()
+                    .map(|block| block.logseq_uuid)
+                    .collect::<Vec<_>>(),
+                vec![None],
+                "ambiguous baseline UUID claims must remain candidates, not become block identity during terminal SQLite rebuild"
+            );
+        }
+        drop(rebuilt_read);
+        rebuilt_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        let terminal_work = rebuilt_engine.clean_terminal_projection_work().unwrap();
+        assert_eq!(
+            terminal_work, clean_work,
+            "cold open must reconstruct the exact terminal path plan from manifests alone"
+        );
+        let cold_path_owners = rebuilt_projection
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(terminal_work[0].path(), 2)
+            .unwrap();
+        assert_eq!(
+            cold_path_owners
+                .iter()
+                .map(|owner| (owner.page_id, owner.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![(terminal_work[0].page_id(), terminal_work[0].path().clone())]
+        );
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &terminal_work[0],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- edited after clean runtime crash\n",
+            "cold manifest-derived recovery must finish the interrupted Markdown projection"
+        );
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &terminal_work[0],
+        )
+        .unwrap();
+
+        let delete_batch = BatchId::from_uuid(Uuid::from_u128(0x5a30));
+        let delete = OperationTransaction::new(vec![SemanticOperation::DeletePage {
+            page_id: terminal_work[0].page_id(),
+        }])
+        .unwrap();
+        let delete_draft = rebuilt_engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id: delete_batch,
+                    author_device_id: endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5a31)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5a32),
+                },
+                BatchOrigin::LocalMutation,
+                &delete,
+            )
+            .unwrap();
+        let delete_prepared = rebuilt_engine
+            .finalize_author_transaction(delete_draft, &graph, &receipts, endpoint)
+            .unwrap();
+        let delete_identity = rebuilt_projection
+            .database()
+            .preflight_prepared_identity_transition(&rebuilt_engine, &delete_prepared)
+            .unwrap();
+        let delete_claim_source = rebuilt_projection.database().materialized_read().unwrap();
+        rebuilt_engine
+            .commit_clean_prepared(&delete_prepared, &delete_claim_source)
+            .unwrap();
+        drop(delete_claim_source);
+        let delete_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, delete_batch)
+                .unwrap()
+                .with_prepared_identity_transition(delete_identity)
+                .unwrap();
+        rebuilt_projection
+            .database_and_lease_identity()
+            .0
+            .apply_engine_owned_accepted(&delete_event, &rebuilt_engine)
+            .unwrap();
+        let delete_work = rebuilt_engine
+            .clean_projection_work_for_batch(delete_batch)
+            .unwrap();
+        assert!(matches!(
+            delete_work.as_slice(),
+            [work] if matches!(work.target(), crate::oplog::ProjectionWorkTarget::Absent)
+        ));
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &delete_work[0],
+        )
+        .unwrap();
+        assert!(
+            !graph.resolve_rel("pages/alpha.md").unwrap().exists(),
+            "manifest-derived clean deletion must remove the exact prior projection"
+        );
+        assert_eq!(
+            rebuilt_engine.clean_terminal_projection_work().unwrap(),
+            delete_work,
+            "the run-local terminal plan keeps only the latest accepted row for a path"
+        );
+        assert!(
+            crate::oplog::projection::execute_clean_manifested_projection_work(
+                &graph,
+                &receipts,
+                rebuilt_projection.database(),
+                &mut rebuilt_engine,
+                &terminal_work[0],
+            )
+            .is_err(),
+            "an older accepted Present row must not regain write authority after a later deletion"
+        );
+    }
+
+    #[test]
+    fn clean_activation_source_drift_keeps_direct_files_authoritative() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-activation-source-drift",
+            &[("pages/alpha.md", "- alpha\n")],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            &root.path().join("clean-preparation"),
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        fs::write(
+            root.path().join("graph/pages/alpha.md"),
+            "- changed after capture\n",
+        )
+        .unwrap();
+
+        assert!(commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .is_err());
+        assert!(!clean_archive
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY)
+            .exists());
+        assert_eq!(
+            crate::oplog::lazy_genesis::read_activation_marker(&clean_enrollment).unwrap(),
+            None
+        );
+        assert!(!tine_storage::sqlite::SqliteFileSet::new(&database).any_exists());
+    }
+
+    #[test]
+    #[ignore = "explicit 20k-block managed-activation spill acceptance gate"]
+    fn activation_page_record_stream_accepts_one_20k_block_page_when_spilled() {
+        let mut source = String::with_capacity(1_000_000);
+        for ordinal in 0..20_000 {
+            source.push_str(&format!(
+                "- TODO [#A] block {ordinal:05} [[Target]] #bulk\n"
+            ));
+        }
+        force_next_activation_page_record_memory_limit(0);
+        let (_root, prepared, _) = prepare_streaming_bootstrap(
+            "activation-pages-20k-spill",
+            &[("pages/fat.md", source.as_str())],
+        );
+        assert!(prepared.instrumentation().terminal_projection_hint_spilled);
+        assert_eq!(prepared.instrumentation().terminal_projection_hint_pages, 1);
+        assert_eq!(prepared.instrumentation().parser_nodes, 20_000);
+        let store = prepared
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .expect("20k activation page record store");
+        let page_id = match store {
+            ActivationPageRecordStore::Memory { .. } => panic!("forced 20k spill stayed in memory"),
+            ActivationPageRecordStore::Spilled(records) => {
+                *records.index.keys().next().expect("one spilled page")
+            }
+        };
+        let record = store.page(page_id).unwrap().expect("spilled 20k page");
+        assert_eq!(record.page.blocks.len(), 20_000);
+        assert_eq!(record.block_sources.len(), 20_000);
     }
 
     fn bootstrap_preparation_scratch(root: &TestRoot, label: &str) -> (PathBuf, PathBuf) {
@@ -10799,26 +13682,9 @@ mod tests {
                 <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
         );
 
-        let work = prepared.candidate().bootstrap_catalog_work_stats();
+        let work = prepared.candidate().bootstrap_index_work_stats();
         assert_eq!(work.full_catalog_author_clones, 0);
         assert_eq!(work.reference_fallback_document_reconstructions, 0);
-        assert!(
-            work.reference_catalog_peak_resident_bytes
-                <= super::super::authenticated_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
-            "private Patricia construction exceeded its fixed resident budget: {work:?}"
-        );
-        assert_eq!(
-            work.reference_catalog_prepared_validations,
-            prepared.aggregate().parts().len(),
-            "each accepted part must consume one exact prepared-candidate proof"
-        );
-        assert_eq!(
-            work.reference_catalog_full_delta_validations, 0,
-            "private same-call construction must not replay prepared catalog deltas"
-        );
-        assert_eq!(work.reference_catalog_prepared_sources, PAGE_COUNT);
-        assert_eq!(work.reference_catalog_fact_updates, PAGE_COUNT);
-        assert_eq!(work.reference_catalog_persistent_node_reads, 0);
         assert_eq!(
             work.authenticated_page_identity_lookups, 0,
             "page-capsule authoring must use its prospective catalog rather than reopen page identity per page"
@@ -10897,10 +13763,10 @@ mod tests {
 
         let sparse_stats = sparse.candidate().detached_publication_stats().unwrap();
         let dense_stats = dense.candidate().detached_publication_stats().unwrap();
-        assert!(sparse_stats.immutable_publications > 0);
+        assert!(sparse_stats.packed_immutable_publications > 0);
         assert!(
-            dense_stats.immutable_publications > sparse_stats.immutable_publications,
-            "reference/UUID density should increase immutable object work: sparse={sparse_stats:?} dense={dense_stats:?}"
+            dense_stats.packed_immutable_publications > sparse_stats.packed_immutable_publications,
+            "UUID density should increase retained identity-index object work: sparse={sparse_stats:?} dense={dense_stats:?}"
         );
         assert_eq!(sparse_stats.successful_batch_completions, 1);
         assert_eq!(dense_stats.successful_batch_completions, 1);
@@ -10957,17 +13823,6 @@ mod tests {
                 super::super::hot_engine::LogseqUuidResolution::Unique(claim)
                     if claim.page_id == page_id && claim.block_id == page.blocks[0].block_id
             ));
-            let posting = dense
-                .candidate()
-                .accepted_engine()
-                .reference_posting_for_test(page_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(posting.facts().len(), 1);
-            assert!(matches!(
-                &posting.facts()[0],
-                super::super::reference_catalog::ReferenceFactV1::PageName(_)
-            ));
         }
     }
 
@@ -11000,12 +13855,8 @@ mod tests {
 
         let retried = prepare_streaming_bootstrap_attempt(&root, "retry", workspace).unwrap();
         let stats = retried.candidate().detached_publication_stats().unwrap();
-        assert!(stats.immutable_publications > 0);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        assert!(
-            stats.verified_existing_publications > clean_stats.verified_existing_publications,
-            "retry did not add byte-verification work for abandoned exact objects: clean={clean_stats:?} retry={stats:?}"
-        );
+        assert_eq!(stats.packed_immutable_publications, 0);
+        assert!(clean_stats.packed_immutable_publications > 0);
         assert_eq!(stats.successful_batch_completions, 1);
         assert_eq!(
             retried.candidate().index_archive_identity(),
@@ -11045,7 +13896,7 @@ mod tests {
         assert_eq!(publication.successful_batch_completions, 1);
         assert_eq!(publication.packed_capacity_fallbacks, 0);
         assert!(publication.packed_immutable_publications > 0);
-        assert_eq!(count_packed_patricia_heads(&root.path().join("archive")), 4);
+        assert_eq!(count_packed_patricia_heads(&root.path().join("archive")), 3);
     }
 
     #[test]
@@ -11131,7 +13982,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_refuses_non_round_tripping_org_before_operations() {
+    fn inactive_bootstrap_accepts_non_round_tripping_org_as_exact_read_only_source() {
         for (label, path, source) in [(
             "bootstrap-skipped-org",
             "pages/skipped.org",
@@ -11151,7 +14002,7 @@ mod tests {
                 .capture_inactive_bootstrap_sources(&capture_scratch)
                 .unwrap();
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a11));
-            let result = prepare_inactive_bootstrap_import(
+            let prepared = prepare_inactive_bootstrap_import(
                 &graph,
                 capture,
                 workspace,
@@ -11160,16 +14011,44 @@ mod tests {
                 ReferenceCatalogPolicyV1::default(),
                 &target_catalog(&root.path().join("archive"), workspace),
                 &preparation_scratch,
-            );
-            let Err(BootstrapStreamingImportError::InvalidSource(detail)) = result else {
-                panic!("{label} constructed bootstrap publication");
-            };
-            assert!(
-                detail.starts_with(&format!("{path}: ")),
-                "{label} omitted the graph-relative source path: {detail}"
-            );
+            )
+            .unwrap_or_else(|error| panic!("{label} refused exact read-only source: {error:?}"));
+            assert!(prepared.instrumentation().operations > 0);
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
+    }
+
+    #[test]
+    fn inactive_bootstrap_accepts_non_round_tripping_markdown_as_exact_read_only_source() {
+        let source = "- root\r  ```\r  - fake\r  ```";
+        let root = TestRoot::new("bootstrap-non-round-tripping-markdown");
+        let graph_root = root.path().join("graph");
+        let target = graph_root.join("pages/a.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, source).unwrap();
+        let graph = Graph::open(&graph_root);
+        let capture_scratch = root.path().join("capture-scratch");
+        let preparation_scratch = root.path().join("preparation-scratch");
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a13));
+
+        let prepared = prepare_inactive_bootstrap_import(
+            &graph,
+            capture,
+            workspace,
+            LineageDigest::of(b"inactive-bootstrap-markdown-admission"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a14)),
+            ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
+            &preparation_scratch,
+        )
+        .expect("parseable non-round-tripping Markdown remains an exact read-only source");
+        assert!(prepared.instrumentation().operations > 0);
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
     #[test]
@@ -11234,9 +14113,11 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count,
             declaration_count: 0,
+            activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -11266,9 +14147,11 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count: page_count,
             declaration_count: 0,
+            activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -11307,9 +14190,11 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count: declaration_count,
             declaration_count,
+            activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -11360,7 +14245,7 @@ mod tests {
                 std::mem::size_of::<u32>(),
             )
             .unwrap();
-            let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+            let mut operations = BootstrapOperationSpoolReader::open(&spool).unwrap();
             let mut observed_boundaries = Vec::new();
             let mut observed_pages = Vec::new();
             while let Some(boundary) = boundaries.next().unwrap() {
@@ -11437,7 +14322,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_streaming_bootstrap_capture_c_mutation_leaves_no_seal() {
+    fn inactive_streaming_bootstrap_live_mutation_prepares_only_from_sealed_capture() {
         let root = TestRoot::new("streaming-capture-c-mutation");
         let graph_root = root.path().join("graph");
         fs::write(graph_root.join("pages/mutable.md"), "- before").unwrap();
@@ -11451,7 +14336,7 @@ mod tests {
             .unwrap();
         fs::write(graph_root.join("pages/mutable.md"), "- after").unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5b01));
-        assert!(prepare_inactive_bootstrap_import(
+        let prepared = prepare_inactive_bootstrap_import(
             &graph,
             capture,
             workspace,
@@ -11461,16 +14346,15 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             &preparation_scratch,
         )
-        .is_err());
-        let publication_root = preparation_scratch.join(BOOTSTRAP_STREAM_DIRECTORY);
+        .unwrap();
         assert!(
-            !publication_root.exists()
-                || fs::read_dir(publication_root).unwrap().all(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".building-"))
+            prepared
+                .source_capture()
+                .verify_before_inactive_bootstrap_authoring(&graph)
+                .is_err(),
+            "the final live-source proof must reject bytes changed after capture"
         );
+        assert_eq!(prepared.instrumentation().capture_passes, 1);
     }
 
     #[test]
@@ -11565,6 +14449,64 @@ mod tests {
             .commit()
             .validate_aggregate(prepared.aggregate())
             .unwrap();
+    }
+
+    #[test]
+    fn detached_authoring_uses_sealed_capture_and_final_source_proof_rejects_external_changes() {
+        for (ordinal, mutation) in ["modify", "add", "delete", "rename"]
+            .into_iter()
+            .enumerate()
+        {
+            let root = TestRoot::new(&format!("streaming-source-change-{mutation}"));
+            let graph_root = root.path().join("graph");
+            let source = graph_root.join("pages/source.md");
+            let added = graph_root.join("pages/added.md");
+            let renamed = graph_root.join("pages/renamed.md");
+            fs::write(&source, b"- captured source\n").unwrap();
+            let graph = Graph::open(&graph_root);
+            let capture_scratch = root.path().join("capture");
+            let preparation_scratch = root.path().join("preparation");
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5c20 + ordinal as u128));
+            let catalog = target_catalog(&root.path().join("archive"), workspace);
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let added = added.clone();
+                    let renamed = renamed.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"- modified externally\n"),
+                        "add" => fs::write(added, b"- added externally\n"),
+                        "delete" => fs::remove_file(source),
+                        "rename" => fs::rename(source, renamed),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let prepared = prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(format!("streaming-source-change-{mutation}").as_bytes()),
+                DocumentId::from_uuid(Uuid::from_u128(0x5c30 + ordinal as u128)),
+                ReferenceCatalogPolicyV1::default(),
+                &catalog,
+                &preparation_scratch,
+            )
+            .unwrap();
+            assert_eq!(prepared.instrumentation().capture_passes, 1);
+            assert!(
+                prepared
+                    .source_capture()
+                    .verify_before_inactive_bootstrap_authoring(&graph)
+                    .is_err(),
+                "final source proof admitted an external {mutation} at the former mid-authoring boundary"
+            );
+        }
     }
 
     #[test]
@@ -11759,9 +14701,11 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             ImportId::from_digest([0x63; 32]),
             &BootstrapOperationSpool {
-                path: operation_path,
+                storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: 4,
                 declaration_count: 0,
+                activation_pages: None,
+                lazy_genesis: None,
             },
             2,
             &working,
@@ -11830,9 +14774,11 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             ImportId::from_digest([0x6f; 32]),
             &BootstrapOperationSpool {
-                path: operation_path,
+                storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
+                activation_pages: None,
+                lazy_genesis: None,
             },
             1,
             &working,
@@ -11866,7 +14812,10 @@ mod tests {
         )
         .unwrap();
         for (path, contents) in [
-            ("Root.md", "title:: Root logical name\n\n- root\n"),
+            (
+                "Root.md",
+                "title:: Root logical name\n\n- root\n  id:: 00000000-0000-0000-0000-000000005e00\n- ambiguous root claimant\n  id:: 00000000-0000-0000-0000-000000005e00\n",
+            ),
             (
                 "notes/arbitrary/nested/Markdown.md",
                 "title:: Markdown title ☕\n\n- parent\n  - child\n",
@@ -11912,14 +14861,65 @@ mod tests {
             &mut source_instrumentation,
         )
         .unwrap();
-        let streaming = spool_bootstrap_operations(
+        let mut streaming = spool_bootstrap_operations(
             &capture,
             source.import_id,
             workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
             &working,
             &mut source_instrumentation,
         )
         .unwrap();
+        let lazy_genesis = streaming
+            .lazy_genesis
+            .as_ref()
+            .expect("shadow lazy-genesis candidate");
+        let clean_lazy_genesis = build_lazy_genesis_from_activation_records(
+            streaming
+                .activation_pages
+                .as_ref()
+                .expect("terminal activation records"),
+            workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            capture.capture_identity().unwrap(),
+            &working,
+        )
+        .unwrap();
+        assert_eq!(
+            clean_lazy_genesis.root(),
+            lazy_genesis.root(),
+            "operation-free baseline construction must be byte-identical to the temporary operation oracle"
+        );
+        assert_eq!(
+            lazy_genesis.page_count(),
+            usize::try_from(capture.source_file_count()).unwrap()
+        );
+        let root_path = ManagedPath::parse("Root.md").unwrap();
+        let root_page_id = source
+            .import_id
+            .unmatched_page_id(&ImportLocator::page(root_path));
+        let lazy_root = lazy_genesis.page(root_page_id).unwrap().unwrap();
+        let parsed_root = streaming
+            .activation_pages
+            .as_ref()
+            .unwrap()
+            .page(root_page_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lazy_root.page_id, parsed_root.page.page_id);
+        assert_eq!(lazy_root.name, parsed_root.page.name);
+        assert_eq!(lazy_root.preamble, parsed_root.page.preamble);
+        assert_eq!(lazy_root.blocks.len(), parsed_root.page.blocks.len());
+        assert!(lazy_root
+            .blocks
+            .iter()
+            .zip(&parsed_root.page.blocks)
+            .all(|(lazy, parsed)| lazy.block_id == parsed.block_id
+                && lazy.parent == parsed.parent
+                && lazy.order == parsed.order
+                && lazy.content == parsed.content));
         let mut partition_instrumentation = BootstrapStreamingImportInstrumentation::default();
         assert_eq!(
             partition_bootstrap_operation_spool(
@@ -11948,7 +14948,7 @@ mod tests {
             partition_instrumentation.max_part_documents
                 <= u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
         );
-        let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming.path).unwrap();
+        let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming).unwrap();
         let mut streaming_operations = Vec::new();
         while let Some(operation) = streaming_reader.next().unwrap() {
             streaming_operations.push(operation.operation);
@@ -12053,9 +15053,293 @@ mod tests {
             ));
             engine.canonical_snapshot().unwrap()
         };
+        let old_snapshot = canonical_snapshot(&old.transaction);
+        let streaming_snapshot = canonical_snapshot(&streaming_transaction);
+        assert_eq!(streaming_snapshot, old_snapshot);
+        let lazy = streaming.lazy_genesis.as_ref().unwrap();
+        let lazy_pages = lazy
+            .page_ids()
+            .map(|page_id| {
+                let page = lazy.page(page_id).unwrap().unwrap();
+                (page.home_document_id, page.document_checkpoint)
+            })
+            .collect::<Vec<_>>();
+        let lazy_snapshot = ShardedHotEngine::canonical_snapshot_from_lazy_genesis_for_test(
+            workspace,
+            LineageDigest::of(b"streaming-differential-snapshot"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            &lazy.catalog_checkpoint().unwrap(),
+            lazy_pages,
+        )
+        .unwrap();
+        assert_eq!(lazy_snapshot, old_snapshot);
+        let candidate = std::sync::Arc::new(streaming.lazy_genesis.take().unwrap());
+        let first_page = candidate
+            .page(candidate.page_ids().next().unwrap())
+            .unwrap()
+            .unwrap();
+        let first_block = first_page.blocks.first().unwrap();
+        let edit = |content: &str| {
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: first_block.block_id,
+                    home_document_id: first_block.home_document_id,
+                },
+                content: content.to_owned(),
+            }])
+            .unwrap()
+        };
+        for (ordinal, content) in [(1_u128, "left first edit"), (2, "right first edit")] {
+            let mut engine = ShardedHotEngine::new(
+                workspace,
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            let frontier = engine.accepted_frontier_root().unwrap();
+            assert_eq!(
+                frontier.genesis().unwrap().root(),
+                candidate.root(),
+                "accepted frontier must bind the exact immutable genesis"
+            );
+            assert_eq!(
+                frontier.document_count(),
+                candidate.page_count() as u64 + 1,
+                "accepted frontier must include every page and the catalog causal baseline"
+            );
+            assert_eq!(
+                engine.lazy_genesis_resident_page_documents_for_test(),
+                0,
+                "install must not eagerly open untouched page documents"
+            );
+            assert_eq!(engine.canonical_snapshot().unwrap(), old_snapshot);
+            assert_eq!(engine.lazy_genesis_resident_page_documents_for_test(), 0);
+            engine
+                .draft_author_transaction(
+                    AuthorBatch {
+                        batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e20 + ordinal)),
+                        author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e30 + ordinal)),
+                        author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e40 + ordinal)),
+                        crdt_peer_id: CrdtPeerId::from_u64(0x5e50 + ordinal as u64),
+                    },
+                    BatchOrigin::LocalMutation,
+                    &edit(content),
+                )
+                .unwrap();
+        }
+        let mut renamed = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+        );
+        renamed
+            .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+            .unwrap();
+        let renamed_name = LogicalPageName::parse("Lazy Genesis Renamed").unwrap();
+        let renamed_path = ManagedPath::parse("pages/lazy-genesis-renamed.md").unwrap();
+        let rename = renamed
+            .prepare_bootstrap_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e58)),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e59)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e5a)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5e5b),
+                },
+                &OperationTransaction::new(vec![
+                    SemanticOperation::RenamePagesAndRewriteReferrers {
+                        page_changes: vec![super::super::PageRename {
+                            page_id: first_page.page_id,
+                            new_name: renamed_name.clone(),
+                            new_path: renamed_path.clone(),
+                        }],
+                        block_rewrites: Vec::new(),
+                        page_preamble_rewrites: Vec::new(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            renamed
+                .stage_ready(super::super::ValidatedBatch::new(rename))
+                .disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        let renamed_page = renamed.materialize_page(first_page.page_id).unwrap();
+        assert_eq!(renamed_page.name, renamed_name);
+        assert_eq!(renamed_page.path, renamed_path);
         assert_eq!(
-            canonical_snapshot(&streaming_transaction),
-            canonical_snapshot(&old.transaction)
+            renamed
+                .accepted_frontier_root()
+                .unwrap()
+                .genesis()
+                .unwrap()
+                .root(),
+            candidate.root(),
+            "first page identity mutation must preserve genesis authority"
+        );
+        let make_engine = || {
+            let mut engine = ShardedHotEngine::new(
+                workspace,
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            engine
+        };
+        let base = make_engine();
+        let left_author = AuthorBatch {
+            batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e61)),
+            author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e62)),
+            author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e63)),
+            crdt_peer_id: CrdtPeerId::from_u64(0x5e64),
+        };
+        let right_author = AuthorBatch {
+            batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e71)),
+            author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e72)),
+            author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e73)),
+            crdt_peer_id: CrdtPeerId::from_u64(0x5e74),
+        };
+        let left = base
+            .prepare_bootstrap_transaction(left_author, &edit("left concurrent edit"))
+            .unwrap();
+        let right = base
+            .prepare_bootstrap_transaction(right_author, &edit("right concurrent edit"))
+            .unwrap();
+        let merge = |prepared: [PreparedBatch; 2]| {
+            let mut merged = make_engine();
+            for prepared in prepared {
+                let outcome = merged.stage_ready(super::super::ValidatedBatch::new(prepared));
+                assert!(
+                    matches!(
+                        outcome.disposition,
+                        super::super::BatchDisposition::Accepted { .. }
+                    ),
+                    "concurrent lazy-genesis batch refused: {:?}",
+                    outcome.disposition
+                );
+            }
+            assert_eq!(
+                merged
+                    .accepted_frontier_root()
+                    .unwrap()
+                    .genesis()
+                    .unwrap()
+                    .root(),
+                candidate.root(),
+                "ordinary accepted events must preserve the genesis authority binding"
+            );
+            let merged_page = merged.materialize_page(first_page.page_id).unwrap();
+            merged_page
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content
+                .clone()
+        };
+        let forward = merge([left.clone(), right.clone()]);
+        let reverse = merge([right.clone(), left.clone()]);
+        assert_eq!(forward, reverse, "concurrent first edits did not converge");
+        assert!(
+            forward != first_block.content
+                && forward != "left concurrent edit"
+                && forward != "right concurrent edit",
+            "concurrent lazy-genesis edits collapsed instead of merging: {:?}",
+            forward
+        );
+
+        let archive_path = root.path().join("lazy-genesis-scratch-archive");
+        let scratch_writer = ObjectStore::open(&archive_path, workspace).unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&left)
+            .unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&right)
+            .unwrap();
+        let make_scratch_engine = || {
+            let mut engine = ShardedHotEngine::with_archive_store(
+                ObjectStore::open(&archive_path, workspace).unwrap(),
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            assert_eq!(engine.lazy_genesis_resident_page_documents_for_test(), 0);
+            engine
+        };
+        let scratch_merge = |batch_ids: [BatchId; 2]| {
+            let mut merged = make_scratch_engine();
+            for batch_id in batch_ids {
+                let outcome = merged.stage_archive_batch(batch_id).unwrap();
+                assert!(
+                    matches!(
+                        outcome.disposition,
+                        super::super::BatchDisposition::Accepted { .. }
+                    ),
+                    "scratch-backed concurrent lazy-genesis batch refused: {:?}",
+                    outcome.disposition
+                );
+            }
+            let merged_page = merged.materialize_page(first_page.page_id).unwrap();
+            merged_page
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content
+                .clone()
+        };
+        assert_eq!(
+            scratch_merge([left.manifest().batch_id(), right.manifest().batch_id()]),
+            scratch_merge([right.manifest().batch_id(), left.manifest().batch_id()]),
+            "scratch-backed concurrent first edits did not converge"
+        );
+
+        let mut sequential = make_scratch_engine();
+        let first_outcome = sequential
+            .stage_archive_batch(left.manifest().batch_id())
+            .unwrap();
+        assert!(matches!(
+            first_outcome.disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        let second = sequential
+            .prepare_bootstrap_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e81)),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e82)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e83)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5e84),
+                },
+                &edit("ordinary receipt supersedes genesis"),
+            )
+            .unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&second)
+            .unwrap();
+        let second_outcome = sequential
+            .stage_archive_batch(second.manifest().batch_id())
+            .unwrap();
+        assert!(matches!(
+            second_outcome.disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        assert_eq!(
+            sequential
+                .materialize_page(first_page.page_id)
+                .unwrap()
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content,
+            "ordinary receipt supersedes genesis"
         );
         assert_eq!(
             capture
@@ -12068,6 +15352,183 @@ mod tests {
                 .as_str(),
             "Root.md"
         );
+    }
+
+    #[test]
+    fn in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains(&format!(
+            "at or below {} MiB",
+            BOOTSTRAP_OPERATION_MEMORY_BYTES / (1024 * 1024)
+        )));
+        let root = TestRoot::new("bootstrap-memory-spill-differential");
+        let graph_root = root.path().join("graph");
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        let unique = Uuid::from_u128(0x5e80_0001);
+        let duplicate = Uuid::from_u128(0x5e80_0002);
+        fs::write(
+            graph_root.join("pages/alpha.md"),
+            format!(
+                "title:: Alpha\n\n- parent\n  id:: {unique}\n  - child\n- duplicate one\n  id:: {duplicate}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            graph_root.join("pages/beta.md"),
+            format!("- duplicate two\n  id:: {duplicate}\n- plain\n"),
+        )
+        .unwrap();
+        let graph = Graph::open(&graph_root);
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5e80_1000));
+        let lineage = LineageDigest::of(b"bootstrap-memory-spill-differential");
+        let catalog_document_id = DocumentId::from_uuid(Uuid::from_u128(0x5e80_2000));
+
+        let prepare = |label: &str, memory_limit: usize| {
+            let capture_scratch = root.path().join(format!("capture-{label}"));
+            let preparation_scratch = root.path().join(format!("preparation-{label}"));
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            force_next_bootstrap_operation_memory_limit(memory_limit);
+            prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                lineage,
+                catalog_document_id,
+                ReferenceCatalogPolicyV1::default(),
+                &target_catalog(&root.path().join(format!("archive-{label}")), workspace),
+                &preparation_scratch,
+            )
+            .unwrap()
+        };
+
+        let memory = prepare("memory", usize::MAX);
+        let spilled = prepare("spilled", 0);
+        assert!(!memory.instrumentation().operation_builder_spilled);
+        assert!(spilled.instrumentation().operation_builder_spilled);
+        assert!(memory.instrumentation().operation_builder_retained_bytes > 0);
+        assert_eq!(
+            memory.aggregate_bytes().unwrap(),
+            spilled.aggregate_bytes().unwrap()
+        );
+        assert_eq!(
+            memory.commit().encode().unwrap(),
+            spilled.commit().encode().unwrap()
+        );
+        assert_eq!(
+            memory.instrumentation().operations,
+            spilled.instrumentation().operations
+        );
+        assert_eq!(
+            memory.instrumentation().parts,
+            spilled.instrumentation().parts
+        );
+        let memory_genesis = memory
+            .terminal_construction
+            .as_ref()
+            .unwrap()
+            .lazy_genesis
+            .as_ref()
+            .unwrap();
+        let spilled_genesis = spilled
+            .terminal_construction
+            .as_ref()
+            .unwrap()
+            .lazy_genesis
+            .as_ref()
+            .unwrap();
+        assert_eq!(memory_genesis.root(), spilled_genesis.root());
+        assert_eq!(
+            memory_genesis.catalog_checkpoint().unwrap(),
+            spilled_genesis.catalog_checkpoint().unwrap()
+        );
+        let alpha_path = ManagedPath::parse("pages/alpha.md").unwrap();
+        let alpha_id = memory
+            .aggregate()
+            .import_id()
+            .unmatched_page_id(&ImportLocator::page(alpha_path));
+        let alpha = memory_genesis.page(alpha_id).unwrap().unwrap();
+        let unique = LogseqUuid::from_uuid(unique);
+        let duplicate = LogseqUuid::from_uuid(duplicate);
+        let unique_block = alpha
+            .blocks
+            .iter()
+            .find(|block| block.external_uuid_claims == vec![unique])
+            .unwrap();
+        let duplicate_block = alpha
+            .blocks
+            .iter()
+            .find(|block| block.external_uuid_claims == vec![duplicate])
+            .unwrap();
+        let checkpoint = loro::LoroDoc::new();
+        assert!(checkpoint
+            .import(&alpha.document_checkpoint)
+            .unwrap()
+            .pending
+            .is_none());
+        let identities = checkpoint.get_map("logseq_uuids");
+        assert_eq!(
+            match identities.get(&unique_block.block_id.to_string()) {
+                Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value))) => {
+                    Some((*value).clone())
+                }
+                _ => None,
+            },
+            Some(unique.to_string())
+        );
+        assert!(identities
+            .get(&duplicate_block.block_id.to_string())
+            .is_none());
+    }
+
+    #[test]
+    fn clean_external_planning_uses_sqlite_path_ownership_without_a_native_index() {
+        let source = include_str!("import.rs");
+        let entry = source
+            .split_once("pub(crate) fn plan_clean_affected_import(")
+            .and_then(|(_, tail)| tail.split_once("fn clean_sqlite_path_owner("))
+            .map(|(body, _)| body)
+            .expect("clean external planner must remain identifiable");
+        assert!(entry.contains("database: &SqliteFrontier"));
+        assert!(entry.contains("capture_clean_import_scope("));
+        assert!(entry.contains("database,"));
+        assert!(entry.contains("Some(database)"));
+
+        let authority = source
+            .split_once("fn clean_sqlite_path_owner(")
+            .and_then(|(_, tail)| tail.split_once("fn capture_clean_import_scope("))
+            .map(|(body, _)| body)
+            .expect("clean SQLite predecessor authority must remain identifiable");
+        assert!(authority.contains("materialized_read()"));
+        assert!(authority.contains("pages_by_path(path, 2)"));
+        assert!(!authority.contains("current_page_at_path"));
+        assert!(!authority.contains("projection_work_index"));
+
+        let name_authority = source
+            .split_once("impl<'a> PageNameAuthority<'a> {")
+            .and_then(|(_, tail)| tail.split_once("fn retain_authoritative_desired_pages("))
+            .map(|(body, _)| body)
+            .expect("page-name authority must remain identifiable");
+        assert!(name_authority.contains("clean_database: Option<&'a SqliteFrontier>"));
+        assert!(name_authority.contains("causal_page_name_identity_record"));
+        assert!(name_authority.contains("current_page_for_logical_name"));
+        let name_preflight = source
+            .split_once("fn preflight_desired_page_names(")
+            .and_then(|(_, tail)| tail.split_once("struct CurrentImportBlock"))
+            .map(|(body, _)| body)
+            .expect("page-name preflight must remain identifiable");
+        assert!(name_preflight.contains("authority: &PageNameAuthority<'_>"));
+
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("SQLite owns current exact\npath identity"));
+        assert!(contract.contains("and current canonical page-name identity"));
+        assert!(contract.contains("does not reacquire its\nlogical name"));
+        assert!(contract.contains("must not ask a native\nPatricia path or page-name index"));
+        assert!(contract.contains("acquires no identity: no page is created for it"));
+        assert!(contract.contains("selects the first exact path per portable identity"));
     }
 
     fn orchestration_binding(
@@ -12378,18 +15839,6 @@ mod tests {
                 u64::from(descriptor.acceptance_sequence())
             );
         }
-        let terminal = prepared.engine_materials.last().unwrap();
-        let terminal_frontier = prepared.candidate().accepted_frontier_root().unwrap();
-        assert_eq!(
-            terminal.reference_catalog_root(),
-            terminal_frontier.reference_catalog_root(),
-            "the terminal accepted record must bind the complete catalog"
-        );
-        assert_eq!(
-            terminal.reference_catalog_root().source_count(),
-            page_transitions.len() as u64,
-            "the terminal catalog must contain both reference-bearing sources"
-        );
         (root, prepared, workspace)
     }
 
@@ -12627,7 +16076,10 @@ mod tests {
         }
     }
 
-    fn run_external_semantic_differential(case: ExternalSemanticDifferentialCase, seed: u128) {
+    fn run_clean_external_semantic_differential(
+        case: ExternalSemanticDifferentialCase,
+        seed: u128,
+    ) {
         let initial_paths = case
             .initial
             .iter()
@@ -12638,10 +16090,41 @@ mod tests {
             .iter()
             .map(|document| document.name)
             .collect::<Vec<_>>();
+        let clean_initial_names = initial_names
+            .iter()
+            .map(|name| {
+                if case.label == "matrix-exact-byte-unanchored-move" {
+                    "old"
+                } else {
+                    *name
+                }
+            })
+            .collect::<Vec<_>>();
         let initial_contents = case
             .initial
             .iter()
             .map(|document| document.content)
+            .collect::<Vec<_>>();
+        let clean_baseline_contents = case
+            .initial
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                if index == 0 && case.initial_uuid.is_some() {
+                    document
+                        .content
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("id::"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    document.content.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        let clean_baseline_content_refs = clean_baseline_contents
+            .iter()
+            .map(String::as_str)
             .collect::<Vec<_>>();
         let initial_preambles = case
             .initial
@@ -12651,7 +16134,7 @@ mod tests {
         assert!(
             initial_preambles.iter().all(Option::is_some)
                 || initial_preambles.iter().all(Option::is_none),
-            "{}: SnapshotFixture requires uniform initial preamble presence",
+            "{}: CleanSnapshotFixture requires uniform initial preamble presence",
             case.label
         );
         let preambles = initial_preambles.iter().all(Option::is_some).then(|| {
@@ -12660,96 +16143,106 @@ mod tests {
                 .map(|preamble| preamble.unwrap())
                 .collect::<Vec<_>>()
         });
-        let fixture = SnapshotFixture::new_with_initial_uuid_and_config(
+        let mut fixture = CleanSnapshotFixture::new_with_initial_uuid_and_config(
             case.label,
             &initial_paths,
-            case.initial_uuid,
+            None,
             case.initial_config,
-            Some(&initial_names),
-            Some(&initial_contents),
+            Some(&clean_initial_names),
+            Some(&clean_baseline_content_refs),
             preambles.as_deref(),
         );
+        if case.initial_uuid.is_some() {
+            for (index, document) in case.initial.iter().enumerate() {
+                let source = clean_snapshot_source(
+                    document.path,
+                    document.preamble,
+                    initial_contents[index],
+                    None,
+                );
+                fs::write(fixture.graph_root.join(document.path), source).unwrap();
+            }
+            fixture.apply_external_paths(&initial_paths);
+        }
+        let clean_current = case
+            .current
+            .iter()
+            .copied()
+            .map(|document| {
+                if case.label == "matrix-referrer-unchanged-restart"
+                    && document.path == "pages/referrer.md"
+                {
+                    DifferentialCurrentDocument {
+                        bytes: "title:: Referrer\n\n- see [[Old Logical]] and [[New Logical]]\n",
+                        graph_name: "Referrer",
+                        ..document
+                    }
+                } else {
+                    document
+                }
+            })
+            .collect::<Vec<_>>();
         let retained = case
             .retained_initial
             .iter()
-            .map(|(path, index)| (*path, fixture.intents[*index].page_id()))
+            .map(|(path, index)| (*path, fixture.page_id(*index)))
             .collect::<Vec<_>>();
+        write_differential_current(
+            &fixture.graph_root,
+            case.current_config,
+            &clean_current,
+            &case.affected,
+        );
         let unchanged = case
             .unchanged_bytes
             .iter()
             .map(|path| (*path, fs::read(fixture.graph_root.join(path)).unwrap()))
             .collect::<Vec<_>>();
-        write_differential_current(
-            &fixture.graph_root,
-            case.current_config,
-            &case.current,
-            &case.affected,
-        );
         let mut fixture = fixture.reopen_after_config_change();
+
+        if case.collision {
+            let plan = fixture.plan(&case.affected);
+            assert!(plan.blocks().is_empty(), "{plan:?}");
+            assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+            let material = plan
+                .execution_material()
+                .expect("collision case reconciles");
+            let created = material
+                .transaction()
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    SemanticOperation::CreatePage { name, path, .. } => {
+                        Some((path.as_str().to_owned(), name.as_str().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                created,
+                vec![("pages/first.md".to_owned(), "Shared Explicit".to_owned())],
+                "{plan:?}"
+            );
+            assert!(
+                material
+                    .observation()
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().as_str() == "pages/second.md"
+                        && entry.state().bytes().is_some()
+                        && entry.state().annotations().is_empty()),
+                "the withheld duplicate is still observed exactly: {plan:?}"
+            );
+            return;
+        }
 
         let bootstrap_files = case
             .current
             .iter()
             .map(|document| (document.path, document.bytes))
             .collect::<Vec<_>>();
-        if case.collision {
-            let collision_root = TestRoot::new(&format!("{}-bootstrap-collision", case.label));
-            write_differential_current(
-                &collision_root.path().join("graph"),
-                case.current_config,
-                &case.current,
-                &case.affected,
-            );
-            let graph = Graph::open(&collision_root.path().join("graph"));
-            for document in &case.current {
-                let page = graph.load_by_path(document.path).unwrap().unwrap();
-                assert_eq!(page.name, document.graph_name);
-            }
-            let capture_scratch = collision_root.path().join("capture");
-            let preparation_scratch = collision_root.path().join("preparation");
-            fs::create_dir(&capture_scratch).unwrap();
-            fs::create_dir(&preparation_scratch).unwrap();
-            let capture = graph
-                .capture_inactive_bootstrap_sources(&capture_scratch)
-                .unwrap();
-            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a01));
-            let prepared = prepare_inactive_bootstrap_import(
-                &graph,
-                capture,
-                workspace,
-                LineageDigest::of(b"inactive-streaming-bootstrap-test"),
-                DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
-                ReferenceCatalogPolicyV1::default(),
-                &target_catalog(&collision_root.path().join("archive"), workspace),
-                &preparation_scratch,
-            )
-            .unwrap();
-            let mut captured = prepared.source_capture().entries_cursor().unwrap();
-            let mut captured_names = Vec::new();
-            while let Some(entry) = captured.next().unwrap() {
-                captured_names.push((
-                    entry.path().as_str().to_owned(),
-                    entry.logical_name().to_owned(),
-                ));
-            }
-            assert_eq!(
-                captured_names,
-                vec![
-                    ("pages/first.md".into(), "Shared Explicit".into()),
-                    ("pages/second.md".into(), "Shared Explicit".into()),
-                ]
-            );
-            let plan = fixture.plan(&case.affected);
-            assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
-            assert!(plan
-                .blocks()
-                .iter()
-                .any(|block| block.reason == ImportBlockReason::ConflictingLocalTail));
-            return;
-        }
-
         let (bootstrap_root, prepared, workspace) = prepare_streaming_bootstrap_with_config(
-            &format!("{}-bootstrap", case.label),
+            &format!("{}-clean-bootstrap", case.label),
             case.current_config,
             &bootstrap_files,
         );
@@ -12757,7 +16250,7 @@ mod tests {
             &bootstrap_root,
             &prepared,
             workspace,
-            0x7900 + seed,
+            0x7b00 + seed,
             "archive",
         );
         let bootstrap_runtime =
@@ -12783,31 +16276,8 @@ mod tests {
 
         let plan = fixture.plan(&case.affected);
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
-        fixture.apply_external_plan(plan, 0x7a00 + seed);
-        loop {
-            let Some(work) = fixture
-                .engine
-                .projection_work_index()
-                .unwrap()
-                .next()
-                .unwrap()
-            else {
-                break;
-            };
-            execute_manifested_projection_work(
-                &fixture.graph,
-                &fixture.receipts,
-                &mut fixture.engine,
-                &work,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{}: projection failed: {error:?}; work={work:#?}",
-                    case.label
-                )
-            });
-        }
-        for document in &case.current {
+        fixture.apply_external_paths(&case.affected);
+        for document in &clean_current {
             if case.affected.contains(&document.path) {
                 assert_eq!(
                     fs::read(fixture.graph_root.join(document.path)).unwrap(),
@@ -12826,25 +16296,12 @@ mod tests {
             );
         }
 
-        let fixture = fixture.reopen_after_config_change();
-        let runtime =
-            ApplicationRuntimeRoot::open_for_test(&fixture._root.path().join("steady-runtime"))
-                .unwrap();
-        let claim = ProjectionClaim::current(
-            fixture.engine.workspace_id(),
-            fixture.engine.lineage_digest(),
-        );
-        let source =
-            RebuildSource::new(&fixture.engine, fixture.engine.archive_store().unwrap()).unwrap();
-        let sqlite_path = fixture._root.path().join("steady.sqlite");
-        let opened =
-            SqliteFrontier::open_or_rebuild(&sqlite_path, &runtime, claim, source).unwrap();
-        for document in case.current.iter().copied() {
+        for document in clean_current.iter().copied() {
             let page_id = assert_external_semantic_observation(
                 case.label,
                 &Graph::open(&fixture.graph_root),
-                &fixture.engine,
-                &opened.database,
+                fixture.engine(),
+                fixture.runtime.database(),
                 document,
                 false,
             );
@@ -12854,25 +16311,18 @@ mod tests {
                 assert_eq!(page_id, *retained_page_id, "{}: PageId changed", case.label);
             }
         }
-        drop(opened);
-        let reopened = SqliteFrontier::open_or_rebuild(
-            &sqlite_path,
-            &runtime,
-            claim,
-            RebuildSource::new(&fixture.engine, fixture.engine.archive_store().unwrap()).unwrap(),
-        )
-        .unwrap();
-        for document in case.current.iter().copied() {
+
+        let fixture = fixture.reopen_after_config_change();
+        for document in clean_current.iter().copied() {
             assert_external_semantic_observation(
                 case.label,
                 &Graph::open(&fixture.graph_root),
-                &fixture.engine,
-                &reopened.database,
+                fixture.engine(),
+                fixture.runtime.database(),
                 document,
                 false,
             );
         }
-        drop(reopened);
         let reimport = fixture.plan(&case.affected);
         assert_eq!(
             reimport.status(),
@@ -12882,8 +16332,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn external_document_semantic_cases_share_bootstrap_steady_sqlite_and_restart_oracles() {
+    fn external_semantic_differential_cases() -> Vec<ExternalSemanticDifferentialCase> {
         const LEGACY: &str = "{:file/name-format :legacy}\n";
         const TRIPLE: &str = "{:file/name-format :triple-lowbar}\n";
         const JOURNAL_OLD: &str = "{:journal/file-name-format \"dd-MM-yyyy\"\n\
@@ -12901,7 +16350,7 @@ mod tests {
             content: "seed",
             preamble: None,
         };
-        let cases = vec![
+        vec![
             ExternalSemanticDifferentialCase {
                 label: "matrix-new-markdown-title",
                 initial_config: None,
@@ -13305,17 +16754,24 @@ mod tests {
                 unchanged_bytes: vec![],
                 collision: true,
             },
-        ];
-        for (index, case) in cases.into_iter().enumerate() {
-            run_external_semantic_differential(case, index as u128);
+        ]
+    }
+
+    #[test]
+    fn external_document_semantic_cases_share_bootstrap_steady_sqlite_and_restart_oracles_clean() {
+        for (index, case) in external_semantic_differential_cases()
+            .into_iter()
+            .enumerate()
+        {
+            run_clean_external_semantic_differential(case, index as u128);
         }
     }
 
     #[test]
-    fn fresh_attack_anchored_crlf_move_projects_and_stabilizes() {
-        run_external_semantic_differential(
+    fn fresh_attack_anchored_crlf_move_projects_and_stabilizes_clean() {
+        run_clean_external_semantic_differential(
             ExternalSemanticDifferentialCase {
-                label: "fresh-attack-anchored-crlf-move",
+                label: "fresh-attack-anchored-crlf-move-clean",
                 initial_config: None,
                 current_config: None,
                 initial: vec![DifferentialInitialDocument {
@@ -13342,10 +16798,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_attack_anchored_crlf_markdown_to_org_move_projects_and_stabilizes() {
-        run_external_semantic_differential(
+    fn fresh_attack_anchored_crlf_markdown_to_org_move_projects_and_stabilizes_clean() {
+        run_clean_external_semantic_differential(
             ExternalSemanticDifferentialCase {
-                label: "fresh-attack-anchored-crlf-markdown-to-org-move",
+                label: "fresh-attack-anchored-crlf-markdown-to-org-move-clean",
                 initial_config: None,
                 current_config: None,
                 initial: vec![DifferentialInitialDocument {
@@ -13372,20 +16828,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_attack_move_destination_changed_after_observation_refuses_without_overwrite() {
-        let fixture = SnapshotFixture::new_with_initial_uuid(
-            "fresh-attack-move-destination-stale",
-            &["pages/old.md"],
-            Some(LogseqUuid::from_uuid(Uuid::from_u128(0x5300c))),
-        );
+    fn fresh_attack_move_destination_changed_after_observation_refuses_without_overwrite_clean() {
+        let mut fixture =
+            CleanSnapshotFixture::new("fresh-attack-move-destination-stale", &["pages/old.md"]);
+        fs::write(
+            fixture.graph_root.join("pages/old.md"),
+            b"- page 0\n  id:: 00000000-0000-0000-0000-00000005300c\n",
+        )
+        .unwrap();
+        fixture.apply_external_paths(&["pages/old.md"]);
         let destination = fixture.graph_root.join("pages/new.md");
         fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
         let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
         let material = plan.into_execution_material().unwrap();
-        let endpoint = fixture.engine.projection_endpoint_binding().unwrap();
+        let endpoint = fixture.engine().projection_endpoint_binding().unwrap();
         let draft = fixture
-            .engine
+            .engine()
             .draft_external_import_transaction(
                 AuthorBatch {
                     batch_id: material.batch_id(),
@@ -13400,12 +16859,11 @@ mod tests {
         fs::write(&destination, &changed).unwrap();
 
         assert!(matches!(
-            fixture.engine.capture_external_author_transaction(
+            fixture.engine().capture_external_author_transaction(
                 draft,
                 &fixture.graph,
                 &fixture.receipts,
                 endpoint,
-                None,
             ),
             Err(crate::oplog::EngineError::ProjectionManifest(message))
                 if message.contains("observation") && message.contains("stale")
@@ -13723,13 +17181,6 @@ mod tests {
         assert!(!truncated_archive.join("projection-work").exists());
     }
 
-    // Quarantined for v0.6.92, not repaired: the rebuild reports zero
-    // inductive reference-coverage checks where this expects one per accepted
-    // part. Open as GH #314, which records what is established and what still
-    // has to be read in tine-storage to decide whether the assertion is stale
-    // or a per-part verification step stopped running. Deliberately not
-    // relaxed to make the release gate green. Un-ignore with the answer.
-    #[ignore = "GH #314: bootstrap rebuild reports zero inductive reference-coverage checks"]
     #[test]
     fn inactive_bootstrap_sqlite_rebuilds_zero_one_and_forced_multipart_exactly() {
         let (zero_root, zero, workspace) =
@@ -13870,20 +17321,23 @@ mod tests {
         assert_eq!(multi_opened.rebuild.accepted_events_applied, parts);
         assert_eq!(multi_opened.rebuild.max_live_events, 1);
         assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
-        // One, not one per part, for both of these, and that is the point: the
-        // accepted root is authenticated once per rebuild and the exact catalog
-        // is loaded once, however many parts the publication has. Pinning the
-        // literals keeps it that way — a `<= parts` bound would pass while
-        // quietly letting a large graph's rebuild scale with its part count
-        // again. The two counters above stay per-part, because validating and
-        // applying each accepted event is exactly what a part costs.
+        // The accepted root and the still-transitional history catalog are each
+        // loaded once per rebuild, however many parts the publication has.
+        // Pinning these literals keeps that boundedness explicit: a `<= parts`
+        // bound would pass while quietly letting a large graph's rebuild scale
+        // with its part count again. The two counters above stay per-part,
+        // because validating and applying each accepted event is exactly what
+        // a part costs. The catalog load disappears with the subsequent
+        // history-authority deletion packet; it is no longer consulted by the
+        // parser-derived SQLite projection in this packet.
         assert_eq!(multi_opened.rebuild.accepted_root_authentications, 1);
         assert_eq!(multi_opened.rebuild.exact_catalog_loads, 1);
-        assert_eq!(
-            multi_opened.rebuild.reference_coverage_inductive_checks,
-            multi.aggregate().parts().len()
-        );
-        assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 1);
+        // Terminal bootstrap construction intentionally does not replay each
+        // part's reference delta. It authenticates and applies every accepted
+        // event above, then seeds parser-derived reference rows as disposable
+        // state.
+        // There is no longer a reference-coverage proof or scan in the SQLite
+        // path (GH #314).
         assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.physical_candidate_transactions, 1);
@@ -14369,12 +17823,7 @@ mod tests {
             (
                 "insert extra materialization batch row",
                 "INSERT INTO materialization_batches
-                 SELECT 1000, randomblob(16), input_digest, event_binding_digest,
-                        prior_frontier_root_digest, post_frontier_root_digest,
-                        prior_catalog_root, prior_catalog_root_digest,
-                        post_catalog_root, post_catalog_root_digest,
-                        catalog_change, catalog_change_digest,
-                        canonical_input_digest
+                 SELECT 1000, randomblob(16), input_digest
                  FROM materialization_batches WHERE acceptance_sequence = 1",
             ),
         ];

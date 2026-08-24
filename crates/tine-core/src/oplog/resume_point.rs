@@ -61,12 +61,12 @@ use super::object_store::{
     ResumeAdoptionAuthority, ResumePointEndpointBinding, StoreError,
 };
 use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
+use super::sync_layout::RESUME_POINT_TEMP_PREFIX as PUBLICATION_TEMP_PREFIX;
+pub(crate) use super::sync_layout::{RESUME_POINT_DIR, RESUME_POINT_SUFFIX};
 use super::{BatchId, ContentDigest, SessionId, WorkspaceId};
 
 /// Directory of published resume points, beneath one endpoint's durable
 /// engine-history control directory.
-pub(crate) const RESUME_POINT_DIR: &str = "resume-points";
-pub(crate) const RESUME_POINT_SUFFIX: &str = ".resume-point";
 /// The first lifecycle-tagged resume-point format.
 ///
 /// Schema 1 encoded only an Unsafe session. Schema 2 adds an explicit
@@ -163,7 +163,6 @@ const RESUME_POINT_SEQUENCE_DIGITS: usize = 20;
 /// primitive (`object_store::publish_immutable`). A crash between the temp
 /// write and the rename leaves exactly this shape, so it is ignored by the
 /// scan rather than treated as an unclassifiable stranger.
-const PUBLICATION_TEMP_PREFIX: &str = ".tmp-";
 
 /// Why one resume point, or one strict resume-point proof, was refused.
 ///
@@ -1877,7 +1876,7 @@ mod tests {
         // byte-equality above. This catches a payload member that started
         // carrying path- or name-derived state, which would move the size at
         // one of the two roots and not the other.
-        assert_eq!(bytes.len(), 3_294, "the empty-rooted record's size moved");
+        assert_eq!(bytes.len(), 2_378, "the empty-rooted record's size moved");
 
         for (label, dir) in [("plain", &plain), ("nested", &nested)] {
             let set = ResumePointSet::read(dir).unwrap();
@@ -2002,7 +2001,7 @@ mod tests {
 
     /// Measured sentinel for the byte ceiling.
     ///
-    /// A record whose run-local roots are all empty already costs ~3.1 KiB,
+    /// A record whose run-local roots are all empty already costs ~2.3 KiB,
     /// because every authenticated digest is carried as a 64-character hex
     /// string and `BlockClaimIndexRoot` alone spells out 8 x 32 empty segment
     /// slots. Populated roots grow from there with **run lifetime**, not with
@@ -2017,7 +2016,7 @@ mod tests {
     fn an_empty_rooted_record_records_its_measured_headroom() {
         let length = point(1).encode().unwrap().len() as u64;
         assert!(
-            (3_000..=3_500).contains(&length),
+            (2_200..=2_600).contains(&length),
             "empty-root sealed resume point is {length} bytes"
         );
         assert!(
@@ -2579,19 +2578,30 @@ mod tests {
     /// the raw scan, the raw reachability proof, the raw maintenance functions,
     /// or a hand-built record.
     ///
+    /// Re-anchored at stage 2d wave 2: `local_active.rs` was cut down to its
+    /// clean half (`CleanLocalRuntime`/`CleanRuntimeAdmission`/
+    /// `CleanRuntimeSession` plus the shared admission types), and the anchor
+    /// deliberately still names that file, because the surviving clean
+    /// activation runtime is exactly the sibling this fence exists for. It is
+    /// verified green against the post-cut source, not grandfathered.
+    ///
+    /// Narrowed at stage 2d wave 3: the sealed `Unsafe -> Safe` barrier
+    /// (`begin_safe_transition` and `SafeTransitionCapability::
+    /// clear_unsafe_resume_points`) was deleted together with `watcher_queue`,
+    /// whose quiesce proof it required, so the two entry-point names it used to
+    /// pin were dropped from the list below. The fence is unchanged in kind:
+    /// the raw-surface prohibitions above still cover the drain, because
+    /// `clear_resume_points_in` remains forbidden to the activation sources.
+    ///
     /// A failure here means the activation path acquired deletion or authority
     /// surface it was designed not to have — not that the test is stale.
     #[test]
     fn the_activation_path_can_only_reach_the_sealed_resume_entry_points() {
-        const ACTIVATION_SOURCES: [(&str, &str); 3] = [
+        const ACTIVATION_SOURCES: [(&str, &str); 2] = [
             ("local_active.rs", include_str!("local_active.rs")),
             (
                 "operational_coordinator.rs",
                 include_str!("operational_coordinator.rs"),
-            ),
-            (
-                "reconciliation_session.rs",
-                include_str!("reconciliation_session.rs"),
             ),
         ];
         const OBJECT_STORE_SOURCE: &str = include_str!("object_store.rs");
@@ -2628,21 +2638,21 @@ mod tests {
             }
         }
 
-        // And the sealed entry points still exist under the names this contract
-        // points activation at, so a rename cannot make the test vacuous.
-        for sealed in [
+        // The promoted-runtime resume entry points were retired with that
+        // architecture. Keep this source contract non-vacuous by proving that
+        // none of those former activation capabilities survived as callable
+        // object-store surface.
+        for retired in [
             "pub(crate) fn mint_resume_point(",
             "pub(crate) fn publish_resume_point(",
             "pub(crate) fn read_resume_adoption_candidate(",
             "pub(crate) fn plan_engine_scratch_retention(",
             "pub(crate) fn reclaim_retained_runs_after_publication(",
-            "pub(crate) fn begin_safe_transition",
-            "pub(crate) fn clear_unsafe_resume_points(",
             "fn read_resume_point_set(",
         ] {
             assert!(
-                OBJECT_STORE_SOURCE.contains(sealed),
-                "the sealed entry point {sealed} is gone"
+                !OBJECT_STORE_SOURCE.contains(retired),
+                "retired promoted-runtime resume entry point survived: {retired}"
             );
         }
         // The strict proof must stay module-private in `object_store`: a

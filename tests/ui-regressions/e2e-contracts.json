@@ -31,8 +31,7 @@
    "nonRequirements": [
     "Exact indentation pixels or disclosure-icon artwork."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-11 (v0.6.92 candidate e7c73bcf): the journey has no readiness predicate for embedded content, so its failure point moves with timing. A DOM probe right after openTestPage found the exact failing selector matching (1 element, data-block-ref 66666666-... present inside the rendered embed), and a separate dump at the same point found the cross-page embed with its children not yet rendered. Two full-suite runs failed at exerciseArrowAndDelete; an instrumented run with one added await failed earlier instead, at exerciseDisclosure(CROSS) on .collapse-toggle.has-children. Embeds resolve their content asynchronously and the scenario clicks straight into it. That is a missing wait, not a lost user outcome. Keep running it for artifacts; restore release blocking only once it waits on a test-visible embed-content-ready boundary. Harness debt: GH #315."
+   "stability": "stable"
   },
   "scripts/e2e-block-ref-count.mjs": {
    "contracts": [
@@ -80,7 +79,8 @@
    "nonRequirements": [
     "Exact pixels, menu geometry, coordinate values, CSS/DOM nesting, timing, palette/order, or animation."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-17: harness debt, source-proven, not a product defect. The journey was written on 2026-08-11 (981e8ffd) and no suite, npm script or workflow ever selected it, so nothing noticed when 3d79497f \"fix(outliner): add OG-compatible nested block drops\" (2026-08-12, GH #326) landed one day later. That change added blockDropPosition(), which returns \"child\" whenever clientX - blockRect.left > 50 -- OG's deeper-than-50px nesting zone. This journey drops at target.left + width * 0.65, far beyond 50px, so B+C are now nested under E and the visible roots are A,D,E rather than A,D,E,B,C. Failed identically on two unchanged-binary runs at 4253d52b (72.3s, 72.0s; capsule step \"drag B+C from A bullet to after E\"). The drop x-coordinate is explicitly a nonRequirement of this very contract, so the repair belongs to the harness, not the product: aim the drop inside E's shallow (<= 50px from its left edge) zone and keep the vertical half that means \"after\". Quarantined under the AGENTS.md 2b E2E stop-loss after two attempts instead of debugging further; it stays selected by linux-release so its evidence is retained, and returns to stable with that coordinate repair."
   },
   "scripts/e2e-capabilities.mjs": {
    "contracts": [
@@ -673,6 +673,40 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-managed-force-close-recovery.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "On a real-scale graph, an existing-page edit saved through the visible managed editor survives a ten-second settle, SIGKILL of the actual Tine process, and restart with the same graph and private state; managed storage reopens actively and the exact edit remains in both UI and Markdown.",
+     "blocking": true,
+     "authority": "Tine managed-storage process-crash recovery and Markdown projection contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Native recovery remains visibly observable and reaches a usable graph without native.unavailable, a refusal loop, a silent hang, or recurring error notifications.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Emergency return remains actionable while managed recovery is still running, publishes Direct Files without waiting for managed recovery or changing managed evidence, and preserves a subsequent Direct edit across restart.",
+     "blocking": true,
+     "authority": "Native StorageModeSupervisor priority, Direct-selection receipt, and stale-publication contract"
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A healthy Settings return drains managed storage, confirms the Markdown projection, switches to Direct Files, and preserves the next Direct edit across restart.",
+     "blocking": true,
+     "authority": "Graceful managed-to-Direct transition contract"
+    }
+   ],
+   "acceptableVariations": [
+    "Activation, driver startup, and recovery durations may vary with corpus size and machine speed while progress remains observable and recovery completes within the scenario timeout."
+   ],
+   "nonRequirements": [
+    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing. Managed provider bytes may remain in place after emergency return because the private Direct-selection receipt is authoritative."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
     {
@@ -834,6 +868,42 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-sparse-v2-two-device.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Two installations with separate private app data can explicitly discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
+     "blocking": true,
+     "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "A fresh second device remains in Direct Files until the user explicitly asks to join, then discovers the provider state and becomes a writable managed-sync member.",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "While a file-sync tool is still delivering the shared provider tree, asking to join says the data is not ready yet rather than calling it unsafe, says it once instead of repeating, and the same running app joins successfully once the remaining bytes arrive, without a restart.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A device that already runs Tine-managed storage on its own graph is offered the same explicit join action, is told what happens to its own history, and its own post-activation edit stays readable across the attempt and the next restart.",
+     "blocking": true,
+     "authority": "Tine cross-device managed-storage enrollment and local managed-history retention contract"
+    }
+   ],
+   "acceptableVariations": [
+    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout.",
+    "The exact wording of the not-ready-yet notice, and the label of the join action in either storage mode.",
+    "The order in which a provider delivers files outside the canonical enrollment prefix."
+   ],
+   "nonRequirements": [
+    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout.",
+    "Enumerating every possible provider delivery ordering; the journey drives one fixed order through the enrollment prefix the discovery path keys on."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-windows-managed-storage.mjs": {
    "contracts": [
     {
@@ -949,6 +1019,81 @@
    "stability": "stable",
    "notes": "Added 2026-08-09 after a generated graph linked 29 papers by filename while every file declared a different title::; every link opened a blank page with nothing on screen to explain it. Logseq does NOT dim unresolved links (components/block.cljs:548 dims only untitled-page?, meaning a page existing under a uuid name), so the dimming is a deliberate, Martin-approved divergence and this journey is its contract."
   },
+  "scripts/e2e-concord-sync-copy.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord sync-copy handoff contract approved by Martin on 2026-08-22.",
+     "userOutcome": "A delivered conflict copy on today's journal is discovered in native-event and polling modes; applying keep-both or a same-content keep-mine result installs and durably retains the exact committed page, keeps today in the Journals feed, retires its notice, and ordinary post-resolution editing saves without reopening Concord before or after restart.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A newly delivered sync conflict becomes discoverable without first navigating to its page, while resolution remains explicit and non-modal.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The native event or focus fallback may discover the conflict before the other, provided the same derived queue and resolver result.",
+    "Notice wording and resolver labels may evolve while the conflict is actionable and both page versions are preserved."
+   ],
+   "nonRequirements": [
+    "Exact watcher event count, delivery latency within the generous wait, toast geometry, colors, or DOM nesting.",
+    "Generated block identities and conflict-trash filename."
+   ],
+      "stability": "burn-in",
+   "notes": "Added after field sequences where Apply wrote the merge but the pre-merge editor remained installed, then expanded when a current-journal resolution disappeared from the live feed and its sticky notice survived. The journey asserts the file, visible current journal, notice retirement, save-debounce settlement, copy retirement, and process restart in both watcher modes; TINE_E2E_CONCORD_DECISION=mine additionally proves that same-content handoff adopts the returned revision before ordinary editing resumes."
+  },
+  "scripts/e2e-concord-focus-freshness.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord live-focus contract: focus freshness is established before a stale editor can acquire input authority.",
+     "userOutcome": "After another device atomically replaces a page while Tine is backgrounded, returning and clicking immediately opens the editor on the external winner; the subsequent local edit preserves both changes.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The ordinary clean-page journey does not surface the retired Direct Files Keep mine / Use current conflict bar.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The watcher may notice the external replacement before the explicit focus rescan, provided the editor still opens on the external winner.",
+    "A perceptible refresh may show a small progress status before the editor activates."
+   ],
+   "nonRequirements": [
+    "Exact refresh-indicator styling, duration, DOM nesting, or watcher event count.",
+    "Exact pixel geometry or animation."
+   ],
+   "stability": "stable",
+   "notes": "Added for the suspended-laptop/Syncthing Concord redesign. It asserts rendered editor content and durable file bytes, not timing or DOM trivia."
+  },
+  "scripts/e2e-concord-live-save.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord live-save contract: a guarded save refusal retains both the editor draft and the exact disk winner across a process restart.",
+     "userOutcome": "A local draft racing an atomic external replacement appears in the page-level Concord resolver, survives restarting Tine, and can resolve with both sides into ordinary Markdown.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Direct Files conflicts use the in-page resolver and queue, never the retired global Keep mine / Use current bar.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Three-way suggestions may select one side where the common base proves it changed alone; the user can still choose either side or both.",
+    "Labels and explanatory wording may evolve while both texts remain visible and the guarded apply remains explicit."
+   ],
+   "nonRequirements": [
+    "Exact conflict colors, row geometry, button ordering, DOM nesting, or animation.",
+    "Exact generated block identities or save debounce duration."
+   ],
+   "stability": "stable",
+   "notes": "Added for the Concord live Direct Files redesign. It drives an actual guarded save conflict, full app restart, no-loss resolution, visible post-resolution state, and final file bytes."
+  },
   "scripts/e2e-dirty-editor-replacement.mjs": {
    "contracts": [
     {
@@ -985,7 +1130,7 @@
     "Which of the two same-named files the router treats as canonical."
    ],
    "stability": "quarantined",
-   "quarantineReason": "Harness debt, not a product defect. No user gesture opens a chosen file by path: the Quick Switcher row renders kind and name only, so two files sharing a page name are indistinguishable, and positional selection would be the brittle oracle the semantic-E2E contract forbids. See notes for the source-level confirmation.",
+   "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. No user gesture opens a chosen file by path: the Quick Switcher row renders kind and name only, so two files sharing a page name are indistinguishable, and positional selection would be the brittle oracle the semantic-E2E contract forbids. See notes for the source-level confirmation.",
    "notes": "GH #304, fixed in GH #254 increment 3. Two files legitimately share one page name (the duplicate-day stray of #21, or same-titled pages in different folders). Replacing the loaded instance destroyed the unsaved edit, and the dirty mark SURVIVED to describe the replacement's content, so the next save wrote the wrong file's bytes under the user's intent. The journey deliberately continues past 'the edit survived' to prove the refusal is not a trap: a survival-only assertion would pass on an implementation that never shows the requested file at all, which is why the non-wedging half is blocking rather than advisory. QUARANTINED 2026-08-10, harness debt. The first two assertions run green against the branch binary — the unsaved edit survives — but the journey drives the second file through an invented `#/page-path/...` hash route that the router does not implement, so the navigation never happens and the survival assertion passes VACUOUSLY. It is quarantined rather than deleted because the journey shape is right; what is missing is a real UI affordance for opening a same-named file by path (the duplicate-day journal conflicts list is the honest candidate). ROOT CAUSE CONFIRMED AT SOURCE 2026-08-10: no user gesture opens a chosen file by path. The router does support a path-pinned route (Page.tsx uses r.path -> getPageByPath), and the Quick Switcher is the only UI carrying a per-file path into openFile, but its row renders kind and name ONLY (QuickSwitcher.tsx Row), so two files sharing a page name are visually identical and a user cannot choose between them; selecting positionally would be exactly the brittle oracle the semantic-E2E contract forbids. No duplicates/conflicts list exists, and the router is not exposed on window, so browser.execute cannot reach openFile without adding a production test hook. The journey stays quarantined until such an affordance exists - which is itself the product gap GH #304's scenario implies. Until then the composition-level regressions in src/instanceReplacement.test.ts carry this contract; they drive the real store and both fail against the pre-fix code."
   },
   "scripts/e2e-conflict-keep-mine.mjs": {
@@ -1012,7 +1157,7 @@
     "The precise observation-epoch numbering."
    ],
    "stability": "quarantined",
-   "quarantineReason": "Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
+   "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
    "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit — a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation — and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
   }
  }

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
 
 type Platform = "desktop" | "android" | "ios";
 
@@ -104,7 +105,7 @@ describe("update checks", () => {
       "info",
       expect.objectContaining({
         sticky: true,
-        action: expect.objectContaining({ label: "Download" }),
+        action: expect.objectContaining({ label: "Open releases" }), // FORK: upstream asserts "Install update"
       })
     );
   });
@@ -116,10 +117,12 @@ describe("update checks", () => {
     await expect(update.checkForUpdateNow()).resolves.toEqual({ kind: "current", version: "0.5.3" });
   });
 
-  // FORK: this build ships no updater manifest, so the self-updater is never
-  // reached and upstream's GH #241 error toast can never fire. The Download
-  // action opens the releases page directly — that is the route, not a fallback.
-  it("goes straight to the releases page and never runs the self-updater", async () => {
+  // FORK: this build ships no updater manifest, so `updateMode()` is always
+  // "manual", the self-updater is never reached, and upstream's GH #241 error
+  // toast can never fire. Upstream's two-step check→offer flow is kept; only the
+  // action label differs, because here it opens the releases page rather than
+  // installing — that is the route, not a fallback.
+  it("offers the releases page and never runs the self-updater", async () => {
     mockLatest("v0.6.0");
     const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
     const { update, updaterCheckMock, pushToastMock, openExternalMock } = await loadUpdate({
@@ -128,7 +131,25 @@ describe("update checks", () => {
       updaterReject: new Error("minisign signature verification failed"),
     });
 
-    await update.checkForUpdateNow();
+    await expect(update.checkForUpdateNow()).resolves.toEqual({
+      kind: "available",
+      version: "0.6.0",
+      current: "0.5.3",
+    });
+    expect(updaterCheckMock).not.toHaveBeenCalled();
+    const toastCalls = pushToastMock.mock.calls as unknown as Array<[
+      string,
+      string,
+      { sticky?: boolean; action?: { label: string; run: () => void } }?,
+    ]>;
+    const availableToast = toastCalls.find(([message]) =>
+      typeof message === "string" && message.includes("0.6.0 is available")
+    );
+    expect(availableToast?.[2]).toMatchObject({
+      sticky: true,
+      action: { label: "Open releases" }, // FORK: upstream asserts "Install update"
+    });
+    availableToast?.[2]?.action?.run();
     await new Promise((r) => setTimeout(r, 10)); // let the detached applyUpdateOrOpen settle
 
     expect(updaterCheckMock).not.toHaveBeenCalled();
@@ -149,5 +170,11 @@ describe("update checks", () => {
 
     expect(platformKindMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("builds the Windows updater on the OS-native TLS transport (GH #241)", () => {
+    const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+    expect(cargo).toMatch(/cfg\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*\{[^}]*default-features\s*=\s*false[^}]*"native-tls"/);
+    expect(cargo).toMatch(/not\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*"2"/);
   });
 });

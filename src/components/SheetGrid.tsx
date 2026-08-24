@@ -497,8 +497,7 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
 
   const growAndEdit = (edge: "row" | "col") => {
     if (readOnly()) return;
-    const target = growSheetEdge(props.id, edge, surfaceId);
-    if (target) startCellEditing(target);
+    growSheetEdge(props.id, edge, surfaceId, (target) => startCellEditing(target));
   };
 
   const activateEmptyGrid = (e: MouseEvent | KeyboardEvent) => {
@@ -753,6 +752,7 @@ function SheetGridCell(props: { gridId: string; surfaceId: string; cell: MatrixC
     rowId: doc.byId[props.gridId]?.children[props.cell.row],
     gridId: props.gridId,
     col: props.cell.col,
+    surfaceId: props.surfaceId,
   });
   const openCellMenu = (e: MouseEvent) => {
     const blockId = props.cell.blockId;

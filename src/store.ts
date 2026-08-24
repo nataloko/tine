@@ -8,7 +8,20 @@
 
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
-import type { ActivationIntent, BlockDto, EditorActivationHandle, Format, PageDto, PageKind, RefGroup } from "./types";
+import type { GraphChange } from "./backend";
+import type {
+  ActivationIntent,
+  BlockDto,
+  EditorActivationHandle,
+  Format,
+  ManagedApplicationMovePlacement,
+  ManagedApplicationMoveRoot,
+  ManagedApplicationMoveSubtreesOutcome,
+  ManagedApplicationMoveSubtreesRequest,
+  PageDto,
+  PageKind,
+  RefGroup,
+} from "./types";
 import type { ClipboardBlock, ClipboardPayloadData, ClipboardPayloadSlot, ClipboardSourcePage } from "./clipboard";
 import {
   CLIPBOARD_PAYLOAD_MAX_BLOCKS,
@@ -19,6 +32,7 @@ import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
+import { clearHeldExternalChanges } from "./conflictPolicy";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
@@ -85,6 +99,9 @@ import {
   isTombstonedFile,
   tombstoneCovers,
   graphBinding,
+  holdManagedMovePages,
+  requireManagedRuntimeReopen,
+  saveBaselineFor,
   forgetSaveState,
   resetSaveState,
   isSaving,
@@ -104,6 +121,11 @@ export function __setStoreMutationObserverForTest(
   observer: ((observation: StoreMutationObservation) => void) | null,
 ) {
   storeMutationObserverForTest = observer;
+}
+
+export function __setPageMutationEffectFailureForTest(enabled: boolean): void {
+  if (import.meta.env.MODE !== "test") return;
+  pageMutationEffectFailureForTest = enabled;
 }
 
 /** Production keeps the exact persistence function identity and call path. Vitest
@@ -148,7 +170,7 @@ export interface FeedPage {
   roots: string[];
   /** On-disk format (drives org vs markdown inline rendering). */
   format: Format;
-  /** True for an org page Tine can't round-trip — shown but not editable. */
+  /** True for a source page Tine can't round-trip — shown but not editable. */
   readOnly: boolean;
   /** Bundled in-app Guide page: read-only and ephemeral. */
   guide: boolean;
@@ -287,6 +309,11 @@ const editGenerations = new Map<string, number>();
 // user saw without authorising a new local transaction begun during an await.
 let editorTransactionClock = 0;
 const editorTransactionGenerations = new Map<string, number>();
+const [managedMoveBusyPages, setManagedMoveBusyPages] = createSignal<ReadonlySet<string>>(new Set());
+let managedMoveQueue: Promise<void> = Promise.resolve();
+let managedHistoryReplayRunning = false;
+let managedHistoryReplayEpoch = 0;
+const managedHistoryCommands: Array<"undo" | "redo"> = [];
 
 /** Current content-edit generation for a page. */
 export function editGeneration(name: string): number {
@@ -300,6 +327,37 @@ export function bumpEditGeneration(name: string): void {
 /** Current component-local editor-transaction generation for a page. */
 export function editorTransactionGeneration(name: string): number {
   return editorTransactionGenerations.get(name) ?? 0;
+}
+
+export function pageMutationBusy(name: string): boolean {
+  return managedMoveBusyPages().has(name);
+}
+
+/** Keep the named page editors inert across one explicit native mutation.
+ * This is UI ownership only; callers drain then separately hold persistence. */
+export function holdPageMutationUi(pages: readonly string[]): () => void {
+  const held = [...new Set(pages)];
+  setManagedMoveBusy(held, true);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    setManagedMoveBusy(held, false);
+    // Releasing explicit ownership is a real replacement-gate transition, just
+    // like ending an edit or draining a save. A winner-file watcher event can
+    // arrive while Concord owns the page and be deferred by
+    // reloadPageIfStillSafe; leaving that event parked until the user's next
+    // keystroke makes the fresh edit look divergent and opens Concord again.
+    // Sweep only after every held page is released; each watcher re-checks the
+    // full gate synchronously before it is notified.
+    sweepReplaceable();
+  };
+}
+
+function setManagedMoveBusy(pages: readonly string[], busy: boolean): void {
+  const next = new Set(managedMoveBusyPages());
+  for (const page of pages) busy ? next.add(page) : next.delete(page);
+  setManagedMoveBusyPages(next);
 }
 
 /** The page-instance generation WITHOUT creating one for a page that has none.
@@ -715,7 +773,13 @@ export async function ensurePageLoaded(
   }
 
   // Already active exact-instance hydration is the idempotent fast path.
-  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) return null;
+  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) {
+    // Exact same-content hydration still carries new disk authority. Skipping
+    // this adoption after Concord Apply left the winner open with no baseline,
+    // so the next ordinary edit correctly looked like a brand-new conflict.
+    setBaseRev(dto.name, dto.rev ?? null);
+    return null;
+  }
 
   let handle: EditorActivationHandle | null = null;
   const editable = !dto.read_only && !dto.guide;
@@ -780,6 +844,7 @@ export async function ensurePageLoaded(
   }
 
   if (sameInstanceHydration) {
+    setBaseRev(dto.name, dto.rev ?? null);
     if (handle) recordEditorActivation(dto.name, handle);
     return null;
   }
@@ -985,6 +1050,14 @@ function pinnedPages(): Set<string> {
   return pin;
 }
 
+/** Pages whose current bytes matter before the focus freshness barrier can
+ * release input. This deliberately exposes only the bounded working-set pins,
+ * never the graph inventory: focus verification must stay O(visible/active
+ * pages), not O(graph). */
+export function focusFreshnessPageNames(): string[] {
+  return [...pinnedPages()];
+}
+
 /** Replace a page in the working set from a fresh DTO (e.g. resolving a conflict
  *  with the disk version, or a watcher reload). Updates the main view and any
  *  satellite that shows it, since they share `byId`. */
@@ -1033,6 +1106,92 @@ export async function reloadPageIfStillSafe(
   if (!mayReplaceInstance(name)) return false;
   if (reloadDisposition(name) !== "reload") return false;
   return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
+}
+
+// --- deferred replay of skipped external reloads (Concord P1, freshness) ---
+//
+// `reloadDisposition` answers "skip" while a block on the changed page is being
+// edited or a block move is in flight, and `mayReplaceInstance` refuses while a
+// component-local editor lease holds uncommitted input. Those refusals are
+// correct — but the watcher event they decline used to be DROPPED: the backend
+// cache was fresh while the visible page stayed stale until some unrelated
+// event happened to touch it again. Record the declined change instead and
+// re-dispatch it through the original watcher handler once the page becomes
+// replaceable (editing ends, the move settles, the lease is released — all of
+// which already announce through `notifyPageBecameReplaceable`). Re-dispatching
+// the ORIGINAL handler means the disposition is re-evaluated at replay time: a
+// page that became dirty meanwhile takes the normal divergence path
+// (`applyDivergenceVerdict`), never a clobbering reload. No guard is weakened —
+// replay still funnels through `reloadPageIfStillSafe` and the same handler
+// branches as a live event.
+
+/** Why an external reload was deferred (diagnostics; the replay re-checks). */
+type DeferredExternalReloadReason =
+  | "block-edit"
+  | "block-move"
+  | "uncommitted-input"
+  | "declined";
+
+type DeferredExternalReload = {
+  change: GraphChange;
+  binding: number;
+  reason: DeferredExternalReloadReason;
+  stop: () => void;
+};
+
+const deferredExternalReloads = new Map<string, DeferredExternalReload>();
+
+let externalReloadReplay: ((change: GraphChange) => void) | null = null;
+
+/** Wired once by the watcher handler's module (`handleGraphChange`); injected
+ *  because the store must not import the App module. */
+export function installExternalReloadReplayHandler(
+  handler: (change: GraphChange) => void,
+): void {
+  externalReloadReplay = handler;
+}
+
+function deferredExternalReloadReason(name: string): DeferredExternalReloadReason {
+  if (isBlockMoving()) return "block-move";
+  const ed = editingId();
+  if (ed && doc.byId[ed]?.page === name) return "block-edit";
+  if (hasEditorLease(name)) return "uncommitted-input";
+  return "declined";
+}
+
+/** Record an external change the watcher handler could not apply right now, and
+ *  replay it when the page becomes replaceable. Latest observation wins — the
+ *  replay refetches the DTO, so only the newest change's shape (kind,
+ *  created/removed) matters. */
+export function deferExternalReload(change: GraphChange, binding = graphBinding()): void {
+  const existing = deferredExternalReloads.get(change.name);
+  if (existing) {
+    existing.change = change;
+    existing.binding = binding;
+    existing.reason = deferredExternalReloadReason(change.name);
+    return;
+  }
+  const stop = onPageBecameReplaceable(change.name, () => {
+    const pending = deferredExternalReloads.get(change.name);
+    if (!pending) return;
+    pending.stop();
+    deferredExternalReloads.delete(change.name);
+    if (pending.binding !== graphBinding()) return;
+    // Fire-and-forget like a live watcher event; if the handler declines again
+    // it re-defers, so the record cannot be lost between here and there.
+    externalReloadReplay?.(pending.change);
+  });
+  deferredExternalReloads.set(change.name, {
+    change,
+    binding,
+    reason: deferredExternalReloadReason(change.name),
+    stop,
+  });
+}
+
+function clearDeferredExternalReloads(): void {
+  for (const pending of deferredExternalReloads.values()) pending.stop();
+  deferredExternalReloads.clear();
 }
 
 const pendingHlsRefreshes = new Map<string, () => void>();
@@ -1115,11 +1274,23 @@ function evictIfNeeded() {
  *  cancels pending saves and clears dirty flags so nothing from the old graph
  *  can be written after a switch. */
 export function resetStore() {
+  // Pure node tests historically exercise the synchronous Direct store without
+  // opening a graph. Seed that authority once; managed-boundary tests explicitly
+  // rebind to the authority they exercise after reset.
+  if (import.meta.env.MODE === "test" && managedStorageRuntime.snapshot().bindingGeneration === null) {
+    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  }
   // Every identity belongs to the graph being left. The core drops its own
   // registry with the Graph, so clearing locally is sufficient and avoids a
   // storm of per-page retirements against a graph that is going away.
   clearAllEditorActivations();
   clearAllEditorLeases();
+  setManagedMoveBusyPages(new Set<string>());
+  managedHistoryReplayEpoch++;
+  managedHistoryReplayRunning = false;
+  managedHistoryCommands.length = 0;
+  clearDeferredExternalReloads();
+  clearHeldExternalChanges(); // Concord P5: a held change belongs to its graph
   clearPendingHlsRefreshes();
   clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph
@@ -1297,7 +1468,9 @@ export function clearAllEditorLeases(): void {
  * uncommitted rename during that await. (GH #254 increment 3.)
  */
 export function mayReplaceInstance(name: string): boolean {
-  return reloadDisposition(name) === "reload" && !hasEditorLease(name);
+  return reloadDisposition(name) === "reload"
+    && !hasEditorLease(name)
+    && !pageMutationBusy(name);
 }
 
 /** Why a replacement was refused, for the surface that asked for it. */
@@ -1326,7 +1499,7 @@ export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
 export async function loadFeed(
   dtos: PageDto[],
   opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
-) {
+): Promise<boolean> {
   // Publication FOLLOWS installation. When the DTO is declined the name used to
   // be published into the feed anyway, so the feed rendered a dirty path-pinned
   // stray as though it were the requested canonical journal — no refusal, no
@@ -1341,13 +1514,15 @@ export async function loadFeed(
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
   for (const dto of dtos) {
-    if (await upsertUnlessDirty(dto, binding)) installed.push(dto.name);
+    if (!(await upsertUnlessDirty(dto, binding))) return false;
+    installed.push(dto.name);
   }
-  if (binding !== graphBinding()) return;
+  if (binding !== graphBinding()) return false;
   setDoc("feed", installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
+  return true;
 }
 
 /** Append more pages to the journals feed (infinite scroll). */
@@ -1397,15 +1572,24 @@ export async function restoreTodayJournalInFeed(): Promise<boolean> {
   return true;
 }
 
-function toDto(id: string): BlockDto {
-  const n = doc.byId[id];
+function toDtoFrom(nodes: Readonly<Record<string, Node>>, id: string): BlockDto {
+  const n = nodes[id];
   // Trim a block's trailing space only here, at the disk-write boundary — OG
   // keeps the space while you edit and trims on save. (The live editor buffer
   // keeps it so backspacing to a trailing space doesn't eat the space out from
   // under the caret.) `trimBlockTrailingSpace` is idempotent and only touches
   // whitespace at the very end of the block, so a block with nothing to trim
   // serializes byte-identically — no churn, no property reordering.
-  return { id: n.id, raw: trimBlockTrailingSpace(n.raw), collapsed: n.collapsed, children: n.children.map(toDto) };
+  return {
+    id: n.id,
+    raw: trimBlockTrailingSpace(n.raw),
+    collapsed: n.collapsed,
+    children: n.children.map((child) => toDtoFrom(nodes, child)),
+  };
+}
+
+function toDto(id: string): BlockDto {
+  return toDtoFrom(doc.byId, id);
 }
 
 /** Mirror of Rust `first_root_is_promotable_page_header` (model.rs): a childless
@@ -1421,19 +1605,24 @@ function isPromotablePageHeaderRoot(node: Node): boolean {
   );
 }
 
-export function pageToDto(pageName: string): PageDto | null {
-  const p = doc.pages.find((x) => x.name === pageName);
+function projectPageDto(
+  p: FeedPage | undefined,
+  nodes: Readonly<Record<string, Node>>,
+  reportInvalidHeader: boolean,
+): PageDto | null {
   if (!p) return null;
   let rootIds = p.roots;
   let preBlock = p.preBlock;
-  const first = doc.byId[rootIds[0]];
+  const first = nodes[rootIds[0]];
   if (first?.originatedFromPageHeader) {
     // Enter temporarily leaves one or more trailing newlines in the live
     // page-header editor. Tolerate only that authoring artifact at the disk
     // firewall; keep the strict shared display predicate and live raw intact.
     const canonicalRaw = first.raw.replace(/\n+$/, "");
     if (first.children.length > 0 || (first.raw !== "" && !isPageHeaderPropertiesOnly(canonicalRaw))) {
-      pushToast("Page-header properties must contain only valid key:: value lines before they can be saved.", "error");
+      if (reportInvalidHeader) {
+        pushToast("Page-header properties must contain only valid key:: value lines before they can be saved.", "error");
+      }
       return null;
     }
     // Exact raw is authoritative here: ordinary toDto trimming must never eat a
@@ -1454,7 +1643,7 @@ export function pageToDto(pageName: string): PageDto | null {
     preBlock = first.raw.replace(/\n+$/, "");
     rootIds = rootIds.slice(1);
   }
-  let blocks = rootIds.map(toDto);
+  let blocks = rootIds.map((id) => toDtoFrom(nodes, id));
   // Don't persist a lone placeholder block. A page that exists only for its
   // properties is loaded with one empty editable bullet (toLoadable); saving it
   // — e.g. after a page-property edit — must NOT write that bullet back as a
@@ -1482,6 +1671,520 @@ export function pageToDto(pageName: string): PageDto | null {
     guide: p.guide,
     read_only: p.readOnly,
   };
+}
+
+export function pageToDto(pageName: string): PageDto | null {
+  return projectPageDto(doc.pages.find((x) => x.name === pageName), doc.byId, true);
+}
+
+// ---------------------------------------------------------------------------
+// Detached one-page mutation plans
+// ---------------------------------------------------------------------------
+
+export type PageMutationEffect =
+  | { kind: "create"; node: Readonly<Omit<Node, "children">> & { readonly children: readonly string[] }; parent: string; at: number }
+  | { kind: "delete"; id: string }
+  | { kind: "raw"; id: string; raw: string }
+  | { kind: "property"; id: string; key: string; value: string | null; raw: string }
+  | { kind: "parent"; id: string; parent: string }
+  | { kind: "order"; parent: string; children: readonly string[] };
+
+export type PageMutationDraftNode = Readonly<Omit<Node, "children">> & {
+  readonly children: readonly string[];
+};
+
+export type PageMutationDraftPage = Readonly<Omit<FeedPage, "roots">> & {
+  readonly roots: readonly string[];
+};
+
+export interface PageMutationDraft {
+  readonly page: PageMutationDraftPage;
+  node(id: string): PageMutationDraftNode | undefined;
+  createChild(parentId: string, at: number, raw?: string): string | null;
+  insertOutlineChildren(parentId: string, outlines: readonly OutlineNode[]): string | null;
+  deleteSubtree(id: string): boolean;
+  setRaw(id: string, raw: string): boolean;
+  setProperty(id: string, key: string, value: string | null): boolean;
+  replaceChildren(parentId: string, children: readonly string[]): boolean;
+}
+
+const pageMutationPlanSeal = Symbol("page-mutation-plan");
+
+export interface PageMutationPlan<T> {
+  readonly [pageMutationPlanSeal]: true;
+  readonly pageName: string;
+  readonly tag: string;
+  readonly value: T;
+  readonly candidate: PageDto;
+  readonly effects: readonly PageMutationEffect[];
+}
+
+/** Optional UI ownership attached to a plan. The token itself is immutable and
+ * `isCurrent` must cover the exact selection and mounted Sheet surface that
+ * issued the command. Store code checks it before native admission, before
+ * publication, and once more before post-commit UI effects. */
+export interface PageMutationAuthority<T> {
+  readonly token: Readonly<Record<string, unknown>>;
+  isCurrent(value: T): boolean;
+}
+
+interface InternalPageMutationPlan<T> extends PageMutationPlan<T> {
+  graphRoot: string;
+  graphEpoch: number;
+  graphBinding: number;
+  pageGeneration: number;
+  editGeneration: number;
+  editorTransactionGeneration: number;
+  saveBaseline: string | null;
+  bindingGeneration: number;
+  authority: "direct" | "managed_writable" | "managed_unavailable" | "missing";
+  pendingKey: string;
+  captured: Readonly<Record<string, PageMutationDraftNode>>;
+  capturedPage: PageMutationDraftPage;
+  uiAuthority?: PageMutationAuthority<T>;
+}
+
+export type PageMutationDispatch<T> =
+  | { kind: "applied"; value: T }
+  | { kind: "pending"; value: T; settled: Promise<boolean> }
+  | { kind: "refused"; claimed: boolean };
+
+const pendingPageMutations = new Map<string, object>();
+const startedPageMutationPlans = new WeakSet<object>();
+const appliedPageMutationPlans = new WeakSet<object>();
+let pageMutationEffectFailureForTest = false;
+
+function immutableClone<T>(value: T): T {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => immutableClone(item))) as T;
+  }
+  const clone: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    clone[key] = immutableClone(nested);
+  }
+  return Object.freeze(clone) as T;
+}
+
+function immutableNode(node: Node): PageMutationDraftNode {
+  return immutableClone(cloneNode(node)) as PageMutationDraftNode;
+}
+
+function immutablePage(page: FeedPage): PageMutationDraftPage {
+  return immutableClone(clonePages([page])[0]) as PageMutationDraftPage;
+}
+
+function clonePageTree(page: FeedPage): Record<string, Node> | null {
+  const nodes: Record<string, Node> = {};
+  const visit = (id: string): boolean => {
+    if (nodes[id]) return true;
+    const current = doc.byId[id];
+    if (!current || current.page !== page.name) return false;
+    nodes[id] = cloneNode(unwrap(current));
+    return current.children.every(visit);
+  };
+  return page.roots.every(visit) ? nodes : null;
+}
+
+/** Build a pure detached draft. The callback sees only the captured page tree;
+ * it cannot publish, dirty, save, select, or enter an editor. */
+export function createPageMutationPlan<T>(
+  pageName: string,
+  tag: string,
+  build: (draft: PageMutationDraft) => T | null,
+  uiAuthority?: PageMutationAuthority<T>,
+): PageMutationPlan<T> | null {
+  const livePage = pageByName(pageName);
+  if (!livePage || !pageWritable(pageName) || graphTransitioning()) return null;
+  const generation = pageInstanceGeneration(pageName);
+  if (generation === null) return null;
+  const draftPage = clonePages([unwrap(livePage)])[0];
+  const draftNodes = clonePageTree(livePage);
+  if (!draftNodes) return null;
+  const capturedMutable: Record<string, Node> = {};
+  for (const [id, node] of Object.entries(draftNodes)) capturedMutable[id] = cloneNode(node);
+  const effects: PageMutationEffect[] = [];
+  let active = true;
+
+  const remove = (id: string): boolean => {
+    const node = draftNodes[id];
+    if (!node) return false;
+    const siblings = node.parent === null
+      ? draftPage.roots
+      : draftNodes[node.parent]?.children;
+    if (!siblings) return false;
+    const at = siblings.indexOf(id);
+    if (at < 0) return false;
+    siblings.splice(at, 1);
+    const descend = (childId: string) => {
+      const child = draftNodes[childId];
+      if (!child) return;
+      for (const grandchild of [...child.children]) descend(grandchild);
+      delete draftNodes[childId];
+    };
+    descend(id);
+    effects.push({ kind: "delete", id });
+    return true;
+  };
+
+  const draft: PageMutationDraft = {
+    page: immutablePage(draftPage),
+    node: (id) => active && draftNodes[id] ? immutableNode(draftNodes[id]) : undefined,
+    createChild(parentId, at, raw = "") {
+      if (!active) return null;
+      const parent = draftNodes[parentId];
+      if (!parent || at < 0 || at > parent.children.length) return null;
+      const id = freshId();
+      const node: Node = {
+        id,
+        raw,
+        collapsed: false,
+        parent: parentId,
+        page: pageName,
+        children: [],
+      };
+      draftNodes[id] = node;
+      parent.children.splice(at, 0, id);
+      effects.push({ kind: "create", node: immutableNode(node), parent: parentId, at });
+      return id;
+    },
+    insertOutlineChildren(parentId, outlines) {
+      if (!active) return null;
+      const parent = draftNodes[parentId];
+      if (!parent || !outlines.length) return null;
+      const format = draftPage.format;
+      let last: string | null = null;
+      const create = (outline: OutlineNode, parent: string): string => {
+        const id = freshId();
+        const raw = rawWithInheritedOrderListType(outline.raw, format, parentId);
+        draftNodes[id] = { id, raw, collapsed: false, parent, page: pageName, children: [] };
+        const at = draftNodes[parent]?.children.length ?? 0;
+        draftNodes[parent]?.children.push(id);
+        effects.push({ kind: "create", node: immutableNode(draftNodes[id]), parent, at });
+        const children = outline.children.map((child) => create(child, id));
+        draftNodes[id].children = children;
+        return id;
+      };
+      const created = outlines.map((outline) => create(outline, parentId));
+      last = created[created.length - 1] ?? null;
+      return last;
+    },
+    deleteSubtree(id) {
+      return active && remove(id);
+    },
+    setRaw(id, raw) {
+      if (!active) return false;
+      const node = draftNodes[id];
+      if (!node) return false;
+      node.raw = raw;
+      effects.push({ kind: "raw", id, raw });
+      return true;
+    },
+    setProperty(id, key, value) {
+      if (!active) return false;
+      const node = draftNodes[id];
+      if (!node) return false;
+      node.raw = draftPage.format === "org"
+        ? orgRawWithProperty(node.raw, key, value)
+        : markdownRawWithProperty(node.raw, key, value);
+      effects.push({ kind: "property", id, key, value, raw: node.raw });
+      return true;
+    },
+    replaceChildren(parentId, children) {
+      if (!active) return false;
+      const parent = draftNodes[parentId];
+      if (!parent || children.some((id) => !draftNodes[id] || draftNodes[id].page !== pageName)) return false;
+      parent.children = [...children];
+      for (const id of children) {
+        if (draftNodes[id].parent !== parentId) {
+          draftNodes[id].parent = parentId;
+          effects.push({ kind: "parent", id, parent: parentId });
+        }
+      }
+      effects.push({ kind: "order", parent: parentId, children: [...children] });
+      return true;
+    },
+  };
+
+  let builtValue: T | null;
+  try {
+    builtValue = build(draft);
+  } finally {
+    active = false;
+  }
+  if (builtValue === null) return null;
+  const frozenEffects = immutableClone(effects) as readonly PageMutationEffect[];
+  const capturedPage = immutablePage(draftPage);
+  const captured = immutableClone(Object.fromEntries(
+    Object.entries(capturedMutable).map(([id, node]) => [id, immutableNode(node)]),
+  )) as Readonly<Record<string, PageMutationDraftNode>>;
+  const replay = replayPageMutationEffects(capturedPage, captured, frozenEffects);
+  if (!replay) return null;
+  const candidate = projectPageDto(replay.page, replay.nodes, false);
+  if (!candidate) return null;
+  const value = immutableClone(builtValue);
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const graphRoot = graphMeta()?.root ?? "";
+  const epoch = graphEpoch();
+  const binding = graphBinding();
+  const plan: InternalPageMutationPlan<T> = {
+    [pageMutationPlanSeal]: true,
+    pageName,
+    tag,
+    value,
+    candidate: immutableClone(candidate),
+    effects: frozenEffects,
+    graphRoot,
+    graphEpoch: epoch,
+    graphBinding: binding,
+    pageGeneration: generation,
+    editGeneration: editGeneration(pageName),
+    editorTransactionGeneration: editorTransactionGeneration(pageName),
+    saveBaseline: saveBaselineFor(pageName),
+    bindingGeneration: admission?.binding_generation ?? -1,
+    authority: admission?.authority ?? "missing",
+    pendingKey: `${graphRoot}\0${epoch}\0${binding}\0${generation}\0${pageName}`,
+    captured,
+    capturedPage,
+    uiAuthority: uiAuthority
+      ? Object.freeze({ token: immutableClone(uiAuthority.token), isCurrent: uiAuthority.isCurrent })
+      : undefined,
+  };
+  return Object.freeze(plan);
+}
+
+interface ReplayedPageMutation {
+  page: FeedPage;
+  nodes: Record<string, Node>;
+}
+
+function mutablePage(page: PageMutationDraftPage | FeedPage): FeedPage {
+  return clonePages([page as FeedPage])[0];
+}
+
+function mutableNodes(nodes: Readonly<Record<string, PageMutationDraftNode>>): Record<string, Node> {
+  return Object.fromEntries(Object.entries(nodes).map(([id, node]) => [id, cloneNode(node as Node)]));
+}
+
+function applyEffectsToMutablePage(
+  page: FeedPage,
+  nodes: Record<string, Node>,
+  effects: readonly PageMutationEffect[],
+): boolean {
+  if (pageMutationEffectFailureForTest) return false;
+  for (const effect of effects) {
+    if (effect.kind === "create") {
+      const parent = nodes[effect.parent];
+      if (nodes[effect.node.id] || !parent || effect.at < 0 || effect.at > parent.children.length) return false;
+      const node = cloneNode(effect.node as Node);
+      if (node.page !== page.name || node.parent !== effect.parent || node.children.length) return false;
+      nodes[node.id] = node;
+      parent.children.splice(effect.at, 0, node.id);
+      continue;
+    }
+    if (effect.kind === "delete") {
+      const node = nodes[effect.id];
+      if (!node) return false;
+      const siblings = node.parent === null ? page.roots : nodes[node.parent]?.children;
+      if (!siblings) return false;
+      const at = siblings.indexOf(effect.id);
+      if (at < 0) return false;
+      siblings.splice(at, 1);
+      const remove = (id: string): boolean => {
+        const current = nodes[id];
+        if (!current) return false;
+        for (const child of [...current.children]) if (!remove(child)) return false;
+        delete nodes[id];
+        return true;
+      };
+      if (!remove(effect.id)) return false;
+      continue;
+    }
+    if (effect.kind === "raw") {
+      const node = nodes[effect.id];
+      if (!node) return false;
+      node.raw = effect.raw;
+      continue;
+    }
+    if (effect.kind === "property") {
+      const node = nodes[effect.id];
+      if (!node) return false;
+      const raw = page.format === "org"
+        ? orgRawWithProperty(node.raw, effect.key, effect.value)
+        : markdownRawWithProperty(node.raw, effect.key, effect.value);
+      if (raw !== effect.raw) return false;
+      node.raw = raw;
+      continue;
+    }
+    if (effect.kind === "parent") {
+      const node = nodes[effect.id];
+      if (!node || !nodes[effect.parent]) return false;
+      node.parent = effect.parent;
+      continue;
+    }
+    const parent = nodes[effect.parent];
+    if (!parent || new Set(effect.children).size !== effect.children.length) return false;
+    if (effect.children.some((id) => !nodes[id] || nodes[id].page !== page.name)) return false;
+    parent.children = [...effect.children];
+  }
+
+  const seen = new Set<string>();
+  const visit = (id: string, parent: string | null): boolean => {
+    const node = nodes[id];
+    if (!node || seen.has(id) || node.page !== page.name || node.parent !== parent) return false;
+    seen.add(id);
+    return node.children.every((child) => visit(child, id));
+  };
+  if (new Set(page.roots).size !== page.roots.length || !page.roots.every((id) => visit(id, null))) return false;
+  return Object.values(nodes).every((node) => node.page !== page.name || seen.has(node.id));
+}
+
+function replayPageMutationEffects(
+  page: PageMutationDraftPage,
+  captured: Readonly<Record<string, PageMutationDraftNode>>,
+  effects: readonly PageMutationEffect[],
+): ReplayedPageMutation | null {
+  const replay = { page: mutablePage(page), nodes: mutableNodes(captured) };
+  return applyEffectsToMutablePage(replay.page, replay.nodes, effects) ? replay : null;
+}
+
+function replayMatchesCandidate(plan: InternalPageMutationPlan<unknown>): boolean {
+  const replay = replayPageMutationEffects(plan.capturedPage, plan.captured, plan.effects);
+  const projected = replay && projectPageDto(replay.page, replay.nodes, false);
+  return !!projected && JSON.stringify(projected) === JSON.stringify(plan.candidate);
+}
+
+/** Test-only proof that the finalized authority is a deeply immutable replay
+ * program. Returns false in production builds. */
+export function __pageMutationPlanDeeplyFrozenForTest(plan: PageMutationPlan<unknown>): boolean {
+  if (import.meta.env.MODE !== "test") return false;
+  const check = (value: unknown): boolean => {
+    if (value === null || typeof value !== "object") return true;
+    if (!Object.isFrozen(value)) return false;
+    return Object.values(value).every(check);
+  };
+  return check(plan.effects) && check(plan.candidate) && check(plan.value);
+}
+
+function pageMutationPlanCurrent(
+  plan: InternalPageMutationPlan<unknown>,
+  checkUiAuthority = true,
+): boolean {
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (
+    graphTransitioning()
+    || (graphMeta()?.root ?? "") !== plan.graphRoot
+    || graphEpoch() !== plan.graphEpoch
+    || graphBinding() !== plan.graphBinding
+    || pageInstanceGeneration(plan.pageName) !== plan.pageGeneration
+    || editGeneration(plan.pageName) !== plan.editGeneration
+    || editorTransactionGeneration(plan.pageName) !== plan.editorTransactionGeneration
+    || saveBaselineFor(plan.pageName) !== plan.saveBaseline
+    || admission?.binding_generation !== plan.bindingGeneration
+    || admission?.authority !== plan.authority
+  ) return false;
+  const page = pageByName(plan.pageName);
+  if (!page || JSON.stringify(mutablePage(page)) !== JSON.stringify(mutablePage(plan.capturedPage))) return false;
+  const liveIds = Object.values(doc.byId).filter((node) => node.page === plan.pageName).map((node) => node.id).sort();
+  const capturedIds = Object.keys(plan.captured).sort();
+  if (liveIds.length !== capturedIds.length || liveIds.some((id, index) => id !== capturedIds[index])) return false;
+  for (const [id, expected] of Object.entries(plan.captured)) {
+    const current = doc.byId[id];
+    if (!current
+      || current.page !== expected.page
+      || current.parent !== expected.parent
+      || current.raw !== expected.raw
+      || current.collapsed !== expected.collapsed
+      || current.children.length !== expected.children.length
+      || current.children.some((child, index) => child !== expected.children[index])) return false;
+  }
+  return !checkUiAuthority || !plan.uiAuthority || plan.uiAuthority.isCurrent(plan.value);
+}
+
+function applyPageMutationPlanNow<T>(
+  plan: InternalPageMutationPlan<T>,
+  checkUiAuthority: boolean,
+): boolean {
+  if (appliedPageMutationPlans.has(plan)
+    || !pageMutationPlanCurrent(plan, checkUiAuthority)
+    || !replayMatchesCandidate(plan)) return false;
+  const pageIndex = doc.pages.findIndex((page) => page.name === plan.pageName);
+  if (pageIndex < 0) return false;
+  const livePage = mutablePage(doc.pages[pageIndex]);
+  const liveNodes = Object.fromEntries(
+    Object.values(doc.byId)
+      .filter((node) => node.page === plan.pageName)
+      .map((node) => [node.id, cloneNode(unwrap(node))]),
+  );
+  if (!applyEffectsToMutablePage(livePage, liveNodes, plan.effects)) return false;
+  const projected = projectPageDto(livePage, liveNodes, false);
+  if (!projected || JSON.stringify(projected) !== JSON.stringify(plan.candidate)) return false;
+  pushUndo(plan.tag, [plan.pageName]);
+  setDoc(produce((state) => {
+    if (!applyEffectsToMutablePage(state.pages[pageIndex], state.byId, plan.effects)) {
+      throw new Error("validated page-mutation effects failed during atomic replay");
+    }
+  }));
+  appliedPageMutationPlans.add(plan);
+  markDirty(plan.pageName);
+  return true;
+}
+
+const managedPageMutationBusyToast = "This Sheet is still checking its previous change. Nothing was changed.";
+const managedPageMutationRefusedToast = "Tine-managed storage could not accept this Sheet change. Nothing was changed.";
+
+/** Apply Direct plans synchronously. Managed plans claim one per-page slot,
+ * await exact native preparation, recheck every captured authority and relation,
+ * then publish once. */
+export function applyPageMutationPlan<T>(
+  publicPlan: PageMutationPlan<T>,
+  afterApply?: (value: T) => void,
+): PageMutationDispatch<T> {
+  const plan = publicPlan as InternalPageMutationPlan<T>;
+  if (!plan[pageMutationPlanSeal] || startedPageMutationPlans.has(plan)) {
+    return { kind: "refused", claimed: plan.authority !== "direct" };
+  }
+  startedPageMutationPlans.add(plan);
+  if (plan.authority === "direct") {
+    if (!applyPageMutationPlanNow(plan, false)) return { kind: "refused", claimed: false };
+    afterApply?.(plan.value);
+    return { kind: "applied", value: plan.value };
+  }
+  if (plan.authority !== "managed_writable") {
+    pushToast(managedPageMutationRefusedToast, "error");
+    return { kind: "refused", claimed: true };
+  }
+  if (!pageMutationPlanCurrent(plan) || !replayMatchesCandidate(plan)) {
+    return { kind: "refused", claimed: true };
+  }
+  if (pendingPageMutations.has(plan.pendingKey)) {
+    pushToast(managedPageMutationBusyToast, "error");
+    return { kind: "refused", claimed: true };
+  }
+  pendingPageMutations.set(plan.pendingKey, plan);
+  const settled = backend()
+    .preflightManagedPageMutation(plan.candidate, plan.saveBaseline, plan.bindingGeneration)
+    .then((acceptance) => {
+      const accepted = acceptance.status === "accepted"
+        && acceptance.binding_generation === plan.bindingGeneration
+        && acceptance.page_name === plan.candidate.name
+        && acceptance.page_path === plan.candidate.path
+        && acceptance.base_revision === plan.saveBaseline;
+      if (!accepted || !applyPageMutationPlanNow(plan, true)) {
+        pushToast(managedPageMutationRefusedToast, "error");
+        return false;
+      }
+      if (!plan.uiAuthority || plan.uiAuthority.isCurrent(plan.value)) afterApply?.(plan.value);
+      return true;
+    })
+    .catch(() => {
+      pushToast(managedPageMutationRefusedToast, "error");
+      return false;
+    })
+    .finally(() => {
+      if (pendingPageMutations.get(plan.pendingKey) === plan) pendingPageMutations.delete(plan.pendingKey);
+    });
+  return { kind: "pending", value: plan.value, settled };
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,6 +2456,8 @@ interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
   bindingGeneration: number;
   authority: "managed_writable";
   plan: ManagedBulkInsertionPlan;
+  limits: ManagedBulkAdmissionLimits;
+  insertionRootDepthOffset: number;
 }
 
 export type ManagedBulkInsertionPreflight =
@@ -1766,17 +2471,86 @@ const managedBulkOverflowToast = (limit: number): string =>
 const managedBulkUnavailableToast =
   "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
 
-function boundedPageBlockCount(page: FeedPage, cap: number): number {
-  let count = 0;
+interface BoundedPageCensus {
+  blocks: number;
+  requestTextUtf8Bytes: number;
+}
+
+/** One bounded walk answering both page-sized questions an admission asks.
+ *
+ * `requestTextUtf8Bytes` is a deliberate LOWER BOUND on what the native
+ * validator charges for saving this page (`validate_editor_save_request`,
+ * crates/tine-core/src/sync_runtime.rs). That charge is per block — its key,
+ * its parent's key, and its content — plus the page name/id, the base revision
+ * and any preamble. Existing blocks are counted here with all three per-block
+ * terms; the page-level terms and the inserted blocks' request-local keys are
+ * not modelled, because they are not known here and omitting them keeps this a
+ * lower bound rather than a guess. Under-counting means we may still admit
+ * something the actor refuses; over-counting would refuse saves that are
+ * genuinely fine, which is the worse error (GH #323). */
+function boundedPageCensus(
+  page: FeedPage,
+  blockCap: number,
+  textByteCap: number,
+): BoundedPageCensus {
+  const encoder = new TextEncoder();
+  let blocks = 0;
+  let requestTextUtf8Bytes = 0;
   const stack = [...page.roots];
-  while (stack.length && count < cap) {
+  while (stack.length && blocks < blockCap && requestTextUtf8Bytes < textByteCap) {
     const id = stack.pop()!;
     const node = doc.byId[id];
     if (!node) continue;
-    count++;
+    blocks++;
+    requestTextUtf8Bytes = Math.min(
+      textByteCap,
+      requestTextUtf8Bytes
+        + encoder.encode(node.raw).byteLength
+        + id.length
+        + (node.parent === null ? 0 : node.parent.length),
+    );
     for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
   }
-  return count;
+  return { blocks, requestTextUtf8Bytes };
+}
+
+/** The absolute depth an insertion's roots land at, derived from the live tree.
+ * Callers state their own root depth relative to the target; a token records the
+ * offset so the same question can be re-asked after an await (GH #322). */
+function insertionRootDepthBasis(targetId: string | null): number {
+  return targetId === null ? 1 : depthOf(targetId) + 1;
+}
+
+/** Re-answerable overflow question. Every input the caller can no longer affect
+ * lives in `plan`; everything that can move while a bulk route awaits — the
+ * page's current size and the target's depth — is read live here, so preflight
+ * and consumption apply the identical rule to different instants (GH #322). */
+function bulkInsertionOverflows(
+  pageName: string,
+  insertionRootDepth: number,
+  plan: ManagedBulkInsertionPlan,
+  limits: ManagedBulkAdmissionLimits,
+): boolean {
+  const page = pageByName(pageName);
+  if (!page) return true;
+  const census = boundedPageCensus(
+    page,
+    limits.applicationSavePageBlocks + 1,
+    limits.applicationPageRequestTextBytes + 1,
+  );
+  const exceedsBlockLimit =
+    census.blocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+      > limits.applicationSavePageBlocks;
+  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
+    && insertionRootDepth + plan.maximumInputRelativeDepth - 1 > limits.applicationPageMaxDepth;
+  // The save request carries the WHOLE page, so an insertion is charged on top
+  // of what the page already holds. `>=` rather than `>`: the native charge also
+  // includes the page name/id and base revision, which are never empty, so a
+  // lower bound that merely reaches the limit is already over it (GH #323).
+  const exceedsTextLimit =
+    census.requestTextUtf8Bytes + plan.insertedRawTextUtf8Bytes
+      >= limits.applicationPageRequestTextBytes;
+  return exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit;
 }
 
 /**
@@ -1811,15 +2585,7 @@ export function preflightManagedBulkInsertion(
     applicationPageMaxDepth: admission.application_page_max_depth,
   };
   const plan = buildPlan(limits);
-  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
-  const exceedsBlockLimit =
-    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
-      > limits.applicationSavePageBlocks;
-  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
-    && plan.insertionRootDepth + plan.maximumInputRelativeDepth - 1
-      > limits.applicationPageMaxDepth;
-  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
-  if (exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit) {
+  if (bulkInsertionOverflows(pageName, plan.insertionRootDepth, plan, limits)) {
     return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
   }
 
@@ -1835,6 +2601,8 @@ export function preflightManagedBulkInsertion(
     bindingGeneration: admission.binding_generation,
     authority: admission.authority,
     plan,
+    limits,
+    insertionRootDepthOffset: plan.insertionRootDepth - insertionRootDepthBasis(targetId),
   };
   return { kind: "admitted", token };
 }
@@ -1861,6 +2629,15 @@ export function consumeManagedBulkInsertionAdmission(
     || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
     || graphEpoch() !== internal.graphEpoch
     || (graphMeta()?.root ?? "") !== internal.graphRoot
+    // The page may have grown, or the target moved deeper, while the caller
+    // awaited. Identity checks alone cannot see that, so ask the limit question
+    // again against the tree we are about to mutate (GH #322).
+    || bulkInsertionOverflows(
+      internal.targetPage,
+      insertionRootDepthBasis(targetId) + internal.insertionRootDepthOffset,
+      internal.plan,
+      internal.limits,
+    )
   ) return false;
   internal.consumed = true;
   return true;
@@ -1908,7 +2685,21 @@ interface RawEntry {
   instances: Record<string, number>;
   preservedIds?: string[];
 }
-type UndoEntry = SnapEntry | RawEntry;
+interface ManagedMoveHistorySpec {
+  sourcePage: string;
+  destinationPage: string;
+  roots: string[];
+  forwardPlacement: ManagedApplicationMovePlacement;
+  inversePlacement: ManagedApplicationMovePlacement;
+  forwardRewrites: Map<string, string>;
+  inverseRewrites: Map<string, string>;
+}
+interface ManagedMoveEntry extends ManagedMoveHistorySpec {
+  kind: "managed-move";
+  context: HistoryContext;
+  instances: Record<string, number>;
+}
+type UndoEntry = SnapEntry | RawEntry | ManagedMoveEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
@@ -2082,6 +2873,7 @@ export function clearUndoHistory() {
  *  every page including this one). */
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
+  if (e.kind === "managed-move") return e.sourcePage === name || e.destinationPage === name;
   return e.pages === null || e.pages.includes(name);
 }
 
@@ -2287,6 +3079,9 @@ function pushRawUndo(id: string, prevRaw: string) {
 
 /** Apply one entry and return its inverse (to push onto the opposite stack). */
 function applyEntry(e: UndoEntry): UndoEntry {
+  if (e.kind === "managed-move") {
+    throw new Error("managed move history must replay through the native actor");
+  }
   if (e.kind === "raw") {
     const node = doc.byId[e.id];
     const rootIndex = node?.originatedFromPageHeader
@@ -2393,38 +3188,130 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
   }
 }
 
-export function undo() {
+function pushManagedMoveHistory(spec: ManagedMoveHistorySpec): void {
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
+  const pages = [spec.sourcePage, spec.destinationPage];
+  undoStack.push({
+    kind: "managed-move",
+    ...spec,
+    roots: [...spec.roots],
+    forwardRewrites: new Map(spec.forwardRewrites),
+    inverseRewrites: new Map(spec.inverseRewrites),
+    context: captureHistoryContext(),
+    instances: captureInstances(pages),
+  });
+  if (undoStack.length > 200) undoStack.shift();
+  redoStack = [];
+  lastUndoTag = "managed-move";
+}
+
+async function replayManagedMoveHistory(entry: ManagedMoveEntry, direction: "undo" | "redo") {
+  const undoing = direction === "undo";
+  const sourcePage = undoing ? entry.destinationPage : entry.sourcePage;
+  const destinationPage = undoing ? entry.sourcePage : entry.destinationPage;
+  const placement = undoing ? entry.inversePlacement : entry.forwardPlacement;
+  const rewrites = undoing ? entry.inverseRewrites : entry.forwardRewrites;
+  const success = await enqueueManagedCrossPageMove(
+    sourcePage,
+    destinationPage,
+    entry.roots,
+    placement,
+    rewrites,
+    false,
+  );
+  if (!success) {
+    (undoing ? undoStack : redoStack).push(entry);
+    return;
+  }
+  (undoing ? redoStack : undoStack).push({
+    ...entry,
+    context: captureHistoryContext(),
+    instances: captureInstances([entry.sourcePage, entry.destinationPage]),
+  });
+  lastUndoTag = null;
+  endEdit(direction);
+  restoreEntryContext(entry.context);
+}
+
+function performUndo(): Promise<void> | null {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(undoStack);
-  if (!entry) return;
-  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
+  if (!entry) return null;
+  if (!entryIsReplayable(entry)) {
+    discardStaleHistory(entry);
+    return null;
+  }
+  if (entry.kind === "managed-move") {
+    return replayManagedMoveHistory(entry, "undo");
+  }
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  return null;
 }
 
-export function redo() {
+function performRedo(): Promise<void> | null {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(redoStack);
-  if (!entry) return;
-  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
+  if (!entry) return null;
+  if (!entryIsReplayable(entry)) {
+    discardStaleHistory(entry);
+    return null;
+  }
+  if (entry.kind === "managed-move") {
+    return replayManagedMoveHistory(entry, "redo");
+  }
   if (entry.preservedIds && hasLoadedIdentityCollision(entry.preservedIds)) {
     // The selected prerequisite is already popped. A later redo snapshot cannot
     // remain valid without it, including in page-only mode where the tagged
     // entry may have been selected from the middle of the global stack.
     redoStack = [];
     pushToast("Redo skipped: a block with the same id now exists", "error");
-    return;
+    return null;
   }
   undoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("redo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  return null;
+}
+
+function submitHistoryCommand(direction: "undo" | "redo"): void {
+  if (managedHistoryReplayRunning) {
+    managedHistoryCommands.push(direction);
+    return;
+  }
+  const pending = direction === "undo" ? performUndo() : performRedo();
+  if (!pending) return;
+  managedHistoryReplayRunning = true;
+  const epoch = managedHistoryReplayEpoch;
+  void (async () => {
+    try {
+      await pending;
+      while (epoch === managedHistoryReplayEpoch) {
+        const next = managedHistoryCommands.shift();
+        if (!next) break;
+        const replay = next === "undo" ? performUndo() : performRedo();
+        if (replay) await replay;
+      }
+    } finally {
+      if (epoch === managedHistoryReplayEpoch) managedHistoryReplayRunning = false;
+    }
+  })();
+}
+
+export function undo() {
+  submitHistoryCommand("undo");
+}
+
+export function redo() {
+  submitHistoryCommand("redo");
 }
 
 /** Data replay and opposite-stack insertion are complete before this function is
@@ -3009,20 +3896,34 @@ function liveDocReferences(id: string): boolean {
   return Object.values(doc.byId).some((node) => reference.test(node.raw));
 }
 
-interface ClipboardPasteAuthority {
+/** What a bulk insertion route decided against, so a continuation resuming after
+ * an await can prove it is still talking about the same block, the same page
+ * instance, the same graph AND the same storage route.
+ *
+ * The storage route is part of it because a route is selected synchronously and
+ * acted on later: a drop or paste that chose Direct Files can still be reading
+ * a file while the user finishes turning managed storage on, and would then
+ * insert without the admission the managed route requires (GH #325). Graph
+ * activation flips this authority inside its own transitioning window, so
+ * `graphTransitioning` alone stops only continuations that resume DURING the
+ * switch, not the ones that resume just after it. */
+export interface BulkRouteFence {
   epoch: number;
   root: string;
   targetId: string;
   targetNode: Node;
   targetPage: string;
   targetGeneration: number;
+  routeAuthority: string | null;
+  routeBindingGeneration: number | null;
 }
 
-function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthority | null {
+export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
   const target = doc.byId[targetId];
   if (!target || graphTransitioning()) return null;
   const targetGeneration = pageInstanceGeneration(target.page);
   if (targetGeneration === null) return null;
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return {
     epoch: graphEpoch(),
     root: graphMeta()?.root ?? "",
@@ -3030,18 +3931,23 @@ function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthori
     targetNode: unwrap(target),
     targetPage: target.page,
     targetGeneration,
+    routeAuthority: route?.authority ?? null,
+    routeBindingGeneration: route?.binding_generation ?? null,
   };
 }
 
-function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boolean {
-  const target = doc.byId[authority.targetId];
+export function bulkRouteFenceCurrent(fence: BulkRouteFence): boolean {
+  const target = doc.byId[fence.targetId];
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return !graphTransitioning()
-    && graphEpoch() === authority.epoch
-    && (graphMeta()?.root ?? "") === authority.root
+    && graphEpoch() === fence.epoch
+    && (graphMeta()?.root ?? "") === fence.root
     && !!target
-    && unwrap(target) === authority.targetNode
-    && target.page === authority.targetPage
-    && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
+    && unwrap(target) === fence.targetNode
+    && target.page === fence.targetPage
+    && pageInstanceGeneration(fence.targetPage) === fence.targetGeneration
+    && (route?.authority ?? null) === fence.routeAuthority
+    && (route?.binding_generation ?? null) === fence.routeBindingGeneration;
 }
 
 function clipboardTargetReusesEmptyHost(target: Node, targetFormat: Format): boolean {
@@ -3125,20 +4031,21 @@ export function pasteClipboardPayload(
   targetId: string,
   slot: ClipboardPayloadSlot,
 ): Promise<string | null> {
-  const authority = captureClipboardPasteAuthority(targetId);
+  const authority = captureBulkRouteFence(targetId);
   if (!authority) return Promise.resolve(null);
 
-  let managedReuseEmptyHost: boolean | null = null;
-  const admission = preflightManagedBulkInsertion(targetId, (limits) => {
-    const target = doc.byId[targetId]!;
-    managedReuseEmptyHost = clipboardTargetReusesEmptyHost(target, formatForPage(target.page));
-    return managedBulkOutlinePlan(
-      slot.blocks,
-      depthOf(targetId) + 1,
-      managedReuseEmptyHost ? 1 : 0,
-      limits,
-    );
-  });
+  // Plan as if the host will NOT be reused. Whether an empty host is replaced is
+  // decided from the live block at insertion time, after this route's awaits, so
+  // no cached answer may authorize deleting a block the user has since typed
+  // into (GH #322). Assuming the host survives keeps the admitted block count an
+  // upper bound on the realized one either way; the cost is refusing a paste
+  // into an empty host on a page already exactly at the limit.
+  const admission = preflightManagedBulkInsertion(targetId, (limits) => managedBulkOutlinePlan(
+    slot.blocks,
+    depthOf(targetId) + 1,
+    0,
+    limits,
+  ));
   if (admission.kind === "refused") {
     reportManagedBulkInsertionRefusal(admission.toast);
     return Promise.resolve(null);
@@ -3172,7 +4079,7 @@ export function pasteClipboardPayload(
         recordClipboardPhaseForTest("source-retirement");
       }
       preserveIds = await flushCutSourcePages(grant!.sourcePages);
-      if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
+      if (preserveIds && !bulkRouteFenceCurrent(authority)) return null;
     }
     if (preserveIds) {
       try {
@@ -3189,7 +4096,7 @@ export function pasteClipboardPayload(
 
     // Final JS-single-thread section: every authority and retirement check is
     // synchronous and insertion follows immediately with no await boundary.
-    if (!clipboardPasteAuthorityCurrent(authority)) return null;
+    if (!bulkRouteFenceCurrent(authority)) return null;
     if (preserveIds) {
       if (import.meta.env.MODE === "test") {
         recordClipboardWorkForTest("final_identity_guard_phases");
@@ -3201,9 +4108,10 @@ export function pasteClipboardPayload(
     if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
       return null;
     }
-    const reuseEmptyHost = admission.kind === "admitted"
-      ? managedReuseEmptyHost!
-      : clipboardTargetReusesEmptyHost(doc.byId[targetId], formatForPage(doc.byId[targetId].page));
+    const reuseEmptyHost = clipboardTargetReusesEmptyHost(
+      doc.byId[targetId],
+      formatForPage(doc.byId[targetId].page),
+    );
     return insertClipboardBlocksSync(
       targetId,
       slot.blocks,
@@ -3347,7 +4255,7 @@ export function blockPageReadOnly(id: string): boolean {
  * equally non-writable. */
 export function pageWritable(name: string): boolean {
   const page = pageByName(name);
-  return !!page && !page.readOnly && !page.guide;
+  return !!page && !page.readOnly && !page.guide && !pageMutationBusy(name);
 }
 
 export function blockWritable(id: string): boolean {
@@ -4871,14 +5779,6 @@ export async function moveBlock(
   // the caller didn't supply one (a same-page reorder).
   const newPage = newParent ? doc.byId[newParent].page : (targetPage ?? oldPage);
   if (!pageWritable(oldPage) || !pageWritable(newPage)) return;
-  // Cross-page drag: flush the source while it still holds the block, so a
-  // pre-existing pending save can't write the removal before the destination
-  // lands. Abort (no move) if the source can't be saved.
-  if (newPage !== oldPage && !(await prepareCrossPageSources([oldPage]))) {
-    pushToast(`Couldn't move — “${oldPage}” has unsaved changes that need resolving first.`, "error");
-    return;
-  }
-  if (!doc.byId[id]) return; // block vanished during the async flush
   const sourceFormat = formatForBlock(id);
   const destinationFormat = formatForPage(newPage);
   const inheritanceTarget = dropTargetId ?? newParent;
@@ -4887,6 +5787,35 @@ export async function moveBlock(
   const movedRaw = orderListTypeFromRaw(doc.byId[id].raw, sourceFormat) !== null
     ? doc.byId[id].raw
     : rawWithInheritedOrderListType(doc.byId[id].raw, destinationFormat, inheritanceTarget);
+  if (newPage !== oldPage) {
+    const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+    if (!admission || admission.authority === "managed_unavailable") {
+      pushToast("Can't move between pages while managed storage is changing state.", "error");
+      return;
+    }
+    if (admission.authority === "managed_writable") {
+      const rewrites = new Map<string, string>();
+      if (movedRaw !== doc.byId[id].raw) rewrites.set(id, movedRaw);
+      await enqueueManagedCrossPageMove(
+        oldPage,
+        newPage,
+        [id],
+        newParent === null
+          ? { placement: "root", position: index }
+          : { placement: "child", parent_identity: newParent, position: index },
+        rewrites,
+      );
+      return;
+    }
+  }
+  // Cross-page drag: flush the source while it still holds the block, so a
+  // pre-existing pending save can't write the removal before the destination
+  // lands. Abort (no move) if the source can't be saved.
+  if (newPage !== oldPage && !(await prepareCrossPageSources([oldPage]))) {
+    pushToast(`Couldn't move — “${oldPage}” has unsaved changes that need resolving first.`, "error");
+    return;
+  }
+  if (!doc.byId[id]) return; // block vanished during the async flush
   // Drag-move can cross pages → snapshot both source and destination.
   pushUndo("move", [...new Set([oldPage, newPage])]);
   setDoc(
@@ -5017,13 +5946,18 @@ function relativeMovePlan(capturedIds: readonly string[], targetId: string): Rel
 export async function moveBlocksRelative(
   capturedIds: readonly string[],
   targetId: string,
-  position: "before" | "after",
+  position: "before" | "after" | "child",
 ): Promise<boolean> {
   let plan = relativeMovePlan(capturedIds, targetId);
   if (!plan) return false;
 
   const crossSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
-  if (crossSources.length) {
+  const relativeAdmission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (crossSources.length && (!relativeAdmission || relativeAdmission.authority === "managed_unavailable")) {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return false;
+  }
+  if (crossSources.length && relativeAdmission?.authority === "direct") {
     if (!(await prepareCrossPageSources(crossSources))) {
       pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
       return false;
@@ -5052,6 +5986,34 @@ export async function moveBlocksRelative(
     return [id, raw];
   }));
   const affectedPages = [...new Set([plan.destinationPage, ...plan.sourcePages])];
+  if (crossSources.length) {
+    if (relativeAdmission?.authority === "managed_writable") {
+      if (crossSources.length !== 1 || plan.sourcePages.includes(plan.destinationPage)) {
+        pushToast("Managed cross-page moves currently require all selected roots to share one source page.", "error");
+        return false;
+      }
+      const target = doc.byId[targetId];
+      const siblings = position === "child"
+        ? target.children
+        : target.parent === null
+          ? pageByName(target.page)!.roots
+          : doc.byId[target.parent].children;
+      const positionIndex = position === "child"
+        ? siblings.length
+        : siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
+      return enqueueManagedCrossPageMove(
+        crossSources[0],
+        plan.destinationPage,
+        plan.roots,
+        position === "child"
+          ? { placement: "child", parent_identity: targetId, position: positionIndex }
+          : target.parent === null
+            ? { placement: "root", position: positionIndex }
+            : { placement: "child", parent_identity: target.parent, position: positionIndex },
+        movedRaw,
+      );
+    }
+  }
   pushUndo("move-selection-relative", affectedPages);
   setDoc(produce((state) => {
     const siblingsFor = (id: string): string[] => {
@@ -5066,12 +6028,13 @@ export async function moveBlocksRelative(
     }
 
     const target = state.byId[targetId];
-    const destination = target.parent === null
+    const destinationParent = position === "child" ? targetId : target.parent;
+    const destination = destinationParent === null
       ? state.pages.find((page) => page.name === target.page)!.roots
-      : state.byId[target.parent].children;
-    const targetIndex = destination.indexOf(targetId);
+      : state.byId[destinationParent].children;
+    const targetIndex = position === "child" ? destination.length : destination.indexOf(targetId);
     for (const id of plan!.roots) {
-      state.byId[id].parent = target.parent;
+      state.byId[id].parent = destinationParent;
       state.byId[id].raw = movedRaw.get(id)!;
     }
     destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);
@@ -5119,29 +6082,77 @@ export function setBlockMoving(v: boolean, page?: string): void {
   if (ended) sweepReplaceable();
 }
 
-export function moveItem(id: string, dir: 1 | -1) {
+interface OutlineStepPlan {
+  parent: string | null;
+  index: number;
+}
+
+/** OG's move-up/down is an outline-order operation, not merely a sibling swap.
+ * At a child-list edge it crosses into the adjacent parent sibling: moving down
+ * enters the next sibling as its first child; the inverse up move enters the
+ * previous sibling as its last child. Root edges remain available to the
+ * journal-feed cross-page route below. */
+function outlineStepPlan(id: string, dir: 1 | -1): OutlineStepPlan | null {
   const node = doc.byId[id];
-  if (!node || !blockWritable(id)) return;
+  if (!node) return null;
   const sibs = rootsOf(id);
   const i = sibs.indexOf(id);
-  const ni = i + dir;
-  if (ni < 0 || ni >= sibs.length) return;
+  if (i < 0) return null;
+  const siblingIndex = i + dir;
+  if (siblingIndex >= 0 && siblingIndex < sibs.length) {
+    return { parent: node.parent, index: siblingIndex };
+  }
+  if (node.parent === null) return null;
+  const parent = doc.byId[node.parent];
+  if (!parent) return null;
+  const parentSiblings = rootsOf(node.parent);
+  const parentIndex = parentSiblings.indexOf(node.parent);
+  const adjacentParent = parentSiblings[parentIndex + dir];
+  if (!adjacentParent || !doc.byId[adjacentParent]) return null;
+  return {
+    parent: adjacentParent,
+    index: dir === -1 ? doc.byId[adjacentParent].children.length : 0,
+  };
+}
+
+export function moveItem(id: string, dir: 1 | -1): boolean {
+  const node = doc.byId[id];
+  if (!node || !blockWritable(id)) return false;
+  const plan = outlineStepPlan(id, dir);
+  if (!plan) return false;
+  const movedRaw = plan.parent !== node.parent
+    ? rawWithInheritedOrderListType(node.raw, formatForPage(node.page), plan.parent)
+    : node.raw;
   pushUndo("move-item", [node.page]);
   setDoc(
     produce((s) => {
-      const arr =
+      const source =
         node.parent === null
           ? s.pages[s.pages.findIndex((p) => p.name === node.page)].roots
           : s.byId[node.parent!].children;
-      arr.splice(i, 1);
-      arr.splice(ni, 0, id);
+      const from = source.indexOf(id);
+      if (from < 0) return;
+      source.splice(from, 1);
+      const destination = plan.parent === null
+        ? s.pages[s.pages.findIndex((p) => p.name === node.page)].roots
+        : s.byId[plan.parent].children;
+      s.byId[id].parent = plan.parent;
+      s.byId[id].raw = movedRaw;
+      destination.splice(Math.max(0, Math.min(plan.index, destination.length)), 0, id);
     })
   );
   markDirty(node.page);
+  return true;
 }
 
-/** Can a block move one slot in `dir` within its sibling list? */
+/** Can a block move one OG outline step in `dir`? */
 function canMoveItem(id: string, dir: 1 | -1): boolean {
+  return outlineStepPlan(id, dir) !== null;
+}
+
+/** Selection movement is still batched as sibling-array swaps. Structural edge
+ * crossing is handled separately from its root/day boundary below. */
+function canMoveSelectionWithinSiblings(id: string, dir: 1 | -1): boolean {
   const sibs = rootsOf(id);
   const ni = sibs.indexOf(id) + dir;
   return ni >= 0 && ni < sibs.length;
@@ -5198,6 +6209,321 @@ function persistCrossPage(dest: string, sources: string[]) {
   holdSourcesForDest(dest, sources);
   markDirty(dest);
   void flushPage(dest);
+}
+
+interface ManagedCrossPageMoveIntent {
+  sourcePage: string;
+  destinationPage: string;
+  roots: string[];
+  placement: ManagedApplicationMovePlacement;
+  rewrites: Map<string, string>;
+  graphBinding: number;
+  bindingGeneration: number;
+  sourceInstance: number;
+  destinationInstance: number;
+  sourceEditorGeneration: number;
+  destinationEditorGeneration: number;
+  rootNodes: Node[];
+  targetParentNode: Node | null;
+  history: ManagedMoveHistorySpec | null;
+}
+
+function managedMoveAdmission() {
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  return admission?.authority === "managed_writable" ? admission : null;
+}
+
+function blockTreeMetrics(ids: readonly string[]): { count: number; bytes: number; depth: number } | null {
+  let count = 0;
+  let bytes = 0;
+  let depth = 0;
+  const seen = new Set<string>();
+  const stack = ids.map((id) => ({ id, depth: 1 }));
+  while (stack.length) {
+    const current = stack.pop()!;
+    const node = doc.byId[current.id];
+    if (!node || seen.has(current.id)) return null;
+    seen.add(current.id);
+    count++;
+    bytes += new TextEncoder().encode(node.raw).byteLength;
+    depth = Math.max(depth, current.depth);
+    for (const child of node.children) stack.push({ id: child, depth: current.depth + 1 });
+  }
+  return { count, bytes, depth };
+}
+
+function pageTreeMetrics(pageName: string): { count: number; bytes: number; depth: number } | null {
+  const page = pageByName(pageName);
+  return page ? blockTreeMetrics(page.roots) : null;
+}
+
+function blockDepth(id: string): number | null {
+  let depth = 1;
+  let node = doc.byId[id];
+  const seen = new Set<string>();
+  while (node?.parent !== null) {
+    if (!node || seen.has(node.id)) return null;
+    seen.add(node.id);
+    node = doc.byId[node.parent];
+    depth++;
+  }
+  return node ? depth : null;
+}
+
+function installManagedMovedPages(source: PageDto, destination: PageDto): void {
+  setBaseRev(source.name, source.rev ?? null);
+  setBaseRev(destination.name, destination.rev ?? null);
+  setDoc(produce((state) => {
+    purgePageNodes(state, source.name);
+    purgePageNodes(state, destination.name);
+    for (const dto of [source, destination]) {
+      const page = toFeedPage(dto, state.byId);
+      const index = state.pages.findIndex((candidate) => candidate.name === dto.name);
+      if (index >= 0) state.pages[index] = page;
+      else state.pages.push(page);
+    }
+  }));
+  activatePageInstance(source.name);
+  activatePageInstance(destination.name);
+  invalidateUndoForPage(source.name);
+  invalidateUndoForPage(destination.name);
+  clearConflict(source.name);
+  clearConflict(destination.name);
+  invalidateAllMatrixDimensions();
+  bumpDataRev();
+}
+
+function managedMoveStillOwns(intent: ManagedCrossPageMoveIntent): boolean {
+  const admission = managedMoveAdmission();
+  return !!admission
+    && graphBinding() === intent.graphBinding
+    && admission.binding_generation === intent.bindingGeneration
+    && pageInstanceGeneration(intent.sourcePage) === intent.sourceInstance
+    && pageInstanceGeneration(intent.destinationPage) === intent.destinationInstance
+    && intent.roots.every((id, index) => {
+      const node = doc.byId[id];
+      return !!node && node.page === intent.sourcePage && unwrap(node) === intent.rootNodes[index];
+    })
+    && (intent.placement.placement === "root"
+      ? intent.targetParentNode === null
+      : !!doc.byId[intent.placement.parent_identity]
+        && unwrap(doc.byId[intent.placement.parent_identity]) === intent.targetParentNode
+        && doc.byId[intent.placement.parent_identity].page === intent.destinationPage);
+}
+
+function moveRefusal(outcome: ManagedApplicationMoveSubtreesOutcome): string {
+  if (outcome.status === "no_commit") return `Couldn't move blocks (${outcome.reason.replaceAll("_", " ")}). Nothing was changed.`;
+  return "Couldn't finish the managed move. Reopen Tine to recover the exact result safely.";
+}
+
+async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Promise<boolean> {
+  if (!managedMoveStillOwns(intent)) return false;
+  if (hasEditorLease(intent.sourcePage) || hasEditorLease(intent.destinationPage)) {
+    pushToast("Finish editing the affected page before moving blocks between pages.", "error");
+    return false;
+  }
+  setManagedMoveBusy([intent.sourcePage, intent.destinationPage], true);
+  let releaseSaves = () => {};
+  let resolved = true;
+  try {
+    if (!managedMoveStillOwns(intent)
+      || editorTransactionGeneration(intent.sourcePage) !== intent.sourceEditorGeneration
+      || editorTransactionGeneration(intent.destinationPage) !== intent.destinationEditorGeneration
+      || hasEditorLease(intent.sourcePage)
+      || hasEditorLease(intent.destinationPage)) return false;
+    if (!(await flushPageToQuiescence(intent.sourcePage))
+      || !(await flushPageToQuiescence(intent.destinationPage))) {
+      pushToast("Couldn't move — finish saving the affected pages first.", "error");
+      return false;
+    }
+    if (!managedMoveStillOwns(intent)) return false;
+    releaseSaves = holdManagedMovePages([intent.sourcePage, intent.destinationPage]);
+    const admission = managedMoveAdmission()!;
+    const source = pageByName(intent.sourcePage);
+    const destination = pageByName(intent.destinationPage);
+    const sourceRevision = saveBaselineFor(intent.sourcePage);
+    const destinationRevision = saveBaselineFor(intent.destinationPage);
+    if (!source?.path || !destination?.path || !sourceRevision || !destinationRevision) return false;
+    const roots = blockTreeMetrics(intent.roots);
+    const destinationMetrics = pageTreeMetrics(intent.destinationPage);
+    const insertionDepth = intent.placement.placement === "root"
+      ? 1
+      : (() => {
+          const parentDepth = blockDepth(intent.placement.parent_identity);
+          return parentDepth === null ? null : parentDepth + 1;
+        })();
+    if (!roots || !destinationMetrics
+      || insertionDepth === null
+      || destinationMetrics.count + roots.count > admission.application_save_page_blocks
+      || destinationMetrics.bytes + roots.bytes > admission.application_page_request_text_bytes
+      || Math.max(destinationMetrics.depth, insertionDepth + roots.depth - 1) > admission.application_page_max_depth) {
+      pushToast("Can't move: the destination would exceed managed storage's page limits. Nothing was changed.", "error");
+      return false;
+    }
+    const request: ManagedApplicationMoveSubtreesRequest = {
+      episode_id: crypto.randomUUID(),
+      source_path: source.path,
+      source_revision: sourceRevision,
+      destination_path: destination.path,
+      destination_revision: destinationRevision,
+      roots: intent.roots.map((identity): ManagedApplicationMoveRoot => ({
+        identity,
+        raw_rewrite: intent.rewrites.has(identity)
+          ? { expected_raw: doc.byId[identity].raw, desired_raw: intent.rewrites.get(identity)! }
+          : null,
+      })),
+      placement: intent.placement,
+      admission: {
+        application_save_page_blocks: admission.application_save_page_blocks,
+        application_page_request_text_bytes: admission.application_page_request_text_bytes,
+        application_page_max_depth: admission.application_page_max_depth,
+      },
+    };
+    let result = await backend().moveManagedApplicationSubtrees(intent.bindingGeneration, request);
+    for (let recoveryTurns = 0; result.outcome.status === "deferred"; recoveryTurns++) {
+      if (recoveryTurns >= 8) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(result.outcome), "error");
+        return false;
+      }
+      const recovered = await backend().recoverManagedApplicationSubtrees(
+        result.binding_generation,
+        request,
+      );
+      if (recovered.binding_generation !== result.binding_generation
+        && !managedStorageRuntime.transitionMoveRecovery(
+          recovered,
+          request.episode_id,
+          result.binding_generation,
+          () => managedMoveStillOwns(intent),
+        )) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(recovered.outcome), "error");
+        return false;
+      }
+      result = {
+        binding_generation: recovered.binding_generation,
+        application_page_admission: recovered.application_page_admission,
+        outcome: recovered.outcome,
+      };
+      intent.bindingGeneration = recovered.binding_generation;
+      if (result.outcome.status === "deferred" && result.outcome.state.status === "blocked_recovery") {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(result.outcome), "error");
+        return false;
+      }
+    }
+    if (result.outcome.status !== "committed") {
+      pushToast(moveRefusal(result.outcome), "error");
+      return false;
+    }
+    if (!managedMoveStillOwns(intent)) {
+      // A graph switch owns its replacement and may discard this old response.
+      // A same-graph page replacement cannot: the actor committed, but the
+      // frontend no longer knows whether that replacement is pre- or post-move.
+      // Keep both save lanes closed until reopen resolves the durable truth.
+      if (graphBinding() === intent.graphBinding
+        && managedMoveAdmission()?.binding_generation === intent.bindingGeneration) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal({
+          status: "deferred",
+          episode_id: request.episode_id,
+          state: {
+            status: "blocked_recovery",
+            batch_id: result.outcome.batch_id,
+            phase: "projection_drain",
+            retained_publication: true,
+          },
+        }), "error");
+      }
+      return false;
+    }
+    installManagedMovedPages(
+      { ...result.outcome.source.page, rev: result.outcome.source.revision },
+      { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
+    );
+    if (intent.history) pushManagedMoveHistory(intent.history);
+    return true;
+  } catch (error) {
+    pushToast(`Couldn't move blocks. (${String(error)})`, "error");
+    return false;
+  } finally {
+    if (resolved) {
+      releaseSaves();
+      setManagedMoveBusy([intent.sourcePage, intent.destinationPage], false);
+    }
+  }
+}
+
+function enqueueManagedCrossPageMove(
+  sourcePage: string,
+  destinationPage: string,
+  roots: readonly string[],
+  placement: ManagedApplicationMovePlacement,
+  rewrites: Map<string, string>,
+  recordHistory = true,
+): Promise<boolean> {
+  const admission = managedMoveAdmission();
+  const sourceInstance = pageInstanceGeneration(sourcePage);
+  const destinationInstance = pageInstanceGeneration(destinationPage);
+  if (!admission || sourceInstance === null || destinationInstance === null) return Promise.resolve(false);
+  const nodes = roots.map((id) => doc.byId[id]);
+  if (nodes.some((node) => !node || node.page !== sourcePage)) return Promise.resolve(false);
+  const originalParent = nodes[0].parent;
+  if (nodes.some((node) => node.parent !== originalParent)) {
+    pushToast("Managed multi-block moves require the selected roots to share one parent.", "error");
+    return Promise.resolve(false);
+  }
+  const originalSiblings = originalParent === null
+    ? pageByName(sourcePage)?.roots
+    : doc.byId[originalParent]?.children;
+  const originalPositions = nodes.map((node) => originalSiblings?.indexOf(node.id) ?? -1);
+  if (!originalSiblings
+    || originalPositions.some((position) => position < 0)
+    || originalPositions.some((position, index) => index > 0 && position !== originalPositions[index - 1] + 1)) {
+    pushToast("Managed multi-block moves require one contiguous selection.", "error");
+    return Promise.resolve(false);
+  }
+  const history: ManagedMoveHistorySpec | null = recordHistory ? {
+    sourcePage,
+    destinationPage,
+    roots: [...roots],
+    forwardPlacement: placement,
+    inversePlacement: originalParent === null
+      ? { placement: "root", position: originalPositions[0] }
+      : { placement: "child", parent_identity: originalParent, position: originalPositions[0] },
+    forwardRewrites: new Map(rewrites),
+    inverseRewrites: new Map(
+      roots
+        .filter((id) => rewrites.has(id))
+        .map((id) => [id, doc.byId[id].raw]),
+    ),
+  } : null;
+  const intent: ManagedCrossPageMoveIntent = {
+    sourcePage,
+    destinationPage,
+    roots: [...roots],
+    placement,
+    rewrites,
+    graphBinding: graphBinding(),
+    bindingGeneration: admission.binding_generation,
+    sourceInstance,
+    destinationInstance,
+    sourceEditorGeneration: editorTransactionGeneration(sourcePage),
+    destinationEditorGeneration: editorTransactionGeneration(destinationPage),
+    rootNodes: nodes.map((node) => unwrap(node)),
+    targetParentNode: placement.placement === "child"
+      ? (doc.byId[placement.parent_identity] ? unwrap(doc.byId[placement.parent_identity]) : null)
+      : null,
+    history,
+  };
+  const result = managedMoveQueue.then(() => runManagedCrossPageMove(intent));
+  managedMoveQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
@@ -5266,6 +6592,21 @@ export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" |
   if (node.parent !== null) return "none"; // nested block at a child-list edge: stop
   const target = await feedNeighbor(node.page, dir);
   if (!target || !pageWritable(target)) return "none";
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (!admission || admission.authority === "managed_unavailable") {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return "none";
+  }
+  if (admission.authority === "managed_writable") {
+    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+    return (await enqueueManagedCrossPageMove(
+      node.page,
+      target,
+      [id],
+      { placement: "root", position },
+      new Map(),
+    )) ? "crossed" : "none";
+  }
   if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
   if (!doc.byId[id]) return "none"; // vanished during the flush
   pushUndo("move-cross", [node.page, target]);
@@ -5279,7 +6620,7 @@ export async function moveSelectionItems(dir: 1 | -1) {
   const ids = topSelected(); // document order: ids[0] topmost, last bottommost
   if (!ids.length || ids.some((id) => !blockWritable(id))) return;
   const lead = dir === 1 ? ids[ids.length - 1] : ids[0];
-  if (canMoveItem(lead, dir)) {
+  if (canMoveSelectionWithinSiblings(lead, dir)) {
     // Batch the whole selection into ONE undo entry + ONE produce. Doing it
     // per-block (a moveItem call each) snapshots the entire working set K times —
     // a 15-block nudge became 15 full clones, the visible jank. Going down, move
@@ -5317,6 +6658,22 @@ export async function moveSelectionItems(dir: 1 | -1) {
   if (ids.some((id) => doc.byId[id].parent !== null || doc.byId[id].page !== page)) return;
   const target = await feedNeighbor(page, dir);
   if (!target || !pageWritable(target)) return;
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (!admission || admission.authority === "managed_unavailable") {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return;
+  }
+  if (admission.authority === "managed_writable") {
+    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+    await enqueueManagedCrossPageMove(
+      page,
+      target,
+      ids,
+      { placement: "root", position },
+      new Map(),
+    );
+    return;
+  }
   if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
   pushUndo("move-sel-cross", [page, target]);
   crossMoveBlocks(ids, page, target, dir);

@@ -23,16 +23,44 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Native text controls cannot use the Twemoji <img> renderer. Keep the bundled
-   monochrome emoji face ahead of system fallback so WebKitGTK never reaches a
-   COLRv1 font's crashing Skia path (#76), but put our bundled text face first.
+/* Native text controls cannot use the Twemoji <img> renderer. Desktop Linux
+   keeps the bundled monochrome face so WebKitGTK never reaches the crashing
+   COLRv1 Skia path (#76). Healthy native platforms use their color face first
+   and retain Noto Emoji Variable as the safe last emoji fallback (GH #293).
    Noto Emoji also contains the keycap bases #, * and 0-9; putting it first gives
    ordinary source text emoji-width advances (for example `v 0 . 5 . 0`).
    !important is deliberate: several specialized editors use `font: inherit` or
    a monospace shorthand later in this file; safety must survive those rules. */
+:root {
+  --tine-editable-emoji-font: "Noto Emoji Variable";
+  /* System-inset gutters for viewport-fixed chrome.
+     `.app-container` already pads the app SHELL by the four insets, but a
+     `position: fixed` overlay is laid out against the viewport and escapes that
+     padding completely — so every full-viewport overlay has to reapply them.
+     A larger vh/px constant cannot substitute: the status bar, cutout and
+     gesture bar differ per device, and on Android targetSdk 36 the viewport
+     always includes them. All four are 0 on desktop, so each `calc()` below
+     reduces to its own gap there.
+     Overriding these four variables is also how the browser harness
+     (scripts/check-mobile-safe-area.mjs) can measure inset behaviour in a
+     desktop Chromium, where env() is always 0. */
+  --overlay-inset-top: env(safe-area-inset-top, 0px);
+  --overlay-inset-right: env(safe-area-inset-right, 0px);
+  --overlay-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --overlay-inset-left: env(safe-area-inset-left, 0px);
+}
+html[data-editable-emoji="windows"] {
+  --tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable";
+}
+html[data-editable-emoji="apple"] {
+  --tine-editable-emoji-font: "Apple Color Emoji", "Noto Emoji Variable";
+}
+html[data-editable-emoji="android"] {
+  --tine-editable-emoji-font: "Noto Color Emoji", "Noto Emoji Variable";
+}
 input:not([type="checkbox"]):not([type="radio"]),
 textarea {
-  font-family: var(--tine-editable-font, "Inter", "Noto Emoji Variable", var(--ls-font-family)) !important;
+  font-family: var(--tine-editable-font, "Inter", var(--tine-editable-emoji-font), var(--ls-font-family)) !important;
 }
 
 .formula-editor-textarea,
@@ -40,7 +68,7 @@ textarea {
   /* Keep Noto ahead of the generic family here too: a generic may resolve to
      the crashing system color font before CSS considers a later family. */
   --tine-editable-font: "MonoLisa", "Fira Code", "JetBrains Mono", Menlo, Monaco,
-    Consolas, "Courier New", "Noto Emoji Variable", monospace;
+    Consolas, "Courier New", var(--tine-editable-emoji-font), monospace;
 }
 
 #root {
@@ -78,7 +106,9 @@ textarea {
   left: 0;
   right: 0;
   z-index: 9999;
-  padding: 8px 14px;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 14px) 8px
+    calc(var(--overlay-inset-left) + 14px);
   font-size: 13px;
   background: #b91c1c;
   color: #fff;
@@ -1835,6 +1865,7 @@ textarea {
 
 .references-header.clickable {
   cursor: pointer;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -1846,7 +1877,14 @@ textarea {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 12vh;
+  box-sizing: border-box;
+  /* Shared by Settings, Copy/Export, Print to PDF and the advanced query
+     workspace, so the system-inset gutter belongs here rather than on any one
+     of them. */
+  padding: calc(var(--overlay-inset-top) + 12vh)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 120;
 }
 .settings-modal {
@@ -2516,6 +2554,59 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.focus-freshness-barrier {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  z-index: 10020;
+  transform: translateX(-50%);
+  padding: 0.42rem 0.72rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 24%);
+  font-size: 0.78rem;
+  pointer-events: none;
+}
+
+/* Concord P5: an external change held for review ("always ask"). A calm bar
+   above the page, in the same family as the VCS-marker banner — never a modal. */
+.external-change-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent, #3b82f6);
+  border-radius: 6px;
+  background: var(--bg-secondary, transparent);
+  font-size: 13px;
+}
+.external-change-text {
+  color: var(--text-muted);
+  flex: 1 1 320px;
+}
+.external-change-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* One proposed journal rename: the current name above the name it would get. */
+.journal-rename-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.journal-rename-row .journal-conflict-preview:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
 .journal-conflict-rename {
   display: flex;
   gap: 6px;
@@ -2565,6 +2656,11 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 60;
 }
 .sync-merge-modal {
@@ -2705,6 +2801,138 @@ textarea {
   font-size: 11px;
   color: var(--text-muted);
 }
+/* A 3-way pre-selection (Concord base ledger) the user hasn't overridden. */
+.sync-merge-suggested-tag {
+  font-size: 11px;
+  color: var(--link-color);
+}
+/* --- Concord L3/L4: the calm queue badge and the in-page resolver. --- */
+
+/* The badge waits in the sidebar footer. Deliberately quiet: no red, no count
+   bubble, no animation — a conflict is a thing to get to, not an alarm. */
+.conflict-queue-badge {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  text-align: left;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.conflict-queue-badge:hover {
+  border-color: color-mix(in srgb, var(--link-color) 45%, var(--border-color));
+  color: var(--text-primary);
+}
+.conflict-queue-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #b45309;
+  flex-shrink: 0;
+}
+
+.page-conflict {
+  margin: 0 0 14px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+.page-conflict-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+.page-conflict-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.page-conflict-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.page-conflict-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+/* The two (or three) sides get distinct, stable colours: the same hue names the
+   column label, the cell, and the segment button for that side. */
+.page-conflict-legend {
+  display: flex;
+  gap: 14px;
+  padding: 6px 14px 0;
+  font-size: 11px;
+}
+.page-conflict-side {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+}
+.page-conflict-side::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.page-conflict-side.mine::before {
+  background: #2e7d32;
+}
+.page-conflict-side.theirs::before {
+  background: #1565c0;
+}
+.page-conflict-side.base::before {
+  background: var(--text-muted);
+}
+.page-conflict .sync-merge-cell.mine {
+  border-left: 3px solid color-mix(in srgb, #2e7d32 55%, transparent);
+}
+.page-conflict .sync-merge-cell.theirs {
+  border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
+}
+.page-conflict-rows {
+  padding: 2px 14px 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+/* Brief highlight as "n conflicts ↑↓" walks between regions. */
+.page-conflict-row-focus {
+  background: color-mix(in srgb, var(--link-color) 14%, transparent);
+  border-radius: 5px;
+}
+.page-conflict-empty {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.page-conflict-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+.page-conflict-foot button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.page-conflict .sync-merge-toolbar,
+.page-conflict .sync-merge-collabels {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
 .sync-merge-preblock {
   padding: 6px 16px 0;
 }
@@ -2808,12 +3036,21 @@ textarea {
 }
 @media (max-width: 480px) {
   .modal-overlay {
-    padding-top: 2vh;
+    /* Exactly the system inset, and nothing on top of it. The extra 2vh was a
+       desktop-shaped breathing gap; on a phone it put the modal noticeably
+       below the status bar and left a lit strip of the workspace behind it
+       showing through the scrim. A full-height sheet wants its top edge ON the
+       inset. */
+    padding-top: var(--overlay-inset-top);
   }
   .settings-modal {
-    width: calc(100vw - 16px);
+    /* Fill the overlay's already-inset content box instead of measuring against
+       the raw viewport. `96vh` counted the status bar and the gesture bar as
+       usable space, so the modal rode up under the transparent status bar and
+       its lowest control could sit under the gesture bar. */
+    width: 100%;
     max-width: none;
-    height: 96vh;
+    height: 100%;
     max-height: none;
     flex-direction: column;
   }
@@ -3525,6 +3762,19 @@ textarea {
   background: var(--bg-secondary);
   color: var(--text-secondary);
 }
+/* Unresolved VCS merge markers (git/Fossil) on disk: the page is readable but
+   quarantined from saves so Tine never mangles the markers. Amber = caution,
+   not an error — the fix happens outside Tine. */
+.vcs-marker-banner {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
 .page-guide-banner {
   display: flex;
   align-items: center;
@@ -3673,6 +3923,10 @@ textarea {
 .page-section {
   padding-bottom: 18px;
 }
+.page-section.page-mutation-busy {
+  cursor: wait;
+  opacity: 0.72;
+}
 
 .page-section + .page-section {
   margin-top: 6px;
@@ -3692,6 +3946,8 @@ textarea {
   cursor: text;
   text-align: left;
   padding-left: 34px;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-trailing-block-target span {
   opacity: 0;
@@ -3729,6 +3985,10 @@ textarea {
 }
 .block-main.drop-before {
   box-shadow: inset 0 2px 0 var(--link-color);
+}
+.block-main.drop-child {
+  box-shadow: inset 3px 0 0 var(--link-color);
+  background: color-mix(in srgb, var(--link-color) 9%, transparent);
 }
 .block-main.dragging {
   opacity: 0.4;
@@ -4456,9 +4716,11 @@ textarea {
   border-radius: 4px;
   background: color-mix(in srgb, currentColor 15%, transparent);
   color: var(--marker-color);
-  cursor: pointer;
+  cursor: default;
   vertical-align: 1px;
 }
+
+.block-marker.marker-clickable { cursor: pointer; }
 
 /* GFM `[ ]`/`[x]` checklist checkbox (distinct from TODO markers). */
 .block-checkbox {
@@ -4999,7 +5261,11 @@ mark {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 24px)
+    calc(var(--overlay-inset-right) + 24px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 24px);
 }
 .audio-panel {
   width: 90vw;
@@ -6446,8 +6712,8 @@ body.file-drop-active::after {
 /* ------------------------------------------------------------- toasts */
 .toast-stack {
   position: fixed;
-  bottom: 18px;
-  right: 18px;
+  bottom: calc(var(--overlay-inset-bottom) + 18px);
+  right: calc(var(--overlay-inset-right) + 18px);
   z-index: 200;
   display: flex;
   flex-direction: column;
@@ -6527,11 +6793,19 @@ body.file-drop-active::after {
   display: flex;
   align-items: center;
   justify-content: center;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   cursor: zoom-out;
 }
-.lightbox-img {
+.lightbox-overlay > img.lightbox-img {
+  width: auto;
+  height: auto;
   max-width: 92vw;
   max-height: 92vh;
+  object-fit: contain;
   border-radius: 6px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
   cursor: default;
@@ -6937,6 +7211,8 @@ img.emoji {
   display: flex;
   align-items: center;
   gap: 8px;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .reference-filter-toggle {
@@ -7931,7 +8207,11 @@ img.emoji {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 12vh;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 12vh)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 100;
 }
 
@@ -8979,7 +9259,11 @@ img.emoji {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 24px)
+    calc(var(--overlay-inset-right) + 24px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 24px);
   background: var(--bg-primary);
   overflow: auto;
 }
@@ -9208,7 +9492,10 @@ img.emoji {
   display: grid;
   place-items: center;
   box-sizing: border-box;
-  padding: 46px 20px 24px;
+  padding: calc(var(--overlay-inset-top) + 46px)
+    calc(var(--overlay-inset-right) + 20px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 20px);
   overflow: auto;
   background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
   color: var(--text-primary);

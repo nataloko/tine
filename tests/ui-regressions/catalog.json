@@ -2,6 +2,57 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-CONCORD-LIVE-DIRECT-SAVE-337",
+      "title": "A Direct Files save conflict enters Concord with both exact versions, survives restart, and resolves without the retired global conflict bar",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [337],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::concord_live_save_conflict_uses_editor_base_and_guarded_resolution",
+          "crates/tine-core/src/model.rs::tests::concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk",
+          "src/components/ConflictResolution.test.tsx",
+          "scripts/e2e-concord-live-save.mjs"
+        ],
+        "scenario": "concord.live-direct-save-exact-restart-handoff",
+        "failBefore": "proven"
+      },
+      "notes": "A guarded Direct Files save refusal retains the exact disk winner and the editor draft in app-private recovery state. The conflict is reviewed through the page-level Concord resolver, survives a real process restart, applies under the shown revision guard, and returns to ordinary editable Markdown. The blocking E2E contract also proves that the retired Keep mine / Use current global bar never reappears."
+    },
+    {
+      "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",
+      "title": "Applying a sync conflict copy installs the exact committed merge and returns the journal to ordinary conflict-free editing",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [337],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/graph.rs::resolve_sync_conflict_merges_and_trashes",
+          "src-tauri/src/watcher.rs::unset_watch_mode_prefers_native_events_on_every_platform",
+          "src/components/ConflictResolution.test.tsx",
+          "src/components/ConflictQueueBadge.test.tsx",
+          "scripts/e2e-concord-sync-copy.mjs"
+        ],
+        "scenario": "concord.sync-copy-exact-editor-handoff",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's 2026-08-22 Direct Files tests exposed a continuing incomplete handoff: the pre-merge editor could remain installed; resolving today's journal could omit that mutation-held day; sticky notices could outlive the object; a winner-file watcher event declined during mutation ownership remained parked until the next edit and then looked divergent; an older inventory refresh could republish an already-resolved conflict; and a same-content resolution could lose its disk baseline so the next edit reopened Concord. The correction contract requires event-independent discovery, a quiescent exact-DTO handoff, atomic journal-feed publication, immediate replay when explicit ownership releases, newest-generation inventory publication, notification retirement, and a successful ordinary post-resolution edit after both changed-content and same-content handoffs."
+    },
+    {
       "id": "UI-BLOCK-SELECTION-ACTION-OWNERSHIP-240",
       "title": "An active block selection owns heading commands and bullet drag even when the pointer is on another block",
       "family": "block-selection",
@@ -17,7 +68,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/ContextMenu.test.tsx",
@@ -100,8 +151,7 @@
       "status": "reported",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/oplog/local_active/tests.rs",
-          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/sync_runtime.rs::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
           "src-tauri/src/lib.rs",
           "src/startupReveal.test.ts"
         ],
@@ -2122,28 +2172,30 @@
     },
     {
       "id": "UI-EDITABLE-EMOJI-COLRV1-001",
-      "title": "Editable emoji fields avoid the unsafe WebKitGTK system COLRv1 font path",
+      "title": "Editable emoji fields use native color faces on healthy platforms while avoiding the unsafe WebKitGTK COLRv1 path",
       "family": "gpu-rendering",
       "sources": {
         "issues": [
-          76
+          76,
+          293
         ],
         "commits": [
           "7ba8d74"
         ]
       },
       "platforms": [
-        "linux"
+        "all"
       ],
       "layer": "native",
-      "status": "closed",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/editableEmojiFont.test.ts"
         ],
         "scenario": null,
         "failBefore": "proven"
-      }
+      },
+      "notes": "GH #76 requires a bundled monochrome emoji face for native editable controls on desktop Linux because WebKitGTK's system COLRv1 path can abort the render process. The first safety fix applied that fallback to every platform, making status emoji monochrome and hard to distinguish in the Windows editor (GH #293). A pre-paint user-agent boundary now keeps the safe monochrome default for desktop Linux, while Windows selects Segoe UI Emoji, Apple platforms select Apple Color Emoji, and Android selects Noto Color Emoji before the bundled fallback. Rendered non-editing surfaces deliberately remain Twemoji SVGs; native input/textarea artwork can differ slightly, but color and semantic distinctions survive. Exact Windows paint awaits reporter confirmation; source tests freeze all platform classifications and font-stack order."
     },
     {
       "id": "UI-ZOOM-COLLAPSED-ROOT-001",
@@ -2296,7 +2348,7 @@
     },
     {
       "id": "UI-SPLIT-MIDDLE-CLICK-PANE-001",
-      "title": "Middle-clicked page links open a tab in their source pane",
+      "title": "Middle-clicked page links open a background tab in the pane that was already active",
       "family": "split-navigation",
       "sources": {
         "issues": [
@@ -2308,14 +2360,16 @@
         "all"
       ],
       "layer": "render",
-      "status": "closed",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/render/clickSpans.test.tsx"
+          "src/render/clickSpans.test.tsx",
+          "src/paneTracker.test.tsx"
         ],
         "scenario": null,
         "failBefore": "proven"
-      }
+      },
+      "notes": "The first fix for GH #87 encoded the source pane as the destination, contradicting both the original report and the reporter's reopened clarification: a background tab belongs to the pane that was active before the gesture, even when the clicked link is in another pane or the sidebar. The global pointer tracker also treated middle-button pointerdown as pane activation, making the destination depend on event order. Middle pointerdown now preserves pane focus, page-reference anchors prevent incidental middle-button DOM focus, and page references plus page titles use the focused-router facade for their background tab. The regression explicitly renders the link in one registered split while another is active and proves only the active pane gains the tab."
     },
     {
       "id": "UI-BLOCK-EMBED-ROOT-BULLET-001",
@@ -2727,7 +2781,7 @@
       "coverage": {
         "tests": [
           "crates/tine-core/src/publish.rs",
-          "website/demo/project-roadmap.html"
+          "website/guide/project-roadmap.html"
         ],
         "scenario": "publish.block-referrers",
         "failBefore": "proven"
@@ -2751,11 +2805,78 @@
       "coverage": {
         "tests": [
           "crates/tine-core/src/publish.rs",
-          "website/demo/index.html",
-          "website/demo/pages.html"
+          "website/guide/index.html",
+          "website/guide/pages.html"
         ],
         "scenario": "publish.welcome-home",
         "failBefore": "proven"
+      }
+    },
+    {
+      "id": "UI-PUBLISH-SHEET-VIEWS-001",
+      "title": "Published tine.view sheets render as read-only tables, boards, and grids instead of bare nested bullets",
+      "family": "publishing",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/publish.rs",
+          "website/guide/features-sheets.html",
+          "website/guide/workflows-structure-repeated-information.html"
+        ],
+        "scenario": "publish.sheet-views",
+        "failBefore": "proven"
+      }
+    },
+    {
+      "id": "UI-PUBLISH-ORDERED-LIST-001",
+      "title": "Own-numbered blocks keep their ordinal markers in the static HTML export",
+      "family": "publishing",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/publish.rs",
+          "website/guide/feature-showcase.html"
+        ],
+        "scenario": "publish.ordered-list-markers",
+        "failBefore": "reconstructed"
+      }
+    },
+    {
+      "id": "UI-PUBLISH-LOGBOOK-SUMMARY-001",
+      "title": "LOGBOOK clock rows keep their elapsed-time badge while the drawer stays hidden in the static HTML export",
+      "family": "publishing",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/publish.rs",
+          "website/guide/feature-showcase.html"
+        ],
+        "scenario": "publish.logbook-summary",
+        "failBefore": "reconstructed"
       }
     },
     {
@@ -2946,7 +3067,7 @@
         "tests": [
           "crates/tine-core/src/publish.rs",
           "scripts/check-publish-outline-geometry.mjs",
-          "website/demo/index.html"
+          "website/guide/index.html"
         ],
         "scenario": "publish.outline-guide-geometry",
         "failBefore": "proven"
@@ -5806,7 +5927,7 @@
         "all"
       ],
       "layer": "native",
-      "status": "reported",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/sheet/config.test.ts",
@@ -5816,7 +5937,7 @@
         "scenario": "sheets.table-stable-column-resize",
         "failBefore": "proven"
       },
-      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged."
+      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged. 2026-08-12: the held observation ran. scripts/e2e-sheets.mjs PASSED in the linux-release catalog against the v0.6.93 candidate binary (appSha256 75b3c2e9\u2026, commit 651d605e), in both ordinary and strict release mode, so the row advances past `reported`. Released in v0.6.93."
     },
     {
       "id": "UI-SHEET-TABLE-COLUMN-REORDER-217",
@@ -5898,7 +6019,8 @@
       "family": "editor/slash",
       "sources": {
         "issues": [
-          225
+          225,
+          238
         ],
         "commits": []
       },
@@ -5915,7 +6037,7 @@
         "scenario": "editor.slash-task-set-marker",
         "failBefore": "proven"
       },
-      "notes": "Task rows used to be literal insertions. They now clear the slash trigger and call the shared setMarker primitive like OG, covering every supported marker, plain and already-task blocks, multiline/property content, priority placement, Markdown/Org, one commit, and end-of-block caret placement."
+      "notes": "Task rows used to be literal insertions. They now clear the slash trigger and call the shared setMarker primitive like OG, covering every supported marker, plain and already-task blocks, multiline/property content, priority placement, Markdown/Org, one commit, and end-of-block caret placement. GH #238 was filed after this repair reached master but before its first release; the same test proves its /later, /now and /todo-at-end report post-fixed without a second implementation."
     },
     {
       "id": "UI-NAMESPACE-REFERENCE-ONLY-DESCENDANTS-229",
@@ -6241,7 +6363,7 @@
     },
     {
       "id": "UI-UPDATER-FAILURE-SURFACE-241",
-      "title": "A failed desktop self-update logs the real error and tells the user while still opening the releases page as the safe fallback",
+      "title": "Windows update checks use the native network trust path and require a separate install confirmation",
       "family": "updater",
       "sources": {
         "issues": [
@@ -6262,11 +6384,11 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #241. The catch around check()/downloadAndInstall()/relaunch() swallowed every error and silently opened the releases page, making all updater failures (notably on Windows) indistinguishable from the manual path. It now logs '[update] self-update failed: <err>' to the console (captured in the debug log) and shows an error toast. The underlying Windows update failure itself is NOT diagnosed: manifest entries exist, so reproduce on a Windows install and read the (now-visible) error; reporter follow-up should ask for exactly that."
+      "notes": "GH #241. The earlier catch fix exposed the reporter's concrete failure: Tauri's default rustls updater transport could not send the latest.json request on their otherwise-online Windows 11 installation, before manifest parsing, signature verification, download, or installation. Windows updater builds now use reqwest native-tls/Schannel so the request follows the OS-native certificate and network trust path; Linux/macOS retain the shipped rustls path. Cargo feature-tree evidence proves Windows selects native-tls and Linux selects rustls-tls; physical reporter confirmation remains necessary. The explicit Check for updates action no longer installs by itself: it reports availability and presents a separate sticky Install update action. Installer failures remain logged and visible, with the releases page as fallback."
     },
     {
       "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
-      "title": "Enter inside a multi-line $$ \u2026 $$ environment keeps the block together instead of splitting it",
+      "title": "Enter and multiline paste inside a $$ \u2026 $$ environment keep the block together instead of splitting it",
       "family": "editor-enter",
       "sources": {
         "issues": [
@@ -6280,15 +6402,74 @@
         "macos"
       ],
       "layer": "render",
-      "status": "released",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/Block.mathBlockEnter.test.tsx"
+          "src/components/Block.mathBlockEnter.test.tsx",
+          "src/components/Block.multilinePaste.test.tsx"
         ],
         "scenario": "editor.enter-inside-display-math-stays-in-block",
         "failBefore": "proven"
       },
-      "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. Scope is the editor's Enter decision only (src/editor/fences.ts caretInDisplayMath): the parser, the on-disk bytes and property classification are untouched. Necessity gate proven \u2014 the new tests fail on the pre-fix tree."
+      "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. The v0.6.92 Enter fix was too narrow: the reporter's post-release follow-up proved that pasting LaTeX containing a blank line into the same environment still segmented it into outline blocks. The shared syntax-sensitive editor decision now uses caretInDisplayMath for paste as well as Enter, including selection replacement; ordinary blank-line prose still segments normally. The parser, on-disk bytes and property classification remain untouched. Necessity gate proven: the exact reporter paste tests fail before the paste predicate is widened."
+    },
+    {
+      "id": "UI-TASK-MARKER-LABEL-CLICK-259",
+      "title": "Clicking a task marker label uses Logseq's open-state toggle and never removes DONE",
+      "family": "editor-task-markers",
+      "sources": {
+        "issues": [259],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/repeat.test.ts",
+          "src/components/Block.markerClick.test.tsx",
+          "src/components/SheetTable.test.tsx"
+        ],
+        "scenario": "editor.task-marker-label-click",
+        "failBefore": "proven"
+      },
+      "notes": "OG source at 6e7afa8eb separates marker-switch (components/block.cljs:1861) from keyboard cycle-marker-state (util/marker.cljs:40): label clicks toggle TODO/DOING and LATER/NOW, while DONE is not clickable; keyboard cycling may still reach DONE and then remove the marker. Tine had wired both block and Sheet label clicks to its keyboard cycle, so clicking DONE silently removed completion. The click helper is now separate, preserves the existing logbook transition machinery, and is shared by ordinary blocks and Sheet state cells. Keyboard and checkbox behavior are unchanged. The reporter confirmed this exact OG behavior and accepted it."
+    },
+    {
+      "id": "UI-LIGHTBOX-CUSTOM-CSS-GEOMETRY-319",
+      "title": "Generic custom.css image sizing does not constrain the full-screen lightbox",
+      "family": "image-lightbox",
+      "sources": {
+        "issues": [319],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/components/Lightbox.customCss.test.tsx"],
+        "scenario": "image.lightbox-custom-css-geometry",
+        "failBefore": "proven"
+      },
+      "notes": "Graph custom.css intentionally loads after Tine's stylesheet, so a generic `img { width: 320px; height: auto }` thumbnail rule also constrained `.lightbox-img`. The lightbox now owns its geometry through the more-specific `.lightbox-overlay > img.lightbox-img` rule with auto width/height, viewport maxima and object-fit contain. A later generic img rule remains effective for inline thumbnails but loses only on the dedicated lightbox surface; users can still target `.lightbox-img` explicitly if desired."
+    },
+    {
+      "id": "UI-NATIVE-SELECTION-EXCLUDES-CHROME-328",
+      "title": "Native page selections exclude Add block and reference-section UI labels",
+      "family": "native-text-selection",
+      "sources": {
+        "issues": [328],
+        "commits": []
+      },
+      "platforms": ["android", "linux", "macos", "windows"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/styles/uiChromeSelection.test.ts"],
+        "scenario": "selection.page-content-excludes-ui-chrome",
+        "failBefore": "proven"
+      },
+      "notes": "The reporter's concrete copied suffixes are UI labels, not page content: `+ Add block`, `Linked References`, and `Unlinked References`. The trailing target and every references header now opt out of native selection in both standard and WebKit-prefixed CSS, so mouse/touch selection can cross the page without copying application chrome. This deliberately does not attempt nonstandard region-containment semantics; actual reference block content remains selectable."
     },
     {
       "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
@@ -6442,7 +6623,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/startupRecovery.test.ts",
@@ -6468,7 +6649,7 @@
         "all"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/store.test.ts"
@@ -6492,7 +6673,7 @@
         "all"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/clipboard.paste.test.ts"
@@ -6501,6 +6682,221 @@
         "failBefore": "reconstructed"
       },
       "notes": "The superseded per-id predicate rescanned every loaded key and every loaded raw for each incoming identity, so cost grew with candidates times page size. The batched helper is asserted through an explicit work receipt (src/clipboardWorkProbe.ts): 200+ preserved-ID paste and redo candidates each record exactly one loaded_identity_pass, and incoming_identity_ids_checked stays fixed as the loaded document grows. Fail-closed behaviour is unchanged and independently asserted: an internally duplicated moved payload is rejected before the loaded document is consulted, and both the Markdown id:: and Org :id: raw forms are still matched without requiring an Org drawer. Fail-before is reconstructed from the superseded source at v0.6.92, not from a red run executed at release time."
+    },
+    {
+      "id": "UI-PROPERTY-AUTOCOMPLETE-KEYBOARD-LIFECYCLE-306",
+      "title": "Property autocomplete remains usable when authored entirely from the keyboard",
+      "family": "editor-autocomplete",
+      "sources": {
+        "issues": [306],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/autocomplete.test.ts",
+          "src/components/Block.propertyAutocomplete.test.tsx"
+        ],
+        "scenario": "editor.property-autocomplete-keyboard-lifecycle",
+        "failBefore": "proven"
+      },
+      "notes": "OG moves the caret before a line-opening :: delimiter and searches the property name to its left. Tine previously left the caret after ::, so the first name character produced malformed ::a text, closed the popup, and could surface repeated backend error notifications. Coverage exercises the real input-event lifecycle: :: moves the caret left; typed characters filter without closing; Create is discoverable at the top; selection enters value search; a directly authored key:: followed by space also enters value search; and comma starts a new value search with already-authored values excluded. Facet lookup failure is contained to the optional autocomplete surface and cannot reject the editor input event."
+    },
+    {
+      "id": "UI-BLOCK-DRAG-NESTED-DROP-326",
+      "title": "Dragging a block into the deep target zone makes it a child of that block",
+      "family": "outline-drag-drop",
+      "sources": {
+        "issues": [326],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/blockDrag.test.ts",
+          "src/store.test.ts"
+        ],
+        "scenario": "outline.drag-to-nest-selected-subtrees",
+        "failBefore": "proven"
+      },
+      "notes": "Tine's pointer drag implementation exposed only before/after sibling targets, so Windows was not exceptional: no platform could express OG's nested drop. OG 6e7afa8eb chooses :nested when the pointer is more than 50px inside the target block and moves the dragged roots under that target. The shared pointer path now uses that same intent threshold and a distinct child indicator. The target-relative store transaction accepts child placement for one or many normalized selected roots, appends them after existing children, preserves subtrees, page reassignment and order-list inheritance, rejects self/descendant cycles through the existing plan, and remains one undo/redo unit. Cross-page managed moves transmit the equivalent child placement to the storage actor."
+    },
+    {
+      "id": "UI-CUSTOM-CSS-INTER-OPENTYPE-298",
+      "title": "Custom CSS can enable Inter OpenType stylistic sets and character variants",
+      "family": "custom-css",
+      "sources": {
+        "issues": [298],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/interFont.test.ts"
+        ],
+        "scenario": "custom-css.bundled-inter-retains-opentype-features",
+        "failBefore": "proven"
+      },
+      "notes": "The custom CSS property itself reached the computed style correctly; the bundled @fontsource/inter per-script static subsets lacked ss02 and every other Inter stylistic set. Tine now ships the audited full upstream Inter 4.1 variable faces under the same public Inter family name, preserving existing themes and user CSS while restoring ss01-ss08 and cv01-cv14. The regression pins both upstream font hashes and verifies the public family and variable-weight declarations; the production build separately proves Vite emits both faces."
+    },
+    {
+      "id": "UI-E2E-PAGE-HEADER-ARROWDOWN-READINESS-330",
+      "title": "The release E2E distinguishes undelivered native ArrowDown input from broken page-header traversal",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [330],
+        "commits": []
+      },
+      "platforms": ["linux", "windows"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-page-properties.mjs",
+          "scripts/test-release-pipeline.mjs"
+        ],
+        "scenario": "e2e.page-header-arrow-down-delivery-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "Release run 31569006329 observed no keydown witness despite the expected header activeElement; the unchanged candidate passed the rerun and six focused repetitions. The journey now uses a real pointer action to transfer native focus, proves document focus/editor/caret readiness, and retries locally only when no key witness arrives. The suite runner may retry that isolated scenario once on the explicit E2E_NATIVE_INPUT_UNDELIVERED receipt. An unmodified ArrowDown witnessed on the expected header but failing to enter the first body block remains an immediate blocking product failure."
+    },
+    {
+      "id": "UI-E2E-GTK-UPLOAD-CHOOSER-READINESS-329",
+      "title": "The release E2E distinguishes an unready GTK upload chooser from an upload product failure",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [329],
+        "commits": []
+      },
+      "platforms": ["linux"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-pdf-logseq.mjs",
+          "scripts/test-release-pipeline.mjs"
+        ],
+        "scenario": "e2e.gtk-upload-chooser-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "The unchanged v0.6.93 candidate passed the same literal upload journey twice and failed once after a blind chooser activation/type/120ms sequence. The harness already launches Openbox, so a missing window manager was not the current cause. It now proves the chooser is visible and EWMH-active, submits the absolute path, observes closure, and only reactivates/sends Open while the chooser remains visibly mapped. The suite runner may retry the isolated scenario once only on E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED. If the chooser closes but the graph asset or Markdown write is absent, the existing blocking product assertion remains unchanged."
+    },
+    {
+      "id": "UI-E2E-BLOCK-EMBED-CONTENT-READINESS-315",
+      "title": "The release E2E waits for semantic block-embed content before interacting with it",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [315],
+        "commits": []
+      },
+      "platforms": ["linux"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-block-embed.mjs",
+          "src/components/LiveRefGroup.activation.test.tsx",
+          "tests/ui-regressions/e2e-contracts.json"
+        ],
+        "scenario": "e2e.block-embed-semantic-content-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The semantic readiness repair then exposed a deterministic product defect: multiple visible refs/embeds to the same initially unloaded page raced activation; one loaded the exact page, while siblings treated their expected stale-install refusal as permanent failure and stayed shallow. LiveRefGroup now rechecks the exact loaded kind/path after every installation attempt, so a sibling winner hydrates all groups while a different page/path remains refused. A render regression forces two concurrent activation promises and proves both descendants render with one retained activation. The release journey waits for exactly the identities/content/disclosure controls it will operate on, asserts no timing or pixels, and is restored to stable blocking coverage."
+    },
+    {
+      "id": "UI-MANAGED-SHARE-ACTOR-REBIND-001",
+      "title": "Setting up or joining managed sync reopens the actor retired by the enrollment cut before reporting success",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed-storage.share-join-reopen-retired-actor",
+        "failBefore": "proven"
+      },
+      "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. That repair exposed a second product defect: a bounded watcher scan could acknowledge one epoch while newer observations remained pending, but an AdmittedNoop/Complete tick scheduled no continuation and a quiet graph supplied no new inotify edge. The watcher now consults the actor's post-tick pending bit, drains all retained epochs without a timer guess, and still leaves a truly quiet actor asleep. The source regressions pin cut -> reopen -> exact publish ordering and pending-epoch continuation; the real two-device journey remains the release-blocking semantic proof."
+    },
+    {
+      "id": "UI-MANAGED-PROVIDER-ARRIVAL-SCHEDULING-001",
+      "title": "A peer edit delivered into managed storage becomes visible without waiting for an unrelated filesystem event",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/watcher.rs",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed-storage.provider-arrival-becomes-scheduled-work",
+        "failBefore": "proven"
+      },
+      "notes": "The two-device journey delivered device B's edit into device A's graph-local provider tree while device A was stopped. On reopen, device A discovered the delivery (provider_pending=3) while its watcher was idle (pending=false, latest_enqueue=2, acknowledged=2), and the peer edit never appeared. The Tauri sparse scheduler decided continuation from the tick result plus the actor's watcher pending bit only, so a tick that settled a watcher epoch read as a quiet graph and cleared the retry schedule; a quiet graph produces no further inotify edge for bytes another device wrote, so the delivered work was stranded forever. The actor now publishes provider_runnable alongside provider_pending - the exact predicate tick consults, not the broad inventory that legitimately never reaches zero while durable publication intents remain - and the scheduler continues while SyncRuntimeStatusSnapshot::has_runnable_work() is true. A tick that reports Idle while still naming runnable provider work is paced by the ordinary backoff schedule instead of the progress cadence, so a blocked causal dependency cannot become a poll loop, and a genuinely quiet actor still arms no timer at all. Source regressions pin arrival across the delivery/reopen cut, arrival to a running receiver, a multi-item drain to zero with interleaved page reads, and the idle direction; the real two-device journey remains the release-blocking semantic proof."
+    },
+    {
+      "id": "UI-MANAGED-PROVIDER-PROJECTION-LOSS-001",
+      "title": "A peer edit that lands in managed SQLite always reaches the Markdown file, even when a local external edit is admitted in the same window",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/oplog/projection.rs"
+        ],
+        "scenario": "managed-storage.provider-batch-always-projects-markdown",
+        "failBefore": "proven"
+      },
+      "notes": "On a running receiving device, an inbound provider batch could be applied to SQLite while its Markdown file was never written. The receiver-local projection decided whether a delivered foreign intent was still the live authority by comparing the intent's post-frontier with the page's WHOLE current merged frontier. An ordinary local external admission landing in the same window commits its own batch, which advances the shared page-catalog document, so the delivered intent stopped matching a page it never touched; the intent was then treated as superseded historical evidence and dropped. Nothing else owned that path, so the page existed in ListPages at the right path with no file on disk, clean_shutdown still returned Safe, and a reopen with a full re-drive never repaired it - durable data-visibility loss, since Markdown is the interchange truth for Direct Files parity and for every external tool. A receiver that cannot prove the delivered intent is still current now projects the page's CURRENT accepted state instead of skipping it (idempotent: a genuinely superseded page renders to the bytes already on disk), projects at the path the accepted state names rather than the intent's stale one, and retains the obligation as a published continuation when neither the intent nor the current state can be authorized. Source regressions pin creates, edits and cross-page moves under that interleaving, each with a Safe shutdown and a clean reopen. NOT covered here: provider-delivered DELETES and RENAMES never converge on the clean runtime at all - with or without the interleaving - because the receiver-local tombstone authorization still requires the retired pre-0.7 durable endpoint history store; that is a separate open defect."
+    },
+    {
+      "id": "UI-ANDROID-BACK-OWNERSHIP-001",
+      "title": "The Android Back gesture reaches Tine's rungs and closes the Settings modal instead of silently stepping WebView history",
+      "family": "android-shell",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/SafeBackOwnershipTest.kt",
+          "src/androidBack.settings.test.tsx"
+        ],
+        "scenario": "android.safe-back-owner-is-topmost",
+        "failBefore": "unavailable"
+      },
+      "notes": "Reported internally by Martin: with the Settings modal open, the hardware Back gesture did not close it. The frontend rungs were never at fault - dispatchAndroidBack, the transient registry and Settings' three-rung dismiss all behave correctly in the real app composition, which is why the defect survived. androidx's OnBackPressedDispatcher hands a gesture to the LAST-ADDED enabled callback, and Tauri's core AppPlugin adds its own from its Kotlin constructor, which runs on the Rust startup thread tao spawns inside Rust.create() - after MainActivity.onCreate has already returned. AppPlugin therefore sat ABOVE Tine's SafeBack owner, took its no-listener branch (Tine registers android-safe-back on its own plugin, never back-button on Tauri's) and answered Back with WebView.goBack() whenever the WebView had history. The mobile router pushes one history entry per navigation, so after the user's first navigation every Back popped a route BEHIND whatever was on screen and no rung ever ran; before that first navigation canGoBack() is false, AppPlugin re-dispatches and Back works, which is why this read as intermittent. SafeBackPlugin now claims ownership from its own constructor and again from load(), both strictly later than every plugin registered so far. The frontend semantic regression is blocking and green. The native WebView instrumentation remains in the Android runtime job but is explicitly quarantined after the 2026-08-22 two-attempt stop-loss: on GitHub's software-graphics emulator the process aborts before any JUnit assertion with Android libc reporting pthread_mutex_lock on a destroyed mutex. Managed-storage activation/crash-recovery tests run in a separate instrumentation lifetime and remain fully blocking."
     }
   ]
 }

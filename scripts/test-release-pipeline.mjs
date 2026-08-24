@@ -38,8 +38,13 @@ const flatpakMetadataWorkflow = fs.readFileSync(
 );
 const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-release-preflight.mjs"), "utf8");
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
+const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
+const androidManagedRuntimeScript = fs.readFileSync(
+  path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
+  "utf8"
+);
 const windowsWebviewDriverInstaller = fs.readFileSync(
   path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
   "utf8"
@@ -409,7 +414,7 @@ assert.equal(
     "run",
     8
   ),
-  "cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4"
+  "node scripts/tine-core-nextest-contract.mjs --mode linux --run-shard ${{ matrix.shard }}"
 );
 assert.equal(
   yamlScalar(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "uses", 8),
@@ -426,12 +431,40 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
+const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.equal(
   yamlScalar(androidCompile, "if", 4),
   "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+);
+assert.equal(
+  yamlScalar(androidManagedRuntime, "name", 4),
+  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen"
+);
+assert.equal(
+  yamlScalar(androidManagedRuntime, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')"
+);
+assert.match(
+  androidManagedRuntimeScript,
+  /grep -Fq 'FAILURES!!!'/,
+  "Android instrumentation must fail closed on a JUnit failure summary"
+);
+assert.ok(
+  androidManagedRuntimeScript.includes("grep -Eq 'OK \\([0-9]+ tests?\\)'"),
+  "Android instrumentation must require the runner's explicit passing summary"
+);
+assert.match(
+  androidManagedRuntimeScript,
+  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
+  "independent Android native/activity contracts must use separate instrumentation lifetimes"
+);
+assert.match(
+  androidManagedRuntimeScript,
+  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
+  "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
 );
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
@@ -450,7 +483,7 @@ assert.equal(yamlScalar(androidTestJava, "uses", 8), "actions/setup-java@v4");
 assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "distribution", 10), "temurin");
 assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "java-version", 10), '"17"');
 const androidTestNode = yamlNamedStep(androidTestApk, "Set up Node 20");
-assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v4");
+assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v5");
 assert.equal(yamlScalar(yamlBlock(androidTestNode, "with", 8), "node-version", 10), "20");
 const androidTestRust = yamlNamedStep(androidTestApk, "Set up Rust 1.96.0");
 assert.equal(yamlScalar(androidTestRust, "uses", 8), "dtolnay/rust-toolchain@1.96.0");
@@ -618,6 +651,38 @@ assert.match(
   "release mode does not block every safety, core-operation, and stateful-UX failure"
 );
 assert.match(
+  e2eRunner,
+  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\}\]/,
+  "the mandatory Linux release catalog does not prove real two-device managed sync"
+);
+assert.match(
+  e2eRunner,
+  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{[\s\S]*?TINE_E2E_JOIN_ORDERING: "join-from-managed",[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "240000",[\s\S]*?\}\]/,
+  "the mandatory Linux release catalog does not prove joining from a device that already runs Tine-managed storage"
+);
+assert.match(
+  e2eRunner,
+  /const scenarioTimeoutMs = Number\(env\.E2E_SCENARIO_TIMEOUT_MS \|\| timeoutMs\);[\s\S]*?setTimeout\([\s\S]*?scenarioTimeoutMs\);/,
+  "per-scenario E2E timeout budgets are declared but not applied to the spawned scenario"
+);
+assert.match(
+  e2eRunner,
+  /"linux-managed-real-release": \[[\s\S]*?TINE_MANAGED_RECOVERY_KILL_CYCLES: "2"[\s\S]*?\["sparse-v2-two-device-real", "scripts\/e2e-sparse-v2-two-device\.mjs"/,
+  "the local private-corpus release suite does not prove repeated forced-close recovery and real two-device sync"
+);
+assert.match(
+  packageJson,
+  /"e2e:linux:managed-real-release": "TINE_E2E_MODE=release E2E_SCENARIO_TIMEOUT_MS=1800000 node scripts\/run-e2e\.mjs linux-managed-real-release"/,
+  "the private-corpus managed release suite is not exposed as a strict local command"
+);
+for (const workflow of [ciWorkflow, uiE2eWorkflow, releaseWorkflow]) {
+  assert.doesNotMatch(
+    workflow,
+    /TINE_MANAGED_REAL_GRAPH|linux-managed-real-release/,
+    "a hosted workflow must not reference the private-corpus managed release gate"
+  );
+}
+assert.match(
   uiE2eWorkflow,
   /Snapshot Linux E2E candidate inputs[\s\S]*?Write Linux E2E candidate receipt[\s\S]*?Snapshot Windows E2E candidate inputs[\s\S]*?Write Windows E2E candidate receipt/,
   "manually dispatched raw Linux and Windows builds do not create receipts"
@@ -754,6 +819,46 @@ assert.equal(
   isRetryableNativeHarnessFailure("capture", "cold-restart autocomplete assertion failed", "", false),
   false,
   "arbitrary Quick Capture assertion failures must not be retried"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "page-properties",
+    "E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown []",
+    "",
+    false
+  ),
+  true,
+  "a proven-ready page-properties WebView that receives no key event is not retried"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "page-properties",
+    "PAGE_HEADER_ARROWDOWN_DELIVERED_BUT_IGNORED {}",
+    "",
+    false
+  ),
+  false,
+  "a delivered but ignored page-header ArrowDown must remain a product failure"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "pdf-logseq",
+    "E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED chooser-remained-open /tmp/source.pdf",
+    "",
+    false
+  ),
+  true,
+  "a mapped GTK chooser that never accepts native input is not retried"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "pdf-logseq",
+    "GTK-selected asset was not stored at /tmp/graph/assets/source.pdf",
+    "",
+    false
+  ),
+  false,
+  "a closed chooser followed by a missing asset must remain a product failure"
 );
 assert.match(
   printSecurity,

@@ -72,8 +72,11 @@ import {
   pageInventoryRev,
   bumpPageInventoryRev,
   installPaneTracker,
+  isConflicted,
+  conflicts,
   pushToast,
   refreshSyncConflicts,
+  refreshConflictQueueIfTouched,
   graphEpoch,
   graphTransitioning,
   setGraphTransitioning,
@@ -89,14 +92,24 @@ import {
   flushAll,
   appendToTodayJournal,
   captureToPage,
+  deferExternalReload,
+  installExternalReloadReplayHandler,
   pageByName,
+  focusFreshnessPageNames,
   reloadDisposition,
   reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { applyDivergenceVerdict, graphBinding, isSaving, reconcileExternalChange } from "./persistence";
+import {
+  applyDivergenceVerdict,
+  conflictObservationKindFor,
+  graphBinding,
+  isSaving,
+  reconcileExternalChange,
+  saveBaselineFor,
+} from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
-import { backend, isTauri, type GraphChange } from "./backend";
+import { backend, isTauri, type GraphChange, type GraphChangedBulk } from "./backend";
 import { parserFailed } from "./render/parse";
 import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
@@ -115,6 +128,13 @@ import {
 import { initCodeHlSettings } from "./codeHighlightSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
+import {
+  conflictPolicyAlwaysAsk,
+  holdExternalChange,
+  initConflictPolicy,
+  installHeldExternalChangeApplier,
+  setConflictPolicyAlwaysAskForTest,
+} from "./conflictPolicy";
 import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
@@ -138,11 +158,18 @@ import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
 import { installBackgroundFlush } from "./backgroundFlush";
+import {
+  installFocusFreshnessVerifier,
+  installReloadOnFocus,
+  trackGraphChangeApplication,
+} from "./reloadOnFocus";
+import { freshnessVisible } from "./freshnessBarrier";
 import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import { createStartupRecoveryController } from "./startupRecovery";
+import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
 
@@ -226,6 +253,79 @@ function requestJournalFeedWatcherRestart(
   if (owner) void reloadJournalsFeedFromStart(owner);
 }
 
+// A skip/decline below records the change for deferred replay; the replay
+// re-enters this same handler so the disposition is re-evaluated with whatever
+// state holds at that moment (it may have become "conflict", which then takes
+// the divergence path exactly like a live event).
+installExternalReloadReplayHandler((change) => void handleGraphChange(change));
+
+// Native rescan completion means the backend cache is current, but event
+// callbacks cross the Tauri bridge independently. Verify the bounded set of
+// pages the user can immediately interact with against that cache before the
+// focus input barrier opens. This is intentionally O(active pages), not
+// O(graph), and reuses the ordinary external-change policy below.
+installFocusFreshnessVerifier(async () => {
+  const binding = graphBinding();
+  const changes: GraphChange[] = [];
+  for (const name of focusFreshnessPageNames()) {
+    const loaded = pageByName(name);
+    if (!loaded) continue;
+    const current = loaded.path
+      ? await backend().getPageByPath(loaded.path)
+      : await backend().getPage(loaded.name, loaded.kind);
+    if (binding !== graphBinding()) return;
+    const baseline = saveBaselineFor(name);
+    const currentRev = current?.rev ?? null;
+    if (currentRev === baseline) continue;
+    changes.push({
+      name,
+      kind: loaded.kind,
+      created: baseline === null && current !== null,
+      removed: current === null,
+    });
+  }
+  if (!changes.length || binding !== graphBinding()) return;
+  bumpDataRev();
+  if (changes.some((change) => change.created || change.removed)) {
+    bumpPageInventoryRev();
+  }
+  for (const change of changes) {
+    if (binding !== graphBinding()) return;
+    await applyExternalChange(change, binding);
+  }
+});
+
+// Concord L0's reload-on-focus fallback. Returning to the window replays
+// anything already deferred and asks the backend watcher for one full stat diff,
+// for the filesystems and sync clients that give us no event at all. Both halves
+// funnel into the machinery above; neither applies anything by itself.
+installReloadOnFocus();
+
+// Read BEFORE the router normalizes the URL on load (the mock reads `?conflicts`
+// at call time instead, which is why that gate needs no snapshot).
+const ALWAYS_ASK_DEMO =
+  typeof location !== "undefined" && /[?&]alwaysask\b/.test(location.search);
+
+// Concord P5 policy toggle: "Reload from disk" on a held change re-enters the
+// ordinary external-change path with the policy bypassed for that one change, so
+// every other gate (disposition, editor leases, deferred replay) still applies.
+installHeldExternalChangeApplier((change, binding) => {
+  void applyExternalChange(change, binding, { bypassPolicy: true });
+});
+
+// Console-only diagnostic for external-change latency reports (GH #337; see
+// docs/concord.md). Release builds ship the devtools but not `withGlobalTauri`,
+// so a reporter needs one named callable to reach the backend's receipt ring.
+// No UI beyond this.
+if (isTauri()) {
+  (window as unknown as {
+    __tineWatcherLatency?: () => Promise<unknown>;
+  }).__tineWatcherLatency = async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke("watcher_latency_recent");
+  };
+}
+
 export async function handleGraphChange(c: GraphChange) {
   const binding = graphBinding();
   // The backend watcher has already landed this transaction in its graph cache.
@@ -234,7 +334,27 @@ export async function handleGraphChange(c: GraphChange) {
   // below, while unloaded block references re-resolve by UUID from dataRev.
   bumpDataRev();
   if (c.created || c.removed) bumpPageInventoryRev();
+  await applyExternalChange(c, binding);
+  // A merge finished outside Tine (git resolving the markers, a sync tool
+  // removing a copy) must not leave a stale item in the conflict queue.
+  await refreshConflictQueueIfTouched([c]);
+}
+
+/** The per-page half of `handleGraphChange`: everything except the dataRev /
+ *  inventory bumps, which a bulk revision performs once for its whole epoch.
+ *  `suppressFeedRestart` lets that bulk path restart a live Journals feed once
+ *  at the end instead of once per changed journal. */
+async function applyExternalChange(
+  c: GraphChange,
+  binding: number,
+  opts: { suppressFeedRestart?: boolean; bypassPolicy?: boolean } = {},
+) {
   const routes = layoutPaneIds().map((paneId) => ({ paneId, router: paneRouter(paneId), route: paneRouter(paneId).route() }));
+  const requestJournalFeedRestart = (
+    owned: Array<{ paneId: string; route: ReturnType<PaneRouter["route"]> }>
+  ) => {
+    if (!opts.suppressFeedRestart) requestJournalFeedWatcherRestart(owned);
+  };
   if (c.removed) {
     const disp = reloadDisposition(c.name);
     if (disp === "conflict") {
@@ -242,11 +362,12 @@ export async function handleGraphChange(c: GraphChange) {
       // raise the banner: only its refusal carries the authority "Keep mine"
       // must present (see `reconcileExternalChange`).
       await reconcileExternalChange(c.name);
-      if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+      if (c.kind === "journal") requestJournalFeedRestart(routes);
       return;
     }
     if (disp === "skip") {
-      if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+      deferExternalReload(c, binding);
+      if (c.kind === "journal") requestJournalFeedRestart(routes);
       return;
     }
     for (const p of routes) {
@@ -257,14 +378,23 @@ export async function handleGraphChange(c: GraphChange) {
     }
     if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
       await restoreTodayJournalInFeed();
-      requestJournalFeedWatcherRestart(routes);
+      requestJournalFeedRestart(routes);
     }
     return;
   }
 
   const disp = reloadDisposition(c.name);
   if (disp === "skip") {
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    deferExternalReload(c, binding);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
+    return;
+  }
+  // Concord P5 — "always ask". Reached only AFTER the skip/conflict branches, so
+  // it converts the one SILENT case (a loaded, clean page) into an asked one and
+  // changes nothing that already asked or deferred. A page Tine does not hold has
+  // nothing to ask about: navigation refetches from the backend anyway.
+  if (!opts.bypassPolicy && conflictPolicyAlwaysAsk() && disp === "reload" && pageByName(c.name)) {
+    holdExternalChange(c, binding);
     return;
   }
   if (disp === "conflict") {
@@ -279,35 +409,91 @@ export async function handleGraphChange(c: GraphChange) {
       if (binding !== graphBinding()) return;
       await applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
     return;
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding);
+    // A decline here (an editor lease took hold, or the page turned dirty during
+    // the await) is the same dropped-reload hole as "skip": defer, don't drop.
+    if (dto && !(await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding))) {
+      deferExternalReload(c, binding);
+    }
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
     return;
   }
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
     if (pageByName(c.name)) {
       const dto = await backend().getPage(c.name, c.kind);
-      if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
-      requestJournalFeedWatcherRestart(routes);
+      if (dto && !(await reloadPageIfStillSafe(c.name, dto, binding))) {
+        deferExternalReload(c, binding);
+      }
+      requestJournalFeedRestart(routes);
       return;
     }
     // The feed owner performs the page-scoped dirty/save/conflict/move gate.
     // Calling it even while unsafe records a pending restart instead of losing
     // this watcher update until another unrelated file changes.
-    requestJournalFeedWatcherRestart(routes);
+    requestJournalFeedRestart(routes);
     return;
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
+    if (dto && !(await reloadPageIfStillSafe(c.name, dto, binding))) {
+      deferExternalReload(c, binding);
+    }
   }
+}
+
+/** An external bulk revision — a VCS checkout, branch switch, or big sync that
+ *  the watcher coalesced into one `graph-changed-bulk` epoch (Concord P2).
+ *
+ *  One epoch, one invalidation: dataRev and the page inventory bump once for
+ *  the whole batch. Only pages that need active handling are touched — visible
+ *  (routed) pages reload through the existing safe path, and pages with unsaved
+ *  state run exactly the same divergence/defer machinery as a single watcher
+ *  event (a bulk change while a page is being edited defers that page's reload
+ *  like any other). Everything else is left for lazy reload: navigation always
+ *  refetches from the backend, whose cache the watcher has already updated.
+ *  The user sees one calm summary toast — never a dialog. */
+export async function handleGraphChangedBulk(bulk: GraphChangedBulk) {
+  const binding = graphBinding();
+  const changes = bulk.changes;
+  if (!changes.length) return;
+  bumpDataRev();
+  if (changes.some((c) => c.created || c.removed)) bumpPageInventoryRev();
+  const routedNames = new Set<string>();
+  for (const paneId of layoutPaneIds()) {
+    const route = paneRouter(paneId).route();
+    if (route.kind === "page") routedNames.add(route.name);
+  }
+  let conflicts = 0;
+  for (const c of changes) {
+    if (binding !== graphBinding()) return;
+    const active = routedNames.has(c.name) || reloadDisposition(c.name) !== "reload";
+    if (!active) continue;
+    // Journal-feed restarts are suppressed per page and issued once below.
+    await applyExternalChange(c, binding, { suppressFeedRestart: true });
+    if (isConflicted(c.name)) conflicts += 1;
+  }
+  if (binding !== graphBinding()) return;
+  if (changes.some((c) => c.kind === "journal")) {
+    requestJournalFeedWatcherRestart(
+      layoutPaneIds().map((paneId) => ({ paneId, route: paneRouter(paneId).route() }))
+    );
+  }
+  // A bulk revision is exactly the shape that resolves marker conflicts (a
+  // `git merge --continue`, a branch switch): re-derive the queue if it touched
+  // anything queued.
+  await refreshConflictQueueIfTouched(changes);
+  const summary = `${changes.length} page${changes.length === 1 ? "" : "s"} updated externally`;
+  const conflictSuffix = conflicts
+    ? ` · ${conflicts} conflict${conflicts === 1 ? "" : "s"} to review`
+    : "";
+  pushToast(summary + conflictSuffix, "info");
 }
 
 export async function handleSparseV2Changed() {
@@ -616,17 +802,13 @@ export function App(): JSX.Element {
     forward: () => goForward(),
   };
   const startupRecovery = createStartupRecoveryController({
-    lookupGraphPath: (attempt) => backend().startupGraphPath(attempt),
+    lookupGraphPath: () => backend().startupGraphPath(),
     injectedGraphPath: () => (window as any).__GRAPH_PATH__ ?? "",
     persistedGraphPath,
-    openGraph: (path) => loadGraphPath(path),
+    openGraph: (path, supersedeCurrent) => loadGraphPath(path, { supersedeCurrent }),
     pickGraph: switchGraph,
-    coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
+    coldReturn: (path) => backend().cancelSparseV2Cold(path),
     acceptColdReturn: acceptColdReturnManagedStorage,
-    confirmColdReturn: (name) => backend().confirm(
-      `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
-      "Return to Direct Files?",
-    ),
     copyText: writeClipboardTextResilient,
     notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
     completeFirstLoad: () => setFirstLoadDone(true),
@@ -650,10 +832,15 @@ export function App(): JSX.Element {
       unlisten();
     });
   });
+  // One calm report per condition, not one per retry. The bridge advances the
+  // notice sequence only for a message the user has not already been shown, and
+  // clears it when the actor genuinely recovers, so a permanently blocked
+  // reconciliation says its piece once and leaves Storage & sync to carry the
+  // live status (GH: Android, 2026-08-18).
   createEffect(on(
-    () => managedStorageRuntime.snapshot().error,
-    (reason) => {
-      if (reason) pushToast(managedStorageRuntimeErrorMessage(reason), "error");
+    () => managedStorageRuntime.snapshot().notice,
+    (notice) => {
+      if (notice) pushToast(managedStorageRuntimeErrorMessage(notice.message), "error");
     },
     { defer: true },
   ));
@@ -672,7 +859,13 @@ export function App(): JSX.Element {
       dismissTransient: () => dismissTopTransient("back"),
       dismissDrawer: () => dismissMobileDrawer("back"),
       restoreDrawerFocus: () => restoreDrawerFocus("back"),
-      historyBack: () => window.history.back(),
+      // The router's own back, not the WebView's: it knows whether Tine has an
+      // entry to pop, and it is what every other Back affordance already uses.
+      historyBack: () => {
+        if (!canGoBack()) return false;
+        goBack();
+        return true;
+      },
       closeRoot: () => { void closeAndroidRootSafely(); },
       // Listener absence/rejection remains owned by the native SafeBackPlugin,
       // which consumes Back rather than delegating to AppPlugin's unsafe
@@ -722,15 +915,35 @@ export function App(): JSX.Element {
 
   onMount(() => {
     let disposed = false;
+    let started = false;
     let unlisten = () => {};
-    void backend().onStartupProgress(startupRecovery.receiveProgress).then((stop) => {
-      if (disposed) stop();
-      else unlisten = stop;
+    const start = () => {
+      if (disposed || started) return;
+      started = true;
+      startupRecovery.start();
+    };
+    // Subscribe before starting: native transition identity is the only
+    // progress authority, and early synchronous receipts must not be missed.
+    void backend().onStorageTransition((event) => {
+      storageTransitionRuntime.receive(event);
+      startupRecovery.receiveTransition(event);
+    }).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      // Native managed-open phases can begin synchronously with the graph-open
+      // command.  Do not start that command until its progress listener is
+      // installed: otherwise Android WebView startup can lose the first (and,
+      // for a long clean-manifest recovery, only) phase receipt.
+      start();
     }).catch(() => {
-      // The watchdog remains independent of this subscription. If the native
-      // bridge itself is unavailable, the recovery panel still appears.
+      // If the event bridge itself is unavailable, startup still attempts the
+      // native command; command failure remains actionable without inventing a
+      // timeout-based storage outcome.
+      start();
     });
-    startupRecovery.start();
     onCleanup(() => {
       disposed = true;
       unlisten();
@@ -765,11 +978,31 @@ export function App(): JSX.Element {
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
+  onMount(() => void initConflictPolicy());
+  // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
+  // always-ask policy on and hold one external change, so the bar is visible
+  // without a real second writer. Browser mock only — never in the app.
+  onMount(() => {
+    if (isTauri() || !ALWAYS_ASK_DEMO) return;
+    setConflictPolicyAlwaysAskForTest(true);
+    (window as unknown as { __tineHoldExternalChange?: (name: string) => void })
+      .__tineHoldExternalChange = (name: string) => {
+      holdExternalChange(
+        {
+          name,
+          kind: doc.pages.find((p) => p.name === name)?.kind ?? "page",
+          created: false,
+          removed: false,
+        },
+        graphBinding()
+      );
+    };
+  });
   // A conflict copy appearing/vanishing on disk (watcher) refreshes the list.
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onConflictsChanged(() => void refreshSyncConflicts())
+      .onConflictsChanged(() => trackGraphChangeApplication(refreshSyncConflicts("new")))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -778,7 +1011,16 @@ export function App(): JSX.Element {
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onGraphChanged((c) => void handleGraphChange(c))
+      .onGraphChanged((c) => trackGraphChangeApplication(handleGraphChange(c)))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // Coalesced external bulk revisions (VCS checkout / big sync): one aggregate
+  // event above the backend's bulk threshold instead of per-page events.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphChangedBulk((bulk) => trackGraphChangeApplication(handleGraphChangedBulk(bulk)))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -1349,7 +1591,12 @@ export function App(): JSX.Element {
             </Show>
           </div>
         </header>
-        <ConflictBar />
+        {/* Direct Files conflicts are Concord objects rendered in-page. The old
+            global two-button surface remains only for actor-owned managed
+            conflicts until that protocol adopts the multi-side queue. */}
+        <Show when={conflicts().some((name) => conflictObservationKindFor(name) === "managed")}>
+          <ConflictBar />
+        </Show>
         <InPageFind />
         </DrawerBackground>
         {/* Everything below the topbar lives in this row, so the topbar (and its
@@ -1429,6 +1676,11 @@ export function App(): JSX.Element {
         onClose={closeWelcome}
       />
       <StartupRecoveryLayer controller={startupRecovery} />
+      <Show when={freshnessVisible()}>
+        <div class="focus-freshness-barrier" role="status" aria-live="polite">
+          Refreshing changes from disk…
+        </div>
+      </Show>
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
         <Toasts />
       </DrawerBackground>

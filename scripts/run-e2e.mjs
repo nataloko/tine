@@ -17,7 +17,13 @@ const app = path.resolve(process.env.TINE_APP || path.join(root, process.platfor
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
 const longFocusedWindows = suiteName === "windows-smoke"
   && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (
+  only === "windows-managed-storage"
+    ? 35 * 60_000
+    : longFocusedWindows
+      ? 15 * 60_000
+      : 180_000
+));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -83,6 +89,31 @@ const suites = {
   // coverage so it is run only with the exact sparse-v2 candidate receipt.
   "sparse-v2-recovery": [
     ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
+    // Direct Files and Tine-managed storage are peers, so BOTH joining-device
+    // starting states are first-class legs of this gate. Neither is a smoke
+    // test of the other and neither may be dropped to save wall clock.
+    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
+    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_E2E_JOIN_ORDERING: "join-from-managed",
+      // This leg deliberately exercises three partial provider deliveries,
+      // declines adoption, and proves the original managed history again after
+      // a clean reopen. It takes ~177s locally, so the ordinary 180s scenario
+      // ceiling is not a meaningful product gate on slower hosted runners.
+      E2E_SCENARIO_TIMEOUT_MS: "240000",
+    }],
+  ],
+  // Release-only local proof on a copied private corpus. This suite is kept
+  // separate from hosted coverage so neither the source graph nor a derivative
+  // can enter GitHub Actions artifacts.
+  "linux-managed-real-release": [
+    ["managed-force-close-recovery", "scripts/e2e-managed-force-close-recovery.mjs", {
+      TINE_MANAGED_RECOVERY_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
+      TINE_MANAGED_RECOVERY_SETTLE_MS: "10000",
+      TINE_MANAGED_RECOVERY_KILL_CYCLES: "2",
+    }],
+    ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
+    }],
   ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
@@ -116,6 +147,11 @@ const suites = {
     ["plugin-revocation", "scripts/e2e-plugin-revocation.mjs", {}],
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
     ["external-assets", "scripts/e2e-external-assets.mjs", {}],
+    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
+    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_E2E_JOIN_ORDERING: "join-from-managed",
+      E2E_SCENARIO_TIMEOUT_MS: "240000",
+    }],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
@@ -130,6 +166,23 @@ const suites = {
     ["empty-query-workspace", "scripts/e2e-empty-query-workspace.mjs", {}],
     ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
+    // Catalogued since 2026-08-09 and selected by nothing until 2026-08-17: seven
+    // journeys, six of them `stability: "stable"`, including the published-site
+    // security boundary. The catalog checker now enforces both directions, so a
+    // journey can no longer sit in the contract without a runner.
+    ["publish-security", "scripts/e2e-publish-security.mjs", {}],
+    ["page-identity-links", "scripts/e2e-page-identity-links.mjs", {}],
+    ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
+    ["concord-focus-freshness", "scripts/e2e-concord-focus-freshness.mjs", {}],
+    ["concord-live-save", "scripts/e2e-concord-live-save.mjs", {}],
+    ["concord-sync-copy-native", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify" }],
+    ["concord-sync-copy-poll", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll" }],
+    ["concord-sync-copy-native-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify", TINE_E2E_CONCORD_DECISION: "mine" }],
+    ["concord-sync-copy-poll-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll", TINE_E2E_CONCORD_DECISION: "mine" }],
+    ["rendered-delete-verify", "scripts/e2e-rendered-delete-verify.mjs", {}],
+    ["delete-selection-timing", "scripts/e2e-delete-selection-timing.mjs", {}],
+    ["selection-actions", "scripts/e2e-selection-actions.mjs", {}],
+    ["clipboard-roundtrip", "scripts/e2e-clipboard-roundtrip.mjs", {}],
   ],
   "windows-smoke": [
     // og-parity-references is a HARD gate on Linux (linux-release + og-parity-pilot
@@ -156,6 +209,14 @@ const suites = {
 if (!suites[suiteName]) {
   console.error(`unknown suite ${suiteName}; choose ${Object.keys(suites).join(", ")}`);
   process.exit(2);
+}
+if (suiteName === "linux-managed-real-release") {
+  if (e2eMode !== "release") {
+    throw new Error("linux-managed-real-release must run with TINE_E2E_MODE=release");
+  }
+  if (!process.env.TINE_MANAGED_REAL_GRAPH) {
+    throw new Error("linux-managed-real-release requires TINE_MANAGED_REAL_GRAPH pointing at a read-only local corpus");
+  }
 }
 
 function loadSelectedContracts(scenarios) {
@@ -343,8 +404,14 @@ function isRetryableDriverTransportFailure(output, errors, timedOut) {
 }
 
 function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
-  if (timedOut || id !== "capture") return false;
+  if (timedOut) return false;
   const combined = `${output}\n${errors}`;
+  // Page-properties proves the target editor and document focus before sending
+  // ArrowDown, then records the capture-phase key event. Only a missing event is
+  // transport infrastructure; a delivered-but-ignored key is a product failure.
+  if (id === "page-properties") return /E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown/.test(combined);
+  if (id === "pdf-logseq") return /E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED/.test(combined);
+  if (id !== "capture") return false;
   // Hosted Openbox occasionally leaves its active-window property pointing at
   // a frame destroyed during the short single-instance forwarder's teardown.
   // Retry the entire isolated scenario once; the second run must still prove
@@ -395,6 +462,10 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       E2E_NATIVE_PORT: String(nativePort),
       E2E_PREVIEW_PORT: String(previewPort),
       TINE_SOURCE_REVISION: buildProvenance.testedCommit || "",
+      // Journeys that refuse to run against an unidentified artifact read the
+      // exact receipted commit under this name; give them the same authority the
+      // runner already proved rather than a hand-exported shell variable.
+      TINE_CANDIDATE_COMMIT: buildProvenance.testedCommit || "",
       E2E_LEGACY_NOTES: "0",
       TAURI_DRIVER: process.env.TAURI_DRIVER || (process.platform === "win32" ? "msedgedriver.exe" : "tauri-driver"),
     };
@@ -435,13 +506,14 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       : [path.join(root, script)];
     const child = spawn(command, args, { cwd: root, env, detached: process.platform !== "win32", stdio: ["ignore", stdout, stderr] });
     let timedOut = false;
+    const scenarioTimeoutMs = Number(env.E2E_SCENARIO_TIMEOUT_MS || timeoutMs);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
         if (process.platform === "win32") child.kill("SIGKILL");
         else process.kill(-child.pid, "SIGKILL");
       } catch {}
-    }, timeoutMs);
+    }, scenarioTimeoutMs);
     const result = await new Promise((resolve) => {
       child.once("error", (error) => resolve({ code: 1, error: String(error) }));
       child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
@@ -463,7 +535,11 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     if (status === "failed" && attempt === 1 && (retryDriver || retryNativeHarness)) {
       const reason = retryDriver
         ? "WebDriver session became invalid or lost transport"
-        : "hosted X11 active-window state raced a destroyed transient frame";
+        : id === "page-properties"
+          ? "native ArrowDown did not reach the proven-ready WebView"
+          : id === "pdf-logseq"
+            ? "native input did not reach the mapped and active GTK file chooser"
+          : "hosted X11 active-window state raced a destroyed transient frame";
       process.stdout.write(`RETRY ${id}: ${reason}; retaining attempt 1\n`);
       process.stdout.write(`${output.slice(-1200)}\n${errors.slice(-1200)}\n`);
       archiveInfrastructureAttempt(dir, attempt);

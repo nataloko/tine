@@ -21,14 +21,15 @@ use std::fmt;
 use std::io;
 
 use super::{
-    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, EngineError,
-    LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
-    ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
-    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
+    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid,
+    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
+    MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
+    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
     ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
     ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
-    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
-    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    ProjectionWorkTarget, ReceiptError, ShardedHotEngine, SqliteFrontier, StructuralLocator,
+    StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -43,6 +44,11 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static HARNESS_FAIL_AFTER_FORMATTING_INTENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    // Repeats of the same manifested-projection fault. A one-shot fault always
+    // converges on the first retry, which cannot exercise a retained
+    // publication that does NOT settle.
+    static HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -70,6 +76,7 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) fallback: usize,
     pub(crate) finalizer_post_state_render: usize,
     pub(crate) finalizer_predecessor_replay_render: usize,
+    pub(crate) capture_prepared_predecessor_use: usize,
     pub(crate) capture_sealed_pending_local_predecessor_success: usize,
     pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
     /// The two renders are separate evidence obligations.  Keep their timing
@@ -77,6 +84,8 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     /// opaque "projection" cost.
     pub(crate) accepted_render: std::time::Duration,
     pub(crate) target_render: std::time::Duration,
+    pub(crate) accepted_renders: usize,
+    pub(crate) incremental_target_patches: usize,
     pub(crate) accepted_blocks_visited: usize,
     pub(crate) target_blocks_visited: usize,
 }
@@ -89,10 +98,13 @@ impl PreparedEditorProjectionInstrumentation {
         fallback: 0,
         finalizer_post_state_render: 0,
         finalizer_predecessor_replay_render: 0,
+        capture_prepared_predecessor_use: 0,
         capture_sealed_pending_local_predecessor_success: 0,
         finalizer_sealed_pending_local_predecessor_use: 0,
         accepted_render: std::time::Duration::ZERO,
         target_render: std::time::Duration::ZERO,
+        accepted_renders: 0,
+        incremental_target_patches: 0,
         accepted_blocks_visited: 0,
         target_blocks_visited: 0,
     };
@@ -148,6 +160,15 @@ pub(crate) fn note_capture_sealed_pending_local_predecessor_success() {
     });
 }
 
+pub(crate) fn note_capture_prepared_predecessor_use() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.capture_prepared_predecessor_use = instrumentation
+            .capture_prepared_predecessor_use
+            .saturating_add(1);
+    });
+}
+
 pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
     #[cfg(test)]
     note_prepared_editor_projection(|instrumentation| {
@@ -183,7 +204,21 @@ pub(crate) fn fail_next_formatting_adoption_after_intent_for_harness() {
     HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| fail.set(true));
 }
 
+pub(crate) fn fail_manifested_projection_repeatedly_for_harness(times: u32) {
+    HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| fail.set(times));
+}
+
 fn fail_during_manifested_projection_for_harness() -> Result<(), ProjectionError> {
+    let repeated = HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| {
+        let remaining = fail.get();
+        fail.set(remaining.saturating_sub(1));
+        remaining > 0
+    });
+    if repeated {
+        return Err(ProjectionError::Work(
+            "deterministic failure during manifested projection".into(),
+        ));
+    }
     HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| {
         if fail.replace(false) {
             Err(ProjectionError::Work(
@@ -322,6 +357,7 @@ pub(crate) struct PreparedEditorProjection {
     requested_page: MaterializedPage,
     exact_base: Vec<u8>,
     candidate_base_layout: Vec<StructuralLayoutIdentity>,
+    capture_predecessor_annotations: Option<Vec<AnnotatedIdentity>>,
     before_candidate: Option<PreparedEditorProjectionBeforeCandidate>,
     rendered: RenderedProjection,
 }
@@ -354,6 +390,7 @@ impl PreparedEditorProjection {
         #[cfg(test)]
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.accepted_renders = instrumentation.accepted_renders.saturating_add(1);
             instrumentation.accepted_render = instrumentation
                 .accepted_render
                 .saturating_add(accepted_elapsed);
@@ -370,6 +407,7 @@ impl PreparedEditorProjection {
             requested_page,
             exact_base,
             candidate_base_layout,
+            capture_predecessor_annotations: None,
             before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
                 // The caller binds the owned accepted page below.  Keeping the
                 // render here first lets the UI boundary use the same borrowed
@@ -381,8 +419,80 @@ impl PreparedEditorProjection {
         })
     }
 
+    /// Prepare against the exact process-local predecessor already retained by
+    /// the hot overlay. The overlay annotations are only a rendering shortcut:
+    /// draft capture independently rechecks the same overlay entry, exact bytes,
+    /// page state and semantic before-snapshot before it can reuse them.
+    pub(crate) fn prepare_from_hot_predecessor(
+        requested_page: MaterializedPage,
+        accepted_page: &MaterializedPage,
+        exact_base: Vec<u8>,
+        accepted_annotations: Vec<AnnotatedIdentity>,
+    ) -> Result<Self, ProjectionError> {
+        let candidate_base_layout = structural_layout_identities(&accepted_annotations);
+        #[cfg(test)]
+        let target_started = std::time::Instant::now();
+        let incremental = incremental_markdown_content_projection(
+            accepted_page,
+            &requested_page,
+            &exact_base,
+            &accepted_annotations,
+        )?;
+        #[cfg(test)]
+        let used_incremental = incremental.is_some();
+        let rendered = match incremental {
+            Some(rendered) => rendered,
+            None => render_projection_page_with_layout_identities(
+                &requested_page,
+                Some(&exact_base),
+                &candidate_base_layout,
+            )?,
+        };
+        #[cfg(test)]
+        let target_elapsed = target_started.elapsed();
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.target_render =
+                instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.incremental_target_patches = instrumentation
+                .incremental_target_patches
+                .saturating_add(usize::from(used_incremental));
+            instrumentation.accepted_blocks_visited = instrumentation
+                .accepted_blocks_visited
+                .saturating_add(accepted_annotations.len());
+            instrumentation.target_blocks_visited = instrumentation
+                .target_blocks_visited
+                .saturating_add(requested_page.blocks.len());
+        });
+        Ok(Self {
+            requested_page,
+            exact_base: exact_base.clone(),
+            candidate_base_layout,
+            capture_predecessor_annotations: Some(accepted_annotations.clone()),
+            before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
+                accepted_page: None,
+                accepted_rendered: RenderedProjection {
+                    target: exact_base,
+                    annotations: accepted_annotations,
+                    base_layout_identities: Vec::new(),
+                    generated_anchors: Vec::new(),
+                },
+            }),
+            rendered,
+        })
+    }
+
     pub(crate) fn target(&self) -> &[u8] {
         &self.rendered.target
+    }
+
+    /// Borrow the editor-requested semantic post-page while draft proves that
+    /// the authored transaction produced exactly this state.  This remains a
+    /// candidate: the hot engine must compare the complete semantic delta and
+    /// prospective frontier before it may avoid rematerializing the CRDT page.
+    pub(crate) const fn requested_page_candidate(&self) -> &MaterializedPage {
+        &self.requested_page
     }
 
     pub(crate) fn accepted_target(&self) -> &[u8] {
@@ -392,6 +502,16 @@ impl PreparedEditorProjection {
             .expect("accepted editor projection remains available before draft")
             .accepted_rendered
             .target
+    }
+
+    /// Borrow the exact predecessor bytes and annotations carried by this
+    /// affine editor artifact. Capture may use these only after independently
+    /// binding them to the current managed-local overlay entry and semantic
+    /// pre-state; every other lane retains the complete projector replay.
+    pub(crate) fn accepted_predecessor_candidate(&self) -> Option<(&[u8], &[AnnotatedIdentity])> {
+        self.capture_predecessor_annotations
+            .as_deref()
+            .map(|annotations| (self.exact_base.as_slice(), annotations))
     }
 
     /// Replace the provisional accepted page with the exact editor-owned
@@ -457,6 +577,193 @@ impl PreparedEditorProjection {
             instrumentation.fallback = instrumentation.fallback.saturating_add(1);
         });
     }
+}
+
+/// Patch ordinary Markdown block bodies directly into the exact hot
+/// predecessor. This lane is deliberately narrow: page metadata, membership,
+/// ordering, identity, and Logseq-ID policy must be unchanged. Every patch is
+/// parsed back as exactly one block before it can become projection evidence;
+/// anything unusual takes the complete projector.
+fn incremental_markdown_content_projection(
+    accepted_page: &MaterializedPage,
+    requested_page: &MaterializedPage,
+    exact_base: &[u8],
+    accepted_annotations: &[AnnotatedIdentity],
+) -> Result<Option<RenderedProjection>, ProjectionError> {
+    if !accepted_page.path.is_markdown()
+        || accepted_page.page_id != requested_page.page_id
+        || accepted_page.home_document_id != requested_page.home_document_id
+        || accepted_page.name != requested_page.name
+        || accepted_page.path != requested_page.path
+        || accepted_page.kind != requested_page.kind
+        || accepted_page.preamble != requested_page.preamble
+        || accepted_page.blocks.len() != requested_page.blocks.len()
+        || accepted_page.blocks.len() != accepted_annotations.len()
+    {
+        return Ok(None);
+    }
+
+    let accepted_by_id = accepted_page
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    let requested_by_id = requested_page
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    if accepted_by_id.len() != accepted_page.blocks.len()
+        || requested_by_id.len() != requested_page.blocks.len()
+        || accepted_by_id
+            .keys()
+            .any(|id| !requested_by_id.contains_key(id))
+    {
+        return Ok(None);
+    }
+
+    let mut replacements = HashMap::<BlockId, Vec<u8>>::new();
+    let use_crlf = exact_base.windows(2).any(|window| window == b"\r\n");
+    for (block_id, accepted) in &accepted_by_id {
+        let requested = requested_by_id[block_id];
+        if accepted.home_document_id != requested.home_document_id
+            || accepted.parent != requested.parent
+            || accepted.order != requested.order
+            || accepted.logseq_uuid != requested.logseq_uuid
+            || accepted.logseq_identity_origin != requested.logseq_identity_origin
+            || accepted.logseq_uuid.is_some()
+            || accepted.logseq_identity_origin.is_some()
+        {
+            return Ok(None);
+        }
+        if accepted.content != requested.content {
+            replacements.insert(*block_id, Vec::new());
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ordered = accepted_annotations.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(_, annotation)| annotation.span().start());
+    let mut cursor = 0_usize;
+    let mut target = Vec::with_capacity(exact_base.len());
+    let mut shifted_spans = HashMap::<BlockId, StructuralSpan>::new();
+    for (_, annotation) in ordered {
+        let span = annotation.span();
+        let start =
+            usize::try_from(span.start()).map_err(|_| ProjectionError::ProjectionTooLarge)?;
+        let end = usize::try_from(span.end()).map_err(|_| ProjectionError::ProjectionTooLarge)?;
+        if start < cursor || end < start || end > exact_base.len() {
+            return Ok(None);
+        }
+        target.extend_from_slice(&exact_base[cursor..start]);
+        let shifted_start = target.len();
+        if replacements.contains_key(&annotation.block_id()) {
+            let accepted = accepted_by_id[&annotation.block_id()];
+            let requested = requested_by_id[&annotation.block_id()];
+            let Some(replacement) = render_incremental_markdown_block(
+                &exact_base[start..end],
+                &accepted.content,
+                &requested.content,
+                use_crlf,
+            ) else {
+                return Ok(None);
+            };
+            target.extend_from_slice(&replacement);
+            replacements.insert(annotation.block_id(), replacement);
+        } else {
+            target.extend_from_slice(&exact_base[start..end]);
+        }
+        let shifted_end = target.len();
+        if shifted_spans
+            .insert(
+                annotation.block_id(),
+                StructuralSpan::new(
+                    u64::try_from(shifted_start)
+                        .map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                    u64::try_from(shifted_end).map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                )?,
+            )
+            .is_some()
+        {
+            return Ok(None);
+        }
+        cursor = end;
+    }
+    if replacements.values().any(Vec::is_empty) {
+        return Ok(None);
+    }
+    target.extend_from_slice(&exact_base[cursor..]);
+
+    let annotations = accepted_annotations
+        .iter()
+        .map(|annotation| {
+            Ok(AnnotatedIdentity::new(
+                annotation.locator().clone(),
+                *shifted_spans
+                    .get(&annotation.block_id())
+                    .ok_or(ProjectionError::SpanInstrumentationMismatch)?,
+                annotation.block_id(),
+                annotation.logseq_uuid(),
+            ))
+        })
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    Ok(Some(RenderedProjection {
+        target,
+        annotations,
+        base_layout_identities: structural_layout_identities(accepted_annotations),
+        generated_anchors: Vec::new(),
+    }))
+}
+
+fn render_incremental_markdown_block(
+    accepted_source: &[u8],
+    accepted_content: &str,
+    requested_content: &str,
+    use_crlf: bool,
+) -> Option<Vec<u8>> {
+    let accepted_text = std::str::from_utf8(accepted_source).ok()?;
+    let parsed = crate::doc::try_parse_with_source_spans(accepted_text).ok()?;
+    if parsed.document.pre_block.is_some()
+        || parsed.document.roots.len() != 1
+        || !parsed.document.roots[0].children.is_empty()
+        || parsed.document.roots[0].raw != accepted_content
+    {
+        return None;
+    }
+    let first_line = accepted_text
+        .split_once('\n')
+        .map_or(accepted_text, |(line, _)| line);
+    let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+    let indent_len = first_line.len() - first_line.trim_start_matches([' ', '\t']).len();
+    let indent = &first_line[..indent_len];
+    let bullet = &first_line[indent_len..];
+    if bullet != "-" && !bullet.starts_with("- ") {
+        return None;
+    }
+    let newline = if use_crlf { "\r\n" } else { "\n" };
+    let mut output = String::with_capacity(accepted_source.len() + requested_content.len());
+    for (index, line) in requested_content.split('\n').enumerate() {
+        if index > 0 {
+            output.push_str(newline);
+            output.push_str(indent);
+            output.push_str("  ");
+        } else {
+            output.push_str(indent);
+            output.push('-');
+            if !line.is_empty() {
+                output.push(' ');
+            }
+        }
+        output.push_str(line.strip_suffix('\r').unwrap_or(line));
+    }
+    let reparsed = crate::doc::try_parse_with_source_spans(&output).ok()?;
+    (reparsed.document.pre_block.is_none()
+        && reparsed.document.roots.len() == 1
+        && reparsed.document.roots[0].children.is_empty()
+        && reparsed.document.roots[0].raw == requested_content)
+        .then(|| output.into_bytes())
 }
 
 fn materialized_page_projection_identity_equal(
@@ -570,10 +877,12 @@ pub fn plan_projection(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactSourceSemanticDifference {
     UnsupportedSourceLayout(String),
+    #[cfg(test)]
     PageKind {
         accepted: &'static str,
         source: &'static str,
     },
+    #[cfg(test)]
     PageName {
         accepted: String,
         source: String,
@@ -604,12 +913,14 @@ impl fmt::Display for ExactSourceSemanticDifference {
                     "source layout is not safely importable: {detail}"
                 )
             }
+            #[cfg(test)]
             Self::PageKind { accepted, source } => {
                 write!(
                     formatter,
                     "page kind differs: accepted={accepted}, source={source}"
                 )
             }
+            #[cfg(test)]
             Self::PageName { accepted, source } => write!(
                 formatter,
                 "page name differs: accepted={accepted:?}, source={source:?}"
@@ -690,93 +1001,6 @@ pub(crate) fn plan_projection_with_layout_annotations(
     projection_plan_from_rendered(workspace_id, state, expected_base, rendered)
 }
 
-/// One current completed-path receipt whose immutable completion and the live
-/// graph bytes together prove the exact semantic predecessor for a new local
-/// projection. This is deliberately a *live* proof: an old receipt base is
-/// not reconstructed and compared with a newer serializer. The completed-path
-/// row authenticates which receipt is current, while the live target digest and
-/// layout-aware replay prove that those bytes still describe the accepted page.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReceiptBackedLiveProjectionPredecessor {
-    completed: ProjectionCompletedReceipt,
-    intent: ProjectionIntent,
-    completion: ProjectionCompletion,
-}
-
-impl ReceiptBackedLiveProjectionPredecessor {
-    pub(crate) const fn completed(&self) -> &ProjectionCompletedReceipt {
-        &self.completed
-    }
-
-    pub(crate) const fn intent(&self) -> &ProjectionIntent {
-        &self.intent
-    }
-
-    pub(crate) const fn completion(&self) -> &ProjectionCompletion {
-        &self.completion
-    }
-}
-
-/// Prove that `live_bytes` remain the current projection of `state` through
-/// the enrolled completed-path authority. `None` is an ordinary stale or
-/// externally-divergent observation and must enter reconciliation; an error
-/// denotes malformed or foreign durable authority.
-pub(crate) fn receipt_backed_live_projection_predecessor(
-    workspace_id: WorkspaceId,
-    endpoint: ProjectionEndpointBinding,
-    receipts: &ProjectionReceiptStore,
-    work_index: &ProjectionWorkIndex,
-    state: &ProjectionPageState,
-    live_bytes: &[u8],
-) -> Result<Option<ReceiptBackedLiveProjectionPredecessor>, ProjectionError> {
-    if receipts.workspace_id() != workspace_id
-        || receipts.endpoint_binding() != Some(endpoint)
-        || work_index.workspace_id() != workspace_id
-        || work_index.endpoint_id() != endpoint.endpoint_id()
-        || work_index.graph_resource_id() != endpoint.graph_resource_id()
-        || work_index.receipt_store_id() != receipts.store_id()
-    {
-        return Err(ProjectionError::EndpointBindingMismatch);
-    }
-
-    let completed = work_index
-        .completed_receipts_for_path(&state.page.path)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let [completed] = completed.as_slice() else {
-        return Ok(None);
-    };
-    if !matches!(completed.target(), ProjectionWorkTarget::Present(_)) {
-        return Ok(None);
-    }
-
-    let (intent, completion) = receipts.load_completed_receipt(completed)?;
-    if intent.workspace_id() != workspace_id
-        || intent.page_id() != state.page.page_id
-        || intent.path() != &state.page.path
-        || intent.frontier() != &state.frontier
-        || intent.claim_evidence() != state.claim_evidence
-        || intent.target() != super::BlobDescription::of(live_bytes)
-    {
-        return Ok(None);
-    }
-
-    let replay = plan_projection_with_layout_annotations(
-        workspace_id,
-        state,
-        Some(live_bytes),
-        Some(intent.annotations()),
-    )?;
-    if replay.target() != live_bytes || replay.intent().annotations() != intent.annotations() {
-        return Ok(None);
-    }
-
-    Ok(Some(ReceiptBackedLiveProjectionPredecessor {
-        completed: completed.clone(),
-        intent,
-        completion,
-    }))
-}
-
 fn projection_plan_from_rendered(
     workspace_id: WorkspaceId,
     state: &ProjectionPageState,
@@ -828,26 +1052,16 @@ fn plan_exact_source_projection(
             ExactSourceSemanticDifference::UnsupportedSourceLayout(error.to_string()),
         )
     })?;
-    let source_is_importable = match format {
-        ProjectionFormat::Markdown => {
-            crate::doc::markdown_structurally_round_trips_parsed(source_text, &parsed)
-        }
-        ProjectionFormat::Org => crate::org::org_editable_parsed(source_text, &parsed),
-    };
-    if !source_is_importable {
+    if matches!(format, ProjectionFormat::Markdown)
+        && !crate::doc::markdown_structurally_round_trips_parsed(source_text, &parsed)
+    {
         return Err(ExactSourceProjectionError::Semantic(
-            ExactSourceSemanticDifference::UnsupportedSourceLayout(match format {
-                ProjectionFormat::Markdown => {
-                    "Markdown parsing and format-preserving serialization change its semantic document"
-                }
-                ProjectionFormat::Org => {
-                    "Org heading structure does not round-trip through the editable representation"
-                }
-            }
-            .into()),
+            ExactSourceSemanticDifference::UnsupportedSourceLayout(
+                "Markdown parsing and format-preserving serialization change its semantic document"
+                    .into(),
+            ),
         ));
     }
-
     let mut metadata = ProjectionMetadata::with_capacity(state.page.blocks.len());
     let accepted = build_page_document(
         &state.page,
@@ -1252,6 +1466,22 @@ pub fn derive_receiver_local_projection(
     receiver_endpoint_id: ProjectionEndpointId,
     exact_local_base: Option<&[u8]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
+    derive_receiver_local_projection_with_layout(
+        engine,
+        source,
+        receiver_endpoint_id,
+        exact_local_base,
+        None,
+    )
+}
+
+fn derive_receiver_local_projection_with_layout(
+    engine: &ShardedHotEngine,
+    source: &ManifestedProjectionIntent,
+    receiver_endpoint_id: ProjectionEndpointId,
+    exact_local_base: Option<&[u8]>,
+    source_layout_annotations: Option<&[AnnotatedIdentity]>,
+) -> Result<ProjectionPlan, ProjectionError> {
     if source.workspace_id() != engine.workspace_id() {
         return Err(ProjectionError::ReceiverSourceMismatch);
     }
@@ -1266,21 +1496,70 @@ pub fn derive_receiver_local_projection(
         source.post_frontier(),
         source.claim_evidence(),
     )?;
-    plan_projection(
+    plan_projection_with_layout_annotations(
         engine.workspace_id(),
         authorization.state(),
         exact_local_base,
+        source_layout_annotations,
     )
+}
+
+/// Load only the authenticated structural identity map that the source author
+/// used as its render base. Receiver-local bytes remain the mutation
+/// precondition and are rendered again, so line endings and harmless local
+/// trivia remain local. The identity map is what lets an edited block retain
+/// non-canonical but parser-owned structure such as an unbulleted heading.
+fn authenticated_source_layout_base(
+    engine: &ShardedHotEngine,
+    source: &ManifestedProjectionIntent,
+) -> Result<Option<AnnotatedProjectionBase>, ProjectionError> {
+    let reference = source
+        .render_base()
+        .or_else(|| source.precondition().base());
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let archive = engine.archive_store().ok_or_else(|| {
+        ProjectionError::Archive("receiver projection has no accepted archive".into())
+    })?;
+    let object = archive
+        .read_object(reference.content_digest())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if object.kind() != ObjectKind::AnnotatedBaseBlob
+        || object.document_id() != reference.document_id()
+        || !object.descriptor().is_ok_and(|descriptor| {
+            descriptor.content_digest() == reference.content_digest()
+                && descriptor.encoded_byte_length() == reference.encoded_byte_length()
+        })
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let base = AnnotatedProjectionBase::decode(object.payload())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if base.workspace_id() != source.workspace_id() {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    Ok(Some(base))
 }
 
 /// Derive and execute a receiver-local projection from one accepted foreign
 /// endpoint intent. The foreign target bytes grant no authority: rendering is
 /// repeated from accepted semantic state and the receiver's exact current
-/// bytes, then committed through the receiver's private receipt store.
+/// bytes. Authenticated source-base identities preserve the same blocks'
+/// structural layout across an edit without copying source-local trivia.
+///
+/// `clean_projection` is `Some` exactly on the index-free clean runtime, whose
+/// deletions are authorized against the disposable SQLite projection instead of
+/// the retired pre-0.7 endpoint history and portable-path index. `None` keeps
+/// the enrolled pre-0.7 runtime on its own authorization unchanged.
+///
+/// `Ok(Some(_))` means the intent is finished for this device, `Ok(None)` means
+/// the caller must retain a continuation.
 pub(crate) fn execute_receiver_local_projection_under_handoff(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
+    clean_projection: Option<&SqliteFrontier>,
     source: &ManifestedProjectionIntent,
     handoff: &crate::model::PublishedHandoffLatch,
     allow_mutation: bool,
@@ -1294,80 +1573,74 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         return Err(ProjectionError::ReceiverEndpointIsSource);
     }
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
-    let mut effective_candidate = None;
+    // The accepted current state of this page, retained when the source intent
+    // is no longer the live authority but this receiver still owes the page a
+    // Markdown projection. See the supersession note below.
+    let mut superseded_current = None;
     let tombstone_authorization = if source_absent {
-        match engine.authorize_projection_tombstone(source) {
-            Ok(authorization) => Some(authorization),
-            Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
-            Err(error) => return Err(error.into()),
+        let projection = clean_projection.ok_or_else(|| {
+            ProjectionError::Engine(EngineError::ProjectionWork(
+                "clean receiver-local deletion has no disposable SQLite projection".into(),
+            ))
+        })?;
+        match engine.authorize_clean_projection_tombstone(projection, source)? {
+            CleanTombstoneAuthorization::Authorized(authorization) => Some(*authorization),
+            CleanTombstoneAuthorization::Superseded(_) => return Ok(Some(false)),
+            CleanTombstoneAuthorization::Deferred(_) => return Ok(None),
         }
     } else {
-        let current_matches_source = match engine.authorize_projection_write(source.page_id()) {
-            Ok(current) => {
-                current.state().page.path == *source.path()
-                    && current.state().frontier == *source.post_frontier()
-                    && current.state().claim_evidence == source.claim_evidence()
-            }
-            Err(EngineError::ProjectionAuthorizationUnavailable) => false,
+        let current = match engine.authorize_projection_write(source.page_id()) {
+            Ok(current) => Some(current),
+            Err(EngineError::ProjectionAuthorizationUnavailable) => None,
             Err(error) => return Err(error.into()),
         };
+        let current_matches_source = current.as_ref().is_some_and(|current| {
+            current.state().page.path == *source.path()
+                && current.state().frontier == *source.post_frontier()
+                && current.state().claim_evidence == source.claim_evidence()
+        });
         if !current_matches_source {
-            // Most superseded immutable intents are historical evidence only.
-            // One exception is an exact-title event selected by the current
-            // merged frontier: its original source intent remains the
-            // authenticated authority for the winning UTF-8 spelling and for
-            // whether that title was explicit or filename-derived.
-            match engine.authenticate_effective_title_projection_candidate(source.page_id()) {
-                Ok(candidate) => effective_candidate = Some(candidate),
-                Err(EngineError::ProjectionAuthorizationUnavailable) => {
-                    return Ok(Some(false));
-                }
-                Err(error) => return Err(error.into()),
-            }
+            let Some(current) = current else {
+                return Ok(None);
+            };
+            superseded_current = Some(current);
         }
         None
     };
-    let projection_source = effective_candidate
+    // A page renamed after this intent was authored is projected at the path
+    // the accepted state names, never at the intent's stale one.
+    let projection_path = superseded_current
         .as_ref()
-        .map(|candidate| candidate.source())
-        .unwrap_or(source);
-    let local_base = graph.read_projection_input(projection_source.path())?;
-    let mut effective_prior_completion = None;
-    let plan = if source_absent {
-        receiver_tombstone_plan(
-            receipts,
-            engine,
-            tombstone_authorization
-                .as_ref()
-                .expect("Absent source has tombstone authorization"),
-            local_base.as_deref(),
-        )?
-    } else if let Some(candidate) = effective_candidate.as_ref() {
-        let (completed_intent, completion) =
-            receipts.load_completed_receipt(candidate.lifecycle_completion())?;
-        let local_base = local_base
-            .as_deref()
-            .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-        let authorization = engine.authorize_effective_title_projection_write(
-            candidate,
-            projection_source,
-            &completed_intent,
-            &completion,
-            local_base,
-        )?;
-        let plan = plan_projection(
-            engine.workspace_id(),
-            authorization.state(),
-            Some(local_base),
-        )?;
-        effective_prior_completion = Some((completed_intent, completion));
-        plan
+        .map_or_else(|| source.path(), |current| &current.state().page.path);
+    let local_base = graph.read_projection_input(projection_path)?;
+    let source_layout_base = if source_absent {
+        None
     } else {
-        derive_receiver_local_projection(
+        authenticated_source_layout_base(engine, source)?
+    };
+    let plan = if source_absent {
+        let authorization = tombstone_authorization
+            .as_ref()
+            .expect("Absent source has tombstone authorization");
+        receiver_clean_tombstone_plan(engine, authorization, local_base.as_deref())?
+    } else if let Some(current) = superseded_current.as_ref() {
+        plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            local_base.as_deref(),
+            source_layout_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
+        )?
+    } else {
+        derive_receiver_local_projection_with_layout(
             engine,
             source,
             endpoint.endpoint_id,
             local_base.as_deref(),
+            source_layout_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
         )?
     };
     receipts.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
@@ -1446,102 +1719,42 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             record_completed_tombstone_path(receipts, engine, plan.intent(), authorization)?
         }
         None => {
-            if let Some((completed_intent, completion)) = effective_prior_completion.as_ref() {
-                let candidate = effective_candidate
-                    .as_ref()
-                    .expect("effective prior completion has a candidate");
-                let exact_local_base = local_base
-                    .as_deref()
-                    .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-                let authorization = engine.authorize_effective_title_projection_write(
-                    candidate,
-                    projection_source,
-                    completed_intent,
-                    completion,
-                    exact_local_base,
-                )?;
-                let replay = plan_projection(
-                    engine.workspace_id(),
-                    authorization.state(),
-                    Some(exact_local_base),
-                )?;
-                if replay.intent() != plan.intent() {
-                    return Err(ProjectionError::RecoveryIntentMismatch);
+            match record_completed_path(receipts, engine, source.page_id(), plan.intent()) {
+                Ok(()) => {}
+                Err(ProjectionError::RecoveryIntentMismatch)
+                    if engine.require_index_free_clean_projection_runtime().is_ok()
+                        && engine.accepted_batch_projection_is_superseded(
+                            source.source_batch_id(),
+                        )? =>
+                {
+                    // A receiver-local completion for a source batch
+                    // superseded by concurrent accepted history is durable
+                    // historical evidence, but must not be held
+                    // to the later merged rendering merely to perform that
+                    // no-op index publication. Linear mismatches still
+                    // refuse above and here.
                 }
-                record_completed_path_target(
-                    receipts,
-                    engine,
-                    source.page_id(),
-                    plan.intent(),
-                    ProjectionWorkTarget::Present(plan.intent().target()),
-                )?;
-            } else {
-                record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
+                Err(error) => return Err(error),
             }
         }
     }
     Ok(Some(!already_complete))
 }
 
-fn receiver_tombstone_plan(
-    store: &ProjectionReceiptStore,
+/// Plan one clean-runtime receiver-local deletion.
+///
+/// The pre-0.7 sibling below reconstructs the removal precondition from the
+/// enrolled projection work index, which the clean runtime does not build. The
+/// clean runtime already holds the stronger operand: the receiver's own exact
+/// bytes on disk. They are the mutation precondition everywhere else on this
+/// path — a delivered edit renders against them too — and `remove_page_projection`
+/// re-checks them under the page lock at the publication boundary, so a write
+/// that races the removal refuses instead of clobbering.
+fn receiver_clean_tombstone_plan(
     engine: &ShardedHotEngine,
     authorization: &ProjectionTombstoneAuthorization,
     local_base: Option<&[u8]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
-    let (_, work_index) = engine.enrolled_projection_runtime()?;
-    let completed = work_index
-        .completed_receipts_for_path(authorization.path())
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let mut deletion = completed.iter().filter(|receipt| {
-        receipt.page_id() == authorization.page_id()
-            && receipt.path() == authorization.path()
-            && receipt.frontier() == authorization.frontier()
-            && receipt.target() == ProjectionWorkTarget::Absent
-    });
-    if let Some(receipt) = deletion.next() {
-        if deletion.next().is_some() {
-            return Err(ProjectionError::ReceiverBaseMismatch);
-        }
-        let (intent, _) = store.load_completed_receipt(receipt)?;
-        let base = store.load_base(&intent)?;
-        return Ok(ProjectionPlan {
-            intent,
-            base,
-            target: Vec::new(),
-            guarded_layout: GuardedProjectionLayout::empty(),
-            generated_anchors: Vec::new(),
-        });
-    }
-
-    let prior_description = match authorization.prior_frontier() {
-        Some(prior_frontier) => {
-            let mut prior = completed.iter().filter_map(|receipt| {
-                (receipt.page_id() == authorization.page_id()
-                    && receipt.path() == authorization.path()
-                    && receipt.frontier() == prior_frontier)
-                    .then(|| match receipt.target() {
-                        ProjectionWorkTarget::Present(description) => Some((receipt, description)),
-                        ProjectionWorkTarget::Absent => None,
-                    })
-                    .flatten()
-            });
-            match prior.next() {
-                Some((receipt, description)) => {
-                    if prior.next().is_some() {
-                        return Err(ProjectionError::ReceiverBaseMismatch);
-                    }
-                    store.load_completed_receipt(receipt)?;
-                    Some(description)
-                }
-                None if local_base.is_some() => {
-                    return Err(ProjectionError::ReceiverBaseMismatch);
-                }
-                None => None,
-            }
-        }
-        None => None,
-    };
     let make_intent = |precondition| {
         ProjectionIntent::new(
             engine.workspace_id(),
@@ -1554,31 +1767,14 @@ fn receiver_tombstone_plan(
             Vec::new(),
         )
     };
-    let (intent, base) = match (prior_description, local_base) {
-        (Some(description), Some(bytes)) => {
-            if super::BlobDescription::of(bytes) != description {
-                return Err(ProjectionError::ReceiverBaseMismatch);
-            }
-            (
-                make_intent(ProjectionPrecondition::Base(description))?,
-                Some(BaseBlob::new(bytes.to_vec())),
-            )
-        }
-        (Some(description), None) => {
-            let base_intent = make_intent(ProjectionPrecondition::Base(description))?;
-            match store.load_intent(base_intent.id()?)? {
-                Some(intent) if intent == base_intent => {
-                    let base = store
-                        .load_base(&intent)?
-                        .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-                    (intent, Some(base))
-                }
-                Some(_) => return Err(ProjectionError::ReceiverBaseMismatch),
-                None => (make_intent(ProjectionPrecondition::Absent)?, None),
-            }
-        }
-        (None, None) => (make_intent(ProjectionPrecondition::Absent)?, None),
-        (None, Some(_)) => return Err(ProjectionError::ReceiverBaseMismatch),
+    let (intent, base) = match local_base {
+        Some(bytes) => (
+            make_intent(ProjectionPrecondition::Base(super::BlobDescription::of(
+                bytes,
+            )))?,
+            Some(BaseBlob::new(bytes.to_vec())),
+        ),
+        None => (make_intent(ProjectionPrecondition::Absent)?, None),
     };
     Ok(ProjectionPlan {
         intent,
@@ -1589,127 +1785,75 @@ fn receiver_tombstone_plan(
     })
 }
 
-/// Execute one source-endpoint manifested work row. Recovery reloads immutable
-/// target/base objects through the batch locator; no local intent or target
-/// copy is published. Device-local attempt reservations remain forensic, while
-/// stable completion is recorded against the immutable work/object reference.
-pub fn execute_manifested_projection_work(
+/// Execute one clean-runtime work row derived from an accepted immutable
+/// manifest. SQLite supplies only current path ownership/current-frontier
+/// evidence; it is disposable and never becomes a second work-status store.
+pub(crate) fn execute_clean_manifested_projection_work(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
+    projection: &SqliteFrontier,
     engine: &mut ShardedHotEngine,
     work: &ProjectionWork,
 ) -> Result<(), ProjectionError> {
-    let (archive, work_index) = engine.enrolled_projection_runtime()?;
-    execute_manifested_projection_work_with_runtime(
-        graph,
-        receipts,
-        &archive,
-        engine,
-        &work_index,
-        work,
-        None,
-    )
+    execute_manifested_projection_work_with_runtime(graph, receipts, engine, projection, work, None)
 }
 
-pub(crate) fn execute_manifested_projection_work_under_handoff(
+pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
+    projection: &SqliteFrontier,
     engine: &mut ShardedHotEngine,
     work: &ProjectionWork,
     handoff: &crate::model::PublishedHandoffLatch,
 ) -> Result<(), ProjectionError> {
-    let (archive, work_index) = engine.enrolled_projection_runtime()?;
     execute_manifested_projection_work_with_runtime(
         graph,
         receipts,
-        &archive,
         engine,
-        &work_index,
+        projection,
         work,
         Some(handoff),
     )
 }
 
-fn block_manifested_projection_work(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    work_index: &ProjectionWorkIndex,
-    work: &ProjectionWork,
-    intent_id: super::ProjectionIntentId,
-) -> Result<(), ProjectionError> {
-    let observed = graph
-        .read_projection_input(work.path())
-        .map_err(ProjectionError::Io)?
-        .as_deref()
-        .map(super::BlobDescription::of);
-    work_index
-        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict_for_intent(
-            work,
-            receipts.store_id(),
-            observed,
-            intent_id,
-        ))
-        .map_err(|error| ProjectionError::Work(error.to_string()))
+/// Read-only, content-addressed decoding of one exact accepted projection work
+/// row.  It constructs the receiver-local intent exactly once for the normal
+/// executor, correlated import planning, and correlated successor capture.
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedManifestedProjectionWork {
+    manifested: ManifestedProjectionIntent,
+    receiver_local_intent: ProjectionIntent,
+    annotated_base: Option<AnnotatedProjectionBase>,
+    target: Option<Vec<u8>>,
+    guarded_layout: GuardedProjectionLayout,
 }
 
-fn execute_manifested_projection_work_with_runtime(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
+impl DecodedManifestedProjectionWork {
+    pub(crate) const fn manifested(&self) -> &ManifestedProjectionIntent {
+        &self.manifested
+    }
+
+    pub(crate) const fn receiver_local_intent(&self) -> &ProjectionIntent {
+        &self.receiver_local_intent
+    }
+
+    pub(crate) const fn annotated_base(&self) -> Option<&AnnotatedProjectionBase> {
+        self.annotated_base.as_ref()
+    }
+
+    pub(crate) fn target_bytes(&self) -> Option<&[u8]> {
+        self.target.as_deref()
+    }
+
+    const fn guarded_layout(&self) -> &GuardedProjectionLayout {
+        &self.guarded_layout
+    }
+}
+
+pub(crate) fn decode_manifested_projection_work(
     archive: &ObjectStore,
-    engine: &mut ShardedHotEngine,
-    work_index: &ProjectionWorkIndex,
     work: &ProjectionWork,
-    handoff: Option<&crate::model::PublishedHandoffLatch>,
-) -> Result<(), ProjectionError> {
-    let endpoint = engine
-        .projection_endpoint_binding()
-        .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    let receipt_store_id = engine
-        .projection_receipt_store_id()
-        .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    if receipts.store_id() != receipt_store_id || work_index.receipt_store_id() != receipt_store_id
-    {
-        return Err(ProjectionError::EndpointBindingMismatch);
-    }
-    receipts.require_endpoint(endpoint)?;
-    if graph.canonical_resource_id()? != endpoint.graph_resource_id {
-        return Err(ProjectionError::EndpointBindingMismatch);
-    }
-    retire_pending_projection_recovery(graph, receipts)?;
-    engine
-        .authorize_projection_work(work_index, work)
-        .map_err(ProjectionError::Engine)?;
-    // A journal drain has no affine process-memory continuation after a
-    // restart. Re-entering with the exact already-completed work must therefore
-    // authenticate the same archive/intent/receipt authority below and adopt
-    // it idempotently. `mark_completed` already performs that exact terminal
-    // comparison; blocked, superseded, absent, and merely reserved work remain
-    // refusals.
-    if !matches!(
-        work_index
-            .status(work.work_id())
-            .map_err(|error| ProjectionError::Work(error.to_string()))?,
-        Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)
-    ) {
-        return Err(ProjectionError::WorkNotReady);
-    }
-    // Read the one object this work names, not the batch that contains it.
-    //
-    // The previous shape asked the archive to `inspect_batch(work.batch_id())`
-    // and then linearly scanned the result for an object whose digest it was
-    // already holding. `inspect_batch` reads, SHA-256s and decodes *every*
-    // object the manifest requires, so a single document's projection cost
-    // O(whole batch) and a whole import cost O(n^2): measured at 3.59 GB of
-    // read+SHA-256 to import 300 files of a ~1.3 MB corpus, scaling as n^1.79.
-    //
-    // Nothing is trusted here that was not already established. The object is
-    // content-addressed, so the digest in the authenticated work row pins its
-    // identity exactly as the scan did. Batch *completeness* is proved once at
-    // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the archive
-    // only on `BatchInspection::Ready`, and a projection work row reaches
-    // `Ready` only inside `accept_batch_at_history` -- so re-deriving it per
-    // document was re-derivation, not protection. A missing object still fails
-    // closed, now as an archive read error rather than an incompleteness error.
+) -> Result<DecodedManifestedProjectionWork, ProjectionError> {
     let intent_object = archive
         .read_object(work.intent().content_digest())
         .map_err(|error| ProjectionError::Archive(error.to_string()))?;
@@ -1722,12 +1866,14 @@ fn execute_manifested_projection_work_with_runtime(
     {
         return Err(ProjectionError::WorkIntentMismatch);
     }
-    let intent_object = &intent_object;
     let manifested = ManifestedProjectionIntent::decode(intent_object.payload())
         .map_err(|error| ProjectionError::Archive(error.to_string()))?;
-    if manifested.source_endpoint_id() != work.endpoint_id()
+    if manifested.workspace_id() != work.workspace_id()
+        || manifested.source_batch_id() != work.batch_id()
+        || manifested.source_endpoint_id() != work.endpoint_id()
         || manifested.page_id() != work.page_id()
         || manifested.path() != work.path()
+        || manifested.portable_path_index_root() != work.portable_path_index_root()
         || manifested.post_frontier() != work.post_frontier()
     {
         return Err(ProjectionError::WorkIntentMismatch);
@@ -1738,12 +1884,18 @@ fn execute_manifested_projection_work_with_runtime(
             description,
             bytes,
             annotations,
-        } => (*description, Some(bytes.as_slice()), annotations.clone()),
+        } => (*description, Some(bytes.clone()), annotations.clone()),
     };
-    let expected_base = match manifested.precondition() {
+    if work.target()
+        != target.as_ref().map_or(ProjectionWorkTarget::Absent, |_| {
+            ProjectionWorkTarget::Present(description)
+        })
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let annotated_base = match manifested.precondition() {
         ManifestProjectionPrecondition::Absent => None,
         ManifestProjectionPrecondition::Present { base } => {
-            // Same one-object read as the intent above, same argument.
             let base_object = archive
                 .read_object(base.content_digest())
                 .map_err(|error| ProjectionError::Archive(error.to_string()))?;
@@ -1756,7 +1908,6 @@ fn execute_manifested_projection_work_with_runtime(
             {
                 return Err(ProjectionError::WorkIntentMismatch);
             }
-            let base_object = &base_object;
             Some(
                 AnnotatedProjectionBase::decode(base_object.payload())
                     .map_err(|error| ProjectionError::Archive(error.to_string()))?,
@@ -1765,7 +1916,7 @@ fn execute_manifested_projection_work_with_runtime(
     };
     let guarded_layout = if target.is_some() {
         GuardedProjectionLayout::from_authenticated_annotations(
-            expected_base
+            annotated_base
                 .as_ref()
                 .map(AnnotatedProjectionBase::annotations),
             &annotations,
@@ -1773,13 +1924,13 @@ fn execute_manifested_projection_work_with_runtime(
     } else {
         GuardedProjectionLayout::empty()
     };
-    let local_attempt_intent = ProjectionIntent::new(
+    let receiver_local_intent = ProjectionIntent::new(
         manifested.workspace_id(),
         manifested.page_id(),
         manifested.path().clone(),
         manifested.post_frontier().clone(),
         manifested.claim_evidence().to_vec(),
-        expected_base
+        annotated_base
             .as_ref()
             .map_or(ProjectionPrecondition::Absent, |base| {
                 ProjectionPrecondition::Base(base.description())
@@ -1787,6 +1938,106 @@ fn execute_manifested_projection_work_with_runtime(
         description,
         annotations,
     )?;
+    Ok(DecodedManifestedProjectionWork {
+        manifested,
+        receiver_local_intent,
+        annotated_base,
+        target,
+        guarded_layout,
+    })
+}
+
+/// Name the page whose projection failed, so a bare platform errno arriving
+/// from a device receipt identifies the artifact as well as the syscall.
+///
+/// Only [`ProjectionError::Io`] is decorated: every other variant already
+/// carries its own semantic name, and `GuardedConflict` in particular must keep
+/// its marker error intact for `is_projection_semantic_refusal`.
+fn locate_projection_failure(path: &str, error: ProjectionError) -> ProjectionError {
+    match error {
+        ProjectionError::Io(error) => ProjectionError::Io(io::Error::new(
+            error.kind(),
+            format!("projecting {path:?}: {error}"),
+        )),
+        other => other,
+    }
+}
+
+fn execute_manifested_projection_work_with_runtime(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    projection: &SqliteFrontier,
+    work: &ProjectionWork,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<(), ProjectionError> {
+    let path = work.path().as_str().to_owned();
+    execute_manifested_projection_work_located(graph, receipts, engine, projection, work, handoff)
+        .map_err(|error| locate_projection_failure(&path, error))
+}
+
+fn execute_manifested_projection_work_located(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    projection: &SqliteFrontier,
+    work: &ProjectionWork,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<(), ProjectionError> {
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    let receipt_store_id = engine
+        .projection_receipt_store_id()
+        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    if receipts.store_id() != receipt_store_id {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
+    receipts.require_endpoint(endpoint)?;
+    if graph.canonical_resource_id()? != endpoint.graph_resource_id {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
+    retire_pending_projection_recovery(graph, receipts)?;
+    let archive = engine
+        .authorize_clean_projection_work(projection, work)
+        .map_err(ProjectionError::Engine)?;
+    let decoded = decode_manifested_projection_work(&archive, work)?;
+    let manifested = decoded.manifested();
+    let target = decoded.target_bytes();
+    let expected_base = decoded.annotated_base();
+    let guarded_layout = decoded.guarded_layout();
+    let local_attempt_intent = decoded.receiver_local_intent().clone();
+    if let Some(target) = target {
+        let current = engine
+            .authorize_projection_write(work.page_id())
+            .map_err(ProjectionError::Engine)?;
+        let replay = plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            expected_base.map(AnnotatedProjectionBase::bytes),
+            expected_base.map(AnnotatedProjectionBase::annotations),
+        )?;
+        let target_matches = replay.target() == target;
+        let layout_matches = replay.guarded_layout() == guarded_layout;
+        let intent_matches = local_attempt_intent.matches_replay_except_frontier(replay.intent());
+        if !target_matches || !layout_matches || !intent_matches {
+            if super::phase_trace_enabled() {
+                eprintln!(
+                    "PHASE DETAIL Projection.work_not_ready path={} batch={} target_matches={} layout_matches={} intent_matches={} target={:?} replay={:?} target_text={:?} replay_text={:?}",
+                    work.path(),
+                    work.batch_id(),
+                    target_matches,
+                    layout_matches,
+                    intent_matches,
+                    BlobDescription::of(target),
+                    BlobDescription::of(replay.target()),
+                    String::from_utf8_lossy(target),
+                    String::from_utf8_lossy(replay.target()),
+                );
+            }
+            return Err(ProjectionError::WorkNotReady);
+        }
+    }
     // Projecting one document costs ~95ms uniformly (F46), which is far too slow
     // for ~1.2KB of bytes and points at durable-write barriers rather than work.
     // This is the first of several durable receipt steps per document; time it to
@@ -1794,7 +2045,7 @@ fn execute_manifested_projection_work_with_runtime(
     let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
     receipts.publish_intent(
         &local_attempt_intent,
-        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+        expected_base.map(AnnotatedProjectionBase::bytes),
     )?;
     if let Some(started) = intent_started {
         eprintln!(
@@ -1804,10 +2055,6 @@ fn execute_manifested_projection_work_with_runtime(
     }
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-        let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-        work_index
-            .mark_completed(authority)
-            .map_err(|error| ProjectionError::Work(error.to_string()))?;
         return Ok(());
     }
     let attempts = receipts.load_attempt_reservations(&local_attempt_intent)?;
@@ -1820,14 +2067,14 @@ fn execute_manifested_projection_work_with_runtime(
             (Some(handoff), Some(target)) => handoff.recover_page_projection_with_layout(
                 graph,
                 manifested.path().as_str(),
-                expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::bytes),
                 target,
                 &guarded_layout,
                 &mut authority,
             ),
             (None, Some(target)) => graph.recover_page_projection_with_layout(
                 manifested.path().as_str(),
-                expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::bytes),
                 target,
                 &guarded_layout,
                 &mut authority,
@@ -1868,13 +2115,6 @@ fn execute_manifested_projection_work_with_runtime(
             None
         }
         Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
-            block_manifested_projection_work(
-                graph,
-                receipts,
-                work_index,
-                work,
-                local_attempt_intent.id()?,
-            )?;
             return Err(ProjectionError::GuardedConflict(error));
         }
         Some((Err(error), _)) => return Err(error.into()),
@@ -1913,14 +2153,14 @@ fn execute_manifested_projection_work_with_runtime(
                     (Some(handoff), target) => handoff.recover_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
                     ),
                     (None, target) => graph.recover_page_projection_with_layout(
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
@@ -1943,14 +2183,14 @@ fn execute_manifested_projection_work_with_runtime(
                     (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
                     ),
                     (None, Some(target)) => graph.write_page_projection_with_layout(
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
@@ -1986,13 +2226,6 @@ fn execute_manifested_projection_work_with_runtime(
                         io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
                     ) || crate::model::is_projection_semantic_refusal(&error) =>
                 {
-                    block_manifested_projection_work(
-                        graph,
-                        receipts,
-                        work_index,
-                        work,
-                        local_attempt_intent.id()?,
-                    )?;
                     return Err(ProjectionError::GuardedConflict(error));
                 }
                 Err(error) => return Err(error.into()),
@@ -2001,10 +2234,6 @@ fn execute_manifested_projection_work_with_runtime(
     };
     receipts.publish_completion(authority, &local_attempt_intent, &proof)?;
     retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-    let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-    work_index
-        .mark_completed(authority)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
     Ok(())
 }
 
@@ -2308,50 +2537,7 @@ fn record_adopted_formatting_path(
     page_id: PageId,
     intent: &ProjectionIntent,
 ) -> Result<(), ProjectionError> {
-    let current = engine.authorize_projection_write(page_id)?;
-    if current.state().page.path != *intent.path()
-        || current.state().frontier != *intent.frontier()
-        || current.state().claim_evidence != intent.claim_evidence()
-    {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let base = store.load_base(intent)?;
-    let Some(base) = base.as_ref() else {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    };
-    if base.description() != intent.target() {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let replay = plan_projection_with_layout_annotations(
-        engine.workspace_id(),
-        current.state(),
-        Some(base.bytes()),
-        Some(intent.annotations()),
-    )?;
-    if replay.intent() != intent {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let (_, work_index) = engine.enrolled_projection_runtime()?;
-    let prior = work_index
-        .completed_receipts_for_path(intent.path())
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let [prior] = prior.as_slice() else {
-        return Err(ProjectionError::Work(
-            "formatting adoption requires one exact prior completed-path authority".into(),
-        ));
-    };
-    let (engine_history_generation, engine_history_root) =
-        engine.projection_completion_history_authority()?;
-    let authority = store.completed_direct_authority(
-        intent,
-        ProjectionWorkTarget::Present(intent.target()),
-        engine_history_generation,
-        engine_history_root,
-    )?;
-    work_index
-        .mark_formatting_adopted(authority, prior)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    Ok(())
+    record_completed_path_with_authorization(store, engine, page_id, intent)
 }
 
 fn record_completed_tombstone_path(
@@ -2369,13 +2555,7 @@ fn record_completed_tombstone_path(
     {
         return Err(ProjectionError::RecoveryIntentMismatch);
     }
-    record_completed_path_target(
-        store,
-        engine,
-        intent.page_id(),
-        intent,
-        ProjectionWorkTarget::Absent,
-    )
+    Ok(())
 }
 
 fn record_completed_path_with_authorization(
@@ -2409,63 +2589,40 @@ fn record_completed_path_with_authorization(
             plan_projection(engine.workspace_id(), current.state(), base_bytes)?
         };
     if replay.intent() != intent {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-
-    record_completed_path_target(
-        store,
-        engine,
-        page_id,
-        intent,
-        ProjectionWorkTarget::Present(intent.target()),
-    )
-}
-
-fn record_completed_path_target(
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
-    target: ProjectionWorkTarget,
-) -> Result<(), ProjectionError> {
-    // The compatibility writer still produces a normal enrolled completion.
-    // Mirror it into the authenticated completed-path tree when its accepted
-    // work row is present, so sparse import never has to fall back to receipt
-    // directory enumeration for this path.
-    if let Ok((_, work_index)) = engine.enrolled_projection_runtime() {
-        let mut exact = work_index
-            .pending_for_path(intent.path())
-            .map_err(|error| ProjectionError::Work(error.to_string()))?
-            .into_iter()
-            .filter(|work| {
-                work.page_id() == page_id
-                    && work.post_frontier() == intent.frontier()
-                    && work.target() == target
-            });
-        if let Some(work) = exact.next() {
-            if exact.next().is_some() {
-                return Err(ProjectionError::Work(
-                    "multiple ready work rows match one direct projection completion".into(),
-                ));
+        // The completion may have been captured by the annotation-guided
+        // planner (its predecessor base carried layout annotations), which the
+        // plain replay above cannot reproduce even though the bytes agree.
+        // Accept only when the guided planner reproduces the recorded intent
+        // exactly from the same current state and recorded base — byte or
+        // frontier drift still refuses through the equality below.
+        let guided = plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            base_bytes,
+            Some(intent.annotations()),
+        )?;
+        if guided.intent() != intent {
+            // Span annotations have two deterministic producer conventions:
+            // exact-source adoption shifts the predecessor's spans (each block
+            // keeps its trailing newline), while a fresh plan derives spans
+            // from the parse (newline excluded). A completion captured through
+            // the former cannot be reproduced by the latter even though every
+            // semantic component agrees. In the index-free clean runtime the
+            // publication below is a no-op, so tolerate exactly that drift:
+            // path, page, frontier, claims and target bytes must still match.
+            let annotations_only_drift =
+                engine.require_index_free_clean_projection_runtime().is_ok()
+                    && guided.intent().path() == intent.path()
+                    && guided.intent().page_id() == intent.page_id()
+                    && guided.intent().frontier() == intent.frontier()
+                    && guided.intent().claim_evidence() == intent.claim_evidence()
+                    && guided.intent().target() == intent.target();
+            if !annotations_only_drift {
+                return Err(ProjectionError::RecoveryIntentMismatch);
             }
-            let authority = store.completed_work_authority(&work, intent)?;
-            work_index
-                .mark_completed(authority)
-                .map_err(|error| ProjectionError::Work(error.to_string()))?;
-        } else {
-            let (engine_history_generation, engine_history_root) =
-                engine.projection_completion_history_authority()?;
-            let authority = store.completed_direct_authority(
-                intent,
-                target,
-                engine_history_generation,
-                engine_history_root,
-            )?;
-            work_index
-                .mark_direct_completed(authority)
-                .map_err(|error| ProjectionError::Work(error.to_string()))?;
         }
     }
+
     Ok(())
 }
 
@@ -3419,6 +3576,68 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn incremental_markdown_content_projection_matches_complete_crlf_projector() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/incremental.md",
+            vec![
+                (81_001, None, "a", "alpha".into(), None),
+                (81_002, None, "b", "omega".into(), None),
+            ],
+        );
+        let canonical = plan_projection(workspace, &state, None).unwrap();
+        let crlf = String::from_utf8(canonical.target().to_vec())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        let accepted = plan_projection(workspace, &state, Some(&crlf)).unwrap();
+        assert_eq!(accepted.target(), crlf);
+
+        let mut requested = state.page.clone();
+        requested.blocks[0].content = "alpha edited\ncontinuation".into();
+        let incremental = incremental_markdown_content_projection(
+            &state.page,
+            &requested,
+            &crlf,
+            accepted.intent().annotations(),
+        )
+        .unwrap()
+        .expect("ordinary content edit uses the incremental projector");
+        let complete = render_projection_page_with_layout_identities(
+            &requested,
+            Some(&crlf),
+            &structural_layout_identities(accepted.intent().annotations()),
+        )
+        .unwrap();
+        assert_eq!(incremental.target, complete.target);
+        assert_eq!(incremental.annotations, complete.annotations);
+        assert_eq!(incremental.generated_anchors, complete.generated_anchors);
+    }
+
+    #[test]
+    fn incremental_markdown_content_projection_refuses_structural_change() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/incremental-structure.md",
+            vec![
+                (82_001, None, "a", "alpha".into(), None),
+                (82_002, None, "b", "omega".into(), None),
+            ],
+        );
+        let accepted = plan_projection(workspace, &state, None).unwrap();
+        let mut requested = state.page.clone();
+        requested.blocks[1].parent = Some(requested.blocks[0].block_id);
+        assert!(incremental_markdown_content_projection(
+            &state.page,
+            &requested,
+            accepted.target(),
+            accepted.intent().annotations(),
+        )
+        .unwrap()
+        .is_none());
     }
 
     fn assert_prepared_editor_projection_matches_ordinary_fallback(

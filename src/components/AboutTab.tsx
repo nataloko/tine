@@ -57,6 +57,8 @@ export function AboutTab(): JSX.Element {
     const r = await checkForUpdateNow();
     setChecking(false);
     if (r.kind === "current") setStatus(`You're on the latest version (${r.version}).`);
+    // FORK: this build can't install an upstream release — the toast action only
+    // opens upstream's releases page, which is the cue to run a sync.
     else if (r.kind === "available") setStatus(`Tine ${r.version} is available upstream — you're on ${r.current}. Merge it into your fork.`);
     else setStatus("Couldn't check right now — see the releases page.");
   };

@@ -88,22 +88,27 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("activate_absent_editor", ManagedRouted),
     ("activate_editor", ManagedRouted),
     ("activate_sparse_v2", NoGraphSlot),
+    ("adopt_sparse_v2_shared", NoGraphSlot),
     ("app_platform", NoGraphSlot),
+    ("apply_journal_filename_migrations", LegacyOnly),
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
     ("asset_trash_stats", Filesystem),
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
     ("cancel_sparse_v2", NoGraphSlot),
-    // Cold recovery starts without a bound GraphContext. Its blocking worker
-    // takes graph_load before reserving the replacement Direct Files slot.
+    // Emergency recovery starts without a bound GraphContext. The native
+    // supervisor validates the selected root and supersedes stale managed work
+    // before publishing the replacement Direct Files slot.
     ("cancel_sparse_v2_cold", NoGraphSlot),
     ("capture_frontend_ready", NoGraphSlot),
     ("capture_graph_binding", NoGraphSlot),
+    ("capture_live_save_conflict", Filesystem),
     ("capture_quick_switch", NoGraphSlot),
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
+    ("conflict_queue", Filesystem),
     ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
@@ -112,6 +117,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("default_graph_parent", NoGraphSlot),
     ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
+    ("durable_live_save_conflict_diff", Filesystem),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
@@ -142,17 +148,21 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_backups", LegacyOnly),
     ("list_installed_plugins", NoGraphSlot),
     ("list_journal_conflicts", Filesystem),
+    ("list_journal_filename_migrations", Filesystem),
     ("list_known_graphs", NoGraphSlot),
     ("list_orphan_assets", ManagedRouted),
     ("list_pages", ManagedRouted),
     ("list_spellcheck_dictionaries", NoGraphSlot),
     ("list_sync_conflicts", Filesystem),
     ("list_templates", ManagedRouted),
+    ("list_vcs_marker_conflicts", Filesystem),
+    ("live_save_conflict_diff", Filesystem),
     ("load_graph", NoGraphSlot),
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),
     ("load_workspaces", NoGraphSlot),
     ("merge_pages", ManagedRouted),
+    ("move_managed_application_subtrees", ManagedRouted),
     ("open_asset", Filesystem),
     ("open_external", NoGraphSlot),
     ("open_graph_window", NoGraphSlot),
@@ -161,6 +171,10 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("page_aliases", ManagedRouted),
     ("page_icons", ManagedRouted),
     ("page_print_html", ManagedRouted),
+    // Asks the sparse actor whether a whole detached page candidate would be
+    // accepted, before the frontend applies it. Managed-only by construction:
+    // it refuses unless the binding is exact and the authority is writable.
+    ("preflight_managed_page_mutation", ManagedRouted),
     ("prepare_tine_quit", NoGraphSlot),
     ("prepare_sparse_v2_share", NoGraphSlot),
     ("present_conflict_override", LegacyOnly),
@@ -175,12 +189,17 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("read_local_image", NoGraphSlot),
     ("read_plugin_entry", NoGraphSlot),
     ("read_text_file", NoGraphSlot),
+    ("recover_managed_application_subtrees", NoGraphSlot),
     ("referenced_page_names", ManagedRouted),
     ("rename_file_to_page", ManagedRouted),
     ("rename_page", ManagedRouted),
+    ("rescan_graph_now", NoGraphSlot),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
+    ("resolve_durable_live_save_conflict", LegacyOnly),
+    ("resolve_live_save_conflict", LegacyOnly),
     ("resolve_sync_conflict", ManagedRouted),
+    ("resolve_vcs_marker_conflict", LegacyOnly),
     ("restore_backup", LegacyOnly),
     ("retire_editor_activation", LegacyOnly),
     ("run_advanced_query", ManagedRouted),
@@ -215,6 +234,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("sparse_v2_editor_load", NoGraphSlot),
     ("sparse_v2_editor_save", NoGraphSlot),
     ("sparse_v2_query", NoGraphSlot),
+    ("sparse_v2_recovery_location", NoGraphSlot),
     ("sparse_v2_status", NoGraphSlot),
     ("sparse_v2_tick", NoGraphSlot),
     ("startup_graph_path", NoGraphSlot),
@@ -222,6 +242,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("stream_asset_path", Filesystem),
     ("sync_conflict_diff", Filesystem),
     ("take_data_home_fallback_notice", NoGraphSlot),
+    ("text_block_diff", NoGraphSlot),
+    ("text_block_diff3", NoGraphSlot),
     ("take_identifier_migration_notice", NoGraphSlot),
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),
@@ -229,8 +251,10 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("trash_journal_file", ManagedRouted),
     ("trash_sync_conflict", TrashWrite),
     ("uninstall_plugin", NoGraphSlot),
+    ("vcs_marker_conflict_diff", Filesystem),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
+    ("watcher_latency_recent", NoGraphSlot),
     ("write_highlights", ManagedRouted),
     ("write_pdf_view_state", ManagedRouted),
 ];
@@ -242,12 +266,30 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
+        "apply_journal_filename_migrations",
+        "renaming graph files is the oplog's authority under managed storage, \
+         which has no Direct Files journal filenames to repair",
+    ),
+    (
         "list_backups",
         "legacy zip backups have no managed analogue",
     ),
     (
         "present_conflict_override",
         "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
+        "resolve_durable_live_save_conflict",
+        "durable live-save conflicts are retained Direct Files editor state, not managed actor state",
+    ),
+    (
+        "resolve_live_save_conflict",
+        "live-save conflicts consume a Direct Files observation epoch that managed editors do not issue",
+    ),
+    (
+        "resolve_vcs_marker_conflict",
+        "VCS merge markers are a Direct Files phenomenon: an external tool wrote \
+         them into the graph's own files, which managed storage does not have",
     ),
     (
         "restore_backup",

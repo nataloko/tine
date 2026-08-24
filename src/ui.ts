@@ -1,11 +1,19 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
-import type { GraphMeta, JournalConflict, SyncConflict, PageKind } from "./types";
+import type {
+  ConflictObject,
+  GraphMeta,
+  JournalConflict,
+  SyncConflict,
+  VcsMarkerConflict,
+  PageKind,
+  PageDto,
+} from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
-import { route, focusBlock, scheduleSessionSave, type PageTarget } from "./router";
+import { route, focusBlock, openPageTarget, scheduleSessionSave, type PageTarget } from "./router";
 import { PaneContext } from "./paneContext";
 import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
@@ -340,20 +348,341 @@ export async function refreshJournalConflicts(notify = false): Promise<void> {
 // Excluded from the page list; surfaced here so the user can review + merge them
 // (Settings → Backups & recovery) instead of them rotting as garbage pages. ---
 export const [syncConflicts, setSyncConflicts] = createSignal<SyncConflict[]>([]);
-/** Re-fetch the sync-conflict list; with `notify`, toast if any exist. */
-export async function refreshSyncConflicts(notify = false): Promise<void> {
+// Pages whose on-disk bytes carry unresolved VCS merge markers (git/Fossil).
+// Readable but quarantined from saves; surfaced in the same Settings area and
+// as a banner on the affected page.
+export const [vcsMarkerConflicts, setVcsMarkerConflicts] = createSignal<VcsMarkerConflict[]>([]);
+/** Whether the page loaded from `path` is quarantined by VCS merge markers. */
+export function vcsMarkerConflictFor(path: string | undefined): VcsMarkerConflict | undefined {
+  return path ? vcsMarkerConflicts().find((c) => c.path === path) : undefined;
+}
+// --- Concord L3: one conflict queue. Disk artifacts (conflict copies and
+// VCS-marker pages) are derived afresh; live save conflicts are app-private
+// capsules because their retained draft does not exist on disk. Neither source
+// writes metadata into the graph. The combined queue drives one calm badge and
+// the in-page resolver. ---
+const [conflictQueue, setConflictQueueSignal] = createSignal<ConflictObject[]>([]);
+export { conflictQueue };
+let artifactConflictQueue: ConflictObject[] = [];
+const liveSaveConflicts = new Map<string, ConflictObject>();
+const LIVE_CONFLICT_STORE_KEY = "tine.concord.live-conflicts.v1";
+
+type StoredLiveConflict = { root: string; conflict: ConflictObject };
+
+function readStoredLiveConflicts(): StoredLiveConflict[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LIVE_CONFLICT_STORE_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is StoredLiveConflict =>
+      typeof item?.root === "string"
+      && item?.conflict?.source === "live-save"
+      && !!item.conflict.live?.page,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistLiveSaveConflicts(): boolean {
+  const root = graphMeta()?.root;
+  if (!root) return false;
+  try {
+    const otherGraphs = readStoredLiveConflicts().filter((item) => item.root !== root);
+    const current = [...liveSaveConflicts.values()].map((conflict) => ({ root, conflict }));
+    localStorage.setItem(LIVE_CONFLICT_STORE_KEY, JSON.stringify([...otherGraphs, ...current]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Rehydrate unresolved live drafts after a process restart. The capsule stays
+ * app-private; no marker or metadata is written into the graph. */
+export function restoreLiveSaveConflicts(root: string): void {
+  liveSaveConflicts.clear();
+  for (const item of readStoredLiveConflicts()) {
+    if (item.root === root && item.conflict.live) {
+      liveSaveConflicts.set(item.conflict.page_name, {
+        ...item.conflict,
+        live: { ...item.conflict.live, restored: true },
+      });
+    }
+  }
+  publishConflictQueue();
+}
+
+function publishConflictQueue(): void {
+  // A retained draft is the page's unsaved work and must be resolved before a
+  // disk artifact for that same page can safely replace its editor.
+  setConflictQueueSignal([...liveSaveConflicts.values(), ...artifactConflictQueue]);
+}
+
+/** Test/setup replacement of the complete queue. Production artifact refreshes
+ * use `replaceArtifactConflictQueue` so they cannot erase retained live drafts. */
+export function setConflictQueue(queue: ConflictObject[]): void {
+  artifactConflictQueue = queue.filter((item) => item.source !== "live-save");
+  liveSaveConflicts.clear();
+  for (const item of queue) {
+    if (item.source === "live-save") liveSaveConflicts.set(item.page_name, item);
+  }
+  publishConflictQueue();
+}
+
+function replaceArtifactConflictQueue(queue: ConflictObject[]): void {
+  artifactConflictQueue = queue;
+  publishConflictQueue();
+}
+
+export function registerLiveSaveConflict(
+  page: PageDto,
+  baseRev: string | null,
+  conflictEpoch: number,
+  recovery?: { base_text: string | null; disk_rev: string },
+): void {
+  const previous = liveSaveConflicts.get(page.name)?.live?.draft_version ?? 0;
+  liveSaveConflicts.set(page.name, {
+    id: `live:${page.path || page.name}`,
+    source: "live-save",
+    page_name: page.name,
+    page_path: page.path ?? page.name,
+    kind: page.kind,
+    sides: [
+      { role: "mine", label: "Your retained draft" },
+      { role: "theirs", label: "Current file on disk", path: page.path },
+      { role: "base", label: "Last version this editor loaded" },
+    ],
+    live: {
+      page,
+      base_rev: baseRev,
+      conflict_epoch: conflictEpoch,
+      draft_version: previous + 1,
+      base_text: recovery?.base_text,
+      disk_rev: recovery?.disk_rev,
+    },
+  });
+  publishConflictQueue();
+  if (recovery && !persistLiveSaveConflicts()) {
+    pushToast(
+      `“${page.name}” is still recoverable in this window, but Tine could not preserve the conflict for an app restart.`,
+      "error",
+      { sticky: true },
+    );
+  }
+}
+
+export function refreshLiveSaveConflictDraft(page: PageDto): void {
+  const current = liveSaveConflicts.get(page.name);
+  if (!current?.live) return;
+  liveSaveConflicts.set(page.name, {
+    ...current,
+    live: { ...current.live, page, draft_version: current.live.draft_version + 1 },
+  });
+  publishConflictQueue();
+  persistLiveSaveConflicts();
+}
+
+export function updateLiveSaveConflictDiskRev(name: string, diskRev: string): void {
+  const current = liveSaveConflicts.get(name);
+  if (!current?.live || current.live.disk_rev === diskRev) return;
+  liveSaveConflicts.set(name, {
+    ...current,
+    live: { ...current.live, disk_rev: diskRev },
+  });
+  publishConflictQueue();
+  persistLiveSaveConflicts();
+}
+
+export function clearLiveSaveConflict(name: string): void {
+  if (liveSaveConflicts.delete(name)) {
+    publishConflictQueue();
+    persistLiveSaveConflicts();
+  }
+}
+/** The queue entry for the page loaded from `path`, if it has one. */
+export function conflictObjectFor(
+  path: string | undefined,
+  name?: string,
+): ConflictObject | undefined {
+  return conflictQueue().find((conflict) =>
+    (path && conflict.page_path === path)
+    || (conflict.source === "live-save" && name !== undefined && conflict.page_name === name)
+  );
+}
+// Where the badge left off, so repeated clicks WALK the queue instead of parking
+// on its first item. Transient session state: the queue itself is derived.
+let conflictCursor = 0;
+let syncConflictInventoryToast: number | undefined;
+let vcsConflictInventoryToast: number | undefined;
+const artifactArrivalToasts = new Map<number, Set<string>>();
+// Inventory calls include several awaited filesystem walks. Only the newest
+// refresh episode may publish: a conflicts-changed scan begun before Apply can
+// otherwise finish after the guarded native resolution and resurrect the exact
+// conflict object the user just settled.
+let artifactConflictRefreshGeneration = 0;
+
+function retireToast(id: number | undefined): void {
+  if (id !== undefined) dismissToast(id);
+}
+
+/** Sticky conflict notices describe live derived objects, not history. Retire
+ * them when the objects disappear so a successful resolution cannot leave a
+ * blue "needs review" notice contradicting the green success confirmation. */
+function retireSettledArtifactArrivalToasts(queue: ConflictObject[]): void {
+  const live = new Set(queue.map((conflict) => conflict.id));
+  for (const [toastId, ids] of [...artifactArrivalToasts]) {
+    if ([...ids].some((id) => live.has(id))) continue;
+    artifactArrivalToasts.delete(toastId);
+    dismissToast(toastId);
+  }
+}
+
+/** Apply the exact local consequence of a successful guarded artifact resolve.
+ * The native commit proves this one derived object is gone, so the UI need not
+ * block on another graph-wide inventory walk before closing the resolver. A
+ * best-effort refresh still follows in the background to catch unrelated
+ * arrivals/removals. */
+export function settleArtifactConflict(id: string): void {
+  const settled = artifactConflictQueue.find((conflict) => conflict.id === id);
+  if (!settled) return;
+  ++artifactConflictRefreshGeneration;
+  replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
+  resetConflictCursor();
+  if (settled.source === "sync-copy") {
+    const copy = settled.sides.find((side) => side.role === "theirs")?.path;
+    if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
+    if (!syncConflicts().length) {
+      retireToast(syncConflictInventoryToast);
+      syncConflictInventoryToast = undefined;
+    }
+  } else if (settled.source === "vcs-markers") {
+    setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+    if (!vcsMarkerConflicts().length) {
+      retireToast(vcsConflictInventoryToast);
+      vcsConflictInventoryToast = undefined;
+    }
+  }
+  retireSettledArtifactArrivalToasts(artifactConflictQueue);
+}
+/** The next conflict to visit, cycling. `undefined` when the queue is empty. */
+export function advanceConflictCursor(): ConflictObject | undefined {
+  const queue = conflictQueue();
+  if (!queue.length) return undefined;
+  conflictCursor = conflictCursor % queue.length;
+  const next = queue[conflictCursor];
+  conflictCursor = (conflictCursor + 1) % queue.length;
+  return next;
+}
+/** Reset the walk (a fresh queue makes the old position meaningless). */
+export function resetConflictCursor(): void {
+  conflictCursor = 0;
+}
+
+/** Re-derive the queue when an external change touched a page that is IN it.
+ *
+ *  The watcher's `conflicts-changed` event fires for conflict-copy files only,
+ *  so a merge finished outside Tine (git resolving the markers) would otherwise
+ *  leave a resolved page sitting in the queue until the next graph load. Gated
+ *  on the queue being non-empty and actually touched, so the ordinary case —
+ *  no conflicts — costs one length check per external change. */
+export async function refreshConflictQueueIfTouched(
+  changes: { name: string; kind: PageKind }[]
+): Promise<void> {
+  const queue = conflictQueue();
+  if (!queue.length) return;
+  const touched = changes.some((c) =>
+    queue.some((q) => q.page_name === c.name && q.kind === c.kind)
+  );
+  if (touched) await refreshSyncConflicts();
+}
+
+/** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
+export async function refreshSyncConflicts(notify: boolean | "new" = false): Promise<void> {
+  const generation = ++artifactConflictRefreshGeneration;
   try {
     const c = await backend().listSyncConflicts();
+    if (generation !== artifactConflictRefreshGeneration) return;
     setSyncConflicts(c);
-    if (notify && c.length) {
-      pushToast(
+    if (!c.length) {
+      retireToast(syncConflictInventoryToast);
+      syncConflictInventoryToast = undefined;
+    } else if (notify === true && syncConflictInventoryToast === undefined) {
+      const id = pushToast(
         `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
         "info",
-        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
+        {
+          sticky: true,
+          action: { label: "Open", run: () => openSettings("backups") },
+          onDismiss: () => {
+            if (syncConflictInventoryToast === id) syncConflictInventoryToast = undefined;
+          },
+        }
       );
+      syncConflictInventoryToast = id;
     }
   } catch {
     /* best-effort */
+  }
+  try {
+    const m = await backend().listVcsMarkerConflicts();
+    if (generation !== artifactConflictRefreshGeneration) return;
+    setVcsMarkerConflicts(m);
+    if (!m.length) {
+      retireToast(vcsConflictInventoryToast);
+      vcsConflictInventoryToast = undefined;
+    } else if (notify === true && vcsConflictInventoryToast === undefined) {
+      const id = pushToast(
+        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; open the page to resolve the merge block by block`,
+        "info",
+        {
+          sticky: true,
+          action: { label: "Open", run: () => openSettings("backups") },
+          onDismiss: () => {
+            if (vcsConflictInventoryToast === id) vcsConflictInventoryToast = undefined;
+          },
+        }
+      );
+      vcsConflictInventoryToast = id;
+    }
+  } catch {
+    /* best-effort */
+  }
+  try {
+    const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
+    const before = conflictQueue().map((c) => c.id).join("\u0000");
+    const queue = await backend().conflictQueue();
+    if (generation !== artifactConflictRefreshGeneration) return;
+    replaceArtifactConflictQueue(queue);
+    retireSettledArtifactArrivalToasts(queue);
+    if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
+    if (notify === "new") {
+      const arrived = queue.filter((conflict) =>
+        conflict.source === "sync-copy" && !previousIds.has(conflict.id)
+      );
+      if (arrived.length) {
+        const first = arrived[0];
+        const toastId = pushToast(
+          `${arrived.length} new sync conflict${arrived.length === 1 ? " needs" : "s need"} review`,
+          "info",
+          {
+            sticky: true,
+            action: {
+              label: "Review",
+              run: () => openPageTarget({
+                name: first.page_name,
+                pageKind: first.kind,
+                path: first.page_path,
+              }),
+            },
+            onDismiss: () => artifactArrivalToasts.delete(toastId),
+          },
+        );
+        artifactArrivalToasts.set(toastId, new Set(arrived.map((conflict) => conflict.id)));
+      }
+    }
+  } catch {
+    // Best-effort like the two listings above: a missing queue means no badge,
+    // never a broken app. The Settings fallback surface still works.
+    if (generation === artifactConflictRefreshGeneration) replaceArtifactConflictQueue([]);
   }
 }
 
@@ -389,6 +718,11 @@ export function installPaneTracker(): () => void {
     // mode goes stale — the ring lingers and, worse, its keyboard handler
     // would still be armed after the user clicks off to do something else.
     exitPaneSelect();
+    // A middle-click is a background-tab gesture, not a pane activation. Keep
+    // the pane that was already active so links in another pane or the sidebar
+    // open their background tab there (GH #87). Target anchors also prevent the
+    // middle-button default focus so a following focusin cannot undo this.
+    if ("button" in e && (e as PointerEvent).button === 1) return;
     // Global chrome can still target the pane the user last focused. Back,
     // Forward, Search, and Journals all call the focused-router facade; letting
     // this capture-phase pointer event fall through would retarget to `main`
@@ -1057,6 +1391,7 @@ export function markConflict(name: string) {
 }
 export function clearConflict(name: string) {
   setConflicts(conflicts().filter((n) => n !== name));
+  clearLiveSaveConflict(name);
 }
 export function isConflicted(name: string): boolean {
   return conflicts().includes(name);
@@ -1468,7 +1803,7 @@ export async function pruneSidebarBlocks(): Promise<void> {
  *  row block to drop (works for grid + table, sort-safe). `gridId`/`col` enable a
  *  positional column delete (grid only; tables remove columns via "Remove from
  *  schema" on the header instead). */
-export type SheetCellRemoveCtx = { rowId?: string; gridId?: string; col?: number };
+export type SheetCellRemoveCtx = { rowId?: string; gridId?: string; col?: number; surfaceId?: string };
 
 export type CtxTarget =
   | { kind: "block"; blockId: string }

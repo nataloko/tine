@@ -2,15 +2,21 @@
 //! Logseq-compatible outliner. Pure Rust, no GUI dependencies — fully unit
 //! testable without the Tauri shell.
 
+pub mod concord_ledger;
+pub mod concord_queue;
 pub mod config;
 pub mod date;
+mod direct_projection;
 pub mod doc;
 pub mod edn;
 pub mod fast_commit;
+mod filesystem_durability;
 
+pub mod graph_name_folding;
 pub mod graph_text_scope;
 pub mod html_sanitize;
 pub mod logbook;
+pub mod managed_storage_journey;
 pub mod model;
 pub mod onboarding;
 pub mod oplog;
@@ -42,6 +48,6 @@ pub use graph_text_scope::{
 };
 pub use model::{
     ActivationIntent, BlockDto, BlockPreview, ConflictOverride, ConflictPresentation,
-    EditorActivation, EditorActivationHandle, Graph, GraphMeta, PageDto, PageEntry, PageKind,
-    RefGroup, ReferencedPageNames,
+    EditorActivation, EditorActivationHandle, Graph, GraphMeta, LiveSaveConflictCapture, PageDto,
+    PageEntry, PageKind, RefGroup, ReferencedPageNames,
 };

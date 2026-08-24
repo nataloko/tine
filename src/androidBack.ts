@@ -12,7 +12,11 @@ export interface AndroidBackDispatchDeps {
   dismissTransient(): boolean;
   dismissDrawer(): boolean;
   restoreDrawerFocus(): void;
-  historyBack(): void;
+  /** Whether Tine actually went back. The WebView's own `canGoBack` cannot
+   * answer this: the mobile router pushes same-URL entries, so its history
+   * moves without the address or the entry count changing, and entries that
+   * are not Tine's can sit in the same stack. Only the router knows. */
+  historyBack(): boolean;
   closeRoot(): void;
 }
 
@@ -21,7 +25,7 @@ export type AndroidBackDisposition = "transient" | "drawer" | "history" | "root"
 /** Synchronous ordering matters: a hardware Back gesture selects exactly one
  * rung and never synthesizes a KeyboardEvent or a second router back action. */
 export function dispatchAndroidBack(
-  payload: AndroidBackPayload,
+  _payload: AndroidBackPayload,
   deps: AndroidBackDispatchDeps,
 ): AndroidBackDisposition {
   if (deps.dismissTransient()) return "transient";
@@ -29,10 +33,10 @@ export function dispatchAndroidBack(
     deps.restoreDrawerFocus();
     return "drawer";
   }
-  if (payload.canGoBack) {
-    deps.historyBack();
-    return "history";
-  }
+  // The rung is chosen by whether the router moved, not by the WebView's
+  // opinion of its own stack. `canGoBack` was true on a phone whose router had
+  // nothing to pop, so Back landed here and silently did nothing, forever.
+  if (deps.historyBack()) return "history";
   deps.closeRoot();
   return "root";
 }

@@ -20,7 +20,7 @@ import {
 } from "../ui";
 import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
 import { removePageTargetAcrossPanes } from "../panes";
-import { refreshAfterRename } from "../graph";
+import { refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
@@ -30,6 +30,7 @@ import {
   ensureBlockId,
   persistentBlockRef,
   blockSubtreeMarkdown,
+  blockIsGridView,
   deleteBlock,
   setBlockProperty,
   toggleBlockProperty,
@@ -51,8 +52,16 @@ import {
 } from "../store";
 import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
 import { canConvertPipeTableToGrid, convertGridToPipeTable, convertPipeTableToGrid } from "../sheet/conversions";
-import { appendSheetCellChild, deleteColumn, setBoardGroupBy } from "../sheet/mutations";
-import { cellBlockId, cellForBlockId, cellOwner, cellSel, focusCell, setCellSel } from "../sheet/selection";
+import { appendSheetCellChild, deleteColumn, deleteRow as deleteSheetRow, setBoardGroupBy } from "../sheet/mutations";
+import {
+  captureSheetMutationAuthority,
+  cellBlockId,
+  cellForBlockId,
+  cellOwner,
+  cellSel,
+  focusCell,
+  setCellSel,
+} from "../sheet/selection";
 import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
@@ -429,14 +438,31 @@ function SheetCellMenu(props: { id: string; remove?: SheetCellRemoveCtx; close: 
   const canDeleteColumn = () =>
     props.remove?.gridId != null && props.remove?.col != null && !!doc.byId[props.remove.gridId];
   const deleteRow = () => {
-    const rowId = props.remove?.rowId;
+    const { rowId, gridId, surfaceId } = props.remove ?? {};
+    const row = gridId && rowId ? doc.byId[gridId]?.children.indexOf(rowId) ?? -1 : -1;
+    const active = cellSel();
+    const directGridRow = !!gridId
+      && !!rowId
+      && row >= 0
+      && doc.byId[rowId]?.parent === gridId
+      && blockIsGridView(gridId);
+    if (directGridRow) {
+      if (active && active.gridId === gridId && active.surfaceId === surfaceId) {
+        deleteSheetRow(gridId, row, props.close, captureSheetMutationAuthority(active));
+      } else {
+        props.close();
+      }
+      return;
+    }
     if (rowId && doc.byId[rowId]) deleteBlock(rowId);
     props.close();
   };
   const deleteColumnHere = () => {
     const { gridId, col } = props.remove ?? {};
-    if (gridId != null && col != null) deleteColumn(gridId, col);
-    props.close();
+    const active = cellSel();
+    if (gridId != null && col != null && active && active.gridId === gridId) {
+      deleteColumn(gridId, col, props.close, captureSheetMutationAuthority(active));
+    }
   };
   const addChild = () => {
     const active = cellSel();
@@ -1004,14 +1030,14 @@ function RenamePage(props: {
         pushToast("Couldn't save pending edits — resolve the conflict before renaming.", "error");
         return;
       }
-      if (props.path) await backend().renamePage(from, next, props.path);
-      else await backend().renamePage(from, next);
+      const outcome = await renameOrMergePage(from, next, props.path);
+      if (outcome === "cancelled") return;
       // Backend rewrote refs across pages via the self-write guard (no watcher
       // reload) → in-memory pages are stale; reset + reload so a stale save can't
       // revert the rename.
       refreshAfterRename(from, next, { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) });
       openPage(next, kind);
-      pushToast(`Renamed to “${next}”`, "success");
+      pushToast(outcome === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
     } catch (e) {
       pushToast(`Rename failed: ${String(e)}`, "error");
     }

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
-import { closeSettings, dismissToast, openSettings, setToasts, toasts } from "../ui";
+import { closeSettings, dismissToast, openSettings, setGraphMeta, setGraphTransitioning, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import * as store from "../store";
 import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal, parseJournalWith } from "../journal";
@@ -30,6 +31,9 @@ afterEach(() => {
   localStorage.clear();
   setToasts([]);
   managedStorageRuntime.clear();
+  storageTransitionRuntime.clear();
+  setGraphTransitioning(false);
+  setGraphMeta(null);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -40,6 +44,7 @@ describe("Settings storage transitions", () => {
     // fixtures. These tests intentionally exercise backend status transitions
     // across several explicit binding generations, so they must begin unbound.
     managedStorageRuntime.clear();
+    setGraphMeta({ root: "/graphs/settings-test" } as never);
   });
 
   const legacy = (): SparseV2Status => ({
@@ -81,6 +86,7 @@ describe("Settings storage transitions", () => {
       shared_role: null,
       shared_phase: null,
       provider_pending: 0,
+      provider_runnable: false,
     },
     can_activate: false,
     can_retry: false,
@@ -139,13 +145,295 @@ describe("Settings storage transitions", () => {
 
     expect(experimental.getAttribute("aria-expanded")).toBe("true");
     expect(root.textContent).toContain("Tine-managed storage is for testing and is not yet mature.");
-    expect(root.textContent).toContain("You can keep using Direct files in the meantime.");
-    expect(root.textContent).toContain("Uses your graph’s Markdown or Org files directly.");
+    // Direct files and Tine-managed storage are peers. Neither description may
+    // present the other as the destination, and the panel says so where a user
+    // deciding between them will read it.
+    expect(root.textContent).toContain(
+      "Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything."
+    );
+    expect(root.textContent).toContain("Many people will want to stay here.");
     expect(root.textContent).toContain("Enable Tine-managed storage");
+    expect(root.textContent).toContain("Join a synced graph from another device");
     dispose();
   });
 
-  it("flushes before setup, offers retry, and invalidates stale pages", async () => {
+  it("starts shared discovery only after an explicit Direct Files join action", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const join = vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error("managed join could not find a shared provider descriptor")
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    expect(join).not.toHaveBeenCalled();
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    expect(join).toHaveBeenCalledTimes(1);
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Couldn't join the synced graph: managed join could not find a shared provider descriptor",
+      sticky: true,
+    });
+    dispose();
+  });
+
+  it("keeps the not-yet refusal actionable after the panel truncates it to one line", async () => {
+    // The native message names the file and both ordinary causes; the panel
+    // shows only its first line, which is the dead end. The remedy carries the
+    // rest, or a real device is told nothing it can act on.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error(
+        "This graph does not yet contain sync data from another device.\n\n"
+        + "Tine looked for /graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json.\n\n"
+        + "Two things usually explain that."
+      )
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    const message = String(toasts().at(-1)?.message ?? "");
+    expect(message).toContain("does not yet contain sync data from another device");
+    expect(message).toContain(
+      ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+    );
+    expect(message).toContain("Set up sync with another device");
+    expect(message).toContain("skip dot-directories");
+    expect(message).toContain("Nothing was changed on this device.");
+    dispose();
+  });
+
+  const sharedActive = (): SparseV2Status => {
+    const base = localActive();
+    return {
+      ...base,
+      runtime: { ...base.runtime!, shared_role: "initiator", shared_phase: "active" },
+    };
+  };
+
+  it("offers the join action from Tine-managed storage and names what happens to this device's own history", async () => {
+    // The native join branch accepts a device that already holds managed
+    // storage (`prepare_sparse_v2_join`'s `slot.sparse_binding().is_some()`
+    // path), so hiding the action behind Direct files made a supported action
+    // invisible — the worst of the three options.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const join = vi.spyOn(backend(), "joinSparseV2Shared");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    expect(button).toBeTruthy();
+    button.click();
+    await tick();
+    await tick();
+
+    const prompt = confirm.mock.calls[0][0];
+    // The exact consequence, not "this may replace data": the shared baseline
+    // and operation archive REPLACE this device's own, the replaced pair is
+    // deleted, and the swap happens only when the notes already match.
+    expect(prompt).toContain("its own operation history and baseline are replaced by the shared ones");
+    expect(prompt).toContain("the replaced pair is deleted");
+    expect(prompt).toContain("already identical on both sides");
+    // And the other branch: a different history changes nothing at all.
+    expect(prompt).toContain("Tine changes nothing at all");
+    // And that the dead end has an exit: a second prompt, which is where the
+    // archive location is named.
+    expect(prompt).toContain("offers to ADOPT the other device's graph instead");
+    expect(prompt).toContain("nothing happens until you accept that second prompt");
+    // Declining leaves the graph exactly as it was.
+    expect(join).not.toHaveBeenCalled();
+    expect(toasts()).toEqual([]);
+    dispose();
+  });
+
+  const independentHistoryRefusal = () =>
+    new Error(
+      "managed sync join failed at provider scan: sync actor refused request: "
+        + "clean shared descriptor names another managed graph"
+    );
+
+  const clickManagedJoin = async (root: HTMLElement) => {
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+    await tick();
+  };
+
+  it("offers adoption when the shared graph names another managed history, and says where this device's own goes", async () => {
+    // Two devices that each enabled managed storage on their own can never
+    // join each other: the native branch compares workspace identity first.
+    // The refusal is correct, and adoption is the operation behind it.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue(
+      "/home/example/.local/share/tine/managed-history-archive"
+    );
+    const adopt = vi.spyOn(backend(), "adoptSparseV2Shared").mockResolvedValue({
+      status: {
+        ...localActive(),
+        binding_generation: 12,
+        runtime: { ...localActive().runtime!, shared_role: "joiner", shared_phase: "active" },
+        application_page_admission: {
+          ...localActive().application_page_admission,
+          binding_generation: 12,
+        },
+      },
+      binding_generation: 12,
+      archive_location: "/home/example/.local/share/tine/managed-history-archive/graph-7",
+      adoption_statement:
+        "This device now serves the graph shared by your other device. Its own previous Tine-managed "
+        + "history was archived at /home/example/.local/share/tine/managed-history-archive/graph-7 and was not merged.",
+    });
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    expect(adopt).toHaveBeenCalledTimes(1);
+    const prompt = confirm.mock.calls[1][0];
+    // The archive location is stated BEFORE the operation, not only in the
+    // receipt: an archive nobody can find is not a backup.
+    expect(prompt).toContain("/home/example/.local/share/tine/managed-history-archive");
+    expect(prompt).toContain("archived whole, not deleted");
+    // The divergence, named. This is not a merge.
+    expect(prompt).toContain("Tine will not merge two histories");
+    expect(prompt).toContain("Nothing from this device's own managed history is carried across");
+    expect(prompt).toContain("they must already match the shared graph's files");
+    expect(prompt).toContain("Cancel now and this device is left exactly as it is");
+    expect(toasts().at(-1)?.message).toContain("was archived at");
+    dispose();
+  });
+
+  it("keeps the refusal and its remedy when the adoption prompt is declined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue("/archive/root");
+    const adopt = vi.spyOn(backend(), "adoptSparseV2Shared");
+    let call = 0;
+    vi.spyOn(backend(), "confirm").mockImplementation(async () => {
+      call += 1;
+      return call === 1;
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    expect(adopt).not.toHaveBeenCalled();
+    const message = toasts().at(-1)?.message ?? "";
+    expect(message).toContain("Nothing was changed on either device");
+    expect(message).toContain("Tine will not merge two histories");
+    expect(message).toContain("archives this device's own history rather than deleting it");
+    dispose();
+  });
+
+  it("reports a failed adoption without claiming the shared graph was joined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue("/archive/root");
+    vi.spyOn(backend(), "adoptSparseV2Shared").mockRejectedValue(
+      new Error(
+        "This device's Tine-managed storage is already shared with, or joined to, another device. Nothing was changed."
+      )
+    );
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    const message = toasts().at(-1)?.message ?? "";
+    expect(message).toContain("Couldn't adopt the shared graph");
+    expect(message).toContain("already shared with, or joined to, another device");
+    expect(message).toContain("Nothing was changed");
+    expect(message).not.toContain("joined the synced graph");
+    dispose();
+  });
+
+  it("leaves the graph exactly as it is when the share confirmation is declined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const share = vi.spyOn(backend(), "prepareSparseV2Share");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Set up sync with another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    // The confirmation is the last moment at which nothing has been written,
+    // and it says so rather than letting the user find out afterwards.
+    expect(confirm.mock.calls[0][0]).toContain("Cancel now and this graph is left exactly as it is");
+    expect(confirm.mock.calls[0][0]).toContain("cannot be un-shared");
+    expect(share).not.toHaveBeenCalled();
+    expect(toasts()).toEqual([]);
+    expect(root.textContent).toContain("Set up sync with another device");
+    dispose();
+  });
+
+  it("says what a shared graph's state is and where its only exit is", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(sharedActive());
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    expect(root.textContent).toContain("This graph is shared.");
+    expect(root.textContent).toContain("Join a synced graph from another device");
+    expect(root.textContent).toContain("Sharing cannot be switched off again");
+    expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("flushes before setup and leaves the serving Direct renderer intact on candidate failure", async () => {
     const calls: string[] = [];
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
@@ -171,7 +459,7 @@ describe("Settings storage transitions", () => {
     await tick();
 
     expect(calls).toEqual(["flush", "activate"]);
-    expect(reset).toHaveBeenCalled();
+    expect(reset).not.toHaveBeenCalled();
     expect(toasts().at(-1)).toMatchObject({
       message: "Tine-managed storage setup did not complete: projection proof paused on the exact test cut",
       kind: "error",
@@ -180,6 +468,33 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
     expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("accepts the native readiness receipt without a second frontend page probe", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "listPages");
+    const loadPage = vi.spyOn(backend(), "getPageByPath");
+    vi.spyOn(backend(), "activateSparseV2").mockResolvedValue(localActive());
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    loadPage.mockClear();
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await vi.waitFor(() => expect(toasts().at(-1)).toMatchObject({
+      message: "Tine-managed storage is active.",
+      kind: "success",
+    }));
+    // Renderer rebinding may refresh ordinary page-derived resources, but it
+    // must not run the former representative-page readiness proof.
+    expect(loadPage).not.toHaveBeenCalled();
     dispose();
   });
 
@@ -342,6 +657,7 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
       state: "refused",
       reason_code: "local_active",
+      scenario_id: "MS-REF-DISK-CORRUPT",
       detail: "SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob at /home/martin/private/.tine-sync/v2/blobs.data",
       runtime: null,
       can_activate: false,
@@ -363,6 +679,7 @@ describe("Settings storage transitions", () => {
     await tick();
 
     expect(root.textContent).toContain("document scratch index failed: malformed scratch blob");
+    expect(root.textContent).toContain("MS-REF-DISK-CORRUPT");
     expect(root.textContent).toContain("LeaseContended(\"[path]\")");
     expect(root.textContent).not.toContain("/home/martin");
     expect(root.textContent).not.toContain("C:\\Users\\Martin");
@@ -373,6 +690,7 @@ describe("Settings storage transitions", () => {
     copy.click();
     await tick();
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("malformed scratch blob"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("MS-REF-DISK-CORRUPT"));
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Return to Direct files:"));
     const copied = writeText.mock.calls.at(-1)?.[0] ?? "";
     expect(copied).toContain("[path]");
@@ -418,9 +736,18 @@ describe("Settings storage transitions", () => {
         return () => calls.push(`unlisten-${generation}`);
       }
     );
+    let activationOperation = 100;
     vi.spyOn(backend(), "activateSparseV2").mockImplementation(
       () => new Promise<SparseV2Status>((resolve) => {
         calls.push("activate");
+        storageTransitionRuntime.receive({
+          operationId: activationOperation,
+          window: "main",
+          kind: "activate_managed",
+          phase: "activating_managed",
+          elapsedMs: 0,
+          terminal: false,
+        });
         resolvers.push(resolve);
       })
     );
@@ -450,6 +777,19 @@ describe("Settings storage transitions", () => {
     expect(progress.value).toBe(2);
     expect(progress.max).toBe(4);
 
+    listeners[0]({ kind: "phase", phase: "retained_runtime_open" });
+    await tick();
+    expect(root.textContent).toContain("Opening retained managed state");
+
+    storageTransitionRuntime.receive({
+      operationId: activationOperation,
+      window: "main",
+      kind: "activate_managed",
+      phase: "activating_managed",
+      elapsedMs: 12,
+      terminal: true,
+      outcome: "failed",
+    });
     resolvers[0](localRetryable());
     await tick();
     await tick();
@@ -460,6 +800,7 @@ describe("Settings storage transitions", () => {
       (button) => button.textContent === "Retry setup"
     ) as HTMLButtonElement;
     retry.click();
+    activationOperation += 1;
     await tick();
     await tick();
     expect(calls.slice(-2)).toEqual(["listen-11", "activate"]);
@@ -468,6 +809,15 @@ describe("Settings storage transitions", () => {
     progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
     expect(root.textContent).toContain("Sealing prepared history");
     expect(progress.hasAttribute("value")).toBe(false);
+    storageTransitionRuntime.receive({
+      operationId: activationOperation,
+      window: "main",
+      kind: "activate_managed",
+      phase: "activating_managed",
+      elapsedMs: 9,
+      terminal: true,
+      outcome: "succeeded",
+    });
     resolvers[1](localActive());
     await tick();
     await tick();
@@ -554,6 +904,108 @@ describe("Settings storage transitions", () => {
     expect(toasts().at(-1)?.message).toBe(
       "Direct file mode is active. Complete recovery state was preserved."
     );
+    dispose();
+  });
+
+  it("uses the independent cold escape when the managed actor cannot shut down", async () => {
+    const calls: string[] = [];
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const flush = vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const reset = vi.spyOn(store, "resetStore");
+    vi.spyOn(backend(), "cancelSparseV2").mockRejectedValue(
+      new Error("sync actor is unavailable")
+    );
+    vi.spyOn(backend(), "cancelSparseV2Cold").mockImplementation(async (path) => {
+      calls.push(`cold-${path}`);
+      return {
+        status: legacyAt(12),
+        binding_generation: 12,
+        recovery_statement:
+          "Direct Files is active from the current Markdown/Org tree. Managed-storage evidence was left untouched.",
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const rollback = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Return to Direct files")
+    ) as HTMLButtonElement;
+    rollback.click();
+    await tick();
+    await tick();
+
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(confirm.mock.calls[1][0]).toContain("emergency exit");
+    expect(confirm.mock.calls[1][0]).toContain("sync actor is unavailable");
+    expect(calls).toEqual(["cold-/graphs/settings-test"]);
+    expect(flush).toHaveBeenCalledOnce();
+    expect(reset).toHaveBeenCalledOnce();
+    expect(toasts().at(-1)?.message).toContain("Direct Files is active");
+    dispose();
+  });
+
+  it("bounds cooperative shutdown before offering the independent cold escape", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "cancelSparseV2").mockImplementation(
+      () => new Promise(() => {})
+    );
+    const cold = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
+      status: legacyAt(12),
+      binding_generation: 12,
+      recovery_statement: "Direct Files is active.",
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    vi.useFakeTimers();
+    const rollback = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Return to Direct files")
+    ) as HTMLButtonElement;
+    rollback.click();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cold).toHaveBeenCalledWith("/graphs/settings-test");
+    expect(toasts().at(-1)?.message).toBe("Direct Files is active.");
+    dispose();
+  });
+
+  it("keeps the independent Direct Files escape available while managed status is unavailable", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockRejectedValue(
+      new Error("managed actor did not answer")
+    );
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const cold = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
+      status: legacyAt(13),
+      binding_generation: 13,
+      recovery_statement: "Direct Files is active from the current Markdown/Org tree.",
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await tick();
+    const escape = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Open current files in Direct Files")
+    ) as HTMLButtonElement;
+    expect(escape).toBeTruthy();
+    escape.click();
+    await tick();
+    await tick();
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain("managed storage status is unavailable");
+    expect(cold).toHaveBeenCalledWith("/graphs/settings-test");
+    expect(toasts().at(-1)?.message).toContain("Direct Files is active");
     dispose();
   });
 

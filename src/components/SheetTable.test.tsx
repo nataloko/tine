@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { render } from "solid-js/web";
 import { createSignal, type JSX } from "solid-js";
 import { Block, SurfaceContext } from "./Block";
@@ -20,18 +20,61 @@ import {
 import { editingId, editingOwner } from "../editorController";
 import type { RefGroup } from "../types";
 import { installKeybindings } from "../keybindings";
+import { __setBackendForTest } from "../backend";
+import { managedStorageRuntime } from "../managedStorageRuntime";
+import { mockBackend } from "../mock";
+
+let managedBinding = 3_000;
 
 beforeAll(async () => {
   await initParser();
+});
+
+beforeEach(() => {
+  managedStorageRuntime.bind(++managedBinding, {
+    binding_generation: managedBinding,
+    authority: "direct",
+  });
+  __setBackendForTest(null);
 });
 
 afterEach(() => {
   __sheetTableTestHooks.onIndexRow = undefined;
   resetCellSelectionForTests();
   resetStore();
+  __setBackendForTest(null);
   setWorkflow("todo");
   document.body.innerHTML = "";
 });
+
+function bindManagedRename(preflight: "accepted" | "refused") {
+  const binding = ++managedBinding;
+  managedStorageRuntime.bind(binding, {
+    binding_generation: binding,
+    authority: "managed_writable",
+    application_save_page_blocks: 511,
+    application_page_request_text_bytes: 1024 * 1024,
+    application_page_max_depth: 128,
+  });
+  const base = mockBackend();
+  let calls = 0;
+  __setBackendForTest({
+    ...base,
+    preflightManagedPageMutation: async (candidate, baseRevision, bindingGeneration) => {
+      calls++;
+      return preflight === "accepted"
+        ? {
+            status: "accepted",
+            binding_generation: bindingGeneration,
+            page_name: candidate.name,
+            page_path: candidate.path ?? "",
+            base_revision: baseRevision,
+          }
+        : { status: "refused" };
+    },
+  });
+  return () => calls;
+}
 
 function mount(node: () => JSX.Element): { root: HTMLDivElement; dispose: () => void } {
   const root = document.createElement("div");
@@ -1112,6 +1155,66 @@ describe("SheetTable", () => {
     dispose();
   });
 
+  it("publishes a managed field rename only after one accepted atomic preflight", async () => {
+    const ownerBefore = "Table\ntine.view:: table\ntine.fields:: occurrence=number";
+    const rowBefore = "Row\noccurrence:: 2";
+    setDoc({
+      byId: { table: node("table", ownerBefore, null, ["r1"]), r1: node("r1", rowBefore, "table") },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const calls = bindManagedRename("accepted");
+    const { root, dispose } = mount(() => <>
+      <Block id="table" />
+      <ContextMenu />
+    </>);
+    const header = [...root.querySelectorAll(".sheet-field-header")].find((h) => h.textContent?.includes("occurrence"))!;
+    contextMenu(header);
+    clickMenuItem("Rename field…");
+    const rename = root.querySelector<HTMLInputElement>(".sheet-header-rename-input")!;
+    rename.value = "OCC";
+    input(rename);
+    keydown(rename, "Enter");
+
+    expect(doc.byId.table.raw).toBe(ownerBefore);
+    expect(doc.byId.r1.raw).toBe(rowBefore);
+    expect(rename.disabled).toBe(true);
+    await tick();
+
+    expect(calls()).toBe(1);
+    expect(doc.byId.table.raw).toContain("tine.fields:: OCC=number");
+    expect(doc.byId.r1.raw).toBe("Row\nOCC:: 2");
+    expect(root.querySelector(".sheet-header-rename-input")).toBeNull();
+    dispose();
+  });
+
+  it("keeps a managed field rename editable and byte-identical after refusal", async () => {
+    const ownerBefore = "Table\ntine.view:: table\ntine.fields:: occurrence=number";
+    const rowBefore = "Row\noccurrence:: 2";
+    setDoc({
+      byId: { table: node("table", ownerBefore, null, ["r1"]), r1: node("r1", rowBefore, "table") },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const calls = bindManagedRename("refused");
+    const { root, dispose } = mount(() => <>
+      <Block id="table" />
+      <ContextMenu />
+    </>);
+    const header = [...root.querySelectorAll(".sheet-field-header")].find((h) => h.textContent?.includes("occurrence"))!;
+    contextMenu(header);
+    clickMenuItem("Rename field…");
+    const rename = root.querySelector<HTMLInputElement>(".sheet-header-rename-input")!;
+    rename.value = "OCC";
+    input(rename);
+    keydown(rename, "Enter");
+    await tick();
+
+    expect(calls()).toBe(1);
+    expect(doc.byId.table.raw).toBe(ownerBefore);
+    expect(doc.byId.r1.raw).toBe(rowBefore);
+    expect(root.querySelector<HTMLInputElement>(".sheet-header-rename-input")?.disabled).toBe(false);
+    dispose();
+  });
+
   it("starts the same rename editor on header double-click", () => {
     setDoc({
       byId: {
@@ -1401,7 +1504,7 @@ describe("SheetTable", () => {
     dispose();
   });
 
-  it("state marker click cycles the marker, selects the cell, and does not edit", () => {
+  it("state marker click toggles the open pair, selects the cell, and does not edit", () => {
     loadTableDoc();
     const { root, dispose } = mount(() => <Block id="table" />);
 
@@ -1411,6 +1514,9 @@ describe("SheetTable", () => {
     expect(cellSel()).toEqual({ kind: "cell", gridId: "table", row: 0, col: 1 });
     expect(cell(root, 0, 1).classList.contains("sheet-cell-selected")).toBe(true);
     expect(editingId()).toBeNull();
+
+    (cell(root, 0, 1).querySelector(".block-marker") as HTMLElement).click();
+    expect(doc.byId.r1.raw.split("\n")[0]).toBe("TODO [#A] Ship #sheets");
     dispose();
   });
 
@@ -1698,6 +1804,52 @@ describe("SheetTable", () => {
     expect(doc.byId.r1).toBeUndefined();
     expect(doc.byId.table.children).toEqual(["r2"]);
 
+    dispose();
+  });
+
+  it("query-backed cell menu preserves generic Delete row semantics", () => {
+    const queryRaw = "{{query (todo TODO)}}\ntine.view:: table";
+    const rowRaw = "TODO Query row\nowner:: Martin";
+    setDoc({
+      byId: {
+        q: node("q", queryRaw, null),
+        r1: node("r1", rowRaw, null),
+      },
+      pages: [page(["q", "r1"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const groups: RefGroup[] = [{
+      page: "Sheet",
+      kind: "page",
+      blocks: [{
+        id: "r1",
+        raw: rowRaw,
+        collapsed: false,
+        children: [],
+        marker: "TODO",
+        properties: [["owner", "Martin"]],
+      }],
+    }];
+    const { root, dispose } = mount(() => (
+      <>
+        <SheetTable ownerId="q" rowSource="query" groups={groups} />
+        <ContextMenu />
+      </>
+    ));
+
+    const field = root.querySelector(".sheet-field-cell") as HTMLElement;
+    contextMenu(field);
+    clickMenuItem("Delete row");
+
+    expect(doc.byId.r1).toBeUndefined();
+    expect(doc.byId.q.raw).toBe(queryRaw);
+    expect(doc.pages[0].roots).toEqual(["q"]);
+
+    undo();
+    expect(doc.byId.r1.raw).toBe(rowRaw);
+    expect(doc.byId.q.raw).toBe(queryRaw);
+    expect(doc.pages[0].roots).toEqual(["q", "r1"]);
     dispose();
   });
 

@@ -23,6 +23,7 @@ use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::AsRawHandle as _;
 
 use super::object_store::sync_dir_required;
+pub(crate) use super::sync_layout::ARCHIVE_INSTANCE_CLAIM_FILE;
 
 macro_rules! opaque_uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -372,7 +373,6 @@ impl<'de> Deserialize<'de> for CanonicalGraphResourceId {
     }
 }
 
-pub(crate) const ARCHIVE_INSTANCE_CLAIM_FILE: &str = "archive-instance-v1.claim";
 const ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION: u32 = 1;
 const MAX_ARCHIVE_INSTANCE_CLAIM_BYTES: usize = 256;
 
@@ -678,14 +678,10 @@ fn validate_archive_claim_handle(file: &File) -> std::io::Result<()> {
         ));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: geteuid has no arguments or memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "opened archive claim has unsafe ownership or links",
+            "opened archive claim has unexpected links",
         ));
     }
     #[cfg(windows)]

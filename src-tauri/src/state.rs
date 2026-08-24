@@ -17,14 +17,14 @@ static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 /// The bounded application-page envelope the current graph binding can accept.
 /// This is an advisory frontend wire record only: the actor remains the final
 /// authority for every managed application save.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ApplicationPageAdmission {
     pub(crate) binding_generation: u64,
     #[serde(flatten)]
     pub(crate) authority: ApplicationPageAdmissionAuthority,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "authority", rename_all = "snake_case")]
 pub(crate) enum ApplicationPageAdmissionAuthority {
     Direct,
@@ -89,16 +89,6 @@ impl ApplicationPageAdmission {
 pub(crate) struct CaptureGraphBinding {
     pub(crate) target: WindowKey,
     pub(crate) binding_generation: u64,
-}
-
-/// Native authority for a startup recovery action.  The frontend may preserve
-/// an injected or locally cached path for display, but a destructive cold
-/// recovery is authorized only after the native remembered-graph lookup has
-/// associated this exact canonical root with the current window attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StartupRecoveryTarget {
-    attempt: u64,
-    canonical_root: Option<PathBuf>,
 }
 
 /// The single **write** authority retained for one graph/window binding.
@@ -503,6 +493,34 @@ impl GraphRegistry {
         Ok(())
     }
 
+    /// Publish one prepared successor only while the exact predecessor is
+    /// still installed for this window and canonical root. All overlap checks
+    /// happen before `bind` mutates either registry index, making this the one
+    /// final linearization point for managed-runtime recovery handoff.
+    pub(crate) fn replace_if_current(
+        &mut self,
+        window: &str,
+        expected_generation: u64,
+        expected_root: &Path,
+        successor: Arc<GraphSlot>,
+    ) -> Result<(), String> {
+        let current = self
+            .by_window
+            .get(window)
+            .ok_or_else(|| "stale-graph-binding".to_owned())?;
+        if current.binding_generation != expected_generation || current.root_key != expected_root {
+            return Err("stale-graph-binding".into());
+        }
+        if successor.root_key != expected_root
+            || successor.binding_generation == expected_generation
+        {
+            return Err(
+                "managed recovery successor does not replace the expected graph binding".into(),
+            );
+        }
+        self.bind(window.to_owned(), successor)
+    }
+
     pub(crate) fn remove(&mut self, window: &str) -> Option<Arc<GraphSlot>> {
         let slot = self.by_window.remove(window)?;
         slot.background_cancelled
@@ -517,13 +535,12 @@ impl GraphRegistry {
 
 pub(crate) struct AppState {
     pub(crate) graphs: RwLock<GraphRegistry>,
-    // Serializes open/switch/window-create decisions. Existing commands never
-    // take this lock, so a slow graph open cannot stall another graph's editor.
-    pub(crate) graph_load: Mutex<()>,
+    /// Sole owner of serialized open/switch/storage-mode transitions and their
+    /// typed native operation model.
+    pub(crate) storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor,
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<Option<CaptureGraphBinding>>,
-    pub(crate) startup_recovery: Mutex<HashMap<WindowKey, StartupRecoveryTarget>>,
     /// Stateless sparse runtime composition. It retains no runtime handle;
     /// active authority lives only in the corresponding graph slot.
     pub(crate) sync_runtime: crate::sync_runtime::SyncRuntimeFacade,
@@ -532,70 +549,6 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn begin_startup_recovery_attempt(&self, window: &str, attempt: u64) {
-        self.startup_recovery.lock().unwrap().insert(
-            window.to_string(),
-            StartupRecoveryTarget {
-                attempt,
-                canonical_root: None,
-            },
-        );
-    }
-
-    /// A late worker cannot overwrite a newer attempt's authority.  An
-    /// unavailable/missing remembered graph remains deliberately unauthorised.
-    pub(crate) fn authorize_startup_recovery_target(
-        &self,
-        window: &str,
-        attempt: u64,
-        canonical_root: Option<PathBuf>,
-    ) {
-        if let Some(target) = self.startup_recovery.lock().unwrap().get_mut(window) {
-            if target.attempt == attempt {
-                target.canonical_root = canonical_root;
-            }
-        }
-    }
-
-    pub(crate) fn authorized_startup_recovery_target(
-        &self,
-        window: &str,
-        attempt: u64,
-    ) -> Result<PathBuf, String> {
-        let target = self.startup_recovery.lock().unwrap();
-        let Some(target) = target.get(window) else {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        };
-        if target.attempt != attempt {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        }
-        target.canonical_root.clone().ok_or_else(|| {
-            "Tine has not verified a remembered graph for this recovery action. Retry graph lookup before returning to Direct files."
-                .into()
-        })
-    }
-
-    pub(crate) fn startup_recovery_attempt_is_current(&self, window: &str, attempt: u64) -> bool {
-        self.startup_recovery
-            .lock()
-            .unwrap()
-            .get(window)
-            .is_some_and(|target| target.attempt == attempt)
-    }
-
-    /// Starting a normal graph open supersedes any startup recovery action for
-    /// that window, so a delayed button click cannot mutate a graph after the
-    /// user chose another recovery route.
-    pub(crate) fn clear_startup_recovery_target(&self, window: &str) {
-        self.startup_recovery.lock().unwrap().remove(window);
-    }
-
     /// Record the graph window that commands such as quick capture should use.
     ///
     /// Explicit graph activation must update this state synchronously: some
@@ -765,8 +718,13 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
     // Serialize the whole operation with graph loads and sparse-v2 promotion.
-    let _transition = ctx.state.graph_load.lock().unwrap();
+    let root_hint = slot_for_window(&ctx.state, &label)?.root_key.clone();
+    let transition_gate = ctx.state.storage_supervisor.transition_lane(&root_hint);
+    let _transition = transition_gate.lock().unwrap();
     let old = slot_for_window(&ctx.state, &label)?;
+    if old.root_key != root_hint {
+        return Err("graph changed while refresh waited for its transition lane".into());
+    }
     if old.is_sparse_v2() {
         // A managed binding has no legacy graph to reopen, and the reopen below
         // would install one as a second writer. What the callers actually need
@@ -785,9 +743,11 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
         crate::settings::approved_external_assets(ctx.window.app_handle(), &old.root_key);
     let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())
         .map_err(|e| e.to_string())?;
-    graph
-        .migrate_journal_filenames_checked()
-        .map_err(|error| format!("journal filename migration failed: {error}"))?;
+    // Concord invariant 4: a refresh re-reads configuration, it does not rewrite
+    // the tree. Journal filename repairs are proposed and applied explicitly
+    // (`apply_journal_filename_migrations`) — a settings change must not rename
+    // the user's files as a side effect. (This site did not even take the
+    // pre-migration snapshot the open path used to.)
     let replacement = Arc::new(GraphSlot::refreshed(graph, &old)?);
     ctx.state.graphs.write().unwrap().bind(label, replacement)?;
     poke_watcher(&ctx.state);
@@ -1028,11 +988,10 @@ mod tests {
     fn explicit_graph_activation_updates_capture_routing_idempotently() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("graph-1".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -1047,11 +1006,10 @@ mod tests {
     fn capture_binding_retains_the_selected_graph_lease() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -1107,11 +1065,10 @@ mod tests {
         let new_root = base.join("new");
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -1190,12 +1147,63 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_candidate_has_no_registry_or_watcher_ownership() {
+        let base = std::env::temp_dir().join(format!(
+            "tine-unpublished-candidate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let serving_root = base.join("serving");
+        let candidate_root = base.join("candidate");
+        let mut registry = GraphRegistry::default();
+        let serving = graph(&serving_root);
+        registry.bind("main".into(), Arc::clone(&serving)).unwrap();
+
+        let candidate = graph(&candidate_root);
+        assert_eq!(registry.entries().len(), 1);
+        assert!(Arc::ptr_eq(&registry.entries()[0].1, &serving));
+        assert!(registry.owner(&candidate.root_key).is_none());
+        assert_ne!(candidate.binding_generation, serving.binding_generation);
+
+        let watcher = include_str!("watcher.rs");
+        assert!(watcher.contains("app.state::<AppState>().graphs.read().unwrap().entries()"));
+        assert!(!watcher.contains("PreparedManagedCandidate"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn registry_rejects_two_windows_for_one_root() {
         let base = std::env::temp_dir().join(format!("tine-registry-dupe-{}", std::process::id()));
         let mut registry = GraphRegistry::default();
         registry.bind("main".into(), graph(&base)).unwrap();
         assert!(registry.bind("graph-1".into(), graph(&base)).is_err());
         assert!(registry.slot("graph-1").is_none());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn registry_stale_replacement_preserves_the_newer_slot() {
+        let base = std::env::temp_dir().join(format!("tine-registry-cas-{}", uuid::Uuid::new_v4()));
+        let mut registry = GraphRegistry::default();
+        let predecessor = graph(&base);
+        let expected_generation = predecessor.binding_generation;
+        registry.bind("main".into(), predecessor).unwrap();
+
+        let competitor = graph(&base);
+        registry
+            .bind("main".into(), Arc::clone(&competitor))
+            .unwrap();
+        let stale_successor = graph(&base);
+        assert_eq!(
+            registry
+                .replace_if_current("main", expected_generation, &base, stale_successor)
+                .unwrap_err(),
+            "stale-graph-binding"
+        );
+        assert_eq!(
+            registry.slot("main").unwrap().binding_generation,
+            competitor.binding_generation
+        );
+        assert_eq!(registry.owner(&base).as_deref(), Some("main"));
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -13,18 +13,14 @@ use uuid::Uuid;
 use crate::model::Graph;
 use crate::oplog::batch::ObjectKind;
 use crate::oplog::hot_engine::AcceptedFrontierRoot;
-use crate::oplog::local_active::{
-    LocalRuntimeAdmission, PromotedRuntimeSession, WorkspaceAuthorityBoundary,
-};
+use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBoundary};
 use crate::oplog::object_store::{BatchInspection, StoreError};
-use crate::oplog::projection_work_index::{
-    ProjectionWork, ProjectionWorkStatus, ProjectionWorkTarget,
-};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManifestObjectRef,
     ManifestProjectionTarget, ObjectStore, ProjectionEndpointBinding, ProjectionReceiptStore,
-    RebuildSource, ShardedHotEngine, SqliteFrontier, TailOverlay, WorkspaceId,
+    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
+    TailOverlay, WorkspaceId,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -451,63 +447,6 @@ fn checkpoint_advance(
     })
 }
 
-/// Production facade for one promoted runtime window.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain(
-    session: &mut PromotedRuntimeSession<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    resume_managed_local_journal_drain_with_superseding_projection(
-        session,
-        graph,
-        receipts,
-        frame,
-        None,
-        checkpoint,
-        continuation,
-        publisher,
-    )
-}
-
-/// Runtime integration seam for an older journal record whose guarded graph
-/// target has been replaced by a later committed record for the same page.
-/// The later frame is decoded and reauthenticated against the hot prefix and
-/// exact current graph bytes before the older derivative may advance.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain_with_superseding_projection(
-    session: &mut PromotedRuntimeSession<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    let (admission, engine, database, tail) = match session.parts() {
-        Ok(parts) => parts,
-        Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
-    };
-    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
-        &admission,
-        graph,
-        receipts,
-        engine,
-        database,
-        tail,
-        frame,
-        superseding_projection,
-        checkpoint,
-        continuation,
-        publisher,
-    )
-}
-
 /// The same boundary with explicit promoted parts, retained for deterministic
 /// semantic/failure tests. Production callers use the session facade above.
 #[allow(clippy::too_many_arguments)]
@@ -529,13 +468,50 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
         receipts,
         engine,
         database,
-        tail,
+        ManagedLocalSqliteMode::Tail(tail),
         frame,
         None,
         checkpoint,
         continuation,
         publisher,
     )
+}
+
+/// Resume one foreground-journal record through the clean runtime's direct
+/// SQLite frontier. The journal is the durable foreground boundary; this
+/// continuation performs only rebuildable archive, SQLite, Markdown receipt,
+/// and publication derivatives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_clean_managed_local_journal_drain(
+    admission: &LocalRuntimeAdmission<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    database: &mut SqliteFrontier,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    checkpoint: &ManagedLocalDrainCheckpoint,
+    continuation: Option<&ManagedLocalDrainContinuation>,
+    publisher: &mut impl ManagedLocalDerivativePublisher,
+) -> ManagedLocalDrainOutcome {
+    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
+        admission,
+        graph,
+        receipts,
+        engine,
+        database,
+        ManagedLocalSqliteMode::Direct,
+        frame,
+        superseding_projection,
+        checkpoint,
+        continuation,
+        publisher,
+    )
+}
+
+enum ManagedLocalSqliteMode<'a> {
+    Tail(&'a mut TailOverlay),
+    Direct,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -545,7 +521,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
-    tail: &mut TailOverlay,
+    sqlite_mode: ManagedLocalSqliteMode<'_>,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     checkpoint: &ManagedLocalDrainCheckpoint,
@@ -708,6 +684,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error),
     };
 
+    let direct_clean_runtime = matches!(&sqlite_mode, ManagedLocalSqliteMode::Direct);
     match exact_archive_batch(&record, &archive) {
         Ok(true) => {}
         Ok(false) => {
@@ -759,17 +736,39 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         {
             return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string());
         }
-        let staged = match engine.stage_archive_batch_bounded_below_managed_local_overlay(
-            batch_id,
-            ENGINE_STAGE_WORK_PER_RESUME,
-        ) {
-            Ok(staged) => staged,
-            Err(error) => {
-                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+        let (disposition, has_more, stage_work) = if direct_clean_runtime {
+            let claim_source = match database.materialized_read() {
+                Ok(source) => source,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
+            };
+            match engine.accept_clean_prepared_below_managed_local_overlay(
+                record.prepared_batch(),
+                &claim_source,
+            ) {
+                Ok(staged) => (staged.disposition().clone(), false, 1),
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
+            }
+        } else {
+            match engine.stage_archive_batch_bounded_below_managed_local_overlay(
+                batch_id,
+                ENGINE_STAGE_WORK_PER_RESUME,
+            ) {
+                Ok(staged) => (
+                    staged.outcome().disposition().clone(),
+                    staged.has_more(),
+                    staged.work(),
+                ),
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
             }
         };
-        work_done.engine_stage_work = staged.work();
-        match staged.outcome().disposition() {
+        work_done.engine_stage_work = stage_work;
+        match disposition {
             BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => {}
             BatchDisposition::IncompleteStaged {
                 missing_dependencies,
@@ -794,7 +793,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                 )
             }
         }
-        if staged.has_more() {
+        if has_more {
             return pending(ManagedLocalDrainStage::EngineAcceptance, frame, &record);
         }
         if drain_fault!(AfterEngineAcceptance) {
@@ -815,41 +814,82 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
     };
     work_done.accepted_events = 1;
-    if let Err(error) = tail.try_enqueue(database, engine, &event) {
-        return pending_with_detail(
-            ManagedLocalDrainStage::TailAndSqlite,
-            frame,
-            &record,
-            error.to_string(),
-        );
-    }
-    if drain_fault!(AfterTailAdmission) {
-        return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-    }
-    if let Err(error) =
-        admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
-    {
-        return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
-    }
-    let source = match RebuildSource::new(engine, &archive) {
-        Ok(source) => source,
-        Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
-    };
-    if drain_fault!(BeforeSqliteCommit) {
-        return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-    }
-    work_done.sqlite_batches = match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME)
-    {
-        Ok(applied) => applied,
-        Err(error) => {
-            return pending_with_detail(
-                ManagedLocalDrainStage::TailAndSqlite,
-                frame,
-                &record,
-                error.to_string(),
-            )
+    match sqlite_mode {
+        ManagedLocalSqliteMode::Tail(tail) => {
+            if let Err(error) = tail.try_enqueue(database, engine, &event) {
+                return pending_with_detail(
+                    ManagedLocalDrainStage::TailAndSqlite,
+                    frame,
+                    &record,
+                    error.to_string(),
+                );
+            }
+            if drain_fault!(AfterTailAdmission) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            if let Err(error) =
+                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
+            {
+                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
+            }
+            let source = match RebuildSource::new(engine, &archive) {
+                Ok(source) => source,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
+                }
+            };
+            if drain_fault!(BeforeSqliteCommit) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            work_done.sqlite_batches =
+                match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME) {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        return pending_with_detail(
+                            ManagedLocalDrainStage::TailAndSqlite,
+                            frame,
+                            &record,
+                            error.to_string(),
+                        )
+                    }
+                };
         }
-    };
+        ManagedLocalSqliteMode::Direct => {
+            if drain_fault!(AfterTailAdmission) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            if let Err(error) =
+                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
+            {
+                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
+            }
+            if drain_fault!(BeforeSqliteCommit) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            let applied = match database.frontier_root() {
+                Ok(frontier) => frontier,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
+                }
+            };
+            if applied.same_accepted_authority(event.prior_frontier_root()) {
+                if let Err(error) = database.apply_engine_owned_accepted(&event, engine) {
+                    return pending_with_detail(
+                        ManagedLocalDrainStage::TailAndSqlite,
+                        frame,
+                        &record,
+                        error.to_string(),
+                    );
+                }
+                work_done.sqlite_batches = 1;
+            } else if !applied.same_accepted_authority(event.post_frontier_root()) {
+                return recovery(
+                    ManagedLocalDrainStage::TailAndSqlite,
+                    "clean SQLite frontier is neither before nor after the journal batch",
+                );
+            }
+        }
+    }
     let accepted_frontier = match engine.accepted_frontier_root() {
         Ok(frontier) => frontier,
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
@@ -878,59 +918,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Ok(work) => work,
         Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
     };
-    let work_index = match engine.projection_work_index() {
-        Ok(index) => index,
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    };
-    // Read the accepted point row rather than enumerating ready work. The row
-    // was prepared directly from this archived manifested intent and the
-    // executor below reauthenticates that binding against both authorities.
-    let work = match work_index.get(expected_work.work_id()) {
-        Ok(Some(work)) => work,
-        Ok(None) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work point row is absent",
-            )
-        }
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    };
-    work_done.projection_work_point_reads = 1;
-    match work_index.status(work.work_id()) {
-        Ok(Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)) => {}
-        Ok(Some(ProjectionWorkStatus::Superseded { .. })) if projection_superseded => {}
-        Ok(Some(ProjectionWorkStatus::Blocked | ProjectionWorkStatus::Superseded { .. })) => {
-            return conflict(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work has divergent terminal state",
-            )
-        }
-        Ok(_) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work is absent or not accepted",
-            )
-        }
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    }
     if !projection_superseded {
-        if let Err(error) = crate::oplog::projection::execute_manifested_projection_work(
-            graph, receipts, engine, &work,
+        if let Err(error) = crate::oplog::projection::execute_clean_manifested_projection_work(
+            graph,
+            receipts,
+            database,
+            engine,
+            &expected_work,
         ) {
             let current = graph.read_projection_input(intent.path());
             return if matches!(current, Ok(Some(bytes)) if bytes != exact_target) {

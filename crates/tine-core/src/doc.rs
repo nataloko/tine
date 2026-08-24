@@ -718,6 +718,41 @@ pub(crate) fn parse_property_line(line: &str) -> Option<(String, String)> {
     Some((key.to_string(), value))
 }
 
+/// Original-case page names carried by OG-compatible `tags::`, `alias::`, or
+/// `aliases::` properties. Quoted whole values are ordinary text rather than a
+/// reference list; list items may be bare, `#tag`, or `[[page]]` spellings.
+pub(crate) fn property_reference_page_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = parse_property_line(line) else {
+            continue;
+        };
+        if !(key.eq_ignore_ascii_case("tags")
+            || key.eq_ignore_ascii_case("alias")
+            || key.eq_ignore_ascii_case("aliases"))
+        {
+            continue;
+        }
+        let quoted = value.trim();
+        if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
+            continue;
+        }
+        for value in value.split([',', '，']) {
+            let value = value.trim();
+            let value = value.strip_prefix('#').unwrap_or(value).trim();
+            let value = value
+                .strip_prefix("[[")
+                .and_then(|inner| inner.strip_suffix("]]"))
+                .unwrap_or(value)
+                .trim();
+            if !value.is_empty() {
+                names.push(value.to_string());
+            }
+        }
+    }
+    names
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromotedHeadingLayout {
     /// The first parser-owned block is an unbulleted ATX heading, but its next
@@ -1187,6 +1222,120 @@ pub(crate) fn markdown_structurally_round_trips_parsed(
     }
     try_parse_with_source_spans(&rendered)
         .is_ok_and(|canonical| canonical.document == parsed.document)
+}
+
+/// Distinct VCS merge-conflict marker kinds present in `content`, in order of
+/// first appearance — empty when the file is not merge-conflicted.
+///
+/// Recognizes the column-0 markers git writes (`<<<<<<< ours`, diff3
+/// `||||||| base`, `=======`, `>>>>>>> theirs`) and Fossil's verbose variants
+/// (`<<<<<<< BEGIN MERGE CONFLICT: …`, `####### SUGGESTED CONFLICT RESOLUTION
+/// follows …`, `||||||| COMMON ANCESTOR content follows …`, `======= MERGED IN
+/// content follows …`, `>>>>>>> END MERGE CONFLICT …` — the `mergeMarker` table
+/// in fossil's `src/merge3.c`). Both tools write markers at column 0 only, so
+/// indented lines never count.
+///
+/// Two guards keep a page that merely DOCUMENTS merge conflicts from being
+/// flagged:
+/// - lines inside column-0 fenced code blocks (``` / ~~~) are ignored; markers
+///   quoted in an indented fence inside a bullet are not at column 0 anyway;
+/// - the file counts as conflicted only if an anchor line (`<<<<<<< ` or
+///   `>>>>>>> `) is present — a lone `=======` (e.g. a setext-style divider)
+///   never quarantines a page.
+pub fn vcs_conflict_markers(content: &str) -> Vec<&'static str> {
+    let scan = scan_vcs_conflict_markers(content);
+    if !scan
+        .iter()
+        .any(|(_, kind)| matches!(kind, ConflictMarkerKind::Ours | ConflictMarkerKind::Theirs))
+    {
+        // No anchor line → not a conflicted file (a lone `=======` is a divider).
+        return Vec::new();
+    }
+    let mut seen: Vec<&'static str> = Vec::new();
+    for (_, kind) in scan {
+        let token = kind.token();
+        if !seen.contains(&token) {
+            seen.push(token);
+        }
+    }
+    seen
+}
+
+/// One recognized column-0 VCS merge-conflict marker line.
+///
+/// Ordering inside a git/Fossil conflict region is
+/// `Ours` → [`Suggested` (Fossil only)] → [`Base`] → `Divider` → `Theirs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictMarkerKind {
+    /// `<<<<<<< ours` — opens the region; our/local side follows.
+    Ours,
+    /// `||||||| base` (git diff3) / `||||||| COMMON ANCESTOR …` (Fossil).
+    Base,
+    /// `=======` / `======= MERGED IN …` — their side follows.
+    Divider,
+    /// `####### SUGGESTED CONFLICT RESOLUTION follows …` (Fossil only).
+    Suggested,
+    /// `>>>>>>> theirs` — closes the region.
+    Theirs,
+}
+
+impl ConflictMarkerKind {
+    /// The bare marker token, as reported to the user.
+    pub fn token(self) -> &'static str {
+        match self {
+            ConflictMarkerKind::Ours => "<<<<<<<",
+            ConflictMarkerKind::Base => "|||||||",
+            ConflictMarkerKind::Divider => "=======",
+            ConflictMarkerKind::Suggested => "#######",
+            ConflictMarkerKind::Theirs => ">>>>>>>",
+        }
+    }
+}
+
+/// THE scanner for VCS merge-conflict marker lines: `(line index, kind)` for
+/// every column-0 marker outside a column-0 fenced code block, in file order.
+///
+/// Single source of truth — [`vcs_conflict_markers`] (detection/quarantine) and
+/// the Concord marker parser (`crate::concord_queue`) both derive from it, so
+/// "what counts as a marker" can never diverge between the code that REFUSES to
+/// rewrite a file and the code that RESOLVES it. See [`vcs_conflict_markers`]
+/// for the recognized dialects and the two false-positive guards.
+pub fn scan_vcs_conflict_markers(content: &str) -> Vec<(usize, ConflictMarkerKind)> {
+    let mut fence: Option<char> = None;
+    let mut out = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if let Some(delimiter) = fence {
+            if line.chars().take_while(|&c| c == delimiter).count() >= 3 {
+                fence = None;
+            }
+            continue;
+        }
+        if line.starts_with("```") {
+            fence = Some('`');
+            continue;
+        }
+        if line.starts_with("~~~") {
+            fence = Some('~');
+            continue;
+        }
+        let kind = if line.starts_with("<<<<<<< ") {
+            Some(ConflictMarkerKind::Ours)
+        } else if line.starts_with(">>>>>>> ") {
+            Some(ConflictMarkerKind::Theirs)
+        } else if line.starts_with("||||||| ") {
+            Some(ConflictMarkerKind::Base)
+        } else if line == "=======" || line.starts_with("======= ") {
+            Some(ConflictMarkerKind::Divider)
+        } else if line.starts_with("####### ") {
+            Some(ConflictMarkerKind::Suggested)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            out.push((index, kind));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

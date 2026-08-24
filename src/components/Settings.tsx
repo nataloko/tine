@@ -11,7 +11,6 @@ import {
   clearSettingsTabRequest,
   setJournalTemplate,
   setGraphTransitioning,
-  bumpGraphEpoch,
   theme,
   appearancePreference,
   setAppearancePreference,
@@ -61,6 +60,7 @@ import {
   refreshJournalConflicts,
   syncConflicts,
   refreshSyncConflicts,
+  vcsMarkerConflicts,
   type SettingsTabId,
 } from "../ui";
 import { interfaceZoom, zoomIn, zoomOut, zoomReset } from "../zoom";
@@ -106,6 +106,7 @@ import {
   type PushMode,
 } from "../git";
 import { allowLocalFileImages, setAllowLocalFileImages } from "../localFileSettings";
+import { conflictPolicyAlwaysAsk, setConflictPolicyAlwaysAsk } from "../conflictPolicy";
 import { linkAutocompletePolicy, setLinkAutocompletePolicy, type LinkAutocompletePolicy } from "../editor/linkDefault";
 import {
   spellcheckEnabled,
@@ -135,15 +136,16 @@ import {
   themeVersionIsRevoked,
   uninstallThemePackage,
 } from "../themes/manager";
-import { openPage, openFile } from "../router";
+import { openPage, openFile, openPageTarget } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
-import { switchGraph, loadGraphPath } from "../graph";
-import { flushAll, resetStore } from "../store";
+import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
+import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -194,6 +196,14 @@ const DATE_FORMATS = [
   "yyyy_MM_dd",
   "yyyyMMdd",
 ];
+
+// The one file a joining device waits for, relative to the graph folder.
+// The native side names the absolute path in a message the panel can only show
+// the first line of (`shared_enrollment_not_here_yet`, src-tauri/src/sync_runtime.rs),
+// so the panel names the relative one itself. Pinned from the native side by
+// `the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact`.
+const SHARED_ENROLLMENT_RELATIVE_PATH =
+  ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
 
 type Tab = SettingsTabId;
 const TABS: { id: Tab; label: string }[] = [
@@ -253,6 +263,11 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Watch for external edits", description: "inotify polling network filesystem" },
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
+  {
+    tab: "backups",
+    label: "Always ask before applying an external change",
+    description: "external edits conflict policy silent reload sync merge ask",
+  },
   { tab: "graph", label: "Graph", description: "folder export publish" },
   { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
   { tab: "extras", label: "Bullet threading", description: "thread active path outline depth rainbow accent colour animate flow" },
@@ -2410,10 +2425,24 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const status = () => managedStorageRuntime.snapshot().status;
   const runtimeError = () => managedStorageRuntime.snapshot().error;
   const [loading, setLoading] = createSignal(true);
-  const [enabling, setEnabling] = createSignal(false);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
   const [sharing, setSharing] = createSignal(false);
   const [cancelling, setCancelling] = createSignal(false);
+  // Every managed-storage command in this panel brackets its native call with
+  // these two. `graphTransitioning` fences the editor; the runtime bracket
+  // additionally tells the shared bridge that the sync cut's own retired-actor
+  // window is expected, so it is not toasted as a failure the command is about
+  // to resolve by itself.
+  const beginStorageTransition = () => {
+    managedStorageRuntime.beginTransition();
+    setGraphTransitioning(true);
+  };
+  const endStorageTransition = () => {
+    setGraphTransitioning(false);
+    managedStorageRuntime.endTransition();
+  };
+  const activeNativeTransition = () => storageTransitionRuntime.active();
+  const enabling = () => activeNativeTransition()?.kind === "activate_managed";
   const retryable = () => {
     const value = status();
     return value?.state === "retryable" ? value : null;
@@ -2434,7 +2463,12 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
   const activationProgressLabel = () => {
     const progress = activationProgress();
-    if (!progress) return "Preparing Tine-managed storage…";
+    if (!progress) {
+      const transition = activeNativeTransition();
+      return transition
+        ? `${transition.phase.replaceAll("_", " ")}…`
+        : "Preparing Tine-managed storage…";
+    }
     if (progress.kind === "bootstrap_detached_authoring") {
       return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
     }
@@ -2450,33 +2484,52 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     if (progress.kind === "bootstrap_preparation_summary") {
       return "Prepared graph operation history…";
     }
+    if (progress.kind === "readiness_sample") {
+      return "Selecting representative pages for the readiness proof…";
+    }
     return {
-      source_capture: "Capturing source files…",
-      bootstrap_import_preparation: "Preparing graph operation history…",
-      immutable_publication_install: "Installing prepared history…",
-      backup_proof: "Verifying the safety backup…",
-      sqlite_open_build: "Building the local index…",
-      shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
-      promotion_receipt_confirmation: "Confirming managed storage…",
-      reconciliation_baseline_actor_open: "Starting managed storage…",
-    }[progress.phase];
+        private_setup: "Preparing private managed state…",
+        source_capture: "Capturing source files…",
+        bootstrap_import_preparation: "Preparing graph operation history…",
+        immutable_publication_install: "Installing prepared history…",
+        backup_proof: "Verifying the safety backup…",
+        sqlite_open_build: "Building the local index…",
+        shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
+        promotion_receipt_confirmation: "Confirming managed storage…",
+        reconciliation_baseline_actor_open: "Starting managed storage…",
+        retained_runtime_open: "Opening retained managed state…",
+        retained_runtime_tail_replay: "Replaying retained managed changes…",
+        retained_runtime_projection_repair: "Repairing the Markdown projection…",
+        retained_runtime_actor_open: "Starting the retained managed runtime…",
+      }[progress.phase];
   };
 
   const refresh = async () => {
     setLoading(true);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      await managedStorageRuntime.refresh();
+      await Promise.race([
+        managedStorageRuntime.refresh(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("managed storage status did not answer within 10 seconds")),
+            10_000,
+          );
+        }),
+      ]);
     } catch (error) {
       reportManagedFailure("Couldn't read Tine-managed storage status", safeManagedErrorDetail(error));
     } finally {
+      clearTimeout(timeout);
       setLoading(false);
     }
   };
   onMount(() => void refresh());
 
-  const refreshAuthorityState = () => {
-    resetStore();
-    bumpGraphEpoch();
+  const acceptNativeAuthority = (result: SparseV2Status) => {
+    if (!managedStorageRuntime.acceptNativeTransition(result)) return false;
+    rebindCurrentStorageAuthority();
+    return true;
   };
 
   // Status fields are structured, but some Rust producers still embed native
@@ -2484,15 +2537,128 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const failureDetail = (value: SparseV2Status): string | null => {
     if (value.state === "retryable") return safeManagedErrorDetail(value.detail);
     if (value.state === "refused") {
-      return safeManagedErrorDetail(value.detail ?? `reason code: ${value.reason_code}`);
+      const detail = safeManagedErrorDetail(value.detail ?? "managed storage refused the operation");
+      return `${detail} (${value.scenario_id}; reason code: ${value.reason_code})`;
     }
-    if (value.state === "blocked") return safeManagedErrorDetail(`reason code: ${value.reason_code}`);
+    if (value.state === "blocked") {
+      return safeManagedErrorDetail(`${value.scenario_id}; reason code: ${value.reason_code}`);
+    }
     return null;
   };
 
-  const reportManagedFailure = (summary: string, detail: string) => {
-    pushToast(`${summary}: ${detail}`, "error", { sticky: true });
+  const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
+    pushToast(`${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`, "error", { sticky: true });
   };
+
+  /**
+   * Translate the two refusals the native join branch raises into the action
+   * that actually resolves them. Both leave every authority untouched, which is
+   * the part a raw refusal string never says.
+   * (`join_shared_clean` in crates/tine-core/src/sync_runtime.rs.)
+   */
+  const joinFailureRemedy = (detail: string): string | null => {
+    // The native side writes a three-paragraph explanation for this one, and
+    // the panel keeps only its first line — which is the dead end the native
+    // text was written to replace. Re-author the rest here, where nothing has
+    // to survive redaction. The relative path is a constant, not user data.
+    if (detail.includes("does not yet contain sync data")) {
+      return (
+        "Nothing was changed on this device. Tine looked for "
+        + `${SHARED_ENROLLMENT_RELATIVE_PATH} inside this graph's folder. `
+        + "Two things usually explain an absent one. The other device may not have finished "
+        + "\"Set up sync with another device\" yet — check that it reports sharing as ready. Or your "
+        + "file-sync tool is not carrying the hidden .tine-sync folder; several skip dot-directories "
+        + "unless you tell them not to."
+      );
+    }
+    if (detail.includes("names another managed graph")) {
+      return (
+        "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
+        + "not the one the other device is sharing, and Tine will not merge two histories. "
+        + "Joining anyway means adopting the other device's graph, which archives this device's own history rather "
+        + "than deleting it. Use the join action again and accept the second prompt when you are ready."
+      );
+    }
+    if (detail.includes("not in the shared provider frontier")) {
+      return (
+        "Nothing was changed on either device. This device's notes differ from the shared graph, and a join can only "
+        + "adopt a history whose notes already match. Let the other device's changes finish arriving, or reconcile the "
+        + "differing pages, then Join again."
+      );
+    }
+    return null;
+  };
+
+  /**
+   * What the native join branch actually does, said before it happens.
+   * The native join command (src-tauri/src/sync_runtime.rs) has two branches.
+   * From Direct Files it bootstraps a binding out of the shared descriptor.
+   * From Tine-managed storage it hands the descriptor to this device's live
+   * actor, and `join_shared_clean` then either refuses — because the descriptor
+   * names a different managed graph, or because this device's notes are not
+   * already equal to the shared ones — or installs the shared baseline and
+   * operation archive in place of this device's own and deletes the replaced
+   * pair. The managed variant is the dangerous-looking one, so it names that
+   * outcome rather than warning vaguely about "data".
+   */
+  const joinConfirmation = (fromManaged: boolean) => {
+    if (!fromManaged) {
+      return (
+        "Join a synced graph from another device?\n\n"
+        + "Tine verifies that this device is joining the same graph history before it continues. "
+        + "Existing Markdown/Org files stay in place and remain Logseq-compatible."
+      );
+    }
+    return (
+      "Join a synced graph from another device?\n\n"
+      + "This device already has Tine-managed storage of its own, so exactly one of two things will happen:\n\n"
+      + "1. If the other device is sharing the SAME managed history this device holds, this device adopts the shared "
+      + "copy: its own operation history and baseline are replaced by the shared ones and the replaced pair is deleted. "
+      + "Tine performs that swap only when every live page, its outline and its text are already identical on both "
+      + "sides, so no note text is lost.\n\n"
+      + "2. If the other device is sharing a DIFFERENT history — which is the normal case when this device set up "
+      + "Tine-managed storage on its own — Tine changes nothing at all and stops. It then offers to ADOPT the other "
+      + "device's graph instead, in a second prompt that names where this device's own history is archived. Nothing "
+      + "is merged, and nothing happens until you accept that second prompt.\n\n"
+      + "Either way your Markdown/Org files stay in place and remain Logseq-compatible."
+    );
+  };
+
+  /**
+   * The second prompt, shown only when the native join has already refused
+   * because the two devices hold independent histories. It is where the
+   * divergence is named honestly: adoption keeps the shared graph and sets
+   * this device's own history aside; it is not a merge, and nothing of this
+   * device's own managed history crosses over. The archive location comes from
+   * the native side so it can be stated BEFORE the operation, not only in the
+   * receipt afterwards.
+   */
+  const adoptionConfirmation = (location: string | null) =>
+    "Adopt the graph your other device is sharing?\n\n"
+    + "This device set up Tine-managed storage on its own, so it holds a separate history. Tine will not merge two "
+    + "histories.\n\n"
+    + "Adopting keeps the other device's history and sets this device's own aside. This device's history is archived "
+    + "whole, not deleted"
+    + (location ? `, at:\n${location}\n\n` : ", inside Tine's application data folder.\n\n")
+    + "Nothing from this device's own managed history is carried across — not its recorded edits, not its block "
+    + "identities. Your Markdown/Org files are not touched by the archive step, and they must already match the "
+    + "shared graph's files; if they do not, Tine stops and changes nothing.\n\n"
+    + "Cancel now and this device is left exactly as it is. Continue and this device's own managed history is "
+    + "reachable only from that archive.";
+
+  /**
+   * The share cut is one-way. The storage contract never retires an active
+   * shared graph, so this confirmation is the last moment at which the
+   * graph is exactly as it was, and the dialog says so instead of letting the
+   * user discover it afterwards.
+   */
+  const shareConfirmation = () =>
+    "Set up sync with another device?\n\n"
+    + "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place "
+    + "and remain Logseq-compatible.\n\n"
+    + "Cancel now and this graph is left exactly as it is. Once the sync data is written it cannot be un-shared: the "
+    + "only way out is \"Return to Direct files\", which archives this device's managed storage and reopens the "
+    + "Markdown/Org files.";
 
   const managedDiagnostics = () => {
     const current = status();
@@ -2518,6 +2684,37 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     }
   };
 
+  /**
+   * Say what a shared graph's state IS and where the exit is. Until this, a
+   * completed share left the panel looking identical to a purely local managed
+   * graph: the one success toast scrolled away and nothing named either the
+   * next step on the other device or the fact that sharing is one-way.
+   */
+  const sharedDisclosure = () => {
+    const runtime = status()?.runtime;
+    const phase = runtime?.shared_phase;
+    if (!phase) return null;
+    if (phase === "share_prepared") {
+      return (
+        "Sync setup did not finish writing this graph's sync data. “Retry setup” completes it. "
+        + "Until it does, no other device can join."
+      );
+    }
+    if (phase === "joining") {
+      return "This device is joining a graph shared by another device and has not finished.";
+    }
+    const exit =
+      " Sharing cannot be switched off again: the only exit is “Return to Direct files” below, which archives "
+      + "this device's managed storage and reopens the Markdown/Org files.";
+    if (runtime?.shared_role === "joiner") {
+      return `This device is syncing with a graph shared by another device.${exit}`;
+    }
+    return (
+      "This graph is shared. On your other device, open this same graph folder and use “Join a synced graph "
+      + `from another device” — it is offered in both Direct files and Tine-managed storage.${exit}`
+    );
+  };
+
   const directFilesWarning = () => {
     const current = status();
     if (!current) return null;
@@ -2540,21 +2737,64 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     );
   };
 
+  const emergencyDirectFilesConfirmation = (detail: string) =>
+    "Managed storage did not stop cleanly. Open the existing Markdown/Org files in Direct Files mode anyway?\n\n" +
+    "This is an emergency exit. In-memory or managed-only changes may be missing from the Markdown/Org tree. " +
+    "Tine will leave the managed-storage evidence untouched and will not silently reopen or merge it.\n\n" +
+    `Managed shutdown detail: ${safeManagedErrorDetail(detail)}`;
+
+  const cancelSparseCooperatively = async () => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        backend().cancelSparseV2(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("managed storage did not stop within 10 seconds")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  const emergencyDirectFiles = async (detail: string) => {
+    const root = graphMeta()?.root;
+    if (!root) throw new Error("The current graph path is unavailable.");
+    if (!(await backend().confirm(emergencyDirectFilesConfirmation(detail)))) return false;
+    const result = await backend().cancelSparseV2Cold(root);
+    if (!managedStorageRuntime.acceptNativeTransition(result.status)) return false;
+    rebindCurrentStorageAuthority();
+    pushToast(result.recovery_statement, "success");
+    return true;
+  };
+
+  const forceDirectFiles = async (detail: string) => {
+    setCancelling(true);
+    beginStorageTransition();
+    try {
+      await emergencyDirectFiles(detail);
+    } catch (error) {
+      reportManagedFailure("Couldn't open the current files in Direct Files", safeManagedErrorDetail(error));
+    } finally {
+      endStorageTransition();
+      setCancelling(false);
+    }
+  };
+
   const enable = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
-    setEnabling(true);
     setActivationProgress(null);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     let unlisten: (() => void) | undefined;
     try {
-      dbg("managed storage setup: flushing pending writes");
       const flushed = await flushAll();
       dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
       if (!flushed) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
-      dbg("managed storage setup: awaiting native confirmation");
       const confirmed = await backend().confirm(
         `Enable Tine-managed storage for this graph?\n\n` +
           `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
@@ -2567,21 +2807,22 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         try {
           unlisten = await backend().onSparseV2ActivationProgress(
             generation,
-            setActivationProgress
+            (progress) => {
+              setActivationProgress(progress);
+            }
           );
         } catch {
           // Progress is observational; setup must continue if event listening
           // is unavailable in an older or closing WebView.
         }
       }
-      dbg("managed storage setup: invoking native activation");
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        if (!acceptNativeAuthority(result)) return;
         pushToast("Tine-managed storage is active.", "success");
       } else {
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         reportManagedFailure(
           "Tine-managed storage setup did not complete",
           failureDetail(result) ?? "Tine-managed storage did not become active."
@@ -2592,76 +2833,146 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } finally {
       unlisten?.();
       setActivationProgress(null);
-      setGraphTransitioning(false);
-      setEnabling(false);
+      endStorageTransition();
     }
   };
 
   const prepareShare = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       if (!(await flushAll())) {
         pushToast("Resolve pending save conflicts before preparing sharing.", "error");
         return;
       }
-      if (!(await backend().confirm(
-        "Set up sync with another device?\n\n" +
-          "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
-      ))) return;
+      if (!(await backend().confirm(shareConfirmation()))) return;
       const result = await backend().prepareSparseV2Share();
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        if (!acceptNativeAuthority(result)) return;
         pushToast("Sync is ready to use on another device.", "success");
       } else {
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         reportManagedFailure("Sync setup did not complete", failureDetail(result) ?? "Tine-managed storage did not become active.");
       }
     } catch (error) {
       reportManagedFailure("Couldn't set up sync", safeManagedErrorDetail(error));
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setSharing(false);
     }
   };
 
-  const joinShare = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
+  /**
+   * Offer adoption in place of the refusal. Returns false when the user
+   * declines, so the caller still reports the refusal and its remedy.
+   * The refused join changed nothing on either device: the native branch
+   * compares identities before it stops the actor or opens the provider.
+   */
+  /**
+   * The one adoption failure whose remedy depends on how far it got. The
+   * native side marks it with a stable phrase because the panel keeps only the
+   * first line of a native error, and the archive location is worth more here
+   * than anywhere else.
+   */
+  const adoptionFailureRemedy = (detail: string, location: string | null): string | null => {
+    if (!detail.includes("after this device's own history was archived")) return null;
+    return (
+      "This device's own history is preserved"
+      + (location ? ` in ${location}` : " in Tine's application data folder")
+      + ", and your Markdown/Org files are unchanged. Nothing was merged. This device is back on Direct files, so "
+      + "the join action above retries the remaining half on its own."
+    );
+  };
+
+  const offerAdoption = async (): Promise<boolean> => {
+    let location: string | null = null;
+    try {
+      location = await backend().sparseV2RecoveryLocation();
+    } catch {
+      // Naming the folder is better than naming nothing, but a lookup failure
+      // must not be the reason a user cannot proceed.
+    }
+    if (!(await backend().confirm(adoptionConfirmation(location)))) return false;
+    let result: SparseV2AdoptionResult;
+    try {
+      result = await backend().adoptSparseV2Shared();
+    } catch (error) {
+      reportManagedFailure(
+        "Couldn't adopt the shared graph",
+        safeManagedErrorDetail(error),
+        // Adoption raises the same not-yet refusal as the join it follows,
+        // and the panel truncates it the same way.
+        adoptionFailureRemedy(String(error), location) ?? joinFailureRemedy(String(error))
+      );
+      return true;
+    }
+    if (result.status.state === "active") {
+      if (acceptNativeAuthority(result.status)) {
+        pushToast(result.adoption_statement, "success");
+      }
+      return true;
+    }
+    if (managedStorageRuntime.acceptNativeTransition(result.status)) {
+      reportManagedFailure(
+        "Adopting the shared graph did not complete",
+        failureDetail(result.status) ?? "Tine-managed storage did not become active."
+      );
+    }
+    return true;
+  };
+
+  /**
+   * One refusal has an action behind it rather than only an explanation:
+   * a descriptor naming another managed graph is exactly the two-independent-
+   * activations case, and adoption is the operation for it.
+   */
+  const reportJoinRefusal = async (summary: string, detail: string, redacted: string) => {
+    if (detail.includes("names another managed graph")) {
+      try {
+        if (await offerAdoption()) return;
+      } catch (error) {
+        reportManagedFailure("Couldn't adopt the shared graph", safeManagedErrorDetail(error));
+        return;
+      }
+    }
+    reportManagedFailure(summary, redacted, joinFailureRemedy(detail));
+  };
+
+  const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
     setSharing(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       if (!(await flushAll())) {
         pushToast("Resolve pending save conflicts before joining.", "error");
         return;
       }
-      if (!(await backend().confirm(
-        "Join this synced graph?\n\n" +
-          "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
-      ))) return;
+      if (!(await backend().confirm(joinConfirmation(options.fromManaged)))) return;
       const result = await backend().joinSparseV2Shared();
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        if (!acceptNativeAuthority(result)) return;
         pushToast("This device joined the synced graph.", "success");
       } else {
-        reportManagedFailure(
-          "Joining the synced graph did not complete",
-          failureDetail(result) ?? "Tine-managed storage did not become active."
-        );
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
+        const detail = failureDetail(result) ?? "Tine-managed storage did not become active.";
+        await reportJoinRefusal("Joining the synced graph did not complete", detail, detail);
       }
     } catch (error) {
-      reportManagedFailure("Couldn't join the synced graph", safeManagedErrorDetail(error));
+      // The refusal that matters most here is raw native text. Read the remedy
+      // off the untruncated message, then report the redacted one.
+      await reportJoinRefusal(
+        "Couldn't join the synced graph",
+        String(error),
+        safeManagedErrorDetail(error)
+      );
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setSharing(false);
     }
   };
 
   const cancelSparse = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
     setCancelling(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       try {
         await flushAll();
@@ -2671,8 +2982,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         // has been restored.
       }
       if (!(await backend().confirm(directFilesConfirmation()))) return;
-      const result = await backend().cancelSparseV2();
-      if (!managedStorageRuntime.transitionTo(result.status, expectedBinding)) return;
+      let result: SparseV2CancelResult;
+      try {
+        result = await cancelSparseCooperatively();
+      } catch (error) {
+        if (!(await emergencyDirectFiles(safeManagedErrorDetail(error)))) return;
+        return;
+      }
+      if (!managedStorageRuntime.acceptNativeTransition(result.status)) return;
       let flushed = false;
       try {
         flushed = await flushAll();
@@ -2686,7 +3003,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         );
         return;
       }
-      refreshAuthorityState();
+      rebindCurrentStorageAuthority();
       // Older native builds may still use the former mode name in this recovery text.
       pushToast(
         result.recovery_statement
@@ -2697,7 +3014,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } catch (error) {
       reportManagedFailure("Couldn't return to Direct files", safeManagedErrorDetail(error));
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setCancelling(false);
     }
   };
@@ -2707,16 +3024,40 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       <div class="settings-section">Storage &amp; sync</div>
       <ExperimentalSection forceOpen={props.forceOpen}>
         <div class="settings-experimental-warning" role="note">
-          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. You can keep using Direct files in the meantime.
+          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
         </div>
         <Show
           when={!loading()}
-          fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
+          fallback={
+            <div class="settings-hint settings-block">
+              <div>Checking sync state…</div>
+              <div style={{ "margin-top": "6px" }}>
+                <button
+                  class="settings-btn settings-btn-danger"
+                  disabled={cancelling()}
+                  onClick={() => void forceDirectFiles("managed storage status is still loading")}
+                >
+                  {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
+                </button>
+              </div>
+            </div>
+          }
         >
           <Show
             when={status()}
             fallback={
-              <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
+              <div class="settings-hint settings-block">
+                <div>Tine-managed storage status is unavailable.</div>
+                <div style={{ "margin-top": "6px" }}>
+                  <button
+                    class="settings-btn settings-btn-danger"
+                    disabled={cancelling()}
+                    onClick={() => void forceDirectFiles("managed storage status is unavailable")}
+                  >
+                    {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
+                  </button>
+                </div>
+              </div>
             }
           >
             {(current) => (
@@ -2726,11 +3067,16 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={current().state === "legacy_default"}>
                     <span class="settings-value">Direct files</span>
                     <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Uses your graph’s Markdown or Org files directly.
+                      Tine reads and writes your graph’s Markdown or Org files directly. Many people will want to stay here.
                     </div>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
                         {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
+                      </button>
+                    </div>
+                    <div style={{ "margin-top": "6px" }}>
+                      <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                        {sharing() ? "Joining..." : "Join a synced graph from another device..."}
                       </button>
                     </div>
                   </Show>
@@ -2773,13 +3119,47 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                               : "Set up sync with another device..."}
                         </button>
                       </div>
+                      {/* The native join branch accepts a device that already
+                          holds managed storage, so the action is offered here
+                          rather than hidden until the device is back in Direct
+                          files. Its confirmation, and its refusal, say what
+                          becomes of this device's own managed history. */}
+                      <div style={{ "margin-top": "6px" }}>
+                        <button
+                          class="settings-btn"
+                          disabled={sharing()}
+                          onClick={() => void joinShare({ fromManaged: true })}
+                        >
+                          {sharing() ? "Joining..." : "Join a synced graph from another device..."}
+                        </button>
+                      </div>
                     </Show>
                     <Show when={current().runtime?.shared_phase === "joining"}>
                       <div style={{ "margin-top": "6px" }}>
-                        <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                        <button
+                          class="settings-btn"
+                          disabled={sharing()}
+                          onClick={() => void joinShare({ fromManaged: true })}
+                        >
                           {sharing() ? "Joining..." : "Join this synced graph..."}
                         </button>
                       </div>
+                    </Show>
+                    {/* The share cut is a single durable native step: it is
+                        the confirmation, not this moment, that is the point of
+                        no return, and saying so beats a silent spinner. */}
+                    <Show when={sharing()}>
+                      <div class="settings-hint" role="status" aria-live="polite" style={{ "margin-top": "6px" }}>
+                        This step writes durable sync data and cannot be interrupted. If it fails, the panel keeps
+                        “Return to Direct files” below.
+                      </div>
+                    </Show>
+                    <Show when={sharedDisclosure()}>
+                      {(disclosure) => (
+                        <div class="settings-hint" role="note" style={{ "margin-top": "6px" }}>
+                          {disclosure()}
+                        </div>
+                      )}
                     </Show>
                   </Show>
                   <Show when={blocked()}>
@@ -2851,7 +3231,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                     </div>
                   </Show>
                   <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                    Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
+                    Tine-managed storage keeps a durable operation history and a local index while continuously maintaining the same Logseq-compatible Markdown/Org tree. That history is what makes syncing a graph across devices possible; it is the reason to choose this mode, not a newer replacement for Direct files.
                   </div>
                 </div>
               </div>
@@ -3014,8 +3394,36 @@ function BackupsTab(props: { search: string }): JSX.Element {
         </div>
       </Show>
 
+      {/* Concord P5 — the one user-visible conflict policy switch. */}
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        External changes
+      </div>
+      <Field
+        label="Always ask before applying an external change"
+        hint="By default a page you have open with nothing unsaved updates silently when another editor or a sync tool changes its file — the same as VS Code. Turn this on and Tine holds the change instead: the page keeps showing what you were reading and offers Reload from disk / Keep mine. Everything that already asks keeps asking — a page with unsaved edits, or one being edited, is unaffected either way."
+      >
+        <Toggle
+          on={conflictPolicyAlwaysAsk()}
+          onClick={() => setConflictPolicyAlwaysAsk(!conflictPolicyAlwaysAsk())}
+        />
+      </Field>
+
+      <SettingsConflictPanels />
+    </>
+  );
+}
+
+/** The conflict INVENTORY: everything on disk that needs the user's judgement,
+ *  plus the actions only this surface can offer (discard a copy, rename journal
+ *  files, reconcile a duplicate day). Resolution itself happens at the page.
+ *  Exported so it can be mounted on its own in tests. */
+export function SettingsConflictPanels(): JSX.Element {
+  return (
+    <>
+      <JournalFilenamePanel />
       <JournalConflictsPanel />
       <SyncConflictsPanel />
+      <VcsMarkerConflictsPanel />
     </>
   );
 }
@@ -3203,13 +3611,121 @@ function JournalConflictsPanel(): JSX.Element {
   );
 }
 
+// Journal files whose names don't round-trip to a date (a title-named
+// "Jun 18th, 2026.md" left behind by a date-format change or another tool).
+// Such a file can't be parsed back to its day, so the day looks empty in the
+// feed — a real repair. But it is a rename in a tree the user owns, and until
+// Concord P5 Tine performed it silently at every graph open, which lands as an
+// unrequested diff in a graph kept in git (invariant 4, write-shyness). It is
+// now proposed here and applied only on this button, after a snapshot.
+function JournalFilenamePanel(): JSX.Element {
+  const [pending, { refetch }] = createResource(async () => {
+    // Best-effort like the other inventories: an absent panel beats a broken
+    // Backups tab.
+    try {
+      return await backend().listJournalFilenameMigrations();
+    } catch {
+      return [];
+    }
+  });
+  const [busy, setBusy] = createSignal(false);
+  const apply = async () => {
+    const files = pending() ?? [];
+    if (
+      !(await backend().confirm(
+        `Rename ${files.length} journal file${files.length === 1 ? "" : "s"} to their date names?\n\n` +
+          `A snapshot is taken first, so the original names stay in Backups & recovery. ` +
+          `Nothing is overwritten — a file whose date name is already taken is left alone.`
+      ))
+    )
+      return;
+    setBusy(true);
+    try {
+      const n = await backend().applyJournalFilenameMigrations();
+      pushToast(`Renamed ${n} journal file${n === 1 ? "" : "s"}`, "success");
+      void refetch();
+      await refreshJournalConflicts();
+    } catch (e) {
+      pushToast(`Couldn’t rename them: ${String(e)}`, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Show when={(pending() ?? []).length}>
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        Journal files named by title
+      </div>
+      <div class="settings-hint settings-block">
+        These journal files aren’t named after their date, so Tine can’t place them in the journal
+        feed and their days look empty. Renaming them fixes that — but it changes files you own, so
+        Tine never does it on its own. Your version-control tool will see these as renames.
+      </div>
+      <For each={pending() ?? []}>
+        {(m) => (
+          <div class="settings-block journal-rename-row">
+            <span class="journal-conflict-preview mono">{m.from}</span>
+            <span class="journal-conflict-preview mono">→ {m.to}</span>
+          </div>
+        )}
+      </For>
+      <span class="journal-conflict-actions">
+        <button class="settings-btn" disabled={busy()} onClick={() => void apply()}>
+          {busy() ? "Renaming…" : "Rename to date names"}
+        </button>
+      </span>
+    </Show>
+  );
+}
+
+// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+// (git/Fossil `<<<<<<<` / `=======` / `>>>>>>>` lines). They stay readable, but
+// Tine refuses to save them: re-serializing would re-indent the column-0
+// markers and break the VCS's own conflict detection (Concord invariant 3).
+// This panel is the INVENTORY: which files are affected and why. Resolution
+// happens at the page (Concord L4) or in the user's own VCS.
+function VcsMarkerConflictsPanel(): JSX.Element {
+  return (
+    <Show when={vcsMarkerConflicts().length}>
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        VCS merge conflicts
+      </div>
+      <div class="settings-hint settings-block">
+        Files listed here contain unresolved version-control merge markers (git/Fossil). They stay
+        readable, but Tine refuses to save them so the markers are never mangled.{" "}
+        <strong>Review in page</strong> opens the file and resolves the merge there, block by
+        block; resolving it in your version-control tool instead clears this list on its own.
+      </div>
+      <For each={vcsMarkerConflicts()}>
+        {(c) => (
+          <div class="settings-block sync-conflict-row">
+            <div class="sync-conflict-head">
+              <span class="settings-asset-name">{c.name}</span>
+              <span class="sync-conflict-tag mono">{c.markers.join(" ")}</span>
+            </div>
+            <div class="journal-conflict-preview mono">{c.path}</div>
+            <span class="journal-conflict-actions">
+              <button
+                class="settings-btn"
+                title="Open the file and resolve the merge there, block by block"
+                onClick={() => reviewInPage(c.path, c.name, c.kind)}
+              >
+                Review in page…
+              </button>
+            </span>
+          </div>
+        )}
+      </For>
+    </Show>
+  );
+}
+
 // Sync-tool conflict copies (Syncthing/Dropbox `*.sync-conflict-*` files). They're
 // excluded from the page list (so they don't show as garbage pages) and surfaced
 // here so the user can review a per-block diff against the winning page and merge,
 // or just discard the copy. Never auto-merged / auto-deleted (ADR 0007).
 function SyncConflictsPanel(): JSX.Element {
   void refreshSyncConflicts(); // refresh when the Backups tab opens
-  const [merging, setMerging] = createSignal<SyncConflict | null>(null);
   const discard = async (c: SyncConflict) => {
     const name = c.path.split("/").pop() ?? c.path;
     if (
@@ -3235,9 +3751,9 @@ function SyncConflictsPanel(): JSX.Element {
       <div class="settings-hint settings-block">
         Syncthing and Dropbox leave a <code>*.sync-conflict-*</code> copy when the same page was
         edited on two devices. Tine keeps these out of your page list.{" "}
-        <strong>Review &amp; merge</strong> shows a block-by-block diff against the current page so
-        you can keep either side (or both) per block; <strong>Discard copy</strong> trashes it
-        (recoverable) and leaves the current page unchanged.
+        <strong>Review in page</strong> opens the page and resolves it there, block by block, next
+        to the content itself; <strong>Discard copy</strong> trashes it (recoverable) and leaves
+        the current page unchanged.
       </div>
       <For each={syncConflicts()}>
         {(c) => (
@@ -3256,8 +3772,12 @@ function SyncConflictsPanel(): JSX.Element {
               }
             >
               <span class="journal-conflict-actions">
-                <button class="settings-btn" title="See a per-block diff and merge" onClick={() => setMerging(c)}>
-                  Review &amp; merge…
+                <button
+                  class="settings-btn"
+                  title="Open the page and resolve it there, block by block"
+                  onClick={() => reviewInPage(c.base_path!, c.base_name, c.kind)}
+                >
+                  Review in page…
                 </button>
               </span>
             </Show>
@@ -3269,257 +3789,23 @@ function SyncConflictsPanel(): JSX.Element {
           </div>
         )}
       </For>
-      <Show when={merging()}>
-        {(c) => <SyncConflictMergeModal conflict={c()} onClose={() => setMerging(null)} />}
-      </Show>
     </Show>
   );
 }
 
-// The effective decision for a row (default keep-the-current-page everywhere).
-function decisionOf(decisions: Record<string, MergeDecision>, id: string): MergeDecision {
-  return decisions[id] ?? "mine";
-}
-
-// Collect every decidable row (id + kind), flattened, for the escape-hatch buttons.
-function collectRows(rows: DiffRow[], out: { id: string; kind: string }[] = []): { id: string; kind: string }[] {
-  for (const r of rows) {
-    if (r.kind !== "unchanged") out.push({ id: r.id, kind: r.kind });
-    if (r.children.length) collectRows(r.children, out);
-  }
-  return out;
-}
-
-function firstLine(text: string): string {
-  const l = text.split("\n").find((s) => s.trim().length) ?? "";
-  return l.trim();
-}
-
-// One diff row (recursive: a modified row shows its aligned children indented).
-function DiffRowView(props: {
-  row: DiffRow;
-  depth: number;
-  decisions: Record<string, MergeDecision>;
-  setDecision: (id: string, d: MergeDecision) => void;
-  showUnchanged: boolean;
-}): JSX.Element {
-  const row = () => props.row;
-  const dec = () => decisionOf(props.decisions, row().id);
-  const seg = (value: MergeDecision, label: string, side: "mine" | "theirs") => (
-    <button
-      class="sync-merge-seg"
-      classList={{ active: dec() === value }}
-      data-side={side}
-      onClick={() => props.setDecision(row().id, value)}
-    >
-      {label}
-    </button>
-  );
-  return (
-    <Show when={props.showUnchanged || row().kind !== "unchanged"}>
-      <div class="sync-merge-row" data-kind={row().kind} style={{ "padding-left": `${props.depth * 16}px` }}>
-        <div class="sync-merge-cols">
-          <div class="sync-merge-cell mine" classList={{ chosen: row().kind !== "removed" && dec() !== "theirs" }}>
-            {row().mine ? firstLine(row().mine!.text) : <span class="sync-merge-absent">—</span>}
-            <Show when={(row().mine?.child_count ?? 0) > 0}>
-              <span class="sync-merge-kids"> +{row().mine!.child_count}</span>
-            </Show>
-          </div>
-          <div class="sync-merge-cell theirs" classList={{ chosen: dec() === "theirs" || dec() === "both" }}>
-            {row().theirs ? firstLine(row().theirs!.text) : <span class="sync-merge-absent">—</span>}
-            <Show when={(row().theirs?.child_count ?? 0) > 0}>
-              <span class="sync-merge-kids"> +{row().theirs!.child_count}</span>
-            </Show>
-          </div>
-        </div>
-        <div class="sync-merge-controls">
-          <Show when={row().kind === "modified"}>
-            {seg("mine", "Current", "mine")}
-            {seg("theirs", "Copy", "theirs")}
-            {seg("both", "Both", "theirs")}
-          </Show>
-          <Show when={row().kind === "added"}>
-            {seg("mine", "Keep", "mine")}
-            {seg("theirs", "Drop", "theirs")}
-          </Show>
-          <Show when={row().kind === "removed"}>
-            {seg("mine", "Skip", "mine")}
-            {seg("theirs", "Pull in", "theirs")}
-          </Show>
-          <Show when={row().kind === "unchanged"}>
-            <span class="sync-merge-unchanged-tag">unchanged</span>
-          </Show>
-        </div>
-      </div>
-      <For each={row().children}>
-        {(child) => (
-          <DiffRowView
-            row={child}
-            depth={props.depth + 1}
-            decisions={props.decisions}
-            setDecision={props.setDecision}
-            showUnchanged={props.showUnchanged}
-          />
-        )}
-      </For>
-    </Show>
-  );
-}
-
-// The block-level merge modal: a two-column diff (current page vs conflict copy)
-// with a per-row keep-current / keep-copy / keep-both choice. Nothing is written
-// until "Merge & trash copy". Resolving goes through the safe backend path
-// (base_rev-guarded save + stage-before-commit trash).
-function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => void }): JSX.Element {
-  let root: HTMLDivElement | undefined;
-  createEffect(() => {
-    const unregister = registerTransientLayer({ id: `sync-conflict-merge-${props.conflict.path}`, parentId: "settings", root: () => root ?? null, dismiss: () => { props.onClose(); return true; } });
-    onCleanup(unregister);
-  });
-  const winner = props.conflict.base_path!; // only opened when the winner exists
-  const [decisions, setDecisions] = createSignal<Record<string, MergeDecision>>({});
-  const [preChoice, setPreChoice] = createSignal<"mine" | "theirs" | "union">("union");
-  const [showUnchanged, setShowUnchanged] = createSignal(false);
-  const [busy, setBusy] = createSignal(false);
-  const [diff, { refetch }] = createResource<SyncConflictDiff | null>(() =>
-    backend().syncConflictDiff(winner, props.conflict.path)
-  );
-  let diffVersion: string | undefined;
-  createEffect(() => {
-    const current = diff();
-    if (!current) return;
-    const nextVersion = `${current.base_rev}\0${current.conflict_rev}`;
-    if (diffVersion !== undefined && diffVersion !== nextVersion) {
-      // Choices are row-id decisions for one exact pair of files. A refetch can
-      // publish a different alignment, so never carry old choices into it.
-      setDecisions({});
-      setPreChoice("union");
-    }
-    diffVersion = nextVersion;
-  });
-  const setDecision = (id: string, d: MergeDecision) => setDecisions((m) => ({ ...m, [id]: d }));
-  const setAll = (d: MergeDecision) => {
-    const rows = diff()?.rows ?? [];
-    const next: Record<string, MergeDecision> = {};
-    for (const { id } of collectRows(rows)) next[id] = d;
-    setDecisions(next);
-  };
-  const merge = async () => {
-    const currentDiff = diff();
-    if (!currentDiff || diff.loading) return;
-    setBusy(true);
-    try {
-      await backend().resolveSyncConflict(
-        winner,
-        props.conflict.path,
-        decisions(),
-        currentDiff.base_rev,
-        currentDiff.conflict_rev,
-        preChoice()
-      );
-      pushToast(`Merged into “${props.conflict.base_name}”`, "success");
-      await refreshSyncConflicts();
-      props.onClose();
-    } catch (e) {
-      if (String(e).includes("conflict")) {
-        pushToast("The current page changed on disk — re-reading it, please redo your choices.", "error");
-        setDecisions({});
-        void refetch();
-      } else {
-        pushToast(`Merge failed: ${String(e)}`, "error");
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-  const counts = createMemo(() => {
-    const rows = collectRows(diff()?.rows ?? []);
-    return {
-      modified: rows.filter((r) => r.kind === "modified").length,
-      added: rows.filter((r) => r.kind === "added").length,
-      removed: rows.filter((r) => r.kind === "removed").length,
-    };
-  });
-  return (
-    <div class="sync-merge-overlay" onClick={props.onClose}>
-      <div ref={root} class="sync-merge-modal" onClick={(e) => e.stopPropagation()}>
-        <div class="sync-merge-header">
-          <div>
-            <div class="sync-merge-title">Merge “{props.conflict.base_name}”</div>
-            <div class="sync-merge-sub mono">{props.conflict.tag}</div>
-          </div>
-          <button class="settings-btn" onClick={props.onClose}>Close</button>
-        </div>
-        <Show
-          when={diff()}
-          fallback={<div class="sync-merge-body">{diff.loading ? "Loading diff…" : "Couldn’t load the diff."}</div>}
-        >
-          {(d) => (
-            <Show
-              when={!d().blocks_identical || d().pre_differs}
-              fallback={
-                <div class="sync-merge-body">
-                  <p>These files are identical — the copy is safe to discard.</p>
-                </div>
-              }
-            >
-              <div class="sync-merge-toolbar">
-                <span class="settings-hint">
-                  {counts().modified} changed · {counts().added} only here · {counts().removed} only in copy
-                </span>
-                <span class="sync-merge-toolbar-actions">
-                  <button class="settings-btn" onClick={() => setAll("mine")}>Keep all current</button>
-                  <button class="settings-btn" onClick={() => setAll("theirs")}>Take all copy</button>
-                  <label class="sync-merge-showunchanged">
-                    <input type="checkbox" checked={showUnchanged()} onChange={(e) => setShowUnchanged(e.currentTarget.checked)} />
-                    show unchanged
-                  </label>
-                </span>
-              </div>
-              <div class="sync-merge-collabels">
-                <span>Current page</span>
-                <span>Conflict copy</span>
-              </div>
-              <div class="sync-merge-body">
-                <For each={d().rows}>
-                  {(row) => (
-                    <DiffRowView
-                      row={row}
-                      depth={0}
-                      decisions={decisions()}
-                      setDecision={setDecision}
-                      showUnchanged={showUnchanged()}
-                    />
-                  )}
-                </For>
-              </div>
-              <Show when={d().pre_differs}>
-                <div class="sync-merge-preblock">
-                  <div class="settings-hint">
-                    Page properties differ. Keep{" "}
-                    <select value={preChoice()} onChange={(e) => setPreChoice(e.currentTarget.value as "mine" | "theirs" | "union")}>
-                      <option value="union">both (merge)</option>
-                      <option value="mine">current</option>
-                      <option value="theirs">copy</option>
-                    </select>
-                  </div>
-                </div>
-              </Show>
-            </Show>
-          )}
-        </Show>
-        <div class="sync-merge-footer">
-          <span class="settings-hint">The copy is moved to trash after a successful merge.</span>
-          <span>
-            <button class="settings-btn" onClick={props.onClose}>Cancel</button>
-            <button class="settings-btn settings-btn-primary" disabled={busy() || diff.loading || !diff()} onClick={() => void merge()}>
-              {busy() ? "Merging…" : "Merge & trash copy"}
-            </button>
-          </span>
-        </div>
-      </div>
-    </div>
-  );
+// Concord P5: ONE resolution surface. The Settings panels are the INVENTORY —
+// what exists on disk that needs judgement, including a copy whose page is gone
+// and the discard action, which the page cannot offer. Resolution itself happens
+// at the page, where the blocks are. The Settings modal that used to duplicate
+// it is gone: two surfaces over the same data drift, and these two already had
+// diverging defaults (the modal opened on "mine", the page on the suggested or
+// no-loss choice) — the same hazard one level up from the two block-facet
+// renderers, and from the two diff-row renderers the P4 lane collapsed.
+function reviewInPage(path: string, name: string, kind: "page" | "journal"): void {
+  // Address the exact FILE: a duplicate-day journal would otherwise resolve to
+  // the canonical file rather than the one carrying the conflict.
+  openPageTarget({ name, pageKind: kind, path });
+  closeSettings();
 }
 
 function FilesTab(props: { search: string }): JSX.Element {

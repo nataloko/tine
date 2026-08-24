@@ -16,7 +16,22 @@ function measurement(label, bigLoad, scrollBig) {
     metrics: { bigLoad: { rawMin: load }, scrollBig: { rawMin: scroll } },
     parseStats: { calls: 12, hits: 0, misses: 12 },
   });
-  const median = (values) => [...values].sort((a, b) => a - b)[1];
+  const median = (values) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  };
+  // Each scenario is written as three values whose min/median/max encode the
+  // shape under test. The policy's round count is higher than three, so pad
+  // with copies of the median: min, max, spread and median are all preserved,
+  // and every scenario keeps meaning exactly what its three values say.
+  const pad = (values) => {
+    const padded = [...values];
+    while (padded.length < policy.reliability.rounds) padded.push(median(values));
+    return padded;
+  };
+  bigLoad = pad(bigLoad);
+  scrollBig = pad(scrollBig);
   const spread = (values) => Number(((Math.max(...values) / Math.min(...values) - 1) * 100).toFixed(1));
   return {
     schemaVersion: 2,
@@ -73,9 +88,9 @@ try {
     /warning: immutable\/scrollBig: .*immutable baseline-only variance accepted/,
   );
 
-  // Candidate-only variance is safe when a fast outlier raises the symmetric
-  // spread but the median beats both anchors and the slowest round remains
-  // inside both performance budgets. This is the exact run 30963828453 shape.
+  // Candidate-only variance is safe when every observed candidate round stays
+  // inside both performance budgets. A fast outlier may raise symmetric spread
+  // without weakening the release contract.
   const favorableVariableCandidate = measurement(
     "candidate",
     [90, 92, 91],
@@ -85,7 +100,7 @@ try {
   assert.equal(favorableVariable.status, 0, favorableVariable.stderr || favorableVariable.stdout);
   assert.match(
     `${favorableVariable.stdout}\n${favorableVariable.stderr}`,
-    /warning: candidate\/scrollBig: .*candidate median beats both anchors and its slowest round remains within both budgets/,
+    /warning: candidate\/scrollBig: .*every observed candidate round remains within both regression budgets/,
   );
 
   // The candidate waiver belongs only to candidate variance. If the immutable
@@ -112,14 +127,14 @@ try {
     "unsafe candidate slow tail remains a blocker",
   );
 
-  // A variable candidate whose median does not beat both anchors remains a
-  // reliability failure even though its slowest round itself is budget-safe.
+  // A variable candidate need not beat both anchors. The slowest round is the
+  // actual safety boundary, so budget-safe positive deltas remain admissible.
   const nonFavorableMedianCandidate = measurement("candidate", [90, 92, 91], [90, 110, 120]);
   const nonFavorableMedian = check(nonFavorableMedianCandidate, stableImmutable, stablePrevious);
-  assertFails(
-    nonFavorableMedian,
-    /candidate\/scrollBig: .*round spread exceeds/,
-    "candidate variance requires a median no slower than both anchors",
+  assert.equal(nonFavorableMedian.status, 0, nonFavorableMedian.stderr || nonFavorableMedian.stdout);
+  assert.match(
+    `${nonFavorableMedian.stdout}\n${nonFavorableMedian.stderr}`,
+    /warning: candidate\/scrollBig: .*every observed candidate round remains within both regression budgets/,
   );
 
   // The rolling previous-release anchor can be the one noisy measurement:
@@ -222,7 +237,9 @@ try {
     "calibration instability remains a blocker",
   );
 
-  assert.equal(policy.reliability.rounds, 3);
+  // The scenarios above are POLICY-DRIVEN (fixtures pad to the configured
+  // round count), so this guard only pins the floor the padding logic needs.
+  assert.ok(policy.reliability.rounds >= 3, "bench policy must run at least 3 rounds");
   console.log("Performance A/B multi-round reliability fixtures passed.");
 } finally {
   rmSync(temporary, { recursive: true, force: true });

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { evaluateStorageMode } from "./lib/storage-mode-policy.mjs";
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -13,51 +14,21 @@ function optionalArg(name) {
 
 const policy = JSON.parse(readFileSync(arg("--policy"), "utf8"));
 
-// Storage mode is an informational, paired axis. It intentionally has no
-// regression threshold until Martin has reviewed real measurements. Reusing
-// this checker keeps its table and receipt shape beside the release A/B gate
-// without allowing an unreviewed number to fail or pass a release.
+// Storage mode is a paired Direct-vs-managed release axis. Its budgets are
+// tripwires around measured current behavior, not declarations that the
+// managed tax is desirable. A breach is a regression to diagnose; budgets may
+// only tighten after a faster receipt, never advance automatically.
 const storageModePath = optionalArg("--storage-mode");
 if (storageModePath) {
   const report = JSON.parse(readFileSync(storageModePath, "utf8"));
-  const failures = [];
-  const storage = policy.storageMode;
-  if (!storage || !Array.isArray(storage.modes) || !storage.operations) {
-    failures.push("policy does not define the storage-mode report contract");
-  }
-  if (report.schemaVersion !== 1 || report.kind !== "storage-mode") {
-    failures.push("expected a schema-1 storage-mode measurement");
-  }
-  if (!Array.isArray(report.rounds) || report.rounds.length < policy.reliability?.rounds) {
-    failures.push(`storage-mode report has fewer than ${policy.reliability?.rounds ?? "the required"} rounds`);
-  }
-  const operations = Object.keys(storage?.operations ?? {});
-  console.log("operation                 direct ms  managed ms  managed delta  direct spread  managed spread");
-  for (const name of operations) {
-    const direct = report.modes?.direct?.metrics?.[name];
-    const managed = report.modes?.managed?.metrics?.[name];
-    const directValue = direct?.rawMedianOfRoundMins;
-    const managedValue = managed?.rawMedianOfRoundMins;
-    const directSpread = direct?.roundSpreadPct;
-    const managedSpread = managed?.roundSpreadPct;
-    if (![directValue, managedValue, directSpread, managedSpread].every(Number.isFinite)) {
-      failures.push(`${name}: missing paired direct/managed measurement or round spread`);
-      continue;
-    }
-    const delta = ((managedValue / directValue) - 1) * 100;
-    console.log(
-      `${(storage.operations[name].label ?? name).padEnd(25)} ` +
-      `${directValue.toFixed(1).padStart(9)}  ${managedValue.toFixed(1).padStart(10)}  ` +
-      `${`${delta.toFixed(1)}%`.padStart(13)}  ${`${directSpread.toFixed(1)}%`.padStart(13)}  ` +
-      `${`${managedSpread.toFixed(1)}%`.padStart(14)}`,
-    );
-  }
+  const { failures, lines } = evaluateStorageMode(policy, report);
+  for (const line of lines) console.log(line);
   if (failures.length) {
     console.error("\nStorage-mode report is incomplete:");
     for (const failure of failures) console.error(`- ${failure}`);
     process.exit(1);
   }
-  console.log("Storage-mode comparison reported (informational; no pass/fail performance budget).");
+  console.log("Storage-mode Direct-vs-managed budgets passed.");
   process.exit(0);
 }
 
@@ -119,13 +90,11 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
     : Number.NaN;
   const slowestVsOld = ((candidateSlowest / old) - 1) * 100;
   const slowestVsPrev = ((candidateSlowest / prev) - 1) * 100;
-  // A full max/min spread is symmetric: a fast candidate round can exceed the
-  // threshold without masking a regression. Candidate-only variance is safe
-  // only when its median beats both anchors and its slowest round still stays
-  // within each respective regression budget.
-  const favorableCandidateVariance = vsOld <= 0
-    && vsPrev <= 0
-    && Number.isFinite(candidateSlowest)
+  // Spread is a reliability signal, not the release contract. A variable
+  // candidate is safe when even its slowest observed round remains within both
+  // regression budgets: faster outliers cannot conceal a bad tail in that
+  // case, and rejecting the run would add no performance protection.
+  const budgetSafeCandidateVariance = Number.isFinite(candidateSlowest)
     && slowestVsOld <= budget.maxVsImmutablePct
     && slowestVsPrev <= budget.maxVsPreviousPct;
   for (const [label, measurement] of Object.entries(measurements)) {
@@ -155,9 +124,9 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
           && Number.isFinite(candidateSlowest)
           && slowestVsOld <= budget.maxVsImmutablePct
           && slowestVsPrev <= budget.maxVsPreviousPct;
-        if (label === "candidate" && favorableCandidateVariance) {
+        if (label === "candidate" && budgetSafeCandidateVariance) {
           console.warn(
-            `warning: ${message}; candidate median beats both anchors and its slowest round remains within both budgets`,
+            `warning: ${message}; every observed candidate round remains within both regression budgets`,
           );
         } else if (immutableBaselineOnlyVariance) {
           console.warn(

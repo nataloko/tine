@@ -4,6 +4,9 @@
 //! Ordinary graph loading never creates it. Once present, startup discovers
 //! sparse state and never falls back to a legacy `Graph` writer.
 
+use crate::storage_mode_supervisor::{
+    StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
+};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -11,26 +14,44 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tine_core::model::GraphMeta;
+use tine_core::oplog::sync_layout::{
+    PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
+    PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+};
+use tine_core::oplog::SHARED_PROVIDER_TREE_NAMESPACES;
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
-    inspect_shared_enrollment_for_cold_discovery, SyncAmbiguousEvidence,
-    SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
-    SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
-    SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
-    SyncRuntimeLifecycle, SyncRuntimeOpenPhase, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest,
-    SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot,
-    SyncRuntimeTick, SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole,
-    SyncShutdownOutcome, SyncStorageProfile,
+    inspect_shared_enrollment_for_cold_discovery, ManagedStorageRefusalScenario,
+    SyncAmbiguousEvidence, SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
+    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSelector, SyncLocalActivationIdentities,
+    SyncLocalActivationPhase, SyncLocalActivationProgress, SyncLocalActivationRequest,
+    SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
+    SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
+    SyncRuntimeOpenPhase, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest, SyncRuntimeOpenResult,
+    SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
+    SyncStorageProfile,
 };
 use uuid::Uuid;
 
 const BINDING_SCHEMA_VERSION: u32 = 2;
-const SPARSE_BINDING_DIR: &str = "sparse-v2";
-const SPARSE_BINDING_FILE: &str = "binding.json";
-const SPARSE_RECOVERY_DIR: &str = "sparse-v2-recovery";
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
+const DIRECT_SELECTION_SCHEMA_VERSION: u32 = 1;
+const DIRECT_SELECTION_DIR: &str = "storage-mode-selections";
+const DIRECT_SELECTION_FILE_SUFFIX: &str = ".direct-v1.json";
+static DIRECT_SELECTION_WRITE: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct DirectSelectionReceipt {
+    schema_version: u32,
+    graph_root: String,
+    reason: String,
+}
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -104,13 +125,21 @@ impl SparseV2ActivationRecord {
         let private = self.private_root(app)?;
         Ok(SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(SyncLocalActivationIdentities {
+                workspace_id: self.workspace_id,
+                lineage_digest: self.lineage_digest,
+                catalog_document_id: self.catalog_document_id,
+                endpoint_id: self.endpoint_id,
+                device_id: self.device_id,
+                preparation_id: self.preparation_id,
+                session_id: self.activation_session_id,
+            }),
             graph_root: PathBuf::from(&self.graph_root),
             archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
             provider_journal_root: private.join("provider/device/journal"),
         })
@@ -128,7 +157,6 @@ impl SparseV2ActivationRecord {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
@@ -146,20 +174,108 @@ impl SparseV2ActivationRecord {
     }
 }
 
+fn graph_private_key(graph_root: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tine/sparse-v2/app-binding/v1\0");
+    digest.update(graph_root.as_os_str().as_encoded_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn sparse_private_root(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
     let app_data = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
-    let mut digest = Sha256::new();
-    digest.update(b"tine/sparse-v2/app-binding/v1\0");
-    digest.update(graph_root.as_os_str().as_encoded_bytes());
-    let key = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(app_data.join(SPARSE_BINDING_DIR).join(key))
+    Ok(app_data
+        .join(SPARSE_BINDING_DIR)
+        .join(graph_private_key(graph_root)))
+}
+
+fn direct_selection_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
+    Ok(direct_selection_path_at(&app_data, graph_root))
+}
+
+fn direct_selection_path_at(app_data: &Path, graph_root: &Path) -> PathBuf {
+    app_data.join(DIRECT_SELECTION_DIR).join(format!(
+        "{}{}",
+        graph_private_key(graph_root),
+        DIRECT_SELECTION_FILE_SUFFIX
+    ))
+}
+
+fn direct_selection_is_active(app: &tauri::AppHandle, graph_root: &Path) -> Result<bool, String> {
+    let path = direct_selection_path(app, graph_root)?;
+    direct_selection_is_active_at(&path, graph_root)
+}
+
+fn direct_selection_is_active_at(path: &Path, graph_root: &Path) -> Result<bool, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Couldn't read Direct Files selection: {error}")),
+    };
+    match serde_json::from_slice::<DirectSelectionReceipt>(&bytes) {
+        Ok(receipt)
+            if receipt.schema_version == DIRECT_SELECTION_SCHEMA_VERSION
+                && Path::new(&receipt.graph_root) == graph_root =>
+        {
+            Ok(true)
+        }
+        Ok(_) | Err(_) => {
+            // The digest-addressed receipt can only have been written for this
+            // canonical root. A torn/corrupt app-private receipt fails toward
+            // Direct Files; it must never resurrect the managed selector.
+            crate::debug::diag(format!(
+                "Direct Files selection receipt is malformed at {}; retaining Direct selection",
+                path.display()
+            ));
+            Ok(true)
+        }
+    }
+}
+
+fn publish_direct_selection(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+    reason: &str,
+) -> Result<(), String> {
+    let path = direct_selection_path(app, graph_root)?;
+    publish_direct_selection_at(&path, graph_root, reason)
+}
+
+fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> Result<(), String> {
+    let receipt = DirectSelectionReceipt {
+        schema_version: DIRECT_SELECTION_SCHEMA_VERSION,
+        graph_root: graph_root.display().to_string(),
+        reason: reason.to_owned(),
+    };
+    let encoded = serde_json::to_string_pretty(&receipt)
+        .map(|mut value| {
+            value.push('\n');
+            value
+        })
+        .map_err(|error| error.to_string())?;
+    tine_core::model::atomic_update(path, &DIRECT_SELECTION_WRITE, |_| Ok(encoded.clone()))
+        .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
+}
+
+fn retire_direct_selection(app: &tauri::AppHandle, graph_root: &Path) -> Result<(), String> {
+    let path = direct_selection_path(app, graph_root)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Couldn't retire the prior Direct Files selection: {error}"
+        )),
+    }
 }
 
 fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
@@ -197,6 +313,45 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
             value
         })
         .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "android")]
+    if !path.exists() {
+        use std::io::Write as _;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Tine-managed storage binding has no private parent".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("Couldn't create Tine-managed storage private binding directory: {error}")
+        })?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(encoded.as_bytes()).map_err(|error| {
+                    format!("Couldn't write Tine-managed storage private binding: {error}")
+                })?;
+                file.sync_all().map_err(|error| {
+                    format!("Couldn't flush Tine-managed storage private binding: {error}")
+                })?;
+                // The initial binding is small, device-local and published
+                // before any managed authority exists. Android kernels can
+                // deny renameat2(RENAME_NOREPLACE) even in app-private storage;
+                // direct create_new preserves no-clobber semantics. A crash
+                // can at worst leave a malformed private opt-in record, which
+                // is recoverable through the always-available Direct Files
+                // escape without touching the Markdown tree.
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "Couldn't create Tine-managed storage private binding: {error}"
+                ));
+            }
+        }
+    }
     tine_core::model::atomic_update(path, &BINDING_WRITE, |existing| {
         if existing.trim().is_empty() || existing.trim() == "{}" {
             return Ok(encoded.clone());
@@ -218,7 +373,7 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
     .map_err(|error| format!("Couldn't save Tine-managed storage setup: {error}"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum SparseV2Availability {
     LegacyDefault,
@@ -232,15 +387,18 @@ pub(crate) enum SparseV2Availability {
     },
     Blocked {
         reason_code: String,
+        scenario_id: String,
     },
     Refused {
         reason_code: String,
+        scenario_id: String,
         detail: Option<String>,
     },
 }
 
 impl SparseV2Availability {
     fn from_open(status: SyncRuntimeOpenStatus) -> Self {
+        let scenario = status.durable_refusal_scenario();
         match status {
             SyncRuntimeOpenStatus::LegacyDefault => Self::LegacyDefault,
             SyncRuntimeOpenStatus::Active => Self::Active,
@@ -252,27 +410,52 @@ impl SparseV2Availability {
                 stage: non_active_stage(stage).into(),
                 detail: "Tine-managed storage setup can be resumed.".into(),
             },
-            SyncRuntimeOpenStatus::Blocked { reason_code } => Self::Blocked { reason_code },
-            SyncRuntimeOpenStatus::UnsupportedOrIncompatible(component) => Self::Refused {
+            SyncRuntimeOpenStatus::Blocked { reason_code } => Self::Blocked {
+                reason_code,
+                scenario_id: required_scenario_id(scenario),
+            },
+            SyncRuntimeOpenStatus::UnsupportedOrIncompatible { component, .. } => Self::Refused {
                 reason_code: format!("unsupported_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::CorruptOrUnreadable(component) => Self::Refused {
+            SyncRuntimeOpenStatus::CorruptOrUnreadable { component, .. } => Self::Refused {
                 reason_code: format!("corrupt_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(evidence) => Self::Refused {
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue { evidence, .. } => Self::Refused {
                 reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::OpenRefused { detail } => Self::Retryable {
-                stage: "local_active".into(),
-                detail,
+            SyncRuntimeOpenStatus::OpenRefused { detail } => match scenario {
+                Some(scenario) => Self::Refused {
+                    reason_code: "open_refused".into(),
+                    scenario_id: scenario.as_str().into(),
+                    detail: Some(detail),
+                },
+                None => Self::Retryable {
+                    stage: "local_active".into(),
+                    detail,
+                },
+            },
+            // Not a durable refusal: the startup path retires the state and
+            // reopens the graph in Direct Files. This mapping only surfaces if
+            // a non-startup caller races the retirement.
+            SyncRuntimeOpenStatus::SupersededLegacyState => Self::Refused {
+                reason_code: SUPERSEDED_LEGACY_REASON.into(),
+                scenario_id: SUPERSEDED_LEGACY_REASON.into(),
+                detail: Some(
+                    "Pre-0.7 managed-storage state was found; it is set aside and the graph opens in Direct files."
+                        .into(),
+                ),
             },
         }
     }
 
     fn from_activation(status: SyncLocalActivationStatus) -> Self {
+        let scenario = status.durable_refusal_scenario();
         match status {
             SyncLocalActivationStatus::Active => Self::Active,
             SyncLocalActivationStatus::Retryable {
@@ -282,21 +465,38 @@ impl SparseV2Availability {
                 stage: activation_stage(durable_stage).into(),
                 detail,
             },
-            SyncLocalActivationStatus::Blocked { reason_code } => Self::Blocked { reason_code },
-            SyncLocalActivationStatus::UnsupportedOrIncompatible(component) => Self::Refused {
-                reason_code: format!("unsupported_{}", component_name(component)),
-                detail: None,
+            SyncLocalActivationStatus::Blocked { reason_code } => Self::Blocked {
+                reason_code,
+                scenario_id: required_scenario_id(scenario),
             },
-            SyncLocalActivationStatus::CorruptOrUnreadable(component) => Self::Refused {
+            SyncLocalActivationStatus::UnsupportedOrIncompatible { component, .. } => {
+                Self::Refused {
+                    reason_code: format!("unsupported_{}", component_name(component)),
+                    scenario_id: required_scenario_id(scenario),
+                    detail: None,
+                }
+            }
+            SyncLocalActivationStatus::CorruptOrUnreadable { component, .. } => Self::Refused {
                 reason_code: format!("corrupt_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncLocalActivationStatus::AmbiguousOrForeignResidue(evidence) => Self::Refused {
-                reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
-                detail: None,
-            },
+            SyncLocalActivationStatus::AmbiguousOrForeignResidue { evidence, .. } => {
+                Self::Refused {
+                    reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
+                    scenario_id: required_scenario_id(scenario),
+                    detail: None,
+                }
+            }
         }
     }
+}
+
+fn required_scenario_id(scenario: Option<ManagedStorageRefusalScenario>) -> String {
+    scenario
+        .expect("every durable managed-storage refusal has a contract scenario")
+        .as_str()
+        .into()
 }
 
 fn activation_stage(stage: SyncLocalActivationStage) -> &'static str {
@@ -334,9 +534,24 @@ fn ambiguous_name(evidence: SyncAmbiguousEvidence) -> &'static str {
     }
 }
 
+/// Reason code for pre-0.7 managed state discovered at open. The graph-open
+/// path treats it as an instruction (set aside, reopen Direct), never as an
+/// error to show.
+pub(crate) const SUPERSEDED_LEGACY_REASON: &str = "superseded_legacy_state";
+
 pub(crate) struct SparseV2Binding {
     availability: SparseV2Availability,
     handle: Option<SyncRuntimeHandle>,
+}
+
+impl SparseV2Binding {
+    pub(crate) fn superseded_legacy(&self) -> bool {
+        matches!(
+            &self.availability,
+            SparseV2Availability::Refused { reason_code, .. }
+                if reason_code == SUPERSEDED_LEGACY_REASON
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,7 +654,7 @@ fn retryable_binding(stage: &str, detail: String) -> SparseV2Binding {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2WatcherStatusDto {
     latest_enqueue: u64,
     acknowledged: u64,
@@ -451,14 +666,14 @@ pub(crate) struct SparseV2WatcherStatusDto {
     sequence_exhausted: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2TickDto {
     state: String,
     detail: Option<String>,
     epoch: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2RuntimeStatusDto {
     lifecycle: String,
     recovery: Option<String>,
@@ -468,13 +683,19 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     shared_role: Option<String>,
     shared_phase: Option<String>,
     provider_pending: usize,
+    /// The actor's own scheduling predicate: shared-active AND holding provider
+    /// work a tick can advance. `provider_pending` alone is ambiguous — it is a
+    /// broad protocol inventory that legitimately stays non-zero — so a capsule
+    /// showing `provider_pending > 0` with an idle watcher cannot be read
+    /// without this. See `docs/storage-sync-contract.md` §2.3.
+    provider_runnable: bool,
     managed_local_pending: usize,
     managed_local_checkpointed_sequence: u64,
     managed_local_next_sequence: u64,
     managed_local_stage: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2StatusDto {
     #[serde(flatten)]
     availability: SparseV2Availability,
@@ -570,6 +791,43 @@ impl SparseV2StatusDto {
             },
         }
     }
+
+    fn from_binding_observation(
+        binding: &SparseV2Binding,
+        binding_generation: u64,
+        snapshot: SyncRuntimeStatusSnapshot,
+    ) -> Self {
+        let availability = match snapshot.lifecycle {
+            SyncRuntimeLifecycle::StoppedSafe => SparseV2Availability::Retryable {
+                stage: "local_active".into(),
+                detail: "Tine-managed storage stopped safely and needs to be reopened.".into(),
+            },
+            SyncRuntimeLifecycle::StoppedCrashed => SparseV2Availability::Retryable {
+                stage: "local_active".into(),
+                detail: "Tine-managed storage needs to be reopened after it stopped unexpectedly."
+                    .into(),
+            },
+            SyncRuntimeLifecycle::Active | SyncRuntimeLifecycle::Terminal => {
+                binding.availability().clone()
+            }
+        };
+        let can_retry = matches!(availability, SparseV2Availability::Retryable { .. });
+        let application_page_admission =
+            crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+                binding_generation,
+                &snapshot.lifecycle,
+            );
+        Self {
+            availability,
+            runtime: Some(runtime_status(snapshot)),
+            can_activate: false,
+            can_retry,
+            can_cancel: false,
+            cancel_reason: None,
+            binding_generation,
+            application_page_admission,
+        }
+    }
 }
 
 pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2RuntimeStatusDto {
@@ -595,6 +853,8 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
                 SyncRuntimeRecovery::ResumedOwnUnsafe => "resumed_own_unsafe",
                 SyncRuntimeRecovery::AdoptedSafeHandoff => "adopted_safe_handoff",
                 SyncRuntimeRecovery::TookOverCrashedUnsafe => "took_over_crashed_unsafe",
+                SyncRuntimeRecovery::CleanActivation => "clean_activation",
+                SyncRuntimeRecovery::CleanManifestReplay => "clean_manifest_replay",
             }
             .into()
         }),
@@ -620,6 +880,7 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
             SyncSharedPhase::Active => "active".into(),
         }),
         provider_pending,
+        provider_runnable: snapshot.provider_runnable,
         managed_local_pending: snapshot.managed_local_pending,
         managed_local_checkpointed_sequence: snapshot.managed_local_checkpointed_sequence,
         managed_local_next_sequence: snapshot.managed_local_next_sequence,
@@ -632,6 +893,9 @@ pub(crate) fn tick_dto(tick: SyncRuntimeTick) -> SparseV2TickDto {
         SyncRuntimeTick::Idle => tick_value("idle", None, None),
         SyncRuntimeTick::LocalMutation(outcome) => {
             tick_value("local_mutation", Some(format!("{outcome:?}")), None)
+        }
+        SyncRuntimeTick::ProviderMutation { batch_id } => {
+            tick_value("provider_mutation", Some(batch_id.to_string()), None)
         }
         SyncRuntimeTick::RecoveryBlocked(detail) => {
             tick_value("recovery_blocked", Some(detail), None)
@@ -667,30 +931,34 @@ pub(crate) fn shutdown_status(outcome: SyncShutdownOutcome) -> SparseV2RuntimeSt
 /// What the graph-local provider namespace proves for the narrowly scoped
 /// "Return to Direct files" escape hatch.
 ///
-/// The first local activation creates the provider directory skeleton before
-/// any shared enrollment exists.  Its mere presence is therefore not proof
-/// that another device can depend on this graph.  In contrast, a descriptor,
-/// provider work, or anything that does not exactly match that empty local
-/// skeleton is treated as shared/unknown and remains fail-closed.
+/// A first local activation writes NOTHING under `.tine-sync/` — it is
+/// write-shy about the graph folder until the user asks to share, and
+/// `tine_core::sync_runtime::tests::local_activation_writes_nothing_into_the_graphs_sync_folder`
+/// holds it to that. The empty namespace skeleton is written by the SHARED
+/// TRANSPORT (`ProviderRuntime::open`), which runs when a share is prepared or
+/// joined and on every shared reopen — always before any descriptor or
+/// publication exists. A file-sync client can also deliver that skeleton to a
+/// second device ahead of its contents.
+///
+/// So an exactly-empty skeleton still proves what this check needs — no other
+/// device can depend on this graph through it — but not for the reason this
+/// comment used to give. A descriptor, provider work, or anything that does not
+/// exactly match the empty skeleton is treated as shared/unknown and remains
+/// fail-closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderNamespaceEvidence {
     LocalOnly,
     SharedOrUnknown,
 }
 
-const PROVIDER_SCAFFOLD_TREES: [&str; 2] = ["inbox", "outbox"];
-const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 10] = [
-    "objects",
-    "manifests",
-    "enrollment",
-    "frontier-heads-v1",
-    "publication-intents-v1",
-    "manifest-recovery-links-v1",
-    "manifest-recovery-blobs-v1",
-    ".part",
-    "removed",
-    "rename-evidence",
-];
+const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR];
+/// Exactly what the shared provider transport writes when it opens a tree —
+/// taken from the core that writes it, never re-listed here. A hand-copied list
+/// drifted the moment clean baselines were added: the transport wrote eleven
+/// namespaces while this check still expected ten, so a tree that had only ever
+/// been opened failed to match its own skeleton and the escape hatch warned the
+/// user their graph might be shared with another device.
+const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 8] = SHARED_PROVIDER_TREE_NAMESPACES;
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     let mut entries = std::fs::read_dir(path)
@@ -710,6 +978,9 @@ fn has_exact_directory_names(entries: &[std::fs::DirEntry], expected: &[&str]) -
         })
 }
 
+/// Is this tree exactly what opening a shared provider transport leaves, with
+/// nothing published into it? Not "what activation writes" — activation writes
+/// nothing here at all.
 fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> {
     let root_entries = sorted_directory_entries(shared_root)?;
     if !has_exact_directory_names(&root_entries, &PROVIDER_SCAFFOLD_TREES) {
@@ -771,8 +1042,8 @@ fn provider_namespace_evidence(path: &Path) -> Result<ProviderNamespaceEvidence,
 
     match inspect_shared_enrollment_for_cold_discovery(&shared.path()) {
         Ok(Some(_)) => Ok(ProviderNamespaceEvidence::SharedOrUnknown),
-        // A canonical empty provider topology is made by a first local
-        // activation, before any authority/share publication.  Any other
+        // A canonical empty provider topology is what opening the shared
+        // transport leaves, before any authority/share publication.  Any other
         // descriptor-inspection failure remains evidence, rather than being
         // guessed to be local-only.
         Ok(None) | Err(_) if is_empty_local_provider_scaffold(&shared.path())? => {
@@ -824,24 +1095,111 @@ fn cancel_warning(binding: &SparseV2Binding, provider_namespace: &Path) -> Optio
     })
 }
 
+fn cancel_warning_for_observation(
+    binding: &SparseV2Binding,
+    provider_namespace: &Path,
+    snapshot: &SyncRuntimeStatusSnapshot,
+) -> Option<String> {
+    let provider_evidence = provider_namespace_evidence(provider_namespace)
+        .unwrap_or(ProviderNamespaceEvidence::SharedOrUnknown);
+    let shared_or_unknown = binding_names_shared_state(binding)
+        || provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown
+        || snapshot.shared_role.is_some()
+        || snapshot.shared_phase.is_some()
+        || (snapshot.provider_pending != 0
+            && provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown);
+    shared_or_unknown.then(|| {
+        "Managed storage may contain shared or pending provider state. Tine will archive the complete private managed-storage state before reopening this graph with Direct files. Other devices will not receive further managed-storage updates from this device.".into()
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct SyncRuntimeFacade;
 
+/// The sole ordinary graph-open decision for storage authority.
+///
+/// A validated private binding is the durable, device-local proof that Martin
+/// explicitly enabled managed storage for this graph. Its absence means Direct
+/// Files. In particular, graph-local `.tine-sync` bytes are never consulted to
+/// infer or force managed mode; they are inspected only after the user invokes
+/// the explicit join flow.
+pub(crate) enum ExplicitStorageSelection {
+    DirectFiles,
+    Managed(SparseV2ActivationRecord),
+}
+
 impl SyncRuntimeFacade {
+    pub(crate) fn explicit_storage_selection(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<ExplicitStorageSelection, String> {
+        Ok(match self.binding_record(app, graph_root)? {
+            Some(record) => ExplicitStorageSelection::Managed(record),
+            None => ExplicitStorageSelection::DirectFiles,
+        })
+    }
+
     pub(crate) fn binding_record(
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
     ) -> Result<Option<SparseV2ActivationRecord>, String> {
+        if direct_selection_is_active(app, graph_root)? {
+            return Ok(None);
+        }
         let private = sparse_private_root(app, graph_root)?;
         let record = read_binding_at(&private.join(SPARSE_BINDING_FILE), graph_root)?;
-        if record.is_none() && std::fs::symlink_metadata(&private).is_ok() {
-            return Err(
-                "Tine-managed storage data is incomplete, so this graph could not be opened safely."
-                    .into(),
-            );
-        }
+        // Candidate construction is deliberately private and disposable until
+        // the selector is published. A crash may therefore leave candidate
+        // bytes without a binding record; absence of that record means Direct
+        // Files, and the next explicit activation quarantines the residue.
         Ok(record)
+    }
+
+    /// True when a binding file exists but predates the current schema. Such
+    /// a file cannot decode into `SparseV2ActivationRecord`, so ordinary
+    /// discovery reports corruption; startup instead retires it. A current-
+    /// version file that fails to decode stays an error - that IS corruption.
+    pub(crate) fn superseded_binding_file(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> bool {
+        let Ok(private) = sparse_private_root(app, graph_root) else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(private.join(SPARSE_BINDING_FILE)) else {
+            return false;
+        };
+        binding_bytes_are_superseded(&bytes)
+    }
+
+    /// Pre-0.7 policy (Martin, Aug 19): experimental state is not migrated.
+    /// Archive the whole app-private root into the recovery directory - never
+    /// hard-delete - and select Direct Files so the next open is ordinary.
+    pub(crate) fn retire_superseded_legacy(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<(), String> {
+        let private = sparse_private_root(app, graph_root)?;
+        let recovery = sparse_recovery_root(app)?;
+        let archived = archive_private_root(&private, &recovery).map_err(|error| {
+            format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
+        })?;
+        crate::debug::diag(format!(
+            "pre-0.7 managed state retired: archived={}",
+            archived
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "nothing-to-archive".into())
+        ));
+        publish_direct_selection(
+            app,
+            graph_root,
+            "superseded pre-0.7 managed state set aside",
+        )
     }
 
     pub(crate) fn prepare_binding_record(
@@ -850,14 +1208,26 @@ impl SyncRuntimeFacade {
         graph_root: &Path,
         graph_meta: GraphMeta,
     ) -> Result<SparseV2ActivationRecord, String> {
-        match self.binding_record(app, graph_root)? {
-            Some(record) => Ok(record),
-            None => Ok(SparseV2ActivationRecord::new(
-                graph_root,
-                graph_meta,
-                DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
-            )),
+        let direct_selected = direct_selection_is_active(app, graph_root)?;
+        if !direct_selected {
+            if let Some(record) = self.binding_record(app, graph_root)? {
+                return Ok(record);
+            }
         }
+        let private = sparse_private_root(app, graph_root)?;
+        if std::fs::symlink_metadata(&private).is_ok() {
+            let recovery = sparse_recovery_root(app)?;
+            archive_private_root(&private, &recovery).map_err(|error| {
+                format!(
+                    "Couldn't quarantine prior unpublished managed-storage candidate before fresh activation: {error}"
+                )
+            })?;
+        }
+        Ok(SparseV2ActivationRecord::new(
+            graph_root,
+            graph_meta,
+            DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
+        ))
     }
 
     pub(crate) fn persist_binding_record(
@@ -866,7 +1236,16 @@ impl SyncRuntimeFacade {
         record: &SparseV2ActivationRecord,
     ) -> Result<(), String> {
         let root = Path::new(&record.graph_root);
-        persist_binding_at(&binding_path(app, root)?, record)
+        persist_binding_at(&binding_path(app, root)?, record)?;
+        retire_direct_selection(app, root)
+    }
+
+    pub(crate) fn direct_selection_is_active(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<bool, String> {
+        direct_selection_is_active(app, graph_root)
     }
 
     pub(crate) fn graph_meta(record: &SparseV2ActivationRecord) -> GraphMeta {
@@ -972,29 +1351,13 @@ impl SyncRuntimeFacade {
     pub(crate) fn open_record_for_window(
         &self,
         app: &tauri::AppHandle,
-        label: &str,
+        _label: &str,
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
-        let reporter = crate::graph::StartupProgressReporter::for_window(app, label);
-        reporter.phase("managed_open.entry");
-        let result = self.open_record_with_progress(app, record, |progress| match progress {
-            SyncRuntimeOpenProgress::Phase { phase, .. } => {
-                reporter.phase(managed_open_phase_name(phase));
-            }
-            SyncRuntimeOpenProgress::Waiting { phase, .. } => {
-                reporter.phase(managed_open_waiting_phase_name(phase));
-            }
-            // The detailed receipt remains terminal-only.  The webview sees a
-            // bounded phase update, never counts, error strings, or paths.
-            SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {
-                reporter.phase("managed_open.recovery_diagnostics");
-            }
-        });
-        reporter.terminal(
-            "managed_open.complete",
-            if result.is_ok() { "ok" } else { "error" },
-        );
-        result
+        // The supervisor owns the public typed operation. Detailed engine
+        // phases remain native diagnostics and must not create a second
+        // frontend recovery state machine.
+        self.open_record_with_progress(app, record, |_| {})
     }
 
     pub(crate) fn activate_record(
@@ -1042,6 +1405,9 @@ impl SyncRuntimeFacade {
 fn managed_open_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
     match phase {
         SyncRuntimeOpenPhase::RetainingGraph => "managed_open.retaining_graph",
+        SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime => {
+            "managed_open.recovering_clean_manifest_runtime"
+        }
         SyncRuntimeOpenPhase::DiscoveringEnrollment => "managed_open.discovering_enrollment",
         SyncRuntimeOpenPhase::OpeningActorGraph => "managed_open.opening_actor_graph",
         SyncRuntimeOpenPhase::RevalidatingEnrollment => "managed_open.revalidating_enrollment",
@@ -1062,6 +1428,9 @@ fn managed_open_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
 fn managed_open_waiting_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
     match phase {
         SyncRuntimeOpenPhase::RetainingGraph => "managed_open.waiting_retaining_graph",
+        SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime => {
+            "managed_open.waiting_recovering_clean_manifest_runtime"
+        }
         SyncRuntimeOpenPhase::DiscoveringEnrollment => {
             "managed_open.waiting_discovering_enrollment"
         }
@@ -1097,45 +1466,56 @@ fn managed_open_outcome_code(status: &SyncRuntimeOpenStatus) -> &'static str {
             "existing_verified_local"
         }
         SyncRuntimeOpenStatus::Blocked { .. } => "blocked",
-        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Enrollment) => {
-            "unsupported_enrollment"
-        }
-        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Archive) => {
-            "unsupported_archive"
-        }
-        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Enrollment) => {
-            "corrupt_enrollment"
-        }
-        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Archive) => {
-            "corrupt_archive"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentResidue,
-        ) => "ambiguous_enrollment_residue",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentNamespace,
-        ) => "ambiguous_enrollment_namespace",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentGraphBinding,
-        ) => "ambiguous_enrollment_graph_binding",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveResidue) => {
-            "ambiguous_archive_residue"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::ArchiveNamespace,
-        ) => "ambiguous_archive_namespace",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveBinding) => {
-            "ambiguous_archive_binding"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::ActiveArchiveMismatch,
-        ) => "ambiguous_active_archive_mismatch",
+        SyncRuntimeOpenStatus::SupersededLegacyState => "superseded_legacy_state",
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+            component: SyncRuntimeComponent::Enrollment,
+            ..
+        } => "unsupported_enrollment",
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+            component: SyncRuntimeComponent::Archive,
+            ..
+        } => "unsupported_archive",
+        SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Enrollment,
+            ..
+        } => "corrupt_enrollment",
+        SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Archive,
+            ..
+        } => "corrupt_archive",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentResidue,
+            ..
+        } => "ambiguous_enrollment_residue",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentNamespace,
+            ..
+        } => "ambiguous_enrollment_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentGraphBinding,
+            ..
+        } => "ambiguous_enrollment_graph_binding",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveResidue,
+            ..
+        } => "ambiguous_archive_residue",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveNamespace,
+            ..
+        } => "ambiguous_archive_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveBinding,
+            ..
+        } => "ambiguous_archive_binding",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ActiveArchiveMismatch,
+            ..
+        } => "ambiguous_active_archive_mismatch",
         SyncRuntimeOpenStatus::Active => "active",
         SyncRuntimeOpenStatus::OpenRefused { .. } => "open_refused",
     }
 }
 
-const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTIVATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const ACTIVATION_PROGRESS_EVENT: &str = "sparse-v2-activation-progress";
 pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
@@ -1197,17 +1577,41 @@ struct SparseV2ActivationProgressEvent {
     progress: SyncLocalActivationProgress,
 }
 
+struct PreparedActivationBinding {
+    binding: SparseV2Binding,
+    largest_page_path: Option<String>,
+}
+
+fn attach_latest_progress_to_activation_result(
+    binding: &mut SparseV2Binding,
+    progress: &str,
+) -> Option<String> {
+    let SparseV2Availability::Retryable { detail, .. } = &mut binding.availability else {
+        return None;
+    };
+    let contextual = format!("Tine-managed storage setup failed during {progress}: {detail}");
+    *detail = contextual.clone();
+    Some(contextual)
+}
+
 fn activate_record_with_diagnostics(
     facade: &SyncRuntimeFacade,
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
     record: &SparseV2ActivationRecord,
-) -> Result<SparseV2Binding, String> {
+) -> Result<PreparedActivationBinding, String> {
     let started = Instant::now();
     let latest_progress = Arc::new(Mutex::new(None));
+    let largest_page_path = Arc::new(Mutex::new(None));
     let heartbeat = ActivationHeartbeat::start(started, Arc::clone(&latest_progress));
+    let largest_page_path_for_progress = Arc::clone(&largest_page_path);
     let result = facade.activate_record_with_detailed_progress(app, record, |progress| {
+        if let SyncLocalActivationProgress::ReadinessSample { largest_page_path } = &progress {
+            *largest_page_path_for_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = largest_page_path.clone();
+        }
         let diagnostic = progress.diagnostic_name();
         let _ = app.emit_to(
             label,
@@ -1226,7 +1630,34 @@ fn activate_record_with_diagnostics(
         ));
     });
     drop(heartbeat);
-    result
+    let progress = latest_activation_progress_name(&latest_progress);
+    match result {
+        Ok(mut binding) => {
+            if let Some(detail) =
+                attach_latest_progress_to_activation_result(&mut binding, &progress)
+            {
+                crate::debug::diag(format!(
+                    "sparse-v2 activation failed after {} ms: {detail}",
+                    started.elapsed().as_millis()
+                ));
+            }
+            Ok(PreparedActivationBinding {
+                binding,
+                largest_page_path: largest_page_path
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            })
+        }
+        Err(error) => {
+            let detail = format!("Tine-managed storage setup failed during {progress}: {error}");
+            crate::debug::diag(format!(
+                "sparse-v2 activation failed after {} ms: {detail}",
+                started.elapsed().as_millis()
+            ));
+            Err(detail)
+        }
+    }
 }
 
 pub(crate) fn active_handle(
@@ -1247,21 +1678,235 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
             status.cancel_reason = cancel_warning(binding, &slot.root_key.join(".tine-sync/v2"));
             status
         }
-        None => {
-            match inspect_shared_enrollment_for_cold_discovery(
-                &slot.root_key.join(".tine-sync/v2/shared"),
-            )? {
-                Some(descriptor) => {
-                    SparseV2StatusDto::joinable(slot.binding_generation, &descriptor)
-                }
-                None => SparseV2StatusDto::legacy(slot.binding_generation),
-            }
-        }
+        // Status is observational and runs on every ordinary graph bind. It
+        // must not turn Direct Files into an implicit managed-storage probe.
+        // The explicit Join command performs provider discovery after the user
+        // asks for it.
+        None => SparseV2StatusDto::legacy(slot.binding_generation),
     };
     // Status names describe enrollment/recovery. This record describes the
     // exact writer retained by the slot that will service `save_page`.
     status.application_page_admission = slot.application_page_admission();
     Ok(status)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagedReadinessReceipt {
+    page_count: usize,
+    sampled_paths: Vec<String>,
+    inventory_ms: u64,
+    sample_load_ms: u64,
+    total_ms: u64,
+}
+
+/// Prove the application observation boundary before a managed candidate is
+/// published. Installing an actor-backed GraphSlot is only native
+/// construction; users need its ordinary inventory and representative
+/// page-load commands to observe the complete SQLite materialization at the
+/// candidate's own authenticated accepted frontier.
+pub(crate) fn prove_managed_application_ready(
+    slot: &crate::state::GraphSlot,
+    largest_page_path: Option<&str>,
+) -> Result<ManagedReadinessReceipt, String> {
+    let started = Instant::now();
+    let handle = active_handle(slot)?;
+    let inventory_started = Instant::now();
+    let pages = match handle
+        .application_page_inventory()
+        .map_err(|error| format!("managed readiness page inventory failed: {error}"))?
+    {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        SyncApplicationPageInventoryOutcome::Deferred { .. } => {
+            return Err("managed readiness page inventory remained deferred".into())
+        }
+    };
+    let inventory_ms = inventory_started.elapsed().as_millis() as u64;
+    let mut sampled_paths = Vec::new();
+    if let Some(page) = pages.first() {
+        sampled_paths.push(page.rel_path.clone());
+    }
+    if let Some(path) = largest_page_path
+        .filter(|path| pages.iter().any(|page| page.rel_path == *path))
+        .filter(|path| !sampled_paths.iter().any(|sample| sample == path))
+    {
+        sampled_paths.push(path.to_owned());
+    }
+    let sample_started = Instant::now();
+    for path in &sampled_paths {
+        match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath { path: path.clone() },
+            })
+            .map_err(|error| format!("managed readiness representative page failed: {error}"))?
+        {
+            SyncApplicationPageLoadOutcome::Loaded { .. } => {}
+            SyncApplicationPageLoadOutcome::Missing { .. }
+            | SyncApplicationPageLoadOutcome::Ambiguous
+            | SyncApplicationPageLoadOutcome::Deferred { .. } => {
+                return Err("managed readiness could not open its representative page".into())
+            }
+        }
+    }
+    let receipt = ManagedReadinessReceipt {
+        page_count: pages.len(),
+        sampled_paths,
+        inventory_ms,
+        sample_load_ms: sample_started.elapsed().as_millis() as u64,
+        total_ms: started.elapsed().as_millis() as u64,
+    };
+    crate::debug::diag(format!("managed readiness proved: {receipt:?}"));
+    Ok(receipt)
+}
+
+fn sparse_v2_status_for_observation(
+    slot: &crate::state::GraphSlot,
+    snapshot: SyncRuntimeStatusSnapshot,
+) -> Result<SparseV2StatusDto, String> {
+    let binding = slot
+        .sparse_binding()
+        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?;
+    let cancel_reason =
+        cancel_warning_for_observation(binding, &slot.root_key.join(".tine-sync/v2"), &snapshot);
+    let mut status =
+        SparseV2StatusDto::from_binding_observation(binding, slot.binding_generation, snapshot);
+    status.can_cancel = true;
+    status.cancel_reason = cancel_reason;
+    Ok(status)
+}
+
+fn move_outcome_episode_id(outcome: &SyncApplicationMoveSubtreesOutcome) -> &str {
+    match outcome {
+        SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. }
+        | SyncApplicationMoveSubtreesOutcome::NoCommit { episode_id, .. }
+        | SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, .. } => episode_id,
+    }
+}
+
+fn move_recovery_result(
+    previous_binding_generation: u64,
+    slot: &crate::state::GraphSlot,
+    expected_episode_id: &str,
+    outcome: SyncApplicationMoveSubtreesOutcome,
+    snapshot: SyncRuntimeStatusSnapshot,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    if move_outcome_episode_id(&outcome) != expected_episode_id {
+        return Err("managed cross-page move recovery returned a different episode".into());
+    }
+    if snapshot.lifecycle != SyncRuntimeLifecycle::Active {
+        return Err(
+            "managed cross-page move recovery requires process reopen after a terminal runtime"
+                .into(),
+        );
+    }
+    let status = sparse_v2_status_for_observation(slot, snapshot)?;
+    let application_page_admission = status.application_page_admission.clone();
+    Ok(
+        crate::commands::ManagedApplicationMoveSubtreesRecoveryResult {
+            previous_binding_generation,
+            binding_generation: slot.binding_generation,
+            status,
+            application_page_admission,
+            episode_id: expected_episode_id.to_owned(),
+            outcome,
+        },
+    )
+}
+
+fn recover_managed_application_subtrees_with(
+    state: &crate::state::AppState,
+    label: &str,
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
+    if predecessor.root_key != root {
+        return Err("graph changed while move recovery waited for its transition lane".into());
+    }
+    let action = predecessor
+        .sparse_binding()
+        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?
+        .action();
+
+    match action {
+        SparseV2BindingAction::ReturnRetained => {
+            let handle = predecessor.sparse_runtime().ok_or_else(|| {
+                "managed cross-page move recovery has no retained actor".to_owned()
+            })?;
+            let observation = handle
+                .resolve_application_move_subtrees(request.clone())
+                .map_err(|error| error.to_string())?;
+            let result = move_recovery_result(
+                binding_generation,
+                &predecessor,
+                &request.episode_id,
+                observation.move_outcome,
+                observation.runtime_snapshot,
+            )?;
+            crate::state::poke_watcher(state);
+            Ok(result)
+        }
+        SparseV2BindingAction::ReopenActive => {
+            let (binding, graph_meta) = reopen(&root)?;
+            let successor = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                binding,
+                root.clone(),
+                graph_meta,
+            ));
+            let observation = successor
+                .sparse_runtime()
+                .ok_or_else(|| {
+                    "managed cross-page move recovery could not reopen an active actor".to_owned()
+                })?
+                .resolve_application_move_subtrees(request.clone())
+                .map_err(|error| error.to_string())?;
+            let result = move_recovery_result(
+                binding_generation,
+                &successor,
+                &request.episode_id,
+                observation.move_outcome,
+                observation.runtime_snapshot,
+            )?;
+
+            state.storage_supervisor.publish_managed_maintenance(|| {
+                state.graphs.write().unwrap().replace_if_current(
+                    label,
+                    binding_generation,
+                    &root,
+                    Arc::clone(&successor),
+                )
+            })?;
+            crate::state::poke_watcher(state);
+            Ok(result)
+        }
+        SparseV2BindingAction::ActivateOrResume => {
+            Err("managed cross-page move recovery cannot activate an incomplete runtime".into())
+        }
+    }
+}
+
+pub(crate) fn recover_managed_application_subtrees_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let state = app.state::<crate::state::AppState>();
+    recover_managed_application_subtrees_with(&state, label, binding_generation, request, |root| {
+        let record = state
+            .sync_runtime
+            .binding_record(app, root)?
+            .ok_or_else(|| "Tine-managed storage setup is missing.".to_owned())?;
+        let graph_meta = SyncRuntimeFacade::graph_meta(&record);
+        let binding = state.sync_runtime.open_record(app, &record)?;
+        Ok((binding, graph_meta))
+    })
 }
 
 #[tauri::command]
@@ -1305,12 +1950,71 @@ fn activate_sparse_v2_blocking(
     label: &str,
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
+    let state = app.state::<crate::state::AppState>();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ActivateManaged,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("managed activation was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    transition.advance(StorageTransitionPhase::ActivatingManaged)?;
+    let prepared = match prepare_sparse_v2_activation(app, label, binding_generation, root) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            transition.fail("activation_failed");
+            return Err(error);
+        }
+    };
+    let PreparedActivationOutcome::Candidate(candidate) = prepared else {
+        let PreparedActivationOutcome::AlreadyCurrent(status) = prepared else {
+            unreachable!()
+        };
+        transition.succeed(StableStorageMode::Managed)?;
+        return Ok(status);
+    };
+    let state = app.state::<crate::state::AppState>();
+    let (published, status) =
+        transition.publish(|| publish_managed_candidate(app, &state, label, candidate))?;
+    published.succeed(StableStorageMode::Managed)?;
+    Ok(status)
+}
+
+struct PreparedManagedCandidate {
+    predecessor: Arc<crate::state::GraphSlot>,
+    replacement: Arc<crate::state::GraphSlot>,
+    record: SparseV2ActivationRecord,
+    readiness: ManagedReadinessReceipt,
+    direct_source_generation: Option<u64>,
+}
+
+enum PreparedActivationOutcome {
+    AlreadyCurrent(SparseV2StatusDto),
+    Candidate(PreparedManagedCandidate),
+}
+
+fn prepare_sparse_v2_activation(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    root: PathBuf,
+) -> Result<PreparedActivationOutcome, String> {
     let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let _transition = state.graph_load.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
-    let root = slot.root_key.clone();
+    if slot.root_key != root {
+        return Err("graph changed while activation waited for its transition lane".into());
+    }
 
     if let Some(binding) = slot.sparse_binding() {
         let action = binding.action();
@@ -1324,7 +2028,7 @@ fn activate_sparse_v2_blocking(
                 "sparse-v2 retained activation completed after {} ms: {result:?}",
                 started.elapsed().as_millis()
             ));
-            return result;
+            return result.map(PreparedActivationOutcome::AlreadyCurrent);
         }
         let record = state
             .sync_runtime
@@ -1332,15 +2036,18 @@ fn activate_sparse_v2_blocking(
             .ok_or("Tine-managed storage setup is missing.")?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
         let core_started = Instant::now();
-        let binding = match action {
+        let prepared = match action {
             SparseV2BindingAction::ReopenActive => state.sync_runtime.open_record(app, &record)?,
-            SparseV2BindingAction::ActivateOrResume => activate_record_with_diagnostics(
-                &state.sync_runtime,
-                app,
-                label,
-                binding_generation,
-                &record,
-            )?,
+            SparseV2BindingAction::ActivateOrResume => {
+                activate_record_with_diagnostics(
+                    &state.sync_runtime,
+                    app,
+                    label,
+                    binding_generation,
+                    &record,
+                )?
+                .binding
+            }
             SparseV2BindingAction::ReturnRetained => {
                 unreachable!("retained bindings return before replacement")
             }
@@ -1351,24 +2058,27 @@ fn activate_sparse_v2_blocking(
             binding.availability()
         ));
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-            binding, root, graph_meta,
+            prepared, root, graph_meta,
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
-        crate::state::poke_watcher(&state);
-        let result = sparse_v2_status_for_slot(&replacement);
+        let readiness = prove_managed_application_ready(&replacement, None)?;
         crate::debug::diag(format!(
-            "sparse-v2 retained activation published after {} ms: {result:?}",
+            "sparse-v2 retained activation candidate ready after {} ms: {readiness:?}",
             started.elapsed().as_millis()
         ));
-        return result;
+        return Ok(PreparedActivationOutcome::Candidate(
+            PreparedManagedCandidate {
+                predecessor: slot,
+                replacement,
+                record,
+                readiness,
+                direct_source_generation: None,
+            },
+        ));
     }
 
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
+    let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
     let record = state
         .sync_runtime
@@ -1378,62 +2088,13 @@ fn activate_sparse_v2_blocking(
         started.elapsed().as_millis()
     ));
 
-    slot.begin_legacy_retirement()?;
-    crate::debug::diag("sparse-v2 legacy authority retirement started");
-    let removed = state.graphs.write().unwrap().remove(label);
-    if removed
-        .as_ref()
-        .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
-    {
-        slot.cancel_legacy_retirement()?;
-        return Err(
-            "The graph changed while Tine-managed storage was being set up. Retry setup.".into(),
-        );
-    }
-    crate::state::poke_watcher(&state);
-
-    if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
-        crate::debug::diag(format!(
-            "sparse-v2 legacy authority drain failed after {} ms: {error}",
-            started.elapsed().as_millis()
-        ));
-        slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
-        return Err(format!(
-            "Tine-managed storage setup can be retried: {error}"
-        ));
-    }
     crate::debug::diag(format!(
-        "sparse-v2 legacy authority drained after {} ms",
-        started.elapsed().as_millis()
-    ));
-
-    if let Err(error) = state.sync_runtime.persist_binding_record(app, &record) {
-        crate::debug::diag(format!(
-            "sparse-v2 private binding persistence failed after {} ms: {error}",
-            started.elapsed().as_millis()
-        ));
-        slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
-        return Err(error);
-    }
-    crate::debug::diag(format!(
-        "sparse-v2 private binding persisted after {} ms; starting core bootstrap",
+        "sparse-v2 private candidate prepared after {} ms; starting core bootstrap while Direct Files continues serving",
         started.elapsed().as_millis()
     ));
 
     let core_started = Instant::now();
-    let binding = activate_record_with_diagnostics(
+    let prepared = activate_record_with_diagnostics(
         &state.sync_runtime,
         app,
         label,
@@ -1443,23 +2104,125 @@ fn activate_sparse_v2_blocking(
     crate::debug::diag(format!(
         "sparse-v2 core bootstrap completed after {} ms: availability={:?}",
         core_started.elapsed().as_millis(),
-        binding.availability()
+        prepared.binding.availability()
     ));
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-        binding, root, graph_meta,
+        prepared.binding,
+        root.clone(),
+        graph_meta.clone(),
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state);
-    let result = sparse_v2_status_for_slot(&replacement);
+    let readiness =
+        prove_managed_application_ready(&replacement, prepared.largest_page_path.as_deref())?;
     crate::debug::diag(format!(
-        "sparse-v2 fresh activation published after {} ms: {result:?}",
+        "sparse-v2 fresh activation candidate ready after {} ms: {readiness:?}",
         started.elapsed().as_millis()
     ));
-    result
+    Ok(PreparedActivationOutcome::Candidate(
+        PreparedManagedCandidate {
+            predecessor: slot,
+            replacement,
+            record,
+            readiness,
+            direct_source_generation: Some(direct_source_generation),
+        },
+    ))
+}
+
+fn publish_managed_candidate(
+    app: &tauri::AppHandle,
+    state: &crate::state::AppState,
+    label: &str,
+    candidate: PreparedManagedCandidate,
+) -> Result<SparseV2StatusDto, String> {
+    let record = candidate.record.clone();
+    publish_managed_candidate_with(
+        state,
+        label,
+        candidate,
+        || state.sync_runtime.persist_binding_record(app, &record),
+        |root| {
+            publish_direct_selection(app, root, "managed publication lost its exact predecessor")
+        },
+    )
+}
+
+fn publish_managed_candidate_with(
+    state: &crate::state::AppState,
+    label: &str,
+    candidate: PreparedManagedCandidate,
+    persist_successor: impl FnOnce() -> Result<(), String>,
+    restore_direct_selection: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<SparseV2StatusDto, String> {
+    let current = state
+        .graphs
+        .read()
+        .unwrap()
+        .slot(label)
+        .ok_or_else(|| "stale-graph-binding".to_owned())?;
+    if current.binding_generation != candidate.predecessor.binding_generation
+        || current.root_key != candidate.predecessor.root_key
+    {
+        return Err(
+            "The graph changed while the managed candidate was prepared. Retry setup.".into(),
+        );
+    }
+    // Acquire the predecessor's graph-text mutation authority before taking
+    // the registry write lock.  This both avoids a lock-order inversion and
+    // keeps the source generation stable through selector + slot publication.
+    let source_graph = candidate
+        .direct_source_generation
+        .map(|_| current.legacy_graph())
+        .transpose()?;
+    let _source_publication = if let Some(expected_generation) = candidate.direct_source_generation
+    {
+        let graph = source_graph
+            .as_ref()
+            .expect("a Direct source generation always retains its graph lease");
+        Some(
+            graph
+                .lock_graph_text_identity_publication(expected_generation)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "The Markdown/Org graph changed while managed storage was being prepared. Direct Files remains active; retry setup.".to_owned())?,
+        )
+    } else {
+        None
+    };
+
+    let mut graphs = state.graphs.write().unwrap();
+    let current = graphs
+        .slot(label)
+        .ok_or_else(|| "stale-graph-binding".to_owned())?;
+    if current.binding_generation != candidate.predecessor.binding_generation
+        || current.root_key != candidate.predecessor.root_key
+    {
+        return Err(
+            "The graph changed while the managed candidate was prepared. Retry setup.".into(),
+        );
+    }
+    persist_successor()?;
+    if let Err(error) = graphs.replace_if_current(
+        label,
+        candidate.predecessor.binding_generation,
+        &candidate.predecessor.root_key,
+        Arc::clone(&candidate.replacement),
+    ) {
+        let rollback = restore_direct_selection(&candidate.predecessor.root_key);
+        return Err(match rollback {
+            Ok(()) => format!("managed publication was superseded: {error}"),
+            Err(rollback) => format!(
+                "managed publication was superseded ({error}) and Direct Files selection could not be restored ({rollback})"
+            ),
+        });
+    }
+    drop(graphs);
+    crate::state::poke_watcher(state);
+    crate::debug::diag(format!(
+        "managed candidate published once: predecessor_generation={}, successor_generation={}, readiness={:?}",
+        candidate.predecessor.binding_generation,
+        candidate.replacement.binding_generation,
+        candidate.readiness,
+    ));
+    sparse_v2_status_for_slot(&candidate.replacement)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1473,6 +2236,19 @@ pub(crate) struct SparseV2CancelResult {
 /// in-app Direct Files return.  The caller's attempt is validated at the
 /// mutation boundary, not trusted as storage authority or reflected to the UI.
 pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
+
+/// A binding file from a schema before the current one is pre-0.7 state.
+/// Undecodable JSON is NOT superseded: a current-format file that fails to
+/// parse is corruption and must keep failing loudly.
+fn binding_bytes_are_superseded(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(BINDING_SCHEMA_VERSION))
+}
 
 fn archive_private_root(
     private_root: &Path,
@@ -1527,6 +2303,18 @@ enum ProviderNamespaceArchive {
 /// namespace, so archiving only private app-data would leave a delayed
 /// lockout.  This is a same-filesystem rename, never a delete or copy.
 fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespaceArchive, String> {
+    archive_graph_provider_namespace_with(graph_root, |shared| {
+        matches!(
+            inspect_shared_enrollment_for_cold_discovery(shared),
+            Ok(Some(_))
+        )
+    })
+}
+
+fn archive_graph_provider_namespace_with(
+    graph_root: &Path,
+    joinable: impl FnOnce(&Path) -> bool,
+) -> Result<ProviderNamespaceArchive, String> {
     let source = graph_root.join(".tine-sync/v2");
     let metadata = match std::fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
@@ -1541,6 +2329,19 @@ fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespa
     };
     if metadata.file_type().is_symlink() {
         return Err("Graph-local managed-storage state is a symbolic link, so it could not be archived safely.".into());
+    }
+    // A COMPLETE provider tree is the other device's live enrollment, and this
+    // folder is synced: archiving it here removes the descriptor from the
+    // device that is still sharing, which is how Martin's graph ended up with
+    // two `recovery/v2-*` archives and no `v2` at all. The archive exists only
+    // to stop an UNCLAIMED namespace from locking a later Direct Files open
+    // out, and a joinable tree does not — `refuse_unclaimed_sparse_archive`
+    // admits it and the panel offers Join beside it.
+    if joinable(&source.join("shared")) {
+        crate::debug::diag(
+            "sparse-v2 direct-files return: phase=graph_provider; outcome=preserved_joinable_peer_evidence",
+        );
+        return Ok(ProviderNamespaceArchive::Absent);
     }
     let tine_sync = source
         .parent()
@@ -1576,6 +2377,21 @@ fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespa
         source,
         destination,
     })
+}
+
+/// Adoption's counterpart to `archive_graph_provider_namespace`: it preserves
+/// `<graph>/.tine-sync/v2` exactly where it is.
+///
+/// The graceful Direct Files return archives that subtree because an unclaimed
+/// v2 namespace would otherwise lock a later Direct Files restart out. Adoption
+/// is not staying in Direct Files: the subtree it would archive is the OTHER
+/// device's shared evidence, and archiving it would delete the descriptor the
+/// second half of adoption is about to read — and, under a folder-syncing
+/// tool, propagate that removal back to the device that is sharing.
+fn preserve_graph_provider_namespace(
+    _graph_root: &Path,
+) -> Result<ProviderNamespaceArchive, String> {
+    Ok(ProviderNamespaceArchive::Absent)
 }
 
 fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result<(), String> {
@@ -1649,27 +2465,62 @@ fn shutdown_for_direct_files_escape(
     }
 }
 
-fn publish_retryable_sparse_slot(
+fn shutdown_for_graceful_direct_files(
+    slot: &crate::state::GraphSlot,
+) -> Result<DirectFilesShutdown, String> {
+    let Some(handle) = slot.sparse_runtime() else {
+        return Ok(DirectFilesShutdown::Clean);
+    };
+    match handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => Ok(DirectFilesShutdown::Clean),
+        Ok(SyncShutdownOutcome::Terminal(snapshot)) => Err(format!(
+            "Tine-managed storage could not confirm a safe projection before returning to Direct Files: {}. Use the emergency return if you accept that managed operations may be newer than Markdown.",
+            snapshot
+                .detail
+                .unwrap_or_else(|| "the managed actor reached a terminal state".into())
+        )),
+        Err(error) => Err(format!(
+            "Tine-managed storage could not drain safely before returning to Direct Files: {error}. Use the emergency return if you accept that managed operations may be newer than Markdown."
+        )),
+    }
+}
+
+fn publish_stopped_managed_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
     root_key: PathBuf,
     graph_meta: GraphMeta,
     detail: String,
+    transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
 ) -> Result<Arc<crate::state::GraphSlot>, String> {
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         retryable_binding("local_active", detail),
         root_key,
         graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(state);
+    commit_transition(transition, || {
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label.to_string(), Arc::clone(&replacement))?;
+        crate::state::poke_watcher(state);
+        Ok(())
+    })?;
     Ok(replacement)
 }
 
+fn commit_transition<T>(
+    transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
+    publish: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    match transition {
+        Some(transition) => transition.commit_recovery_step(publish),
+        None => publish(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     state: &crate::state::AppState,
     label: &str,
@@ -1679,7 +2530,10 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     approved_assets: Option<&Path>,
     shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    archive_provider: impl FnOnce(&Path) -> Result<ProviderNamespaceArchive, String>,
     publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+    transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
+    after_shutdown: impl FnOnce(&DirectFilesShutdown) -> Result<(), String>,
 ) -> Result<SparseV2CancelResult, String> {
     slot.sparse_binding()
         .ok_or("This graph is already using Direct files.")?;
@@ -1688,7 +2542,9 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     // learn a path we already own.
     let direct_root = slot.root_key.clone();
     let graph_meta = slot.graph_meta();
-    let removed = state.graphs.write().unwrap().remove(label);
+    let removed = commit_transition(transition, || {
+        Ok(state.graphs.write().unwrap().remove(label))
+    })?;
     if removed.is_some() {
         crate::state::poke_watcher(state);
     }
@@ -1696,12 +2552,15 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         current.binding_generation != slot.binding_generation || current.root_key != slot.root_key
     }) {
         if let Some(current) = removed {
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), current)?;
-            crate::state::poke_watcher(state);
+            commit_transition(transition, || {
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind(label.to_string(), current)?;
+                crate::state::poke_watcher(state);
+                Ok(())
+            })?;
         }
         return Err("The graph changed while returning to Direct files. Try again.".into());
     }
@@ -1711,37 +2570,42 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         Err(error) => {
             // No archive has started; the live slot remains usable when a
             // force-stop itself could not be completed.
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), slot)
-                .map_err(|restore| {
-                    format!(
-                        "{error}; Tine-managed storage could not be restored in memory: {restore}"
-                    )
-                })?;
-            crate::state::poke_watcher(state);
+            commit_transition(transition, || {
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind(label.to_string(), slot)
+                    .map_err(|restore| {
+                        format!(
+                            "{error}; Tine-managed storage could not be restored in memory: {restore}"
+                        )
+                    })?;
+                crate::state::poke_watcher(state);
+                Ok(())
+            })?;
             return Err(error);
         }
     };
+    after_shutdown(&shutdown)?;
 
     // `clean_shutdown` consumes the live actor even when it succeeds.  If a
     // later archive step fails, re-publishing that old slot would advertise a
     // dead handle.  Publish a fresh no-handle retry route, then release every
     // reference to the retired actor before touching its storage.
-    let retryable = publish_retryable_sparse_slot(
+    let retryable = publish_stopped_managed_recovery_slot(
         state,
         label,
         direct_root.clone(),
         graph_meta,
         shutdown.retry_detail(),
+        transition,
     )?;
     let retry_generation = retryable.binding_generation;
     drop(removed);
     drop(slot);
 
-    let provider_archive = match archive_graph_provider_namespace(&direct_root) {
+    let provider_archive = match archive_provider(&direct_root) {
         Ok(archive) => archive,
         Err(error) => return Err(error),
     };
@@ -1753,7 +2617,9 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         return Err(reason);
     }
 
-    let binding_generation = publish_direct(&direct_root, approved_assets).map_err(|error| {
+    let binding_generation = commit_transition(transition, || {
+        publish_direct(&direct_root, approved_assets)
+    }).map_err(|error| {
         // Before Direct publication the retryable no-actor slot remains the
         // only authority.  Remove only that slot; if a later lifecycle step
         // already published Direct Files, leave its usable binding intact.
@@ -1804,6 +2670,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
         approved_assets,
         shutdown,
         archive,
+        archive_graph_provider_namespace,
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
@@ -1821,6 +2688,40 @@ fn cancel_sparse_v2_at_paths_with_archive(
             crate::state::poke_watcher(state);
             Ok(binding_generation)
         },
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// The path-level shape of adoption's first half, wired to exactly the
+/// production provider-namespace decision. `set_aside_managed_history_for_adoption`
+/// composes the same call with the supervisor guard around it.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn set_aside_managed_history_at_paths(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+) -> Result<SparseV2CancelResult, String> {
+    cancel_sparse_v2_at_paths_with_archive_and_publish(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown,
+        archive,
+        preserve_graph_provider_namespace,
+        publish_direct,
+        None,
+        |_| Ok(()),
     )
 }
 
@@ -1845,28 +2746,29 @@ fn cancel_sparse_v2_at_paths(
     )
 }
 
-fn cold_binding_record_at(
-    private_root: &Path,
-    root_key: &Path,
-) -> Result<SparseV2ActivationRecord, String> {
+#[cfg(test)]
+fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<GraphMeta, String> {
     match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {
-        Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(
-            "No local Tine-managed storage recovery binding was found for this remembered graph. Nothing was changed."
-                .into(),
-        ),
-        Err(_) => Err(
-            "The local Tine-managed storage recovery binding is incomplete or unreadable. Nothing was changed."
-                .into(),
-        ),
+        Ok(Some(record)) => Ok(SyncRuntimeFacade::graph_meta(&record)),
+        // A second device is expected to have shared graph-local state before
+        // it has any private binding.  The explicit Direct Files escape also
+        // has to work when a failed setup left that private binding corrupt.
+        // The Markdown graph supplies the reservation metadata; both the
+        // private directory (if any) and the complete graph-local v2 namespace
+        // are still archived byte-for-byte before Direct Files is published.
+        Ok(None) | Err(_) => tine_core::model::Graph::open_checked(root_key)
+            .map(|graph| graph.meta())
+            .map_err(|error| {
+                format!(
+                    "Tine could not verify the Markdown/Org graph before returning to Direct files: {error}. Nothing was changed."
+                )
+            }),
     }
 }
 
-/// The caller must hold `graph_load`.  That lock serializes every graph-open,
-/// sparse activation, and Direct Files return.  The registry check below is
-/// therefore a quiescence proof, not a best-effort snapshot: an actor/open
-/// worker cannot acquire a target slot between this check and the no-actor
-/// recovery slot reservation.
+/// Legacy cold-return fixture retained only to exercise archival rollback.
+/// Production emergency return never reserves a managed slot.
+#[cfg(test)]
 fn reserve_cold_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
@@ -1907,11 +2809,9 @@ fn reserve_cold_recovery_slot(
     Ok(slot)
 }
 
-/// Resolve the exact slot that appeared while a cold-start recovery request was
-/// waiting for `graph_load`.  Callers hold that lock, so this is the mutation
-/// boundary rather than a stale preflight: an exact managed slot is safe to
-/// drain and archive through the established live-slot path; any other slot
-/// means the recovery request has been superseded.
+/// Legacy cold-return fixture retained only to exercise archival rollback.
+/// Native operation IDs own production supersession.
+#[cfg(test)]
 fn exact_live_cold_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
@@ -1936,6 +2836,7 @@ fn exact_live_cold_recovery_slot(
     Ok(Some(slot))
 }
 
+#[cfg(test)]
 fn cancel_sparse_v2_cold_at_paths_with_archive(
     state: &crate::state::AppState,
     label: &str,
@@ -1957,15 +2858,8 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
             archive,
         );
     }
-    // This is deliberately before the reservation: a missing/corrupt binding
-    // is a persistent safe refusal, never permission to archive either side.
-    let record = cold_binding_record_at(private_root, &root_key)?;
-    let slot = reserve_cold_recovery_slot(
-        state,
-        label,
-        root_key,
-        SyncRuntimeFacade::graph_meta(&record),
-    )?;
+    let graph_meta = cold_recovery_graph_meta(private_root, &root_key)?;
+    let slot = reserve_cold_recovery_slot(state, label, root_key, graph_meta)?;
     cancel_sparse_v2_at_paths_with_archive(
         state,
         label,
@@ -1978,49 +2872,7 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
     )
 }
 
-fn cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
-    state: &crate::state::AppState,
-    label: &str,
-    root_key: PathBuf,
-    private_root: &Path,
-    recovery_root: &Path,
-    approved_assets: Option<&Path>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
-) -> Result<SparseV2ColdCancelResult, String> {
-    if let Some(slot) = exact_live_cold_recovery_slot(state, label, &root_key)? {
-        return cancel_sparse_v2_at_paths_with_archive_and_publish(
-            state,
-            label,
-            slot,
-            private_root,
-            recovery_root,
-            approved_assets,
-            shutdown_for_direct_files_escape,
-            archive,
-            publish_direct,
-        );
-    }
-    let record = cold_binding_record_at(private_root, &root_key)?;
-    let slot = reserve_cold_recovery_slot(
-        state,
-        label,
-        root_key,
-        SyncRuntimeFacade::graph_meta(&record),
-    )?;
-    cancel_sparse_v2_at_paths_with_archive_and_publish(
-        state,
-        label,
-        slot,
-        private_root,
-        recovery_root,
-        approved_assets,
-        shutdown_for_direct_files_escape,
-        archive,
-        publish_direct,
-    )
-}
-
+#[cfg(test)]
 fn cancel_sparse_v2_cold_at_paths(
     state: &crate::state::AppState,
     label: &str,
@@ -2043,82 +2895,96 @@ fn cancel_sparse_v2_cold_at_paths(
 #[tauri::command]
 pub(crate) async fn cancel_sparse_v2_cold(
     path: String,
-    attempt: u64,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<SparseV2ColdCancelResult, String> {
     let label = window.label().to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        cancel_sparse_v2_cold_blocking(&app, &label, path, attempt)
-    })
-    .await
-    .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
+    tauri::async_runtime::spawn_blocking(move || cancel_sparse_v2_cold_blocking(&app, &label, path))
+        .await
+        .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
 }
 
 fn cancel_sparse_v2_cold_blocking(
     app: &tauri::AppHandle,
     label: &str,
     path: String,
-    attempt: u64,
 ) -> Result<SparseV2ColdCancelResult, String> {
-    // Canonicalization is read-only.  It happens before `graph_load` only to
-    // compare the submitted target with native authority; every state/storage
-    // mutation remains inside the serialized transition below.
+    // Canonicalization is read-only. Emergency return intentionally does not
+    // wait for the managed root lane: its first durable mutation selects the
+    // current Markdown tree as Direct Files, and stale managed workers are
+    // barred from later publication by the supervisor operation ID.
     let submitted_root = crate::state::canonical_graph_root(&path).map_err(|_| {
         "The selected recovery folder is unavailable. Retry graph lookup or choose another graph."
             .to_string()
     })?;
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let operation_id =
+        state
+            .storage_supervisor
+            .begin_emergency_return(app, label, submitted_root.clone())?;
+    let mut failure_code = "target_validation_failed";
+    let result = (|| {
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::ValidatingTarget,
+        )?;
+        failure_code = "direct_selection_failed";
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::QuarantiningManagedSelection,
+        )?;
+        publish_direct_selection(app, &submitted_root, "emergency_return")?;
 
-    // Re-read both the native attempt and exact canonical target *after*
-    // acquiring the open lock.  A late result, picker, normal open, or another
-    // recovery action cannot turn a stale frontend token into archive authority.
-    let authorized_root = match state.authorized_startup_recovery_target(label, attempt) {
-        Ok(root) => root,
-        Err(_) if state.startup_recovery_attempt_is_current(label, attempt) => {
-            // A lookup watchdog is observational: it cannot let a locally
-            // cached path archive anything by itself.  The only timeout route
-            // independently rereads native settings under this same lock and
-            // accepts an exact canonical remembered/known graph only.
-            if !crate::settings::startup_recovery_target_is_remembered(app, &submitted_root) {
-                return Err(
-                    "Tine could not verify this recovery target in its remembered graphs. Nothing was changed; retry graph lookup or choose another graph."
-                        .into(),
-                );
-            }
-            state.authorize_startup_recovery_target(label, attempt, Some(submitted_root.clone()));
-            submitted_root.clone()
-        }
-        Err(error) => return Err(error),
-    };
-    if authorized_root != submitted_root {
-        return Err(
-            "The selected recovery target no longer matches Tine's remembered graph. Retry graph lookup before returning to Direct files."
-                .into(),
-        );
-    }
-    let private_root = sparse_private_root(app, &submitted_root)?;
-    let recovery_root = sparse_recovery_root(app)?;
-    let approved_assets = crate::settings::approved_external_assets(app, &submitted_root);
-    cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
-        &state,
-        label,
-        submitted_root,
-        &private_root,
-        &recovery_root,
-        approved_assets.as_deref(),
-        archive_private_root,
-        |direct_root, _| {
-            crate::graph::open_and_publish_direct_files(
+        failure_code = "direct_open_failed";
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::PublishingDirect,
+        )?;
+        let prepared = crate::graph::prepare_direct_files_open(app, submitted_root.clone())
+            .map_err(|error| {
+                format!(
+                    "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not open: {error}. Retry opening this graph or choose another graph."
+                )
+            })?;
+        state.storage_supervisor.commit_if_current(operation_id, || {
+            crate::graph::publish_prepared_direct_files(app, label, &state, prepared)
+                .map_err(|error| {
+                    format!(
+                        "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not publish: {error}. Retry opening this graph or choose another graph."
+                    )
+                })
+        })
+    })();
+
+    match result {
+        Ok(direct) => {
+            state.storage_supervisor.finish_transition(
                 app,
-                label,
-                &state,
-                direct_root.to_path_buf(),
-            )
-            .map(|direct| direct.binding_generation)
-        },
-    )
+                operation_id,
+                StorageTransitionOutcome::Succeeded,
+                Some(StableStorageMode::Direct),
+                None,
+            )?;
+            Ok(SparseV2CancelResult {
+                binding_generation: direct.binding_generation,
+                status: SparseV2StatusDto::legacy(direct.binding_generation),
+                recovery_statement: "Direct Files is active from the current Markdown/Org tree. Managed-storage evidence was left untouched and may contain operations newer than Markdown; it will never be silently reopened or merged.".into(),
+            })
+        }
+        Err(error) => {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                operation_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some(failure_code.into()),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -2139,24 +3005,79 @@ fn cancel_sparse_v2_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2CancelResult, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_recovery_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ReturnGracefully,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("the graceful Direct Files return was superseded while waiting".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while return waited for its transition lane".into());
+    }
     let private_root = sparse_private_root(&app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(&app)?;
     let approved_assets = crate::settings::approved_external_assets(&app, &slot.root_key);
-    cancel_sparse_v2_at_paths(
+    transition.advance(StorageTransitionPhase::DrainingManaged)?;
+    let result = cancel_sparse_v2_at_paths_with_archive_and_publish(
         &state,
         label,
         slot,
         &private_root,
         &recovery_root,
         approved_assets.as_deref(),
-        shutdown_for_direct_files_escape,
-    )
+        shutdown_for_graceful_direct_files,
+        archive_private_root,
+        archive_graph_provider_namespace,
+        |direct_root, approved_assets| {
+            let graph =
+                tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                    .map_err(|error| error.to_string())?;
+            let replacement = Arc::new(crate::state::GraphSlot::new(
+                graph,
+                direct_root.to_path_buf(),
+            ));
+            let binding_generation = replacement.binding_generation;
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), replacement)?;
+            crate::state::poke_watcher(&state);
+            Ok(binding_generation)
+        },
+        Some(&transition),
+        |_| {
+            transition.advance(StorageTransitionPhase::ConfirmingProjection)?;
+            transition.advance(StorageTransitionPhase::PublishingDirect)
+        },
+    );
+    match result {
+        Ok(result) => {
+            transition.succeed(StableStorageMode::Direct)?;
+            Ok(result)
+        }
+        Err(error) => {
+            transition.fail("graceful_return_failed");
+            Err(error)
+        }
+    }
 }
 
-/// Publish the already-safe local archive into the single shared v2
-/// namespace, then reopen the same private device binding as SharedActive.
+/// Publish the already-safe local archive into the shared namespace. Core
+/// deliberately retires the local-only actor after committing the enrollment
+/// transition, so the Tauri composition must reopen that durable state and
+/// atomically replace the serving slot before reporting success.
 #[tauri::command]
 pub(crate) async fn prepare_sparse_v2_share(
     state: crate::state::GraphContext<'_>,
@@ -2175,44 +3096,98 @@ fn prepare_sparse_v2_share_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while share setup waited for its transition lane".into());
+    }
     let record = state
         .sync_runtime
-        .binding_record(&app, &slot.root_key)?
+        .binding_record(app, &root)?
         .ok_or("Tine-managed storage setup is missing.")?;
     active_handle(&slot)?
         .prepare_shared()
         .map_err(|error| error.to_string())?;
-    let binding = match state.sync_runtime.open_record(&app, &record) {
-        Ok(binding) => binding,
-        Err(error) => {
-            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-                retryable_binding("share_prepared", error.clone()),
-                slot.root_key.clone(),
-                SyncRuntimeFacade::graph_meta(&record),
-            ));
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), replacement)?;
-            crate::state::poke_watcher(&state);
-            return Err(error);
-        }
-    };
+    let candidate = prepare_reopened_managed_candidate(
+        app,
+        &state,
+        slot,
+        record,
+        "share enrollment runtime reopen",
+    )?;
+    publish_managed_candidate(app, &state, label, candidate)
+}
+
+/// The exact file a joining device is waiting for.
+pub(crate) fn shared_enrollment_descriptor_path(graph_root: &Path) -> PathBuf {
+    graph_root
+        .join(".tine-sync/v2/shared/outbox")
+        .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+}
+
+/// What a device that cannot find sync data should be told.
+///
+/// "This graph does not yet contain sync data from another device" is true and
+/// a dead end: it names neither what was looked for nor either thing the user
+/// can actually check. Both causes are ordinary — the other device has not
+/// finished its half, or the file-sync tool never carried `.tine-sync/`, which
+/// several exclude by default because it starts with a dot.
+fn shared_enrollment_not_here_yet(graph_root: &Path) -> String {
+    format!(
+        concat!(
+            "This graph does not yet contain sync data from another device.\n\n",
+            "Tine looked for {}.\n\n",
+            "Two things usually explain that. The other device may not have finished ",
+            "\"Set up sync with another device\" yet. Or your file-sync tool is not copying the ",
+            "hidden .tine-sync folder — several tools skip dot-directories unless you ",
+            "tell them not to.",
+        ),
+        shared_enrollment_descriptor_path(graph_root).display()
+    )
+}
+
+/// Reconstitute the sole application actor after a durable enrollment cut.
+/// `prepare_shared` and a completed `join_shared` intentionally stop their
+/// predecessor actor: continuing to serve that handle would mix two enrollment
+/// epochs. This helper therefore proves the replacement through ordinary page
+/// APIs before its caller publishes it with `replace_if_current`.
+fn prepare_reopened_managed_candidate(
+    app: &tauri::AppHandle,
+    state: &crate::state::AppState,
+    predecessor: Arc<crate::state::GraphSlot>,
+    record: SparseV2ActivationRecord,
+    stage: &str,
+) -> Result<PreparedManagedCandidate, String> {
+    let graph_meta = SyncRuntimeFacade::graph_meta(&record);
+    let binding = state
+        .sync_runtime
+        .open_record(app, &record)
+        .map_err(|error| {
+            let detail = format!("{stage} failed: {error}");
+            crate::debug::diag(&detail);
+            detail
+        })?;
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding,
-        slot.root_key.clone(),
-        SyncRuntimeFacade::graph_meta(&record),
+        predecessor.root_key.clone(),
+        graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state);
-    sparse_v2_status_for_slot(&replacement)
+    let readiness = prove_managed_application_ready(&replacement, None).map_err(|error| {
+        let detail = format!("{stage} readiness failed: {error}");
+        crate::debug::diag(&detail);
+        detail
+    })?;
+    Ok(PreparedManagedCandidate {
+        predecessor,
+        replacement,
+        record,
+        readiness,
+        direct_source_generation: None,
+    })
 }
 
 /// Explicitly retire the second device's legacy reader/watcher, derive its
@@ -2235,51 +3210,87 @@ fn join_sparse_v2_shared_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::JoinManaged,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("managed join was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    transition.advance(StorageTransitionPhase::JoiningManaged)?;
+    let prepared = match prepare_sparse_v2_join(app, label, binding_generation, root) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            transition.fail("join_failed");
+            return Err(error);
+        }
+    };
+    let PreparedActivationOutcome::Candidate(candidate) = prepared else {
+        let PreparedActivationOutcome::AlreadyCurrent(status) = prepared else {
+            unreachable!()
+        };
+        transition.succeed(StableStorageMode::Managed)?;
+        return Ok(status);
+    };
+    let state = app.state::<crate::state::AppState>();
+    let (published, status) =
+        transition.publish(|| publish_managed_candidate(app, &state, label, candidate))?;
+    published.succeed(StableStorageMode::Managed)?;
+    Ok(status)
+}
+
+fn prepare_sparse_v2_join(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    root: PathBuf,
+) -> Result<PreparedActivationOutcome, String> {
+    fn join_failure(stage: &str, error: impl std::fmt::Display) -> String {
+        let detail = error.to_string();
+        crate::debug::diag(format!(
+            "managed sync join failed: stage={stage}; detail={detail}"
+        ));
+        format!("managed sync join failed at {stage}: {detail}")
+    }
+
+    let state = app.state::<crate::state::AppState>();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while join waited for its transition lane".into());
+    }
     let descriptor =
-        inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))?
-            .ok_or("This graph does not yet contain sync data from another device.")?;
+        inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
+            .map_err(|error| join_failure("provider discovery", error))?
+            .ok_or_else(|| shared_enrollment_not_here_yet(&slot.root_key))?;
     if slot.sparse_binding().is_some() {
         let record = state
             .sync_runtime
-            .binding_record(app, &slot.root_key)?
+            .binding_record(app, &root)?
             .ok_or("Tine-managed storage setup is missing.")?;
         active_handle(&slot)?
             .join_shared(descriptor)
-            .map_err(|error| error.to_string())?;
-        let reopened = match state.sync_runtime.open_record(app, &record) {
-            Ok(binding) => binding,
-            Err(error) => {
-                let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-                    retryable_binding("shared_active", error.clone()),
-                    slot.root_key.clone(),
-                    SyncRuntimeFacade::graph_meta(&record),
-                ));
-                state
-                    .graphs
-                    .write()
-                    .unwrap()
-                    .bind(label.to_string(), replacement)?;
-                crate::state::poke_watcher(&state);
-                return Err(error);
-            }
-        };
-        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-            reopened,
-            slot.root_key.clone(),
-            SyncRuntimeFacade::graph_meta(&record),
-        ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
-        crate::state::poke_watcher(&state);
-        return sparse_v2_status_for_slot(&replacement);
+            .map_err(|error| join_failure("provider scan", error))?;
+        let candidate = prepare_reopened_managed_candidate(
+            app,
+            &state,
+            slot,
+            record,
+            "joined enrollment runtime reopen",
+        )?;
+        return Ok(PreparedActivationOutcome::Candidate(candidate));
     }
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
+    let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
     let record = SparseV2ActivationRecord::from_shared(
         &slot.root_key,
@@ -2288,120 +3299,318 @@ fn join_sparse_v2_shared_blocking(
         &descriptor,
     );
 
-    slot.begin_legacy_retirement()?;
-    let removed = state.graphs.write().unwrap().remove(label);
-    if removed
-        .as_ref()
-        .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
-    {
-        slot.cancel_legacy_retirement()?;
-        return Err("The graph changed while joining sync. Try again.".into());
-    }
-    crate::state::poke_watcher(&state);
-    if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
-        slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
-        return Err(format!("Joining sync can be retried: {error}"));
-    }
-    if let Err(error) = state.sync_runtime.persist_binding_record(app, &record) {
-        slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
-        return Err(error);
-    }
-    let activated = match state.sync_runtime.activate_record(app, &record) {
-        Ok(activated) => activated,
-        Err(error) => {
-            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-                SparseV2Binding {
-                    availability: SparseV2Availability::Retryable {
-                        stage: "activation_request".into(),
-                        detail: error.clone(),
-                    },
-                    handle: None,
-                },
-                slot.root_key.clone(),
-                graph_meta,
-            ));
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), replacement)?;
-            crate::state::poke_watcher(&state);
-            return Err(error);
-        }
-    };
-    let Some(handle) = activated.handle() else {
+    let activated = activate_record_with_diagnostics(
+        &state.sync_runtime,
+        app,
+        label,
+        binding_generation,
+        &record,
+    )
+    .map_err(|error| join_failure("local activation", error))?;
+    let Some(handle) = activated.binding.handle() else {
         let detail = format!(
             "join bootstrap did not reach LocalActive: {:?}",
-            activated.availability()
+            activated.binding.availability()
         );
-        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-            activated,
-            slot.root_key.clone(),
-            graph_meta,
-        ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), replacement)?;
-        crate::state::poke_watcher(&state);
         return Err(detail);
     };
-    if let Err(error) = handle.join_shared(descriptor) {
-        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-            activated,
-            slot.root_key.clone(),
-            graph_meta,
-        ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), replacement)?;
-        crate::state::poke_watcher(&state);
-        return Err(error.to_string());
-    }
-    let binding = match state.sync_runtime.open_record(app, &record) {
-        Ok(binding) => binding,
-        Err(error) => {
-            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-                retryable_binding("shared_active", error.clone()),
-                slot.root_key.clone(),
-                SyncRuntimeFacade::graph_meta(&record),
-            ));
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), replacement)?;
-            crate::state::poke_watcher(&state);
-            return Err(error);
-        }
-    };
+    handle
+        .join_shared(descriptor)
+        .map_err(|error| join_failure("provider scan", error))?;
+    let binding = state
+        .sync_runtime
+        .open_record(app, &record)
+        .map_err(|error| join_failure("runtime reopen", error))?;
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding,
         slot.root_key.clone(),
         graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state);
-    sparse_v2_status_for_slot(&replacement)
+    let readiness =
+        prove_managed_application_ready(&replacement, activated.largest_page_path.as_deref())?;
+    Ok(PreparedActivationOutcome::Candidate(
+        PreparedManagedCandidate {
+            predecessor: slot,
+            replacement,
+            record,
+            readiness,
+            direct_source_generation: Some(direct_source_generation),
+        },
+    ))
+}
+
+/// How this device's own managed identity stands to the graph another device
+/// is sharing.
+///
+/// The three identities are minted together by one activation
+/// (`SparseV2ActivationRecord::new`) and copied together from a descriptor
+/// (`from_shared`), so in practice they either all agree or all differ. A
+/// mixture is evidence that one side's identity was rewritten or truncated,
+/// which is exactly the state adoption must not guess about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedGraphRelation {
+    /// Every identity matches: this device already holds the shared lineage.
+    SameGraph,
+    /// No identity matches: two independent activations of the same folder.
+    Independent,
+    /// Some identities match and some do not.
+    PartialLineage,
+}
+
+fn shared_graph_relation(
+    local: (WorkspaceId, LineageDigest, DocumentId),
+    shared: (WorkspaceId, LineageDigest, DocumentId),
+) -> SharedGraphRelation {
+    let matches = [
+        local.0 == shared.0,
+        local.1 == shared.1,
+        local.2 == shared.2,
+    ];
+    if matches.iter().all(|matched| *matched) {
+        return SharedGraphRelation::SameGraph;
+    }
+    if matches.iter().all(|matched| !*matched) {
+        return SharedGraphRelation::Independent;
+    }
+    SharedGraphRelation::PartialLineage
+}
+
+/// Both non-adoptable relations, said in the words the panel repeats.
+fn shared_graph_relation_refusal(relation: SharedGraphRelation) -> Option<&'static str> {
+    match relation {
+        SharedGraphRelation::Independent => None,
+        SharedGraphRelation::SameGraph => Some(
+            "This device's Tine-managed storage already holds the same history the other device is sharing, so there is nothing to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead.",
+        ),
+        SharedGraphRelation::PartialLineage => Some(
+            "This device's Tine-managed storage matches part of the shared graph's identity and not the rest, so Tine cannot tell which history is which. Nothing was changed. Let your file-sync tool finish delivering the hidden .tine-sync folder and try again; if it persists, return this device to Direct files and join from there.",
+        ),
+    }
+}
+
+/// Adoption abandons this device's own managed history. When that history is
+/// itself shared, abandoning it also abandons whatever other devices are
+/// joined to it, so adoption refuses instead of deciding that for them.
+fn shared_cut_refusal(shared_phase: Option<&str>) -> Option<&'static str> {
+    match shared_phase? {
+        "share_prepared" => Some(
+            "This device's Tine-managed storage has an unfinished sync cut of its own. Nothing was changed. Finish it with \"Retry setup\", or return this device to Direct files, before adopting another device's graph.",
+        ),
+        "joining" => Some(
+            "This device's Tine-managed storage is part-way through a join already. Nothing was changed. Let that join finish or fail first.",
+        ),
+        _ => Some(
+            "This device's Tine-managed storage is already shared with, or joined to, another device. Nothing was changed. Adopting a different graph would abandon that; return this device to Direct files first if that is what you want.",
+        ),
+    }
+}
+
+/// What adoption did, and where the predecessor went.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct SparseV2AdoptionResult {
+    status: SparseV2StatusDto,
+    binding_generation: u64,
+    /// The archived pre-adoption managed history, named in full. `None` only
+    /// when a failed or partially-created activation had retained nothing.
+    archive_location: Option<String>,
+    adoption_statement: String,
+}
+
+/// Where a set-aside managed history is archived. Stable, and knowable before
+/// the point of no return, which is why the panel can name it in the
+/// confirmation rather than only in the receipt.
+#[tauri::command]
+pub(crate) async fn sparse_v2_recovery_location(app: tauri::AppHandle) -> Result<String, String> {
+    sparse_recovery_root(&app).map(|root| root.display().to_string())
+}
+
+/// Adopt a graph another device is sharing on a device that already holds a
+/// managed graph of its own.
+///
+/// This is a composition, not a new storage operation: the graceful Direct
+/// Files return already archives this device's complete managed history under
+/// `sparse-v2-recovery`, and the Direct Files join branch already bootstraps a
+/// binding out of provider evidence. Adoption sequences exactly those two,
+/// with one difference that a literal "Return to Direct files, then Join"
+/// cannot express — the return must NOT archive `<graph>/.tine-sync/v2`,
+/// because that subtree is the other device's shared evidence and archiving it
+/// removes the very descriptor the join is about to read.
+///
+/// Each half is a complete supervisor transition with its own stable end mode.
+/// A crash between them therefore lands on Direct Files with the predecessor
+/// archived and the shared graph still joinable, which is a state the panel
+/// already offers a button for.
+#[tauri::command]
+pub(crate) async fn adopt_sparse_v2_shared(
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2AdoptionResult, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt_sparse_v2_shared_blocking(&app, &label, binding_generation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn adopt_sparse_v2_shared_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+) -> Result<SparseV2AdoptionResult, String> {
+    let state = app.state::<crate::state::AppState>();
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let root = slot.root_key.clone();
+    if slot.sparse_binding().is_none() {
+        return Err(
+            "This device is already using Direct files, so it has no Tine-managed storage history to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead."
+                .into(),
+        );
+    }
+    // An incomplete provider tree is "not yet", not a reason to start
+    // dismantling this device's own storage.
+    crate::graph::refuse_unclaimed_sparse_archive(&root)?;
+    let descriptor =
+        inspect_shared_enrollment_for_cold_discovery(&root.join(".tine-sync/v2/shared"))
+            .map_err(|error| format!("Couldn't read the shared sync data: {error}"))?
+            .ok_or_else(|| shared_enrollment_not_here_yet(&root))?;
+    let record = state
+        .sync_runtime
+        .binding_record(app, &root)?
+        .ok_or("Tine-managed storage setup is missing.")?;
+    let relation = shared_graph_relation(
+        (
+            record.workspace_id,
+            record.lineage_digest,
+            record.catalog_document_id,
+        ),
+        (
+            descriptor.workspace_id,
+            descriptor.lineage_digest,
+            descriptor.catalog_document_id,
+        ),
+    );
+    if let Some(refusal) = shared_graph_relation_refusal(relation) {
+        return Err(refusal.into());
+    }
+    let status = sparse_v2_status_for_slot(&slot)?;
+    if let Some(refusal) = shared_cut_refusal(
+        status
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.shared_phase.as_deref()),
+    ) {
+        return Err(refusal.into());
+    }
+    drop(slot);
+
+    let (set_aside, archive_location) =
+        set_aside_managed_history_for_adoption(app, label, binding_generation)?;
+    let archive_location = archive_location.map(|path| path.display().to_string());
+    // One line, because the panel's redaction keeps only the first one. The
+    // token is stable so the panel can attach the archive location it already
+    // read, rather than repeating a native path through the redactor.
+    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation)
+        .map_err(|error| {
+            format!(
+                "Tine-managed storage adoption stopped after this device's own history was archived; Direct files is serving your Markdown/Org files unchanged and nothing was merged, so the join action can retry the remaining half on its own: {error}"
+            )
+        })?;
+    let binding_generation = status.binding_generation;
+    Ok(SparseV2AdoptionResult {
+        adoption_statement: match &archive_location {
+            Some(location) => format!(
+                "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived at {location} and was not merged."
+            ),
+            None => "This device now serves the graph shared by your other device. It had no retained managed history to archive, and nothing was merged.".into(),
+        },
+        status,
+        binding_generation,
+        archive_location,
+    })
+}
+
+/// The first half of adoption: drain and stop this device's managed runtime,
+/// archive its complete private managed root, and publish Direct Files from
+/// the unchanged Markdown/Org tree — leaving `<graph>/.tine-sync/v2` exactly
+/// where it is so the second half can still read the shared descriptor.
+fn set_aside_managed_history_for_adoption(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+) -> Result<(SparseV2CancelResult, Option<PathBuf>), String> {
+    let state = app.state::<crate::state::AppState>();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_recovery_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ReturnGracefully,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("adoption was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while adoption waited for its transition lane".into());
+    }
+    let private_root = sparse_private_root(app, &slot.root_key)?;
+    let recovery_root = sparse_recovery_root(app)?;
+    let approved_assets = crate::settings::approved_external_assets(app, &slot.root_key);
+    transition.advance(StorageTransitionPhase::DrainingManaged)?;
+    let archived = std::cell::RefCell::new(None);
+    let result = cancel_sparse_v2_at_paths_with_archive_and_publish(
+        &state,
+        label,
+        slot,
+        &private_root,
+        &recovery_root,
+        approved_assets.as_deref(),
+        shutdown_for_graceful_direct_files,
+        |private_root, recovery_root| {
+            let destination = archive_private_root(private_root, recovery_root)?;
+            *archived.borrow_mut() = destination.clone();
+            Ok(destination)
+        },
+        preserve_graph_provider_namespace,
+        |direct_root, approved_assets| {
+            let graph =
+                tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                    .map_err(|error| error.to_string())?;
+            let replacement = Arc::new(crate::state::GraphSlot::new(
+                graph,
+                direct_root.to_path_buf(),
+            ));
+            let binding_generation = replacement.binding_generation;
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), replacement)?;
+            crate::state::poke_watcher(&state);
+            Ok(binding_generation)
+        },
+        Some(&transition),
+        |_| {
+            transition.advance(StorageTransitionPhase::ConfirmingProjection)?;
+            transition.advance(StorageTransitionPhase::PublishingDirect)
+        },
+    );
+    match result {
+        Ok(result) => {
+            transition.succeed(StableStorageMode::Direct)?;
+            Ok((result, archived.into_inner()))
+        }
+        Err(error) => {
+            transition.fail("adoption_set_aside_failed");
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -2541,6 +3750,7 @@ mod clean_shutdown_slot_tests {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -2569,6 +3779,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tine_core::model::Graph;
     use tine_core::sync_runtime::{
+        SyncApplicationMoveAdmission, SyncApplicationMovePlacement, SyncApplicationMoveRoot,
         SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest,
         SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
         SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncEditorBlockDto,
@@ -2577,6 +3788,30 @@ mod tests {
         SyncLocalMutationOutcome, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
+
+    #[test]
+    fn emergency_direct_selection_is_atomic_sticky_and_graph_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        std::fs::create_dir_all(&graph).unwrap();
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        assert!(!direct_selection_is_active_at(&receipt, &graph).unwrap());
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        let other = temp.path().join("other");
+        let other_receipt = direct_selection_path_at(temp.path(), &other);
+        assert!(!direct_selection_is_active_at(&other_receipt, &other).unwrap());
+    }
+
+    #[test]
+    fn malformed_emergency_receipt_fails_toward_direct_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        std::fs::write(&receipt, b"{").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+    }
 
     #[test]
     fn activation_command_owns_the_complete_transition_inside_spawn_blocking() {
@@ -2603,6 +3838,102 @@ mod tests {
                 .contains("activate_sparse_v2_blocking(&app, &label, binding_generation)"),
             "the blocking operation must re-resolve the exact graph generation from owned inputs"
         );
+    }
+
+    #[test]
+    fn fresh_activation_proves_candidate_owned_readiness_before_slot_publication() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn prepare_sparse_v2_activation(")
+            .expect("fresh activation starts from the Direct Files graph");
+        let body = &source[start
+            ..source[start..]
+                .find("fn publish_managed_candidate(")
+                .map(|offset| start + offset)
+                .expect("fresh activation completion")];
+        assert!(
+            !body.contains("graph.list_pages()") && !body.contains("expected_pages"),
+            "managed readiness must not compare against a retired Direct Files cache"
+        );
+        let readiness = body
+            .find("prove_managed_application_ready")
+            .expect("managed application readiness proof");
+        assert!(readiness > 0);
+        assert!(!body.contains("begin_legacy_retirement"));
+        assert!(!body.contains("wait_for_legacy_drain"));
+        assert!(!body.contains("graphs.write().unwrap().remove"));
+        assert!(!body.contains("persist_binding_record"));
+    }
+
+    #[test]
+    fn fresh_activation_failures_leave_direct_files_serving_until_one_publication() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn prepare_sparse_v2_activation(")
+            .expect("activation preparation exists");
+        let body = &source[start
+            ..source[start..]
+                .find("fn publish_managed_candidate(")
+                .map(|offset| start + offset)
+                .expect("activation publication boundary")];
+
+        assert!(
+            body.contains("activate_record_with_diagnostics("),
+            "candidate build remains fallible before publication"
+        );
+        assert!(
+            body.contains("prove_managed_application_ready("),
+            "candidate readiness remains fallible before publication"
+        );
+        assert!(!body.contains("persist_binding_record"));
+        assert!(!body.contains("graphs.write()"));
+        let publish = &source[source
+            .find("fn publish_managed_candidate(")
+            .expect("single publication function")..];
+        let persist = publish.find("persist_binding_record").unwrap();
+        let replace = publish.find("replace_if_current").unwrap();
+        let status = publish.find("sparse_v2_status_for_slot").unwrap();
+        assert!(persist < replace && replace < status);
+    }
+
+    #[test]
+    fn every_storage_mode_change_is_owned_by_the_native_supervisor() {
+        let source = include_str!("sync_runtime.rs");
+        for (function, kind) in [
+            (
+                "fn activate_sparse_v2_blocking(",
+                "StorageTransitionKind::ActivateManaged",
+            ),
+            (
+                "fn join_sparse_v2_shared_blocking(",
+                "StorageTransitionKind::JoinManaged",
+            ),
+            (
+                "fn cancel_sparse_v2_blocking(",
+                "StorageTransitionKind::ReturnGracefully",
+            ),
+        ] {
+            let start = source.find(function).expect("transition function exists");
+            let body = &source[start
+                ..source[start..]
+                    .find("\n}\n")
+                    .map(|offset| start + offset + 3)
+                    .unwrap_or(source.len())];
+            let guard = if kind == "StorageTransitionKind::ReturnGracefully" {
+                "begin_recovery_guard("
+            } else {
+                "begin_guard("
+            };
+            assert!(body.contains(guard), "{function} bypasses supervisor");
+            assert!(
+                body.contains(kind),
+                "{function} uses the wrong transition kind"
+            );
+        }
+        let emergency = &source[source
+            .find("fn cancel_sparse_v2_cold_blocking(")
+            .expect("emergency return exists")..];
+        assert!(emergency.contains("begin_emergency_return("));
     }
 
     #[test]
@@ -2676,6 +4007,20 @@ mod tests {
     }
 
     #[test]
+    fn durable_managed_refusals_export_their_contract_scenario() {
+        let refused = SparseV2Availability::from_open(SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Enrollment,
+            scenario: ManagedStorageRefusalScenario::DiskCorrupt,
+        });
+        let json = serde_json::to_value(refused).unwrap();
+        assert_eq!(
+            json.get("scenario_id").and_then(serde_json::Value::as_str),
+            Some("MS-REF-DISK-CORRUPT"),
+            "a durable refusal must identify the in-scope failure it defends against"
+        );
+    }
+
+    #[test]
     fn activation_heartbeat_stops_and_joins_without_waiting_for_the_interval() {
         let started = Instant::now();
         let heartbeat = ActivationHeartbeat::start(started, Arc::new(Mutex::new(None)));
@@ -2710,6 +4055,136 @@ mod tests {
         );
         assert_eq!(serialized["progress"]["completed"], 2);
         assert_eq!(serialized["progress"]["total"], 5);
+    }
+
+    /// A join that finds nothing must not dead-end the user. "This graph does
+    /// not yet contain sync data from another device" is true and unactionable:
+    /// it names neither the file it looked for nor either ordinary reason it is
+    /// missing — the other device has not finished, or the sync tool is not
+    /// carrying the hidden `.tine-sync/` folder.
+    #[test]
+    fn a_join_with_no_sync_data_names_the_file_and_both_likely_causes() {
+        let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
+        assert!(
+            message.contains(
+                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("may not have finished"), "{message}");
+        assert!(message.contains("hidden .tine-sync folder"), "{message}");
+        assert!(message.contains("skip dot-directories"), "{message}");
+        assert!(
+            !message.contains("  "),
+            "the message must not carry source-indentation runs: {message:?}"
+        );
+        assert_eq!(
+            shared_enrollment_descriptor_path(Path::new("/graphs/notes")),
+            PathBuf::from(
+                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+            )
+        );
+    }
+
+    /// The message above is helpful and the user never saw it. The panel keeps
+    /// only the FIRST LINE of a native error (`safeManagedErrorDetail`), so the
+    /// path and both causes were cut and the dead-end sentence was all that
+    /// reached the phone. The panel re-authors the rest as a remedy; this pins
+    /// the two halves together, because a remedy keyed on text the native side
+    /// no longer emits is the same silence again.
+    #[test]
+    fn the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact() {
+        let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
+        let first_line = message.lines().next().expect("the message has a line");
+        let panel = include_str!("../../src/components/Settings.tsx");
+
+        // What the panel matches on must survive the truncation to line one.
+        let key = "does not yet contain sync data";
+        assert!(first_line.contains(key), "{first_line}");
+        assert!(
+            panel.contains(&format!("detail.includes(\"{key}\")")),
+            "the panel must recognize the refusal it re-authors"
+        );
+
+        // The relative path the panel names must be the one this message means.
+        let relative = ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
+        assert!(
+            shared_enrollment_descriptor_path(Path::new("/graphs/notes"))
+                .to_string_lossy()
+                .ends_with(relative),
+            "the relative path drifted from the descriptor path"
+        );
+        assert!(
+            panel.contains(&format!("\n  \"{relative}\";")),
+            "the panel must name the same relative path"
+        );
+    }
+
+    /// One source of truth for what a provider tree contains: the check that
+    /// recognizes an untouched skeleton must expect exactly what the shared
+    /// provider transport writes when it opens a tree, or a graph that has only
+    /// ever opened one reads as shared.
+    #[test]
+    fn the_scaffold_check_expects_what_the_shared_transport_actually_writes() {
+        assert_eq!(
+            PROVIDER_SCAFFOLD_NAMESPACES.len(),
+            SHARED_PROVIDER_TREE_NAMESPACES.len()
+        );
+        assert!(PROVIDER_SCAFFOLD_NAMESPACES.contains(&"clean-baselines-v1"));
+
+        let root = std::env::temp_dir().join(format!("tine-scaffold-{}", Uuid::new_v4()));
+        let shared = root.join("shared");
+        for tree in PROVIDER_SCAFFOLD_TREES {
+            for namespace in PROVIDER_SCAFFOLD_NAMESPACES {
+                std::fs::create_dir_all(shared.join(tree).join(namespace)).unwrap();
+            }
+        }
+        assert!(is_empty_local_provider_scaffold(&shared).unwrap());
+        std::fs::write(
+            shared.join("outbox/enrollment/shared-enrollment-v1.json"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!is_empty_local_provider_scaffold(&shared).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retryable_activation_keeps_the_last_exact_progress_in_its_public_detail() {
+        let mut binding = SparseV2Binding {
+            availability: SparseV2Availability::Retryable {
+                stage: "shadow_import".into(),
+                detail: "Permission denied (os error 13)".into(),
+            },
+            handle: None,
+        };
+        assert_eq!(
+            attach_latest_progress_to_activation_result(
+                &mut binding,
+                "bootstrap preparation: sealing",
+            )
+            .as_deref(),
+            Some(
+                "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)"
+            )
+        );
+        assert_eq!(
+            binding.availability,
+            SparseV2Availability::Retryable {
+                stage: "shadow_import".into(),
+                detail: "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)".into(),
+            }
+        );
+
+        let mut active = SparseV2Binding {
+            availability: SparseV2Availability::Active,
+            handle: None,
+        };
+        assert_eq!(
+            attach_latest_progress_to_activation_result(&mut active, "source capture"),
+            None
+        );
+        assert_eq!(active.availability, SparseV2Availability::Active);
     }
 
     #[test]
@@ -2790,11 +4265,11 @@ mod tests {
             ));
             let state = crate::state::AppState {
                 graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
-                graph_load: Mutex::new(()),
+                storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(
+                ),
                 watch_ctl: Mutex::new(None),
                 last_focused: Mutex::new(None),
                 capture_graph: Mutex::new(None),
-                startup_recovery: Mutex::new(std::collections::HashMap::new()),
                 sync_runtime: SyncRuntimeFacade,
                 #[cfg(desktop)]
                 next_window: std::sync::atomic::AtomicU64::new(1),
@@ -2833,7 +4308,6 @@ mod tests {
                     receipt_root: self.private_root.join("receipts"),
                     database_path: self.private_root.join("projection/materialization.sqlite"),
                     application_runtime_root: self.private_root.join("runtime"),
-                    migration_backup_root: self.private_root.join("migration-backup"),
                     capture_root: self.private_root.join("capture"),
                     preparation_root: self.private_root.join("preparation"),
                     provider_root: self.graph_root.join(".tine-sync/v2/shared"),
@@ -2864,6 +4338,135 @@ mod tests {
             self.binding_bytes =
                 std::fs::read(self.private_root.join(SPARSE_BINDING_FILE)).unwrap();
         }
+    }
+
+    #[test]
+    fn stopped_managed_recovery_rebinds_an_empty_registry() {
+        for detail in [
+            "injected candidate-build failure",
+            "injected readiness failure",
+        ] {
+            let fixture = RollbackFixture::new(Some("local_active"));
+            fixture.state.graphs.write().unwrap().remove("main");
+            let graph_meta = Graph::open(&fixture.graph_root).meta();
+
+            let replacement = publish_stopped_managed_recovery_slot(
+                &fixture.state,
+                "main",
+                fixture.graph_root.clone(),
+                graph_meta,
+                detail.into(),
+                None,
+            )
+            .unwrap();
+
+            let bound = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+            assert!(Arc::ptr_eq(&bound, &replacement));
+            assert!(bound.is_sparse_v2());
+            assert!(bound.sparse_runtime().is_none());
+            let status = sparse_v2_status_for_slot(&bound).unwrap();
+            assert!(status.can_retry);
+            assert!(status.can_cancel);
+            assert!(matches!(
+                status.availability,
+                SparseV2Availability::Retryable { ref detail, .. }
+                    if detail.contains("injected")
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_candidate_publication_is_exactly_once_and_source_fenced() {
+        let root = std::env::temp_dir().join(format!("tine-candidate-publish-{}", Uuid::new_v4()));
+        let graph_root = root.join("graph");
+        std::fs::create_dir_all(graph_root.join("pages")).unwrap();
+        let graph = Graph::open(&graph_root);
+        let meta = graph.meta();
+        let source_generation = graph.guarded_graph_text_identity_report().generation;
+        let predecessor = Arc::new(crate::state::GraphSlot::new(graph, graph_root.clone()));
+        let state = crate::state::AppState {
+            graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(None),
+            capture_graph: Mutex::new(None),
+            sync_runtime: SyncRuntimeFacade,
+            #[cfg(desktop)]
+            next_window: std::sync::atomic::AtomicU64::new(1),
+        };
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), Arc::clone(&predecessor))
+            .unwrap();
+        let record = SparseV2ActivationRecord::new(&graph_root, meta.clone(), DeviceId::new());
+        let candidate = |expected_generation| PreparedManagedCandidate {
+            predecessor: Arc::clone(&predecessor),
+            replacement: Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                SparseV2Binding::without_actor_for_test(),
+                graph_root.clone(),
+                meta.clone(),
+            )),
+            record: record.clone(),
+            readiness: ManagedReadinessReceipt {
+                page_count: 0,
+                sampled_paths: Vec::new(),
+                inventory_ms: 0,
+                sample_load_ms: 0,
+                total_ms: 0,
+            },
+            direct_source_generation: Some(expected_generation),
+        };
+
+        let persisted = std::sync::atomic::AtomicUsize::new(0);
+        let error = publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(source_generation.saturating_add(1)),
+            || {
+                persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed while managed storage was being prepared"));
+        assert_eq!(persisted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            predecessor.binding_generation
+        );
+
+        publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(source_generation),
+            || {
+                persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(persisted.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_ne!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            predecessor.binding_generation
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     impl Drop for RollbackFixture {
@@ -2898,7 +4501,7 @@ mod tests {
         found
     }
 
-    fn create_empty_local_provider_scaffold(graph_root: &Path) {
+    fn create_empty_provider_transport_scaffold(graph_root: &Path) {
         let shared = graph_root.join(".tine-sync/v2/shared");
         for tree in PROVIDER_SCAFFOLD_TREES {
             for namespace in PROVIDER_SCAFFOLD_NAMESPACES {
@@ -2918,20 +4521,20 @@ mod tests {
     }
 
     #[test]
-    fn joinable_shared_descriptor_still_serializes_direct_application_admission() {
+    fn direct_status_does_not_inspect_an_existing_shared_descriptor() {
         std::thread::Builder::new()
-            .name("tine-joinable-direct-admission-test".into())
+            .name("tine-direct-status-quarantine-test".into())
             .stack_size(32 * 1024 * 1024)
-            .spawn(joinable_shared_descriptor_still_serializes_direct_application_admission_inner)
+            .spawn(direct_status_does_not_inspect_an_existing_shared_descriptor_inner)
             .unwrap()
             .join()
             .unwrap();
     }
 
-    fn joinable_shared_descriptor_still_serializes_direct_application_admission_inner() {
+    fn direct_status_does_not_inspect_an_existing_shared_descriptor_inner() {
         let mut fixture = RollbackFixture::new(Some("shadow_import"));
         fixture.make_active();
-        let descriptor = fixture
+        fixture
             .slot
             .sparse_runtime()
             .expect("active fixture must retain its runtime")
@@ -2947,8 +4550,7 @@ mod tests {
         let status = sparse_v2_status_for_slot(&direct).unwrap();
         assert!(matches!(
             status.availability,
-            SparseV2Availability::Joinable { ref descriptor_digest }
-                if descriptor_digest == &descriptor.descriptor_digest
+            SparseV2Availability::LegacyDefault
         ));
         assert_eq!(
             serde_json::to_value(status).unwrap()["application_page_admission"],
@@ -2960,7 +4562,54 @@ mod tests {
     }
 
     #[test]
-    fn cold_return_requires_native_lock_attempt_target_and_full_direct_lifecycle() {
+    fn enrollment_commands_reopen_the_retired_actor_before_reporting_success() {
+        let source = include_str!("sync_runtime.rs");
+        let share_start = source
+            .find("fn prepare_sparse_v2_share_blocking(")
+            .expect("share command implementation");
+        let share_end = source[share_start..]
+            .find("/// Reconstitute the sole application actor")
+            .map(|offset| share_start + offset)
+            .expect("share command boundary");
+        let share = &source[share_start..share_end];
+        let share_cut = share.find(".prepare_shared()").expect("share cut");
+        let share_reopen = share
+            .find("prepare_reopened_managed_candidate(")
+            .expect("share runtime reopen");
+        let share_publish = share
+            .find("publish_managed_candidate(")
+            .expect("share replacement publication");
+        assert!(share_cut < share_reopen && share_reopen < share_publish);
+        assert!(
+            !share.contains("sparse_v2_status_for_slot(&slot)"),
+            "the actor that commits a share cut is intentionally stopped"
+        );
+
+        let join_start = source
+            .find("fn prepare_sparse_v2_join(")
+            .expect("join command implementation");
+        let join_end = source[join_start..]
+            .find("#[tauri::command]\npub(crate) async fn sparse_v2_query")
+            .map(|offset| join_start + offset)
+            .expect("join command boundary");
+        let join = &source[join_start..join_end];
+        let retained_branch = join
+            .find("if slot.sparse_binding().is_some()")
+            .expect("already-managed join branch");
+        let retained = &join[retained_branch..];
+        let join_cut = retained.find(".join_shared(").expect("join cut");
+        let join_reopen = retained
+            .find("prepare_reopened_managed_candidate(")
+            .expect("join runtime reopen");
+        assert!(join_cut < join_reopen);
+        assert!(
+            !retained[..join_reopen].contains("PreparedActivationOutcome::AlreadyCurrent"),
+            "a completed join must not publish the retired actor as current"
+        );
+    }
+
+    #[test]
+    fn cold_emergency_return_has_no_managed_runtime_or_archive_dependency() {
         let source = include_str!("sync_runtime.rs");
         let start = source
             .find("fn cancel_sparse_v2_cold_blocking(")
@@ -2971,23 +4620,380 @@ mod tests {
                 .map(|end| start + end)
                 .expect("next managed command")];
         for required in [
-            "state.graph_load.lock()",
-            "authorized_startup_recovery_target",
-            "startup_recovery_target_is_remembered",
-            "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
-            "open_and_publish_direct_files",
+            "begin_emergency_return",
+            "publish_direct_selection",
+            "prepare_direct_files_open",
+            "commit_if_current",
+            "publish_prepared_direct_files",
         ] {
             assert!(
                 command.contains(required),
                 "cold recovery must retain `{required}`"
             );
         }
+        for forbidden in [
+            "transition_lane",
+            "archive_private_root",
+            "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
+            "shutdown_for_direct_files_escape",
+            "sparse_private_root",
+            "startup_recovery",
+            "startup_recovery_target_is_remembered",
+        ] {
+            assert!(
+                !command.contains(forbidden),
+                "emergency return must not depend on `{forbidden}`"
+            );
+        }
+    }
+
+    fn adoption_identities(seed: u128) -> (WorkspaceId, LineageDigest, DocumentId) {
+        (
+            WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+            LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+            DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+        )
+    }
+
+    #[test]
+    fn two_independent_activations_are_adoptable_and_every_other_relation_is_refused() {
+        let mine = adoption_identities(0xad10);
+        let theirs = adoption_identities(0xad20);
+
+        assert_eq!(
+            shared_graph_relation(mine, theirs),
+            SharedGraphRelation::Independent
+        );
+        assert!(shared_graph_relation_refusal(SharedGraphRelation::Independent).is_none());
+
+        assert_eq!(
+            shared_graph_relation(mine, mine),
+            SharedGraphRelation::SameGraph
+        );
+        let same = shared_graph_relation_refusal(SharedGraphRelation::SameGraph).unwrap();
+        assert!(same.contains("Nothing was changed"));
+        assert!(same.contains("Join a synced graph from another device"));
+
+        // Each single agreeing identity is a partial lineage, and none of them
+        // is allowed to look like an independent activation.
+        for partial in [
+            (theirs.0, mine.1, mine.2),
+            (mine.0, theirs.1, mine.2),
+            (mine.0, mine.1, theirs.2),
+            (theirs.0, theirs.1, mine.2),
+            (theirs.0, mine.1, theirs.2),
+            (mine.0, theirs.1, theirs.2),
+        ] {
+            assert_eq!(
+                shared_graph_relation(mine, partial),
+                SharedGraphRelation::PartialLineage,
+                "{partial:?} must not be treated as adoptable"
+            );
+        }
+        let partial = shared_graph_relation_refusal(SharedGraphRelation::PartialLineage).unwrap();
+        assert!(partial.contains("matches part of the shared graph's identity"));
+        assert!(partial.contains("Nothing was changed"));
+        assert!(partial.contains("return this device to Direct files"));
+    }
+
+    #[test]
+    fn every_adoption_refusal_names_a_reason_and_a_remedy_that_survives_panel_redaction() {
+        let mut refusals = vec![
+            shared_graph_relation_refusal(SharedGraphRelation::SameGraph).unwrap(),
+            shared_graph_relation_refusal(SharedGraphRelation::PartialLineage).unwrap(),
+        ];
+        for phase in ["share_prepared", "joining", "active"] {
+            refusals.push(shared_cut_refusal(Some(phase)).expect("a shared cut refuses adoption"));
+        }
+        // A purely local managed device has no shared phase at all, and that is
+        // precisely the device adoption exists for.
+        assert!(shared_cut_refusal(None).is_none());
+
+        for refusal in refusals {
+            assert!(
+                refusal.contains("Nothing was changed"),
+                "refusal must say what it did not do: {refusal}"
+            );
+            // The panel keeps only the first line of a native message and drops
+            // any line with no recognised diagnostic class, so a refusal that
+            // fails this is a refusal the user never reads.
+            assert!(
+                !refusal.contains('\n'),
+                "refusal must survive first-line truncation: {refusal}"
+            );
+            assert!(
+                refusal.contains("storage") || refusal.contains("sync"),
+                "refusal must carry a diagnostic class the panel keeps: {refusal}"
+            );
+        }
+    }
+
+    /// Seam 1 — the drain. Nothing has been archived, so the managed slot must
+    /// come back and every byte on both sides must be untouched.
+    #[test]
+    fn adoption_seam_shutdown_failure_keeps_the_managed_device_serving_its_own_history() {
+        let mut fixture = RollbackFixture::new(Some("local_active"));
+        fixture.make_active();
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            |_| Err("injected adoption drain failure".into()),
+            archive_private_root,
+            |_, _| panic!("adoption must not publish Direct files after a failed drain"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected adoption drain failure"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        let serving = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(serving.is_sparse_v2());
+        assert!(serving.sparse_runtime().is_some());
+    }
+
+    /// Seam 2 — the archive itself. The rename is the only durable step, so a
+    /// failure here must leave the device exactly where it was, retryable.
+    #[test]
+    fn adoption_seam_archive_failure_keeps_both_histories_where_they_were() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            |_, _| Err("injected adoption archive failure".into()),
+            |_, _| panic!("adoption must not publish Direct files after a failed archive"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected adoption archive failure"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(retryable.is_sparse_v2());
+        assert!(retryable.sparse_runtime().is_none());
+    }
+
+    /// Seam 3 — after the archive, before Direct Files opens. The device serves
+    /// its own unchanged Markdown/Org tree either way, which is still the
+    /// pre-adoption state; the archive and the shared evidence both survive, so
+    /// both halves remain retryable.
+    #[test]
+    fn adoption_seam_direct_publication_failure_keeps_the_archive_and_the_shared_evidence() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            archive_private_root,
+            |_, _| Err("injected adoption Direct files failure".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("recovery state was preserved"));
+        assert!(!fixture.private_root.exists());
+        let archives = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(snapshot_tree(&archives[0]), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before,
+            "the shared evidence must survive so the join half can still run"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
+        assert!(Graph::open_checked(&fixture.graph_root).is_ok());
+    }
+
+    /// The first half, completed. This is the one behaviour a literal "Return
+    /// to Direct files, then Join" cannot produce: the predecessor archived AND
+    /// the other device's shared namespace still in place.
+    #[test]
+    fn adoption_set_aside_archives_the_predecessor_and_leaves_the_shared_namespace_in_place() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
+        let descriptor = fixture
+            .graph_root
+            .join(".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json");
+        std::fs::create_dir_all(descriptor.parent().unwrap()).unwrap();
+        std::fs::write(&descriptor, b"the other device's descriptor").unwrap();
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let result = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            archive_private_root,
+            |direct_root, approved_assets| {
+                let graph =
+                    tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                        .map_err(|error| error.to_string())?;
+                let replacement = Arc::new(crate::state::GraphSlot::new(
+                    graph,
+                    direct_root.to_path_buf(),
+                ));
+                let binding_generation = replacement.binding_generation;
+                fixture
+                    .state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind("main".into(), replacement)?;
+                Ok(binding_generation)
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!fixture.private_root.exists());
+        let archives = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(snapshot_tree(&archives[0]), private_before);
+        assert_eq!(
+            std::fs::read(archives[0].join(SPARSE_BINDING_FILE)).unwrap(),
+            fixture.binding_bytes
+        );
+        // The graceful Direct Files return moves this subtree under
+        // `.tine-sync/recovery`. Adoption must not.
+        assert!(!fixture.graph_root.join(".tine-sync/recovery").exists());
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert_eq!(
+            std::fs::read(&descriptor).unwrap(),
+            b"the other device's descriptor"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn adoption_is_composed_of_the_two_existing_transitions_and_never_archives_shared_evidence() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn adopt_sparse_v2_shared_blocking(")
+            .expect("adoption composition exists");
+        let body = &source[start
+            ..source[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset + 3)
+                .unwrap_or(source.len())];
+        // Every refusal is decided before the first durable step.
+        let set_aside = body
+            .find("set_aside_managed_history_for_adoption(")
+            .expect("adoption archives before it joins");
+        for refusal in [
+            "refuse_unclaimed_sparse_archive(",
+            "shared_enrollment_not_here_yet(",
+            "shared_graph_relation_refusal(",
+            "shared_cut_refusal(",
+        ] {
+            let at = body.find(refusal).unwrap_or_else(|| {
+                panic!("adoption must decide `{refusal}` for itself");
+            });
+            assert!(at < set_aside, "`{refusal}` must precede the archive");
+        }
+        assert!(
+            body.find("join_sparse_v2_shared_blocking(").unwrap() > set_aside,
+            "adoption joins only after the predecessor is archived"
+        );
+
+        let start = source
+            .find("fn set_aside_managed_history_for_adoption(")
+            .expect("adoption's first half exists");
+        let first_half = &source[start
+            ..source[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset + 3)
+                .unwrap_or(source.len())];
+        assert!(first_half.contains("preserve_graph_provider_namespace"));
+        assert!(
+            !first_half.contains("archive_graph_provider_namespace"),
+            "adoption must never archive the other device's shared evidence"
+        );
+        assert!(first_half.contains("StorageTransitionKind::ReturnGracefully"));
+        assert!(first_half.contains("begin_recovery_guard("));
+
+        let contract = include_str!("../../docs/storage-sync-contract.md");
+        assert!(contract
+            .contains("### 2.3a Adoption: a device that already has a managed graph of its own"));
+        assert!(contract.contains("it does **not** archive `<graph>/.tine-sync/v2`"));
+        assert!(contract.contains("never a merge of two divergent histories"));
+        assert!(contract.contains("sparse-v2-recovery"));
     }
 
     #[test]
     fn cold_return_without_slot_archives_local_and_shared_provider_evidence_preserving_bytes() {
         let local = cold_fixture(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&local.graph_root);
+        create_empty_provider_transport_scaffold(&local.graph_root);
         let local_provider = snapshot_tree(&local.graph_root.join(".tine-sync/v2"));
         let local_result = cancel_sparse_v2_cold_at_paths(
             &local.state,
@@ -3066,10 +5072,48 @@ mod tests {
             .is_ok());
     }
 
+    /// A Direct Files return must not take the OTHER device's enrollment with
+    /// it. The graph folder is synced, so archiving a live provider tree here
+    /// removes the descriptor from the device that is still sharing — Martin's
+    /// graph reached two `recovery/v2-*` archives and no `v2` exactly that way,
+    /// and the phone was then told the graph "does not yet contain sync data".
+    ///
+    /// The archive exists only so that an UNCLAIMED namespace cannot lock a
+    /// later Direct Files open out. A joinable tree does not: the cold check
+    /// admits it and the panel offers Join beside it.
+    #[test]
+    fn a_direct_files_return_preserves_a_joinable_peer_tree_and_archives_an_unclaimed_one() {
+        let joinable =
+            std::env::temp_dir().join(format!("tine-df-return-joinable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(joinable.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(joinable.join(".tine-sync/v2/shared/evidence"), b"peer").unwrap();
+        let before = snapshot_tree(&joinable.join(".tine-sync/v2"));
+        let archived = archive_graph_provider_namespace_with(&joinable, |shared| {
+            assert_eq!(shared, joinable.join(".tine-sync/v2/shared"));
+            true
+        })
+        .unwrap();
+        assert!(matches!(archived, ProviderNamespaceArchive::Absent));
+        assert_eq!(snapshot_tree(&joinable.join(".tine-sync/v2")), before);
+        assert!(!joinable.join(".tine-sync/recovery").exists());
+
+        let unclaimed =
+            std::env::temp_dir().join(format!("tine-df-return-unclaimed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(unclaimed.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(unclaimed.join(".tine-sync/v2/shared/evidence"), b"mine").unwrap();
+        let before = snapshot_tree(&unclaimed.join(".tine-sync/v2"));
+        let archived = archive_graph_provider_namespace_with(&unclaimed, |_| false).unwrap();
+        let ProviderNamespaceArchive::Moved { destination, .. } = archived else {
+            panic!("an unclaimed namespace must still be archived");
+        };
+        assert!(!unclaimed.join(".tine-sync/v2").exists());
+        assert_eq!(snapshot_tree(&destination), before);
+    }
+
     #[test]
     fn cold_return_archive_failure_keeps_private_provider_and_markdown_bytes_retryable() {
         let fixture = cold_fixture(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
@@ -3100,11 +5144,21 @@ mod tests {
     }
 
     #[test]
-    fn cold_return_refuses_missing_or_corrupt_binding_without_archiving() {
+    fn cold_return_archives_and_opens_direct_with_missing_or_corrupt_binding() {
         let missing = cold_fixture(Some("shadow_import"));
         std::fs::remove_file(missing.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+        let missing_enrollment = missing
+            .graph_root
+            .join(".tine-sync/v2/shared/outbox/enrollment");
+        std::fs::create_dir_all(&missing_enrollment).unwrap();
+        std::fs::write(
+            missing_enrollment.join("shared-enrollment-v1.json"),
+            b"partially delivered descriptor",
+        )
+        .unwrap();
         let missing_before = snapshot_tree(&missing.private_root);
-        let missing_error = cancel_sparse_v2_cold_at_paths(
+        let missing_provider = snapshot_tree(&missing.graph_root.join(".tine-sync/v2"));
+        let missing_result = cancel_sparse_v2_cold_at_paths(
             &missing.state,
             "main",
             missing.graph_root.clone(),
@@ -3112,16 +5166,49 @@ mod tests {
             &missing.recovery_root,
             None,
         )
-        .unwrap_err();
-        assert!(missing_error.contains("No local Tine-managed storage recovery binding"));
-        assert_eq!(snapshot_tree(&missing.private_root), missing_before);
-        assert!(!missing.recovery_root.exists());
-        assert!(missing.state.graphs.read().unwrap().slot("main").is_none());
+        .unwrap();
+        assert!(matches!(
+            missing_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!missing.private_root.exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(&missing.recovery_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            missing_before
+        );
+        assert!(!missing.graph_root.join(".tine-sync/v2").exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(missing.graph_root.join(".tine-sync/recovery"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            missing_provider
+        );
+        assert!(missing
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
 
         let corrupt = cold_fixture(Some("shadow_import"));
         std::fs::write(corrupt.private_root.join(SPARSE_BINDING_FILE), b"{").unwrap();
         let corrupt_before = snapshot_tree(&corrupt.private_root);
-        let corrupt_error = cancel_sparse_v2_cold_at_paths(
+        let corrupt_result = cancel_sparse_v2_cold_at_paths(
             &corrupt.state,
             "main",
             corrupt.graph_root.clone(),
@@ -3129,11 +5216,32 @@ mod tests {
             &corrupt.recovery_root,
             None,
         )
-        .unwrap_err();
-        assert!(corrupt_error.contains("incomplete or unreadable"));
-        assert_eq!(snapshot_tree(&corrupt.private_root), corrupt_before);
-        assert!(!corrupt.recovery_root.exists());
-        assert!(corrupt.state.graphs.read().unwrap().slot("main").is_none());
+        .unwrap();
+        assert!(matches!(
+            corrupt_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!corrupt.private_root.exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(&corrupt.recovery_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            corrupt_before
+        );
+        assert!(corrupt
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
     }
 
     #[test]
@@ -3293,7 +5401,7 @@ mod tests {
     #[test]
     fn incomplete_local_activation_retires_without_touching_markdown_and_preserves_private_bytes() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         assert_eq!(
             provider_namespace_evidence(&fixture.graph_root.join(".tine-sync/v2")).unwrap(),
@@ -3618,7 +5726,7 @@ mod tests {
     #[test]
     fn archive_failure_publishes_a_fresh_retryable_slot_after_shutdown() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
@@ -3807,19 +5915,37 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tine-sync-facade-legacy-{}", Uuid::new_v4()));
         let opened = facade.open_explicit(SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::LegacyDefault,
+            clean_identities: None,
             graph_root: root.join("missing-graph"),
             enrollment_root: root.join("missing-enrollment"),
             archive_root: root.join("missing-archive"),
             receipt_root: root.join("missing-receipts"),
             database_path: root.join("missing.sqlite"),
             application_runtime_root: root.join("missing-runtime"),
-            migration_backup_root: root.join("missing-migration-backup"),
             provider_root: root.join("missing-provider"),
             provider_journal_root: root.join("missing-provider-journal/device/journal"),
         });
         assert_eq!(opened.status, SyncRuntimeOpenStatus::LegacyDefault);
         assert!(opened.handle.is_none());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn superseded_classification_spares_current_and_corrupt_bindings() {
+        // Pre-0.7 shapes: an explicit older version, and a record from before
+        // the version field existed at all.
+        assert!(binding_bytes_are_superseded(
+            br#"{"schema_version":1,"graph_root":"/g"}"#
+        ));
+        assert!(binding_bytes_are_superseded(
+            br#"{"graph_root":"/g","workspace":"w"}"#
+        ));
+        // The current version is not superseded even when the record is
+        // otherwise incomplete - that failure must stay a loud one.
+        assert!(!binding_bytes_are_superseded(br#"{"schema_version":2}"#));
+        // Not JSON at all: corruption, not an old format.
+        assert!(!binding_bytes_are_superseded(b"\x00\x01managed"));
+        assert!(!binding_bytes_are_superseded(b""));
     }
 
     #[test]
@@ -3865,6 +5991,30 @@ mod tests {
         value["unknown"] = serde_json::json!(true);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(read_binding_at(&path, &graph).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_publication_crash_cuts_select_only_direct_or_managed() {
+        let root = std::env::temp_dir().join(format!("tine-selector-cuts-{}", Uuid::new_v4()));
+        let graph = root.join("graph");
+        std::fs::create_dir_all(graph.join("pages")).unwrap();
+        let meta = Graph::open(&graph).meta();
+        let record = SparseV2ActivationRecord::new(&graph, meta, DeviceId::new());
+        let private = root.join("private");
+        let binding = private.join(SPARSE_BINDING_FILE);
+        let direct = root.join("direct.json");
+
+        std::fs::create_dir_all(private.join("candidate-residue")).unwrap();
+        assert!(read_binding_at(&binding, &graph).unwrap().is_none());
+        assert!(!direct_selection_is_active_at(&direct, &graph).unwrap());
+
+        persist_binding_at(&binding, &record).unwrap();
+        assert!(read_binding_at(&binding, &graph).unwrap().is_some());
+
+        publish_direct_selection_at(&direct, &graph, "publication rollback").unwrap();
+        assert!(direct_selection_is_active_at(&direct, &graph).unwrap());
+        assert!(read_binding_at(&binding, &graph).unwrap().is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3981,7 +6131,6 @@ mod tests {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
             provider_root: graph_root.join(".tine-sync/v2/shared"),
@@ -3998,13 +6147,13 @@ mod tests {
         };
         let open_request = SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(request.identities.clone()),
             graph_root: request.graph_root.clone(),
             enrollment_root: request.enrollment_root.clone(),
             archive_root: request.archive_root.clone(),
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
-            migration_backup_root: request.migration_backup_root.clone(),
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         };
@@ -4296,6 +6445,255 @@ mod tests {
         ));
         assert!(matches!(
             clean_shutdown_slot(&reopened_slot).unwrap(),
+            CleanShutdownSlot::Safe
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stopped_move_episode_reopens_and_replaces_one_window_writer() {
+        std::thread::Builder::new()
+            .name("tine-move-recovery-handoff-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(stopped_move_episode_reopens_and_replaces_one_window_writer_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn stopped_move_episode_reopens_and_replaces_one_window_writer_inner() {
+        let root =
+            std::env::temp_dir().join(format!("tine-move-recovery-handoff-{}", Uuid::new_v4()));
+        let graph_root = root.join("graph");
+        let private = root.join("private");
+        let source_path = "pages/Recovery Source.md";
+        let destination_path = "pages/Recovery Destination.md";
+        std::fs::create_dir_all(graph_root.join("pages")).unwrap();
+        std::fs::create_dir_all(graph_root.join("journals")).unwrap();
+        std::fs::write(graph_root.join(source_path), b"- source root\n").unwrap();
+        std::fs::write(graph_root.join(destination_path), b"- destination root\n").unwrap();
+
+        let meta = Graph::open(&graph_root).meta();
+        let record = SparseV2ActivationRecord::new(&graph_root, meta.clone(), DeviceId::new());
+        let activation_request = SyncLocalActivationRequest {
+            graph_root: graph_root.clone(),
+            archive_root: private.join("archive"),
+            enrollment_root: private.join("enrollment"),
+            receipt_root: private.join("receipts"),
+            database_path: private.join("projection/materialization.sqlite"),
+            application_runtime_root: private.join("runtime"),
+            capture_root: private.join("capture"),
+            preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
+            identities: SyncLocalActivationIdentities {
+                workspace_id: record.workspace_id,
+                lineage_digest: record.lineage_digest,
+                catalog_document_id: record.catalog_document_id,
+                endpoint_id: record.endpoint_id,
+                device_id: record.device_id,
+                preparation_id: record.preparation_id,
+                session_id: record.activation_session_id,
+            },
+        };
+        let open_request = SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(activation_request.identities.clone()),
+            graph_root: activation_request.graph_root.clone(),
+            enrollment_root: activation_request.enrollment_root.clone(),
+            archive_root: activation_request.archive_root.clone(),
+            receipt_root: activation_request.receipt_root.clone(),
+            database_path: activation_request.database_path.clone(),
+            application_runtime_root: activation_request.application_runtime_root.clone(),
+            provider_root: activation_request.provider_root.clone(),
+            provider_journal_root: activation_request.provider_journal_root.clone(),
+        };
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let predecessor = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+            SparseV2Binding::from_activation(activated),
+            graph_root.clone(),
+            meta.clone(),
+        ));
+        let state = crate::state::AppState {
+            graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(None),
+            capture_graph: Mutex::new(None),
+            sync_runtime: SyncRuntimeFacade,
+            #[cfg(desktop)]
+            next_window: std::sync::atomic::AtomicU64::new(1),
+        };
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), Arc::clone(&predecessor))
+            .unwrap();
+        let handle = predecessor.sparse_runtime().unwrap();
+        for _ in 0..128 {
+            let status = handle.status().unwrap();
+            if !status.watcher.pending && status.provider_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        let source = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: source_path.into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("source page did not load: {other:?}"),
+        };
+        let destination = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: destination_path.into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("destination page did not load: {other:?}"),
+        };
+        let request = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source.0.path.clone(),
+            source_revision: source.1,
+            destination_path: destination.0.path.clone(),
+            destination_revision: destination.1,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source.0.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: SyncApplicationMoveAdmission {
+                application_save_page_blocks: tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                application_page_request_text_bytes:
+                    tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+            },
+        };
+        // The ordinary move surface creates and commits the durable episode.
+        // `resolve_application_move_subtrees` is recovery-only: asking it to
+        // resolve a missing episode must remain a NoCommit rather than
+        // silently initiating a user mutation (GH #333).
+        let mut committed = handle.move_application_subtrees(request.clone()).unwrap();
+        for _ in 0..512 {
+            if matches!(
+                committed,
+                SyncApplicationMoveSubtreesOutcome::Committed { .. }
+            ) {
+                break;
+            }
+            assert!(
+                matches!(
+                    committed,
+                    SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+                ),
+                "initial move was refused: {committed:?}"
+            );
+            let _ = handle.tick().unwrap();
+            committed = handle.move_application_subtrees(request.clone()).unwrap();
+        }
+        assert!(
+            matches!(
+                committed,
+                SyncApplicationMoveSubtreesOutcome::Committed { .. }
+            ),
+            "initial move did not settle: {committed:?}; status={:?}",
+            handle.status().unwrap(),
+        );
+        assert!(matches!(
+            clean_shutdown_slot(&predecessor).unwrap(),
+            CleanShutdownSlot::Safe
+        ));
+        assert_eq!(
+            predecessor.sparse_binding().unwrap().action(),
+            SparseV2BindingAction::ReopenActive
+        );
+        let previous_generation = predecessor.binding_generation;
+
+        let failed = recover_managed_application_subtrees_with(
+            &state,
+            "main",
+            previous_generation,
+            request.clone(),
+            |_| Err("pre-publication reopen failure".into()),
+        );
+        assert_eq!(failed.unwrap_err(), "pre-publication reopen failure");
+        assert_eq!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            previous_generation
+        );
+
+        let result = recover_managed_application_subtrees_with(
+            &state,
+            "main",
+            previous_generation,
+            request.clone(),
+            |_| {
+                let opened = SyncRuntimeHandle::open(open_request.clone());
+                assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+                Ok((SparseV2Binding::from_open(opened), meta.clone()))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.previous_binding_generation, previous_generation);
+        assert_ne!(result.binding_generation, previous_generation);
+        assert_eq!(result.episode_id, request.episode_id);
+        assert_eq!(
+            result.application_page_admission.binding_generation,
+            result.binding_generation
+        );
+        assert_eq!(
+            result.status.application_page_admission,
+            result.application_page_admission
+        );
+        let result_generation = result.binding_generation;
+        match result.outcome {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                source,
+                destination,
+                ..
+            } => {
+                assert!(source.page.blocks.is_empty());
+                assert_eq!(destination.page.blocks.len(), 2);
+            }
+            other => panic!("reopened episode did not resolve: {other:?}"),
+        }
+        let current = state.graphs.read().unwrap().slot("main").unwrap();
+        assert_eq!(current.binding_generation, result_generation);
+        assert_eq!(
+            predecessor
+                .sparse_runtime()
+                .unwrap()
+                .status()
+                .unwrap()
+                .lifecycle,
+            SyncRuntimeLifecycle::StoppedSafe
+        );
+        let duplicate = SyncRuntimeHandle::open(open_request);
+        assert!(matches!(
+            duplicate.status,
+            SyncRuntimeOpenStatus::OpenRefused { .. }
+        ));
+        assert!(duplicate.handle.is_none());
+        assert!(matches!(
+            clean_shutdown_slot(&current).unwrap(),
             CleanShutdownSlot::Safe
         ));
         let _ = std::fs::remove_dir_all(root);

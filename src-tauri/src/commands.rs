@@ -5,9 +5,9 @@ use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
     slot_for_context, with_config_graph, with_filesystem_graph, with_trash_graph, AppState,
-    GraphContext,
+    ApplicationPageAdmissionAuthority, GraphContext,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State, WebviewWindow};
@@ -17,6 +17,7 @@ use tine_core::model::{
 };
 use tine_core::sync_runtime::{
     SyncApplicationGraphMutationRequest, SyncApplicationGuideCopyOutcome,
+    SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
@@ -24,6 +25,176 @@ use tine_core::sync_runtime::{
     SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
     SyncRuntimeHandle,
 };
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedApplicationMoveSubtreesResult {
+    pub(crate) binding_generation: u64,
+    pub(crate) application_page_admission: crate::state::ApplicationPageAdmission,
+    pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedApplicationMoveSubtreesRecoveryResult {
+    pub(crate) previous_binding_generation: u64,
+    pub(crate) binding_generation: u64,
+    pub(crate) status: crate::sync_runtime::SparseV2StatusDto,
+    pub(crate) application_page_admission: crate::state::ApplicationPageAdmission,
+    pub(crate) episode_id: String,
+    pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
+}
+
+#[cfg(test)]
+mod managed_application_move_wire_tests {
+    use super::{
+        ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesResult,
+    };
+    use crate::state::{ApplicationPageAdmission, ApplicationPageAdmissionAuthority};
+    use tine_core::model::{Format, PageDto, PageKind};
+    use tine_core::sync_runtime::{
+        SyncApplicationMoveConflict, SyncApplicationMoveSubtreesOutcome, SyncApplicationMovedPage,
+        SyncEditorDeferred, SyncLocalMutationPhase,
+    };
+
+    #[test]
+    fn bounded_tauri_move_result_json_round_trips() {
+        let page = |name: &str| PageDto {
+            activation: None,
+            name: name.into(),
+            kind: PageKind::Page,
+            title: name.into(),
+            pre_block: None,
+            blocks: Vec::new(),
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: format!("pages/{name}.md"),
+            guide: false,
+        };
+        let source = page("Source");
+        let destination = page("Destination");
+        let episode_id = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1";
+        let admission = ApplicationPageAdmission {
+            binding_generation: 17,
+            authority: ApplicationPageAdmissionAuthority::ManagedWritable {
+                application_save_page_blocks: 511,
+                application_page_request_text_bytes: 1_048_576,
+                application_page_max_depth: 128,
+            },
+        };
+        let outcomes = vec![
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id: episode_id.into(),
+                batch_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a2".into(),
+                recovered: true,
+                source: SyncApplicationMovedPage {
+                    page: source,
+                    revision: "source-revision".into(),
+                },
+                destination: SyncApplicationMovedPage {
+                    page: destination,
+                    revision: "destination-revision".into(),
+                },
+            },
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                episode_id: episode_id.into(),
+                reason: SyncApplicationMoveConflict::EpisodeNotCommitted,
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::RetryableExternalWork,
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::RetryableRetainedPublication {
+                    batch_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a3".into(),
+                    phase: SyncLocalMutationPhase::ArchiveStage,
+                },
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::BlockedRecovery {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                    retained_publication: true,
+                },
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::Revoked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                },
+            },
+        ];
+        let status: crate::sync_runtime::SparseV2StatusDto =
+            serde_json::from_value(serde_json::json!({
+                "state": "active",
+                "runtime": {
+                    "lifecycle": "active",
+                    "recovery": "adopted_safe_handoff",
+                    "watcher": {
+                        "latest_enqueue": 0,
+                        "acknowledged": 0,
+                        "drain_in_flight": false,
+                        "pending": false,
+                        "pending_requires_full_scan": false,
+                        "deferred": false,
+                        "quiescing": false,
+                        "sequence_exhausted": false
+                    },
+                    "last_tick": null,
+                    "detail": null,
+                    "shared_role": null,
+                    "shared_phase": null,
+                    "provider_pending": 0,
+                    "provider_runnable": false,
+                    "managed_local_pending": 0,
+                    "managed_local_checkpointed_sequence": 0,
+                    "managed_local_next_sequence": 0,
+                    "managed_local_stage": null
+                },
+                "can_activate": false,
+                "can_retry": false,
+                "can_cancel": true,
+                "cancel_reason": null,
+                "binding_generation": 17,
+                "application_page_admission": serde_json::to_value(&admission).unwrap()
+            }))
+            .unwrap();
+
+        for outcome in outcomes {
+            let result = ManagedApplicationMoveSubtreesResult {
+                binding_generation: 17,
+                application_page_admission: admission.clone(),
+                outcome: outcome.clone(),
+            };
+            let bytes = serde_json::to_vec(&result).unwrap();
+            assert!(bytes.len() < 16 * 1024);
+            let decoded: ManagedApplicationMoveSubtreesResult =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+
+            let recovery = ManagedApplicationMoveSubtreesRecoveryResult {
+                previous_binding_generation: 16,
+                binding_generation: 17,
+                status: status.clone(),
+                application_page_admission: admission.clone(),
+                episode_id: episode_id.into(),
+                outcome,
+            };
+            let bytes = serde_json::to_vec(&recovery).unwrap();
+            let decoded: ManagedApplicationMoveSubtreesRecoveryResult =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(recovery).unwrap()
+            );
+        }
+    }
+}
 
 #[tauri::command]
 pub(crate) fn load_workspaces(
@@ -420,6 +591,9 @@ fn sparse_save_request(
 
 fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<String, String> {
     match outcome {
+        SyncApplicationPageSaveOutcome::Prepared => {
+            Err("managed preflight result escaped the preflight command".into())
+        }
         SyncApplicationPageSaveOutcome::Saved { revision, .. }
         | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
         // This bounded family tells the frontend to retain the draft, observe
@@ -449,6 +623,133 @@ where
     let request = sparse_save_request(page, base_rev, force, managed_conflict_observation)?;
     let outcome = save(request).map_err(|error| error.to_string())?;
     map_sparse_page_save(outcome)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ManagedPageMutationPreflightResult {
+    Accepted {
+        binding_generation: u64,
+        page_name: String,
+        page_path: String,
+        base_revision: Option<String>,
+    },
+    Refused,
+    Deferred,
+}
+
+fn managed_preflight_binding_admitted(
+    owned_binding: u64,
+    requested_binding: u64,
+    authority: &ApplicationPageAdmissionAuthority,
+) -> bool {
+    owned_binding == requested_binding
+        && matches!(
+            authority,
+            ApplicationPageAdmissionAuthority::ManagedWritable { .. }
+        )
+}
+
+/// Prepare the exact managed application-page transaction and discard it. This
+/// command never falls back to Direct Files and never settles actor work.
+#[tauri::command]
+pub(crate) async fn preflight_managed_page_mutation(
+    page: PageDto,
+    base_revision: Option<String>,
+    binding_generation: u64,
+    state: GraphContext<'_>,
+) -> Result<ManagedPageMutationPreflightResult, String> {
+    let (app, label, owned_binding) = owned_graph_context(state)?;
+    if owned_binding != binding_generation {
+        return Ok(ManagedPageMutationPreflightResult::Refused);
+    }
+    let page_name = page.name.clone();
+    let page_path = page.path.clone();
+    let echoed_base = base_revision.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        if !managed_preflight_binding_admitted(
+            slot.binding_generation,
+            binding_generation,
+            &slot.application_page_admission().authority,
+        ) {
+            return Ok(ManagedPageMutationPreflightResult::Refused);
+        }
+        let Some(handle) = sparse_application_handle(&slot)? else {
+            return Ok(ManagedPageMutationPreflightResult::Refused);
+        };
+        let request = match sparse_save_request(page, base_revision, false, None) {
+            Ok(request) => request,
+            Err(_) => return Ok(ManagedPageMutationPreflightResult::Refused),
+        };
+        match handle.preflight_application_page(request) {
+            Ok(tine_core::sync_runtime::SyncApplicationPagePreflightOutcome::Accepted) => {
+                Ok(ManagedPageMutationPreflightResult::Accepted {
+                    binding_generation,
+                    page_name,
+                    page_path,
+                    base_revision: echoed_base,
+                })
+            }
+            Ok(tine_core::sync_runtime::SyncApplicationPagePreflightOutcome::Deferred {
+                ..
+            }) => Ok(ManagedPageMutationPreflightResult::Deferred),
+            Ok(tine_core::sync_runtime::SyncApplicationPagePreflightOutcome::Conflict {
+                ..
+            })
+            | Err(_) => Ok(ManagedPageMutationPreflightResult::Refused),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod managed_page_mutation_preflight_tests {
+    use super::{managed_preflight_binding_admitted, ManagedPageMutationPreflightResult};
+    use crate::state::ApplicationPageAdmissionAuthority;
+
+    #[test]
+    fn binding_and_authority_gate_refuses_mismatch_direct_and_unavailable() {
+        let writable = ApplicationPageAdmissionAuthority::ManagedWritable {
+            application_save_page_blocks: 511,
+            application_page_request_text_bytes: 1024 * 1024,
+            application_page_max_depth: 128,
+        };
+        assert!(managed_preflight_binding_admitted(7, 7, &writable));
+        assert!(!managed_preflight_binding_admitted(7, 8, &writable));
+        assert!(!managed_preflight_binding_admitted(
+            7,
+            7,
+            &ApplicationPageAdmissionAuthority::Direct
+        ));
+        assert!(!managed_preflight_binding_admitted(
+            7,
+            7,
+            &ApplicationPageAdmissionAuthority::ManagedUnavailable
+        ));
+    }
+
+    #[test]
+    fn every_preflight_result_round_trips_exact_json() {
+        for result in [
+            ManagedPageMutationPreflightResult::Accepted {
+                binding_generation: 7,
+                page_name: "Dense".into(),
+                page_path: "pages/Dense.md".into(),
+                base_revision: Some("base".into()),
+            },
+            ManagedPageMutationPreflightResult::Refused,
+            ManagedPageMutationPreflightResult::Deferred,
+        ] {
+            let json = serde_json::to_string(&result).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ManagedPageMutationPreflightResult>(&json).unwrap(),
+                result
+            );
+        }
+    }
 }
 
 /// Keep the user-facing save error bounded, while allowing an opt-in local
@@ -1091,6 +1392,64 @@ pub(crate) async fn save_page(
             );
         }
         result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// X1-only native bridge for one actor-owned managed cross-page move. No
+/// production gesture calls this command until X2 installs the queue, busy
+/// lease, save hold, authoritative DTO publication, and semantic history.
+#[tauri::command]
+pub(crate) async fn move_managed_application_subtrees(
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    state: GraphContext<'_>,
+) -> Result<ManagedApplicationMoveSubtreesResult, String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err("managed cross-page move belongs to a stale graph binding".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let handle = sparse_application_handle(&slot)?
+            .ok_or_else(|| "managed cross-page move requires managed storage".to_owned())?;
+        let outcome = handle
+            .move_application_subtrees(request)
+            .map_err(|error| error.to_string())?;
+        let result = ManagedApplicationMoveSubtreesResult {
+            binding_generation,
+            application_page_admission: slot.application_page_admission(),
+            outcome,
+        };
+        crate::state::poke_watcher(&state);
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// X1.5 recovery handoff for one exact, already-issued managed move episode.
+/// The helper owns graph lifecycle serialization and may replace only an
+/// already-stopped retained actor with one recovered successor.
+#[tauri::command]
+pub(crate) async fn recover_managed_application_subtrees(
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    state: GraphContext<'_>,
+) -> Result<ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err("managed cross-page move recovery belongs to a stale graph binding".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::sync_runtime::recover_managed_application_subtrees_blocking(
+            &app,
+            &label,
+            binding_generation,
+            request,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2212,11 +2571,10 @@ mod capture_quick_switch_tests {
         }
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(std::collections::HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -3414,6 +3772,55 @@ pub(crate) fn list_journal_conflicts(
     with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
+/// Concord L0 reload-on-focus fallback: ask the watcher for ONE full stat-diff
+/// pass right now. Whatever changed on disk is then emitted through the normal
+/// `graph-changed` path, so the deferred-replay machinery decides what may be
+/// applied — this command never touches a page itself.
+///
+/// Deliberately graph-slot-free: it arms a process-wide flag on the single
+/// watcher thread, which already covers every bound graph in both regimes.
+#[tauri::command]
+pub(crate) fn rescan_graph_now(state: tauri::State<'_, AppState>) -> u64 {
+    let sequence = crate::watcher::request_full_rescan();
+    crate::state::poke_watcher(&state);
+    sequence
+}
+
+/// Journal files whose names don't round-trip to a date, and the names they
+/// would get. Concord invariant 4 (write-shyness): opening a graph used to
+/// perform these renames silently; it now only proposes them here.
+#[tauri::command]
+pub(crate) fn list_journal_filename_migrations(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::model::JournalFilenameMigration>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.journal_filename_migrations()))
+}
+
+/// Apply the proposed journal renames, on the user's explicit request. Takes the
+/// same pre-migration snapshot the open path used to take, so the original
+/// filenames stay recoverable in Backups & recovery. Returns how many were
+/// renamed (the migration never clobbers an existing target).
+///
+/// Graph-text mutation with no managed analogue: renaming graph files is the
+/// oplog's authority under managed storage and stays refused there.
+#[tauri::command]
+pub(crate) async fn apply_journal_filename_migrations(
+    state: GraphContext<'_>,
+) -> Result<usize, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        crate::backup::backup_graph_now(&app, &graph, "");
+        graph
+            .migrate_journal_filenames_checked()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
 /// user to review + reconcile instead of them showing as garbage pages.
 #[tauri::command]
@@ -3421,6 +3828,77 @@ pub(crate) fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, String> {
     with_filesystem_graph(&state, |g| Ok(g.list_sync_conflicts()))
+}
+
+/// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+/// (git/Fossil). They stay readable but saves to them are refused, so the
+/// conflicts panel and the page banner can explain why.
+#[tauri::command]
+pub(crate) fn list_vcs_marker_conflicts(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::model::VcsMarkerConflict>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.list_vcs_marker_conflicts()))
+}
+
+/// The Concord conflict queue (L3): ONE derived inventory of everything on disk
+/// that needs the user's judgement — conflict copies AND marker-bearing pages —
+/// behind the calm badge and the in-page resolver. Derived on every call from
+/// what is on disk, so it survives restarts without storing anything.
+#[tauri::command]
+pub(crate) fn conflict_queue(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::concord_queue::ConflictObject>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.conflict_queue()))
+}
+
+/// Block-level diff of a marker-bearing page's own sides (Concord L5): the
+/// marker sections are parsed into complete page texts and run through the SAME
+/// block diff the conflict-copy path uses. Read-only.
+#[tauri::command]
+pub(crate) fn vcs_marker_conflict_diff(
+    path: String,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::concord_queue::MarkerConflictDiff>, String> {
+    with_filesystem_graph(&state, |g| {
+        g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string())
+    })
+}
+
+/// Apply the user's per-row decisions to a marker-bearing page, writing the
+/// clean merged result — the one write Concord invariant 3 permits to such a
+/// file. `base_rev` guards against the VCS changing it under the review.
+///
+/// Graph-text write on a Direct Files phenomenon: managed storage has no
+/// marker-bearing files, so this is deliberately legacy-authority only.
+#[tauri::command]
+pub(crate) async fn resolve_vcs_marker_conflict(
+    path: String,
+    decisions: std::collections::HashMap<String, String>,
+    base_rev: String,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.legacy_graph()?
+            .resolve_vcs_marker_conflict(
+                &path,
+                &decisions,
+                &base_rev,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "conflict".to_string()
+                } else {
+                    error.to_string()
+                }
+            })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
@@ -3437,6 +3915,146 @@ pub(crate) fn sync_conflict_diff(
     })
 }
 
+/// Block-level diff of two raw page texts — a pure function of its inputs,
+/// needing no graph, path, or slot (Concord P3's path-free seam; future in-page
+/// conflict UI builds on it). `format`: `"org"` selects the org parser,
+/// anything else means markdown. Revs are `content_rev` of the exact inputs,
+/// the same staleness tokens `Graph::sync_conflict_diff` issues.
+#[tauri::command]
+pub(crate) fn text_block_diff(
+    mine: String,
+    theirs: String,
+    format: Option<String>,
+) -> tine_core::sync_diff::SyncConflictDiff {
+    tine_core::sync_diff::diff_texts(&mine, &theirs, format.as_deref() == Some("org"))
+}
+
+/// 3-way variant of [`text_block_diff`]: classifies each aligned row against
+/// `base` (the last-agreed text) and carries per-row suggestions the UI may
+/// pre-select — never auto-apply. See ADR 0056.
+#[tauri::command]
+pub(crate) fn text_block_diff3(
+    base: String,
+    mine: String,
+    theirs: String,
+    format: Option<String>,
+) -> tine_core::sync_diff::SyncConflictDiff {
+    tine_core::sync_diff::diff3_texts(&base, &mine, &theirs, format.as_deref() == Some("org"))
+}
+
+/// Diff a retained live Direct Files draft against the exact disk observation
+/// that refused its save. The authority is inspected, never consumed.
+#[tauri::command]
+pub(crate) fn live_save_conflict_diff(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    state: GraphContext<'_>,
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .live_save_conflict_diff(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn capture_live_save_conflict(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    state: GraphContext<'_>,
+) -> Result<tine_core::LiveSaveConflictCapture, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .capture_live_save_conflict(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn durable_live_save_conflict_diff(
+    page: PageDto,
+    base_text: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .durable_live_save_conflict_diff(&page, base_text.as_deref())
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn resolve_durable_live_save_conflict(
+    page: PageDto,
+    expected_disk_rev: String,
+    decisions: std::collections::HashMap<String, String>,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        graph
+            .resolve_durable_live_save_conflict(
+                &page,
+                &expected_disk_rev,
+                &decisions,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
+            .map_err(direct_save_error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Resolve a live Direct Files save conflict block-by-block, consuming the same
+/// exact one-shot authority as the former Keep-mine action.
+#[tauri::command]
+pub(crate) async fn resolve_live_save_conflict(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    decisions: std::collections::HashMap<String, String>,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        graph
+            .resolve_live_save_conflict(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+                &decisions,
+                pre_choice.as_deref().unwrap_or("both"),
+            )
+            .map_err(direct_save_error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Resolve a sync-conflict copy: merge it into its winner per the user's per-row
 /// `decisions` (row id → "mine"/"theirs"/"both") via the normal save path, then
 /// trash the conflict copy. `base_rev` guards against the winner changing under
@@ -3450,22 +4068,34 @@ pub(crate) async fn resolve_sync_conflict(
     conflict_rev: String,
     pre_choice: Option<String>,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<PageDto, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         match sparse_application_handle(&slot)? {
-            Some(handle) => map_managed_sync_conflict_resolution(handle.mutate_application_graph(
-                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
-                    winner_path: winner,
-                    conflict_path: conflict,
-                    decisions,
-                    base_revision: base_rev,
-                    conflict_revision: conflict_rev,
-                    pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
-                },
-            )),
+            Some(handle) => {
+                let winner_path = winner.clone();
+                map_managed_sync_conflict_resolution(handle.mutate_application_graph(
+                    SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                        winner_path: winner,
+                        conflict_path: conflict,
+                        decisions,
+                        base_revision: base_rev,
+                        conflict_revision: conflict_rev,
+                        pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
+                    },
+                ))?;
+                load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::ExactPath {
+                        path: winner_path.clone(),
+                    },
+                )?
+                .ok_or_else(|| {
+                    format!("resolved page disappeared after managed conflict merge: {winner_path}")
+                })
+            }
             None => slot
                 .legacy_graph()?
                 .resolve_sync_conflict(
@@ -4054,6 +4684,8 @@ mod application_page_authority_tests {
 pub(crate) async fn merge_pages(
     src: String,
     dst: String,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -4065,12 +4697,21 @@ pub(crate) async fn merge_pages(
                 SyncApplicationGraphMutationRequest::MergePages {
                     source_path: src,
                     destination_path: dst,
+                    rename_from,
+                    rename_to,
                 },
             )),
-            None => slot
-                .legacy_graph()?
-                .merge_pages(&src, &dst)
-                .map_err(|e| e.to_string()),
+            None => match (rename_from.as_deref(), rename_to.as_deref()) {
+                (Some(old), Some(new)) => slot
+                    .legacy_graph()?
+                    .merge_pages_after_rename(&src, &dst, old, new)
+                    .map_err(|e| e.to_string()),
+                (None, None) => slot
+                    .legacy_graph()?
+                    .merge_pages(&src, &dst)
+                    .map_err(|e| e.to_string()),
+                _ => Err("merge rename requires both source and destination names".into()),
+            },
         }
     })
     .await

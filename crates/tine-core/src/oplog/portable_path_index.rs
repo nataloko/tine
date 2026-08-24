@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::authenticated_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
+use super::content_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
 use super::object_store::StoreError;
 use super::{
     BatchCausalDot, BatchId, ContentDigest, ManagedPath, PageId, PortablePathKeyDigest,
@@ -172,6 +172,13 @@ impl PortablePathRecord {
         self.latest_release.as_ref()
     }
 
+    /// Canonical opaque bytes used while SQLite shadows and replaces the
+    /// Patricia point map. Domain interpretation remains in tine-core.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate(self.key_digest)?;
+        encode_record(self)
+    }
+
     fn validate(&self, expected: PortablePathKeyDigest) -> Result<(), StoreError> {
         if self.schema_version != PORTABLE_PATH_RECORD_SCHEMA_VERSION
             || self.key_version != PORTABLE_PATH_KEY_VERSION
@@ -216,8 +223,7 @@ impl PortablePathIndexStore {
     pub(crate) fn finish_detached_construction(
         &self,
         root: PortablePathIndexRoot,
-    ) -> Result<Option<super::authenticated_patricia::CompletedPatriciaConstruction>, StoreError>
-    {
+    ) -> Result<Option<super::content_patricia::CompletedPatriciaConstruction>, StoreError> {
         self.patricia.finish_detached_construction(root.0)
     }
 

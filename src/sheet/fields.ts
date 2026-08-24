@@ -1,8 +1,17 @@
-import { doc, formatForBlock, setRaw, setBlockProperty, setSchedule, blockPageReadOnly, withUndoUnit } from "../store";
+import {
+  doc,
+  formatForBlock,
+  setRaw,
+  setBlockProperty,
+  setSchedule,
+  blockPageReadOnly,
+  withUndoUnit,
+  type PageMutationDraft,
+} from "../store";
 import { facetsFromDto, facetsOf, inlineText, parseBody, tagIdentityKey, type Facets } from "../render/facets";
 import { isRenderHiddenProp } from "../render/block";
 import { leadingMarker, nextMarker, setMarker } from "../editor/marker";
-import { cycleMarkerSmart } from "../editor/repeat";
+import { cycleMarkerSmart, toggleMarkerLabel } from "../editor/repeat";
 import { MARKERS } from "../markers";
 import { MARKER_RE } from "../markers";
 import { workflow, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
@@ -334,6 +343,20 @@ export function cycleField(id: string, field: "state" | "priority"): boolean {
   return writeField(id, "priority", next ?? "");
 }
 
+export function toggleStateMarkerLabel(id: string): boolean {
+  if (blockPageReadOnly(id)) return false;
+  const node = doc.byId[id];
+  if (!node) return false;
+  const raw = toggleMarkerLabel(node.raw, {
+    format: formatForBlock(id),
+    enabled: timetrackingEnabled(),
+    withSeconds: logbookWithSecondSupport(),
+  });
+  if (raw === null) return false;
+  setRaw(id, raw, { timetracking: false });
+  return true;
+}
+
 export function groupKeyForBlock(id: string, field: FieldId): string | null {
   if (isFormulaField(field)) return null;
   const v = readField(id, field);
@@ -389,4 +412,28 @@ function setPriorityRaw(raw: string, level: "A" | "B" | "C" | null): string {
   const prefix = head ? `${head} ` : "";
   lines[0] = level ? (rest ? `${prefix}[#${level}] ${rest}` : `${prefix}[#${level}]`) : `${prefix}${rest}`;
   return lines.join("\n");
+}
+
+/** Pure/detached counterpart used when a structural Sheet command is being
+ * assembled as one atomic page-mutation plan. Restructure only writes fields
+ * that are currently absent, so marker insertion has no clock transition to
+ * preserve. */
+export function writeGroupingFieldToDraft(
+  draft: PageMutationDraft,
+  id: string,
+  field: "state" | "priority" | `prop:${string}`,
+  value: string,
+): boolean {
+  const node = draft.node(id);
+  if (!node) return false;
+  const trimmed = value.trim();
+  if (field === "state") {
+    const target = MARKERS.includes(trimmed as (typeof MARKERS)[number]) ? trimmed : null;
+    return target !== null && draft.setRaw(id, setMarker(node.raw, target));
+  }
+  if (field === "priority") {
+    const target = trimmed === "A" || trimmed === "B" || trimmed === "C" ? trimmed : null;
+    return target !== null && draft.setRaw(id, setPriorityRaw(node.raw, target));
+  }
+  return draft.setProperty(id, field.slice(5), trimmed || null);
 }

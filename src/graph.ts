@@ -3,10 +3,10 @@
 
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
+import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
-import { resetTabsToJournals, openPage, restoreSession, flushSession, type PageTarget } from "./router";
+import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
@@ -53,6 +53,12 @@ export type LoadGraphPathOutcome =
   | { kind: "loaded" | "already_current"; root: string }
   | { kind: "focused_existing" | "aborted" };
 
+// Frontend continuations may overlap while native storage recovery is being
+// superseded (most importantly, emergency Direct Files during a managed open).
+// This is not storage authority: it only prevents an obsolete promise from
+// repainting/resetting the UI after a newer native operation has won.
+let graphLoadContinuation = 0;
+
 /** Establish the one exceptional filesystem capability Tine supports: a graph
  * may point `assets` at an external directory, but only after this installation
  * shows the resolved target and receives explicit consent. */
@@ -78,10 +84,18 @@ export async function authorizeGraphAccess(path: string): Promise<boolean> {
 
 export async function loadGraphPath(
   path: string,
-  options: { forceRefresh?: boolean; transitionHeld?: boolean } = {}
+  options: {
+    forceRefresh?: boolean;
+    transitionHeld?: boolean;
+    supersedeCurrent?: boolean;
+  } = {}
 ): Promise<LoadGraphPathOutcome> {
+  const startedAt = performance.now();
   const ownsTransition = !options.transitionHeld;
-  if (graphTransitioning() && ownsTransition) return { kind: "aborted" };
+  if (graphTransitioning() && ownsTransition && !options.supersedeCurrent) {
+    return { kind: "aborted" };
+  }
+  const continuation = ++graphLoadContinuation;
   if (ownsTransition) {
     setGraphTransitioning(true);
     const active = document.activeElement;
@@ -91,6 +105,7 @@ export async function loadGraphPath(
     await Promise.resolve();
   }
   try {
+  console.info(`[tine] frontend graph open: begin path=${path ? "explicit" : "default"}`);
   // Whether we're switching to a *different* graph than last time. Only then do
   // we drop the persisted right-sidebar items; reopening the same graph at
   // startup keeps them (and we prune stale block refs below).
@@ -122,6 +137,7 @@ export async function loadGraphPath(
     retirePdfOwnership();
     closePdf();
   }
+  if (continuation !== graphLoadContinuation) return { kind: "aborted" };
 
   let result;
   // Native graph replacement is asynchronous. Stop accepting watcher events
@@ -132,6 +148,7 @@ export async function loadGraphPath(
   try {
     result = await backend().loadGraph(path);
   } catch (error) {
+    if (continuation !== graphLoadContinuation) return { kind: "aborted" };
     // load_graph failed before installing a replacement binding.  Publish a new
     // local generation for the still-bound old graph; the retired viewer stays
     // closed, so no callback can regain its former authority.
@@ -139,6 +156,8 @@ export async function loadGraphPath(
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
+  if (continuation !== graphLoadContinuation) return { kind: "aborted" };
+  console.info(`[tine] frontend graph open: native binding ready at ${Math.round(performance.now() - startedAt)} ms`);
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
@@ -162,11 +181,12 @@ export async function loadGraphPath(
   }
   if (switching || !hadGraph) resetLeftSidebarSections();
   setGraphMeta(meta ?? null);
-  // Revoke every in-flight result from the previous binding NOW, before the
-  // awaited journal-template step. This is also required for same-root force
-  // refresh (restore): root equality cannot distinguish pre-restore DTOs from
-  // the freshly rebound graph. The second bump below refetches after a default
-  // template has been written, preserving #73's populated-first observation.
+  restoreLiveSaveConflicts(meta.root);
+  // Revoke every in-flight result from the previous binding NOW. This is also
+  // required for same-root force refresh (restore): root equality cannot
+  // distinguish pre-restore DTOs from the freshly rebound graph. A visible
+  // Journals surface performs template materialization before fetching its feed,
+  // preserving #73's populated-first observation without blocking graph open.
   bumpGraphEpoch();
   setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
@@ -180,11 +200,9 @@ export async function loadGraphPath(
       // ignore
     }
   }
-  // A default journal template writes today's journal to disk. Do that before
-  // invalidating graph-backed resources so the first Journals refetch observes
-  // the populated file instead of caching the synthetic blank page (#73).
-  await ensureJournalTemplateForDay(new Date());
-  bumpGraphEpoch();
+  // A visible Journals surface owns template materialization and awaits it
+  // before fetching the feed (Page.tsx). Doing it here as well makes every graph
+  // open pay getPage/listTemplates, which can cold-scan a large Direct graph.
   void injectCustomCss();
   void loadAliases();
   if (!switching) void pruneSidebarBlocks();
@@ -203,16 +221,26 @@ export async function loadGraphPath(
     // session before the backend knew which graph this webview would own.
     await restoreSession();
   }
+  console.info(`[tine] frontend graph open: session restored at ${Math.round(performance.now() - startedAt)} ms`);
   // GH #245: a configured home page wins over the ordinary landing on an
   // ordinary open (first bind or graph switch) — not on a same-graph reload /
   // watcher refresh. Later explicit intents (quick capture, deep link) still
   // win by navigating after this.
   if (result.kind === "loaded" && (switching || !hadGraph)) {
-    await openConfiguredHomePage(meta.root);
+    const homeEpoch = graphEpoch();
+    const landingRoute = { ...route() };
+    void openConfiguredHomePage(meta.root, () =>
+      graphMeta()?.root === meta.root
+      && graphEpoch() === homeEpoch
+      && sameRoute(route(), landingRoute)
+    );
   }
+  console.info(`[tine] frontend graph open: interactive at ${Math.round(performance.now() - startedAt)} ms`);
   return { kind: result.kind, root: meta.root };
   } finally {
-    if (ownsTransition) setGraphTransitioning(false);
+    if (ownsTransition && continuation === graphLoadContinuation) {
+      setGraphTransitioning(false);
+    }
   }
 }
 
@@ -286,6 +314,21 @@ export async function refreshPageIdentities(): Promise<void> {
     : {};
   commitNavigationIndex();
 }
+
+/** React to native code atomically rebinding the same graph root to a new
+ * storage-authority generation. This retires renderer objects from the former
+ * generation, but never reopens the graph or independently decides whether the
+ * native transition succeeded. */
+export function rebindCurrentStorageAuthority(): void {
+  if (!graphMeta()) throw new Error("the current graph identity disappeared during the storage transition");
+  resetStore();
+  resetNavigationIndex();
+  clearAssetBlobCache();
+  bumpGraphEpoch();
+  void loadAliases();
+  void pruneSidebarBlocks();
+}
+
 async function loadAliases(): Promise<void> {
   const epoch = graphEpoch();
   if (!(await waitForWarmCache(epoch))) return;
@@ -314,6 +357,28 @@ export function refreshAfterRename(from: string, to: string, exactTarget?: PageT
   resetNavigationIndex();
   bumpGraphEpoch();
   void Promise.all([refreshAliases(), refreshPageIdentities()]);
+}
+
+export async function renameOrMergePage(
+  from: string,
+  to: string,
+  sourcePath?: string,
+): Promise<"renamed" | "merged" | "cancelled"> {
+  const destination = await backend().getPage(to, "page");
+  let exactSourcePath = sourcePath;
+  if (!exactSourcePath) exactSourcePath = (await backend().getPage(from, "page"))?.path;
+  if (destination?.path && destination.path !== exactSourcePath) {
+    if (!globalThis.confirm(`Page “${to}” already exists. Merge “${from}” into it?`)) {
+      return "cancelled";
+    }
+    if (!exactSourcePath) {
+      throw new Error(`Couldn't identify the source file for “${from}”.`);
+    }
+    await backend().mergePages(exactSourcePath, destination.path, { from, to });
+    return "merged";
+  }
+  await backend().renamePage(from, to, exactSourcePath);
+  return "renamed";
 }
 
 export type JournalTemplateEnsureResult = "ready" | "deferred" | "stale";

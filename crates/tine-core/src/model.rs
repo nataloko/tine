@@ -15,6 +15,14 @@ use crate::oplog::projection_store::{
     ProjectionCleanupRetirementAuthority, ProjectionMutationAuthority,
     ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
 };
+use crate::oplog::sync_layout::{
+    BOOTSTRAP_SOURCE_CAPTURE_CHUNKS_DIR as BOOTSTRAP_SOURCE_CHUNK_DIRECTORY,
+    BOOTSTRAP_SOURCE_CAPTURE_DIR as BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY,
+    BOOTSTRAP_SOURCE_CAPTURE_MANIFEST_FILE as BOOTSTRAP_SOURCE_MANIFEST,
+    BOOTSTRAP_SOURCE_CHUNKS_FILE as BOOTSTRAP_SOURCE_CHUNKS,
+    BOOTSTRAP_SOURCE_ENTRIES_FILE as BOOTSTRAP_SOURCE_ENTRIES,
+    BOOTSTRAP_SOURCE_INVENTORY_FILE as BOOTSTRAP_SOURCE_INVENTORY,
+};
 use crate::oplog::{
     managed_component_is_portable, BlobDescription, CanonicalGraphResourceId, ContentDigest,
     LocalProjectionEvidenceRecord, ManagedPath, ManagedTextKind, PortablePathKey,
@@ -37,7 +45,6 @@ use std::sync::RwLock;
 use tine_storage::{
     ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, FilesystemError,
 };
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,16 +118,44 @@ fn slash_path(path: &Path) -> String {
 }
 
 /// If `stem` is a sync tool's conflict copy of another file, return the base file
-/// stem it shadows. Recognises Syncthing
-/// (`name.sync-conflict-YYYYMMDD-HHMMSS-XXXXXXX`) and Dropbox
-/// (`name (conflicted copy …)` / `name (<user>'s conflicted copy …)`).
+/// stem it shadows. Recognises the GENERATED shapes only (a page whose name
+/// merely resembles one stays a real page):
+///
+/// - Syncthing: `name.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID`
+///   (`conflictName` in syncthing `lib/model/folder_sendrecv.go`; the device id
+///   is the modifying device's short id — up to 7 base32 chars `[A-Z2-7]`,
+///   empty when unknown — and pre-1.1.0 versions omitted `-DEVICEID`).
+/// - Seafile: `name (SFConflict [modifier ]YYYY-MM-DD-HH-MM-SS)`
+///   (`gen_conflict_path` in seafile `common/vc-common.c`; the modifier is the
+///   editing user's id when known).
+/// - Dropbox: `name (conflicted copy …)` / `name (<user>'s conflicted copy …)`.
+///
+/// Deliberately NOT recognized (too ambiguous to distinguish from a real page
+/// name, so treating them as conflict copies would deindex real pages):
+/// OneDrive's `name-COMPUTERNAME.ext` and Google Drive's `name (1).ext`.
 ///
 /// A conflict copy is NOT a real page — the versioned graph-text policy keeps it
 /// out of normal discovery and exact page resolution. The explicit conflict
 /// workflow has its own retained-capability path.
 pub fn sync_conflict_base(stem: &str) -> Option<&str> {
-    if let Some(i) = stem.find(".sync-conflict-") {
-        return Some(&stem[..i]);
+    const SYNCTHING_TAG: &str = ".sync-conflict-";
+    let mut search = 0;
+    while let Some(found) = stem[search..].find(SYNCTHING_TAG) {
+        let i = search + found;
+        if syncthing_conflict_tail(&stem[i + SYNCTHING_TAG.len()..]) {
+            return Some(&stem[..i]);
+        }
+        search = i + SYNCTHING_TAG.len();
+    }
+    const SEAFILE_TAG: &str = " (SFConflict ";
+    if let Some(inner) = stem.strip_suffix(')') {
+        if let Some(i) = inner.rfind(SEAFILE_TAG) {
+            let args = &inner[i + SEAFILE_TAG.len()..];
+            let timestamp = args.rsplit(' ').next().unwrap_or(args);
+            if seafile_conflict_timestamp(timestamp) && !args.contains(')') {
+                return Some(&stem[..i]);
+            }
+        }
     }
     // Dropbox: "<base> (conflicted copy …)" or "<base> (<user>'s conflicted copy …)".
     if let Some(i) = stem.find(" (") {
@@ -129,6 +164,46 @@ pub fn sync_conflict_base(stem: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Whether the text after `.sync-conflict-` matches Syncthing's generated
+/// `YYYYMMDD-HHMMSS[-DEVICEID]` tail exactly to the end of the stem.
+fn syncthing_conflict_tail(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    if bytes.len() < 15
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || bytes[8] != b'-'
+        || !bytes[9..15].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    match &bytes[15..] {
+        // Pre-1.1.0 Syncthing: no `-DEVICEID` suffix at all.
+        [] => true,
+        // The short device id: up to 7 chars of RFC 4648 base32 (`[A-Z2-7]`),
+        // empty when the modifying device is unknown (zero ShortID).
+        [b'-', device @ ..] => {
+            device.len() <= 7
+                && device
+                    .iter()
+                    .all(|&b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `text` is Seafile's `%Y-%m-%d-%H-%M-%S` conflict timestamp
+/// (`gen_conflict_path` in seafile `common/vc-common.c`).
+fn seafile_conflict_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 19
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            if matches!(i, 4 | 7 | 10 | 13 | 16) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 /// Whether `stem` names a sync-tool conflict copy (see [`sync_conflict_base`]).
@@ -323,6 +398,25 @@ pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
         .is_some_and(|source| source.is::<ProjectionSemanticRefusal>())
 }
 
+/// Name the filesystem primitive and the graph location behind a raw platform
+/// errno on the projection leg.
+///
+/// The device is the only oracle for Android's shared-storage semantics and one
+/// CI round trip costs ~20 minutes, so a receipt that says only
+/// `Invalid argument (os error 22)` cannot be acted on. `ErrorKind` is
+/// preserved, because callers above classify on it (`NotFound`/`AlreadyExists`
+/// are guarded-conflict signals) and the platform durability policy matches on
+/// it too. A semantic refusal is returned untouched so its marker type survives.
+fn projection_platform_error(operation: &str, location: &str, error: io::Error) -> io::Error {
+    if is_projection_semantic_refusal(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!("{operation} failed at {location}: {error}"),
+    )
+}
+
 /// Markdown's parser deliberately omits layout trivia such as empty separator
 /// lines, but a guarded journal target may retain that trivia through its
 /// authenticated projection annotations. This comparison is intentionally
@@ -384,6 +478,39 @@ impl ProjectionParent {
 enum ProjectionParentCapture {
     Missing,
     Present(ProjectionParent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorPublicationAuthority {
+    /// The Markdown/Org file is the sole durable authority (Direct Files).
+    DirectFile,
+    /// The file is a rebuildable managed-storage projection whose durable
+    /// authority is the accepted journal/manifest.
+    ReconstructibleManagedProjection,
+}
+
+fn preflight_editor_publication_chain(
+    authority: EditorPublicationAuthority,
+    chain: &[Dir],
+) -> io::Result<()> {
+    match authority {
+        EditorPublicationAuthority::DirectFile => preflight_projection_chain(chain),
+        EditorPublicationAuthority::ReconstructibleManagedProjection => {
+            preflight_reconstructible_projection_chain(chain)
+        }
+    }
+}
+
+fn sync_editor_publication_chain(
+    authority: EditorPublicationAuthority,
+    chain: &[Dir],
+) -> io::Result<()> {
+    match authority {
+        EditorPublicationAuthority::DirectFile => sync_projection_chain_required(chain),
+        EditorPublicationAuthority::ReconstructibleManagedProjection => {
+            sync_reconstructible_projection_chain(chain)
+        }
+    }
 }
 
 fn validate_projection_attempt(
@@ -533,9 +660,9 @@ pub(crate) struct ParsedExternalDocument {
     pub(crate) effective: PageEntry,
     pub(crate) parsed: doc::ParsedDocument,
     pub(crate) revision: String,
-    /// `None` when the caller only needs read-compatible semantics. Import
-    /// requests the existing byte-round-trip admission proof and receives
-    /// `Some(true)` or fails closed before this value can be consumed.
+    /// `None` when the caller only needs read-compatible semantics. Import-grade
+    /// parsing records whether the source is structurally editable, but a false
+    /// result is now an exact read-only source rather than an admission failure.
     pub(crate) source_round_trips: Option<bool>,
 }
 
@@ -579,8 +706,10 @@ impl ParsedExternalDocument {
         content: &str,
     ) -> io::Result<PageDto> {
         let mut dto = page_dto_checked(&self.effective, &self.parsed.document)?;
-        dto.read_only =
-            self.format == Format::Org && !crate::org::org_editable_parsed(content, &self.parsed);
+        dto.read_only = match self.format {
+            Format::Md => !doc::markdown_structurally_round_trips_parsed(content, &self.parsed),
+            Format::Org => !crate::org::org_editable_parsed(content, &self.parsed),
+        };
         dto.rev = Some(self.revision);
         dto.path = path.as_str().to_owned();
         Ok(dto)
@@ -871,6 +1000,35 @@ pub struct JournalConflict {
     pub files: Vec<JournalFile>,
 }
 
+/// A journal file whose name does not round-trip to its date, and the name it
+/// would get. Concord invariant 4: Tine PROPOSES these renames, it no longer
+/// performs them behind the user's back at graph open — a rename in a tree the
+/// user keeps in git is a diff they did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalFilenameMigration {
+    /// Graph-relative path as it is on disk today.
+    pub from: String,
+    /// Graph-relative path it would be renamed to.
+    pub to: String,
+}
+
+/// Lifetime of the ONE authorized write to a marker-bearing file (Concord
+/// invariant 3's single exemption). Dropping it — including on an early return
+/// or a panic — re-arms the refusal for that path, so an exemption can never
+/// outlive the resolution that earned it.
+struct MarkerResolutionGuard<'a> {
+    graph: &'a Graph,
+    path: PathBuf,
+}
+
+impl Drop for MarkerResolutionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.graph.marker_resolutions.lock() {
+            set.remove(&self.path);
+        }
+    }
+}
+
 /// A sync-tool conflict copy left in the graph (Syncthing/Dropbox) — a
 /// `*.sync-conflict-*.md` (or Dropbox `(conflicted copy)`) file that shadows a
 /// real page. Surfaced so the user can review + reconcile it instead of it
@@ -889,6 +1047,23 @@ pub struct SyncConflict {
     pub tag: String,
     /// One-line content preview of the conflict copy.
     pub preview: String,
+}
+
+/// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
+/// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). The page stays
+/// readable, but saves to it are refused so Tine never mangles the markers —
+/// surfaced alongside [`SyncConflict`]s so the conflicts panel can say
+/// "N files contain unresolved VCS merge markers".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcsMarkerConflict {
+    /// Graph-root-relative path of the marker-bearing file.
+    pub path: String,
+    /// Display name of the page (decoded page name / journal title).
+    pub name: String,
+    pub kind: PageKind,
+    /// Distinct marker kinds found, in order of first appearance
+    /// (e.g. `["<<<<<<<", "=======", ">>>>>>>"]`).
+    pub markers: Vec<String>,
 }
 
 /// A full page as sent to / received from the frontend.
@@ -1243,6 +1418,8 @@ struct ManagedTextWriteState {
     handoff_held: bool,
     #[cfg(test)]
     handoff_releases: usize,
+    #[cfg(test)]
+    recovered_handoff_reconstructions: usize,
 }
 
 #[derive(Default)]
@@ -1259,6 +1436,16 @@ struct GraphTextIdentityMutationState {
 
 struct GraphTextIdentityMutationGuard<'a> {
     gate: &'a ManagedTextWriteGate,
+}
+
+/// Holds the graph-text mutation authority across a storage-mode publication.
+///
+/// Callers cannot manufacture this guard.  `Graph` returns it only after the
+/// complete Direct Files identity generation still matches the candidate's
+/// captured source generation.  Keeping it alive closes the final race between
+/// that comparison and publishing a successor storage authority.
+pub struct GraphTextIdentityPublicationGuard<'a> {
+    _identity: GraphTextIdentityMutationGuard<'a>,
 }
 
 #[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
@@ -2179,6 +2366,11 @@ struct ActivationRecord {
     /// a prospective target that does not exist yet; the target is re-resolved and
     /// compared at first save.
     prospective: bool,
+    /// Exact source text this editor instance last loaded or successfully
+    /// wrote. Unlike the graph cache or Concord ledger, an external watcher
+    /// admission does not advance it; this is the true three-way base for a
+    /// live save conflict.
+    baseline: Option<String>,
 }
 
 #[derive(Default)]
@@ -2225,6 +2417,17 @@ struct ConflictEditorEpisode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConflictOverride {
     pub observation_epoch: u64,
+}
+
+/// App-private recovery material for a live Direct Files conflict. The caller
+/// persists this outside the graph so an unresolved draft survives navigation,
+/// a clean shutdown, or a process crash. `disk_rev` is the exact revision the
+/// review was computed against; resolution rechecks it under the page lock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiveSaveConflictCapture {
+    pub diff: crate::sync_diff::SyncConflictDiff,
+    pub base_text: Option<String>,
+    pub disk_rev: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2359,42 +2562,28 @@ pub struct Graph {
     /// and is preferred over risking a stale slot after broad mutations.
     cache_index: RwLock<Option<PageCacheIndex>>,
     /// Generation-bound effective ownership and parse-failure evidence derived
-    /// from the warm physical-owner cache. Name-only creation combines this with
-    /// current metadata inventory and never reparses graph content during save.
+    /// from the warm physical-owner cache. Name-only creation uses this exact
+    /// generation plus target-local no-replace validation; raw watcher events
+    /// block creation until their debounced reconciliation has advanced it.
     effective_identity_index: RwLock<Option<Arc<EffectiveIdentityIndex>>>,
     /// Bumped on every cache mutation (upsert/remove). The lock-free cache build
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
     cache_gen: std::sync::atomic::AtomicU64,
+    /// Raw watcher callbacks publish an O(1) admission barrier before their
+    /// debounced reconciliation. The app registry admits only one Graph slot per
+    /// canonical root, so this frontier is instance-local and cannot be cleared
+    /// by a different cache. Name-only creation refuses while the two epochs
+    /// differ; existing exact-owner saves keep their path-local validation.
+    external_observation_epoch: std::sync::atomic::AtomicU64,
+    external_reconciled_epoch: std::sync::atomic::AtomicU64,
+    external_observation_instance: u64,
     /// One explicit whole-graph cache-build flight. Owners parse without holding
     /// this mutex; joiners wait on the flight's own notification and therefore
     /// never wait while holding cache or index locks.
     page_build_flight: std::sync::Mutex<Option<Arc<PageBuildFlight>>>,
     #[cfg(test)]
     page_build_test: PageBuildTestState,
-    /// Cached `alias:: → canonical + owning path` records, derived from the page cache. Rebuilt
-    /// lazily and dropped whenever the page cache mutates (the only time aliases
-    /// can change). Avoids re-scanning the whole graph for aliases on every page
-    /// load / backlink lookup.
-    alias_cache: RwLock<Option<Vec<(String, String, String)>>>,
-    /// `block uuid / id:: → page name` hint, derived from the page cache and keyed
-    /// by `cache_gen` so it self-invalidates on any cache mutation (same pattern as
-    /// `alias_cache`). Lets `((uuid))` ref / embed resolution jump straight to the
-    /// owning page instead of walking every block of every page. A stale hint is
-    /// harmless: resolution falls back to a full scan when the block isn't found.
-    block_index: RwLock<Option<(u64, std::collections::HashMap<String, String>)>>,
-    /// Reconstructible, generation-keyed candidate index for page references.
-    /// Explicit postings are parser-owned; the fixed-size per-page signature is
-    /// only a no-false-negative prefilter for safely tokenizable plain mentions.
-    /// Exact reference verification remains authoritative in `query`.
-    reference_candidate_index: RwLock<Option<ReferenceCandidateIndex>>,
-    /// `block uuid → # of distinct blocks that reference it` (`((uuid))`, labeled
-    /// `[..](((uuid)))`, `{{embed ((uuid))}}`), keyed by `cache_gen` so it self-
-    /// invalidates on any cache mutation (same pattern as `block_index`). Drives the
-    /// per-block reference-count badge; `Arc` so handing the whole map to the
-    /// frontend is a refcount bump, not a clone. Only referenced uuids appear, so
-    /// the map is small.
-    block_ref_count_cache: RwLock<Option<(u64, Arc<std::collections::HashMap<String, usize>>)>>,
     /// Memoized results of the pervasive whole-graph scans (run_query / backlinks /
     /// unlinked_refs), keyed by `(cache_gen, today)` so it self-invalidates on ANY
     /// cache mutation and on a date rollover (relative-date queries depend on
@@ -2404,6 +2593,10 @@ pub struct Graph {
     /// Memoized advanced-query results. Kept separate from `derived_cache` because
     /// advanced queries return clause metadata as well as groups.
     advanced_cache: RwLock<Option<AdvancedCache>>,
+    /// Disposable SQLite facts for Direct Files. Markdown/Org and the parsed
+    /// page cache remain authoritative; indexed reads are admitted only when
+    /// this worker has published the exact current `cache_gen`.
+    direct_projection: std::sync::Mutex<Option<Arc<crate::direct_projection::DirectProjection>>>,
     /// Memoized `list_pages()` (the journals//pages/ directory scan), keyed by
     /// cache_gen — which bumps on every page create/delete/rename (Tine or watcher)
     /// — so quick-switch / [[ ]] autocomplete don't re-read both dirs on every
@@ -2423,6 +2616,21 @@ pub struct Graph {
     /// bytes we wrote and suppress that false positive (the parse-cache comparison
     /// alone races that window). See `write_page` / `sync_file_content`.
     recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    /// Concord base ledger (ADR 0056): the per-page last text Tine agreed on
+    /// with the disk, updated best-effort after successful saves and external-
+    /// change admissions. A disposable cache stored OUTSIDE the sync tree;
+    /// unset (managed regime, most tests) makes every hook a no-op. Never
+    /// consulted on the save critical path — only by conflict diffs.
+    concord_ledger: std::sync::OnceLock<Arc<crate::concord_ledger::ConcordLedger>>,
+    /// The exact page files currently being rewritten as the DIRECT result of a
+    /// user's VCS-marker resolution (Concord L5, `resolve_vcs_marker_conflict`).
+    /// Concord invariant 3 says Tine never rewrites a marker-bearing file — the
+    /// one exception is the resolution the user just confirmed, which REMOVES
+    /// the markers. Scoping the exception to an exact path (held only across the
+    /// one guarded write, under that page's lock) means a concurrent editor save
+    /// to any OTHER marker-bearing page is still refused. See
+    /// `serialize_page_document`.
+    marker_resolutions: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// `path → content_rev` of the on-disk bytes the cached page's
     /// `Document` was parsed from. Invariant: an entry exists IFF the page is in
     /// the cache, and `disk_revs[path] == content_rev(current disk bytes)` ⟹ the
@@ -2448,16 +2656,6 @@ pub struct Graph {
     /// snapshot and DTO round-trip, and a copy would then claim an identity it
     /// does not have (see the frontend's `clonePages`/history snapshots).
     editor_activations: std::sync::Mutex<EditorActivationState>,
-    /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
-    /// `tags::`/`alias::` property values — in their as-written display case,
-    /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
-    /// its own file) still "exists" — this lets quick-switch / `[[ ]]`/`#`
-    /// autocomplete surface such a page instead of offering a misleading
-    /// "Create …". Built from the page cache, and only when it's already warm
-    /// (never force-built on a keystroke); empty until then.
-    /// `(cache_gen, names, digest)` — the digest lets a caller holding the same
-    /// set skip transporting it (see `referenced_page_names_versioned`).
-    referenced_names_cache: RwLock<Option<(u64, Vec<String>, u64)>>,
     /// Per-resolved-path write locks. The same page file has TWO in-process
     /// writers — the editor (`save_page`/`write_page`) and the PDF highlight path
     /// (`write_highlights`, for an `hls__` page) — and a rename rewrites many
@@ -2479,6 +2677,28 @@ pub struct Graph {
     search_lanes: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     >,
+}
+
+static NEXT_EXTERNAL_OBSERVATION_INSTANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Opaque acknowledgement ticket for one exact `Graph` instance's raw watcher
+/// frontier. A same-root reopen cannot consume a ticket minted by its retired
+/// predecessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphTextExternalObservationTicket {
+    instance: u64,
+    epoch: u64,
+}
+
+impl GraphTextExternalObservationTicket {
+    pub fn later_for_same_instance(self, other: Self) -> Option<Self> {
+        (self.instance == other.instance).then_some(if self.epoch >= other.epoch {
+            self
+        } else {
+            other
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -2926,91 +3146,6 @@ struct GraphTextAdmissionFeedBinding {
     legacy_publish_on_build: bool,
 }
 
-/// Process-local ownership of one exact feed for one exact [`Graph`] instance.
-///
-/// This lease is deliberately opaque, non-cloneable, and non-serializable.
-/// Dropping it terminally withdraws admission authority from its Graph.
-pub(crate) struct GraphTextExactFeedLease {
-    control: Arc<GraphTextAdmissionControl>,
-    binding: GraphTextAdmissionFeedBinding,
-    terminal: AtomicBool,
-}
-
-#[cfg(test)]
-type GraphTextAdmissionFeedToken = GraphTextExactFeedLease;
-
-impl std::fmt::Debug for GraphTextExactFeedLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GraphTextExactFeedLease")
-            .finish_non_exhaustive()
-    }
-}
-
-impl GraphTextExactFeedLease {
-    /// Whether this move-only lease has permanently lost feed authority.
-    ///
-    /// The core owner uses this only to distinguish a retryable held-rebuild
-    /// failure from root/scope/sequence loss that requires a fresh Graph and
-    /// runtime owner. It exposes no binding, fence, or feed capability.
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
-    }
-
-    /// Construct one bounded batch for this live lease.
-    ///
-    /// Any malformed range/path set is terminal because the platform can no
-    /// longer prove an unambiguous normalized callback drain.
-    pub(crate) fn batch(
-        &self,
-        first_sequence: u64,
-        last_sequence: u64,
-        touched_exact_relatives: impl IntoIterator<Item = String>,
-    ) -> io::Result<GraphTextExactFeedBatch> {
-        if self.terminal.load(Ordering::Acquire) {
-            return Err(graph_text_admission_unavailable(
-                "exact feed lease is terminal",
-            ));
-        }
-        match GraphTextExactFeedBatch::bounded(
-            Arc::clone(&self.binding.instance),
-            first_sequence,
-            last_sequence,
-            touched_exact_relatives,
-        ) {
-            Ok(batch) => Ok(batch),
-            Err(error) => {
-                let mut state = self.control.write().unwrap();
-                poison_graph_text_admission_state(
-                    &mut state,
-                    graph_text_exact_feed_failure_cause(
-                        GraphTextExactFeedFailure::UnsupportedOrAmbiguousEvent,
-                        &error.to_string(),
-                    ),
-                );
-                self.terminal.store(true, Ordering::Release);
-                Err(error)
-            }
-        }
-    }
-}
-
-impl Drop for GraphTextExactFeedLease {
-    fn drop(&mut self) {
-        if self.terminal.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let mut state = self.control.write().unwrap();
-        poison_graph_text_admission_state(
-            &mut state,
-            graph_text_exact_feed_failure_cause(
-                GraphTextExactFeedFailure::LeaseDropped,
-                "exact feed lease dropped",
-            ),
-        );
-    }
-}
-
 /// Terminal reason supplied by a platform exact-feed adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -3039,88 +3174,7 @@ pub enum GraphTextExactFeedPathClass {
     Configuration,
 }
 
-/// One bounded contiguous final-state feed range.
-///
-/// Paths are exact UTF-8 graph-relative spellings. Construction sorts them,
-/// rejects duplicates, and enforces count and aggregate-byte bounds before
-/// retaining the owned set.
-#[derive(Debug)]
-pub(crate) struct GraphTextExactFeedBatch {
-    instance: Arc<GraphTextAdmissionInstance>,
-    first_sequence: u64,
-    last_sequence: u64,
-    touched_exact_relatives: Vec<String>,
-}
-
-impl GraphTextExactFeedBatch {
-    pub(crate) const MAX_TOUCHED_PATHS: usize = 256;
-    pub(crate) const MAX_EXACT_RELATIVE_BYTES: usize = 4096;
-    pub(crate) const MAX_PATH_COMPONENTS: usize = MAX_INITIAL_SHADOW_DIRECTORY_DEPTH + 1;
-    pub(crate) const MAX_AGGREGATE_PATH_BYTES: usize = 64 * 1024;
-
-    fn bounded(
-        instance: Arc<GraphTextAdmissionInstance>,
-        first_sequence: u64,
-        last_sequence: u64,
-        touched_exact_relatives: impl IntoIterator<Item = String>,
-    ) -> io::Result<Self> {
-        if last_sequence < first_sequence {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "exact feed batch has an empty or reverse sequence range",
-            ));
-        }
-        let mut paths = Vec::new();
-        let mut path_bytes = 0_usize;
-        for relative in touched_exact_relatives {
-            if paths.len() == Self::MAX_TOUCHED_PATHS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exact feed batch touched-path count bound exceeded",
-                ));
-            }
-            validate_graph_text_exact_feed_relative(&relative)?;
-            path_bytes = path_bytes.checked_add(relative.len()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exact feed batch aggregate path-byte bound exceeded",
-                )
-            })?;
-            if path_bytes > Self::MAX_AGGREGATE_PATH_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exact feed batch aggregate path-byte bound exceeded",
-                ));
-            }
-            paths.push(relative);
-        }
-        paths.sort_unstable();
-        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "exact feed batch contains a duplicate touched path",
-            ));
-        }
-        Ok(Self {
-            instance,
-            first_sequence,
-            last_sequence,
-            touched_exact_relatives: paths,
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Point authority is deliberately not wired to durable callers yet.
-struct GraphTextAdmissionEpoch {
-    instance: Arc<GraphTextAdmissionInstance>,
-    scope_binding: GraphTextScopeBinding,
-    graph_resource: CanonicalGraphResourceId,
-    generation: u64,
-    feed_sequence: u64,
-}
-
-#[derive(Clone)]
 #[allow(dead_code)] // Some evidence is consumed only by the later point-authority packet.
 struct GraphTextAdmissionRecord {
     description: BlobDescription,
@@ -3163,8 +3217,6 @@ struct CompleteGraphTextAdmissionIndex {
     paths_by_semantic_key: PersistentMap<(u8, String), std::collections::BTreeSet<ManagedPath>>,
     tombstones_by_exact_path: PersistentMap<ManagedPath, GraphTextAdmissionTombstone>,
     directories_by_exact_relative: PersistentMap<String, ContentDigest>,
-    reconciliation_scan_instrumentation:
-        crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation,
     permanent_bytes: u64,
     permanent_limit: u64,
     peak_limit: u64,
@@ -3195,60 +3247,6 @@ enum GraphTextAdmissionState {
     },
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Exact platform feed integration lands in the next packet.
-enum GraphTextAdmissionExactEvent {
-    FileUpsert { relative: String },
-    FileRemove { relative: String },
-    DirectoryChanged { relative: Option<String> },
-}
-
-#[derive(Clone)]
-#[allow(dead_code)] // No durable caller can consume this private observation yet.
-struct GraphTextAdmissionObservation {
-    epoch: GraphTextAdmissionEpoch,
-    record: GraphTextAdmissionRecord,
-    current: GraphTextAdmissionCurrentProof,
-    portable_members: Vec<ManagedPath>,
-    resource_members: Vec<String>,
-    semantic_members: Vec<ManagedPath>,
-}
-
-#[derive(Clone)]
-#[allow(dead_code)] // Private exact absence authority is consumed by the next packet.
-enum GraphTextAdmissionExactObservation {
-    Present(GraphTextAdmissionObservation),
-    AbsentRetained {
-        epoch: GraphTextAdmissionEpoch,
-        tombstone: GraphTextAdmissionTombstone,
-    },
-    AbsentUnowned {
-        epoch: GraphTextAdmissionEpoch,
-        provisional: PageEntry,
-    },
-}
-
-#[cfg(test)]
-impl GraphTextAdmissionExactObservation {
-    fn into_present(self) -> GraphTextAdmissionObservation {
-        match self {
-            Self::Present(observation) => observation,
-            Self::AbsentRetained { .. } | Self::AbsentUnowned { .. } => {
-                panic!("expected a present exact graph-text observation")
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-#[allow(dead_code)] // Sealed for the next private packet; no durable consumer exists yet.
-struct GraphTextAdmissionCurrentProof {
-    bytes: Vec<u8>,
-    description: BlobDescription,
-    file_resource_id: ContentDigest,
-    link_count: u64,
-}
-
 struct PreparedGraphTextAdmissionUpsert {
     relative: String,
     description: BlobDescription,
@@ -3271,7 +3269,6 @@ enum PreparedGraphTextAdmissionFinalState {
 #[derive(Default)]
 struct GraphTextExactFeedBatchActualCharges {
     raw_bytes: u64,
-    parser_bytes: u64,
     prepared_growth: u64,
 }
 
@@ -3302,14 +3299,15 @@ impl GraphTextExactFeedBatchActualCharges {
             .ok_or_else(|| initial_shadow_limit_error("peak build memory"))
     }
 
-    fn ensure_aggregate_work_peak(
+    fn ensure_work_peak(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
         batch_scratch: u64,
+        working_bytes: u64,
     ) -> io::Result<()> {
         ensure_graph_text_peak_limit(
             self.live_preparation_bytes(index, batch_scratch)?,
-            checked_add_bytes(self.raw_bytes, self.parser_bytes)?,
+            working_bytes,
             index.peak_limit,
         )
     }
@@ -3326,23 +3324,10 @@ impl GraphTextExactFeedBatchActualCharges {
             ));
         }
         self.raw_bytes = checked_add_bytes(self.raw_bytes, raw_bytes)?;
-        self.ensure_aggregate_work_peak(index, batch_scratch)
-    }
-
-    fn reserve_parser(
-        &mut self,
-        index: &CompleteGraphTextAdmissionIndex,
-        batch_scratch: u64,
-        parser_bytes: u64,
-    ) -> io::Result<()> {
-        let next = checked_add_bytes(self.parser_bytes, parser_bytes)?;
-        let prior = self.parser_bytes;
-        self.parser_bytes = next;
-        if let Err(error) = self.ensure_aggregate_work_peak(index, batch_scratch) {
-            self.parser_bytes = prior;
-            return Err(error);
-        }
-        Ok(())
+        // `raw_bytes` is an aggregate admission cap, not live memory: each
+        // touched file is read, parsed, and dropped before the next. Only this
+        // file's buffer coexists with previously retained prepared records.
+        self.ensure_work_peak(index, batch_scratch, raw_bytes)
     }
 
     fn ensure_permanent_growth(
@@ -3368,7 +3353,7 @@ impl GraphTextExactFeedBatchActualCharges {
         let next = checked_add_bytes(self.prepared_growth, growth)?;
         let prior = self.prepared_growth;
         self.prepared_growth = next;
-        if let Err(error) = self.ensure_aggregate_work_peak(index, batch_scratch) {
+        if let Err(error) = self.ensure_work_peak(index, batch_scratch, 0) {
             self.prepared_growth = prior;
             return Err(error);
         }
@@ -3467,7 +3452,6 @@ struct DirectCreationCensusFile {
 struct DirectCreationProof {
     target: ManagedPath,
     generation: u64,
-    files: std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>,
 }
 
 enum DirectCreationEvidence {
@@ -3475,236 +3459,7 @@ enum DirectCreationEvidence {
     Warm {
         generation: u64,
         identity_index: Arc<EffectiveIdentityIndex>,
-        disk_revs: std::collections::HashMap<PathBuf, String>,
     },
-}
-
-const REFERENCE_SIGNATURE_WORDS: usize = 64; // 4096 bits = 512 bytes/page
-
-#[derive(Clone)]
-struct ReferenceTokenSignature([u64; REFERENCE_SIGNATURE_WORDS]);
-
-impl Default for ReferenceTokenSignature {
-    fn default() -> Self {
-        Self([0; REFERENCE_SIGNATURE_WORDS])
-    }
-}
-
-impl ReferenceTokenSignature {
-    fn token_hash(token: &[u8], seed: u64) -> usize {
-        let mut hash = seed;
-        for byte in token {
-            hash ^= u64::from(byte.to_ascii_lowercase());
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        (hash as usize) & (REFERENCE_SIGNATURE_WORDS * 64 - 1)
-    }
-
-    fn insert_token(&mut self, token: &[u8]) {
-        for seed in [0xcbf29ce484222325, 0x9e3779b97f4a7c15] {
-            let bit = Self::token_hash(token, seed);
-            self.0[bit / 64] |= 1u64 << (bit % 64);
-        }
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        // Exact plain-reference matching compares Unicode-lowercased, NFC text.
-        // Fold the source the same way before extracting ASCII tokens so a
-        // character such as the Kelvin sign (`K`) cannot match page `K` exactly
-        // while being absent from this no-false-negative prefilter.
-        let folded: String = text.to_lowercase().nfc().collect();
-        let bytes = folded.as_bytes();
-        let mut start = None;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            if byte.is_ascii_alphanumeric() {
-                if start.is_none() {
-                    start = Some(index);
-                }
-            } else if let Some(begin) = start.take() {
-                self.insert_token(&bytes[begin..index]);
-            }
-        }
-        if let Some(begin) = start {
-            self.insert_token(&bytes[begin..]);
-        }
-    }
-
-    /// `None` means tokenization is not provably safe, so callers must full-scan.
-    fn may_contain_name(&self, normalized_name: &str) -> Option<bool> {
-        if !normalized_name.is_ascii() {
-            return None;
-        }
-        let tokens = normalized_name
-            .as_bytes()
-            .split(|byte| !byte.is_ascii_alphanumeric())
-            .filter(|token| !token.is_empty())
-            .collect::<Vec<_>>();
-        if tokens.is_empty() {
-            return None;
-        }
-        Some(tokens.into_iter().all(|token| {
-            [0xcbf29ce484222325, 0x9e3779b97f4a7c15]
-                .into_iter()
-                .all(|seed| {
-                    let bit = Self::token_hash(token, seed);
-                    self.0[bit / 64] & (1u64 << (bit % 64)) != 0
-                })
-        }))
-    }
-}
-
-#[derive(Clone)]
-struct ReferencePageProjection {
-    explicit: Vec<String>,
-    signature: ReferenceTokenSignature,
-    name_key: String,
-    name: String,
-}
-
-struct ReferenceCandidateIndex {
-    generation: u64,
-    complete: bool,
-    pages: std::collections::HashMap<PathBuf, ReferencePageProjection>,
-    explicit: std::collections::HashMap<String, std::collections::BTreeSet<PathBuf>>,
-    real_pages: std::collections::HashMap<String, std::collections::BTreeMap<PathBuf, String>>,
-}
-
-impl ReferenceCandidateIndex {
-    fn page_projection(entry: &PageEntry, doc: &Document) -> io::Result<ReferencePageProjection> {
-        let mut signature = ReferenceTokenSignature::default();
-        if let Some(pre) = doc.pre_block.as_deref() {
-            signature.insert_text(pre);
-        }
-        let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
-            std::array::from_fn(|_| None);
-        let mut len = usize::from(!doc.roots.is_empty());
-        if len != 0 {
-            frames[0] = Some(doc.roots.iter());
-        }
-        while len != 0 {
-            let mut frame = frames[len - 1]
-                .take()
-                .expect("active reference signature frame");
-            let Some(block) = frame.next() else {
-                len -= 1;
-                continue;
-            };
-            frames[len - 1] = Some(frame);
-            signature.insert_text(&block.raw);
-            if !block.children.is_empty() {
-                if len == MAX_MANAGED_BLOCK_DEPTH {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "cached document nesting exceeds 128 levels",
-                    ));
-                }
-                frames[len] = Some(block.children.iter());
-                len += 1;
-            }
-        }
-        Ok(ReferencePageProjection {
-            explicit: crate::query::document_explicit_reference_names(entry, doc),
-            signature,
-            name_key: crate::refs::page_key(&entry.name),
-            name: entry.name.clone(),
-        })
-    }
-
-    fn build(generation: u64, pages: &[(PageEntry, Arc<Document>)]) -> io::Result<Self> {
-        let mut index = Self {
-            generation,
-            complete: true,
-            pages: std::collections::HashMap::with_capacity(pages.len()),
-            explicit: std::collections::HashMap::new(),
-            real_pages: std::collections::HashMap::new(),
-        };
-        for (entry, doc) in pages {
-            index.insert(entry, doc)?;
-        }
-        Ok(index)
-    }
-
-    fn remove(&mut self, path: &Path) {
-        let Some(previous) = self.pages.remove(path) else {
-            return;
-        };
-        for target in previous.explicit {
-            let remove_posting = self.explicit.get_mut(&target).is_some_and(|paths| {
-                paths.remove(path);
-                paths.is_empty()
-            });
-            if remove_posting {
-                self.explicit.remove(&target);
-            }
-        }
-        let remove_name = self
-            .real_pages
-            .get_mut(&previous.name_key)
-            .is_some_and(|owners| {
-                owners.remove(path);
-                owners.is_empty()
-            });
-        if remove_name {
-            self.real_pages.remove(&previous.name_key);
-        }
-    }
-
-    fn insert(&mut self, entry: &PageEntry, doc: &Document) -> io::Result<()> {
-        // Project before mutating the existing posting lists. An over-depth
-        // replacement must leave no partially-updated index behind.
-        let projection = Self::page_projection(entry, doc)?;
-        self.remove(&entry.path);
-        for target in &projection.explicit {
-            self.explicit
-                .entry(target.clone())
-                .or_default()
-                .insert(entry.path.clone());
-        }
-        self.real_pages
-            .entry(projection.name_key.clone())
-            .or_default()
-            .insert(entry.path.clone(), projection.name.clone());
-        self.pages.insert(entry.path.clone(), projection);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn estimated_bytes(&self) -> usize {
-        let page_bytes = self
-            .pages
-            .iter()
-            .map(|(path, page)| {
-                path.as_os_str().len()
-                    + std::mem::size_of::<ReferencePageProjection>()
-                    + page.explicit.iter().map(String::len).sum::<usize>()
-                    + page.name_key.len()
-                    + page.name.len()
-            })
-            .sum::<usize>();
-        let posting_bytes = self
-            .explicit
-            .iter()
-            .map(|(target, paths)| {
-                target.len()
-                    + paths
-                        .iter()
-                        .map(|path| path.as_os_str().len())
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-        let real_page_bytes = self
-            .real_pages
-            .iter()
-            .map(|(key, owners)| {
-                key.len()
-                    + owners
-                        .iter()
-                        .map(|(path, name)| path.as_os_str().len() + name.len())
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-        page_bytes + posting_bytes + real_page_bytes
-    }
 }
 
 pub(crate) struct ReferenceCandidatePages {
@@ -4276,8 +4031,6 @@ thread_local! {
     static GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static GRAPH_TEXT_PORTABLE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static GRAPH_TEXT_EXACT_FEED_PREPARE_PATH: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -4347,34 +4100,6 @@ fn reset_graph_text_admission_test_counters() {
 #[cfg(test)]
 fn graph_text_admission_test_counters() -> GraphTextAdmissionTestCounters {
     GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(Cell::get)
-}
-
-#[cfg(test)]
-fn measure_graph_text_admission_point_queries<T>(
-    query: impl FnOnce() -> T,
-) -> (T, GraphTextAdmissionTestCounters) {
-    reset_graph_text_admission_test_counters();
-    let result = query();
-    (result, graph_text_admission_test_counters())
-}
-
-#[cfg(test)]
-fn assert_graph_text_admission_point_query_only(
-    counters: GraphTextAdmissionTestCounters,
-    exact_attempts: usize,
-) {
-    assert_eq!(counters.point_query_attempts, exact_attempts);
-    assert_eq!(counters.builder_enumerations, 0);
-    assert_eq!(counters.direct_creation_censuses, 0);
-    assert_eq!(counters.direct_creation_files_hashed, 0);
-    assert_eq!(counters.parser_invocations, 0);
-    assert_eq!(counters.index_map_insertions, 0);
-    assert_eq!(counters.event_map_key_reads, 0);
-    assert_eq!(counters.event_map_key_writes, 0);
-    assert_eq!(counters.event_reverse_members, 0);
-    assert_eq!(counters.persistent_node_allocations, 0);
-    assert_eq!(counters.persistent_rotations, 0);
-    assert_eq!(counters.persistent_payload_members, 0);
 }
 
 #[cfg(test)]
@@ -4532,32 +4257,6 @@ fn graph_text_event_revalidation_race_hook() -> io::Result<()> {
 
 #[cfg(not(test))]
 fn graph_text_event_revalidation_race_hook() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-fn graph_text_exact_feed_after_preflight_hook() -> io::Result<()> {
-    GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT.with(|hook| {
-        let callback = hook.borrow_mut().take();
-        callback.map_or(Ok(()), |callback| callback())
-    })
-}
-
-#[cfg(not(test))]
-fn graph_text_exact_feed_after_preflight_hook() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-fn graph_text_exact_feed_prepare_path_hook(relative: &str) -> io::Result<()> {
-    GRAPH_TEXT_EXACT_FEED_PREPARE_PATH.with(|hook| {
-        let mut hook = hook.borrow_mut();
-        hook.as_mut().map_or(Ok(()), |callback| callback(relative))
-    })
-}
-
-#[cfg(not(test))]
-fn graph_text_exact_feed_prepare_path_hook(_relative: &str) -> io::Result<()> {
     Ok(())
 }
 
@@ -5451,7 +5150,9 @@ impl Graph {
         validate_managed_dir(&graph.root, &graph.config.pages_dir, "pages")?;
         validate_managed_dir(&graph.root, "logseq", "logseq")?;
         validate_managed_dir(&graph.root, "publish", "publish")?;
-        validate_managed_dir(&graph.root, ".tine-sync", "managed sync")?;
+        // `.tine-sync` is not part of Direct Files authority. Managed-storage
+        // activation/join validates it at its explicit runtime boundary; an
+        // ordinary graph open must neither inspect nor require its shape.
         if let Some(resolved) = Self::external_assets_target(&graph.root)? {
             let approved = approved_assets.ok_or_else(|| {
                 io::Error::new(
@@ -5650,28 +5351,377 @@ impl Graph {
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
+            external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
+            external_observation_instance: NEXT_EXTERNAL_OBSERVATION_INSTANCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             page_build_flight: std::sync::Mutex::new(None),
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
-            alias_cache: RwLock::new(None),
-            block_index: RwLock::new(None),
-            reference_candidate_index: RwLock::new(None),
-            block_ref_count_cache: RwLock::new(None),
             derived_cache: RwLock::new(None),
             advanced_cache: RwLock::new(None),
+            direct_projection: std::sync::Mutex::new(None),
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            concord_ledger: std::sync::OnceLock::new(),
+            marker_resolutions: std::sync::Mutex::new(std::collections::HashSet::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
             editor_activations: std::sync::Mutex::new(EditorActivationState::default()),
-            referenced_names_cache: RwLock::new(None),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             managed_write_binding,
             handoff_instance_token: Arc::new(HandoffGraphInstanceToken),
             search_lanes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Attach Direct Files' app-private disposable SQLite projection.
+    ///
+    /// This never reads or writes graph files. If the parsed cache is already
+    /// warm, its exact snapshot is queued; otherwise `install_built` supplies it
+    /// when the ordinary background warm completes.
+    pub fn attach_direct_projection(&self, path: PathBuf) -> io::Result<()> {
+        if self.derived_read_only {
+            return Ok(());
+        }
+        let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
+        let mut slot = self.direct_projection.lock().unwrap();
+        if slot.is_some() {
+            return Ok(());
+        }
+        *slot = Some(Arc::clone(&projection));
+        let cache = self.cache.read().unwrap();
+        if let Some(snapshot) = cache.as_ref().map(Arc::clone) {
+            let revisions = Arc::new(self.disk_revs.read().unwrap().clone());
+            projection.enqueue_full(
+                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                snapshot,
+                revisions,
+            );
+        }
+        Ok(())
+    }
+
+    /// Attach the Concord base ledger (ADR 0056) rooted at `dir` (an
+    /// app-private directory OUTSIDE the graph tree). Idempotent; the first
+    /// attach wins. Queues a background prune of unreferenced blobs.
+    pub fn attach_concord_ledger(&self, dir: PathBuf) {
+        let ledger = Arc::new(crate::concord_ledger::ConcordLedger::new(dir));
+        if self.concord_ledger.set(Arc::clone(&ledger)).is_ok() {
+            ledger.queue_prune();
+        }
+    }
+
+    /// The attached ledger, if any (None ⇒ every Concord hook no-ops).
+    pub fn concord_ledger(&self) -> Option<&Arc<crate::concord_ledger::ConcordLedger>> {
+        self.concord_ledger.get()
+    }
+
+    /// Best-effort ledger update: `content` is now the exact text Tine and the
+    /// disk agree on for `path`. Called after a successful save commit and
+    /// after an external-change admission. Foreground cost is one channel send;
+    /// non-page paths (config, assets) are filtered out here.
+    fn concord_record_agreed(&self, path: &Path, content: &str) {
+        let Some(ledger) = self.concord_ledger.get() else {
+            return;
+        };
+        if self.entry_for_path(path).is_none() || path_is_sync_conflict(path) {
+            return;
+        }
+        ledger.record(&self.rel_path(path), content);
+    }
+
+    /// The winner page a conflict copy shadows (same dir, same extension, base
+    /// stem), as a graph-relative path — the identity the ledger pins under.
+    fn conflict_winner_rel(&self, conflict_path: &Path) -> Option<String> {
+        let ext = text_extension_from_path(conflict_path)?;
+        let stem = conflict_path.file_stem()?.to_str()?;
+        let base_stem = sync_conflict_base(stem)?;
+        let winner = conflict_path.parent()?.join(format!("{base_stem}.{ext}"));
+        Some(self.rel_path(&winner))
+    }
+
+    fn direct_projection_enqueue_full(
+        &self,
+        generation: u64,
+        pages: Arc<Vec<(PageEntry, Arc<Document>)>>,
+        revisions: Arc<std::collections::HashMap<PathBuf, String>>,
+    ) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_full(generation, pages, revisions);
+        }
+    }
+
+    fn direct_projection_enqueue_replace(
+        &self,
+        generation: u64,
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+    ) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_replace(generation, entry, document, revision);
+        }
+    }
+
+    fn direct_projection_enqueue_delete(&self, generation: u64, entry: PageEntry) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_delete(generation, entry);
+        }
+    }
+
+    fn direct_projection_mark_stale(&self) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.mark_stale();
+        }
+    }
+
+    fn direct_projection_sparse_task_query(
+        &self,
+        query_src: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<crate::query::BoundedGroups> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        let result = projection.sparse_task_query(
+            &self.root, generation, &pages, query_src, max_rows, max_bytes,
+        )?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let names = projection.referenced_page_names(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+    }
+
+    pub(crate) fn direct_projection_fuzzy_candidate_pages(
+        &self,
+        normalized_needle: &str,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.fuzzy_candidate_paths(generation, normalized_needle)?;
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let cache_index = self.cache_index.read().unwrap();
+        let cache_index = cache_index.as_ref()?;
+        let mut pages = Vec::with_capacity(paths.len());
+        for relative in paths {
+            let path = self.root.join(&relative);
+            let slot = cache_index.by_path.get(&path).copied()?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    fn direct_projection_pages_for_paths(
+        &self,
+        generation: u64,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let cache_index = self.cache_index.read().unwrap();
+        let cache_index = cache_index.as_ref()?;
+        let mut pages = Vec::new();
+        for relative in paths {
+            let path = self.root.join(&relative);
+            let slot = cache_index.by_path.get(&path).copied()?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    fn direct_projection_page_aliases_with_owners(&self) -> Option<Vec<(String, String, String)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let aliases = projection.page_aliases_with_owners(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
+    }
+
+    fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let mut names = projection.real_page_names(generation)?;
+        for (path, _) in names.values_mut() {
+            *path = self.root.join(&*path);
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+    }
+
+    fn direct_projection_reference_candidate_pages(
+        &self,
+        names_norm: &[String],
+        kind: ReferenceKind,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.reference_candidate_paths(generation, names_norm, kind)?;
+        self.direct_projection_pages_for_paths(generation, paths)
+    }
+
+    fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let hint = projection.block_page_hint(generation, uuid)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(hint)
+    }
+
+    fn direct_projection_block_ref_counts(
+        &self,
+    ) -> Option<std::collections::HashMap<String, usize>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let counts = projection.block_ref_counts(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
+    }
+
+    pub(crate) fn direct_projection_block_referrer_candidate_pages(
+        &self,
+        uuid: &str,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
+        self.direct_projection_pages_for_paths(generation, paths)
+    }
+
+    fn direct_projection_ready(&self) -> bool {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|projection| projection.ready_at(generation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_ready_test(&self) -> bool {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|projection| projection.ready_at(generation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_mark_stale_test(&self) {
+        self.direct_projection_mark_stale();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.indexed_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_referenced_name_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.referenced_name_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_fuzzy_candidate_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.fuzzy_candidate_reads())
     }
 
     /// Stable identity of the exact no-follow directory capability retained at
@@ -5741,6 +5791,95 @@ impl Graph {
         })
     }
 
+    /// Reacquire the process-local latch for an already-authenticated
+    /// published continuation. Unlike ordinary minting, a held latch is the
+    /// expected same-process crash residue and is adopted rather than treated
+    /// as a competing writer. Callers must authenticate the exact immutable
+    /// manifest before entering this narrow recovery seam.
+    pub(crate) fn reconstruct_published_handoff_safe(
+        &self,
+        workspace_id: WorkspaceId,
+        endpoint: ProjectionEndpointBinding,
+    ) -> io::Result<HandoffSafe> {
+        let graph_resource_id = self.canonical_resource_id()?;
+        let binding = self.managed_write_binding()?;
+        if binding.resource_id != graph_resource_id
+            || endpoint.graph_resource_id() != graph_resource_id
+        {
+            return Err(managed_write_identity_mismatch_error());
+        }
+        let reconstructed = {
+            let mut state = binding.gate.state.lock().unwrap();
+            if state.active_writers != 0 {
+                return Err(handoff_write_blocked_error());
+            }
+            if state.handoff_held {
+                false
+            } else {
+                state.handoff_held = true;
+                #[cfg(test)]
+                {
+                    state.recovered_handoff_reconstructions += 1;
+                }
+                true
+            }
+        };
+        if let Err(error) = handoff_mint_after_reservation_hook() {
+            if reconstructed {
+                binding.gate.release_handoff();
+            }
+            return Err(error);
+        }
+        Ok(HandoffSafe {
+            gate: Some(Arc::clone(&binding.gate)),
+            instance_token: Arc::clone(&self.handoff_instance_token),
+            binding: HandoffBindingEvidence {
+                workspace_id,
+                endpoint,
+                graph_resource_id,
+            },
+        })
+    }
+
+    /// Reconstruct, when necessary, and consume the process-local graph-text
+    /// latch for one exact durably blocked published batch.
+    ///
+    /// A second cold reopen has no process-local gate state even though the
+    /// accepted projection row remains durably `Blocked`. The caller must first
+    /// authenticate that exact row from accepted history. Under this gate's
+    /// single-writer mutex we then reacquire the missing local latch, if and
+    /// only if it is absent, and consume it before the external feed is
+    /// admitted. This is deliberately not a general startup recovery API.
+    pub(crate) fn reconstruct_and_consume_recovered_published_handoff(
+        &self,
+        endpoint: ProjectionEndpointBinding,
+    ) -> io::Result<()> {
+        let graph_resource_id = self.canonical_resource_id()?;
+        let binding = self.managed_write_binding()?;
+        if binding.resource_id != graph_resource_id
+            || endpoint.graph_resource_id() != graph_resource_id
+        {
+            return Err(managed_write_identity_mismatch_error());
+        }
+        let mut state = binding.gate.state.lock().unwrap();
+        if state.active_writers != 0 {
+            return Err(handoff_write_blocked_error());
+        }
+        if !state.handoff_held {
+            state.handoff_held = true;
+            #[cfg(test)]
+            {
+                state.recovered_handoff_reconstructions += 1;
+            }
+        }
+        state.handoff_held = false;
+        #[cfg(test)]
+        {
+            state.handoff_releases += 1;
+        }
+        Ok(())
+    }
+
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
         // Every graph-text write in this file passes through here, which is why
         // the read-only view is enforced at this one point rather than trusted
@@ -5775,6 +5914,20 @@ impl Graph {
             .lock()
             .unwrap()
             .handoff_releases
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_text_handoff_state(&self) -> (usize, bool, usize, usize) {
+        let binding = self
+            .managed_write_binding()
+            .expect("test graph has managed writer binding");
+        let state = binding.gate.state.lock().unwrap();
+        (
+            state.active_writers,
+            state.handoff_held,
+            state.handoff_releases,
+            state.recovered_handoff_reconstructions,
+        )
     }
 
     fn admit_retained_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
@@ -6379,10 +6532,10 @@ impl Graph {
     /// its 200 ms coalescing delay. Exact file paths update the retained final
     /// state under the same resource-wide authority as Tine writes. Overflow,
     /// notify errors, directory/configuration events, poll cycles, and any
-    /// ambiguous path invalidate the generation. Missing-target creation binds
-    /// one streaming byte digest census to this generation's cached semantic
-    /// evidence; an existing exact-owner save uses its retained path-local and
-    /// single-link proofs instead.
+    /// ambiguous path invalidate the generation. Missing-target creation stays
+    /// blocked from this callback until the debounced reconciler acknowledges
+    /// the observed epoch; an existing exact-owner save uses its retained
+    /// path-local and single-link proofs instead.
     pub fn observe_graph_text_external_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
@@ -6401,6 +6554,59 @@ impl Graph {
         let _ =
             self.update_guarded_graph_text_identity_paths(paths.iter().map(PathBuf::as_path), true);
         Ok(())
+    }
+
+    /// Record a relevant raw watcher callback without touching graph bytes.
+    /// Returns the epoch the callback published.
+    pub fn note_graph_text_external_observation(&self) -> GraphTextExternalObservationTicket {
+        let epoch = self
+            .external_observation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1);
+        GraphTextExternalObservationTicket {
+            instance: self.external_observation_instance,
+            epoch,
+        }
+    }
+
+    /// Snapshot the raw-event frontier represented by one drained watcher batch.
+    pub fn graph_text_external_observation_ticket(&self) -> GraphTextExternalObservationTicket {
+        GraphTextExternalObservationTicket {
+            instance: self.external_observation_instance,
+            epoch: self
+                .external_observation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    /// Admit exactly the drained frontier after successful reconciliation. A
+    /// newer callback cannot be accidentally acknowledged by an older batch,
+    /// and a same-root replacement cannot consume its predecessor's ticket.
+    pub fn acknowledge_graph_text_external_observations(
+        &self,
+        ticket: GraphTextExternalObservationTicket,
+    ) -> bool {
+        if ticket.instance != self.external_observation_instance {
+            return false;
+        }
+        self.external_reconciled_epoch
+            .fetch_max(ticket.epoch, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    pub fn owns_graph_text_external_observation_ticket(
+        &self,
+        ticket: GraphTextExternalObservationTicket,
+    ) -> bool {
+        ticket.instance == self.external_observation_instance
+    }
+
+    fn graph_text_external_observation_pending(&self) -> bool {
+        self.external_observation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != self
+                .external_reconciled_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -6427,6 +6633,22 @@ impl Graph {
             generation: state.generation,
             last_build: state.last_build,
         }
+    }
+
+    /// Acquire graph-text mutation authority iff `expected_generation` is
+    /// still current.  The returned guard must remain alive until the storage
+    /// selector and in-process graph slot have both been published.
+    pub fn lock_graph_text_identity_publication(
+        &self,
+        expected_generation: u64,
+    ) -> io::Result<Option<GraphTextIdentityPublicationGuard<'_>>> {
+        let identity = self.lock_graph_text_identity_mutation()?;
+        if self.guarded_graph_text_identity_report().generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(GraphTextIdentityPublicationGuard {
+            _identity: identity,
+        }))
     }
 
     #[cfg(test)]
@@ -7644,9 +7866,15 @@ impl Graph {
     /// publication remain hard refusals rather than authority to rebuild around
     /// an unexplained gap.
     fn direct_creation_evidence(&self) -> io::Result<DirectCreationEvidence> {
+        if self.graph_text_external_observation_pending() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "external graph-text changes are awaiting watcher reconciliation",
+            ));
+        }
         let cache = self.cache.read().unwrap();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(pages) = cache.as_ref() else {
+        let Some(_pages) = cache.as_ref() else {
             let published_failures = !self.page_index_failures.read().unwrap().is_empty();
             let retained_failures = self
                 .effective_identity_index
@@ -7674,42 +7902,31 @@ impl Graph {
                     "graph has unknown effective identities for name-only creation",
                 )
             })?;
-        let failures = self.page_index_failures.read().unwrap().clone();
-        let disk_revs = self.disk_revs.read().unwrap().clone();
-        let cached_paths = pages
-            .iter()
-            .map(|(entry, _)| entry.path.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if identity_index.generation() != generation
-            || identity_index.failures != failures
-            || identity_index.physical_paths != cached_paths
-            || disk_revs.len() != cached_paths.len()
-            || !disk_revs.keys().all(|path| cached_paths.contains(path))
-        {
+        if identity_index.generation() != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "parsed identity and disk revision evidence is not one coherent generation",
+                "parsed identity evidence is not one coherent generation",
             ));
         }
-        if !failures.is_empty() {
+        if !identity_index.failures.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
                     "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    failures.len()
+                    identity_index.failures.len()
                 ),
             ));
         }
         Ok(DirectCreationEvidence::Warm {
             generation,
             identity_index,
-            disk_revs,
         })
     }
 
-    /// Bind one coherent parsed ownership generation to one current filesystem
-    /// census. Cold evidence may own or join exactly one cache-build flight; the
-    /// second evidence read must be warm, and there is never a repair retry.
+    /// Bind creation to one coherent warm semantic-ownership generation. Cold
+    /// evidence may own or join exactly one cache-build flight; the second read
+    /// must be warm, and there is never a repair retry. Publication itself is
+    /// target-local and no-replace; ordinary creation never hashes the graph.
     fn direct_creation_proof(
         &self,
         permit: &ManagedTextWritePermit,
@@ -7721,11 +7938,9 @@ impl Graph {
             DirectCreationEvidence::Warm {
                 generation,
                 identity_index,
-                disk_revs,
             } => DirectCreationEvidence::Warm {
                 generation,
                 identity_index,
-                disk_revs,
             },
             DirectCreationEvidence::Cold => {
                 let outcome = self.repair_page_cache_once(permit);
@@ -7738,7 +7953,6 @@ impl Graph {
         let DirectCreationEvidence::Warm {
             generation,
             identity_index,
-            disk_revs,
         } = evidence
         else {
             return Err(PageBuildOutcome::Failed.creation_error());
@@ -7750,72 +7964,18 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        let files = self.capture_direct_creation_census(permit)?;
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "effective page identity evidence changed during the creation census",
+                "effective page identity evidence changed during creation validation",
             ));
-        }
-        if files.len() != disk_revs.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "creation census paths do not match the parsed identity snapshot",
-            ));
-        }
-
-        let mut resources = std::collections::BTreeMap::new();
-        for (path, file) in &files {
-            let absolute = self.root.join(path.as_str());
-            if disk_revs.get(&absolute).map(String::as_str)
-                != Some(hex_digest(&file.content_digest).as_str())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "creation census revisions do not match the parsed identity snapshot",
-                ));
-            }
-            if file.link_count != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} has link count {}",
-                        path.as_str(),
-                        file.link_count
-                    ),
-                ));
-            }
-            if let Some(first) = resources.insert(file.file_resource_id, path) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} and {}",
-                        first.as_str(),
-                        path.as_str()
-                    ),
-                ));
-            }
-            if path != &target && path.portable_key() == target.portable_key() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text paths share one portable case/NFC identity: {} and {}",
-                        path.as_str(),
-                        target.as_str()
-                    ),
-                ));
-            }
         }
         let requested_identity_elsewhere = identity_index
             .owners
             .get(&page_cache_key(kind, name))
             .is_some_and(|owners| !owners.is_empty());
         Ok((
-            DirectCreationProof {
-                target,
-                generation,
-                files,
-            },
+            DirectCreationProof { target, generation },
             requested_identity_elsewhere,
         ))
     }
@@ -8484,7 +8644,7 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        if managed_path != proof.target || proof.files.contains_key(&managed_path) {
+        if managed_path != proof.target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "creation proof does not bind one absent exact target",
@@ -8538,6 +8698,19 @@ impl Graph {
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
+        if self.graph_text_external_observation_pending() {
+            let _ = target.parent().remove_file(&temp);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "external graph-text changes arrived before creation publication",
+            ));
+        }
+        if let Err(error) =
+            self.validate_graph_text_portable_aliases_path_local(permit, &proof.target, true)
+        {
+            let _ = target.parent().remove_file(&temp);
+            return Err(error);
+        }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != proof.generation {
             let _ = target.parent().remove_file(&temp);
             return Err(io::Error::new(
@@ -8633,6 +8806,7 @@ impl Graph {
         expected_identity: ContentDigest,
         expected_bytes: Option<&[u8]>,
         editor_episode: Option<&ConflictEditorEpisode>,
+        publication_authority: EditorPublicationAuthority,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -8665,7 +8839,7 @@ impl Graph {
             }
             return Err(error);
         }
-        preflight_projection_chain(&target.chain)?;
+        preflight_editor_publication_chain(publication_authority, &target.chain)?;
         let temp = create_editor_staged_recovery(target.parent(), &target.filename, bytes)?;
         let staged_identity = match (|| {
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
@@ -8716,7 +8890,15 @@ impl Graph {
                 }
                 return Err(error);
             }
-            rename_projection_noreplace(target.parent(), &target.filename, &recovery)?;
+            let rename_noreplace = |from: &str, to: &str| match publication_authority {
+                EditorPublicationAuthority::DirectFile => {
+                    rename_projection_noreplace(target.parent(), from, to)
+                }
+                EditorPublicationAuthority::ReconstructibleManagedProjection => {
+                    rename_reconstructible_projection_noreplace(target.parent(), from, to)
+                }
+            };
+            rename_noreplace(&target.filename, &recovery)?;
             retired = true;
 
             let (retired_file, retired_bytes) =
@@ -8724,7 +8906,7 @@ impl Graph {
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
             validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
             drop(retired_file);
-            sync_projection_chain_required(&target.chain)?;
+            sync_editor_publication_chain(publication_authority, &target.chain)?;
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
             {
@@ -8747,9 +8929,7 @@ impl Graph {
             validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
             drop(staged_file);
 
-            if let Err(error) =
-                rename_projection_noreplace(target.parent(), &temp, &target.filename)
-            {
+            if let Err(error) = rename_noreplace(&temp, &target.filename) {
                 if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
                     conflict_site = Some(EditorConflictSite::ReplacePublicationCollision);
                 }
@@ -8757,7 +8937,7 @@ impl Graph {
             }
             published = true;
             journal_projection_after_publish_hook()?;
-            sync_projection_chain_required(&target.chain)?;
+            sync_editor_publication_chain(publication_authority, &target.chain)?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
@@ -8775,7 +8955,7 @@ impl Graph {
             }
             target.parent().remove_file(&recovery)?;
             retired = false;
-            sync_projection_chain_required(&target.chain)
+            sync_editor_publication_chain(publication_authority, &target.chain)
         })();
 
         let outcome = match result {
@@ -8797,12 +8977,27 @@ impl Graph {
                             ));
                         }
                         validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
-                        rename_projection_noreplace(target.parent(), &recovery, &target.filename)
+                        match publication_authority {
+                            EditorPublicationAuthority::DirectFile => rename_projection_noreplace(
+                                target.parent(),
+                                &recovery,
+                                &target.filename,
+                            ),
+                            EditorPublicationAuthority::ReconstructibleManagedProjection => {
+                                rename_reconstructible_projection_noreplace(
+                                    target.parent(),
+                                    &recovery,
+                                    &target.filename,
+                                )
+                            }
+                        }
                     });
                     match restore {
                         Ok(()) => {
                             retired = false;
-                            if let Err(sync_error) = sync_projection_chain_required(&target.chain) {
+                            if let Err(sync_error) =
+                                sync_editor_publication_chain(publication_authority, &target.chain)
+                            {
                                 Err(io::Error::new(
                                     primary.kind(),
                                     format!(
@@ -9108,6 +9303,182 @@ impl Graph {
     /// This capture never reads, advances, or consumes the process-local live
     /// admission state. Import must always obtain current retained-capability
     /// evidence of its own.
+    /// Enumerate the eligible managed-text paths that exist on disk, reading no
+    /// file contents at all.
+    ///
+    /// The clean watcher's full scan used to seed itself from
+    /// [`Graph::fresh_initial_shadow_raw_managed_text_inventory`] — a two-pass,
+    /// byte-retaining capture of every eligible document — inside ONE unbudgeted
+    /// actor turn. The scan never needed those bytes up front: it uses them only
+    /// to decide which paths to hand to reconciliation, and reconciliation
+    /// recaptures every affected path under its own two-pass authority
+    /// (`plan_clean_affected_import` → `capture_inventory`). Reading them up
+    /// front is what made the first turn of every rescan `2 × N` file opens,
+    /// which is the turn that scales worst to Android scoped storage.
+    ///
+    /// So this walk answers only "which paths are there", and the scan reads
+    /// each one lazily inside its existing per-turn budget. The directory walk
+    /// keeps the capture's no-follow discipline and its limits; per-file
+    /// identity, link-count and alias checks move to the per-path read, which
+    /// `Graph::read_raw_managed_text` performs.
+    pub(crate) fn clean_watcher_managed_text_paths(&self) -> io::Result<Vec<ManagedPath>> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        require_projection_platform()?;
+        let limits = INITIAL_SHADOW_LIMITS;
+        self.ensure_projection_root_binding()?;
+        let root = self
+            .projection_root
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "graph has no retained no-follow projection capability",
+                )
+            })?
+            .try_clone()?;
+
+        let mut paths: Vec<ManagedPath> = Vec::new();
+        let mut all_entries = 0_usize;
+        let mut directory_count = 1_usize;
+        let mut path_bytes = 0_u64;
+        let mut pending = vec![PendingDirectory {
+            directory: root,
+            relative: String::new(),
+            depth: 0,
+        }];
+
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            count_graph_text_admission_builder_enumeration();
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| initial_shadow_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(initial_shadow_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed text entry name is not UTF-8",
+                    )
+                })?;
+                let relative_len = relative
+                    .len()
+                    .checked_add(usize::from(!relative.is_empty()))
+                    .and_then(|length| length.checked_add(name.len()))
+                    .ok_or_else(allocation_overflow)?;
+                path_bytes = path_bytes
+                    .checked_add(
+                        usize_to_u64(relative_len)
+                            .map_err(|_| initial_shadow_limit_error("aggregate path bytes"))?,
+                    )
+                    .ok_or_else(|| initial_shadow_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(initial_shadow_limit_error("aggregate path bytes"));
+                }
+                let child_relative = if relative.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    // Same rule as the capture walk (GH #267 / F3): a symlink is
+                    // not a graph-text document anywhere else in Tine, so it is
+                    // skipped rather than escalated into an error that would
+                    // cost the user every other page.
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !self.graph_text_scope.should_descend(&child_relative) {
+                        continue;
+                    }
+                    let child_depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("managed directory depth"))?;
+                    if child_depth > limits.directory_depth {
+                        return Err(initial_shadow_limit_error("managed directory depth"));
+                    }
+                    directory_count = directory_count
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("directory count"))?;
+                    if directory_count > limits.directories {
+                        return Err(initial_shadow_limit_error("directory count"));
+                    }
+                    projection_real_directory(&directory, name)?;
+                    let child = open_projection_dir_nofollow(&directory, name)?;
+                    if pending.len() == limits.pending_directories {
+                        return Err(initial_shadow_limit_error("pending directories"));
+                    }
+                    pending.push(PendingDirectory {
+                        directory: child,
+                        relative: child_relative,
+                        depth: child_depth,
+                    });
+                    continue;
+                }
+                if !file_type.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("managed text entry is not a regular file: {child_relative}"),
+                    ));
+                }
+                if !self.graph_text_scope.is_eligible(&child_relative) {
+                    continue;
+                }
+                if paths.len() == limits.managed_files {
+                    return Err(initial_shadow_limit_error("managed file count"));
+                }
+                paths.push(ManagedPath::parse(child_relative).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?);
+            }
+        }
+
+        paths.sort_unstable();
+        if paths.windows(2).any(|window| window[0] == window[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed text path inventory contains duplicate managed paths",
+            ));
+        }
+        Ok(paths)
+    }
+
+    /// Read one candidate's on-disk bytes for the clean watcher's full scan, or
+    /// `None` when the path holds nothing this graph would ever have projected.
+    ///
+    /// The eligibility test is not decoration. The scan's candidate list is the
+    /// union of the on-disk walk, the SQLite inventory and the manifest
+    /// projection paths, so it can contain a path SQLite still owns while the
+    /// current `GraphTextScope` no longer admits it. The capture this replaced
+    /// filtered such a path out by never putting it in the inventory; keeping
+    /// the same filter here keeps the changed-path set byte-identical to what
+    /// the capture produced.
+    pub(crate) fn clean_watcher_managed_text_read(
+        &self,
+        path: &ManagedPath,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if !self.graph_text_scope.is_eligible(path.as_str()) {
+            return Ok(None);
+        }
+        Ok(self
+            .read_raw_managed_text(path)?
+            .map(ManagedTextObservation::into_bytes))
+    }
+
     pub(crate) fn fresh_initial_shadow_raw_managed_text_inventory(
         &self,
     ) -> io::Result<Vec<(ManagedPath, Vec<u8>)>> {
@@ -9210,7 +9581,8 @@ impl Graph {
     /// One physical census for the live exact-feed index. Discovery is not
     /// publication authority: reconciliation recaptures every affected path,
     /// and absences cross the durable confirmation boundary before admission.
-    /// Bootstrap source proof retains its separate two-pass capture above.
+    /// Bootstrap activation separately seals one initial capture and performs
+    /// one complete live-source comparison immediately before promotion.
     fn capture_live_graph_text_admission_with_limits(
         &self,
         limits: InitialShadowLimits,
@@ -9294,103 +9666,6 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
         Ok((first, combined_capture_bytes))
-    }
-
-    /// One complete streaming fingerprint pass for the inactive scan
-    /// substrate. The returned rows contain no file bytes and grant no import,
-    /// projection, watcher, or continuing filesystem authority.
-    pub(crate) fn capture_reconciliation_scan_pass(
-        &self,
-        limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
-    ) -> io::Result<crate::oplog::reconciliation_scan::GraphTextScanPass> {
-        require_projection_platform()?;
-        let admission = {
-            let state = self.graph_text_admission.read().unwrap();
-            match &*state {
-                GraphTextAdmissionState::SnapshotComplete(index)
-                | GraphTextAdmissionState::CatchingUp(index)
-                | GraphTextAdmissionState::Complete(index) => Some(Arc::clone(index)),
-                GraphTextAdmissionState::Poisoned { cause, .. } => {
-                    return Err(graph_text_admission_unavailable(cause));
-                }
-                GraphTextAdmissionState::Unbuilt
-                | GraphTextAdmissionState::Armed(_)
-                | GraphTextAdmissionState::Building { .. } => None,
-            }
-        };
-        if let Some(admission) = admission {
-            return reconciliation_scan_pass_from_admission(self, &admission, limits);
-        }
-        let permit = self.admit_retained_managed_text_writer()?;
-        collect_reconciliation_scan_pass(self, &permit, limits)
-    }
-
-    /// Join a complete physical scan to the already-built semantic admission
-    /// snapshot without rereading or reparsing any file. Direct foundation
-    /// scans may run before admission exists; live reconciliation always calls
-    /// this while its queue-fenced index is `CatchingUp` or `Complete`.
-    fn attach_reconciliation_scan_semantic_keys(
-        &self,
-        files: &mut [crate::oplog::reconciliation_scan::GraphTextScanFileFingerprint],
-    ) -> io::Result<()> {
-        use crate::oplog::reconciliation_scan::GraphTextScanPathClass;
-
-        let index = {
-            let state = self.graph_text_admission.read().unwrap();
-            match &*state {
-                GraphTextAdmissionState::SnapshotComplete(index)
-                | GraphTextAdmissionState::CatchingUp(index)
-                | GraphTextAdmissionState::Complete(index) => Some(Arc::clone(index)),
-                GraphTextAdmissionState::Poisoned { cause, .. } => {
-                    return Err(graph_text_admission_unavailable(cause));
-                }
-                GraphTextAdmissionState::Unbuilt
-                | GraphTextAdmissionState::Armed(_)
-                | GraphTextAdmissionState::Building { .. } => None,
-            }
-        };
-        let Some(index) = index else {
-            return Ok(());
-        };
-
-        for file in files {
-            if !matches!(
-                file.class,
-                GraphTextScanPathClass::EligibleManaged(_)
-                    | GraphTextScanPathClass::EligibleUnmanaged
-            ) {
-                continue;
-            }
-            let path = ManagedPath::parse(file.exact_relative.clone()).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("eligible scan path lost managed identity: {error}"),
-                )
-            })?;
-            let record = index.files_by_exact_path.get(&path).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!(
-                        "queue-fenced semantic admission lacks scanned path {}",
-                        file.exact_relative
-                    ),
-                )
-            })?;
-            if file.description != Some(record.description)
-                || file.file_resource_id != record.file_resource_id
-                || file.link_count != record.link_count
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!(
-                        "queue-fenced semantic admission differs from scanned path {}",
-                        file.exact_relative
-                    ),
-                ));
-            }
-            file.semantic_key = Some(graph_text_semantic_key_digest(&record.semantic));
-        }
-        Ok(())
     }
 
     fn begin_graph_text_admission_build(
@@ -9520,234 +9795,6 @@ impl Graph {
         };
     }
 
-    /// Arm one crate-private exact feed for a core-owned runtime actor.
-    ///
-    /// The returned move-only lease is continuing process-local authority for
-    /// this exact `Graph`, retained root, and graph-text scope. It is never
-    /// exposed to a platform adapter: the core actor owns it and accepts only
-    /// normalized watcher observations through its bounded queue.
-    pub(crate) fn arm_graph_text_exact_feed(
-        &self,
-        last_sequence: u64,
-    ) -> io::Result<GraphTextExactFeedLease> {
-        let graph_resource = match self.canonical_resource_id() {
-            Ok(resource) => resource,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        let scope_binding = match self.graph_text_scope_binding() {
-            Ok(binding) => binding,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        if scope_binding.graph_resource_id() != graph_resource {
-            let error = graph_text_admission_unavailable(
-                "graph-text feed scope and retained root binding mismatch",
-            );
-            self.poison_graph_text_admission(error.to_string());
-            return Err(error);
-        }
-        let binding = GraphTextAdmissionFeedBinding {
-            instance: Arc::clone(&self.graph_text_admission_instance),
-            scope_binding,
-            graph_resource,
-            fence: GraphTextAdmissionFeedFence { last_sequence },
-            #[cfg(test)]
-            legacy_publish_on_build: false,
-        };
-        let mut state = self.graph_text_admission.write().unwrap();
-        match &*state {
-            GraphTextAdmissionState::Unbuilt => {
-                *state = GraphTextAdmissionState::Armed(binding.clone());
-                Ok(GraphTextExactFeedLease {
-                    control: Arc::clone(&self.graph_text_admission),
-                    binding,
-                    terminal: AtomicBool::new(false),
-                })
-            }
-            GraphTextAdmissionState::Poisoned { cause, .. } => {
-                Err(graph_text_admission_unavailable(cause))
-            }
-            _ => {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "a second or invalid graph-text feed arm was attempted".to_owned(),
-                );
-                Err(graph_text_admission_unavailable(
-                    "graph-text feed must be armed exactly once before the build",
-                ))
-            }
-        }
-    }
-
-    /// Build the bounded graph-wide admission snapshot for an exact feed.
-    ///
-    /// Success publishes `CatchingUp`; it never creates complete authority.
-    pub(crate) fn build_graph_text_exact_feed(
-        &self,
-        lease: &GraphTextExactFeedLease,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        self.build_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)
-            .map(drop)
-    }
-
-    /// Build an armed exact-feed index directly at a held watcher-queue fence.
-    ///
-    /// An actor intentionally arms the feed during fast runtime open, then
-    /// holds one uncertainty epoch before doing any graph-wide work.  The
-    /// first drain calls this method once: its bounded single-census snapshot and
-    /// its initial feed fence are published together as `CatchingUp`.  This
-    /// avoids a stale open-time snapshot followed by a second full rebuild,
-    /// while retaining exact affected-path admission checks.
-    pub(crate) fn build_graph_text_exact_feed_at_fence(
-        &self,
-        lease: &GraphTextExactFeedLease,
-        last_sequence: u64,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        self.ensure_graph_text_exact_feed_configuration(lease)?;
-        {
-            let mut state = self.graph_text_admission.write().unwrap();
-            let GraphTextAdmissionState::Armed(binding) = &mut *state else {
-                let cause = match &*state {
-                    GraphTextAdmissionState::Poisoned { cause, .. } => cause.clone(),
-                    _ => "exact-feed fenced initial build requires the Armed state".to_owned(),
-                };
-                if !matches!(&*state, GraphTextAdmissionState::Poisoned { .. }) {
-                    poison_graph_text_admission_state(&mut state, cause.clone());
-                }
-                return Err(graph_text_admission_unavailable(&cause));
-            };
-            if last_sequence < binding.fence.last_sequence {
-                let cause = "exact-feed fenced initial build moved the fence backwards";
-                poison_graph_text_admission_state(&mut state, cause.to_owned());
-                return Err(graph_text_admission_unavailable(cause));
-            }
-            binding.fence.last_sequence = last_sequence;
-        }
-        self.build_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)
-            .map(drop)
-    }
-
-    /// Rebuild the complete exact-feed index at one held queue fence.
-    ///
-    /// The old index remains authoritative while the bounded single census
-    /// is constructed. Publication is one pointer swap only after the retained
-    /// graph/root/scope, lease, prior generation, and prior feed fence are
-    /// re-proved unchanged. A transient scan failure therefore leaves the old
-    /// index intact and retryable. The peak budget includes both the old
-    /// retained index and the replacement under construction.
-    ///
-    /// `last_sequence` may equal the current fence for a retry, but may never
-    /// move backwards. A successful rebase preserves `CatchingUp` versus
-    /// `Complete`; only [`Self::publish_graph_text_exact_feed_caught_up`] may
-    /// cross the initial catch-up publication boundary.
-    pub(crate) fn rebase_graph_text_exact_feed_at_fence(
-        &self,
-        lease: &GraphTextExactFeedLease,
-        last_sequence: u64,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        self.ensure_graph_text_exact_feed_configuration(lease)?;
-        let (current, catching_up, next_generation, current_sequence) = {
-            let state = self.graph_text_admission.read().unwrap();
-            let (index, catching_up) = match &*state {
-                GraphTextAdmissionState::CatchingUp(index) => (Arc::clone(index), true),
-                GraphTextAdmissionState::Complete(index) => (Arc::clone(index), false),
-                GraphTextAdmissionState::Poisoned { cause, .. } => {
-                    return Err(graph_text_admission_unavailable(cause));
-                }
-                _ => {
-                    return Err(graph_text_admission_unavailable(
-                        "exact-feed rebase requires CatchingUp or Complete",
-                    ));
-                }
-            };
-            if !graph_text_exact_feed_index_matches_lease(&index, lease) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "exact-feed rebase lease belongs to a different Graph, root, or scope",
-                ));
-            }
-            let current_sequence = index
-                .feed
-                .as_ref()
-                .expect("exact-feed indexes retain a fence")
-                .last_sequence;
-            if last_sequence < current_sequence {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exact-feed rebase fence moved backwards",
-                ));
-            }
-            let next_generation = index.generation.checked_add(1).ok_or_else(|| {
-                graph_text_admission_unavailable("graph-text admission generation overflow")
-            })?;
-            (index, catching_up, next_generation, current_sequence)
-        };
-
-        let (capture, combined_capture_bytes) =
-            self.capture_live_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)?;
-        let replacement_peak_base =
-            checked_add_bytes(combined_capture_bytes, current.permanent_bytes)?;
-        let mut replacement = build_graph_text_admission_index(
-            self,
-            &capture,
-            Some(GraphTextAdmissionFeedFence { last_sequence }),
-            INITIAL_SHADOW_LIMITS,
-            replacement_peak_base,
-            true,
-            Some(&current),
-        )?;
-        if let Some(error) = initial_shadow_global_collision(&replacement) {
-            return Err(error);
-        }
-        replacement.generation = next_generation;
-
-        // Binding checks may perform retained-capability IO, so run them before
-        // taking the publication lock and then prove the exact prior pointer
-        // and fence again under the lock.
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        self.ensure_graph_text_exact_feed_configuration(lease)?;
-        let mut state = self.graph_text_admission.write().unwrap();
-        let unchanged = match &*state {
-            GraphTextAdmissionState::CatchingUp(index) if catching_up => {
-                Arc::ptr_eq(index, &current)
-                    && graph_text_exact_feed_index_matches_lease(index, lease)
-                    && index
-                        .feed
-                        .as_ref()
-                        .is_some_and(|feed| feed.last_sequence == current_sequence)
-            }
-            GraphTextAdmissionState::Complete(index) if !catching_up => {
-                Arc::ptr_eq(index, &current)
-                    && graph_text_exact_feed_index_matches_lease(index, lease)
-                    && index
-                        .feed
-                        .as_ref()
-                        .is_some_and(|feed| feed.last_sequence == current_sequence)
-            }
-            _ => false,
-        };
-        if !unchanged {
-            return Err(graph_text_admission_unavailable(
-                "graph-text admission authority changed during exact-feed rebase",
-            ));
-        }
-        let replacement = Arc::new(replacement);
-        *state = if catching_up {
-            GraphTextAdmissionState::CatchingUp(replacement)
-        } else {
-            GraphTextAdmissionState::Complete(replacement)
-        };
-        Ok(())
-    }
-
     /// Classify one exact feed path without duplicating scope policy.
     pub fn classify_graph_text_exact_feed_path(
         &self,
@@ -9769,1130 +9816,6 @@ impl Graph {
             }
         }
         Ok(GraphTextExactFeedPathClass::RetainedFile)
-    }
-
-    /// Apply one bounded atomic final-state batch from the core-owned feed.
-    pub(crate) fn apply_graph_text_exact_feed_batch(
-        &self,
-        lease: &GraphTextExactFeedLease,
-        batch: GraphTextExactFeedBatch,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        let (current, catching_up, next_generation) = {
-            let mut state = self.graph_text_admission.write().unwrap();
-            if !Arc::ptr_eq(&batch.instance, &lease.binding.instance) {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "exact feed batch belongs to a foreign session".to_owned(),
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "exact feed batch belongs to a foreign session",
-                ));
-            }
-            let (index, catching_up) = match &*state {
-                GraphTextAdmissionState::CatchingUp(index) => (Arc::clone(index), true),
-                GraphTextAdmissionState::Complete(index) => (Arc::clone(index), false),
-                GraphTextAdmissionState::Poisoned { cause, .. } => {
-                    return Err(graph_text_admission_unavailable(cause));
-                }
-                _ => {
-                    poison_graph_text_admission_state(
-                        &mut state,
-                        "exact feed batch was applied outside CatchingUp or Complete".to_owned(),
-                    );
-                    return Err(graph_text_admission_unavailable(
-                        "exact feed batch requires CatchingUp or Complete",
-                    ));
-                }
-            };
-            if !graph_text_exact_feed_index_matches_lease(&index, lease) {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "foreign or stale exact feed lease was applied".to_owned(),
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "exact feed lease belongs to a different Graph, root, or scope",
-                ));
-            }
-            let feed = index
-                .feed
-                .as_ref()
-                .expect("CatchingUp and Complete retain an exact feed");
-            let Some(expected_first) = feed.last_sequence.checked_add(1) else {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    graph_text_exact_feed_failure_cause(
-                        GraphTextExactFeedFailure::SequenceDiscontinuity,
-                        "exact feed sequence wrapped",
-                    ),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "exact feed sequence wrapped",
-                ));
-            };
-            if batch.first_sequence != expected_first {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    graph_text_exact_feed_failure_cause(
-                        GraphTextExactFeedFailure::SequenceDiscontinuity,
-                        &format!(
-                            "expected first sequence {expected_first}, received {}..={}",
-                            batch.first_sequence, batch.last_sequence
-                        ),
-                    ),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "exact feed sequence range is not contiguous",
-                ));
-            }
-            let Some(next_generation) = index.generation.checked_add(1) else {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "graph-text admission generation overflow".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "graph-text admission generation overflow",
-                ));
-            };
-            (index, catching_up, next_generation)
-        };
-
-        for relative in &batch.touched_exact_relatives {
-            if self.classify_graph_text_exact_feed_path(relative)?
-                == GraphTextExactFeedPathClass::Configuration
-            {
-                return Err(self.poison_graph_text_admission_error(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    graph_text_exact_feed_failure_cause(
-                        GraphTextExactFeedFailure::ScopeOrConfigMutation,
-                        "logseq/config.edn changed",
-                    ),
-                )));
-            }
-        }
-
-        let batch_scratch = match self.preflight_graph_text_exact_feed_batch(&current, &batch) {
-            Ok(scratch) => scratch,
-            Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-        };
-        if let Err(error) = graph_text_exact_feed_after_preflight_hook() {
-            return Err(self.poison_graph_text_admission_error(error));
-        }
-        let mut prepared = Vec::with_capacity(batch.touched_exact_relatives.len());
-        let mut actual_charges = GraphTextExactFeedBatchActualCharges::default();
-        for relative in &batch.touched_exact_relatives {
-            if let Err(error) = graph_text_exact_feed_prepare_path_hook(relative) {
-                return Err(self.poison_graph_text_admission_error(error));
-            }
-            let final_state = match self.prepare_graph_text_admission_final_state(
-                &current,
-                relative.clone(),
-                batch_scratch,
-                &mut actual_charges,
-                true,
-                true,
-            ) {
-                Ok(final_state) => final_state,
-                Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-            };
-            let retained_growth = match &final_state {
-                PreparedGraphTextAdmissionFinalState::Present(upsert) => upsert.retained_growth,
-                PreparedGraphTextAdmissionFinalState::Absent(remove) => remove.retained_growth,
-            };
-            if let Err(error) =
-                actual_charges.retain_prepared_growth(&current, batch_scratch, retained_growth)
-            {
-                return Err(self.poison_graph_text_admission_error(error));
-            }
-            prepared.push(final_state);
-        }
-
-        let mut prepared_growth = 0_u64;
-        let mut payload_peak = 0_u64;
-        for final_state in &prepared {
-            let (relative, growth, upsert) = match final_state {
-                PreparedGraphTextAdmissionFinalState::Present(upsert) => {
-                    (&upsert.relative, upsert.retained_growth, Some(upsert))
-                }
-                PreparedGraphTextAdmissionFinalState::Absent(remove) => {
-                    (&remove.relative, remove.retained_growth, None)
-                }
-            };
-            prepared_growth = match checked_add_bytes(prepared_growth, growth) {
-                Ok(growth) => growth,
-                Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-            };
-            payload_peak = match graph_text_admission_delta_payload_peak(&current, relative, upsert)
-                .and_then(|peak| checked_add_bytes(payload_peak, peak))
-            {
-                Ok(peak) => peak,
-                Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-            };
-        }
-        if prepared_growth != actual_charges.prepared_growth {
-            return Err(self.poison_graph_text_admission_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "exact feed batch prepared-growth charge diverged",
-            )));
-        }
-        if let Err(error) = self.revalidate_prepared_graph_text_admission_batch(
-            &current,
-            &prepared,
-            batch_scratch,
-            prepared_growth,
-            true,
-        ) {
-            return Err(self.poison_graph_text_admission_error(error));
-        }
-        let structural_peak = match graph_text_admission_delta_structural_peak(&current)
-            .and_then(|peak| checked_mul_bytes(peak, usize_to_u64(prepared.len())?))
-        {
-            Ok(peak) => peak,
-            Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-        };
-        let event_peak = checked_add_bytes(current.permanent_bytes, prepared_growth)
-            .and_then(|value| checked_add_bytes(value, structural_peak))
-            .and_then(|value| checked_add_bytes(value, payload_peak))
-            .and_then(|value| checked_add_bytes(value, batch_scratch));
-        match event_peak {
-            Ok(peak) if peak <= current.peak_limit => {}
-            Ok(_) => {
-                return Err(
-                    self.poison_graph_text_admission_error(initial_shadow_limit_error(
-                        "peak build memory",
-                    )),
-                );
-            }
-            Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-        }
-
-        let mut state = self.graph_text_admission.write().unwrap();
-        let unchanged = match &*state {
-            GraphTextAdmissionState::CatchingUp(index) if catching_up => {
-                Arc::ptr_eq(index, &current)
-            }
-            GraphTextAdmissionState::Complete(index) if !catching_up => {
-                Arc::ptr_eq(index, &current)
-            }
-            _ => false,
-        };
-        if !unchanged {
-            poison_graph_text_admission_state(
-                &mut state,
-                "graph-text admission authority changed during batch proof".to_owned(),
-            );
-            return Err(graph_text_admission_unavailable(
-                "graph-text admission authority changed during batch proof",
-            ));
-        }
-
-        let mut next = (*current).clone();
-        for final_state in &prepared {
-            let relative = match final_state {
-                PreparedGraphTextAdmissionFinalState::Present(upsert) => &upsert.relative,
-                PreparedGraphTextAdmissionFinalState::Absent(remove) => &remove.relative,
-            };
-            let removed = remove_graph_text_admission_path(&mut next, relative);
-            if let (PreparedGraphTextAdmissionFinalState::Absent(remove), Some(tombstone)) =
-                (final_state, removed)
-            {
-                if let Ok(path) = ManagedPath::parse(relative.clone()) {
-                    next.tombstones_by_exact_path.insert(path, tombstone);
-                }
-                next.permanent_bytes =
-                    match checked_add_bytes(next.permanent_bytes, remove.retained_growth) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            poison_graph_text_admission_state(&mut state, error.to_string());
-                            return Err(error);
-                        }
-                    };
-            }
-        }
-        for final_state in prepared {
-            if let PreparedGraphTextAdmissionFinalState::Present(upsert) = final_state {
-                if let Err(error) = self.apply_prepared_graph_text_file_upsert(&mut next, upsert) {
-                    poison_graph_text_admission_state(&mut state, error.to_string());
-                    return Err(error);
-                }
-            }
-        }
-        for relative in &batch.touched_exact_relatives {
-            if let Err(error) = validate_graph_text_admission_delta(&next, relative) {
-                poison_graph_text_admission_state(&mut state, error.to_string());
-                return Err(error);
-            }
-        }
-        if next.permanent_bytes > next.permanent_limit {
-            let error = initial_shadow_limit_error("permanent index memory");
-            poison_graph_text_admission_state(&mut state, error.to_string());
-            return Err(error);
-        }
-        next.generation = next_generation;
-        next.feed
-            .as_mut()
-            .expect("staged exact-feed indexes retain a fence")
-            .last_sequence = batch.last_sequence;
-        let next = Arc::new(next);
-        *state = if catching_up {
-            GraphTextAdmissionState::CatchingUp(next)
-        } else {
-            GraphTextAdmissionState::Complete(next)
-        };
-        Ok(())
-    }
-
-    /// Seal the initial index at its exact queue fence.
-    pub(crate) fn publish_graph_text_exact_feed_caught_up(
-        &self,
-        lease: &GraphTextExactFeedLease,
-        last_sequence: u64,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_exact_feed_lease(lease)?;
-        let current = {
-            let state = self.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                drop(state);
-                self.poison_graph_text_admission(
-                    "caught-up publication requires the CatchingUp state",
-                );
-                return Err(graph_text_admission_unavailable(
-                    "caught-up publication requires the CatchingUp state",
-                ));
-            };
-            Arc::clone(index)
-        };
-        self.ensure_graph_text_admission_snapshot_binding(&current)
-            .map_err(|error| self.poison_graph_text_admission_error(error))?;
-        let mut state = self.graph_text_admission.write().unwrap();
-        let exact = matches!(
-            &*state,
-            GraphTextAdmissionState::CatchingUp(index)
-                if Arc::ptr_eq(index, &current)
-                    && graph_text_exact_feed_index_matches_lease(index, lease)
-                    && index.feed.as_ref().is_some_and(|feed| {
-                        feed.last_sequence == last_sequence
-                    })
-        );
-        if !exact {
-            poison_graph_text_admission_state(
-                &mut state,
-                "caught-up fence, generation, session, or snapshot changed".to_owned(),
-            );
-            return Err(graph_text_admission_unavailable(
-                "caught-up publication did not match the exact current fence",
-            ));
-        }
-        *state = GraphTextAdmissionState::Complete(current);
-        Ok(())
-    }
-
-    /// Terminally poison/disconnect the crate-private exact feed.
-    pub(crate) fn poison_graph_text_exact_feed(
-        &self,
-        lease: &GraphTextExactFeedLease,
-        reason: GraphTextExactFeedFailure,
-        cause: &str,
-    ) -> io::Result<()> {
-        if !Arc::ptr_eq(&lease.control, &self.graph_text_admission)
-            || !Arc::ptr_eq(&lease.binding.instance, &self.graph_text_admission_instance)
-        {
-            self.poison_graph_text_admission(
-                "foreign exact feed lease attempted to disconnect this Graph",
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "exact feed lease belongs to another Graph instance",
-            ));
-        }
-        lease.terminal.store(true, Ordering::Release);
-        self.poison_graph_text_admission(graph_text_exact_feed_failure_cause(reason, cause));
-        Ok(())
-    }
-
-    fn ensure_graph_text_exact_feed_lease(
-        &self,
-        lease: &GraphTextExactFeedLease,
-    ) -> io::Result<()> {
-        if lease.terminal.load(Ordering::Acquire) {
-            return Err(graph_text_admission_unavailable(
-                "exact feed lease is terminal",
-            ));
-        }
-        if !Arc::ptr_eq(&lease.control, &self.graph_text_admission)
-            || !Arc::ptr_eq(&lease.binding.instance, &self.graph_text_admission_instance)
-        {
-            self.poison_graph_text_admission(
-                "foreign exact feed lease was used with this Graph instance",
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "exact feed lease belongs to another Graph instance",
-            ));
-        }
-        let graph_resource = self
-            .canonical_resource_id()
-            .map_err(|error| self.poison_graph_text_admission_error(error))?;
-        let scope_binding = self
-            .graph_text_scope_binding()
-            .map_err(|error| self.poison_graph_text_admission_error(error))?;
-        if graph_resource != lease.binding.graph_resource
-            || scope_binding != lease.binding.scope_binding
-            || scope_binding.graph_resource_id() != graph_resource
-        {
-            lease.terminal.store(true, Ordering::Release);
-            let error =
-                graph_text_admission_unavailable("exact feed lease root or scope binding changed");
-            self.poison_graph_text_admission(error.to_string());
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn ensure_graph_text_exact_feed_configuration(
-        &self,
-        lease: &GraphTextExactFeedLease,
-    ) -> io::Result<()> {
-        let validate = || {
-            if !self.reconciliation_scan_open_config_utf8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "exact feed requires a fresh Graph after non-UTF-8 configuration",
-                ));
-            }
-            self.ensure_projection_root_binding()?;
-            let root = self
-                .projection_root
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "graph has no retained no-follow projection capability",
-                    )
-                })?
-                .try_clone()?;
-            let limits = crate::oplog::reconciliation_scan::GraphTextScanLimits::default();
-            let mut aggregate_hashed_bytes = 0;
-            let mut instrumentation =
-                crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation::default();
-            let observed = reconciliation_scan_current_config_description(
-                &root,
-                &mut aggregate_hashed_bytes,
-                &mut instrumentation,
-                limits,
-            )?;
-            if observed != self.reconciliation_scan_open_config_description {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "graph-text configuration changed; a fresh Graph is required",
-                ));
-            }
-            Ok(())
-        };
-        if let Err(error) = validate() {
-            lease.terminal.store(true, Ordering::Release);
-            self.poison_graph_text_admission(graph_text_exact_feed_failure_cause(
-                GraphTextExactFeedFailure::ScopeOrConfigMutation,
-                &error.to_string(),
-            ));
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn arm_graph_text_admission_feed(
-        &self,
-        last_sequence: u64,
-    ) -> io::Result<GraphTextExactFeedLease> {
-        let mut lease = self.arm_graph_text_exact_feed(last_sequence)?;
-        lease.binding.legacy_publish_on_build = true;
-        let mut state = self.graph_text_admission.write().unwrap();
-        let GraphTextAdmissionState::Armed(binding) = &mut *state else {
-            unreachable!("test compatibility arm leaves the Graph armed");
-        };
-        binding.legacy_publish_on_build = true;
-        drop(state);
-        Ok(lease)
-    }
-
-    #[allow(dead_code)]
-    fn graph_text_admission_epoch(&self) -> io::Result<GraphTextAdmissionEpoch> {
-        count_graph_text_admission_point_query();
-        let index = {
-            let state = self.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::Complete(index) = &*state else {
-                let cause = match &*state {
-                    GraphTextAdmissionState::Unbuilt => "index is unbuilt",
-                    GraphTextAdmissionState::Armed(_) => "exact feed is armed but unbuilt",
-                    GraphTextAdmissionState::Building { .. } => "index is building",
-                    GraphTextAdmissionState::SnapshotComplete(_) => {
-                        "snapshot feed is not authoritative"
-                    }
-                    GraphTextAdmissionState::CatchingUp(_) => "exact feed snapshot is catching up",
-                    GraphTextAdmissionState::Poisoned { cause, .. } => cause,
-                    GraphTextAdmissionState::Complete(_) => unreachable!(),
-                };
-                return Err(graph_text_admission_unavailable(cause));
-            };
-            Arc::clone(index)
-        };
-        let feed = index
-            .feed
-            .as_ref()
-            .expect("Complete indexes always retain an armed feed");
-        let authority_check = (|| {
-            if !Arc::ptr_eq(&index.instance, &self.graph_text_admission_instance) {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text index belongs to another Graph instance",
-                ));
-            }
-            self.ensure_projection_root_binding()?;
-            let graph_resource = self.canonical_resource_id()?;
-            let scope_binding = self.graph_text_scope_binding()?;
-            if graph_resource != index.graph_resource
-                || scope_binding != index.scope_binding
-                || scope_binding.graph_resource_id() != graph_resource
-            {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text scope or root binding changed",
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = authority_check {
-            return Err(self.poison_graph_text_admission_error(error));
-        }
-
-        let generation = index.generation;
-        let feed_sequence = feed.last_sequence;
-        let mut state = self.graph_text_admission.write().unwrap();
-        let unchanged = matches!(
-            &*state,
-            GraphTextAdmissionState::Complete(current)
-                if Arc::ptr_eq(current, &index)
-                    && Arc::ptr_eq(&current.instance, &self.graph_text_admission_instance)
-                    && current.scope_binding == index.scope_binding
-                    && current.graph_resource == index.graph_resource
-                    && current.generation == generation
-                    && current
-                        .feed
-                        .as_ref()
-                        .is_some_and(|current_feed| current_feed.last_sequence == feed_sequence)
-        );
-        if !unchanged {
-            let cause = "graph-text admission authority changed during epoch proof".to_owned();
-            poison_graph_text_admission_state(&mut state, cause.clone());
-            return Err(graph_text_admission_unavailable(&cause));
-        }
-        Ok(GraphTextAdmissionEpoch {
-            instance: Arc::clone(&index.instance),
-            scope_binding: index.scope_binding,
-            graph_resource: index.graph_resource,
-            generation,
-            feed_sequence,
-        })
-    }
-
-    #[allow(dead_code)]
-    fn graph_text_admission_exact(
-        &self,
-        epoch: &GraphTextAdmissionEpoch,
-        path: &ManagedPath,
-    ) -> io::Result<GraphTextAdmissionExactObservation> {
-        count_graph_text_admission_point_query();
-        let target = self.graph_text_exact_path(path.as_str(), true)?;
-        let index = {
-            let state = self.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::Complete(index) = &*state else {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text admission authority is unavailable",
-                ));
-            };
-            Arc::clone(index)
-        };
-        let feed = index
-            .feed
-            .as_ref()
-            .expect("Complete indexes always retain an armed feed");
-        if !Arc::ptr_eq(&epoch.instance, &self.graph_text_admission_instance)
-            || !Arc::ptr_eq(&index.instance, &self.graph_text_admission_instance)
-            || !Arc::ptr_eq(&epoch.instance, &index.instance)
-            || epoch.scope_binding != index.scope_binding
-            || epoch.graph_resource != index.graph_resource
-            || epoch.generation != index.generation
-            || epoch.feed_sequence != feed.last_sequence
-        {
-            return Err(
-                self.poison_graph_text_admission_error(graph_text_admission_unavailable(
-                    "graph-text admission epoch or Graph instance is stale",
-                )),
-            );
-        }
-        let binding_check = (|| {
-            self.ensure_projection_root_binding()?;
-            let graph_resource = self.canonical_resource_id()?;
-            let scope_binding = self.graph_text_scope_binding()?;
-            if graph_resource != index.graph_resource
-                || scope_binding != index.scope_binding
-                || scope_binding.graph_resource_id() != graph_resource
-            {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text scope or root binding changed",
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = binding_check {
-            return Err(self.poison_graph_text_admission_error(error));
-        }
-        let Some(record) = index.files_by_exact_path.get(path).cloned() else {
-            let absent = match (|| {
-                let first_parent = self.graph_text_event_parent(&target)?;
-                validate_graph_text_event_parent(&index, &target, &first_parent)?;
-                match first_parent.final_dir().symlink_metadata(&target.filename) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Ok(_) => {
-                        return Err(graph_text_admission_unavailable(
-                            "unindexed graph-text path is present",
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                }
-                graph_text_event_revalidation_race_hook()?;
-                let second_parent = self.graph_text_event_parent(&target)?;
-                validate_graph_text_event_parent(&index, &target, &second_parent)?;
-                match second_parent.final_dir().symlink_metadata(&target.filename) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Ok(_) => {
-                        return Err(graph_text_admission_unavailable(
-                            "absent graph-text path appeared during proof",
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                }
-                self.ensure_graph_text_admission_snapshot_binding(&index)?;
-                Ok(index.tombstones_by_exact_path.get(path).cloned())
-            })() {
-                Ok(tombstone) => tombstone,
-                Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-            };
-            let generation = index.generation;
-            let feed_sequence = feed.last_sequence;
-            let mut state = self.graph_text_admission.write().unwrap();
-            let unchanged = matches!(
-                &*state,
-                GraphTextAdmissionState::Complete(current)
-                    if Arc::ptr_eq(current, &index)
-                        && current.generation == generation
-                        && current.feed.as_ref().is_some_and(|feed| {
-                            feed.last_sequence == feed_sequence
-                        })
-            );
-            if !unchanged {
-                let cause =
-                    "graph-text admission authority changed during exact absence proof".to_owned();
-                poison_graph_text_admission_state(&mut state, cause.clone());
-                return Err(graph_text_admission_unavailable(&cause));
-            }
-            let epoch = GraphTextAdmissionEpoch {
-                instance: Arc::clone(&index.instance),
-                scope_binding: index.scope_binding,
-                graph_resource: index.graph_resource,
-                generation,
-                feed_sequence,
-            };
-            return Ok(match absent {
-                Some(tombstone) => {
-                    GraphTextAdmissionExactObservation::AbsentRetained { epoch, tombstone }
-                }
-                None => GraphTextAdmissionExactObservation::AbsentUnowned {
-                    epoch,
-                    provisional: self.provisional_graph_entry_for_managed_path(path)?,
-                },
-            });
-        };
-        let portable_members = index
-            .paths_by_portable_key
-            .get(&path.portable_key())
-            .cloned()
-            .unwrap_or_default();
-        let resource_members = index
-            .paths_by_file_resource
-            .get(&record.file_resource_id)
-            .cloned()
-            .unwrap_or_default();
-        let semantic_members = index
-            .paths_by_semantic_key
-            .get(&graph_text_semantic_key(&record.semantic))
-            .cloned()
-            .unwrap_or_default();
-        if record.link_count != 1
-            || !portable_members.contains(path)
-            || resource_members.len() != 1
-            || !resource_members.contains(path.as_str())
-            || !semantic_members.contains(path)
-            || index
-                .file_resource_by_exact_relative
-                .get(path.as_str())
-                .copied()
-                != Some(record.file_resource_id)
-            || index
-                .file_link_count_by_exact_relative
-                .get(path.as_str())
-                .copied()
-                != Some(record.link_count)
-        {
-            return Err(
-                self.poison_graph_text_admission_error(graph_text_admission_unavailable(
-                    "exact graph-text member has colliding or unsafe retained evidence",
-                )),
-            );
-        }
-
-        let current = match (|| {
-            self.ensure_projection_root_binding()?;
-            if self.canonical_resource_id()? != index.graph_resource
-                || self.graph_text_scope_binding()? != index.scope_binding
-            {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text scope or root binding changed",
-                ));
-            }
-
-            let parent = self.graph_text_event_parent(&target)?;
-            validate_graph_text_event_parent(&index, &target, &parent)?;
-            let opened = open_projection_file_nofollow(parent.final_dir(), &target.filename)?;
-            let opened_resource = canonical_projection_file_resource_id(&opened)?;
-            let opened_link_count = projection_file_link_count(&opened)?;
-            if opened_resource != record.file_resource_id || opened_link_count != 1 {
-                return Err(graph_text_admission_unavailable(
-                    "exact graph-text resource or link proof changed before read",
-                ));
-            }
-
-            let content_limit = record.description.byte_length();
-            let peak_limit = checked_add_bytes(content_limit, 16 * 1024)?;
-            let (bytes, description, file_resource_id, _, _) =
-                read_projection_optional_bound_capture_with_limits(
-                    parent.final_dir(),
-                    &target.filename,
-                    content_limit,
-                    peak_limit,
-                )?
-                .ok_or_else(|| {
-                    graph_text_admission_unavailable(
-                        "exact graph-text path disappeared during current proof",
-                    )
-                })?;
-            std::str::from_utf8(&bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "exact graph text is not UTF-8")
-            })?;
-            if description != record.description || file_resource_id != record.file_resource_id {
-                return Err(graph_text_admission_unavailable(
-                    "exact graph-text bytes or resource changed during current proof",
-                ));
-            }
-
-            let rebound_parent = self.graph_text_event_parent(&target)?;
-            validate_graph_text_event_parent(&index, &target, &rebound_parent)?;
-            let rebound =
-                open_projection_file_nofollow(rebound_parent.final_dir(), &target.filename)?;
-            let rebound_resource = canonical_projection_file_resource_id(&rebound)?;
-            let rebound_link_count = projection_file_link_count(&rebound)?;
-            if rebound_resource != file_resource_id || rebound_link_count != 1 {
-                return Err(graph_text_admission_unavailable(
-                    "exact graph-text resource or link proof changed after read",
-                ));
-            }
-
-            self.ensure_projection_root_binding()?;
-            let graph_resource = self.canonical_resource_id()?;
-            let scope_binding = self.graph_text_scope_binding()?;
-            if graph_resource != index.graph_resource
-                || scope_binding != index.scope_binding
-                || scope_binding.graph_resource_id() != graph_resource
-            {
-                return Err(graph_text_admission_unavailable(
-                    "graph-text scope or root binding changed after point IO",
-                ));
-            }
-            Ok(GraphTextAdmissionCurrentProof {
-                bytes,
-                description,
-                file_resource_id,
-                link_count: rebound_link_count,
-            })
-        })() {
-            Ok(current) => current,
-            Err(error) => return Err(self.poison_graph_text_admission_error(error)),
-        };
-
-        let generation = index.generation;
-        let feed_sequence = feed.last_sequence;
-        let mut state = self.graph_text_admission.write().unwrap();
-        let unchanged = matches!(
-            &*state,
-            GraphTextAdmissionState::Complete(current_index)
-                if Arc::ptr_eq(current_index, &index)
-                    && Arc::ptr_eq(
-                        &current_index.instance,
-                        &self.graph_text_admission_instance,
-                    )
-                    && current_index.scope_binding == index.scope_binding
-                    && current_index.graph_resource == index.graph_resource
-                    && current_index.generation == generation
-                    && current_index
-                        .feed
-                        .as_ref()
-                        .is_some_and(|current_feed| current_feed.last_sequence == feed_sequence)
-        );
-        if !unchanged {
-            let cause =
-                "graph-text admission authority changed during exact point proof".to_owned();
-            poison_graph_text_admission_state(&mut state, cause.clone());
-            return Err(graph_text_admission_unavailable(&cause));
-        }
-        Ok(GraphTextAdmissionExactObservation::Present(
-            GraphTextAdmissionObservation {
-                epoch: GraphTextAdmissionEpoch {
-                    instance: Arc::clone(&index.instance),
-                    scope_binding: index.scope_binding,
-                    graph_resource: index.graph_resource,
-                    generation,
-                    feed_sequence,
-                },
-                record,
-                current,
-                portable_members: portable_members.iter().cloned().collect(),
-                resource_members: resource_members.iter().cloned().collect(),
-                semantic_members: semantic_members.iter().cloned().collect(),
-            },
-        ))
-    }
-
-    #[cfg(test)]
-    fn apply_graph_text_admission_event(
-        &self,
-        token: &GraphTextAdmissionFeedToken,
-        sequence: u64,
-        event: GraphTextAdmissionExactEvent,
-    ) -> io::Result<()> {
-        let (current, next_generation) = {
-            let mut state = self.graph_text_admission.write().unwrap();
-            if !Arc::ptr_eq(&token.binding.instance, &self.graph_text_admission_instance) {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "foreign graph-text feed token was applied to this Graph instance".to_owned(),
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "graph-text feed token belongs to another Graph instance",
-                ));
-            }
-            let current = match &*state {
-                GraphTextAdmissionState::Complete(index) => Arc::clone(index),
-                GraphTextAdmissionState::Poisoned { cause, .. } => {
-                    return Err(graph_text_admission_unavailable(cause));
-                }
-                GraphTextAdmissionState::Armed(_)
-                | GraphTextAdmissionState::Building {
-                    armed_feed: Some(_),
-                } => {
-                    poison_graph_text_admission_state(
-                        &mut state,
-                        "graph-text feed event raced the initial snapshot".to_owned(),
-                    );
-                    return Err(graph_text_admission_unavailable(
-                        "graph-text feed event raced the initial snapshot",
-                    ));
-                }
-                _ => {
-                    return Err(graph_text_admission_unavailable(
-                        "exact feed event requires an authoritative index",
-                    ));
-                }
-            };
-            let feed = current
-                .feed
-                .as_ref()
-                .expect("Complete indexes always retain an armed feed");
-            let Some(expected_sequence) = feed.last_sequence.checked_add(1) else {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "graph-text feed sequence overflow".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "graph-text feed sequence overflow",
-                ));
-            };
-            if sequence != expected_sequence {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    format!(
-                        "graph-text feed sequence gap: expected {expected_sequence}, received {sequence}"
-                    ),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "graph-text feed sequence gap",
-                ));
-            }
-            let Some(next_generation) = current.generation.checked_add(1) else {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "graph-text admission generation overflow".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "graph-text admission generation overflow",
-                ));
-            };
-            if let GraphTextAdmissionExactEvent::DirectoryChanged { relative } = &event {
-                let cause = match relative {
-                    Some(_) => "exact directory event requires a new bounded snapshot".to_owned(),
-                    None => "unnamed graph-text directory event".to_owned(),
-                };
-                poison_graph_text_admission_state(&mut state, cause.clone());
-                return Err(graph_text_admission_unavailable(&cause));
-            }
-            (current, next_generation)
-        };
-
-        let event_relative = match &event {
-            GraphTextAdmissionExactEvent::FileUpsert { relative }
-            | GraphTextAdmissionExactEvent::FileRemove { relative } => relative,
-            GraphTextAdmissionExactEvent::DirectoryChanged { .. } => unreachable!(),
-        };
-        let event_scratch = match graph_text_event_scratch_upper_bound(event_relative) {
-            Ok(scratch) => scratch,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        if let Err(error) =
-            ensure_graph_text_peak_limit(current.permanent_bytes, event_scratch, current.peak_limit)
-        {
-            self.poison_graph_text_admission(error.to_string());
-            return Err(error);
-        }
-        let prepared = match &event {
-            GraphTextAdmissionExactEvent::FileUpsert { relative } => {
-                match self.prepare_graph_text_file_upsert(&current, relative.clone(), event_scratch)
-                {
-                    Ok(prepared) => (Some(prepared), None),
-                    Err(error) => {
-                        self.poison_graph_text_admission(error.to_string());
-                        return Err(error);
-                    }
-                }
-            }
-            GraphTextAdmissionExactEvent::FileRemove { relative } => {
-                match self.prepare_graph_text_file_remove(&current, relative.clone(), true) {
-                    Ok(prepared) => (None, Some(prepared)),
-                    Err(error) => {
-                        self.poison_graph_text_admission(error.to_string());
-                        return Err(error);
-                    }
-                }
-            }
-            GraphTextAdmissionExactEvent::DirectoryChanged { .. } => unreachable!(),
-        };
-        let prepared_growth = prepared
-            .0
-            .as_ref()
-            .map(|prepared| prepared.retained_growth)
-            .or_else(|| prepared.1.as_ref().map(|prepared| prepared.retained_growth))
-            .unwrap_or(0);
-        let structural_peak = match graph_text_admission_delta_structural_peak(&current) {
-            Ok(peak) => peak,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        let payload_peak = match graph_text_admission_delta_payload_peak(
-            &current,
-            event_relative,
-            prepared.0.as_ref(),
-        ) {
-            Ok(peak) => peak,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        let event_peak = match (|| {
-            checked_add_bytes(
-                checked_add_bytes(
-                    checked_add_bytes(
-                        checked_add_bytes(current.permanent_bytes, prepared_growth)?,
-                        structural_peak,
-                    )?,
-                    payload_peak,
-                )?,
-                event_scratch,
-            )
-        })() {
-            Ok(peak) => peak,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        if event_peak > current.peak_limit {
-            let error = initial_shadow_limit_error("peak build memory");
-            self.poison_graph_text_admission(error.to_string());
-            return Err(error);
-        }
-
-        let mut state = self.graph_text_admission.write().unwrap();
-        let unchanged = matches!(
-            &*state,
-            GraphTextAdmissionState::Complete(index)
-                if Arc::ptr_eq(index, &current)
-                    && Arc::ptr_eq(&index.instance, &self.graph_text_admission_instance)
-                    && index.scope_binding == current.scope_binding
-                    && index.graph_resource == current.graph_resource
-                    && index.generation == current.generation
-                    && index.feed.as_ref().is_some_and(|feed| {
-                        feed.last_sequence
-                            == current.feed.as_ref().map(|feed| feed.last_sequence).unwrap()
-                    })
-        );
-        if !unchanged {
-            let cause =
-                "graph-text admission authority changed during exact event proof".to_owned();
-            poison_graph_text_admission_state(&mut state, cause.clone());
-            return Err(graph_text_admission_unavailable(&cause));
-        }
-        let mut next = (*current).clone(); // O(1): persistent map roots are shared.
-        let update = match (event, prepared.0, prepared.1) {
-            (GraphTextAdmissionExactEvent::FileUpsert { .. }, Some(prepared), None) => {
-                self.apply_prepared_graph_text_file_upsert(&mut next, prepared)
-            }
-            (GraphTextAdmissionExactEvent::FileRemove { .. }, None, Some(prepared)) => {
-                self.apply_prepared_graph_text_file_remove(&mut next, prepared)
-            }
-            (GraphTextAdmissionExactEvent::DirectoryChanged { .. }, _, _) => unreachable!(),
-            _ => unreachable!("upsert events always retain prepared evidence"),
-        };
-        if let Err(error) = update {
-            poison_graph_text_admission_state(&mut state, error.to_string());
-            return Err(error);
-        }
-        next.generation = next_generation;
-        next.feed
-            .as_mut()
-            .expect("Complete indexes always retain an armed feed")
-            .last_sequence = sequence;
-        *state = GraphTextAdmissionState::Complete(Arc::new(next));
-        Ok(())
-    }
-
-    fn preflight_graph_text_exact_feed_batch(
-        &self,
-        index: &CompleteGraphTextAdmissionIndex,
-        batch: &GraphTextExactFeedBatch,
-    ) -> io::Result<u64> {
-        let mut scratch = conservative_vec_capacity_upper_bound::<
-            PreparedGraphTextAdmissionFinalState,
-        >(usize_to_u64(batch.touched_exact_relatives.len())?)?;
-        let mut raw_bytes = 0_u64;
-        let mut parser_peak = 0_u64;
-        let mut worst_permanent_growth = 0_u64;
-        for relative in &batch.touched_exact_relatives {
-            scratch = checked_add_bytes(scratch, graph_text_event_scratch_upper_bound(relative)?)?;
-            let target = self.graph_text_exact_path(relative, false)?;
-            let parent = self.graph_text_event_parent(&target)?;
-            validate_graph_text_event_parent(index, &target, &parent)?;
-            let mut present_len = None;
-            match parent.final_dir().symlink_metadata(&target.filename) {
-                Ok(metadata) if metadata.is_file() => {
-                    present_len = Some(metadata.len());
-                    raw_bytes = checked_add_bytes(raw_bytes, metadata.len())?;
-                    if raw_bytes > MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES {
-                        return Err(initial_shadow_limit_error(
-                            "exact feed batch aggregate raw bytes",
-                        ));
-                    }
-                    if self.graph_text_scope.is_eligible(relative) {
-                        parser_peak = checked_add_bytes(
-                            parser_peak,
-                            managed_page_build_metrics_upper_bound(metadata.len(), metadata.len())?,
-                        )?;
-                    }
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        graph_text_exact_feed_failure_cause(
-                            GraphTextExactFeedFailure::DirectoryMutation,
-                            &format!("touched path is not a regular file: {relative}"),
-                        ),
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            worst_permanent_growth = checked_add_bytes(
-                worst_permanent_growth,
-                self.graph_text_exact_feed_worst_permanent_growth(index, relative, present_len)?,
-            )?;
-        }
-        if checked_add_bytes(index.permanent_bytes, worst_permanent_growth)? > index.permanent_limit
-        {
-            return Err(initial_shadow_limit_error("permanent index memory"));
-        }
-        let live = checked_add_bytes(index.permanent_bytes, scratch)?;
-        ensure_graph_text_peak_limit(
-            live,
-            checked_add_bytes(raw_bytes, parser_peak)?,
-            index.peak_limit,
-        )?;
-        Ok(scratch)
-    }
-
-    fn graph_text_exact_feed_worst_permanent_growth(
-        &self,
-        index: &CompleteGraphTextAdmissionIndex,
-        relative: &str,
-        present_len: Option<u64>,
-    ) -> io::Result<u64> {
-        let eligible_path = self
-            .graph_text_scope
-            .is_eligible(relative)
-            .then(|| ManagedPath::parse(relative.to_owned()))
-            .transpose()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut path_growth =
-            graph_text_admission_upsert_retained_upper_bound(relative, None, None)?;
-        if eligible_path.is_some() {
-            let title_format = graph_text_journal_title_format_budget(self)?;
-            let accepted_semantic_name_bound = checked_add_bytes(present_len.unwrap_or(0), 64)?
-                .max(checked_add_bytes(usize_to_u64(relative.len())?, 64)?)
-                .max(title_format.rendered_bytes)
-                .min(MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES);
-            path_growth = checked_add_bytes(
-                path_growth,
-                graph_text_file_record_worst_case_upper_bound(
-                    self,
-                    usize_to_u64(relative.len())?,
-                    accepted_semantic_name_bound,
-                )?,
-            )?;
-        }
-        if let Some(path) = eligible_path.as_ref() {
-            path_growth = checked_add_bytes(
-                path_growth,
-                graph_text_admission_tombstone_upper_bound(
-                    relative,
-                    index.files_by_exact_path.get(path),
-                )?,
-            )?;
-        }
-        Ok(path_growth)
     }
 
     fn prepare_graph_text_admission_final_state(
@@ -11058,6 +9981,46 @@ impl Graph {
         )
     }
 
+    fn graph_text_exact_feed_worst_permanent_growth(
+        &self,
+        index: &CompleteGraphTextAdmissionIndex,
+        relative: &str,
+        present_len: Option<u64>,
+    ) -> io::Result<u64> {
+        let eligible_path = self
+            .graph_text_scope
+            .is_eligible(relative)
+            .then(|| ManagedPath::parse(relative.to_owned()))
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let mut path_growth =
+            graph_text_admission_upsert_retained_upper_bound(relative, None, None)?;
+        if eligible_path.is_some() {
+            let title_format = graph_text_journal_title_format_budget(self)?;
+            let accepted_semantic_name_bound = checked_add_bytes(present_len.unwrap_or(0), 64)?
+                .max(checked_add_bytes(usize_to_u64(relative.len())?, 64)?)
+                .max(title_format.rendered_bytes)
+                .min(MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES);
+            path_growth = checked_add_bytes(
+                path_growth,
+                graph_text_file_record_worst_case_upper_bound(
+                    self,
+                    usize_to_u64(relative.len())?,
+                    accepted_semantic_name_bound,
+                )?,
+            )?;
+        }
+        if let Some(path) = eligible_path.as_ref() {
+            path_growth = checked_add_bytes(
+                path_growth,
+                graph_text_admission_tombstone_upper_bound(
+                    relative,
+                    index.files_by_exact_path.get(path),
+                )?,
+            )?;
+        }
+        Ok(path_growth)
+    }
     fn prepare_graph_text_file_upsert_with_batch_charges(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
@@ -11173,22 +10136,13 @@ impl Graph {
                         format!("graph text is not UTF-8: {path}"),
                     )
                 })?;
-                if let Some(charges) = actual_charges.as_deref_mut() {
-                    charges.reserve_parser(
-                        index,
-                        event_scratch,
-                        managed_page_build_upper_bound(content)?,
-                    )?;
+                let permit = graph_text_parse_budget_permit(self, &path, content)?;
+                let (semantic, format, node_count) =
+                    self.decode_present_graph_text_with_node_count(&path, &bytes, permit)?;
+                if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+                    return Err(initial_shadow_limit_error("parser node count"));
                 }
-                let parser_live = checked_add_bytes(live_bytes, usize_to_u64(bytes.capacity())?)?;
-                let permit = graph_text_parse_budget_permit(
-                    self,
-                    &path,
-                    content,
-                    parser_live,
-                    index.peak_limit,
-                )?;
-                self.decode_present_graph_text(&path, &bytes, permit)?
+                (semantic, format)
             } else {
                 (
                     self.managed_entry_for_managed_path(&path)
@@ -11532,42 +10486,11 @@ impl Graph {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn disconnect_graph_text_admission_feed(
-        &self,
-        token: &GraphTextAdmissionFeedToken,
-    ) -> io::Result<()> {
-        let mut state = self.graph_text_admission.write().unwrap();
-        if !Arc::ptr_eq(&token.binding.instance, &self.graph_text_admission_instance) {
-            poison_graph_text_admission_state(
-                &mut state,
-                "foreign graph-text feed token disconnected this Graph instance".to_owned(),
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "graph-text feed token belongs to another Graph instance",
-            ));
-        }
-        token.terminal.store(true, Ordering::Release);
-        poison_graph_text_admission_state(&mut state, "graph-text feed disconnected".to_owned());
-        Ok(())
-    }
-
     fn poison_graph_text_admission_error(&self, error: io::Error) -> io::Error {
         let cause = error.to_string();
         let mut state = self.graph_text_admission.write().unwrap();
         poison_graph_text_admission_state(&mut state, cause);
         error
-    }
-
-    #[cfg(test)]
-    fn set_graph_text_admission_generation_for_test(&self, generation: u64) {
-        let mut state = self.graph_text_admission.write().unwrap();
-        if let GraphTextAdmissionState::Complete(index) = &*state {
-            let mut changed = (**index).clone();
-            changed.generation = generation;
-            *state = GraphTextAdmissionState::Complete(Arc::new(changed));
-        }
     }
 
     fn ensure_projection_root_binding(&self) -> io::Result<()> {
@@ -11601,10 +10524,8 @@ impl Graph {
         let graph = Graph::open(root);
         let entries = pages.iter().map(|(entry, _)| entry.clone()).collect();
         let index = build_page_cache_index(&pages);
-        let reference_index = ReferenceCandidateIndex::build(0, &pages).ok();
         *graph.cache.write().unwrap() = Some(Arc::new(pages));
         *graph.cache_index.write().unwrap() = Some(index);
-        *graph.reference_candidate_index.write().unwrap() = reference_index;
         *graph.page_list_cache.write().unwrap() = Some((0, entries));
         graph
     }
@@ -11910,7 +10831,7 @@ impl Graph {
                 Ok(()) => {}
                 Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
                     current.create_dir(component)?;
-                    sync_projection_directory_required(current)?;
+                    sync_reconstructible_projection_directory(current)?;
                     projection_parent_after_sync_hook()?;
                 }
                 Err(error) => return Err(error),
@@ -12111,6 +11032,21 @@ impl Graph {
         self.config.preferred_format
     }
 
+    pub(crate) fn rewrite_page_refs_for_names(
+        &self,
+        raw: &str,
+        renames: &std::collections::HashMap<String, String>,
+        is_org: bool,
+    ) -> String {
+        let inline = crate::refs::rename_refs_multi_with_format(
+            raw,
+            renames,
+            is_org,
+            self.config.file_name_format,
+        );
+        crate::refs::rename_tags_property_multi(&inline, renames, is_org)
+    }
+
     /// List all pages and journals in the graph.
     pub fn list_pages(&self) -> Vec<PageEntry> {
         let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
@@ -12178,9 +11114,10 @@ impl Graph {
     /// that "exist" by reference even without a file of their own (OG semantics),
     /// so autocomplete/quick-switch can offer them instead of "Create …".
     ///
-    /// Computed from the whole-graph cache and memoized by `cache_gen`. If the
-    /// cache isn't warm yet it returns empty and memoizes nothing — we never force
-    /// a full-graph parse from here (this runs on autocomplete keystrokes).
+    /// Read from the disposable SQLite fact projection at the exact current
+    /// cache generation. If that projection is unavailable or stale, the
+    /// already-parsed whole-graph cache is the correctness fallback; this never
+    /// forces a full-graph parse (it runs on autocomplete keystrokes).
     pub fn referenced_page_names(&self) -> Vec<String> {
         self.referenced_page_names_versioned(None)
             .names
@@ -12203,61 +11140,31 @@ impl Graph {
     /// changes. It carries the count as well, so adding a name that collides with
     /// a removed one still shows up unless the count also matches.
     pub fn referenced_page_names_versioned(&self, known: Option<u64>) -> ReferencedPageNames {
-        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        if let Some((g, names, digest)) = self.referenced_names_cache.read().unwrap().as_ref() {
-            if *g == gen {
-                return ReferencedPageNames::answer(*digest, names, known);
-            }
+        if let Some(names) = self.direct_projection_referenced_page_names() {
+            let digest = referenced_names_digest(&names);
+            return ReferencedPageNames::answer(digest, &names, known);
         }
-        let names = self.rebuild_referenced_page_names(gen);
+        let names = self.rebuild_referenced_page_names();
         let digest = referenced_names_digest(&names);
         ReferencedPageNames::answer(digest, &names, known)
     }
 
-    fn rebuild_referenced_page_names(&self, gen: u64) -> Vec<String> {
+    fn rebuild_referenced_page_names(&self) -> Vec<String> {
         let guard = self.cache.read().unwrap();
         let Some(pages) = guard.as_ref() else {
-            return Vec::new(); // cache not warm — don't force a parse, don't memoize
+            return Vec::new(); // cache not warm — don't force a parse
         };
         fn add(seen: &mut std::collections::HashMap<String, String>, name: String) {
             if !name.is_empty() {
                 seen.entry(crate::refs::page_key(&name)).or_insert(name);
             }
         }
-        // `tags::` / `alias::` property values are page references in OG too —
-        // comma-separated, written bare or as `[[..]]`/`#..` — so a page named
-        // only in a `tags::`/`alias::` list still "exists". Strip any wrapping
-        // down to the page name. (Line-based, like DocBlock::property.)
-        fn add_property_refs(seen: &mut std::collections::HashMap<String, String>, text: &str) {
-            for line in text.lines() {
-                let Some((k, v)) = crate::doc::parse_property_line(line) else {
-                    continue;
-                };
-                if !(k.eq_ignore_ascii_case("tags")
-                    || k.eq_ignore_ascii_case("alias")
-                    || k.eq_ignore_ascii_case("aliases"))
-                {
-                    continue;
-                }
-                let quoted = v.trim();
-                if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
-                    continue;
-                }
-                for val in v.split([',', '，']) {
-                    let t = val.trim();
-                    let t = t.strip_prefix('#').unwrap_or(t).trim();
-                    let t = t
-                        .strip_prefix("[[")
-                        .and_then(|x| x.strip_suffix("]]"))
-                        .unwrap_or(t);
-                    add(seen, t.trim().to_string());
-                }
-            }
-        }
         let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (_, doc) in pages.iter() {
             if let Some(pre) = &doc.pre_block {
-                add_property_refs(&mut seen, pre); // page-level tags::/alias::
+                for name in crate::doc::property_reference_page_names(pre) {
+                    add(&mut seen, name);
+                }
             }
             let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
                 std::array::from_fn(|_| None);
@@ -12280,12 +11187,14 @@ impl Graph {
                 for name in &block.projection().refs_page {
                     add(&mut seen, name.clone());
                 }
-                add_property_refs(&mut seen, &block.raw);
+                for name in crate::doc::property_reference_page_names(&block.raw) {
+                    add(&mut seen, name);
+                }
                 if !block.children.is_empty() {
                     if len == MAX_MANAGED_BLOCK_DEPTH {
                         // Cache documents normally pass the checked parser/admission
                         // boundary. Contain any forged or stale over-depth value:
-                        // publish neither a partial result nor a memoized generation.
+                        // publish no partial result.
                         return Vec::new();
                     }
                     frames[len] = Some(block.children.iter());
@@ -12293,19 +11202,17 @@ impl Graph {
                 }
             }
         }
-        drop(guard);
-        let names: Vec<String> = seen.into_values().collect();
-        let digest = referenced_names_digest(&names);
-        *self.referenced_names_cache.write().unwrap() = Some((gen, names.clone(), digest));
-        names
+        seen.into_values().collect()
     }
 
     /// Journals sorted newest-first.
     pub fn journals_desc(&self) -> Vec<PageEntry> {
         // Prefer the warmed whole-graph cache — its PageEntry list is kept current
-        // by cache_upsert/cache_remove, so we avoid a directory read + parse on
-        // every infinite-scroll feed append. Fall back to scanning the dir while
-        // the cache isn't built yet.
+        // by cache_upsert/cache_remove. Before warm completes, enumerate only
+        // metadata and filenames, then parse the handful of feed rows selected by
+        // journal_feed_page. Calling list_pages here used to read and parse every
+        // non-journal page on the foreground first-content path, immediately
+        // before background warm repeated that graph-sized work.
         let raw: Vec<PageEntry> = match self.cache.read().unwrap().as_ref() {
             Some(pages) => pages
                 .iter()
@@ -12313,7 +11220,9 @@ impl Graph {
                 .map(|(e, _)| e.clone())
                 .collect(),
             None => self
-                .list_pages()
+                .admit_retained_managed_text_writer()
+                .and_then(|permit| self.graph_text_entries(&permit))
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
                 .collect(),
@@ -12360,20 +11269,31 @@ impl Graph {
     /// empty. Rename such files to their stem — but only when the stem file
     /// doesn't already exist (never clobber/merge). Returns how many were fixed.
     pub fn has_journal_filename_migrations(&self) -> bool {
+        !self.journal_filename_migrations().is_empty()
+    }
+
+    /// The pending renames, for the user to review and authorize. Same
+    /// selection `migrate_journal_filenames_checked` acts on: a file whose stem
+    /// parses as a journal date but is not the graph's filename format, and
+    /// whose target name is free (the migration never clobbers).
+    pub fn journal_filename_migrations(&self) -> Vec<JournalFilenameMigration> {
         let dir = self.journals_path();
         let Ok(rd) = fs::read_dir(&dir) else {
-            return false;
+            return Vec::new();
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            if self
-                .journal_filename_migration_target(&p)
-                .is_some_and(|target| !target.exists())
-            {
-                return true;
-            }
-        }
-        false
+        let mut out: Vec<JournalFilenameMigration> = rd
+            .flatten()
+            .filter_map(|entry| {
+                let from = entry.path();
+                let target = self.journal_filename_migration_target(&from)?;
+                (!target.exists()).then(|| JournalFilenameMigration {
+                    from: self.rel_path(&from),
+                    to: self.rel_path(&target),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.from.cmp(&b.from));
+        out
     }
 
     fn journal_filename_migration_target(&self, p: &std::path::Path) -> Option<PathBuf> {
@@ -12568,6 +11488,513 @@ impl Graph {
         out
     }
 
+    /// Pages whose on-disk content carries unresolved VCS merge-conflict markers
+    /// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). These are REAL
+    /// pages — indexed, readable — but quarantined from saves (the serializer
+    /// refuses to rewrite them; see `serialize_page_document`). Surfaced beside
+    /// [`Graph::list_sync_conflicts`] for the conflicts panel. Sync-tool
+    /// conflict copies are excluded here — they have their own listing.
+    pub fn list_vcs_marker_conflicts(&self) -> Vec<VcsMarkerConflict> {
+        let mut out = Vec::new();
+        for (dir, kind) in [
+            (self.journals_path(), PageKind::Journal),
+            (self.pages_path(), PageKind::Page),
+        ] {
+            walk_page_files(&dir, |p| {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    return;
+                };
+                if is_sync_conflict(stem) {
+                    return;
+                }
+                let Ok(content) = fs::read_to_string(&p) else {
+                    return;
+                };
+                let markers = doc::vcs_conflict_markers(&content);
+                if markers.is_empty() {
+                    return;
+                }
+                let name = match kind {
+                    PageKind::Journal => self
+                        .journal_format
+                        .parse(stem)
+                        .map(|d| self.journal_format.title(d))
+                        .unwrap_or_else(|| stem.to_string()),
+                    PageKind::Page => decode_page_name(stem, self.config.file_name_format),
+                };
+                out.push(VcsMarkerConflict {
+                    path: self.rel_path(&p),
+                    name,
+                    kind,
+                    markers: markers.iter().map(|marker| marker.to_string()).collect(),
+                });
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Whether `path` is inside its one authorized marker-resolution write.
+    fn is_resolving_markers(&self, path: &Path) -> bool {
+        self.marker_resolutions
+            .lock()
+            .map(|set| set.contains(path))
+            .unwrap_or(false)
+    }
+
+    /// Authorize exactly one marker-resolution write to `path`, for the lifetime
+    /// of the returned guard. Held only across the guarded write, under the
+    /// page lock.
+    fn authorize_marker_resolution(&self, path: &Path) -> MarkerResolutionGuard<'_> {
+        if let Ok(mut set) = self.marker_resolutions.lock() {
+            set.insert(path.to_path_buf());
+        }
+        MarkerResolutionGuard {
+            graph: self,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// The Concord conflict queue (L3): ONE derived inventory of everything on
+    /// disk that needs the user's judgement, from both artifact sources.
+    ///
+    /// Derived, never stored — no new metadata goes into the graph (invariant 1)
+    /// and no cache is consulted, so the queue survives a restart trivially: the
+    /// same on-disk state recomputes the same objects with the same ids. Block
+    /// counts are computed here because conflicts are few (a handful at most) and
+    /// each costs one parse of two small texts; the two directory walks the
+    /// sources already do dominate.
+    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+        use crate::concord_queue::{
+            decidable_row_count, ConflictObject, ConflictSide, ConflictSource, SideRole,
+        };
+        let mut out = Vec::new();
+        for copy in self.list_sync_conflicts() {
+            let Some(winner) = copy.base_path.clone() else {
+                // The page it shadowed is gone — it is a stray, not a two-sided
+                // conflict; the Settings panel offers to discard it. Nothing to
+                // resolve in place, so it stays out of the queue.
+                continue;
+            };
+            let diff = self.sync_conflict_diff(&winner, &copy.path).ok().flatten();
+            let mut sides = vec![
+                ConflictSide {
+                    role: SideRole::Mine,
+                    label: "This device".to_string(),
+                    path: Some(winner.clone()),
+                },
+                ConflictSide {
+                    role: SideRole::Theirs,
+                    label: if copy.tag.is_empty() {
+                        "Conflict copy".to_string()
+                    } else {
+                        copy.tag.clone()
+                    },
+                    path: Some(copy.path.clone()),
+                },
+            ];
+            if diff.as_ref().is_some_and(|d| d.three_way) {
+                sides.push(ConflictSide {
+                    role: SideRole::Base,
+                    label: "Last agreed version".to_string(),
+                    path: None,
+                });
+            }
+            out.push(ConflictObject {
+                id: format!("copy:{}", copy.path),
+                source: ConflictSource::SyncCopy,
+                page_name: copy.base_name.clone(),
+                page_path: winner,
+                kind: copy.kind,
+                sides,
+                block_conflicts: diff.as_ref().map(|d| decidable_row_count(&d.rows)),
+                markers: Vec::new(),
+            });
+        }
+        for marked in self.list_vcs_marker_conflicts() {
+            let parsed = self.vcs_marker_conflict_diff(&marked.path).ok().flatten();
+            let label = |pick: fn(&crate::concord_queue::MarkerConflictDiff) -> &str,
+                         fallback: &str| {
+                parsed
+                    .as_ref()
+                    .map(pick)
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or(fallback)
+                    .to_string()
+            };
+            let mut sides = vec![
+                ConflictSide {
+                    role: SideRole::Mine,
+                    label: label(|p| p.mine_label.as_str(), "Local side"),
+                    path: None,
+                },
+                ConflictSide {
+                    role: SideRole::Theirs,
+                    label: label(|p| p.theirs_label.as_str(), "Merged-in side"),
+                    path: None,
+                },
+            ];
+            if parsed.as_ref().is_some_and(|p| p.diff.three_way) {
+                sides.push(ConflictSide {
+                    role: SideRole::Base,
+                    label: "Common ancestor".to_string(),
+                    path: None,
+                });
+            }
+            out.push(ConflictObject {
+                id: format!("markers:{}", marked.path),
+                source: ConflictSource::VcsMarkers,
+                page_name: marked.name.clone(),
+                page_path: marked.path.clone(),
+                kind: marked.kind,
+                sides,
+                block_conflicts: parsed.as_ref().map(|p| decidable_row_count(&p.diff.rows)),
+                markers: marked.markers.clone(),
+            });
+        }
+        out.sort_by(|a, b| a.page_name.cmp(&b.page_name).then_with(|| a.id.cmp(&b.id)));
+        out
+    }
+
+    /// Block-level diff of a marker-bearing page's own two (or three) sides —
+    /// Concord L5 completion. The marker sections are parsed into COMPLETE page
+    /// texts (`concord_queue::parse_vcs_marker_sides`) and run through the very
+    /// same `sync_diff` machinery the conflict-copy path uses, so the in-page
+    /// resolution UI is one renderer, not two.
+    ///
+    /// Read-only. Both staleness tokens are the rev of the whole marker file, so
+    /// [`Graph::resolve_vcs_marker_conflict`]'s guard rejects decisions made
+    /// against a version the VCS has since changed. `Ok(None)` if the path is
+    /// invalid, gone, or not conflicted.
+    pub fn vcs_marker_conflict_diff(
+        &self,
+        rel: &str,
+    ) -> io::Result<Option<crate::concord_queue::MarkerConflictDiff>> {
+        let path = ManagedPath::parse(rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(bytes) = self.read_projection_input(&path)? else {
+            return Ok(None);
+        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(sides) = crate::concord_queue::parse_vcs_marker_sides(&content) else {
+            return Ok(None);
+        };
+        let org = matches!(Format::from_path(&self.root.join(rel)), Format::Org);
+        let mut diff = match sides.base.as_deref() {
+            Some(base) => crate::sync_diff::diff3_texts(base, &sides.mine, &sides.theirs, org),
+            None => crate::sync_diff::diff_texts(&sides.mine, &sides.theirs, org),
+        };
+        // Both revs address the ONE file the decisions will be applied to.
+        let rev = content_rev(&content);
+        diff.base_rev = rev.clone();
+        diff.conflict_rev = rev;
+        Ok(Some(crate::concord_queue::MarkerConflictDiff {
+            mine_label: sides.mine_label,
+            theirs_label: sides.theirs_label,
+            regions: sides.regions,
+            diff,
+        }))
+    }
+
+    /// Apply the user's per-row decisions to a marker-bearing page and write the
+    /// CLEAN merged result — the one write Concord invariant 3 permits to such a
+    /// file, and only as the direct consequence of the resolution the user just
+    /// confirmed in the in-page resolver.
+    ///
+    /// Same guards as [`Graph::resolve_sync_conflict`]: managed-write admission,
+    /// page lock, `base_rev` staleness guard (here against the whole marker
+    /// file), org round-trip firewall. The merge itself is
+    /// `sync_diff::merge_blocks` over the SAME alignment the diff published, so a
+    /// row id means the same block to both. Once this succeeds the file no longer
+    /// carries markers, so the save refusal lifts naturally — nothing else has to
+    /// be told about it.
+    pub fn resolve_vcs_marker_conflict(
+        &self,
+        rel: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        base_rev: &str,
+        pre_choice: &str,
+    ) -> io::Result<()> {
+        let write = self.admit_managed_text_writer()?;
+        let path = self
+            .resolve_managed_rel(&write, rel)?
+            .ok_or_else(bad_path)?;
+        let entry = self.entry_for_path(&path).ok_or_else(bad_path)?;
+        let lock = self.page_lock(&path);
+        let _guard = lock.lock().unwrap();
+        let content = self.managed_read_to_string(&write, &path)?;
+        if content_rev(&content) != base_rev {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file changed on disk",
+            ));
+        }
+        let Some(sides) = crate::concord_queue::parse_vcs_marker_sides(&content) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no VCS merge conflict markers to resolve",
+            ));
+        };
+        // Org round-trip firewall: refuse rather than risk corrupting an .org
+        // page whose sides don't survive a parse/serialize round trip.
+        if Format::from_path(&path) == Format::Org
+            && (!crate::org::org_editable(&sides.mine) || !crate::org::org_editable(&sides.theirs))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an org side of this merge does not round-trip; not resolving",
+            ));
+        }
+        let mine_doc = parse_doc(&path, &sides.mine);
+        let theirs_doc = parse_doc(&path, &sides.theirs);
+        let merged_roots =
+            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        let pre_block = match pre_choice {
+            "theirs" => theirs_doc.pre_block.clone(),
+            "mine" => mine_doc.pre_block.clone(),
+            _ if Format::from_path(&path) == Format::Md => union_pre(
+                mine_doc.pre_block.as_deref(),
+                theirs_doc.pre_block.as_deref(),
+            ),
+            _ => mine_doc.pre_block.clone(),
+        };
+        let mut merged = Document {
+            pre_block,
+            roots: merged_roots,
+        };
+        assign_doc_runtime_ids(&mut merged.roots, &entry.rel_path);
+        let dto = page_dto_checked(&entry, &merged)?;
+        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let authorized = self.authorize_marker_resolution(&path);
+        let result = self.write_page(
+            &write,
+            &dto,
+            &path,
+            Some(&content),
+            true,
+            None,
+            None,
+            None,
+            cacheable,
+        );
+        drop(authorized);
+        result.map(|_| ())
+    }
+
+    /// Capture an exact, still-live save-conflict presentation without
+    /// consuming its one-shot write authority.
+    fn live_save_conflict_parts(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<(PathBuf, Option<String>, Option<String>)> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let activation = page.activation.map(EditorActivation::from_u64);
+        let episode = ConflictEditorEpisode {
+            loaded_revision: base_rev.map(str::to_owned),
+            activation,
+        };
+        let authority = {
+            let state = self.conflict_authority.lock().unwrap();
+            let authority = state.tokens.get(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "live conflict authority is missing or already consumed",
+                )
+            })?;
+            if authority.observation_epoch != presented.observation_epoch
+                || authority.editor_episode != episode
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "live conflict authority no longer describes this editor",
+                ));
+            }
+            authority.clone()
+        };
+        let base = activation
+            .and_then(|activation| self.editor_activation_baseline(&path, activation, base_rev));
+        Ok((path, authority.bytes, base))
+    }
+
+    /// Block-level three-way presentation for a retained editor draft whose
+    /// ordinary Direct Files save was refused. The disk side comes from the
+    /// exact unconsumed authority token; the base comes from the matching live
+    /// editor activation and is not advanced by watcher/cache admission.
+    pub fn live_save_conflict_diff(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
+        let (path, theirs_text, base_text) =
+            self.live_save_conflict_parts(page, base_rev, presented)?;
+        let mine = page_dto_document(page)?;
+        let theirs = theirs_text
+            .as_deref()
+            .map(|text| parse_doc(&path, text))
+            .unwrap_or(Document {
+                pre_block: None,
+                roots: Vec::new(),
+            });
+        Ok(match base_text {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, &base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        })
+    }
+
+    /// Capture the complete restart-recoverable presentation while the original
+    /// one-shot editor authority is still live. This inspects but does not
+    /// consume that authority.
+    pub fn capture_live_save_conflict(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<LiveSaveConflictCapture> {
+        let (path, theirs_text, base_text) =
+            self.live_save_conflict_parts(page, base_rev, presented)?;
+        let theirs_text = theirs_text.unwrap_or_default();
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let mut diff = match base_text.as_deref() {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
+        diff.base_rev = base_rev.unwrap_or_default().to_owned();
+        diff.conflict_rev = content_rev(&theirs_text);
+        Ok(LiveSaveConflictCapture {
+            disk_rev: diff.conflict_rev.clone(),
+            diff,
+            base_text,
+        })
+    }
+
+    /// Recompute a durable live-conflict review against the disk as it exists
+    /// now. This is read-only and deliberately needs no process-local editor
+    /// activation: the draft and its exact base came from a prior capture.
+    pub fn durable_live_save_conflict_diff(
+        &self,
+        page: &PageDto,
+        base_text: Option<&str>,
+    ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let theirs_text = self.managed_read_to_string(&write, &path)?;
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let mut diff = match base_text {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
+        diff.base_rev = page.rev.clone().unwrap_or_default();
+        diff.conflict_rev = content_rev(&theirs_text);
+        Ok(diff)
+    }
+
+    /// Resolve an app-private live-conflict capsule. The expected disk revision
+    /// is durable authority: it is checked under the same page lock immediately
+    /// before the normal Direct Files writer commits. A later external write
+    /// therefore refuses and forces a fresh review.
+    pub fn resolve_durable_live_save_conflict(
+        &self,
+        page: &PageDto,
+        expected_disk_rev: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let lock = self.page_lock(&path);
+        let _guard = lock.lock().unwrap();
+        let theirs_text = self.managed_read_to_string(&write, &path)?;
+        if content_rev(&theirs_text) != expected_disk_rev {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "live conflict changed on disk",
+            ));
+        }
+        if Format::from_path(&path) == Format::Org && !crate::org::org_editable(&theirs_text) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the org file does not round-trip; not merging",
+            ));
+        }
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let pre_block = match pre_choice {
+            "theirs" => theirs.pre_block.clone(),
+            "mine" => mine.pre_block.clone(),
+            _ if page.format == Format::Md => {
+                union_pre(mine.pre_block.as_deref(), theirs.pre_block.as_deref())
+            }
+            _ => mine.pre_block.clone(),
+        };
+        let mut resolved = existing_document_page_dto(
+            page,
+            Document {
+                pre_block,
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+            },
+        )?;
+        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let rev = self.write_page(
+            &write,
+            &resolved,
+            &path,
+            Some(&theirs_text),
+            true,
+            None,
+            None,
+            None,
+            cacheable,
+        )?;
+        resolved.rev = Some(rev);
+        Ok(resolved)
+    }
+
+    /// Apply block decisions for a live Direct Files save conflict through the
+    /// same one-shot authority consumed by `Keep mine`. No second overwrite
+    /// protocol is invented: this only builds a resolved DTO, then delegates to
+    /// the existing exact guarded force-save path.
+    pub fn resolve_live_save_conflict(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+        decisions: &std::collections::HashMap<String, String>,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        let (path, theirs_text, _) = self.live_save_conflict_parts(page, base_rev, presented)?;
+        let mine = page_dto_document(page)?;
+        let theirs = theirs_text
+            .as_deref()
+            .map(|text| parse_doc(&path, text))
+            .unwrap_or(Document {
+                pre_block: None,
+                roots: Vec::new(),
+            });
+        let pre_block = match pre_choice {
+            "theirs" => theirs.pre_block.clone(),
+            "mine" => mine.pre_block.clone(),
+            _ if page.format == Format::Md => {
+                union_pre(mine.pre_block.as_deref(), theirs.pre_block.as_deref())
+            }
+            _ => mine.pre_block.clone(),
+        };
+        let mut resolved = existing_document_page_dto(
+            page,
+            Document {
+                pre_block,
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+            },
+        )?;
+        let rev = self.force_save_page_at_revision(&resolved, base_rev, presented)?;
+        resolved.rev = Some(rev);
+        Ok(resolved)
+    }
+
     /// Structural block-level diff of a conflict copy against its winner (both
     /// graph-root-relative paths). Loads each file directly by path — the conflict
     /// copy is deliberately not in the page cache — and aligns the two block trees
@@ -12591,7 +12018,25 @@ impl Graph {
         let conf = self.root.join(conflict_rel);
         let mine = parse_doc(&win, &win_c);
         let theirs = parse_doc(&conf, &conf_c);
-        let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
+        // Concord ledger (ADR 0056): with a usable base — the last text Tine
+        // agreed on with the disk — upgrade to a 3-way diff whose rows carry
+        // per-row suggestions the UI pre-selects (never auto-applies). A base
+        // identical to the winner is almost always the admission artifact (the
+        // winner's post-sync bytes were admitted and became the ledger entry
+        // before this diff ran), and 3-way against it would blanket-suggest
+        // "theirs"; skip it and fall back to the plain 2-way diff.
+        let base_c = self
+            .concord_ledger
+            .get()
+            .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
+            .filter(|base| base != &win_c);
+        let mut diff = match base_c {
+            Some(base_c) => {
+                let base = parse_doc(&win, &base_c);
+                crate::sync_diff::diff3_docs(&base, &mine, &theirs)
+            }
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
         Ok(Some(diff))
@@ -12713,7 +12158,7 @@ impl Graph {
         base_rev: &str,
         conflict_rev: &str,
         pre_choice: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
         let win = self
             .resolve_managed_rel(&write, winner_rel)?
@@ -12773,7 +12218,8 @@ impl Graph {
             roots: merged_roots,
         };
         assign_doc_runtime_ids(&mut merged.roots, &win_entry.rel_path);
-        let dto = page_dto_checked(&win_entry, &merged)?;
+        let mut dto = page_dto_checked(&win_entry, &merged)?;
+        dto.path = win_entry.rel_path.clone();
         let win_cacheable = self.managed_path_is_cacheable(&write, &win)?;
         // Stage-before-commit (L5): move the conflict copy out first, then write the
         // merged winner; roll the move back if the write fails.
@@ -12789,7 +12235,7 @@ impl Graph {
                 "conflict copy changed during merge",
             ));
         }
-        if let Err(e) = self.write_page(
+        let rev = match self.write_page(
             &write,
             &dto,
             &win,
@@ -12800,11 +12246,20 @@ impl Graph {
             None,
             win_cacheable,
         ) {
-            let _ = managed_write_during_rollback_hook();
-            let _ = self.managed_move_noreplace(&write, &staged, &conf);
-            return Err(e);
+            Ok(rev) => rev,
+            Err(error) => {
+                let _ = managed_write_during_rollback_hook();
+                let _ = self.managed_move_noreplace(&write, &staged, &conf);
+                return Err(error);
+            }
+        };
+        // The conflict copy is resolved and trashed — its pinned base (if any)
+        // has served its purpose; let the ledger forget it (best-effort).
+        if let Some(ledger) = self.concord_ledger.get() {
+            ledger.drop_pin(conflict_rel);
         }
-        Ok(())
+        dto.rev = Some(rev);
+        Ok(dto)
     }
 
     /// Move a sync-conflict copy to the recoverable trash WITHOUT merging (the
@@ -12817,6 +12272,12 @@ impl Graph {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such conflict file"))?;
         self.stage_sync_conflict_trash(conflict_rel, content.as_bytes())
             .map(|_| ())
+            .inspect(|()| {
+                // Discarded without merging — drop the copy's pinned base too.
+                if let Some(ledger) = self.concord_ledger.get() {
+                    ledger.drop_pin(conflict_rel);
+                }
+            })
     }
 
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
@@ -12986,6 +12447,24 @@ impl Graph {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Logseq-compatible title collision: merge the old page into the existing
+    /// destination, then rewrite old-name references (and rename old/* namespace
+    /// descendants) exactly as an ordinary rename does. The merge is committed
+    /// first so an interruption can never delete or overwrite user content; its
+    /// source remains recoverable in typed trash. A later reference-rewrite error
+    /// is reported rather than hidden, and retrying `rename_page_expected` is safe
+    /// because the source file has already left the live graph.
+    pub fn merge_pages_after_rename(
+        &self,
+        src_rel: &str,
+        dst_rel: &str,
+        old: &str,
+        new: &str,
+    ) -> io::Result<()> {
+        self.merge_pages(src_rel, dst_rel)?;
+        self.rename_page_expected(old, new, None)
     }
 
     /// Turn a stray file into a normal, uniquely-named page by moving it to
@@ -13423,24 +12902,19 @@ impl Graph {
     }
 
     pub(crate) fn page_aliases_with_owners(&self) -> Vec<(String, String, String)> {
-        if let Some(a) = self.alias_cache.read().unwrap().as_ref() {
-            return a.clone();
+        if let Some(aliases) = self.direct_projection_page_aliases_with_owners() {
+            return aliases;
         }
-        let aliases = crate::query::page_aliases_with_owners(self);
-        *self.alias_cache.write().unwrap() = Some(aliases.clone());
-        aliases
+        crate::query::page_aliases_with_owners(self)
     }
 
-    /// The page that owns a block uuid / `id::`, via a `cache_gen`-keyed index, or
-    /// `None` if unknown. A hint only — callers must verify (the index can lag a
-    /// concurrent edit). O(graph) to (re)build once per cache change, then O(1).
+    /// The page that owns a block UUID / UUID-valued `id::`, selected from the
+    /// exact-generation disposable SQLite projection. A hint only: callers
+    /// still verify parser evidence, and unsupported/stale projection state
+    /// falls back to an exact parser scan.
     pub fn block_page_hint(&self, uuid: &str) -> Option<String> {
-        use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        if let Some((idx_gen, map)) = self.block_index.read().unwrap().as_ref() {
-            if *idx_gen == gen {
-                return map.get(uuid).cloned();
-            }
+        if let Some(hint) = self.direct_projection_block_page_hint(uuid) {
+            return hint;
         }
         fn walk_idx(
             blocks: &[DocBlock],
@@ -13466,9 +12940,7 @@ impl Graph {
             }
             m
         });
-        let result = map.get(uuid).cloned();
-        *self.block_index.write().unwrap() = Some((gen, map));
-        result
+        map.get(uuid).cloned()
     }
 
     /// Resolve a bounded set of physical cached pages that could contain one of
@@ -13479,121 +12951,13 @@ impl Graph {
         names_norm: &[String],
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        // Force the ordinary single-flight cache build. `install_built` publishes
-        // the matching reference index alongside the parsed snapshot.
-        self.with_pages(|_| ());
-        for _ in 0..2 {
-            let (snapshot, generation) = {
-                let guard = self.cache.read().unwrap();
-                let snapshot = guard.as_ref().map(Arc::clone).unwrap();
-                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-                (snapshot, generation)
+        if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
+            let full_page_count = self.with_pages(|all| all.len());
+            return ReferenceCandidatePages {
+                pages,
+                indexed: true,
+                full_page_count,
             };
-            let full_page_count = snapshot.len();
-            let selected_paths = {
-                let guard = self.reference_candidate_index.read().unwrap();
-                let Some(index) = guard.as_ref().filter(|index| {
-                    index.complete
-                        && index.generation == generation
-                        && index.pages.len() == full_page_count
-                }) else {
-                    if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    return ReferenceCandidatePages {
-                        pages: snapshot.iter().cloned().collect(),
-                        indexed: false,
-                        full_page_count,
-                    };
-                };
-                match kind {
-                    ReferenceKind::Explicit => {
-                        let mut paths = std::collections::BTreeSet::new();
-                        for name in names_norm {
-                            if let Some(postings) = index.explicit.get(name) {
-                                paths.extend(postings.iter().cloned());
-                            }
-                        }
-                        Some(paths)
-                    }
-                    ReferenceKind::Plain => {
-                        let mut paths = std::collections::BTreeSet::new();
-                        let mut safe = true;
-                        for (path, projection) in &index.pages {
-                            let mut any_name = false;
-                            for name in names_norm {
-                                let Some(maybe) = projection.signature.may_contain_name(name)
-                                else {
-                                    safe = false;
-                                    break;
-                                };
-                                any_name |= maybe;
-                            }
-                            if !safe {
-                                break;
-                            }
-                            if any_name {
-                                paths.insert(path.clone());
-                            }
-                        }
-                        safe.then_some(paths)
-                    }
-                }
-            };
-            let Some(selected_paths) = selected_paths else {
-                if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                    continue;
-                }
-                return ReferenceCandidatePages {
-                    pages: snapshot.iter().cloned().collect(),
-                    indexed: false,
-                    full_page_count,
-                };
-            };
-            let selected = {
-                let cache_index = self.cache_index.read().unwrap();
-                let Some(cache_index) = cache_index.as_ref() else {
-                    if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    return ReferenceCandidatePages {
-                        pages: snapshot.iter().cloned().collect(),
-                        indexed: false,
-                        full_page_count,
-                    };
-                };
-                let mut selected = Vec::with_capacity(selected_paths.len());
-                let mut coherent = true;
-                for path in selected_paths {
-                    let Some(slot) = cache_index.by_path.get(&path).copied() else {
-                        coherent = false;
-                        break;
-                    };
-                    let Some(page) = snapshot.get(slot) else {
-                        coherent = false;
-                        break;
-                    };
-                    selected.push(page.clone());
-                }
-                coherent.then_some(selected)
-            };
-            let Some(selected) = selected else {
-                if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                    continue;
-                }
-                return ReferenceCandidatePages {
-                    pages: snapshot.iter().cloned().collect(),
-                    indexed: false,
-                    full_page_count,
-                };
-            };
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
-                return ReferenceCandidatePages {
-                    pages: selected,
-                    indexed: true,
-                    full_page_count,
-                };
-            }
         }
         let pages = self.with_pages(|pages| pages.iter().cloned().collect::<Vec<_>>());
         ReferenceCandidatePages {
@@ -13604,117 +12968,31 @@ impl Graph {
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
-        self.with_pages(|_| ());
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let guard = self.reference_candidate_index.read().unwrap();
-        let index = guard.as_ref()?;
-        if !index.complete || index.generation != generation {
-            return None;
-        }
-        crate::fast_commit::note_real_page_name_materialization(index.real_pages.len());
-        let names = index
-            .real_pages
-            .iter()
-            .filter_map(|(key, owners)| {
-                owners
-                    .first_key_value()
-                    .map(|(path, name)| (key.clone(), (path.clone(), name.clone())))
-            })
-            .collect();
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        let names = self.direct_projection_real_page_names()?;
+        crate::fast_commit::note_real_page_name_materialization(names.len());
+        Some(names)
     }
 
-    /// Candidate paths for rename after validating the index covers the exact
-    /// page-list/collision snapshot rename already collected. `None` means the
-    /// caller must retain its correct whole-list scan.
-    fn reference_candidate_paths_for_entries(
-        &self,
-        names_norm: &[String],
-        entries: &[PageEntry],
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
-        self.with_pages(|_| ());
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let paths = {
-            let guard = self.reference_candidate_index.read().unwrap();
-            let index = guard.as_ref()?;
-            if !index.complete
-                || index.generation != generation
-                || index.pages.len() != entries.len()
-                || entries
-                    .iter()
-                    .any(|entry| !index.pages.contains_key(&entry.path))
-            {
-                return None;
-            }
-            let mut paths = std::collections::BTreeSet::new();
-            for name in names_norm {
-                if let Some(postings) = index.explicit.get(name) {
-                    paths.extend(postings.iter().cloned());
-                }
-            }
-            paths
-        };
-
-        // Generation/path coherence proves only that the index matches the
-        // cached snapshot. Before using it to skip physical files, also prove
-        // every listed file still has the bytes that snapshot was parsed from.
-        // This catches external edits that landed before watcher reconciliation;
-        // failures or mismatches retain the existing full-scan transaction.
-        // Clone the reconstructible revisions so disk I/O does not hold a graph
-        // lock. No document is reparsed on this validation path.
-        let disk_revs = self.disk_revs.read().unwrap().clone();
-        if disk_revs.len() != entries.len() {
-            return None;
-        }
-        for entry in entries {
-            let expected = disk_revs.get(&entry.path)?;
-            let current = fs::read_to_string(&entry.path).ok()?;
-            if content_rev(&current) != *expected {
-                return None;
-            }
-        }
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(paths)
-    }
-
-    /// `block uuid → # of distinct referrer blocks`, over the whole graph, via a
-    /// `cache_gen`-keyed index whose generation is advanced across edits that do
-    /// not change the edited page's block-reference projection. A referrer is a
+    /// `block uuid → # of distinct referrer blocks`, over the whole graph. A referrer is a
     /// block whose text references the uuid (`((uuid))`, `[..](((uuid)))`, or
     /// `{{embed ((uuid))}}`); multiple refs from one block count once (OG semantics).
-    /// O(graph) to build initially or after a reference-bearing edit, then O(1)
-    /// reuse across ordinary edits.
+    /// The exact-generation SQLite projection is the ready route; its parser
+    /// fallback is used only while that disposable projection is unavailable.
     pub fn block_ref_counts(&self) -> io::Result<Arc<std::collections::HashMap<String, usize>>> {
-        use std::sync::atomic::Ordering;
-        loop {
-            let gen = self.cache_gen.load(Ordering::Acquire);
-            if let Some((idx_gen, map)) = self.block_ref_count_cache.read().unwrap().as_ref() {
-                if *idx_gen == gen {
-                    return Ok(Arc::clone(map));
-                }
-            }
-
-            let map = self.with_pages(|pages| -> io::Result<_> {
-                let mut counts = std::collections::HashMap::new();
-                for (_entry, doc) in pages {
-                    for (id, count) in document_block_ref_counts(doc)? {
-                        let total = counts.entry(id).or_insert(0_usize);
-                        *total = total.checked_add(count).ok_or_else(allocation_overflow)?;
-                    }
-                }
-                Ok(counts)
-            })?;
-            // A save can race the scan. Never publish its old snapshot under the
-            // new generation; retry against the current cache instead.
-            if self.cache_gen.load(Ordering::Acquire) != gen {
-                continue;
-            }
-            let arc = Arc::new(map);
-            let mut cache = self.block_ref_count_cache.write().unwrap();
-            if self.cache_gen.load(Ordering::Acquire) == gen {
-                *cache = Some((gen, Arc::clone(&arc)));
-                return Ok(arc);
-            }
+        if let Some(counts) = self.direct_projection_block_ref_counts() {
+            return Ok(Arc::new(counts));
         }
+        let map = self.with_pages(|pages| -> io::Result<_> {
+            let mut counts = std::collections::HashMap::new();
+            for (_entry, doc) in pages {
+                for (id, count) in document_block_ref_counts(doc)? {
+                    let total = counts.entry(id).or_insert(0_usize);
+                    *total = total.checked_add(count).ok_or_else(allocation_overflow)?;
+                }
+            }
+            Ok(counts)
+        })?;
+        Ok(Arc::new(map))
     }
 
     /// Locate a page in the parsed-doc cache by its resolved physical path.
@@ -14052,7 +13330,6 @@ impl Graph {
             .map(|(e, d, _)| (e, Arc::new(d)))
             .collect();
         let index = build_page_cache_index(&pages);
-        let reference_index = ReferenceCandidateIndex::build(expected_generation, &pages).ok();
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
             &pages,
@@ -14069,10 +13346,10 @@ impl Graph {
         if guard.is_some() {
             return PageCacheInstallOutcome::AlreadyAvailable;
         }
-        *guard = Some(Arc::new(pages));
+        let pages = Arc::new(pages);
+        *guard = Some(Arc::clone(&pages));
         *self.cache_index.write().unwrap() = Some(index);
-        *self.reference_candidate_index.write().unwrap() = reference_index;
-        *self.disk_revs.write().unwrap() = revs;
+        *self.disk_revs.write().unwrap() = revs.clone();
         *self.effective_identity_index.write().unwrap() = Some(effective_index);
         *self.page_index_failures.write().unwrap() = failures;
         *self.page_list_cache.write().unwrap() = Some((expected_generation, page_list));
@@ -14081,6 +13358,7 @@ impl Graph {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
+        self.direct_projection_enqueue_full(expected_generation, pages, Arc::new(revs));
         PageCacheInstallOutcome::Installed
     }
 
@@ -14251,24 +13529,20 @@ impl Graph {
     }
 
     fn invalidate_cache_after_tine_mutation(&self) {
+        self.direct_projection_mark_stale();
         let mut guard = self.cache.write().unwrap();
         *guard = None;
         self.page_index_failures.write().unwrap().clear();
         *self.cache_index.write().unwrap() = None;
         *self.effective_identity_index.write().unwrap() = None;
-        *self.reference_candidate_index.write().unwrap() = None;
         self.disk_revs.write().unwrap().clear(); // under the cache lock (cache → disk_revs)
                                                  // Bump the generation AFTER discarding the cache (under the cache lock), so
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
-                                                 // gen-after-content ordering as cache_upsert. The gen-keyed block index
-                                                 // then rebuilds against fresh content too.
+                                                 // gen-after-content ordering as cache_upsert.
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
-        *self.alias_cache.write().unwrap() = None;
-        *self.block_index.write().unwrap() = None;
-        *self.block_ref_count_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
     }
 
@@ -14300,8 +13574,6 @@ impl Graph {
         // removed — invalidating on every save would make a normal edit an O(P)
         // alias rescan on the next navigation.
         let new_aliases = crate::query::document_aliases(&doc);
-        let new_block_refs = document_block_ref_counts(&doc);
-        let mut block_refs_touched = false;
         let mut alias_touched = !new_aliases.is_empty();
         let path_key = entry.path.clone();
         let doc = Arc::new(doc);
@@ -14309,6 +13581,7 @@ impl Graph {
         // (the original is moved into the cache slot; this clone is a refcount bump).
         let evict_doc = Arc::clone(&doc);
         let evict_entry = entry.clone();
+        let projection_revision = disk_rev.clone();
         let mut previous_doc: Option<Arc<Document>> = None;
         let mut is_new_page = false;
         let mut identity_changed = false;
@@ -14324,11 +13597,6 @@ impl Graph {
                 Some(i) => {
                     let slot = &mut pages[i];
                     alias_touched = new_aliases != crate::query::document_aliases(&slot.1);
-                    block_refs_touched = match (document_block_ref_counts(&slot.1), &new_block_refs)
-                    {
-                        (Ok(previous), Ok(current)) => previous != *current,
-                        _ => true,
-                    };
                     previous_doc = Some(Arc::clone(&slot.1));
                     identity_changed = slot.0.kind != entry.kind
                         || !crate::refs::same_page(&slot.0.name, &entry.name)
@@ -14342,9 +13610,6 @@ impl Graph {
                 }
                 None => {
                     is_new_page = true;
-                    block_refs_touched = new_block_refs
-                        .as_ref()
-                        .map_or(true, |counts| !counts.is_empty());
                     let name_key = page_cache_key(entry.kind, &entry.name);
                     pages.push((entry, doc));
                     if let Some(index) = self.cache_index.write().unwrap().as_mut() {
@@ -14411,42 +13676,9 @@ impl Graph {
         }
         *failures_guard = resulting_failures;
         drop(failures_guard);
-        if cache_built {
-            let mut index_guard = self.reference_candidate_index.write().unwrap();
-            match (identity_changed, index_guard.as_mut()) {
-                (true, _) => {
-                    if let Some(pages) = guard.as_ref() {
-                        *index_guard = ReferenceCandidateIndex::build(newgen, pages).ok();
-                    }
-                }
-                (false, Some(index)) if index.complete && index.generation + 1 == newgen => {
-                    if index.insert(&evict_entry, &evict_doc).is_ok() {
-                        index.generation = newgen;
-                    } else {
-                        *index_guard = None;
-                    }
-                }
-                (false, _) => {
-                    if let Some(pages) = guard.as_ref() {
-                        *index_guard = ReferenceCandidateIndex::build(newgen, pages).ok();
-                    }
-                }
-            }
-        }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
-        }
         // Same treatment for the physical page inventory, and for the same
-        // reason as `block_ref_count_cache` above. `list_pages` is keyed on raw
+        // reason as other generation-bound derived inventories. `list_pages` is keyed on raw
         // `cache_gen` equality, and its ONLY way to rebuild is to walk the graph
         // text scope, re-read every file from disk and re-parse each one.
         // Measured at ~35 µs/file, dead linear from 506 to 8,006 pages: 243 ms on
@@ -14471,11 +13703,18 @@ impl Graph {
         // unrelated page was created is stale at an older generation, and
         // stamping it as current republishes that staleness permanently —
         // `list_pages` is keyed on generation equality, so it never rebuilds and
-        // the missing page becomes unloadable. The reference-candidate index
-        // above already uses exactly this guard for exactly this reason.
-        if cache_built && !identity_changed && !is_new_page && !failures_changed {
-            if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
+        // the missing page becomes unloadable.
+        if cache_built && !failures_changed {
+            if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|entry| entry.path == evict_entry.path)
+                    {
+                        *existing = evict_entry.clone();
+                    } else {
+                        entries.push(evict_entry.clone());
+                    }
                     *generation = newgen;
                 }
             }
@@ -14494,6 +13733,16 @@ impl Graph {
             newgen,
             scoped,
         );
+        if cache_built {
+            self.direct_projection_enqueue_replace(
+                newgen,
+                evict_entry,
+                evict_doc,
+                projection_revision,
+            );
+        } else {
+            self.direct_projection_mark_stale();
+        }
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
@@ -14694,20 +13943,21 @@ impl Graph {
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
-        let mut alias_touched = false;
-        let mut block_refs_touched = false;
+        let mut removed_entries = Vec::new();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
+            removed_entries.extend(
+                pages
+                    .iter()
+                    .filter(|(entry, _)| {
+                        entry.kind == kind && crate::refs::same_page(&entry.name, name)
+                    })
+                    .map(|(entry, _)| entry.clone()),
+            );
             let removed_paths = pages
                 .iter()
                 .filter(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
-                .map(|(e, doc)| {
-                    alias_touched |= !crate::query::document_aliases(doc).is_empty();
-                    block_refs_touched |= document_block_ref_counts(doc)
-                        .as_ref()
-                        .map_or(true, |counts| !counts.is_empty());
-                    e.path.clone()
-                })
+                .map(|(e, _)| e.path.clone())
                 .collect::<Vec<_>>();
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
             // Drop all exact revisions removed by this ambiguity-validated logical
@@ -14728,8 +13978,6 @@ impl Graph {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
         if let Some(pages) = guard.as_ref() {
-            *self.reference_candidate_index.write().unwrap() =
-                ReferenceCandidateIndex::build(newgen, pages).ok();
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
@@ -14737,20 +13985,11 @@ impl Graph {
                     self.page_index_failures.read().unwrap().clone(),
                 )));
         } else {
-            *self.reference_candidate_index.write().unwrap() = None;
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
+        for entry in removed_entries {
+            self.direct_projection_enqueue_delete(newgen, entry);
         }
     }
 
@@ -14763,15 +14002,9 @@ impl Graph {
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
-        let mut alias_touched = false;
-        let mut block_refs_touched = false;
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             if let Some(i) = self.cached_page_index_for_path(pages, &entry.path) {
-                alias_touched = !crate::query::document_aliases(&pages[i].1).is_empty();
-                block_refs_touched = document_block_ref_counts(&pages[i].1)
-                    .as_ref()
-                    .map_or(true, |counts| !counts.is_empty());
                 pages.remove(i);
                 // Drop the rev under the cache lock (same cache → disk_revs order
                 // as cache_upsert) so the two never diverge.
@@ -14787,8 +14020,6 @@ impl Graph {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
         if let Some(pages) = guard.as_ref() {
-            *self.reference_candidate_index.write().unwrap() =
-                ReferenceCandidateIndex::build(newgen, pages).ok();
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
@@ -14796,21 +14027,10 @@ impl Graph {
                     self.page_index_failures.read().unwrap().clone(),
                 )));
         } else {
-            *self.reference_candidate_index.write().unwrap() = None;
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
-        }
+        self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
     /// Memoize a derived whole-graph scan result, keyed by `(cache_gen, today)` +
@@ -15079,6 +14299,17 @@ impl Graph {
         {
             return Arc::new(Vec::new());
         }
+        if crate::query::sparse_task_query_eligibility(query_src).is_some()
+            && self.direct_projection_ready()
+        {
+            return self.derived_memo(format!("sq\0{query_src}"), || {
+                self.direct_projection_sparse_task_query(query_src, usize::MAX, usize::MAX)
+                    .map_or_else(
+                        || crate::query::run_query(self, query_src),
+                        |result| result.groups,
+                    )
+            });
+        }
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
         })
@@ -15098,6 +14329,19 @@ impl Graph {
                 total: 0,
                 exceeded: false,
             };
+        }
+        if crate::query::sparse_task_query_eligibility(query_src).is_some()
+            && self.direct_projection_ready()
+        {
+            return self.derived_memo_bounded(
+                format!("SQ\0{max_rows}\0{max_bytes}\0{query_src}"),
+                || {
+                    self.direct_projection_sparse_task_query(query_src, max_rows, max_bytes)
+                        .unwrap_or_else(|| {
+                            crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
+                        })
+                },
+            );
         }
         self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
             crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
@@ -16499,8 +15743,17 @@ impl Graph {
                 format,
             );
             let content = serialize_pdf_hls_page(&page_path, &page_doc, None)?;
-            let page_rev = self
-                .commit_editor_write(&write, &page_path, &content, None, true, None, None, None)?;
+            let page_rev = self.commit_editor_write(
+                &write,
+                &page_path,
+                &content,
+                None,
+                true,
+                None,
+                None,
+                None,
+                EditorPublicationAuthority::DirectFile,
+            )?;
             let name = crate::pdf::hls_page_name(&key);
             let entry = PageEntry {
                 name,
@@ -16950,27 +16203,39 @@ impl Graph {
         // On mismatch → conflict; PdfViewer.persist toasts + reverts and a retry merges
         // cleanly (the .edn was already 3-way-merged, so no highlight is lost).
         let page_md = serialize_pdf_hls_page(&page_path, &page_doc, existing_raw.as_deref())?;
-        let page_rev = match self.commit_editor_write(
-            &write,
-            &page_path,
-            &page_md,
-            page_baseline.as_deref(),
-            true,
-            None,
-            None,
-            None,
-        ) {
-            Ok(rev) => rev,
-            Err(page_error) => {
-                if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
-                    return Err(io::Error::new(
+        // No-op save (write_page's guard, which this path lacked): a re-save of
+        // an unchanged highlight set produces the page's exact current bytes.
+        // Committing them anyway rewrote the file, stamped a watcher
+        // suppression marker and woke every sync tool watching the tree for
+        // nothing — Concord invariant 4. Skip the write; hash the bytes already
+        // on disk for the rev the cache records.
+        let page_changed = page_baseline.as_deref() != Some(page_md.as_str());
+        let page_rev = if !page_changed {
+            content_rev(&page_md)
+        } else {
+            match self.commit_editor_write(
+                &write,
+                &page_path,
+                &page_md,
+                page_baseline.as_deref(),
+                true,
+                None,
+                None,
+                None,
+                EditorPublicationAuthority::DirectFile,
+            ) {
+                Ok(rev) => rev,
+                Err(page_error) => {
+                    if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
+                        return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
                             "highlight notes page was not saved ({page_error}); the sidecar rollback also failed ({rollback_error})"
                         ),
                     ));
+                    }
+                    return Err(page_error);
                 }
-                return Err(page_error);
             }
         };
         // The hls page is a real page; reflect it in the search cache.
@@ -16986,17 +16251,23 @@ impl Graph {
             });
         self.cache_upsert(entry, page_doc, page_rev.clone());
         // Drop the self-write marker now the write is published + cached (see
-        // write_page / drop_self_write_marker).
-        self.drop_self_write_marker(&page_path, &page_rev);
+        // write_page / drop_self_write_marker). A no-op save took no marker.
+        if page_changed {
+            self.drop_self_write_marker(&page_path, &page_rev);
+        }
         self.finish_highlight_sidecar_commit(&sidecar)?;
         // Migrate-on-write cleanup is compare-and-recover: only retire a legacy
         // artifact if it still equals the exact bytes we merged. A concurrent
         // legacy update stays at its original path. Unchanged files are moved to
         // recoverable trash rather than hard-deleted.
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.managed_create_dir_all(&write, &trash)?;
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if self.managed_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
+                // Create the trash directory only when something is actually
+                // going into it. Unconditionally mkdir-ing it made every
+                // highlight save materialize `logseq/.tine-trash/conflict/` in a
+                // tree that may never need it (invariant 4).
+                let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+                self.managed_create_dir_all(&write, &trash)?;
                 let name = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -17183,7 +16454,7 @@ impl Graph {
         let lock = self.page_lock(&target.absolute_path);
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target, false)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         self.validate_current_graph_text_collision(
             write,
@@ -17212,7 +16483,7 @@ impl Graph {
             ));
         }
         file.sync_all()?;
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         self.validate_current_graph_text_collision(
@@ -17292,7 +16563,7 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target_path, true)?;
         self.ensure_projection_target_shape(&parent, &target_path)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
 
         let current = read_projection_optional(parent.final_dir(), &target_path.filename)?;
         let resumed_retirement = current.is_none()
@@ -17463,7 +16734,7 @@ impl Graph {
                                 projection_after_retire_hook(&target_path.absolute_path),
                                 projection_after_retire_collision_hook(),
                             );
-                            preflight_projection_chain(&parent.chain)?;
+                            preflight_reconstructible_projection_chain(&parent.chain)?;
                             let validation = (|| {
                                 self.ensure_projection_parent_binding(&parent, &target_path)?;
                                 self.ensure_projection_target_shape(&parent, &target_path)?;
@@ -17500,7 +16771,7 @@ impl Graph {
                             target,
                         )?;
                         publish_name = Some(publication.clone());
-                        rename_projection_noreplace(
+                        rename_reconstructible_projection_noreplace(
                             parent.final_dir(),
                             &publication,
                             &target_path.filename,
@@ -17508,7 +16779,7 @@ impl Graph {
                         publish_name = None;
                         published = true;
                         mutated = true;
-                        sync_projection_chain_required(&parent.chain)?;
+                        sync_reconstructible_projection_chain(&parent.chain)?;
                         let hooks = combine_projection_hook_results(
                             projection_post_publish_hook(&target_path.absolute_path),
                             projection_post_publish_collision_hook(),
@@ -17613,14 +16884,14 @@ impl Graph {
                             &target_path.filename,
                             &published_target_recovery,
                         ) {
-                            Ok(()) => sync_projection_chain_required(&parent.chain),
+                            Ok(()) => sync_reconstructible_projection_chain(&parent.chain),
                             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                                 match parent
                                     .final_dir()
                                     .symlink_metadata(&target_path.filename)
                                 {
                                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                        sync_projection_chain_required(&parent.chain)
+                                        sync_reconstructible_projection_chain(&parent.chain)
                                     }
                                     Ok(_) => Err(io::Error::new(
                                         io::ErrorKind::Interrupted,
@@ -17768,7 +17039,7 @@ impl Graph {
         )?;
         let parent = self.projection_parent(&target, false)?;
         self.ensure_projection_target_shape(&parent, &target)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         let current = read_projection_optional(parent.final_dir(), &target.filename)?;
         if current.as_deref() != Some(expected_base) {
             return Err(io::Error::new(
@@ -17909,7 +17180,7 @@ impl Graph {
                     Ok(())
                 })();
                 combine_projection_hook_validation(hooks, validation)?;
-                sync_projection_chain_required(&parent.chain)?;
+                sync_reconstructible_projection_chain(&parent.chain)?;
                 let hooks = combine_projection_hook_results(
                     projection_post_publish_hook(&target.absolute_path),
                     projection_post_publish_collision_hook(),
@@ -17973,11 +17244,11 @@ impl Graph {
                 &target.filename,
                 &published_recovery,
             ) {
-                Ok(()) => sync_projection_chain_required(&parent.chain),
+                Ok(()) => sync_reconstructible_projection_chain(&parent.chain),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     match parent.final_dir().symlink_metadata(&target.filename) {
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            sync_projection_chain_required(&parent.chain)
+                            sync_reconstructible_projection_chain(&parent.chain)
                         }
                         Ok(_) => Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -18091,7 +17362,7 @@ impl Graph {
                 "projection confirmation target is present",
             ));
         }
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         let hooks = combine_projection_hook_results(
             projection_post_publish_hook(&target.absolute_path),
             projection_post_publish_collision_hook(),
@@ -18306,7 +17577,7 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target, false)?;
         let bytes = sync_and_read_projection_regular(parent.final_dir(), &evidence.filename)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         Ok(bytes)
     }
@@ -18364,7 +17635,7 @@ impl Graph {
             }
             Err(error) => return Err(error),
         };
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
 
         let record = &records[0];
@@ -18437,7 +17708,7 @@ impl Graph {
                 )?;
                 return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
             }
-            preflight_projection_chain(&parent.chain)?;
+            preflight_reconstructible_projection_chain(&parent.chain)?;
             self.ensure_projection_parent_binding(&parent, &target)?;
             if !allow_retirement {
                 let final_name =
@@ -18517,15 +17788,15 @@ impl Graph {
         }
         drop(opened);
 
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         projection_recovery_retirement_after_validation_hook()?;
-        rename_projection_noreplace(
+        rename_reconstructible_projection_noreplace(
             parent.final_dir(),
             record.recovery_filename(),
             &quarantine_name,
         )?;
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
 
         let (quarantined, quarantine_bytes) =
             open_and_read_projection_regular(parent.final_dir(), &quarantine_name)?;
@@ -18588,7 +17859,7 @@ impl Graph {
                 &bytes,
             )?);
         }
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(parent, target)?;
         evidence.sort_by(|left, right| {
             (&left.relative_path, &left.filename).cmp(&(&right.relative_path, &right.filename))
@@ -18639,7 +17910,7 @@ impl Graph {
                 evidence.push(retained);
             }
         }
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(parent, target)?;
         evidence.sort_by(|left, right| {
             (&left.relative_path, &left.filename).cmp(&(&right.relative_path, &right.filename))
@@ -18715,7 +17986,7 @@ impl Graph {
                 "projection removal recovery has no exact retained base evidence",
             ));
         }
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         let hooks = combine_projection_hook_results(
             projection_post_publish_hook(&target.absolute_path),
             projection_post_publish_collision_hook(),
@@ -18870,7 +18141,7 @@ impl Graph {
         self.note_self_write(&target_path.absolute_path, rev.clone());
         let result = (|| {
             file.sync_all()?;
-            sync_projection_chain_required(&parent.chain)?;
+            sync_reconstructible_projection_chain(&parent.chain)?;
             let hooks = combine_projection_hook_results(
                 projection_post_publish_hook(&target_path.absolute_path),
                 projection_post_publish_collision_hook(),
@@ -19106,7 +18377,17 @@ impl Graph {
             publish()
         })();
         match result {
-            Ok(published) => Ok((rev, published)),
+            Ok(published) => {
+                if let Some(activation) = editor_episode.and_then(|episode| episode.activation) {
+                    self.update_editor_activation_baseline(path, activation, content);
+                }
+                // Concord ledger (ADR 0056): these exact bytes are now on disk,
+                // so they are the last text Tine and the disk agree on. Off the
+                // save critical path — one channel send, work happens on the
+                // ledger's worker thread; failures are logged, never surfaced.
+                self.concord_record_agreed(path, content);
+                Ok((rev, published))
+            }
             Err(error) => {
                 self.drop_self_write_marker(path, &rev);
                 Err(error)
@@ -19124,6 +18405,7 @@ impl Graph {
         expected_identity: Option<ContentDigest>,
         editor_episode: Option<&ConflictEditorEpisode>,
         creation_proof: Option<DirectCreationProof>,
+        publication_authority: EditorPublicationAuthority,
     ) -> io::Result<String> {
         let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
@@ -19142,6 +18424,7 @@ impl Graph {
                     identity,
                     recheck.then_some(baseline).flatten().map(str::as_bytes),
                     editor_episode,
+                    publication_authority,
                 ),
                 (None, Some(creation_proof)) if baseline.is_none() => self
                     .managed_atomic_create_with_proof(
@@ -19232,6 +18515,22 @@ impl Graph {
         // Watch events are untrusted path inputs. Lexically reject non-managed
         // names first; the retained capability traversal below then performs the
         // component-wise no-follow containment and file-shape checks.
+        // Concord ledger: a conflict copy just appeared for its winner. Pin the
+        // winner's CURRENT base under the copy's identity BEFORE the winner's
+        // own external admission overwrites it — the pinned text is the closest
+        // thing to the true common ancestor the 3-way merge suggestions need
+        // (first-wins in the ledger). Checked here because a conflict copy is
+        // deliberately NOT eligible graph text (`entry_for_path` is None for
+        // it; the scope check below is the watcher's own lexical authority).
+        // Purely additive and best-effort; the event then flows through the
+        // unchanged reconcile path (which never caches a copy as a page).
+        if path_is_sync_conflict(path) && self.graph_text_watch_relevant(path) {
+            if let Some(ledger) = self.concord_ledger.get() {
+                if let Some(winner_rel) = self.conflict_winner_rel(path) {
+                    ledger.pin_conflict_base(&self.rel_path(path), &winner_rel);
+                }
+            }
+        }
         if self.entry_for_path(path).is_none() {
             return Ok(None);
         }
@@ -19426,6 +18725,9 @@ impl Graph {
             }
         }
         self.cache_upsert(entry.clone(), newdoc, disk_rev);
+        // Concord ledger: the external change was admitted, so this content is
+        // now what Tine last READ from disk — the new last-agreed text.
+        self.concord_record_agreed(path, content);
         Ok(Some(entry))
     }
 
@@ -19634,10 +18936,10 @@ impl Graph {
         // identifies the mounted editor only; the ordinary save's base-revision
         // guard still decides whether bytes may land and mints any conflict under
         // this activation. Absent editors use `activate_absent_editor` instead.
-        if let Some(expected_revision) = expected_revision {
+        let matched_baseline = if let Some(expected_revision) = expected_revision {
             let permit = self.admit_retained_managed_text_writer()?;
             match self.managed_read_optional_text(&permit, &abs)? {
-                Some(content) if content_rev(&content) == expected_revision => {}
+                Some(content) if content_rev(&content) == expected_revision => Some(content),
                 Some(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -19651,7 +18953,9 @@ impl Graph {
                     ));
                 }
             }
-        }
+        } else {
+            None
+        };
         // A successfully matched expected revision proves presence even if a
         // concurrently cold/stale inventory has not indexed the file yet.
         let prospective = expected_revision.is_none() && self.entry_for_path(&abs).is_none();
@@ -19670,6 +18974,7 @@ impl Graph {
         state.live.entry(abs).or_default().push(ActivationRecord {
             activation,
             prospective,
+            baseline: matched_baseline,
         });
         Ok(EditorActivationHandle {
             activation,
@@ -19705,12 +19010,57 @@ impl Graph {
         state.live.entry(abs).or_default().push(ActivationRecord {
             activation,
             prospective: true,
+            baseline: None,
         });
         Ok(EditorActivationHandle {
             activation,
             target: rel,
             prospective: true,
         })
+    }
+
+    fn editor_activation_baseline(
+        &self,
+        path: &Path,
+        activation: EditorActivation,
+        expected_revision: Option<&str>,
+    ) -> Option<String> {
+        self.editor_activations
+            .lock()
+            .unwrap()
+            .live
+            .get(path)?
+            .iter()
+            .find(|record| record.activation == activation)?
+            .baseline
+            .clone()
+            .filter(|content| expected_revision.is_none_or(|rev| content_rev(content) == rev))
+    }
+
+    fn update_editor_activation_baseline(
+        &self,
+        path: &Path,
+        activation: EditorActivation,
+        content: &str,
+    ) {
+        if let Some(record) = self
+            .editor_activations
+            .lock()
+            .unwrap()
+            .live
+            .get_mut(path)
+            .and_then(|records| {
+                records
+                    .iter_mut()
+                    .find(|record| record.activation == activation)
+            })
+        {
+            record.baseline = Some(content.to_owned());
+            // The first save and the frontend's activation handoff are separate
+            // operations. Keep the issuing absent activation prospective until
+            // `finish_saved_editor_activation` returns its exact resolved target;
+            // clearing it here made that mandatory handoff disappear.
+        }
     }
 
     /// Present a conflict observation WITHOUT writing anything.
@@ -20160,6 +19510,44 @@ impl Graph {
         exact_target: &[u8],
         append: impl FnOnce() -> Result<A, E>,
     ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
+        self.commit_existing_page_with_journal_inner(
+            page,
+            base_rev,
+            expected_base,
+            exact_target,
+            None,
+            append,
+        )
+    }
+
+    pub(crate) fn commit_existing_page_with_journal_evidence<A, E>(
+        &self,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
+        self.commit_existing_page_with_journal_inner(
+            page,
+            base_rev,
+            expected_base,
+            exact_target,
+            evidence,
+            append,
+        )
+    }
+
+    fn commit_existing_page_with_journal_inner<A, E>(
+        &self,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
         #[cfg(test)]
         let validation_started = std::time::Instant::now();
         if page.guide {
@@ -20192,6 +19580,7 @@ impl Graph {
                 base_rev,
                 expected_base,
                 exact_target,
+                evidence,
                 path,
                 cache,
             )
@@ -20400,6 +19789,7 @@ impl Graph {
         base_rev: &str,
         expected_base: &[u8],
         exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
         path: PathBuf,
         cache: bool,
     ) -> io::Result<VerifiedJournalPageProjection<'a>> {
@@ -20421,6 +19811,10 @@ impl Graph {
                 "unchanged existing pages do not require a journal projection",
             ));
         }
+        let target_revision = content_rev(exact_target);
+        let trusted_semantics = evidence.is_some_and(|evidence| {
+            evidence.validates_projection(page, base_rev, &target_revision)
+        });
 
         let validation =
             self.validate_graph_text_target(write, &path, Some((page.kind, &page.name)))?;
@@ -20449,25 +19843,27 @@ impl Graph {
             ));
         }
         let managed_path = ManagedPath::parse(self.rel_path(&path)).map_err(|_| bad_path())?;
-        let parsed_base =
-            self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
-        let parsed_target =
-            self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
-        #[cfg(test)]
-        JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
-            pairs.set(pairs.get().saturating_add(1));
-        });
-        let resolved_target =
-            parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
-                name: &page.name,
-                kind: page.kind,
-                explicit_title: parsed_base.explicit_title.as_deref(),
-            }));
-        if resolved_target.name != page.name || resolved_target.kind != page.kind {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "journal projection target does not preserve its accepted semantic identity",
-            ));
+        if !trusted_semantics {
+            let parsed_base =
+                self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
+            let parsed_target =
+                self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
+            #[cfg(test)]
+            JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
+                pairs.set(pairs.get().saturating_add(1));
+            });
+            let resolved_target =
+                parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
+                    name: &page.name,
+                    kind: page.kind,
+                    explicit_title: parsed_base.explicit_title.as_deref(),
+                }));
+            if resolved_target.name != page.name || resolved_target.kind != page.kind {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "journal projection target does not preserve its accepted semantic identity",
+                ));
+            }
         }
         if loaded.content != expected_base
             || loaded.revision != base_rev
@@ -20490,15 +19886,18 @@ impl Graph {
             ));
         }
 
-        let (_, serialized) = self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
-        let exact_target_matches_guarded_page = serialized == exact_target
-            || (Format::from_path(&path) == Format::Md
-                && guarded_markdown_documents_match(&serialized, exact_target));
-        if !exact_target_matches_guarded_page {
-            return Err(projection_semantic_refusal(
-                io::ErrorKind::InvalidData,
-                "journal target differs from strict guarded page serialization",
-            ));
+        if !trusted_semantics {
+            let (_, serialized) =
+                self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
+            let exact_target_matches_guarded_page = serialized == exact_target
+                || (Format::from_path(&path) == Format::Md
+                    && guarded_markdown_documents_match(&serialized, exact_target));
+            if !exact_target_matches_guarded_page {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    "journal target differs from strict guarded page serialization",
+                ));
+            }
         }
 
         let index = self.validate_current_graph_text_collision_strict(
@@ -20559,7 +19958,7 @@ impl Graph {
                 expected_identity: loaded.file_identity,
                 expected_parent_identity,
                 target: exact_target.to_owned(),
-                revision: content_rev(exact_target),
+                revision: target_revision,
                 cache,
             },
         })
@@ -20624,6 +20023,7 @@ impl Graph {
                 Some(plan.expected_identity),
                 None,
                 None,
+                EditorPublicationAuthority::ReconstructibleManagedProjection,
             )?;
         }
 
@@ -20647,7 +20047,7 @@ impl Graph {
         }
         file.sync_all()?;
         journal_projection_after_file_sync_hook()?;
-        sync_projection_chain_required(&target.chain)?;
+        sync_reconstructible_projection_chain(&target.chain)?;
         let rebound = self.managed_target(write, &plan.path, false)?;
         if canonical_projection_directory_resource_id(rebound.parent())?
             != plan.expected_parent_identity
@@ -21088,6 +20488,7 @@ impl Graph {
                 expected_identity,
                 editor_episode,
                 creation_proof,
+                EditorPublicationAuthority::DirectFile,
             )?
         } else {
             content_rev(&content)
@@ -21200,6 +20601,27 @@ impl Graph {
         // `:journal/file-name-format` — so custom-format graphs create the correct
         // file for the day instead of a misplaced default-named duplicate.)
         let dto_is_org = matches!(Format::from_path(path), Format::Org);
+        // VCS merge-conflict quarantine (Concord invariant 3). In-scope threat:
+        // an external VCS merge (git/Fossil) left column-0 conflict markers in
+        // this file. Re-serializing would re-indent the markers as continuation
+        // lines (or drop them), which destroys the VCS's own conflict
+        // detection and can silently lose one side of the merge. The page
+        // stays readable; every write to it — normal and force — is refused
+        // until the user resolves the merge, in Tine's own in-page conflict
+        // resolver (`resolve_vcs_marker_conflict`, the ONE exemption below) or
+        // outside Tine. Mirrors the GH #163 refusal-instead-of-rewrite pattern.
+        if let Some(existing) = existing {
+            let markers = doc::vcs_conflict_markers(existing);
+            if !markers.is_empty() && !self.is_resolving_markers(path) {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "file contains unresolved VCS merge conflict markers ({}) — resolve the merge with your version-control tool or an external editor first; Tine never rewrites a conflicted file",
+                        markers.join(", ")
+                    ),
+                ));
+            }
+        }
         // Data-preservation firewall for page-header properties (GH #163).
         // A frontend/store bug once reclassified a suffix of the page pre-block
         // as the first outline block (`A::` stayed in the header while `B::` and
@@ -21521,8 +20943,22 @@ fn serialize_pdf_hls_page(
     document: &Document,
     existing: Option<&str>,
 ) -> io::Result<String> {
+    // Concord invariant 4 (write-shyness): an `hls__` page is an ordinary Logseq
+    // page the user and OG also write. This used to serialize with DEFAULT opts
+    // — one trailing newline, tab indent, one blank line after the preamble —
+    // so a highlight save re-indented and re-terminated the whole file even
+    // where nothing changed. Reproduce the file's own formatting exactly as the
+    // editor save path (`serialize_page_document`) does, including the
+    // layout-identity retention that keeps untouched blocks byte-stable.
+    let identities = doc::layout_identities_of(document);
     match Format::from_path(path) {
-        Format::Md => Ok(preserve_crlf(doc::serialize(document), existing)),
+        Format::Md => {
+            let opts = doc::SerializeOpts::detect_with_layout_identities(existing, &identities);
+            Ok(preserve_crlf(
+                doc::serialize_with(document, &opts),
+                existing,
+            ))
+        }
         Format::Org => {
             if existing.is_some_and(|raw| !crate::org::org_editable(raw)) {
                 return Err(io::Error::new(
@@ -21530,7 +20966,11 @@ fn serialize_pdf_hls_page(
                     "org highlight page is read-only (does not round-trip)",
                 ));
             }
-            Ok(crate::org::serialize_org_detect(document, existing))
+            Ok(crate::org::serialize_org_detect_with_layout_identities(
+                document,
+                existing,
+                &identities,
+            ))
         }
     }
 }
@@ -23159,7 +22599,11 @@ fn open_projection_dir_nofollow(dir: &Dir, name: &str) -> io::Result<Dir> {
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(projection_platform_error(
+            "openat(O_DIRECTORY|O_NOFOLLOW) of a projection parent",
+            &format!("{name:?}"),
+            io::Error::last_os_error(),
+        ));
     }
     Ok(Dir::from_std_file(unsafe { fs::File::from_raw_fd(fd) }))
 }
@@ -23214,7 +22658,11 @@ fn open_projection_file_nofollow(dir: &Dir, name: &str) -> io::Result<fs::File> 
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(projection_platform_error(
+            "openat(O_NOFOLLOW) of a projection file",
+            &format!("{name:?}"),
+            io::Error::last_os_error(),
+        ));
     }
     let file = unsafe { fs::File::from_raw_fd(fd) };
     if !file.metadata()?.is_file() {
@@ -23389,7 +22837,7 @@ fn retain_projection_recovery_conflict(
         record.attempt_id().simple(),
         hex_digest(resource_id.as_bytes())
     );
-    preflight_projection_chain(&parent.chain)?;
+    preflight_reconstructible_projection_chain(&parent.chain)?;
     let live_source = open_projection_file_nofollow(parent.final_dir(), source_name)?;
     if canonical_projection_file_resource_id(&live_source)? != resource_id {
         return Err(io::Error::new(
@@ -23397,8 +22845,8 @@ fn retain_projection_recovery_conflict(
             "projection recovery changed identity while preserving a conflict",
         ));
     }
-    rename_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
-    sync_projection_chain_required(&parent.chain)?;
+    rename_reconstructible_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
+    sync_reconstructible_projection_chain(&parent.chain)?;
     projection_recovery_relative_path(&target.relative_path, &conflict_name)
 }
 
@@ -23457,7 +22905,7 @@ fn retire_stable_projection_quarantine(
     }
     projection_recovery_after_final_reread_hook()?;
     parent.remove_file(quarantine_name)?;
-    sync_projection_chain_required(projection_chain)?;
+    sync_reconstructible_projection_chain(projection_chain)?;
     Ok(StableProjectionQuarantineRetirement::Retired)
 }
 
@@ -23529,7 +22977,8 @@ fn sync_open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(f
             "projection evidence exceeds the reload bound",
         ));
     }
-    file.sync_all()?;
+    file.sync_all()
+        .map_err(|error| projection_platform_error("fsync of a projection file", name, error))?;
     let capacity = usize::try_from(len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -23576,11 +23025,35 @@ fn read_projection_optional_bound_capture_with_limits(
     read_projection_optional_bound_capture_impl(dir, name, Some((content_limit, peak_limit)))
 }
 
+/// How many managed documents this thread has physically opened and read
+/// through the one projection capture primitive.
+///
+/// Deliberately NOT test-only. It is what lets the clean watcher publish the
+/// document-read cost of its slowest full-scan turn, which is the property the
+/// bounded full scan exists to hold — and an architectural claim of that kind
+/// has to be observable in production, not asserted in a comment. A thread-local
+/// increment is free next to the open + read + SHA-256 it counts.
+thread_local! {
+    static MANAGED_TEXT_CAPTURE_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reads performed on THIS thread so far. The clean actor samples the delta
+/// across one turn; the counter is monotone and saturating, never reset, so
+/// concurrent actors on other threads cannot perturb each other.
+pub(crate) fn managed_text_capture_reads() -> usize {
+    MANAGED_TEXT_CAPTURE_READS.with(Cell::get)
+}
+
+fn count_managed_text_capture_read() {
+    MANAGED_TEXT_CAPTURE_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+}
+
 fn read_projection_optional_bound_capture_impl(
     dir: &Dir,
     name: &str,
     limits: Option<(u64, u64)>,
 ) -> io::Result<Option<(Vec<u8>, BlobDescription, ContentDigest, u64, u64)>> {
+    count_managed_text_capture_read();
     let rebound_limit = limits
         .map(|(content_limit, _)| content_limit)
         .unwrap_or(MAX_PROJECTION_EVIDENCE_BYTES);
@@ -24147,84 +23620,6 @@ fn document_source_metrics(doc: &Document) -> io::Result<(u64, u64, u64)> {
     Ok((blocks, source, largest_raw))
 }
 
-fn cache_page_derived_upper_bound(
-    entry: &PageEntry,
-    blocks: u64,
-    source: u64,
-    largest_raw: u64,
-) -> io::Result<u64> {
-    // Every explicit reference, block reference, alias, or token consumes at
-    // least one source byte. `units` therefore bounds every retained row count,
-    // while `source` bounds the aggregate owned text payload for each class.
-    let units = source.max(blocks);
-    let mut bytes = checked_add_bytes(
-        conservative_hash_entry_bytes::<PathBuf, ReferencePageProjection>()?,
-        owned_path_upper_bound(&entry.path)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        usize_to_u64(std::mem::size_of::<ReferenceTokenSignature>())?,
-    )?;
-    bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.name)?)?;
-    bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.name)?)?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<String>(units)?,
-    )?;
-    // Projection explicit names, inverted explicit keys, block-ref keys,
-    // aliases/real-page names, and scoped invalidation maps.
-    for _class in [
-        "projection explicit names",
-        "inverted explicit keys",
-        "block-reference keys",
-        "alias names",
-        "scoped invalidation names",
-    ] {
-        bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(source)?)?;
-    }
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            units,
-            checked_add_bytes(
-                conservative_hash_entry_bytes::<String, std::collections::BTreeSet<PathBuf>>()?,
-                checked_add_bytes(
-                    conservative_btree_entry_bytes::<PathBuf, ()>()?,
-                    owned_path_upper_bound(&entry.path)?,
-                )?,
-            )?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(units, conservative_hash_entry_bytes::<String, usize>()?)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_hash_entry_bytes::<String, std::collections::BTreeMap<PathBuf, String>>()?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_add_bytes(
-            conservative_btree_entry_bytes::<PathBuf, String>()?,
-            checked_add_bytes(
-                owned_path_upper_bound(&entry.path)?,
-                owned_string_upper_bound(&entry.name)?,
-            )?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<Option<std::slice::Iter<'_, DocBlock>>>()?,
-    )?;
-    // Unicode lowercase/NFC folding owns at most three UTF-8 bytes per source
-    // byte for the currently processed block; it is scratch, not per-row state.
-    checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(checked_mul_bytes(largest_raw, 3)?)?,
-    )
-}
-
 fn usize_to_u64(value: usize) -> io::Result<u64> {
     u64::try_from(value).map_err(|_| allocation_overflow())
 }
@@ -24743,581 +24138,40 @@ struct InitialShadowCapture {
     peak_build_charge: u64,
 }
 
-fn reconciliation_scan_classify_path(
-    graph: &Graph,
-    relative: &str,
-) -> io::Result<(
-    crate::oplog::reconciliation_scan::GraphTextScanPathClass,
-    Option<PortablePathKey>,
-)> {
-    use crate::oplog::reconciliation_scan::GraphTextScanPathClass;
+/// The bounds and counters the surviving graph-text config-description read
+/// runs under. They were carried over verbatim (same names, same values) from
+/// the deleted `oplog::reconciliation_scan` so the two functions below stay
+/// byte-identical; only the fields those two functions actually read survive.
+const GRAPH_TEXT_SCAN_READ_BUFFER_BYTES: usize = 64 * 1024;
 
-    let page_like = is_page_file(Path::new(relative));
-    let is_configuration = relative.eq_ignore_ascii_case("logseq/config.edn");
-    let is_conflict = page_like && path_is_sync_conflict(Path::new(relative));
-    let eligible = graph.graph_text_scope.is_eligible(relative);
-    let under_configured_root = [&graph.config.pages_dir, &graph.config.journals_dir]
-        .into_iter()
-        .any(|root| {
-            relative
-                .strip_prefix(root)
-                .is_some_and(|tail| tail.starts_with('/'))
-        });
-    if page_like
-        && under_configured_root
-        && !eligible
-        && ManagedPath::parse(relative.to_owned()).is_err()
-    {
-        return Err(reconciliation_scan_unsafe_error(format!(
-            "configured graph-text path is not portable: {relative}"
-        )));
-    }
-    if is_configuration {
-        return Ok((GraphTextScanPathClass::Configuration, None));
-    }
-    if is_conflict {
-        return Ok((GraphTextScanPathClass::ProviderConflictCopy, None));
-    }
-    if !eligible {
-        return Ok((GraphTextScanPathClass::RetainedNonText, None));
-    }
-    let path = ManagedPath::parse(relative.to_owned()).map_err(|error| {
-        reconciliation_scan_unsafe_error(format!(
-            "eligible graph-text path is not portable: {error}"
-        ))
-    })?;
-    let portable_key = path.portable_key();
-    let class = match graph.classify_managed_text_path(&path) {
-        Ok(kind) => GraphTextScanPathClass::EligibleManaged(kind),
-        Err(_) => GraphTextScanPathClass::EligibleUnmanaged,
-    };
-    Ok((class, Some(portable_key)))
+#[derive(Clone, Copy, Debug)]
+struct GraphTextScanLimits {
+    all_entries: usize,
+    aggregate_hashed_bytes: u64,
+    read_buffer_bytes: usize,
 }
 
-fn reconciliation_scan_pass_from_admission(
-    graph: &Graph,
-    index: &CompleteGraphTextAdmissionIndex,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
-) -> io::Result<crate::oplog::reconciliation_scan::GraphTextScanPass> {
-    use crate::oplog::reconciliation_scan::{
-        GraphTextScanFileFingerprint, GraphTextScanPass, GraphTextScanPathClass,
-        GRAPH_TEXT_SCAN_READ_BUFFER_BYTES,
-    };
-
-    if limits.read_buffer_bytes == 0 || limits.read_buffer_bytes > GRAPH_TEXT_SCAN_READ_BUFFER_BYTES
-    {
-        return Err(reconciliation_scan_limit_error("read buffer"));
-    }
-    graph.ensure_projection_root_binding()?;
-    let graph_resource = graph.canonical_resource_id()?;
-    let scope_binding = graph.graph_text_scope_binding()?;
-    if graph_resource != index.graph_resource || scope_binding != index.scope_binding {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "queue-fenced admission snapshot belongs to an older graph binding",
-        ));
-    }
-    let all_entries = index
-        .directories_by_exact_relative
-        .len()
-        .checked_add(index.file_resource_by_exact_relative.len())
-        .ok_or_else(allocation_overflow)?;
-    if index.directories_by_exact_relative.len() > limits.directories
-        || all_entries > limits.all_entries
-    {
-        return Err(reconciliation_scan_limit_error("snapshot row count"));
-    }
-
-    let mut instrumentation = index.reconciliation_scan_instrumentation;
-    let mut aggregate_hashed_bytes = instrumentation.bytes_hashed;
-    let config_description = reconciliation_scan_current_config_description(
-        graph.projection_root.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "graph has no retained no-follow projection capability",
-            )
-        })?,
-        &mut aggregate_hashed_bytes,
-        &mut instrumentation,
-        limits,
-    )?;
-    if config_description != graph.reconciliation_scan_open_config_description {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "reconciliation scan config refresh required: on-disk description changed",
-        ));
-    }
-
-    let directories_by_exact_relative = index
-        .directories_by_exact_relative
-        .iter()
-        .map(|(path, resource)| (path.clone(), *resource))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut files = Vec::with_capacity(index.file_resource_by_exact_relative.len());
-    let mut aggregate_path_bytes = 0_u64;
-    let mut retained_bytes = 1024_u64
-        .checked_add(limits.read_buffer_bytes as u64)
-        .ok_or_else(allocation_overflow)?;
-    for path in directories_by_exact_relative.keys() {
-        if path.len() > limits.exact_path_bytes {
-            return Err(reconciliation_scan_limit_error("exact path bytes"));
+impl Default for GraphTextScanLimits {
+    fn default() -> Self {
+        Self {
+            all_entries: 2_000_000,
+            aggregate_hashed_bytes: 512 * 1024 * 1024,
+            read_buffer_bytes: GRAPH_TEXT_SCAN_READ_BUFFER_BYTES,
         }
-        aggregate_path_bytes = aggregate_path_bytes
-            .checked_add(path.len() as u64)
-            .ok_or_else(|| reconciliation_scan_limit_error("aggregate path bytes"))?;
-        retained_bytes = reconciliation_scan_add_retained_bytes(
-            retained_bytes,
-            (path.len() as u64).saturating_mul(2).saturating_add(1024),
-            limits,
-        )?;
     }
-    for (relative, file_resource_id) in &index.file_resource_by_exact_relative {
-        if relative.len() > limits.exact_path_bytes {
-            return Err(reconciliation_scan_limit_error("exact path bytes"));
-        }
-        aggregate_path_bytes = aggregate_path_bytes
-            .checked_add(relative.len() as u64)
-            .ok_or_else(|| reconciliation_scan_limit_error("aggregate path bytes"))?;
-        if aggregate_path_bytes > limits.aggregate_path_bytes {
-            return Err(reconciliation_scan_limit_error("aggregate path bytes"));
-        }
-        let link_count = index
-            .file_link_count_by_exact_relative
-            .get(relative)
-            .copied()
-            .ok_or_else(|| reconciliation_scan_unsafe_error("admission file lacks link count"))?;
-        if link_count != 1 {
-            return Err(reconciliation_scan_unsafe_error(format!(
-                "scan regular file has ambiguous link count {link_count}: {relative}"
-            )));
-        }
-        let (class, portable_key) = reconciliation_scan_classify_path(graph, relative)?;
-        let record = if class.is_eligible() {
-            let path = ManagedPath::parse(relative.clone()).map_err(|error| {
-                reconciliation_scan_unsafe_error(format!(
-                    "eligible admission path lost managed identity: {error}"
-                ))
-            })?;
-            Some(index.files_by_exact_path.get(&path).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("queue-fenced admission lacks eligible path {relative}"),
-                )
-            })?)
-        } else {
-            None
-        };
-        if record.is_some_and(|record| {
-            record.file_resource_id != *file_resource_id || record.link_count != link_count
-        }) {
-            return Err(reconciliation_scan_unsafe_error(format!(
-                "queue-fenced admission has inconsistent file evidence: {relative}"
-            )));
-        }
-        let description = match class {
-            GraphTextScanPathClass::Configuration => config_description,
-            _ => record.map(|record| record.description),
-        };
-        let semantic_key = record.map(|record| graph_text_semantic_key_digest(&record.semantic));
-        if class.is_eligible() && description.is_none() {
-            return Err(reconciliation_scan_unsafe_error(format!(
-                "queue-fenced admission lacks eligible description: {relative}"
-            )));
-        }
-        let portable_bytes = portable_key
-            .as_ref()
-            .map_or(0_u64, |key| key.as_bytes().len() as u64);
-        retained_bytes = reconciliation_scan_add_retained_bytes(
-            retained_bytes,
-            (relative.len() as u64)
-                .saturating_mul(2)
-                .saturating_add(portable_bytes.saturating_mul(2))
-                .saturating_add(1024),
-            limits,
-        )?;
-        files.push(GraphTextScanFileFingerprint {
-            exact_relative: relative.clone(),
-            class,
-            portable_key,
-            semantic_key,
-            description,
-            file_resource_id: *file_resource_id,
-            link_count,
-        });
-    }
-    instrumentation.eligible_files =
-        files.iter().filter(|file| file.class.is_eligible()).count() as u64;
-    if instrumentation.eligible_files > limits.eligible_files as u64 {
-        return Err(reconciliation_scan_limit_error("eligible file count"));
-    }
-    instrumentation.peak_retained_rows = (directories_by_exact_relative.len() + files.len()) as u64;
-    instrumentation.peak_retained_bytes = retained_bytes;
-    instrumentation.retained_rows = instrumentation.peak_retained_rows;
-    instrumentation.retained_bytes = retained_bytes;
-    Ok(GraphTextScanPass {
-        graph_resource,
-        scope_binding,
-        directories_by_exact_relative,
-        files,
-        instrumentation,
-    })
 }
 
-fn collect_reconciliation_scan_pass(
-    graph: &Graph,
-    _permit: &ManagedTextWritePermit,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
-) -> io::Result<crate::oplog::reconciliation_scan::GraphTextScanPass> {
-    use crate::oplog::reconciliation_scan::{
-        GraphTextScanFileFingerprint, GraphTextScanPass, GraphTextScanPassInstrumentation,
-        GraphTextScanPathClass, GRAPH_TEXT_SCAN_READ_BUFFER_BYTES,
-    };
-
-    struct PendingDirectory {
-        directory: Dir,
-        relative: String,
-        depth: usize,
-    }
-
-    if limits.read_buffer_bytes == 0 || limits.read_buffer_bytes > GRAPH_TEXT_SCAN_READ_BUFFER_BYTES
-    {
-        return Err(reconciliation_scan_limit_error("read buffer"));
-    }
-    let page_root = managed_root_components(&graph.config.pages_dir)
-        .ok_or_else(|| reconciliation_scan_unsafe_error("configured pages root is malformed"))?;
-    let journal_root = managed_root_components(&graph.config.journals_dir)
-        .ok_or_else(|| reconciliation_scan_unsafe_error("configured journals root is malformed"))?;
-    let page_root_key = PortablePathKey::from_graph_text_path(&page_root.join("/"));
-    let journal_root_key = PortablePathKey::from_graph_text_path(&journal_root.join("/"));
-    if page_root_key == journal_root_key {
-        return Err(reconciliation_scan_unsafe_error(
-            "configured managed roots are equal or portable aliases",
-        ));
-    }
-
-    graph.ensure_projection_root_binding()?;
-    let graph_resource = graph.canonical_resource_id()?;
-    let scope_binding = graph.graph_text_scope_binding()?;
-    if scope_binding.graph_resource_id() != graph_resource {
-        return Err(reconciliation_scan_unsafe_error(
-            "scope binding does not match the retained graph root",
-        ));
-    }
-    let root = graph
-        .projection_root
-        .as_ref()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "graph has no retained no-follow projection capability",
-            )
-        })?
-        .try_clone()?;
-    let mut instrumentation = GraphTextScanPassInstrumentation {
-        directories: 1,
-        peak_read_buffers: 1,
-        peak_read_buffer_bytes: limits.read_buffer_bytes as u64,
-        ..GraphTextScanPassInstrumentation::default()
-    };
-    let mut aggregate_hashed_bytes = 0_u64;
-    if !graph.reconciliation_scan_open_config_utf8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "reconciliation scan config refresh required: Graph opened from non-UTF-8 config",
-        ));
-    }
-    let current_config_description = reconciliation_scan_current_config_description(
-        &root,
-        &mut aggregate_hashed_bytes,
-        &mut instrumentation,
-        limits,
-    )?;
-    if current_config_description != graph.reconciliation_scan_open_config_description {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "reconciliation scan config refresh required: on-disk description changed since Graph open",
-        ));
-    }
-    let root_directory_resource = canonical_projection_directory_resource_id(&root)?;
-    let mut directories_by_exact_relative = std::collections::BTreeMap::new();
-    directories_by_exact_relative.insert(String::new(), root_directory_resource);
-    let mut directory_resources = std::collections::BTreeMap::new();
-    directory_resources.insert(root_directory_resource, String::new());
-    let mut file_resources = std::collections::BTreeMap::new();
-    let mut files = Vec::new();
-    let mut pending = vec![PendingDirectory {
-        directory: root,
-        relative: String::new(),
-        depth: 0,
-    }];
-    let mut retained_bytes = 1024_u64
-        .checked_add(limits.read_buffer_bytes as u64)
-        .ok_or_else(allocation_overflow)?;
-    let mut aggregate_path_bytes = 0_u64;
-    reconciliation_scan_update_peak(
-        &mut instrumentation,
-        directories_by_exact_relative.len(),
-        files.len(),
-        pending.len(),
-        retained_bytes,
-        limits,
-    )?;
-
-    while let Some(PendingDirectory {
-        directory,
-        relative,
-        depth,
-    }) = pending.pop()
-    {
-        for entry in directory.entries()? {
-            instrumentation.directory_entries = instrumentation
-                .directory_entries
-                .checked_add(1)
-                .ok_or_else(|| reconciliation_scan_limit_error("directory entry count"))?;
-            if instrumentation.directory_entries > limits.all_entries as u64 {
-                return Err(reconciliation_scan_limit_error("directory entry count"));
-            }
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_str().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "scan entry name is not exact UTF-8",
-                )
-            })?;
-            let relative_len = relative
-                .len()
-                .checked_add(usize::from(!relative.is_empty()))
-                .and_then(|length| length.checked_add(name.len()))
-                .ok_or_else(allocation_overflow)?;
-            if relative_len > limits.exact_path_bytes {
-                return Err(reconciliation_scan_limit_error("exact path bytes"));
-            }
-            aggregate_path_bytes = aggregate_path_bytes
-                .checked_add(usize_to_u64(relative_len)?)
-                .ok_or_else(|| reconciliation_scan_limit_error("aggregate path bytes"))?;
-            if aggregate_path_bytes > limits.aggregate_path_bytes {
-                return Err(reconciliation_scan_limit_error("aggregate path bytes"));
-            }
-            let child_relative = if relative.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{relative}/{name}")
-            };
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                if !graph.graph_text_scope.should_descend(&child_relative)
-                    && !graph.graph_text_scope.is_eligible(&child_relative)
-                {
-                    continue;
-                }
-                return Err(reconciliation_scan_unsafe_error(format!(
-                    "scan entry is a symlink or reparse point: {child_relative}"
-                )));
-            }
-            if file_type.is_dir() {
-                if !graph.graph_text_scope.should_descend(&child_relative) {
-                    continue;
-                }
-                let child_depth = depth
-                    .checked_add(1)
-                    .ok_or_else(|| reconciliation_scan_limit_error("directory depth"))?;
-                if child_depth > limits.directory_depth {
-                    return Err(reconciliation_scan_limit_error("directory depth"));
-                }
-                if directories_by_exact_relative.len() == limits.directories {
-                    return Err(reconciliation_scan_limit_error("directory count"));
-                }
-                projection_real_directory(&directory, name)?;
-                let child = open_projection_dir_nofollow(&directory, name)?;
-                let resource = canonical_projection_directory_resource_id(&child)?;
-                if let Some(first) = directory_resources.insert(resource, child_relative.clone()) {
-                    return Err(reconciliation_scan_unsafe_error(format!(
-                        "scan directories alias one resource: {first} and {child_relative}"
-                    )));
-                }
-                if directories_by_exact_relative
-                    .insert(child_relative.clone(), resource)
-                    .is_some()
-                {
-                    return Err(reconciliation_scan_unsafe_error(
-                        "scan contains a duplicate exact directory path",
-                    ));
-                }
-                let rebound = open_projection_dir_nofollow(&directory, name)?;
-                if projection_dir_identity(&child)? != projection_dir_identity(&rebound)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        format!("scan directory changed during capture: {child_relative}"),
-                    ));
-                }
-                if pending.len() == limits.pending_directories {
-                    return Err(reconciliation_scan_limit_error("pending directory count"));
-                }
-                pending.push(PendingDirectory {
-                    directory: child,
-                    relative: child_relative,
-                    depth: child_depth,
-                });
-                instrumentation.directories = instrumentation
-                    .directories
-                    .checked_add(1)
-                    .ok_or_else(|| reconciliation_scan_limit_error("directory count"))?;
-                retained_bytes = reconciliation_scan_add_retained_bytes(
-                    retained_bytes,
-                    usize_to_u64(relative_len)?
-                        .checked_mul(2)
-                        .and_then(|bytes| bytes.checked_add(1024))
-                        .ok_or_else(allocation_overflow)?,
-                    limits,
-                )?;
-                reconciliation_scan_update_peak(
-                    &mut instrumentation,
-                    directories_by_exact_relative.len(),
-                    files.len(),
-                    pending.len(),
-                    retained_bytes,
-                    limits,
-                )?;
-                continue;
-            }
-            if !file_type.is_file() {
-                return Err(reconciliation_scan_unsafe_error(format!(
-                    "scan entry is not a regular file: {child_relative}"
-                )));
-            }
-
-            let mut file = open_projection_file_nofollow(&directory, name)?;
-            let file_resource_id = canonical_projection_file_resource_id(&file)?;
-            let link_count = projection_file_link_count(&file)?;
-            if link_count != 1 {
-                return Err(reconciliation_scan_unsafe_error(format!(
-                    "scan regular file has ambiguous link count {link_count}: {child_relative}"
-                )));
-            }
-            if let Some(first) = file_resources.insert(file_resource_id, child_relative.clone()) {
-                return Err(reconciliation_scan_unsafe_error(format!(
-                    "scan regular files alias one resource: {first} and {child_relative}"
-                )));
-            }
-
-            let (class, portable_key) = reconciliation_scan_classify_path(graph, &child_relative)?;
-            let eligible = class.is_eligible();
-            let is_configuration = class == GraphTextScanPathClass::Configuration;
-            let description = if eligible || is_configuration {
-                Some(reconciliation_scan_hash_file(
-                    &mut file,
-                    &child_relative,
-                    file_resource_id,
-                    link_count,
-                    &mut aggregate_hashed_bytes,
-                    &mut instrumentation,
-                    limits,
-                )?)
-            } else {
-                None
-            };
-            instrumentation.regular_files = instrumentation
-                .regular_files
-                .checked_add(1)
-                .ok_or_else(|| reconciliation_scan_limit_error("regular file count"))?;
-            if eligible {
-                instrumentation.eligible_files = instrumentation
-                    .eligible_files
-                    .checked_add(1)
-                    .ok_or_else(|| reconciliation_scan_limit_error("eligible file count"))?;
-                if instrumentation.eligible_files > limits.eligible_files as u64 {
-                    return Err(reconciliation_scan_limit_error("eligible file count"));
-                }
-            }
-            let portable_bytes = portable_key
-                .as_ref()
-                .map_or(0_u64, |key| key.as_bytes().len() as u64);
-            retained_bytes = reconciliation_scan_add_retained_bytes(
-                retained_bytes,
-                usize_to_u64(relative_len)?
-                    .checked_mul(2)
-                    .and_then(|bytes| bytes.checked_add(portable_bytes.saturating_mul(2)))
-                    .and_then(|bytes| bytes.checked_add(1024))
-                    .ok_or_else(allocation_overflow)?,
-                limits,
-            )?;
-            files.push(GraphTextScanFileFingerprint {
-                exact_relative: child_relative,
-                class,
-                portable_key,
-                semantic_key: None,
-                description,
-                file_resource_id,
-                link_count,
-            });
-            reconciliation_scan_update_peak(
-                &mut instrumentation,
-                directories_by_exact_relative.len(),
-                files.len(),
-                pending.len(),
-                retained_bytes,
-                limits,
-            )?;
-        }
-    }
-
-    files.sort_unstable_by(|left, right| left.exact_relative.cmp(&right.exact_relative));
-    if files
-        .windows(2)
-        .any(|window| window[0].exact_relative == window[1].exact_relative)
-    {
-        return Err(reconciliation_scan_unsafe_error(
-            "scan contains duplicate exact regular-file paths",
-        ));
-    }
-    graph.attach_reconciliation_scan_semantic_keys(&mut files)?;
-    graph.ensure_projection_root_binding().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::Interrupted,
-            format!("scan root binding changed: {error}"),
-        )
-    })?;
-    let ending_scope = graph.graph_text_scope_binding()?;
-    if ending_scope != scope_binding {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "scan scope binding changed during capture",
-        ));
-    }
-    let ending_config_description = reconciliation_scan_current_config_description(
-        graph.projection_root.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "graph has no retained no-follow projection capability",
-            )
-        })?,
-        &mut aggregate_hashed_bytes,
-        &mut instrumentation,
-        limits,
-    )?;
-    if ending_config_description != graph.reconciliation_scan_open_config_description {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "reconciliation scan config refresh required: on-disk description changed during capture",
-        ));
-    }
-    instrumentation.retained_rows = instrumentation.peak_retained_rows;
-    instrumentation.retained_bytes = instrumentation.peak_retained_bytes;
-    Ok(GraphTextScanPass {
-        graph_resource,
-        scope_binding,
-        directories_by_exact_relative,
-        files,
-        instrumentation,
-    })
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GraphTextScanPassInstrumentation {
+    bytes_read: u64,
+    bytes_hashed: u64,
 }
 
 fn reconciliation_scan_current_config_description(
     root: &Dir,
     aggregate_hashed_bytes: &mut u64,
-    instrumentation: &mut crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
+    instrumentation: &mut GraphTextScanPassInstrumentation,
+    limits: GraphTextScanLimits,
 ) -> io::Result<Option<BlobDescription>> {
     let mut logseq_name = None;
     let mut inspected = 0_usize;
@@ -25411,8 +24265,8 @@ fn reconciliation_scan_hash_file(
     expected_resource: ContentDigest,
     expected_link_count: u64,
     aggregate_hashed_bytes: &mut u64,
-    instrumentation: &mut crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
+    instrumentation: &mut GraphTextScanPassInstrumentation,
+    limits: GraphTextScanLimits,
 ) -> io::Result<BlobDescription> {
     let advertised_len = file.metadata()?.len();
     if advertised_len
@@ -25470,42 +24324,6 @@ fn reconciliation_scan_hash_file(
     ))
 }
 
-fn reconciliation_scan_update_peak(
-    instrumentation: &mut crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation,
-    directories: usize,
-    files: usize,
-    pending: usize,
-    retained_bytes: u64,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
-) -> io::Result<()> {
-    let rows = directories
-        .checked_add(files)
-        .and_then(|rows| rows.checked_add(pending))
-        .ok_or_else(|| reconciliation_scan_limit_error("retained fingerprint rows"))?;
-    if rows > limits.retained_rows {
-        return Err(reconciliation_scan_limit_error("retained fingerprint rows"));
-    }
-    instrumentation.peak_retained_rows = instrumentation.peak_retained_rows.max(rows as u64);
-    instrumentation.peak_retained_bytes = instrumentation.peak_retained_bytes.max(retained_bytes);
-    Ok(())
-}
-
-fn reconciliation_scan_add_retained_bytes(
-    current: u64,
-    growth: u64,
-    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
-) -> io::Result<u64> {
-    let next = current
-        .checked_add(growth)
-        .ok_or_else(|| reconciliation_scan_limit_error("retained fingerprint bytes"))?;
-    if next > limits.retained_bytes {
-        return Err(reconciliation_scan_limit_error(
-            "retained fingerprint bytes",
-        ));
-    }
-    Ok(next)
-}
-
 fn reconciliation_scan_limit_error(resource: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -25523,7 +24341,7 @@ fn reconciliation_scan_unsafe_error(detail: impl Into<String>) -> io::Error {
 // in the graph and not in the object store.  A spool is evidence for a later
 // author; it has no history/publication authority by itself.
 
-pub(crate) const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 1;
+pub(crate) const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 2;
 pub(crate) const BOOTSTRAP_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -25535,35 +24353,29 @@ pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORIES: u64 = 1_000_000;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH: usize = 256;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_PATH_BYTES: usize = 4096;
 const BOOTSTRAP_SOURCE_MAX_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
+const BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY: &str = "activation-pages";
 // Ordinary graphs sort each source spool in memory. Large captures retain the
 // external merge path once a single spool exceeds this measured threshold.
 const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const BOOTSTRAP_SOURCE_MAX_SORT_RUNS: u64 = 4096;
 const BOOTSTRAP_SOURCE_MERGE_INPUTS: usize = 32;
 const BOOTSTRAP_SOURCE_CURSOR_BUFFER_BYTES: usize = 64 * 1024;
-const BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY: &str = "bootstrap-source-capture-v1";
-const BOOTSTRAP_SOURCE_MANIFEST: &str = "capture-manifest.bin";
-const BOOTSTRAP_SOURCE_INVENTORY: &str = "inventory.sorted";
-const BOOTSTRAP_SOURCE_ENTRIES: &str = "entries.sorted";
-const BOOTSTRAP_SOURCE_CHUNKS: &str = "chunks.sorted";
-const BOOTSTRAP_SOURCE_CHUNK_DIRECTORY: &str = "source-chunks";
 
-#[cfg(test)]
 thread_local! {
     static BOOTSTRAP_SOURCE_IO_STAGE: std::cell::Cell<&'static str> =
         const { std::cell::Cell::new("bootstrap source capture not started") };
 }
 
-#[cfg(test)]
 fn note_bootstrap_source_io_stage(stage: &'static str) {
     BOOTSTRAP_SOURCE_IO_STAGE.with(|current| current.set(stage));
 }
 
-#[cfg(not(test))]
-fn note_bootstrap_source_io_stage(_stage: &'static str) {}
-
 #[cfg(test)]
 pub(crate) fn bootstrap_source_io_stage_for_test() -> &'static str {
+    BOOTSTRAP_SOURCE_IO_STAGE.with(std::cell::Cell::get)
+}
+
+fn bootstrap_source_io_stage() -> &'static str {
     BOOTSTRAP_SOURCE_IO_STAGE.with(std::cell::Cell::get)
 }
 
@@ -25577,6 +24389,7 @@ pub(crate) struct BootstrapSourceCaptureInstrumentation {
     pub(crate) sort_runs: u64,
     pub(crate) peak_owned_buffer_bytes: u64,
     pub(crate) peak_owned_rows: u64,
+    pub(crate) parser_calls: u64,
 }
 
 /// A sealed, private source capture.  It is intentionally crate-private until
@@ -25604,33 +24417,52 @@ impl BootstrapSourceCapture {
         self.source_files
     }
 
+    #[cfg(test)]
     pub(crate) fn source_chunk_count(&self) -> u64 {
         self.source_chunks
     }
 
+    #[cfg(test)]
     pub(crate) fn graph_resource(&self) -> CanonicalGraphResourceId {
         self.binding.graph_resource
     }
 
+    #[cfg(test)]
     pub(crate) fn inventory_description(&self) -> BlobDescription {
         self.inventory
     }
 
+    #[cfg(test)]
     pub(crate) fn entries_description(&self) -> BlobDescription {
         self.entries
     }
 
+    #[cfg(test)]
     pub(crate) fn chunks_description(&self) -> BlobDescription {
         self.chunks
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_identity(&self) -> io::Result<BlobDescription> {
         bootstrap_source_capture_id(self)
     }
 
-    /// Final hash-only proof for the later author.  It rereads every source
-    /// through a fresh retained graph capability and compares the complete
-    /// canonical inventory, entry, and chunk spools to the sealed A/B result.
+    /// Content- and policy-bound identity of a graph capture that is stable
+    /// across devices.  The ordinary capture identity also binds the retained
+    /// graph-root resource, file identities, and link counts because it proves
+    /// one local capture episode.  Those facts must not enter clean shared
+    /// authority: two devices can hold byte-identical synced trees at different
+    /// filesystem resources.  Clean activation therefore uses this portable
+    /// identity for its immutable baseline while retaining the stronger local
+    /// capture checks before that baseline is committed.
+    pub(crate) fn portable_capture_identity(&self) -> io::Result<BlobDescription> {
+        portable_bootstrap_source_capture_id(self)
+    }
+
+    /// Final hash-only proof before promotion. It rereads every source through
+    /// a fresh retained graph capability and compares the complete canonical
+    /// inventory and chunk spools to the sealed initial capture. Parser-owned
+    /// entry records are intentionally initial-capture-only.
     pub(crate) fn verify_before_inactive_bootstrap_authoring(
         &self,
         graph: &Graph,
@@ -25660,6 +24492,30 @@ impl BootstrapSourceCapture {
             .join(hex_digest(chunk.description.sha256()));
         BootstrapSourceChunkReader::open(path, chunk.description)
     }
+
+    pub(crate) fn read_activation_page(&self, entry: &BootstrapSourceEntry) -> io::Result<Vec<u8>> {
+        let description = entry.activation_page_description();
+        let path = self
+            .sealed_directory
+            .join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY)
+            .join(hex_digest(description.sha256()));
+        verify_capture_file(&path, description)?;
+        fs::read(path)
+    }
+
+    /// Consume and remove the sealed private capture after another authority
+    /// has committed the same exact source bytes. Cleanup is deliberately a
+    /// separate, post-commit operation: failure can leave only disposable
+    /// evidence and must never revoke the authority that was just published.
+    pub(crate) fn discard(self) -> io::Result<()> {
+        let scratch_directory = self.scratch_directory.clone();
+        drop(self);
+        match fs::remove_dir_all(scratch_directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25671,6 +24527,7 @@ pub(crate) struct BootstrapSourceEntry {
     file_resource: ContentDigest,
     link_count: u64,
     chunk_count: u32,
+    activation_page: BlobDescription,
 }
 
 impl BootstrapSourceEntry {
@@ -25692,16 +24549,22 @@ impl BootstrapSourceEntry {
         self.description
     }
 
+    #[cfg(test)]
     pub(crate) fn file_resource(&self) -> ContentDigest {
         self.file_resource
     }
 
+    #[cfg(test)]
     pub(crate) fn link_count(&self) -> u64 {
         self.link_count
     }
 
     pub(crate) fn chunk_count(&self) -> u32 {
         self.chunk_count
+    }
+
+    pub(crate) fn activation_page_description(&self) -> BlobDescription {
+        self.activation_page
     }
 }
 
@@ -25721,6 +24584,7 @@ impl BootstrapSourceChunk {
         self.ordinal
     }
 
+    #[cfg(test)]
     pub(crate) fn description(&self) -> BlobDescription {
         self.description
     }
@@ -25966,7 +24830,6 @@ impl BootstrapSourcePassPaths {
 }
 
 struct BootstrapSourcePass {
-    binding: BootstrapSourceCaptureBinding,
     paths: BootstrapSourcePassPaths,
     source_files: u64,
     source_chunks: u64,
@@ -26061,14 +24924,13 @@ fn current_bootstrap_source_config_description(
             "graph has no retained no-follow projection capability",
         )
     })?;
-    let mut instrumentation =
-        crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation::default();
+    let mut instrumentation = GraphTextScanPassInstrumentation::default();
     let mut hashed = 0_u64;
     reconciliation_scan_current_config_description(
         root,
         &mut hashed,
         &mut instrumentation,
-        crate::oplog::reconciliation_scan::GraphTextScanLimits::default(),
+        GraphTextScanLimits::default(),
     )
 }
 
@@ -26094,6 +24956,22 @@ fn capture_inactive_bootstrap_sources(
     graph: &Graph,
     scratch: &Path,
 ) -> io::Result<BootstrapSourceCapture> {
+    note_bootstrap_source_io_stage("prepare bootstrap source capture");
+    capture_inactive_bootstrap_sources_inner(graph, scratch).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "bootstrap source capture failed during `{}`: {error}",
+                bootstrap_source_io_stage()
+            ),
+        )
+    })
+}
+
+fn capture_inactive_bootstrap_sources_inner(
+    graph: &Graph,
+    scratch: &Path,
+) -> io::Result<BootstrapSourceCapture> {
     require_projection_platform()?;
     note_bootstrap_source_io_stage("prepare bootstrap source scratch");
     let scratch = prepare_bootstrap_source_scratch(scratch)?;
@@ -26113,25 +24991,22 @@ fn capture_inactive_bootstrap_sources(
     fs::create_dir(&working)?;
     note_bootstrap_source_io_stage("create bootstrap source chunk directory");
     fs::create_dir(working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY))?;
+    note_bootstrap_source_io_stage("create bootstrap activation-page directory");
+    fs::create_dir(working.join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY))?;
 
-    note_bootstrap_source_io_stage("collect bootstrap source pass A");
-    let first = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
-    bootstrap_source_capture_between_passes_hook()?;
-    note_bootstrap_source_io_stage("collect bootstrap source pass B");
-    let second = collect_bootstrap_source_pass(graph, &working, "capture-b", &binding, false)?;
-    note_bootstrap_source_io_stage("compare bootstrap source passes");
-    compare_bootstrap_source_passes(&first, &second)?;
+    note_bootstrap_source_io_stage("collect bootstrap source capture");
+    let captured = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
+    bootstrap_source_capture_after_initial_pass_hook()?;
     note_bootstrap_source_io_stage("revalidate bootstrap source binding after capture");
     require_current_bootstrap_source_binding(graph, &binding)?;
 
-    let inventory =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Inventory))?;
+    let inventory = describe_bootstrap_source_spool(
+        &captured.paths.sorted(BootstrapSourceSpoolKind::Inventory),
+    )?;
     let entries =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Entries))?;
+        describe_bootstrap_source_spool(&captured.paths.sorted(BootstrapSourceSpoolKind::Entries))?;
     let chunks =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Chunks))?;
-    let mut instrumentation = first.instrumentation.clone();
-    bootstrap_source_add_instrumentation(&mut instrumentation, &second.instrumentation)?;
+        describe_bootstrap_source_spool(&captured.paths.sorted(BootstrapSourceSpoolKind::Chunks))?;
     let capture = BootstrapSourceCapture {
         sealed_directory: PathBuf::new(),
         scratch_directory: scratch.clone(),
@@ -26139,9 +25014,9 @@ fn capture_inactive_bootstrap_sources(
         inventory,
         entries,
         chunks,
-        source_files: first.source_files,
-        source_chunks: first.source_chunks,
-        instrumentation,
+        source_files: captured.source_files,
+        source_chunks: captured.source_chunks,
+        instrumentation: captured.instrumentation,
     };
     note_bootstrap_source_io_stage("seal bootstrap source capture");
     seal_bootstrap_source_capture(&working, capture)
@@ -26167,41 +25042,6 @@ fn prepare_bootstrap_source_scratch(scratch: &Path) -> io::Result<PathBuf> {
         Err(error) => return Err(error),
     }
     Ok(root)
-}
-
-fn bootstrap_source_add_instrumentation(
-    total: &mut BootstrapSourceCaptureInstrumentation,
-    pass: &BootstrapSourceCaptureInstrumentation,
-) -> io::Result<()> {
-    total.physical_bytes = total
-        .physical_bytes
-        .checked_add(pass.physical_bytes)
-        .ok_or_else(|| bootstrap_source_capture_error("source physical-byte counter overflow"))?;
-    total.files = total
-        .files
-        .checked_add(pass.files)
-        .ok_or_else(|| bootstrap_source_capture_error("source file counter overflow"))?;
-    total.passes = total
-        .passes
-        .checked_add(pass.passes)
-        .ok_or_else(|| bootstrap_source_capture_error("source pass counter overflow"))?;
-    total.chunks = total
-        .chunks
-        .checked_add(pass.chunks)
-        .ok_or_else(|| bootstrap_source_capture_error("source chunk counter overflow"))?;
-    total.spool_bytes = total
-        .spool_bytes
-        .checked_add(pass.spool_bytes)
-        .ok_or_else(|| bootstrap_source_capture_error("source spool-byte counter overflow"))?;
-    total.sort_runs = total
-        .sort_runs
-        .checked_add(pass.sort_runs)
-        .ok_or_else(|| bootstrap_source_capture_error("source sort-run counter overflow"))?;
-    total.peak_owned_buffer_bytes = total
-        .peak_owned_buffer_bytes
-        .max(pass.peak_owned_buffer_bytes);
-    total.peak_owned_rows = total.peak_owned_rows.max(pass.peak_owned_rows);
-    Ok(())
 }
 
 struct BootstrapSourceWalkState {
@@ -26292,6 +25132,7 @@ fn collect_bootstrap_source_pass(
         &mut writers,
         &mut state,
         &working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
+        &working.join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY),
         seal_chunks,
     )?;
     note_bootstrap_source_io_stage("sync bootstrap source raw spool writers");
@@ -26322,7 +25163,7 @@ fn collect_bootstrap_source_pass(
     note_bootstrap_source_io_stage("validate bootstrap source sorted entries");
     validate_bootstrap_source_sorted_entries(
         &paths.sorted(BootstrapSourceSpoolKind::Entries),
-        state.source_files,
+        if seal_chunks { state.source_files } else { 0 },
     )?;
     note_bootstrap_source_io_stage("validate bootstrap source sorted chunks");
     validate_bootstrap_source_sorted_chunks(
@@ -26332,7 +25173,6 @@ fn collect_bootstrap_source_pass(
     note_bootstrap_source_io_stage("revalidate bootstrap source binding after pass");
     require_current_bootstrap_source_binding(graph, binding)?;
     Ok(BootstrapSourcePass {
-        binding: binding.clone(),
         paths,
         source_files: state.source_files,
         source_chunks: state.source_chunks,
@@ -26348,6 +25188,7 @@ fn walk_bootstrap_source_directory(
     writers: &mut BootstrapSourcePassWriters,
     state: &mut BootstrapSourceWalkState,
     chunks_directory: &Path,
+    activation_pages_directory: &Path,
     seal_chunks: bool,
 ) -> io::Result<()> {
     note_bootstrap_source_io_stage("open bootstrap source directory cursor");
@@ -26508,7 +25349,7 @@ fn walk_bootstrap_source_directory(
         if is_source {
             let path = source_path.expect("source path was just checked");
             note_bootstrap_source_io_stage("capture bootstrap source file");
-            let (logical_name, kind, description, chunk_count) = capture_bootstrap_source_file(
+            let captured = capture_bootstrap_source_file(
                 graph,
                 file,
                 &path,
@@ -26517,6 +25358,7 @@ fn walk_bootstrap_source_directory(
                 writers,
                 state,
                 chunks_directory,
+                activation_pages_directory,
                 seal_chunks,
             )?;
             write_bootstrap_source_inventory_file(
@@ -26524,28 +25366,31 @@ fn walk_bootstrap_source_directory(
                 &child_relative,
                 resource,
                 link_count,
-                Some((kind, description)),
+                Some(captured.description),
                 &mut state.instrumentation,
             )?;
-            write_bootstrap_source_entry(
-                &mut writers.entries,
-                &BootstrapSourceEntry {
-                    path: path.clone(),
-                    kind,
-                    logical_name,
-                    description,
-                    file_resource: resource,
-                    link_count,
-                    chunk_count,
-                },
-                &mut state.instrumentation,
-            )?;
-            write_bootstrap_source_portable(
-                &mut writers.portable,
-                &path.portable_key(),
-                path.as_str(),
-                &mut state.instrumentation,
-            )?;
+            if let Some(semantic) = captured.semantic {
+                write_bootstrap_source_entry(
+                    &mut writers.entries,
+                    &BootstrapSourceEntry {
+                        path: path.clone(),
+                        kind: semantic.kind,
+                        logical_name: semantic.logical_name,
+                        description: captured.description,
+                        file_resource: resource,
+                        link_count,
+                        chunk_count: captured.chunk_count,
+                        activation_page: semantic.activation_page,
+                    },
+                    &mut state.instrumentation,
+                )?;
+                write_bootstrap_source_portable(
+                    &mut writers.portable,
+                    &path.portable_key(),
+                    path.as_str(),
+                    &mut state.instrumentation,
+                )?;
+            }
         } else {
             write_bootstrap_source_inventory_file(
                 &mut writers.inventory,
@@ -26560,6 +25405,18 @@ fn walk_bootstrap_source_directory(
     Ok(())
 }
 
+struct CapturedBootstrapSourceSemantic {
+    logical_name: String,
+    kind: ManagedTextKind,
+    activation_page: BlobDescription,
+}
+
+struct CapturedBootstrapSourceFile {
+    description: BlobDescription,
+    chunk_count: u32,
+    semantic: Option<CapturedBootstrapSourceSemantic>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_bootstrap_source_file(
     graph: &Graph,
@@ -26570,8 +25427,9 @@ fn capture_bootstrap_source_file(
     writers: &mut BootstrapSourcePassWriters,
     state: &mut BootstrapSourceWalkState,
     chunks_directory: &Path,
+    activation_pages_directory: &Path,
     seal_chunks: bool,
-) -> io::Result<(String, ManagedTextKind, BlobDescription, u32)> {
+) -> io::Result<CapturedBootstrapSourceFile> {
     let advertised_len = file.metadata()?.len();
     if advertised_len > BOOTSTRAP_SOURCE_MAX_FILE_BYTES {
         return Err(bootstrap_source_capture_error(format!(
@@ -26646,31 +25504,68 @@ fn capture_bootstrap_source_file(
             "source file changed while captured: {path}"
         )));
     }
-    let content = std::str::from_utf8(&bytes).map_err(|_| {
-        bootstrap_source_capture_error(format!("source graph text is not UTF-8: {path}"))
-    })?;
     let live_bytes = actual_len
         .checked_add(BOOTSTRAP_SOURCE_CHUNK_BYTES as u64)
         .ok_or_else(|| bootstrap_source_capture_error("source working-byte counter overflow"))?;
-    let permit = bootstrap_source_parse_budget_permit(graph, path, content)?;
-    let (semantic, _, node_count) =
-        graph.decode_present_graph_text_with_node_count(path, &bytes, permit)?;
-    if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
-        return Err(bootstrap_source_capture_error(format!(
-            "source parser-node cap exceeded: {path}"
-        )));
-    }
-    state.instrumentation.peak_owned_rows = state.instrumentation.peak_owned_rows.max(node_count);
-    let kind = match semantic.kind {
-        PageKind::Page => ManagedTextKind::Page,
-        PageKind::Journal => ManagedTextKind::Journal,
+    let semantic = if seal_chunks {
+        let content = std::str::from_utf8(&bytes).map_err(|_| {
+            bootstrap_source_capture_error(format!("source graph text is not UTF-8: {path}"))
+        })?;
+        // Retain the same conservative parse budget at the source boundary,
+        // but hand the actual parser tree to activation instead of dropping it
+        // and parsing the sealed bytes again.
+        let permit = bootstrap_source_parse_budget_permit(graph, path, content)?;
+        let record = crate::oplog::import::capture_activation_page_record(graph, path, &bytes)?;
+        state.instrumentation.parser_calls = state
+            .instrumentation
+            .parser_calls
+            .checked_add(1)
+            .ok_or_else(|| bootstrap_source_capture_error("source parser-call overflow"))?;
+        if record.node_count() as u64 > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+            return Err(bootstrap_source_capture_error(format!(
+                "source parser-node cap exceeded: {path}"
+            )));
+        }
+        state.instrumentation.peak_owned_rows = state
+            .instrumentation
+            .peak_owned_rows
+            .max(record.node_count() as u64);
+        let logical_name = record.logical_name().to_owned();
+        let logical_name_allocation = checked_add_bytes(
+            usize_to_u64(std::mem::size_of::<String>())?,
+            usize_to_u64(logical_name.capacity())?,
+        )?;
+        if usize_to_u64(logical_name.len())? > permit.semantic_name_bytes
+            || logical_name_allocation > permit.semantic_name_allocation_bytes
+        {
+            return Err(bootstrap_source_capture_error(
+                "rendered semantic title exceeds source capture budget",
+            ));
+        }
+        validate_bootstrap_source_logical_name(&logical_name)?;
+        let activation_page =
+            seal_bootstrap_activation_page(activation_pages_directory, record.encoded())?;
+        Some(CapturedBootstrapSourceSemantic {
+            logical_name,
+            kind: record.kind(),
+            activation_page,
+        })
+    } else {
+        // The final concurrency proof compares the exact path inventory and
+        // byte/chunk descriptions. The initial capture already established
+        // parser admissibility under the same bound configuration, so parsing
+        // here would prove nothing additional.
+        None
     };
-    let logical_name = semantic.name;
-    validate_bootstrap_source_logical_name(&logical_name)?;
-    let logical_name_allocation =
-        owned_string_len_upper_bound(u64::try_from(logical_name.capacity()).map_err(|_| {
-            bootstrap_source_capture_error("logical source name allocation overflow")
-        })?)?;
+    let logical_name_allocation = semantic
+        .as_ref()
+        .map(|semantic| {
+            owned_string_len_upper_bound(u64::try_from(semantic.logical_name.capacity()).map_err(
+                |_| bootstrap_source_capture_error("logical source name allocation overflow"),
+            )?)
+        })
+        .transpose()?
+        .unwrap_or(0);
     state.source_files += 1;
     state.total_source_bytes = next_total;
     state.instrumentation.files += 1;
@@ -26696,12 +25591,28 @@ fn capture_bootstrap_source_file(
                     bootstrap_source_capture_error("source working-byte counter overflow")
                 })?,
         );
-    Ok((
-        logical_name,
-        kind,
-        BlobDescription::from_parts(hasher.finalize().into(), actual_len),
+    Ok(CapturedBootstrapSourceFile {
+        description: BlobDescription::from_parts(hasher.finalize().into(), actual_len),
         chunk_count,
-    ))
+        semantic,
+    })
+}
+
+fn seal_bootstrap_activation_page(directory: &Path, bytes: &[u8]) -> io::Result<BlobDescription> {
+    let description = BlobDescription::of(bytes);
+    let destination = directory.join(hex_digest(description.sha256()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file.write_all(bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_capture_file(&destination, description)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(description)
 }
 
 fn bootstrap_source_parse_budget_permit(
@@ -26760,7 +25671,7 @@ fn write_bootstrap_source_inventory_file(
     path: &str,
     resource: ContentDigest,
     link_count: u64,
-    source: Option<(ManagedTextKind, BlobDescription)>,
+    source: Option<BlobDescription>,
     instrumentation: &mut BootstrapSourceCaptureInstrumentation,
 ) -> io::Result<()> {
     let mut frame = BootstrapSourceEncoder::new(2);
@@ -26769,8 +25680,11 @@ fn write_bootstrap_source_inventory_file(
     frame.u64(link_count);
     match source {
         None => frame.u8(0),
-        Some((kind, description)) => {
-            frame.u8(managed_text_kind_tag(kind));
+        Some(description) => {
+            // Inventory is the exact-byte concurrency proof. Parser-derived
+            // kind belongs only to the initial activation-page record, so a
+            // final proof can reproduce this row without parsing.
+            frame.u8(1);
             frame.description(description);
         }
     }
@@ -26791,6 +25705,7 @@ fn write_bootstrap_source_entry(
     frame.digest(entry.file_resource);
     frame.u64(entry.link_count);
     frame.u32(entry.chunk_count);
+    frame.description(entry.activation_page);
     write_bootstrap_source_frame_accounted(file, frame.finish(), instrumentation)
 }
 
@@ -27017,6 +25932,7 @@ fn decode_bootstrap_source_entry(frame: &[u8]) -> io::Result<BootstrapSourceEntr
     let file_resource = decoder.digest()?;
     let link_count = decoder.u64()?;
     let chunk_count = decoder.u32()?;
+    let activation_page = decoder.description()?;
     decoder.finish()?;
     if link_count != 1 {
         return Err(bootstrap_source_capture_error(
@@ -27031,6 +25947,7 @@ fn decode_bootstrap_source_entry(frame: &[u8]) -> io::Result<BootstrapSourceEntr
         file_resource,
         link_count,
         chunk_count,
+        activation_page,
     })
 }
 
@@ -27365,7 +26282,7 @@ fn bootstrap_source_inventory_key(frame: &[u8]) -> io::Result<(&str, u8)> {
             }
             match decoder.u8()? {
                 0 => {}
-                1 | 2 => {
+                1 => {
                     let _ = decoder.description()?;
                 }
                 _ => {
@@ -27393,6 +26310,7 @@ fn bootstrap_source_entry_key(frame: &[u8]) -> io::Result<&str> {
     let _ = decoder.digest()?;
     let _ = decoder.u64()?;
     let _ = decoder.u32()?;
+    let _ = decoder.description()?;
     decoder.finish()?;
     Ok(path)
 }
@@ -27562,33 +26480,6 @@ fn describe_bootstrap_source_file(
     ))
 }
 
-fn compare_bootstrap_source_passes(
-    first: &BootstrapSourcePass,
-    second: &BootstrapSourcePass,
-) -> io::Result<()> {
-    if first.binding != second.binding
-        || first.source_files != second.source_files
-        || first.source_chunks != second.source_chunks
-    {
-        return Err(bootstrap_source_capture_interrupted(
-            "source capture bindings or counts changed between A and B",
-        ));
-    }
-    for kind in [
-        BootstrapSourceSpoolKind::Inventory,
-        BootstrapSourceSpoolKind::Entries,
-        BootstrapSourceSpoolKind::Chunks,
-    ] {
-        if !bootstrap_source_files_equal(&first.paths.sorted(kind), &second.paths.sorted(kind))? {
-            return Err(bootstrap_source_capture_interrupted(format!(
-                "source capture A/B {} evidence differs",
-                kind.label()
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn bootstrap_source_files_equal(left: &Path, right: &Path) -> io::Result<bool> {
     if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
@@ -27707,12 +26598,140 @@ fn bootstrap_source_capture_id(capture: &BootstrapSourceCapture) -> io::Result<B
     ))
 }
 
+fn portable_bootstrap_source_capture_id(
+    capture: &BootstrapSourceCapture,
+) -> io::Result<BlobDescription> {
+    const SCHEMA: u32 = 1;
+    struct PortableHasher {
+        hasher: Sha256,
+        length: u64,
+    }
+    impl PortableHasher {
+        fn raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.length = self.length.checked_add(bytes.len() as u64).ok_or_else(|| {
+                bootstrap_source_capture_error("portable capture length overflow")
+            })?;
+            self.hasher.update(bytes);
+            Ok(())
+        }
+
+        fn u8(&mut self, value: u8) -> io::Result<()> {
+            self.raw(&[value])
+        }
+
+        fn u32(&mut self, value: u32) -> io::Result<()> {
+            self.raw(&value.to_be_bytes())
+        }
+
+        fn u64(&mut self, value: u64) -> io::Result<()> {
+            self.raw(&value.to_be_bytes())
+        }
+
+        fn string(&mut self, value: &str) -> io::Result<()> {
+            let length = u32::try_from(value.len()).map_err(|_| {
+                bootstrap_source_capture_error("portable capture string is too long")
+            })?;
+            self.u32(length)?;
+            self.raw(value.as_bytes())
+        }
+
+        fn description(&mut self, value: BlobDescription) -> io::Result<()> {
+            self.raw(value.sha256())?;
+            self.u64(value.byte_length())
+        }
+    }
+
+    let mut encoded = PortableHasher {
+        hasher: Sha256::new(),
+        length: 0,
+    };
+    encoded
+        .hasher
+        .update(b"tine/portable-bootstrap-source-capture/v1\0");
+    encoded.u32(SCHEMA)?;
+    let scope = capture.binding.scope_binding;
+    encoded.u32(scope.binding_schema_version())?;
+    encoded.u32(scope.policy_version())?;
+    encoded.u32(scope.portable_path_key_version())?;
+    let normalization = scope.normalization_unicode_version();
+    for component in [normalization.0, normalization.1, normalization.2] {
+        encoded.u64(component)?;
+    }
+    let case_fold = scope.case_fold_unicode_version();
+    for component in [case_fold.0, case_fold.1, case_fold.2] {
+        encoded.u64(component)?;
+    }
+    encoded.raw(scope.effective_policy_digest())?;
+    match capture.binding.config_description {
+        Some(description) => {
+            encoded.u8(1)?;
+            encoded.description(description)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    encoded.string(&capture.binding.pages_dir)?;
+    encoded.string(&capture.binding.journals_dir)?;
+    encoded.u8(match capture.binding.file_name_format {
+        FileNameFormat::Legacy => 0,
+        FileNameFormat::TripleLowbar => 1,
+    })?;
+    match &capture.binding.journal_file_name_format {
+        Some(value) => {
+            encoded.u8(1)?;
+            encoded.string(value)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    match &capture.binding.journal_page_title_format {
+        Some(value) => {
+            encoded.u8(1)?;
+            encoded.string(value)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    encoded.u64(capture.source_files)?;
+    let mut entries = capture.entries_cursor()?;
+    let mut observed = 0_u64;
+    while let Some(entry) = entries.next()? {
+        observed = observed.checked_add(1).ok_or_else(|| {
+            bootstrap_source_capture_error("portable capture entry count overflow")
+        })?;
+        encoded.string(entry.path.as_str())?;
+        encoded.u8(managed_text_kind_tag(entry.kind))?;
+        encoded.string(&entry.logical_name)?;
+        encoded.description(entry.description)?;
+        encoded.u32(entry.chunk_count)?;
+        encoded.description(entry.activation_page)?;
+    }
+    if observed != capture.source_files {
+        return Err(bootstrap_source_capture_error(
+            "portable capture entry count differs from sealed capture",
+        ));
+    }
+    Ok(BlobDescription::from_parts(
+        encoded.hasher.finalize().into(),
+        encoded.length,
+    ))
+}
+
 fn validate_bootstrap_source_chunk_files(directory: &Path, chunks: &Path) -> io::Result<()> {
     let mut cursor = BootstrapSourceChunkCursor::open(chunks.to_path_buf())?;
     while let Some(chunk) = cursor.next()? {
         verify_capture_file(
             &directory.join(hex_digest(chunk.description.sha256())),
             chunk.description,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_activation_page_files(directory: &Path, entries: &Path) -> io::Result<()> {
+    let mut cursor = BootstrapSourceEntryCursor::open(entries.to_path_buf())?;
+    while let Some(entry) = cursor.next()? {
+        let description = entry.activation_page_description();
+        verify_capture_file(
+            &directory.join(hex_digest(description.sha256())),
+            description,
         )?;
     }
     Ok(())
@@ -27754,7 +26773,240 @@ fn validate_sealed_bootstrap_source_capture(capture: &BootstrapSourceCapture) ->
             .sealed_directory
             .join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
         &capture.sealed_directory.join(BOOTSTRAP_SOURCE_CHUNKS),
+    )?;
+    validate_bootstrap_activation_page_files(
+        &capture
+            .sealed_directory
+            .join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY),
+        &capture.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES),
     )
+}
+
+/// How many differing rows one capture-change refusal names. The refusal has to
+/// fit in a log line and a toast; the row count is reported in full so a large
+/// difference is never mistaken for a small one.
+const BOOTSTRAP_SOURCE_CHANGE_REPORT_ROWS: usize = 4;
+/// How much of a path one reported row carries. Long enough to identify a page
+/// in an ordinary graph, short enough that four rows stay readable.
+const BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES: usize = 120;
+
+/// Render one reported path so that two spellings can never read as one.
+///
+/// The device evidence this reporting exists for printed
+/// `pages/\u{17d} pilot notes #pilot.md` on BOTH sides of a `changed:` row. The
+/// graph held two files whose names differ only by Unicode normalization
+/// (`U+017D` against `Z` + `U+030C`), and both render as the same glyph in
+/// every log, terminal and issue tracker — so the refusal named a row nobody
+/// could tell apart from its neighbour, and the first reading of it was wrong.
+/// Escaping every non-ASCII scalar makes the two spellings different strings.
+/// ASCII paths, which are the overwhelming majority, are untouched.
+fn bootstrap_source_change_report_path(path: &str) -> String {
+    let rendered = if path.is_ascii() {
+        path.to_owned()
+    } else {
+        let mut rendered = String::with_capacity(path.len());
+        for character in path.chars() {
+            if character.is_ascii() {
+                rendered.push(character);
+            } else {
+                rendered.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+        }
+        rendered
+    };
+    if rendered.len() <= BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES {
+        return rendered;
+    }
+    let mut end = BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES;
+    while end > 0 && !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &rendered[..end])
+}
+
+fn bootstrap_source_change_report_digest(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Render one sorted-spool row in the shape the refusal reports.
+///
+/// Only fields the final proof actually compares appear here: the exact path,
+/// the filesystem resource identity, the link count, and the content
+/// description. Nothing derived from the parser is in the inventory at all.
+fn render_bootstrap_source_spool_row(
+    kind: BootstrapSourceSpoolKind,
+    frame: &[u8],
+) -> io::Result<String> {
+    match kind {
+        BootstrapSourceSpoolKind::Inventory => {
+            let tag = *frame
+                .first()
+                .ok_or_else(|| bootstrap_source_capture_error("empty source inventory record"))?;
+            let mut decoder = BootstrapSourceDecoder::new(frame, tag)?;
+            match tag {
+                1 => {
+                    let path = decoder.string()?;
+                    let resource = decoder.digest()?;
+                    decoder.finish()?;
+                    Ok(format!(
+                        "dir {} resource:{}",
+                        bootstrap_source_change_report_path(path),
+                        bootstrap_source_change_report_digest(resource.as_bytes())
+                    ))
+                }
+                2 => {
+                    let path = decoder.string()?;
+                    let resource = decoder.digest()?;
+                    let link_count = decoder.u64()?;
+                    let source = match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.description()?),
+                        _ => {
+                            return Err(bootstrap_source_capture_error(
+                                "invalid source inventory source flag",
+                            ))
+                        }
+                    };
+                    decoder.finish()?;
+                    let content = match source {
+                        None => "none".to_owned(),
+                        Some(description) => format!(
+                            "{}@{}",
+                            bootstrap_source_change_report_digest(description.sha256()),
+                            description.byte_length()
+                        ),
+                    };
+                    Ok(format!(
+                        "file {} resource:{} links:{link_count} content:{content}",
+                        bootstrap_source_change_report_path(path),
+                        bootstrap_source_change_report_digest(resource.as_bytes())
+                    ))
+                }
+                _ => Err(bootstrap_source_capture_error(
+                    "unexpected source inventory record tag",
+                )),
+            }
+        }
+        BootstrapSourceSpoolKind::Chunks => {
+            let chunk = decode_bootstrap_source_chunk(frame)?;
+            Ok(format!(
+                "chunk {}#{} content:{}@{}",
+                bootstrap_source_change_report_path(chunk.path.as_str()),
+                chunk.ordinal,
+                bootstrap_source_change_report_digest(chunk.description.sha256()),
+                chunk.description.byte_length()
+            ))
+        }
+        BootstrapSourceSpoolKind::Entries
+        | BootstrapSourceSpoolKind::Aliases
+        | BootstrapSourceSpoolKind::Portable => Err(bootstrap_source_capture_error(
+            "spool kind carries no capture-change report",
+        )),
+    }
+}
+
+fn bootstrap_source_change_report_key(
+    kind: BootstrapSourceSpoolKind,
+    frame: &[u8],
+) -> io::Result<(String, u32)> {
+    match kind {
+        BootstrapSourceSpoolKind::Inventory => {
+            let (path, tag) = bootstrap_source_inventory_key(frame)?;
+            Ok((path.to_owned(), u32::from(tag)))
+        }
+        BootstrapSourceSpoolKind::Chunks => {
+            let (path, ordinal) = bootstrap_source_chunk_key(frame)?;
+            Ok((path.to_owned(), ordinal))
+        }
+        BootstrapSourceSpoolKind::Entries
+        | BootstrapSourceSpoolKind::Aliases
+        | BootstrapSourceSpoolKind::Portable => Err(bootstrap_source_capture_error(
+            "spool kind carries no capture-change report",
+        )),
+    }
+}
+
+/// Name what changed under a live activation between the sealed capture and the
+/// final proof.
+///
+/// Both spools are sorted by the same key, so one merge walk localises every
+/// difference: a row only the sealed capture has (the file or directory is
+/// gone), a row only the recapture has (something appeared), and a row both
+/// have whose bytes differ (identity, link count or content moved). Reporting
+/// runs only on the refusal path.
+fn describe_bootstrap_source_spool_change(
+    kind: BootstrapSourceSpoolKind,
+    sealed: &Path,
+    recaptured: &Path,
+) -> io::Result<String> {
+    let mut sealed_reader = BootstrapSourceFrameReader::open(sealed)?;
+    let mut recaptured_reader = BootstrapSourceFrameReader::open(recaptured)?;
+    let mut sealed_frame = sealed_reader.next()?;
+    let mut recaptured_frame = recaptured_reader.next()?;
+    let mut differences = 0_u64;
+    let mut reported = Vec::new();
+    let mut report = |line: String| {
+        if reported.len() < BOOTSTRAP_SOURCE_CHANGE_REPORT_ROWS {
+            reported.push(line);
+        }
+    };
+    loop {
+        let order = match (&sealed_frame, &recaptured_frame) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(sealed), Some(recaptured)) => bootstrap_source_change_report_key(kind, sealed)?
+                .cmp(&bootstrap_source_change_report_key(kind, recaptured)?),
+        };
+        match order {
+            std::cmp::Ordering::Less => {
+                let frame = sealed_frame.take().expect("sealed row is present");
+                differences = differences.saturating_add(1);
+                report(format!(
+                    "gone: {}",
+                    render_bootstrap_source_spool_row(kind, &frame)?
+                ));
+                sealed_frame = sealed_reader.next()?;
+            }
+            std::cmp::Ordering::Greater => {
+                let frame = recaptured_frame.take().expect("recaptured row is present");
+                differences = differences.saturating_add(1);
+                report(format!(
+                    "appeared: {}",
+                    render_bootstrap_source_spool_row(kind, &frame)?
+                ));
+                recaptured_frame = recaptured_reader.next()?;
+            }
+            std::cmp::Ordering::Equal => {
+                let sealed_row = sealed_frame.take().expect("sealed row is present");
+                let recaptured_row = recaptured_frame.take().expect("recaptured row is present");
+                if sealed_row != recaptured_row {
+                    differences = differences.saturating_add(1);
+                    report(format!(
+                        "changed: {} -> {}",
+                        render_bootstrap_source_spool_row(kind, &sealed_row)?,
+                        render_bootstrap_source_spool_row(kind, &recaptured_row)?
+                    ));
+                }
+                sealed_frame = sealed_reader.next()?;
+                recaptured_frame = recaptured_reader.next()?;
+            }
+        }
+    }
+    if differences == 0 {
+        // The byte comparison and this walk disagree, which is itself the
+        // report: the spools differ somewhere the sorted key does not describe.
+        return Ok("rows compare equal but the sorted spools differ".to_owned());
+    }
+    Ok(format!(
+        "{differences} row(s) differ; first {}: {}",
+        reported.len(),
+        reported.join("; ")
+    ))
 }
 
 fn encode_bootstrap_source_manifest(capture: &BootstrapSourceCapture) -> io::Result<Vec<u8>> {
@@ -27801,61 +27053,18 @@ fn encode_bootstrap_source_manifest(capture: &BootstrapSourceCapture) -> io::Res
     Ok(frame.finish())
 }
 
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    crate::filesystem_durability::sync_private_tree(path)
+}
+
 fn sync_bootstrap_source_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    sync_projection_directory_required(&directory)
+    crate::filesystem_durability::sync_reconstructible_directory(&directory)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
-    use std::os::fd::{AsFd as _, AsRawFd as _};
-
-    let directory = fs::File::open(path)?;
-    // SAFETY: the opened directory descriptor names the filesystem holding
-    // every authenticated spool, chunk, and directory in the capture prefix.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(bootstrap_source_capture_error(
-                "source capture prefix contains a symlink",
-            ));
-        }
-        if metadata.is_dir() {
-            flush_bootstrap_source_prefix(&child)?;
-        } else if metadata.is_file() {
-            sync_bootstrap_source_regular_file(&child)?;
-        } else {
-            return Err(bootstrap_source_capture_error(
-                "source capture prefix contains a non-file entry",
-            ));
-        }
-    }
-    sync_bootstrap_source_directory(path)
-}
-
-#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(test)]
 fn sync_bootstrap_source_regular_file(path: &Path) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    // Rust's Windows `File::sync_all` calls `FlushFileBuffers`, which requires
-    // a handle with write access. `File::open` supplies only `GENERIC_READ` and
-    // therefore reports `ERROR_ACCESS_DENIED` even for our writable capture
-    // artifacts. Keep the narrower read-only handle on other platforms.
-    #[cfg(windows)]
-    options.write(true);
-    options.open(path)?.sync_all()
+    crate::filesystem_durability::sync_regular_file(path)
 }
 
 fn verify_bootstrap_source_capture(
@@ -27875,24 +27084,32 @@ fn verify_bootstrap_source_capture(
     if current.source_files != capture.source_files
         || current.source_chunks != capture.source_chunks
     {
-        return Err(bootstrap_source_capture_interrupted(
-            "source capture changed before final hash-only proof",
-        ));
+        return Err(bootstrap_source_capture_interrupted(format!(
+            "source capture changed before final hash-only proof: source files {}->{}, \
+             source chunks {}->{}",
+            capture.source_files,
+            current.source_files,
+            capture.source_chunks,
+            current.source_chunks
+        )));
     }
     for (kind, sealed) in [
         (
             BootstrapSourceSpoolKind::Inventory,
             BOOTSTRAP_SOURCE_INVENTORY,
         ),
-        (BootstrapSourceSpoolKind::Entries, BOOTSTRAP_SOURCE_ENTRIES),
         (BootstrapSourceSpoolKind::Chunks, BOOTSTRAP_SOURCE_CHUNKS),
     ] {
-        if !bootstrap_source_files_equal(
-            &current.paths.sorted(kind),
-            &capture.sealed_directory.join(sealed),
-        )? {
+        let recaptured = current.paths.sorted(kind);
+        let sealed = capture.sealed_directory.join(sealed);
+        if !bootstrap_source_files_equal(&recaptured, &sealed)? {
+            // A bare "something changed" is unactionable: this refusal is
+            // Retryable, so the user sees only a failed activation that may
+            // fail again for the same invisible reason. Name the rows.
+            let difference = describe_bootstrap_source_spool_change(kind, &sealed, &recaptured)
+                .unwrap_or_else(|error| format!("difference could not be decoded: {error}"));
             return Err(bootstrap_source_capture_interrupted(format!(
-                "source capture changed before final {} proof",
+                "source capture changed before final {} proof: {difference}",
                 kind.label()
             )));
         }
@@ -27903,7 +27120,7 @@ fn verify_bootstrap_source_capture(
 
 #[cfg(test)]
 thread_local! {
-    static BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+    static BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
     static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
     static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
 }
@@ -27922,15 +27139,15 @@ fn bootstrap_source_capture_before_seal_rename_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn bootstrap_source_capture_between_passes_hook() -> io::Result<()> {
-    BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| match hook.borrow_mut().take() {
+fn bootstrap_source_capture_after_initial_pass_hook() -> io::Result<()> {
+    BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn bootstrap_source_capture_between_passes_hook() -> io::Result<()> {
+fn bootstrap_source_capture_after_initial_pass_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -27940,6 +27157,23 @@ fn bootstrap_source_capture_before_final_proof_hook() -> io::Result<()> {
         Some(hook) => hook(),
         None => Ok(()),
     })
+}
+
+/// Arm one mutation immediately before the final source proof, on the lane
+/// activation actually uses.
+///
+/// The older injection point lives in the shadow-projection publication, which
+/// clean local activation no longer walks, so the test that used it stopped
+/// exercising anything: it asserted a refusal on an activation that had never
+/// run the hook at all. This one sits inside `verify_bootstrap_source_capture`
+/// itself, which every lane reaching promotion must call.
+#[cfg(test)]
+pub(crate) fn set_bootstrap_source_capture_before_final_proof_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|pending| {
+        *pending.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 #[cfg(not(test))]
@@ -28529,19 +27763,6 @@ fn build_graph_text_admission_index(
             .iter()
             .map(|(key, value)| (key.clone(), *value))
             .collect(),
-        reconciliation_scan_instrumentation:
-            crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation {
-                directory_entries: capture.all_entries,
-                directories: capture.directories_by_exact_relative.len() as u64,
-                regular_files: capture.file_link_count_by_exact_relative.len() as u64,
-                eligible_files: capture.entries.len() as u64,
-                bytes_read: capture.raw_bytes,
-                bytes_hashed: capture.raw_bytes,
-                peak_read_buffers: 1,
-                peak_read_buffer_bytes:
-                    crate::oplog::reconciliation_scan::GRAPH_TEXT_SCAN_READ_BUFFER_BYTES as u64,
-                ..crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation::default()
-            },
         permanent_bytes,
         permanent_limit: limits.permanent_index_bytes,
         peak_limit: limits.peak_build_bytes,
@@ -28596,14 +27817,13 @@ fn build_graph_text_admission_index(
                     format!("graph text is not UTF-8: {}", entry.path),
                 )
             })?;
-            let permit = graph_text_parse_budget_permit(
-                graph,
-                &entry.path,
-                content,
-                checked_add_bytes(combined_capture_bytes, permanent_bytes)?,
-                limits.peak_build_bytes,
-            )?;
-            graph.decode_present_graph_text(&entry.path, bytes, permit)?
+            let permit = graph_text_parse_budget_permit(graph, &entry.path, content)?;
+            let (semantic, format, node_count) =
+                graph.decode_present_graph_text_with_node_count(&entry.path, bytes, permit)?;
+            if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+                return Err(initial_shadow_limit_error("parser node count"));
+            }
+            (semantic, format)
         } else {
             (
                 cached_semantics
@@ -28935,44 +28155,18 @@ fn graph_text_file_record_worst_case_upper_bound(
     )
 }
 
-fn graph_text_present_parse_peak_upper_bound(
-    graph: &Graph,
-    path: &ManagedPath,
-    content: &str,
-    semantic_budget: GraphTextSemanticNameBudget,
-) -> io::Result<u64> {
-    let path_len = usize_to_u64(path.as_str().len())?;
-    let mut bytes = managed_page_build_upper_bound(content)?;
-    bytes = checked_add_bytes(
-        bytes,
-        graph_text_file_record_worst_case_upper_bound(
-            graph,
-            path_len,
-            semantic_budget.semantic_name_bytes,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(semantic_budget.title_format.input_bytes)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(semantic_budget.title_format.rendered_bytes)?,
-    )?;
-    checked_add_bytes(bytes, 1024)
-}
-
 fn graph_text_parse_budget_permit(
     graph: &Graph,
     path: &ManagedPath,
     content: &str,
-    live_bytes: u64,
-    peak_limit: u64,
 ) -> io::Result<GraphTextParseBudgetPermit> {
     let semantic_budget = graph_text_observed_semantic_name_upper_bound(graph, path, content)?;
-    let parse_peak =
-        graph_text_present_parse_peak_upper_bound(graph, path, content, semantic_budget)?;
-    ensure_graph_text_peak_limit(live_bytes, parse_peak, peak_limit)?;
+    // Parser work is one-file-at-a-time and its tree is dropped before the next
+    // file. Source-derived `bytes == nodes in every allocation class` estimates
+    // used to count parser, DTO, projection, and index representations as if all
+    // were retained together. That rejected ordinary large pages (#311). The
+    // real envelope is the 64 MiB exact-feed/source cap plus the post-parse
+    // 1,000,000-node cap; only the semantic record below survives this call.
     Ok(GraphTextParseBudgetPermit {
         semantic_name_bytes: semantic_budget.semantic_name_bytes,
         semantic_name_allocation_bytes: owned_string_len_upper_bound(
@@ -29723,14 +28917,20 @@ fn poison_graph_text_admission_state(state: &mut GraphTextAdmissionState, cause:
 
 const MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES: usize = 4096;
 
+/// Exact-path shape bounds for one graph-relative platform event path.
+/// Carried over unchanged from the deleted exact-feed batch that used to
+/// namespace them; `classify_graph_text_exact_feed_path` is the live consumer.
+const MAX_GRAPH_TEXT_EXACT_RELATIVE_BYTES: usize = 4096;
+const MAX_GRAPH_TEXT_EXACT_PATH_COMPONENTS: usize = MAX_INITIAL_SHADOW_DIRECTORY_DEPTH + 1;
+
 fn validate_graph_text_exact_feed_relative(relative: &str) -> io::Result<()> {
     if relative != relative.trim()
         || relative.is_empty()
-        || relative.len() > GraphTextExactFeedBatch::MAX_EXACT_RELATIVE_BYTES
+        || relative.len() > MAX_GRAPH_TEXT_EXACT_RELATIVE_BYTES
         || relative.starts_with('/')
         || relative.contains('\\')
         || relative.contains('\0')
-        || relative.split('/').count() > GraphTextExactFeedBatch::MAX_PATH_COMPONENTS
+        || relative.split('/').count() > MAX_GRAPH_TEXT_EXACT_PATH_COMPONENTS
         || relative
             .split('/')
             .any(|component| !projection_component_is_portable(component))
@@ -29741,16 +28941,6 @@ fn validate_graph_text_exact_feed_relative(relative: &str) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn graph_text_exact_feed_index_matches_lease(
-    index: &CompleteGraphTextAdmissionIndex,
-    lease: &GraphTextExactFeedLease,
-) -> bool {
-    Arc::ptr_eq(&index.instance, &lease.binding.instance)
-        && index.scope_binding == lease.binding.scope_binding
-        && index.graph_resource == lease.binding.graph_resource
-        && index.feed.is_some()
 }
 
 fn graph_text_exact_feed_failure_cause(reason: GraphTextExactFeedFailure, cause: &str) -> String {
@@ -29773,7 +28963,6 @@ fn graph_text_exact_feed_failure_cause(reason: GraphTextExactFeedFailure, cause:
     }
     bounded_graph_text_admission_cause(format!("{label}: {}", &cause[..boundary]))
 }
-
 fn bounded_graph_text_admission_cause(mut cause: String) -> String {
     if cause.len() <= MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES {
         return cause;
@@ -30034,7 +29223,7 @@ fn create_projection_staging_file(
 }
 
 fn retire_projection_target(dir: &Dir, filename: &str, recovery: &str) -> io::Result<()> {
-    rename_projection_noreplace(dir, filename, recovery)
+    rename_reconstructible_projection_noreplace(dir, filename, recovery)
 }
 
 fn projection_attempt_target_recovery_filename(
@@ -30066,7 +29255,7 @@ fn withdraw_projection_target_to_named_recovery(
     filename: &str,
     recovery: &str,
 ) -> io::Result<()> {
-    rename_projection_noreplace(dir, filename, recovery)
+    rename_reconstructible_projection_noreplace(dir, filename, recovery)
 }
 
 fn withdraw_projection_target_to_recovery(dir: &Dir, filename: &str) -> io::Result<String> {
@@ -30075,7 +29264,7 @@ fn withdraw_projection_target_to_recovery(dir: &Dir, filename: &str) -> io::Resu
             ".{filename}.{}.projection.recovery",
             uuid::Uuid::new_v4().simple()
         );
-        match rename_projection_noreplace(dir, filename, &recovery) {
+        match rename_reconstructible_projection_noreplace(dir, filename, &recovery) {
             Ok(()) => return Ok(recovery),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -30123,7 +29312,7 @@ fn preserve_and_restore_projection_recovery(
     expected_bytes: &[u8],
     expected_identity: ContentDigest,
 ) -> io::Result<()> {
-    preflight_projection_chain(&parent.chain)?;
+    preflight_reconstructible_projection_chain(&parent.chain)?;
 
     match read_projection_optional(parent.final_dir(), &target.filename) {
         Ok(Some(_)) => return Ok(()),
@@ -30194,10 +29383,11 @@ fn preserve_and_restore_projection_recovery(
         let _ = parent.final_dir().remove_file(&temp);
         return Ok(());
     }
-    let restore = rename_projection_noreplace(parent.final_dir(), &temp, &target.filename);
+    let restore =
+        rename_reconstructible_projection_noreplace(parent.final_dir(), &temp, &target.filename);
     match restore {
         Ok(()) => {
-            preflight_projection_chain(&parent.chain)?;
+            preflight_reconstructible_projection_chain(&parent.chain)?;
             let validation = (|| {
                 graph.ensure_projection_parent_binding(parent, target)?;
                 graph.ensure_projection_target_shape(parent, target)?;
@@ -30229,7 +29419,7 @@ fn preserve_and_restore_projection_recovery(
                     &target.filename,
                 ) {
                     Ok(withdrawn) => {
-                        preflight_projection_chain(&parent.chain)?;
+                        preflight_reconstructible_projection_chain(&parent.chain)?;
                         Ok(Some(withdrawn))
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -30260,7 +29450,7 @@ fn preserve_and_restore_projection_recovery(
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let _ = parent.final_dir().remove_file(&temp);
-            preflight_projection_chain(&parent.chain)
+            preflight_reconstructible_projection_chain(&parent.chain)
         }
         Err(error) => {
             let _ = parent.final_dir().remove_file(&temp);
@@ -30274,15 +29464,56 @@ fn preserve_and_restore_projection_recovery(
 /// when directory flushing is unavailable. Windows first validates the retained
 /// exact directory capability, then records its documented lack of a
 /// directory-entry flush primitive as a platform limitation.
+///
+/// This is the strict, sole-authority variant. The Markdown/Org projection of
+/// an accepted manifest uses [`preflight_reconstructible_projection_chain`];
+/// see [`crate::filesystem_durability::DurabilityArtifactClass`] for why the
+/// two classes get different platform policies.
 fn preflight_projection_chain(chain: &[Dir]) -> io::Result<()> {
-    for dir in chain.iter().rev() {
-        sync_projection_directory_required(dir)?;
-    }
-    Ok(())
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
 }
 
+/// The same preflight for the reconstructible Markdown/Org projection leg.
+fn preflight_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
+}
+
+/// The exact platform primitive named by the projection receipt. It is a
+/// per-target constant so the enriched failure detail keeps naming the call the
+/// device actually refused.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "renameat2(RENAME_NOREPLACE) publishing the projection";
+
+#[cfg(target_os = "macos")]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "renameatx_np(RENAME_EXCL) publishing the projection";
+
+#[cfg(windows)]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "FileRenameInformation(ReplaceIfExists=false) publishing the projection";
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+)))]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "atomic no-clobber rename publishing the projection";
+
+/// The raw platform no-replace rename. It deliberately returns the untouched
+/// platform error: [`rename_projection_noreplace_with_class`] needs the exact
+/// `errno` to tell a filesystem that cannot provide the flag from a filesystem
+/// that refused the operation, and `io::Error::new` would discard it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -30309,7 +29540,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
 }
 
 #[cfg(target_os = "macos")]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -30332,7 +29563,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
 }
 
 #[cfg(windows)]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     rename_projection_between_noreplace(dir, from, dir, to)
 }
 
@@ -30446,12 +29677,428 @@ fn rename_projection_between_noreplace(
     target_os = "android",
     windows
 )))]
-fn rename_projection_noreplace(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-clobber projection publication is unsupported on this platform",
     ))
 }
+
+/// The strict, sole-authority no-clobber publication. Every caller here writes a
+/// graph-tree artifact the graph itself is the only authority for, so the atomic
+/// primitive is the contract: there is no second copy to rebuild from, and a
+/// two-step publication would leave a reserved-but-empty live name behind a
+/// crash. A filesystem that cannot provide the primitive fails the write.
+fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    rename_projection_noreplace_with_class(
+        dir,
+        from,
+        to,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The same publication for the Markdown/Org projection of an already-accepted
+/// manifest. Android CI run 32091898520 showed the flagged rename itself failing
+/// with `EINVAL` on shared storage — `renameat2(RENAME_NOREPLACE) publishing the
+/// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` — so this class
+/// carries a capability fallback; see [`reserve_and_rename`].
+fn rename_reconstructible_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    rename_projection_noreplace_with_class(
+        dir,
+        from,
+        to,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
+}
+
+/// Is this platform error the filesystem saying "I do not implement that flag"?
+///
+/// `renameat2` reports an unsupported flag as `EINVAL` on most filesystems, as
+/// `ENOSYS` when the syscall itself is absent, and as `EOPNOTSUPP`/`ENOTSUP` on
+/// some stacked filesystems. Android shared storage additionally reports
+/// `EACCES` for this flagged syscall while permitting an ordinary same-directory
+/// rename. That platform-only answer is classified by
+/// [`noreplace_or_reserve_for_platform`], where the fallback must still perform
+/// the ordinary rename; a real permission denial therefore remains a failure.
+/// Everywhere else `EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`, and `ENOENT`
+/// describe the operation rather than the flag and stay fatal.
+#[cfg(unix)]
+fn is_flagged_rename_capability_refusal(error: &io::Error) -> bool {
+    // Written as comparisons rather than a `match`: on Linux `ENOTSUP` and
+    // `EOPNOTSUPP` are the same value, and repeating them as patterns is an
+    // unreachable-pattern lint.
+    error.raw_os_error().is_some_and(|errno| {
+        errno == libc::EINVAL
+            || errno == libc::ENOSYS
+            || errno == libc::EOPNOTSUPP
+            || errno == libc::ENOTSUP
+    })
+}
+
+/// Windows has one no-replace primitive and it is `FileRenameInformation` with
+/// `ReplaceIfExists = FALSE`, which NTFS/ReFS/FAT all implement. There is no
+/// capability answer to recognise, so nothing degrades there.
+#[cfg(not(unix))]
+fn is_flagged_rename_capability_refusal(_error: &io::Error) -> bool {
+    false
+}
+
+/// Filesystems (by `st_dev`) already known to refuse the flagged rename.
+///
+/// The answer is a property of the mounted filesystem, not of one file, so it is
+/// remembered once instead of costing a failed syscall on every publication. It
+/// is only ever consulted for the reconstructible projection class, so the
+/// strict class cannot read or write it.
+#[cfg(unix)]
+static FLAGGED_RENAME_UNSUPPORTED_DEVICES: RwLock<std::collections::BTreeSet<u64>> =
+    RwLock::new(std::collections::BTreeSet::new());
+
+#[cfg(unix)]
+fn projection_device_id(dir: &Dir) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(dir.try_clone()?.into_std_file().metadata()?.dev())
+}
+
+/// A miss is never load-bearing: an unknown device simply attempts the flagged
+/// rename and learns the answer from it. Correctness does not depend on the
+/// cache, only the syscall count does.
+#[cfg(unix)]
+fn flagged_rename_known_unsupported(dir: &Dir) -> bool {
+    let Ok(device) = projection_device_id(dir) else {
+        return false;
+    };
+    FLAGGED_RENAME_UNSUPPORTED_DEVICES
+        .read()
+        .is_ok_and(|devices| devices.contains(&device))
+}
+
+#[cfg(unix)]
+fn remember_flagged_rename_unsupported(dir: &Dir) {
+    if let Ok(device) = projection_device_id(dir) {
+        if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
+            devices.insert(device);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn flagged_rename_known_unsupported(_dir: &Dir) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn remember_flagged_rename_unsupported(_dir: &Dir) {}
+
+/// Publish without the flag, on a filesystem that does not implement it.
+///
+/// **What it keeps.** The destination name is reserved with an exclusive create
+/// (`O_CREAT|O_EXCL`), which fails with `EEXIST` if anything already occupies
+/// that name. So the one guarantee `RENAME_NOREPLACE` was there to provide —
+/// never silently destroy a file that is already at the destination — still
+/// holds, and a failure to reserve is returned as `AlreadyExists`, the exact
+/// error the flagged rename raises, so every guarded-conflict caller above is
+/// unchanged. If the rename itself then fails, the reservation is rolled back
+/// (only when the destination is still byte-for-byte the placeholder this call
+/// created, checked by physical identity), so a failed publication does not
+/// leave an empty file at a live page name.
+///
+/// **What it gives up.** Atomicity of the name transition. Between the
+/// reservation and the rename the destination exists as a zero-length file, so
+/// (a) a crash inside that window leaves a zero-length name that the projection
+/// drain rebuilds from the accepted manifest on the next open — exactly as it
+/// rebuilds an interrupted projection today — and (b) an external writer that
+/// replaces the placeholder inside that window is overwritten rather than
+/// winning the race. Both are why this is confined to
+/// `SharedReconstructibleProjection`, where the manifest in private storage is
+/// still the authority for these bytes, and is never used for artifacts the
+/// graph tree is the sole authority for.
+fn reserve_and_rename(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+) -> io::Result<()> {
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    // An occupied destination fails here, before anything has moved.
+    let reserved = destination_dir.open_with(to, &options)?.into_std();
+    let reserved_identity = match canonical_projection_file_resource_id(&reserved) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = destination_dir.remove_file(to);
+            return Err(error);
+        }
+    };
+    drop(reserved);
+    match source_dir.rename(from, destination_dir, to) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Roll the reservation back, but only if the destination is still
+            // the exact placeholder this call created. If someone replaced it,
+            // their file stays.
+            if let Ok(current) = open_projection_file_nofollow(destination_dir, to) {
+                let still_ours = canonical_projection_file_resource_id(&current)
+                    .is_ok_and(|identity| identity == reserved_identity);
+                drop(current);
+                if still_ours {
+                    let _ = destination_dir.remove_file(to);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The single place the projection leg publishes a name without clobbering.
+///
+/// `PrivateDurableAuthority` gets the platform primitive and nothing else.
+/// `SharedReconstructibleProjection` additionally accepts a capability refusal
+/// from that primitive and falls back to [`reserve_and_rename`];
+/// every other errno stays fatal for both classes, on every platform.
+///
+/// The fallback is not gated on Android, unlike the durability-barrier policy in
+/// [`crate::filesystem_durability`]. That policy gives a guarantee up, so it is
+/// confined to the platform that forces the choice; this one keeps its guarantee
+/// and only loses atomicity, and the same `EINVAL` is reachable on any host
+/// whose graph lives on a filesystem without `rename2` flags (FAT/exFAT media,
+/// some FUSE and network mounts). Failing those writes closed would be an
+/// availability bug with no in-scope threat behind it.
+fn rename_projection_noreplace_with_class(
+    dir: &Dir,
+    from: &str,
+    to: &str,
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+) -> io::Result<()> {
+    let reconstructible = matches!(
+        class,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection
+    );
+    let (step, result) = noreplace_or_reserve(dir, from, dir, to, reconstructible, &|| {
+        #[cfg(test)]
+        if let Some(injected) = armed_projection_noreplace_rename(class, dir)? {
+            return Err(io::Error::from_raw_os_error(injected.errno));
+        }
+        rename_projection_noreplace_platform(dir, from, to)
+    });
+    result.map_err(|error| {
+        projection_platform_error(
+            match step {
+                FlaggedRenameStep::Platform => PROJECTION_NOREPLACE_RENAME_OPERATION,
+                FlaggedRenameStep::Reservation => PROJECTION_RESERVED_RENAME_OPERATION,
+            },
+            &format!("{from:?} -> {to:?}"),
+            error,
+        )
+    })
+}
+
+/// Which of the two primitives produced the answer, so the receipt can name the
+/// call the filesystem actually ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlaggedRenameStep {
+    Platform,
+    Reservation,
+}
+
+/// The single no-clobber-rename policy, shared by the Markdown/Org projection
+/// leg and by the shared-provider tree in [`crate::oplog`].
+///
+/// `platform` is the caller's own no-clobber primitive — the projection leg and
+/// the provider transport each validate different things around theirs, and
+/// neither should inherit the other's checks — so this owns only the policy: a
+/// `PrivateDurableAuthority` artifact gets that primitive and nothing else,
+/// while a `SharedReconstructibleProjection` artifact additionally reads a
+/// capability refusal from it and degrades to [`reserve_and_rename`]. Every
+/// other errno stays fatal for both classes, on every platform.
+///
+/// The device memo is keyed on the destination directory: source and
+/// destination are always on one mount here (a cross-device rename is `EXDEV`
+/// before any flag matters) and the reservation is created at the destination.
+fn noreplace_or_reserve(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    reconstructible: bool,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> (FlaggedRenameStep, io::Result<()>) {
+    noreplace_or_reserve_for_platform(
+        source_dir,
+        from,
+        destination_dir,
+        to,
+        reconstructible,
+        cfg!(target_os = "android"),
+        platform,
+    )
+}
+
+fn noreplace_or_reserve_for_platform(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    reconstructible: bool,
+    android: bool,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> (FlaggedRenameStep, io::Result<()>) {
+    if reconstructible && flagged_rename_known_unsupported(destination_dir) {
+        return (
+            FlaggedRenameStep::Reservation,
+            reserve_and_rename(source_dir, from, destination_dir, to),
+        );
+    }
+    match platform() {
+        Ok(()) => (FlaggedRenameStep::Platform, Ok(())),
+        Err(error)
+            if reconstructible
+                && reconstructible_flagged_rename_capability_refusal(&error, android) =>
+        {
+            remember_flagged_rename_unsupported(destination_dir);
+            (
+                FlaggedRenameStep::Reservation,
+                reserve_and_rename(source_dir, from, destination_dir, to),
+            )
+        }
+        Err(error) => (FlaggedRenameStep::Platform, Err(error)),
+    }
+}
+
+fn reconstructible_flagged_rename_capability_refusal(error: &io::Error, android: bool) -> bool {
+    is_flagged_rename_capability_refusal(error)
+        || (android && error.kind() == io::ErrorKind::PermissionDenied)
+}
+
+/// The same policy for a `SharedReconstructibleProjection` artifact of the
+/// shared-provider tree, which renames ACROSS directories (staging to
+/// `removed/`, a raced name to `rename-evidence/`). `operation` names the
+/// caller's own primitive so a device receipt keeps identifying the exact call
+/// that was refused.
+pub(crate) fn rename_shared_reconstructible_noreplace(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    operation: &str,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    let (step, result) =
+        noreplace_or_reserve(source_dir, from, destination_dir, to, true, platform);
+    result.map_err(|error| {
+        projection_platform_error(
+            match step {
+                FlaggedRenameStep::Platform => operation,
+                FlaggedRenameStep::Reservation => SHARED_RESERVED_RENAME_OPERATION,
+            },
+            &format!("{from:?} -> {to:?}"),
+            error,
+        )
+    })
+}
+
+/// Is this platform error a filesystem saying "I do not implement that flag"?
+/// Re-exported for the shared-provider transport, which owns its own flagged
+/// primitives (including `RENAME_EXCHANGE`) but must read their refusals with
+/// exactly this predicate and no other.
+pub(crate) fn flagged_rename_capability_refusal(error: &io::Error) -> bool {
+    is_flagged_rename_capability_refusal(error)
+}
+
+const PROJECTION_RESERVED_RENAME_OPERATION: &str =
+    "exclusive reservation and rename publishing the projection";
+
+const SHARED_RESERVED_RENAME_OPERATION: &str =
+    "exclusive reservation and rename publishing the shared provider name";
+
+/// A substitute for the platform no-replace rename, armed for exactly one graph
+/// tree, so a host test can reproduce a device whose filesystem refuses the
+/// flagged call. Process-global for the same reason as
+/// [`ArmedProjectionDirectoryBarrier`]: the runtime saves on its actor thread.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ArmedProjectionNoreplaceRename {
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    errno: i32,
+    root: ProjectionDirIdentity,
+}
+
+#[cfg(test)]
+static ARMED_PROJECTION_NOREPLACE_RENAME: std::sync::Mutex<Option<ArmedProjectionNoreplaceRename>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn armed_projection_noreplace_rename(
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    dir: &Dir,
+) -> io::Result<Option<ArmedProjectionNoreplaceRename>> {
+    let armed = *ARMED_PROJECTION_NOREPLACE_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(armed) = armed.filter(|armed| armed.class == class) else {
+        return Ok(None);
+    };
+    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
+}
+
+/// Make every no-replace projection rename of `class` directly inside `root`
+/// fail with `errno` until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) struct InjectedProjectionNoreplaceRenameFailure(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+static PROJECTION_NOREPLACE_RENAME_INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+impl InjectedProjectionNoreplaceRenameFailure {
+    pub(crate) fn enter(
+        class: crate::filesystem_durability::DurabilityArtifactClass,
+        errno: i32,
+        root: &Path,
+    ) -> io::Result<Self> {
+        let exclusive = PROJECTION_NOREPLACE_RENAME_INJECTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let armed = ArmedProjectionNoreplaceRename {
+            class,
+            errno,
+            root: projection_dir_identity(&root_dir)?,
+        };
+        // The device-capability memo is process-global and this fixture's
+        // scratch tree shares a device with every other test's, so a previous
+        // injection must not leave the fallback latched on for tests that arm a
+        // fatal errno.
+        forget_flagged_rename_capabilities();
+        *ARMED_PROJECTION_NOREPLACE_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+        Ok(Self(exclusive))
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedProjectionNoreplaceRenameFailure {
+    fn drop(&mut self) {
+        *ARMED_PROJECTION_NOREPLACE_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        forget_flagged_rename_capabilities();
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn forget_flagged_rename_capabilities() {
+    if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
+        devices.clear();
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+pub(crate) fn forget_flagged_rename_capabilities() {}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_managed_noreplace(
@@ -30551,17 +30198,184 @@ fn rename_managed_noreplace(
     ))
 }
 
+/// The strict directory barrier for graph-tree artifacts the graph is the SOLE
+/// authority for — conflict copies, trash, withdrawn bytes, assets. A barrier
+/// the filesystem refuses for those is a real durability failure and stays fatal
+/// on every platform, Android included.
 fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
     projection_directory_sync_hook(Path::new("."))?;
-    for dir in chain.iter().rev() {
-        sync_projection_directory_required(dir)?;
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The directory barrier for the Markdown/Org projection of an accepted
+/// manifest. Android shared storage can refuse this barrier outright
+/// (`EPERM`/`ENOTSUP`/`EINVAL`); those bytes are reconstructible from the
+/// private manifest, so the refusal degrades there instead of retrying forever.
+fn sync_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
+    projection_directory_sync_hook(Path::new("."))?;
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
+}
+
+fn sync_projection_chain_with_class(
+    chain: &[Dir],
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+) -> io::Result<()> {
+    let depth = chain.len();
+    for (index, dir) in chain.iter().enumerate().rev() {
+        sync_projection_directory_with_class(dir, class, index, depth)?;
     }
     Ok(())
 }
 
 fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    tine_storage::sync_dir_required(dir)
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+        0,
+        1,
+    )
 }
+
+/// Flush one freshly created parent of the reconstructible projection tree.
+fn sync_reconstructible_projection_directory(dir: &Dir) -> io::Result<()> {
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+        0,
+        1,
+    )
+}
+
+/// The single place the projection leg calls the platform directory-flush
+/// primitive. It names the operation and the chain position on failure — a bare
+/// platform errno on a device receipt is not actionable — and then applies the
+/// per-artifact-class platform policy.
+fn sync_projection_directory_with_class(
+    dir: &Dir,
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    index: usize,
+    depth: usize,
+) -> io::Result<()> {
+    let name = |error: io::Error| {
+        projection_platform_error(
+            "fsync of the projection parent directory",
+            &format!("chain depth {}/{depth} ({class:?})", index + 1),
+            error,
+        )
+    };
+    #[cfg(test)]
+    if let Some(injected) = armed_projection_directory_barrier(class, dir)? {
+        let result = Err(name(io::Error::from_raw_os_error(injected.errno)));
+        return if injected.android {
+            crate::filesystem_durability::android_durability_barrier(class, result)
+        } else {
+            crate::filesystem_durability::finish_durability_barrier(class, result)
+        };
+    }
+    let result = tine_storage::sync_dir_required(dir).map_err(name);
+    crate::filesystem_durability::finish_durability_barrier(class, result)
+}
+
+/// A substitute for the platform directory-flush primitive, armed for exactly
+/// one graph tree so a host test can reproduce a device that refuses the barrier
+/// on every attempt.
+///
+/// It is deliberately process-global rather than thread-local: the runtime
+/// executes a save on its actor thread, so a thread-local armed by a test would
+/// never be observed by the code under test. Scoping it to the fixture's own
+/// root directory identity keeps it from touching any other test's graph.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ArmedProjectionDirectoryBarrier {
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    errno: i32,
+    android: bool,
+    root: ProjectionDirIdentity,
+}
+
+#[cfg(test)]
+static ARMED_PROJECTION_DIRECTORY_BARRIER: std::sync::Mutex<
+    Option<ArmedProjectionDirectoryBarrier>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn armed_projection_directory_barrier(
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    dir: &Dir,
+) -> io::Result<Option<ArmedProjectionDirectoryBarrier>> {
+    let armed = *ARMED_PROJECTION_DIRECTORY_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(armed) = armed.filter(|armed| armed.class == class) else {
+        return Ok(None);
+    };
+    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
+}
+
+/// Make every projection directory barrier of `class` inside `root` fail with
+/// `errno` until the returned guard is dropped. `android` selects the Android
+/// platform policy for that barrier, so one test can drive the device's branch
+/// and its sibling can prove the desktop branch still fails closed.
+#[cfg(test)]
+pub(crate) struct InjectedProjectionDirectoryBarrierFailure(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+/// Only one injection may be armed at a time. Under nextest every test is its
+/// own process and this is free; under a threaded `cargo test` it stops two
+/// fixtures from observing each other's arming.
+#[cfg(test)]
+static PROJECTION_DIRECTORY_BARRIER_INJECTION_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(test)]
+impl InjectedProjectionDirectoryBarrierFailure {
+    pub(crate) fn enter(
+        class: crate::filesystem_durability::DurabilityArtifactClass,
+        errno: i32,
+        android: bool,
+        root: &Path,
+    ) -> io::Result<Self> {
+        let exclusive = PROJECTION_DIRECTORY_BARRIER_INJECTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let armed = ArmedProjectionDirectoryBarrier {
+            class,
+            errno,
+            android,
+            root: projection_dir_identity(&root_dir)?,
+        };
+        *ARMED_PROJECTION_DIRECTORY_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+        Ok(Self(exclusive))
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedProjectionDirectoryBarrierFailure {
+    fn drop(&mut self) {
+        *ARMED_PROJECTION_DIRECTORY_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// The platform's directory identity pair as [`projection_dir_identity`]
+/// reports it: `(device, inode)` on unix, `(volume, file id)` on Windows.
+/// Test harnesses that pin an armed injection to one graph store this, so the
+/// type must follow the platform rather than assume the unix shape.
+#[cfg(unix)]
+pub(crate) type ProjectionDirIdentity = (u64, u64);
+#[cfg(windows)]
+pub(crate) type ProjectionDirIdentity = (u64, [u8; 16]);
 
 #[cfg(unix)]
 fn projection_dir_identity(dir: &Dir) -> io::Result<(u64, u64)> {
@@ -32807,6 +32621,388 @@ mod tests {
         dir
     }
 
+    /// The artifact-class split, proved at the primitive itself: both barriers
+    /// call the same syscall on the same directory, and only the reconstructible
+    /// projection class degrades when Android refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reconstructible_projection_barrier_degrades_on_android() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-barrier-artifact-class");
+        let chain = vec![Dir::open_ambient_dir(&dir, ambient_authority()).unwrap()];
+
+        {
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                true,
+                &dir,
+            )
+            .unwrap();
+            sync_reconstructible_projection_chain(&chain)
+                .expect("Android cannot provide this barrier for reconstructible bytes");
+            preflight_reconstructible_projection_chain(&chain).unwrap();
+        }
+
+        {
+            // The graph tree also holds artifacts it is the SOLE authority for —
+            // conflict copies, trash, withdrawn bytes. Those keep the strict
+            // barrier on every platform, Android included.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                true,
+                &dir,
+            )
+            .unwrap();
+            let error = sync_projection_chain_required(&chain).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("fsync of the projection parent directory"),
+                "a bare errno is not diagnosable from a device receipt: {error}"
+            );
+            assert_eq!(
+                preflight_projection_chain(&chain).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        {
+            // Off Android the reconstructible barrier is strict too.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                false,
+                &dir,
+            )
+            .unwrap();
+            assert_eq!(
+                sync_reconstructible_projection_chain(&chain)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        {
+            // A real I/O failure is not a capability refusal and stays fatal
+            // even on Android.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EIO,
+                true,
+                &dir,
+            )
+            .unwrap();
+            let error = sync_reconstructible_projection_chain(&chain).unwrap_err();
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "a real I/O failure must stay fatal even on Android: {error}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same split at the *rename* primitive, which is what Android CI run
+    /// 32091898520 actually caught: `renameat2(RENAME_NOREPLACE) publishing the
+    /// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` with `EINVAL`.
+    /// The reconstructible projection publishes through an exclusive
+    /// reservation instead; the sole-authority class keeps the atomic primitive
+    /// and fails.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-artifact-class");
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            fs::write(dir.join("source"), b"staged projection bytes").unwrap();
+            let staged =
+                canonical_projection_file_resource_id(&fs::File::open(dir.join("source")).unwrap())
+                    .unwrap();
+
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                errno,
+                &dir,
+            )
+            .unwrap();
+            rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                .expect("a filesystem without rename2 flags must still publish");
+
+            assert!(!dir.join("source").exists());
+            assert_eq!(
+                fs::read(dir.join("destination")).unwrap(),
+                b"staged projection bytes"
+            );
+            // The published name must be the staged INODE, not a copy of its
+            // bytes into the reservation placeholder.
+            assert_eq!(
+                canonical_projection_file_resource_id(
+                    &fs::File::open(dir.join("destination")).unwrap()
+                )
+                .unwrap(),
+                staged,
+                "the fallback must publish the exact staged inode ({errno})"
+            );
+            fs::remove_file(dir.join("destination")).unwrap();
+        }
+
+        {
+            // The sole-authority class never degrades: no second copy exists to
+            // rebuild these bytes from, so the atomic primitive is the contract.
+            fs::write(dir.join("source"), b"sole authority bytes").unwrap();
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                &dir,
+            )
+            .unwrap();
+            let error =
+                rename_projection_noreplace(&capability, "source", "destination").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("renameat2(RENAME_NOREPLACE) publishing the projection"),
+                "the enriched detail is what made this diagnosable: {error}"
+            );
+            assert!(!dir.join("destination").exists());
+            assert_eq!(
+                fs::read(dir.join("source")).unwrap(),
+                b"sole authority bytes"
+            );
+            fs::remove_file(dir.join("source")).unwrap();
+        }
+
+        {
+            // A real I/O failure is not a capability answer. It stays fatal for
+            // the reconstructible class too, and nothing is reserved.
+            fs::write(dir.join("source"), b"unmoved bytes").unwrap();
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EIO,
+                &dir,
+            )
+            .unwrap();
+            let error =
+                rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "a real I/O failure must stay fatal: {error}"
+            );
+            assert!(
+                !dir.join("destination").exists(),
+                "a fatal errno must not reserve the destination name"
+            );
+            assert_eq!(fs::read(dir.join("source")).unwrap(), b"unmoved bytes");
+            fs::remove_file(dir.join("source")).unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The artifact classification must cover the whole guarded replacement,
+    /// not only standalone projection publication. Android refused the first
+    /// target-retirement rename in this transaction before the staged bytes
+    /// could be published.
+    #[cfg(unix)]
+    #[test]
+    fn managed_projection_replacement_falls_back_but_direct_files_stays_strict() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("managed-replacement-artifact-class");
+        let path = dir.join("pages/Target.md");
+        fs::write(&path, b"- original\n").unwrap();
+        let graph = Graph::open(&dir);
+        let write = graph.admit_managed_text_writer().unwrap();
+        let identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+
+        {
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- managed replacement\n",
+                    identity,
+                    Some(b"- original\n"),
+                    None,
+                    EditorPublicationAuthority::ReconstructibleManagedProjection,
+                )
+                .expect("a reconstructible managed projection must use the capability fallback");
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"- managed replacement\n");
+
+        let managed_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+        {
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                true,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- managed barrier replacement\n",
+                    managed_identity,
+                    Some(b"- managed replacement\n"),
+                    None,
+                    EditorPublicationAuthority::ReconstructibleManagedProjection,
+                )
+                .expect("a reconstructible managed projection may degrade an Android barrier");
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"- managed barrier replacement\n");
+
+        let managed_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+        {
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            let error = graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- direct replacement\n",
+                    managed_identity,
+                    Some(b"- managed barrier replacement\n"),
+                    None,
+                    EditorPublicationAuthority::DirectFile,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"- managed barrier replacement\n",
+            "Direct Files must not weaken the sole-authority publication contract"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer() {
+        let permission = io::Error::from_raw_os_error(libc::EACCES);
+        assert!(reconstructible_flagged_rename_capability_refusal(
+            &permission,
+            true
+        ));
+        assert!(
+            !reconstructible_flagged_rename_capability_refusal(&permission, false),
+            "desktop EACCES remains a real permission failure"
+        );
+
+        let io_failure = io::Error::from_raw_os_error(libc::EIO);
+        assert!(
+            !reconstructible_flagged_rename_capability_refusal(&io_failure, true),
+            "Android may degrade only the shared-filesystem capability refusal"
+        );
+    }
+
+    /// The guarantee the flag was there to provide, kept by the fallback: an
+    /// occupied destination is refused, never overwritten, and it is refused
+    /// with the same `AlreadyExists` the flagged rename raises so every guarded
+    /// conflict caller above is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn the_projection_rename_fallback_refuses_an_occupied_destination_rather_than_clobbering_it() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-fallback-occupied");
+        fs::write(dir.join("source"), b"staged projection bytes").unwrap();
+        fs::write(dir.join("destination"), b"live bytes that must survive").unwrap();
+        let live = canonical_projection_file_resource_id(
+            &fs::File::open(dir.join("destination")).unwrap(),
+        )
+        .unwrap();
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+            DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            &dir,
+        )
+        .unwrap();
+        let error =
+            rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            fs::read(dir.join("destination")).unwrap(),
+            b"live bytes that must survive"
+        );
+        assert_eq!(
+            canonical_projection_file_resource_id(
+                &fs::File::open(dir.join("destination")).unwrap()
+            )
+            .unwrap(),
+            live,
+            "the occupied destination must keep its exact inode"
+        );
+        assert_eq!(
+            fs::read(dir.join("source")).unwrap(),
+            b"staged projection bytes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A reservation that cannot be completed is rolled back. Otherwise a failed
+    /// publication would leave a zero-length file at a live page name — which is
+    /// worse than the refusal it replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_projection_rename_fallback_that_cannot_complete_leaves_no_empty_destination() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-fallback-rollback");
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+            DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            &dir,
+        )
+        .unwrap();
+        // The source never existed, so the plain rename fails after the
+        // destination has already been reserved.
+        let error =
+            rename_reconstructible_projection_noreplace(&capability, "absent", "Live Page.md")
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(
+            !dir.join("Live Page.md").exists(),
+            "a failed publication must not leave the reservation behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn consumed_external_document_dto_matches_exact_parse_across_formats_and_identity() {
         let dir = scratch("consumed-exact-page-dto");
@@ -32826,6 +33022,14 @@ mod tests {
                 "Plain",
                 PageKind::Page,
                 false,
+            ),
+            (
+                "markdown-read-only",
+                "pages/Read Only.md",
+                "- root\r  ```\r  - fake\r  ```",
+                "Read Only",
+                PageKind::Page,
+                true,
             ),
             (
                 "org-editable-properties",
@@ -33364,276 +33568,6 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
-    }
-
-    fn assert_reference_candidates_equal_full_scan(
-        graph: &Graph,
-        target: &str,
-        names: &[String],
-        kind: ReferenceKind,
-    ) {
-        let aliases = graph.page_aliases();
-        let real_pages = crate::query::real_page_names(graph);
-        let exact_paths = |pages: &[(PageEntry, Arc<Document>)]| {
-            let mut paths = pages
-                .iter()
-                .filter(|(entry, doc)| match kind {
-                    ReferenceKind::Explicit => crate::query::page_affects_backlinks(
-                        &real_pages,
-                        &aliases,
-                        target,
-                        entry,
-                        doc,
-                    ),
-                    ReferenceKind::Plain => crate::query::page_affects_unlinked(
-                        &real_pages,
-                        &aliases,
-                        target,
-                        entry,
-                        doc,
-                    ),
-                })
-                .map(|(entry, _)| entry.rel_path.clone())
-                .collect::<Vec<_>>();
-            paths.sort();
-            paths
-        };
-        let full = graph.with_pages(exact_paths);
-        let candidates = graph.reference_candidate_pages(names, kind);
-        assert_eq!(exact_paths(&candidates.pages), full);
-    }
-
-    fn assert_indexed_reference_results_equal_full_scan(graph: &Graph, target: &str) {
-        {
-            let mut guard = graph.reference_candidate_index.write().unwrap();
-            let index = guard.as_mut().unwrap();
-            index.complete = true;
-            index.generation = graph.cache_generation();
-        }
-        let indexed_backlinks = crate::query::backlinks(graph, target);
-        let indexed_unlinked = crate::query::unlinked_refs(graph, target);
-        graph
-            .reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let full_backlinks = crate::query::backlinks(graph, target);
-        let full_unlinked = crate::query::unlinked_refs(graph, target);
-        assert_eq!(
-            serde_json::to_value(indexed_backlinks).unwrap(),
-            serde_json::to_value(full_backlinks).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(indexed_unlinked).unwrap(),
-            serde_json::to_value(full_unlinked).unwrap()
-        );
-        graph
-            .reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = true;
-    }
-
-    #[test]
-    fn reference_candidate_index_tracks_every_cache_seam_and_falls_back_safely() {
-        let dir = scratch("reference-candidate-index");
-        fs::write(
-            dir.join("pages/Target.md"),
-            "alias:: Alias\n\n- target body\n",
-        )
-        .unwrap();
-        let source_path = dir.join("pages/Source.md");
-        fs::write(&source_path, "- [[Alias]] and plain Target\n").unwrap();
-        fs::write(dir.join("pages/Irrelevant.md"), "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let names = vec![
-            crate::refs::page_key("Target"),
-            crate::refs::page_key("Alias"),
-        ];
-        let explicit = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(explicit.indexed);
-        assert!(candidate_paths(&explicit).contains(&"pages/Source.md".to_string()));
-        assert!(explicit.pages.len() < explicit.full_page_count);
-        let plain = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        assert!(plain.indexed);
-        assert!(candidate_paths(&plain).contains(&"pages/Source.md".to_string()));
-        let unicode_fallback =
-            g.reference_candidate_pages(&[crate::refs::page_key("Café")], ReferenceKind::Plain);
-        assert!(!unicode_fallback.indexed);
-        assert_eq!(
-            unicode_fallback.pages.len(),
-            unicode_fallback.full_page_count
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Normal save/cache-upsert removes both projections without rebuilding
-        // the graph cache.
-        let mut source = g.load_named("Source", PageKind::Page).unwrap().unwrap();
-        source.blocks[0].raw = "nothing here".into();
-        g.save_page(&source, source.rev.as_deref()).unwrap();
-        assert!(
-            !candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert!(
-            !candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Plain))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Watcher-equivalent physical replace is an upsert at the same seam.
-        fs::write(&source_path, "- [[Target]] plus Target\n").unwrap();
-        assert!(g.sync_file(&source_path).is_some());
-        assert!(
-            candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        g.delete_page("Source", PageKind::Page).unwrap();
-        let after_delete = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(after_delete.indexed);
-        assert!(!candidate_paths(&after_delete).contains(&"pages/Source.md".to_string()));
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // A broad invalidation reconstructs from the new physical page set.
-        fs::write(&source_path, "- [[Alias]] and Target again\n").unwrap();
-        g.invalidate_cache();
-        g.warm_cache();
-        assert!(
-            candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        assert!(g
-            .create_markdown_page_if_absent("Created", "- [[Target]] and Target\n")
-            .unwrap());
-        let after_create = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(after_create.indexed);
-        assert!(candidate_paths(&after_create).contains(&"pages/Created.md".to_string()));
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Deliberate incompleteness can never narrow the authority set.
-        g.reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let fallback = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(!fallback.indexed);
-        assert_eq!(fallback.pages.len(), fallback.full_page_count);
-        assert_eq!(fallback.full_page_count, 4);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-
-        let current_generation = g.cache_generation();
-        {
-            let mut guard = g.reference_candidate_index.write().unwrap();
-            let index = guard.as_mut().unwrap();
-            index.complete = true;
-            index.generation = current_generation.saturating_sub(1);
-        }
-        let stale_fallback = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(!stale_fallback.indexed);
-        assert_eq!(stale_fallback.pages.len(), stale_fallback.full_page_count);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plain_reference_signature_folds_unicode_before_ascii_tokenizing() {
-        let dir = scratch("reference-candidate-unicode-fold");
-        fs::write(dir.join("pages/K.md"), "- target body\n").unwrap();
-        fs::write(dir.join("pages/Source.md"), "- plain K mention\n").unwrap();
-        fs::write(dir.join("pages/Irrelevant.md"), "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let names = vec![crate::refs::page_key("K")];
-        let candidates = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        assert!(candidates.indexed);
-        assert!(candidate_paths(&candidates).contains(&"pages/Source.md".to_string()));
-        assert!(candidates.pages.len() < candidates.full_page_count);
-        assert_reference_candidates_equal_full_scan(&g, "K", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "K");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[ignore = "10k synthetic performance receipt"]
-    fn reference_candidate_index_10k_receipt() {
-        let dir = scratch("reference-candidate-10k");
-        for index in 0..10_000 {
-            let body = if index % 1_000 == 0 {
-                format!("- [[Needle]] explicit Needle {index}\n")
-            } else if index % 500 == 0 {
-                format!("- plain Needle {index}\n")
-            } else {
-                format!("- ordinary synthetic page {index}\n")
-            };
-            fs::write(dir.join("pages").join(format!("Page {index:05}.md")), body).unwrap();
-        }
-        let g = Graph::open(&dir);
-        let started = std::time::Instant::now();
-        g.with_pages(|_| ());
-        let build_ms = started.elapsed().as_millis();
-        let names = vec![crate::refs::page_key("Needle")];
-        let explicit = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        let plain = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        let estimated_bytes = g
-            .reference_candidate_index
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .estimated_bytes();
-        let indexed_backlinks = crate::query::backlinks(&g, "Needle");
-        let indexed_unlinked = crate::query::unlinked_refs(&g, "Needle");
-        g.reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let full_backlinks = crate::query::backlinks(&g, "Needle");
-        let full_unlinked = crate::query::unlinked_refs(&g, "Needle");
-        assert!(explicit.indexed && plain.indexed);
-        assert_eq!(explicit.pages.len(), 10);
-        assert!(plain.pages.len() >= 20);
-        assert_eq!(
-            serde_json::to_value(&indexed_backlinks).unwrap(),
-            serde_json::to_value(&full_backlinks).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&indexed_unlinked).unwrap(),
-            serde_json::to_value(&full_unlinked).unwrap()
-        );
-        eprintln!(
-            "reference-index-10k build_ms={build_ms} estimated_bytes={estimated_bytes} explicit_candidates={} plain_candidates={} full_pages={} linked_exact_equal=true unlinked_exact_equal=true",
-            explicit.pages.len(),
-            plain.pages.len(),
-            explicit.full_page_count,
-        );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -34531,95 +34465,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_cache_primes_alias_and_block_ref_count_caches() {
-        let dir = scratch("warm-derived");
-        fs::write(
-            dir.join("pages").join("Target.md"),
-            "alias:: Alias One\n\n- target\n  id:: aaaaaaaa-0000-0000-0000-000000000001\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("pages").join("Refs.md"),
-            "- see ((aaaaaaaa-0000-0000-0000-000000000001))\n",
-        )
-        .unwrap();
-
-        let g = Graph::open(&dir);
-        assert!(
-            g.alias_cache.read().unwrap().is_none(),
-            "alias cache starts cold"
-        );
-        assert!(
-            g.block_ref_count_cache.read().unwrap().is_none(),
-            "block-ref count cache starts cold"
-        );
-
-        g.warm_cache();
-
-        let aliases = g.alias_cache.read().unwrap().as_ref().cloned().unwrap();
-        assert!(
-            aliases
-                .iter()
-                .any(|(alias, canon, _)| alias == "alias one" && canon == "Target"),
-            "alias cache warmed: {aliases:?}"
-        );
-        let gen = g.cache_generation();
-        let counts = g.block_ref_count_cache.read().unwrap();
-        let (count_gen, count_map) = counts.as_ref().expect("block-ref count cache warmed");
-        assert_eq!(
-            *count_gen, gen,
-            "count cache is keyed to the current cache generation"
-        );
-        assert_eq!(
-            count_map
-                .get("aaaaaaaa-0000-0000-0000-000000000001")
-                .copied(),
-            Some(1)
-        );
-
-        let first = g.block_ref_counts().unwrap();
-        let second = g.block_ref_counts().unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "re-entering block_ref_counts should reuse the warmed Arc"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn non_reference_edit_reuses_block_ref_count_index() {
-        let dir = scratch("block-ref-count-scoped");
-        fs::write(
-            dir.join("pages").join("Target.md"),
-            "- target\n  id:: aaaaaaaa-0000-0000-0000-000000000001\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("pages").join("Refs.md"),
-            "- see ((aaaaaaaa-0000-0000-0000-000000000001))\n",
-        )
-        .unwrap();
-
-        let g = Graph::open(&dir);
-        g.warm_cache();
-        let before = g.block_ref_counts().unwrap();
-        let mut target = g.load_named("Target", PageKind::Page).unwrap().unwrap();
-        target.blocks[0].raw = "target edited without changing references".into();
-        g.save_page(&target, target.rev.as_deref()).unwrap();
-        let after = g.block_ref_counts().unwrap();
-
-        assert!(
-            Arc::ptr_eq(&before, &after),
-            "a non-reference edit must retain the already-built whole-graph count map"
-        );
-        assert_eq!(
-            after.get("aaaaaaaa-0000-0000-0000-000000000001").copied(),
-            Some(1)
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn migrate_recovers_title_named_org_journals() {
         // Regression: changing :journal/page-title-format while a stale in-memory
         // format was still active saved new journals under their title
@@ -34763,7 +34608,7 @@ mod tests {
         fs::write(
             dir.join("pages")
                 .join("client-a")
-                .join("Foo.sync-conflict-20260705-141233-A1B2C3D.md"),
+                .join("Foo.sync-conflict-20260705-141233-A2B2C3D.md"),
             "- conflict copy\n",
         )
         .unwrap();
@@ -34777,13 +34622,479 @@ mod tests {
         let c = &conflicts[0];
         assert_eq!(
             c.path,
-            "pages/client-a/Foo.sync-conflict-20260705-141233-A1B2C3D.md"
+            "pages/client-a/Foo.sync-conflict-20260705-141233-A2B2C3D.md"
         );
         assert_eq!(c.base_path.as_deref(), Some("pages/client-a/Foo.md"));
         assert_eq!(c.base_name, "Foo");
         assert_eq!(c.kind, PageKind::Page);
         assert_eq!(c.preview, "conflict copy");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_page_with_sync_conflict_like_name_stays_indexed() {
+        // The recognizer must match Syncthing's GENERATED shape
+        // (`.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID`), not a bare
+        // `.sync-conflict-` substring — a real page whose name merely contains
+        // the substring was silently deindexed as a false positive.
+        let dir = scratch("conflict-lookalike-page");
+        fs::write(
+            dir.join("pages").join("Foo.sync-conflict-notes.md"),
+            "- real content\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let pages = graph.list_pages();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.rel_path == "pages/Foo.sync-conflict-notes.md"),
+            "a page whose name merely CONTAINS `.sync-conflict-` is a real page: {pages:?}"
+        );
+        assert!(
+            graph.list_sync_conflicts().is_empty(),
+            "a name without the generated timestamp shape is not a conflict copy"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seafile_conflict_copy_is_surfaced_not_indexed() {
+        // Seafile names conflict copies `<stem> (SFConflict <modifier>
+        // <YYYY-MM-DD-HH-MM-SS>).<ext>` (seafile/common/vc-common.c,
+        // `gen_conflict_path`). Left unrecognized, the copy is indexed as a
+        // duplicate page — with `title::` it duplicates page identity.
+        let dir = scratch("seafile-conflict");
+        fs::write(dir.join("pages").join("Note.md"), "- winner\n").unwrap();
+        fs::write(
+            dir.join("pages")
+                .join("Note (SFConflict me@example.com 2026-08-01-10-00-00).md"),
+            "- conflict copy\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        assert!(
+            graph
+                .list_pages()
+                .iter()
+                .all(|p| !p.rel_path.contains("SFConflict")),
+            "a Seafile conflict copy must not be indexed as a page"
+        );
+        let conflicts = graph.list_sync_conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "the Seafile copy is surfaced in the conflicts workflow: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].base_name, "Note");
+        assert_eq!(conflicts[0].base_path.as_deref(), Some("pages/Note.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_conflict_base_matches_real_provider_formats_only() {
+        for (stem, base) in [
+            // Syncthing: `<stem>.sync-conflict-YYYYMMDD-HHMMSS-<short device id>`
+            // (syncthing lib/model/folder_sendrecv.go `conflictName`; the device
+            // id is up to 7 base32 chars [A-Z2-7], empty when the modifying
+            // device is unknown; pre-1.1.0 versions omitted `-<device>`).
+            ("Foo.sync-conflict-20260705-141233-A2B3C4D", Some("Foo")),
+            ("Foo.sync-conflict-20260705-141233-", Some("Foo")),
+            ("Foo.sync-conflict-20190201-124559", Some("Foo")),
+            (
+                "Foo.bar.sync-conflict-20260705-141233-ABCDEFG",
+                Some("Foo.bar"),
+            ),
+            // Nested copy: the deepest tag wins, the base keeps the outer tag.
+            (
+                "Foo.sync-conflict-20260101-010101-AAAAAAA.sync-conflict-20260202-020202-BBBBBBB",
+                Some("Foo.sync-conflict-20260101-010101-AAAAAAA"),
+            ),
+            // False positives the loose substring match used to deindex:
+            ("Foo.sync-conflict-notes", None),
+            ("Foo.sync-conflict-", None),
+            ("Foo.sync-conflict-2026-08-01", None),
+            ("Foo.sync-conflict-20260705", None),
+            ("Foo.sync-conflict-20260705-141233x", None),
+            ("Foo.sync-conflict-20260705-141233-abcdefg", None),
+            ("Foo.sync-conflict-20260705-141233-ABCDEFGH", None),
+            // Seafile: `<stem> (SFConflict [modifier ]YYYY-MM-DD-HH-MM-SS)`
+            // (seafile/common/vc-common.c `gen_conflict_path`).
+            (
+                "Note (SFConflict me@example.com 2026-08-01-10-00-00)",
+                Some("Note"),
+            ),
+            ("Note (SFConflict 2026-08-01-10-00-00)", Some("Note")),
+            ("Note (SFConflict discussion)", None),
+            ("Note (SFConflict 2026-08-01)", None),
+            (
+                "Note (SFConflict me@example.com 2026-08-01-10-00-00) extra",
+                None,
+            ),
+            // Dropbox (behavior unchanged):
+            ("Report (conflicted copy 2026-08-01)", Some("Report")),
+            (
+                "Report (Alice's conflicted copy 2026-08-01)",
+                Some("Report"),
+            ),
+        ] {
+            assert_eq!(sync_conflict_base(stem), base, "stem: {stem:?}");
+        }
+    }
+
+    #[test]
+    fn marker_bearing_page_is_never_rewritten_by_save() {
+        // A file holding git/Fossil merge conflict markers must be quarantined:
+        // re-serializing it re-indents the column-0 markers as continuation
+        // lines, which breaks git's own conflict detection. Saves are refused
+        // with a typed refusal naming the markers; the bytes stay untouched.
+        let dir = scratch("vcs-marker-quarantine");
+        let original =
+            "<<<<<<< HEAD\n- mine\n||||||| base\n- old\n=======\n- theirs\n>>>>>>> feature\n";
+        fs::write(dir.join("pages").join("Merge.md"), original).unwrap();
+        let graph = Graph::open(&dir);
+        let mut page = graph
+            .load_named("Merge", PageKind::Page)
+            .unwrap()
+            .expect("a marker-bearing page stays readable");
+        assert!(!page.blocks.is_empty());
+        page.blocks[0].raw = "mine edited".into();
+        let base = page.rev.clone().unwrap();
+        let result = graph.save_page(&page, Some(&base));
+        let after = fs::read_to_string(dir.join("pages").join("Merge.md")).unwrap();
+        assert_eq!(
+            after, original,
+            "a marker-bearing file must never be rewritten by Tine"
+        );
+        let error = result.expect_err("saves to a marker-bearing page are refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains("<<<<<<<") && message.contains(">>>>>>>"),
+            "the refusal names the markers it found: {message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vcs_marker_detection_matches_real_markers_only() {
+        // git (merge and diff3 styles).
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "<<<<<<< HEAD\n- mine\n||||||| merged common ancestors\n- old\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Fossil's verbose variants (mergeMarker table in fossil src/merge3.c).
+        assert_eq!(
+            doc::vcs_conflict_markers(concat!(
+                "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<\n",
+                "- mine\n",
+                "####### SUGGESTED CONFLICT RESOLUTION follows ###################\n",
+                "- suggestion\n",
+                "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+                "- old\n",
+                "======= MERGED IN content follows ===============================\n",
+                "- theirs\n",
+                ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> (line 3)\n"
+            )),
+            vec!["<<<<<<<", "#######", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Markers quoted inside a column-0 fenced code block (someone
+        // DOCUMENTING git) must not flag the page.
+        assert!(doc::vcs_conflict_markers(
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n- notes about git\n"
+        )
+        .is_empty());
+        assert!(
+            doc::vcs_conflict_markers("~~~text\n<<<<<<< HEAD\n>>>>>>> feature\n~~~\n").is_empty()
+        );
+        // Markers quoted in an indented fence inside a bullet are not at
+        // column 0 at all.
+        assert!(doc::vcs_conflict_markers(
+            "- how git conflicts look:\n  ```\n  <<<<<<< HEAD\n  =======\n  >>>>>>> theirs\n  ```\n"
+        )
+        .is_empty());
+        // A lone `=======` (setext-style divider) never quarantines a page —
+        // an anchor marker must be present.
+        assert!(doc::vcs_conflict_markers("Heading\n=======\n- content\n").is_empty());
+        // Markers must start at column 0 with their trailing space/shape.
+        assert!(doc::vcs_conflict_markers("- <<<<<<< HEAD\n- >>>>>>> x\n").is_empty());
+        // A real conflict below a closed fence is still detected.
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "```\nexample\n```\n<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "=======", ">>>>>>>"]
+        );
+    }
+
+    #[test]
+    fn list_vcs_marker_conflicts_reports_only_marker_pages() {
+        let dir = scratch("vcs-marker-listing");
+        fs::write(
+            dir.join("pages").join("Merge.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Clean.md"), "- ordinary page\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Docs about git.md"),
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n",
+        )
+        .unwrap();
+        // A sync-tool conflict copy containing markers belongs to the
+        // conflict-copy listing, not this one.
+        fs::write(
+            dir.join("pages")
+                .join("Merge.sync-conflict-20260817-101010-ABCDEFG.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let conflicts = graph.list_vcs_marker_conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the real marker-bearing page is listed: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].path, "pages/Merge.md");
+        assert_eq!(conflicts[0].name, "Merge");
+        assert_eq!(conflicts[0].kind, PageKind::Page);
+        assert_eq!(conflicts[0].markers, vec!["<<<<<<<", "=======", ">>>>>>>"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Concord P4: the derived conflict queue + in-page marker resolution ---
+
+    /// Markers exactly as `git merge` writes them in `diff3` style.
+    const P4_DIFF3_MARKERS: &str = concat!(
+        "- shared top\n",
+        "<<<<<<< HEAD\n- mine wins\n",
+        "||||||| merged common ancestors\n- original\n",
+        "=======\n- theirs wins\n",
+        ">>>>>>> feature\n",
+    );
+
+    #[test]
+    fn conflict_queue_derives_both_artifact_sources_and_survives_a_restart() {
+        let dir = scratch("concord-queue-sources");
+        fs::write(dir.join("pages").join("Notes.md"), "- winner text\n").unwrap();
+        fs::write(
+            dir.join("pages")
+                .join("Notes.sync-conflict-20260817-101010-ABCDEFG.md"),
+            "- copy text\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        fs::write(dir.join("pages").join("Calm.md"), "- nothing wrong here\n").unwrap();
+
+        let queue = Graph::open(&dir).conflict_queue();
+        assert_eq!(
+            queue.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "markers:pages/Merged.md",
+                "copy:pages/Notes.sync-conflict-20260817-101010-ABCDEFG.md",
+            ],
+            "one object per artifact, ordered by page name: {queue:?}"
+        );
+
+        let markers = &queue[0];
+        assert_eq!(
+            markers.source,
+            crate::concord_queue::ConflictSource::VcsMarkers
+        );
+        assert_eq!(markers.page_path, "pages/Merged.md");
+        // Three sides: the diff3 marker block carries its own common ancestor.
+        assert_eq!(
+            markers.sides.iter().map(|s| s.role).collect::<Vec<_>>(),
+            vec![
+                crate::concord_queue::SideRole::Mine,
+                crate::concord_queue::SideRole::Theirs,
+                crate::concord_queue::SideRole::Base,
+            ]
+        );
+        assert_eq!(markers.sides[0].label, "HEAD");
+        assert_eq!(markers.sides[1].label, "feature");
+        assert!(markers.block_conflicts.is_some_and(|n| n > 0));
+
+        let copy = &queue[1];
+        assert_eq!(copy.source, crate::concord_queue::ConflictSource::SyncCopy);
+        assert_eq!(copy.page_name, "Notes");
+        assert_eq!(copy.page_path, "pages/Notes.md");
+        assert_eq!(
+            copy.sides
+                .iter()
+                .filter_map(|s| s.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "pages/Notes.md".to_string(),
+                "pages/Notes.sync-conflict-20260817-101010-ABCDEFG.md".to_string(),
+            ]
+        );
+        assert!(copy.block_conflicts.is_some_and(|n| n > 0));
+
+        // The queue is DERIVED: a second, independent Graph over the same disk
+        // state — what a restart is — reproduces it identically, with no stored
+        // state of any kind (invariant 1).
+        let after_restart = Graph::open(&dir).conflict_queue();
+        assert_eq!(
+            after_restart
+                .iter()
+                .map(|c| (c.id.clone(), c.block_conflicts))
+                .collect::<Vec<_>>(),
+            queue
+                .iter()
+                .map(|c| (c.id.clone(), c.block_conflicts))
+                .collect::<Vec<_>>()
+        );
+        // And nothing was written into the graph to make that work.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Merged.md")).unwrap(),
+            P4_DIFF3_MARKERS
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_conflict_diff_reads_the_pages_own_sides_without_writing() {
+        let dir = scratch("concord-marker-diff");
+        fs::write(dir.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let parsed = graph
+            .vcs_marker_conflict_diff("pages/Merged.md")
+            .unwrap()
+            .expect("a conflicted page");
+        assert_eq!(parsed.mine_label, "HEAD");
+        assert_eq!(parsed.theirs_label, "feature");
+        assert_eq!(parsed.regions, 1);
+        let diff = parsed.diff;
+        assert!(diff.three_way, "the ||||||| section is a real ancestor");
+        // Both staleness tokens address the ONE file the resolution will write.
+        let rev = content_rev(&fs::read_to_string(dir.join("pages").join("Merged.md")).unwrap());
+        assert_eq!(diff.base_rev, rev);
+        assert_eq!(diff.conflict_rev, rev);
+        // A page with no markers has no marker diff.
+        fs::write(dir.join("pages").join("Calm.md"), "- fine\n").unwrap();
+        assert!(Graph::open(&dir)
+            .vcs_marker_conflict_diff("pages/Calm.md")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_markers_keep_both_writes_sibling_blocks_and_clears_the_quarantine() {
+        let dir = scratch("concord-marker-resolve");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+
+        // Before: the page is quarantined — an ordinary save is refused.
+        let entry = graph.find_entry("Merged", PageKind::Page).unwrap();
+        let page = graph.load_page(&entry).unwrap();
+        assert!(
+            graph.save_page(&page, page.rev.as_deref()).is_err(),
+            "a marker-bearing page must refuse ordinary saves"
+        );
+
+        let diff = graph
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        // Keep-both on every decidable row — the no-loss default.
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "both".to_string()))
+                .collect();
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("resolution writes the merged result");
+
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(
+            doc::vcs_conflict_markers(&after).is_empty(),
+            "no markers survive a resolution: {after:?}"
+        );
+        // Both sides are present, as adjacent sibling blocks of valid markdown.
+        assert!(after.contains("- mine wins"), "{after:?}");
+        assert!(after.contains("- theirs wins"), "{after:?}");
+        assert!(after.contains("- shared top"), "{after:?}");
+        let reparsed = doc::parse(&after);
+        assert_eq!(
+            reparsed
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "mine wins", "theirs wins"]
+        );
+        // The quarantine lifts by itself: the file simply has no markers now.
+        assert!(Graph::open(&dir).list_vcs_marker_conflicts().is_empty());
+        assert!(Graph::open(&dir).conflict_queue().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_resolution_is_guarded_and_never_leaves_the_file_writable() {
+        let dir = scratch("concord-marker-guards");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        let decisions = std::collections::HashMap::new();
+
+        // Stale base_rev → refuse without writing (the VCS moved under the UI).
+        let err = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, "not-the-current-rev", "union")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&file).unwrap(), P4_DIFF3_MARKERS);
+
+        // A page with no markers is not a resolution target.
+        fs::write(dir.join("pages").join("Calm.md"), "- fine\n").unwrap();
+        let calm = Graph::open(&dir);
+        let calm_rev = content_rev("- fine\n");
+        assert_eq!(
+            calm.resolve_vcs_marker_conflict("pages/Calm.md", &decisions, &calm_rev, "union")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // The exemption is scoped to the one resolution: after it, ordinary
+        // saves to a still-marker-bearing page are refused again.
+        fs::write(dir.join("pages").join("Other.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the real resolution succeeds");
+        let other_entry = graph.find_entry("Other", PageKind::Page).unwrap();
+        let other = graph.load_page(&other_entry).unwrap();
+        assert!(
+            graph.save_page(&other, other.rev.as_deref()).is_err(),
+            "the other marker page stays quarantined"
+        );
+        // And the resolved page is now an ordinary, savable page.
+        let resolved_entry = graph.find_entry("Merged", PageKind::Page).unwrap();
+        let resolved = graph.load_page(&resolved_entry).unwrap();
+        assert!(graph.save_page(&resolved, resolved.rev.as_deref()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn collect_decidable_ids(rows: &[crate::sync_diff::DiffRow]) -> Vec<String> {
+        let mut out = Vec::new();
+        for row in rows {
+            if row.kind != crate::sync_diff::RowKind::Unchanged {
+                out.push(row.id.clone());
+            }
+            out.extend(collect_decidable_ids(&row.children));
+        }
+        out
     }
 
     #[test]
@@ -34821,6 +35132,31 @@ mod tests {
             day26.path.file_name().unwrap().to_str().unwrap(),
             "2026_06_26.org"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_journal_inventory_does_not_read_or_parse_ordinary_pages() {
+        let dir = scratch("cold-journal-inventory-metadata-only");
+        for index in 0..128 {
+            fs::write(
+                dir.join("pages").join(format!("Ordinary {index}.md")),
+                format!("- ordinary {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("journals/2026_08_22.md"), "- today\n").unwrap();
+        fs::write(dir.join("journals/2026_08_21.md"), "- yesterday\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let journals = graph.journals_desc();
+
+        assert_eq!(journals.len(), 2);
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        assert!(graph.cache.read().unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -35000,36 +35336,6 @@ mod tests {
         let other = fs::read_to_string(dir.join("pages").join("Other.md")).unwrap();
         assert!(other.contains("[[Beta]]"), "ref rewritten to [[Beta]]");
         assert!(!other.contains("[[Alpha]]"), "no stale [[Alpha]] left");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rename_falls_back_when_a_non_candidate_changed_on_disk() {
-        let dir = scratch("rename-stale-non-candidate");
-        fs::write(dir.join("pages/Old.md"), "- old body\n").unwrap();
-        let referrer = dir.join("pages/Referrer.md");
-        fs::write(&referrer, "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let entries = g.list_pages();
-        let names = vec![crate::refs::page_key("Old")];
-        let initial_candidates = g
-            .reference_candidate_paths_for_entries(&names, &entries)
-            .expect("warm coherent index should narrow");
-        assert!(!initial_candidates.contains(&referrer));
-
-        fs::write(&referrer, "- newly landed [[Old]] reference\n").unwrap();
-        assert!(
-            g.reference_candidate_paths_for_entries(&names, &entries)
-                .is_none(),
-            "disk-ahead-of-cache content must force the full rename scan"
-        );
-
-        g.rename_page("Old", "New").unwrap();
-        let rewritten = fs::read_to_string(&referrer).unwrap();
-        assert!(rewritten.contains("[[New]]"));
-        assert!(!rewritten.contains("[[Old]]"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -35290,6 +35596,13 @@ mod tests {
         GRAPH_TEXT_VALIDATION_TARGET_READS.with(|reads| reads.set(0));
         let fresh = markdown_page_dto("Fresh Indexed", "Fresh Indexed", "- fresh\n").unwrap();
         graph.save_page(&fresh, None).unwrap();
+        assert!(
+            graph
+                .list_pages()
+                .iter()
+                .any(|entry| entry.name == "Fresh Indexed"),
+            "the generation-retagged page inventory must contain the new page"
+        );
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
             1,
@@ -35506,7 +35819,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            0
         );
         assert!(graph.cache.read().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
@@ -35541,7 +35854,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35596,13 +35909,13 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn concurrent_direct_creation_proofs_join_one_build_and_census_independently() {
+    fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
         let dir = scratch("concurrent-direct-creation-proofs");
         fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
         let graph = Arc::new(Graph::open(&dir));
@@ -35640,8 +35953,6 @@ mod tests {
         assert!(!second_owned_elsewhere);
         assert_eq!(first_proof.generation, second_proof.generation);
         assert_ne!(first_proof.target, second_proof.target);
-        assert_eq!(first_proof.files.len(), 1);
-        assert_eq!(second_proof.files.len(), 1);
         assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 1);
         assert_eq!(
             graph
@@ -35669,7 +35980,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35737,7 +36048,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 0);
         assert_eq!(
@@ -35956,7 +36267,6 @@ mod tests {
                 assert_eq!(outcome, PageCacheInstallOutcome::GenerationDrift);
                 assert!(graph.cache.read().unwrap().is_none());
                 assert!(graph.cache_index.read().unwrap().is_none());
-                assert!(graph.reference_candidate_index.read().unwrap().is_none());
                 assert!(graph.disk_revs.read().unwrap().is_empty());
                 assert!(graph.effective_identity_index.read().unwrap().is_none());
             } else {
@@ -36014,6 +36324,11 @@ mod tests {
             "title:: Could Be Hidden\n\n- late\n",
         )
         .unwrap();
+        let late = dir.join("external/Late.md");
+        graph.note_graph_text_external_observation();
+        let observed = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&late).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let fresh = markdown_page_dto("Could Be Hidden", "Could Be Hidden", "- no\n").unwrap();
@@ -36101,7 +36416,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36165,7 +36480,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36611,6 +36926,152 @@ mod tests {
         (graph_a, graph_b)
     }
 
+    /// Poll mode publishes an exact empty set when a complete scan observes no
+    /// changes. That must advance the exact feed without poisoning or rebuilding
+    /// an already-live identity index.
+    #[test]
+    fn quiet_external_observation_keeps_guarded_identity_warm() {
+        let dir = scratch("guarded-identity-quiet-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        let before = graph.guarded_graph_text_identity_report();
+
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), false)
+            .unwrap();
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(!after.invalidated, "{after:?}");
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(after.exact_updates, before.exact_updates + 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A debounced batch may finish after a newer raw callback has arrived. Its
+    /// acknowledgement must not clear that newer callback's creation barrier.
+    #[test]
+    fn older_watcher_batch_cannot_acknowledge_a_newer_observation() {
+        let dir = scratch("watcher-observation-frontier");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let older = graph.note_graph_text_external_observation();
+        let newer = graph.note_graph_text_external_observation();
+        graph.acknowledge_graph_text_external_observations(older);
+
+        let blocked = graph
+            .save_page(&direct_save_bench_new_page("Still Pending"), None)
+            .expect_err("the newer raw callback must remain pending");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock, "{blocked}");
+        assert!(!dir.join("pages/Still Pending.md").exists());
+
+        graph.acknowledge_graph_text_external_observations(newer);
+        graph
+            .save_page(&direct_save_bench_new_page("Now Reconciled"), None)
+            .unwrap();
+        assert!(dir.join("pages/Now Reconciled.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same-root config refresh creates a new `Graph`. A frontier from the
+    /// retired instance must not advance or wedge the replacement's counters.
+    #[test]
+    fn watcher_ticket_cannot_cross_a_same_root_graph_refresh() {
+        let dir = scratch("watcher-ticket-same-root-refresh");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let retired = Graph::open(&dir);
+        retired.warm_cache();
+        let retired_ticket = retired.note_graph_text_external_observation();
+
+        let replacement = Graph::open(&dir);
+        replacement.warm_cache();
+        assert!(!replacement.owns_graph_text_external_observation_ticket(retired_ticket));
+        assert!(!replacement.acknowledge_graph_text_external_observations(retired_ticket));
+        replacement
+            .save_page(&direct_save_bench_new_page("Fresh Instance"), None)
+            .unwrap();
+        assert!(dir.join("pages/Fresh Instance.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An exact watcher observation updates the retained semantic owner without
+    /// rebuilding the complete index.
+    #[test]
+    fn exact_external_observation_updates_guarded_identity() {
+        let dir = scratch("guarded-identity-exact-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        let before = graph.guarded_graph_text_identity_report();
+
+        let external = dir.join("Root note.md");
+        fs::write(&external, b"title:: Root note\n\n- external\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
+            .unwrap();
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(!after.invalidated, "{after:?}");
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(after.exact_updates, before.exact_updates + 1);
+        let _identity = graph.lock_graph_text_identity_mutation().unwrap();
+        let index = graph.guarded_graph_text_identity_index().unwrap();
+        assert!(index
+            .paths_by_semantic_key
+            .contains_key(&(0, crate::refs::page_key("Root note"))));
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            before.complete_builds
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An incomplete poll scan cannot publish an exact final state. Its
+    /// uncertainty invalidates the retained generation so no later write trusts
+    /// partial evidence.
+    #[test]
+    fn uncertain_external_observation_invalidates_guarded_identity() {
+        let dir = scratch("guarded-identity-uncertain-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        assert!(!graph.guarded_graph_text_identity_report().invalidated);
+
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+
+        assert!(graph.guarded_graph_text_identity_report().invalidated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Watcher routing is resource scoped: observing graph A must not mutate a
+    /// separate graph B's retained identity generation.
+    #[test]
+    fn external_observation_isolated_between_graph_resources() {
+        let dir_a = scratch("guarded-identity-resource-a");
+        let dir_b = scratch("guarded-identity-resource-b");
+        fs::write(dir_a.join("pages/Anchor.md"), b"- anchor A\n").unwrap();
+        fs::write(dir_b.join("pages/Anchor.md"), b"- anchor B\n").unwrap();
+        let graph_a = Graph::open(&dir_a);
+        let graph_b = Graph::open(&dir_b);
+        guarded_test_prime_identity(&graph_a);
+        guarded_test_prime_identity(&graph_b);
+        let before_b = graph_b.guarded_graph_text_identity_report();
+
+        let external_a = dir_a.join("Observed.md");
+        fs::write(&external_a, b"- observed A\n").unwrap();
+        graph_a
+            .observe_graph_text_external_paths(std::iter::once(external_a.as_path()), false)
+            .unwrap();
+
+        assert_eq!(graph_b.guarded_graph_text_identity_report(), before_b);
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
     fn copy_tree(source: &Path, destination: &Path) {
         fs::create_dir_all(destination).unwrap();
         for entry in fs::read_dir(source).unwrap() {
@@ -36635,7 +37096,7 @@ mod tests {
     /// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
     /// the source is never mutated.
     #[test]
-    #[ignore]
+    #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]
     fn real_graph_direct_save_does_not_rebuild_the_identity_index() {
         let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
             eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
@@ -36739,6 +37200,10 @@ mod tests {
         graph_a
             .observe_graph_text_external_paths(std::iter::once(collision.as_path()), false)
             .unwrap();
+        graph_b.note_graph_text_external_observation();
+        let observed = graph_b.graph_text_external_observation_ticket();
+        graph_b.sync_file_checked(&collision).unwrap();
+        graph_b.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
         assert_eq!(
             graph_b.save_page(&claimed, None).unwrap_err().kind(),
@@ -36977,6 +37442,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
             .unwrap();
+        let observed = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&external).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
         assert_eq!(
             graph.save_page(&claimed, None).unwrap_err().kind(),
@@ -36985,6 +37453,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let rescanned = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&external).unwrap();
+        graph.acknowledge_graph_text_external_observations(rescanned);
         assert_eq!(
             graph.save_page(&claimed, None).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
@@ -38053,6 +38524,203 @@ mod tests {
             .unwrap();
         assert!(org_path.exists());
         assert!(!dir.join("pages").join("hls__paper.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Concord invariant 4, as a standing guard rather than a per-defect test.
+    /// Opening a graph and READING every page in it must not touch one byte of
+    /// the tree — no reformat, no rename, no new file. A graph kept in git turns
+    /// every spurious write into a diff, and this is the one invariant a user
+    /// notices immediately.
+    ///
+    /// The fixture is deliberately hostile to a default serializer: two-space
+    /// indent, no trailing newline, CRLF, an extra blank line after the page
+    /// preamble, a title-named journal the filename migration would rename, an
+    /// org page, and a `.markdown` spelling.
+    #[test]
+    fn opening_and_reading_a_graph_rewrites_nothing() {
+        let dir = scratch("write-shy-open");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        let files: &[(&str, &str)] = &[
+            (
+                "logseq/config.edn",
+                "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+            ),
+            // two-space indent, no trailing newline
+            (
+                "pages/Two Space.md",
+                "- parent\n  - child\n    - grandchild",
+            ),
+            // CRLF, three trailing newlines
+            (
+                "pages/Crlf.md",
+                "title:: Crlf\r\n\r\n- one\r\n- two\r\n\r\n\r\n",
+            ),
+            // two blank lines after the preamble
+            ("pages/Preamble.md", "alias:: p\ntags:: a, b\n\n\n- body\n"),
+            ("pages/Org.org", "#+TITLE: Org\n* head\n** child\n"),
+            ("pages/Long.markdown", "- long extension spelling\n"),
+            // a journal whose name does not round-trip to its date
+            (
+                "journals/Thursday, 25-06-2026.md",
+                "- title-named journal\n",
+            ),
+            ("journals/2026_06_26.md", "- canonical journal\n"),
+        ];
+        for (relative, content) in files {
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, content).unwrap();
+        }
+        let before = graph_tree_snapshot(&dir);
+
+        let g = Graph::open(&dir);
+        let entries = g.list_pages();
+        assert!(entries.len() >= 5, "the fixture pages were discovered");
+        for entry in &entries {
+            let _ = g.load_page(entry);
+        }
+        for entry in g.journals_desc() {
+            let _ = g.load_page(&entry);
+        }
+        let _ = g.list_sync_conflicts();
+        let _ = g.list_vcs_marker_conflicts();
+        let _ = g.conflict_queue();
+        let _ = g.journal_conflicts();
+        let _ = g.journal_filename_migrations();
+
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "opening and reading a graph must leave every file byte-identical"
+        );
+
+        // ...and the same for a save that changes nothing: load each page, hand
+        // the untouched DTO straight back to `save_page`. Anything the round
+        // trip normalizes would be a rewrite of bytes the user did not change.
+        for entry in &entries {
+            let Ok(dto) = g.load_page(entry) else {
+                continue;
+            };
+            let rev = dto.rev.clone();
+            g.save_page(&dto, rev.as_deref()).unwrap_or_else(|error| {
+                panic!("re-saving unchanged {} failed: {error}", entry.rel_path)
+            });
+        }
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "re-saving an unchanged page must leave every file byte-identical"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every file under `root`, by graph-relative path, with its exact bytes.
+    fn graph_tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(relative, fs::read(&path).unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Concord invariant 4 (write-shyness). An `hls__` page is an ordinary
+    /// Logseq page: the user (or OG) may have written it with two-space
+    /// indentation and no trailing newline, and it may carry hand-written note
+    /// children. Re-saving the SAME highlight set is not a semantic change, so
+    /// it must not touch a single byte — every spurious rewrite is a diff in a
+    /// graph kept in git, and a wake for every sync tool watching the tree.
+    #[test]
+    fn write_highlights_leaves_an_unchanged_hls_page_byte_identical() {
+        let dir = scratch("highlights-write-shy");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        // Rewrite the generated page in the OTHER house style the ecosystem
+        // uses: two-space indent, no trailing newline, plus a user note child.
+        let generated = fs::read_to_string(&page_path).unwrap();
+        let restyled = format!("{}\n  - my own note\n", generated.trim_end()).replace('\t', "  ");
+        let restyled = restyled.trim_end().to_string();
+        fs::write(&page_path, &restyled).unwrap();
+
+        let reopened = Graph::open(&dir);
+        reopened
+            .write_highlights("paper.pdf", "Paper", &[h], &[])
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&page_path).unwrap(),
+            restyled,
+            "re-saving the same highlights must not rewrite the page"
+        );
+        assert!(
+            !dir.join("logseq").join(".tine-trash").exists(),
+            "a highlight save must not materialize a trash directory it never uses"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same invariant when there IS a semantic change: adding a highlight
+    /// appends one block and leaves the rest of the file's formatting alone.
+    #[test]
+    fn write_highlights_keeps_the_hls_pages_formatting_when_it_does_change() {
+        let dir = scratch("highlights-write-shy-changed");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        let restyled = fs::read_to_string(&page_path)
+            .unwrap()
+            .replace('\t', "  ")
+            .trim_end()
+            .to_string()
+            + "\n  - my own note";
+        fs::write(&page_path, &restyled).unwrap();
+
+        let reopened = Graph::open(&dir);
+        let h2 = mkhl("22222222-2222-2222-2222-222222222222", 4, Some("more"));
+        reopened
+            .write_highlights("paper.pdf", "Paper", &[h, h2], &[])
+            .unwrap();
+
+        let after = fs::read_to_string(&page_path).unwrap();
+        assert!(
+            after.contains("more"),
+            "the new highlight landed: {after:?}"
+        );
+        assert!(
+            after.contains("  - my own note"),
+            "the user's note keeps its two-space indent: {after:?}"
+        );
+        assert!(
+            !after.contains('\t'),
+            "no line was re-indented with tabs: {after:?}"
+        );
+        assert!(
+            !after.ends_with('\n'),
+            "the file's missing trailing newline is preserved: {after:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -40609,9 +41277,8 @@ mod tests {
     }
 
     /// A content-only existing save must carry the already-warm semantic
-    /// evidence forward. The immediately following creation may stream one
-    /// census, but may not rebuild/capture/parse the graph to recover evidence
-    /// that the existing save already proved unchanged.
+    /// evidence forward. The immediately following creation is target-local: it
+    /// may not census, rebuild, retain, or parse the graph.
     #[test]
     fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
         let dir = scratch("existing-save-then-create-warm-evidence");
@@ -40623,12 +41290,24 @@ mod tests {
         .unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
+        graph.list_pages();
 
         let mut existing = graph.load_by_path("pages/Existing.md").unwrap().unwrap();
         existing.blocks[0].raw = "after".into();
         graph
             .save_page(&existing, existing.rev.as_deref())
             .expect("identity-preserving existing save");
+        let (inventory_generation, inventory_entries) = graph
+            .page_list_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("content-only save must retain the warm page inventory");
+        assert_eq!(inventory_generation, graph.cache_generation());
+        assert!(inventory_entries
+            .iter()
+            .any(|entry| entry.rel_path == "pages/Existing.md"));
         let installed = graph
             .effective_identity_index
             .read()
@@ -40651,8 +41330,8 @@ mod tests {
             .expect("warm evidence must authorize the noncolliding creation");
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 1);
-        assert_eq!(counters.direct_creation_files_hashed, 2);
+        assert_eq!(counters.direct_creation_censuses, 0);
+        assert_eq!(counters.direct_creation_files_hashed, 0);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
@@ -40660,7 +41339,7 @@ mod tests {
         assert_eq!(
             GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
             Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-            "creation consumed the retained shadow capture hook"
+            "creation must not consume the retained shadow capture hook"
         );
         assert_eq!(
             fs::read(dir.join("pages/Existing.md")).unwrap(),
@@ -40877,10 +41556,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The whole validation/publication path consumes one streaming census and
-    /// no managed retained-capture, complete-index, or parse work.
+    /// The whole validation/publication path is target-local: no graph census,
+    /// retained capture, complete-index build, or parse work.
     #[test]
-    fn missing_target_creation_has_one_census_and_zero_shadow_or_parse_work() {
+    fn missing_target_creation_has_zero_graph_census_shadow_or_parse_work() {
         let dir = scratch("missing-target-one-streaming-census");
         for index in 0..24 {
             fs::write(
@@ -40896,9 +41575,6 @@ mod tests {
         .unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
         let before = graph.guarded_graph_text_identity_report();
         reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
@@ -40907,8 +41583,8 @@ mod tests {
             .unwrap();
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 1);
-        assert_eq!(counters.direct_creation_files_hashed, 25);
+        assert_eq!(counters.direct_creation_censuses, 0);
+        assert_eq!(counters.direct_creation_files_hashed, 0);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(
@@ -40924,10 +41600,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An external retitle can preserve path, inode, and byte length. The
-    /// content digest installed with the parsed cache is what closes that gap.
+    /// A normally reconciled external retitle updates semantic ownership even
+    /// when path, inode, and byte length are unchanged.
     #[test]
-    fn same_path_same_length_retitle_without_reconciliation_refuses_creation() {
+    fn same_path_same_length_retitle_after_reconciliation_refuses_creation() {
         let dir = scratch("same-length-retitle-creation-proof");
         let owner = dir.join("pages/Owner.md");
         let before = b"title:: Alpha Name\n\n- owner\n";
@@ -40937,6 +41613,7 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         fs::write(&owner, after).unwrap();
+        graph.sync_file_checked(&owner).unwrap();
         reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let target = dir.join("pages/Omega Name.md");
@@ -40948,39 +41625,10 @@ mod tests {
         assert!(!target.exists());
         assert_eq!(
             graph_text_admission_test_counters().direct_creation_censuses,
-            1
+            0
         );
         assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A generation change during the one census fails closed. Creation neither
-    /// retries the census nor mutates the target.
-    #[test]
-    fn cache_generation_change_during_creation_census_fails_without_retry() {
-        let dir = scratch("creation-census-generation-change");
-        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
-        fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
-        let graph = Graph::open(&dir);
-        graph.warm_cache();
-        reset_graph_text_admission_test_counters();
-        DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN.with(|armed| armed.set(true));
-        let target = dir.join("pages/Must Not Retry.md");
-        let error = graph
-            .save_page(&direct_save_bench_new_page("Must Not Retry"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-        assert_eq!(
-            graph_text_admission_test_counters().direct_creation_censuses,
-            1
-        );
-        assert!(!target.exists());
-        assert_eq!(
-            fs::read(dir.join("pages/Target.md")).unwrap(),
-            b"- before\n"
-        );
-        assert_eq!(fs::read(dir.join("pages/Other.md")).unwrap(), b"- other\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -41030,7 +41678,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn creation_refuses_hardlinks_without_changing_either_name() {
+    fn unrelated_creation_does_not_mutate_existing_hardlinks() {
         let dir = scratch("creation-hardlink-refusal");
         fs::create_dir_all(dir.join("arbitrary")).unwrap();
         let incumbent = dir.join("pages/Owner.md");
@@ -41040,13 +41688,12 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         let target = dir.join("pages/Fresh Hardlink Check.md");
-        let error = graph
+        graph
             .save_page(&direct_save_bench_new_page("Fresh Hardlink Check"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+            .expect("an unrelated no-replace creation need not rewrite existing aliases");
         assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
         assert_eq!(fs::read(&alias).unwrap(), b"- incumbent\n");
-        assert!(!target.exists());
+        assert!(target.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -41183,6 +41830,95 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn external_portable_alias_creator_wins_before_creation_publication() {
+        let dir = scratch("creation-external-portable-alias-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced.md");
+        let alias = dir.join("pages/raced.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let alias = alias.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"external winner\n")));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced"), None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&alias).unwrap(), b"external winner\n");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_semantic_owner_creator_wins_before_creation_publication() {
+        let dir = scratch("creation-external-semantic-owner-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        graph.warm_cache();
+        let target = dir.join("pages/Raced Semantic.md");
+        let owner = dir.join("pages/External.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let owner = owner.clone();
+            let graph = Arc::clone(&graph);
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(owner, b"title:: Raced Semantic\n\n- external winner\n")?;
+                graph.note_graph_text_external_observation();
+                Ok(())
+            }));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced Semantic"), None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert_eq!(
+            fs::read(&owner).unwrap(),
+            b"title:: Raced Semantic\n\n- external winner\n"
+        );
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_portable_symlink_alias_refuses_creation_publication() {
+        let dir = scratch("creation-external-portable-symlink-alias-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let outside = dir.with_extension("external-symlink-owner");
+        fs::write(&outside, b"external winner\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced.md");
+        let alias = dir.join("pages/raced.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let alias = alias.clone();
+            let outside = outside.clone();
+            *hook.borrow_mut() = Some(Box::new(move || std::os::unix::fs::symlink(outside, alias)));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced"), None)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"external winner\n");
+        assert!(alias.is_symlink());
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&outside);
+    }
+
     /// GH #267 / F3. Leave a deterministic whole-graph capture race armed and
     /// prove an existing save never reaches it.
     #[test]
@@ -41285,8 +42021,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A watcher-free external retitle invalidates the cached byte snapshot and
-    /// refuses creation without rebuilding semantic evidence.
+    /// A reconciled external retitle refuses duplicate semantic creation without
+    /// rebuilding or hashing the graph.
     #[test]
     fn missing_target_creation_refuses_an_externally_retitled_owner() {
         let dir = scratch("creation-proof-follows-external-retitle");
@@ -41294,6 +42030,9 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
+        graph
+            .sync_file_checked(&dir.join("pages/Owner.md"))
+            .unwrap();
         let before = graph.guarded_graph_text_identity_report();
         reset_graph_text_admission_test_counters();
         let error = graph
@@ -41306,7 +42045,7 @@ mod tests {
         );
         assert_eq!(
             graph_text_admission_test_counters().direct_creation_censuses,
-            1
+            0
         );
         assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
         assert!(!dir.join("pages/Omega Name.md").exists());
@@ -41327,6 +42066,10 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let owner = dir.join("pages/Owner.md");
+        let observed = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         graph
             .save_page(&direct_save_bench_new_page("Semantic Prime"), None)
             .unwrap();
@@ -41335,6 +42078,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let observed = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         graph
             .save_page(&direct_save_bench_new_page("Same Bytes Proof"), None)
@@ -41345,6 +42091,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let observed = graph.graph_text_external_observation_ticket();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let error = graph
             .save_page(&direct_save_bench_new_page("Omega Name"), None)
@@ -42151,7 +42900,7 @@ mod tests {
 
         let bytes = b"title:: 26-07-2026\n\n- parser-owned title\n";
         let content = std::str::from_utf8(bytes).unwrap();
-        let permit = graph_text_parse_budget_permit(&graph, &path, content, 0, u64::MAX).unwrap();
+        let permit = graph_text_parse_budget_permit(&graph, &path, content).unwrap();
         let (present, format) = graph
             .decode_present_graph_text(&path, bytes, permit)
             .unwrap();
@@ -42249,7 +42998,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_snapshot_excludes_reserved_paths_and_poisoned_builds_have_no_authority() {
+    fn admission_snapshot_excludes_reserved_paths_and_failed_builds_poison() {
         let root = scratch("admission-exclusions");
         fs::create_dir_all(root.join("logseq")).unwrap();
         fs::write(root.join("logseq/config.edn"), "{:hidden [\"private\"]}\n").unwrap();
@@ -42294,7 +43043,6 @@ mod tests {
             &*invalid_graph.graph_text_admission.read().unwrap(),
             GraphTextAdmissionState::Poisoned { .. }
         ));
-        assert!(invalid_graph.graph_text_admission_epoch().is_err());
 
         let parse = scratch("admission-parse-failure");
         fs::write(parse.join("Bad.md"), b"- valid bytes\n").unwrap();
@@ -42580,412 +43328,6 @@ mod tests {
     }
 
     #[test]
-    fn unarmed_and_poisoned_admission_queries_never_enumerate() {
-        fn assert_epoch_query_rejected_without_side_work(graph: &Graph) {
-            let (result, counters) =
-                measure_graph_text_admission_point_queries(|| graph.graph_text_admission_epoch());
-            assert!(result.is_err());
-            assert_graph_text_admission_point_query_only(counters, 1);
-        }
-
-        let unbuilt_root = scratch("admission-query-unbuilt");
-        let unbuilt = Graph::open(&unbuilt_root);
-        assert_epoch_query_rejected_without_side_work(&unbuilt);
-
-        let building_root = scratch("admission-query-building");
-        let building = Graph::open(&building_root);
-        building.begin_graph_text_admission_build().unwrap();
-        assert_epoch_query_rejected_without_side_work(&building);
-
-        let root = scratch("admission-query-boundary");
-        fs::create_dir_all(root.join("deep/tree")).unwrap();
-        fs::write(root.join("deep/tree/Page.md"), b"- page\n").unwrap();
-        let graph = Graph::open(&root);
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        assert_epoch_query_rejected_without_side_work(&graph);
-
-        graph.poison_graph_text_admission("injected poison");
-        assert_epoch_query_rejected_without_side_work(&graph);
-        let _ = fs::remove_dir_all(&unbuilt_root);
-        let _ = fs::remove_dir_all(&building_root);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn exact_feed_events_atomically_update_reverse_maps_and_fail_closed() {
-        let root = scratch("admission-feed");
-        fs::write(root.join("Page.md"), b"title:: First\n\n- page\n").unwrap();
-        let graph = Graph::open(&root);
-        let token = graph.arm_graph_text_admission_feed(40).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let page_path = ManagedPath::parse("Page.md").unwrap();
-        let before = graph
-            .graph_text_admission_exact(&epoch, &page_path)
-            .unwrap()
-            .into_present();
-        assert_eq!(before.record.semantic.name, "First");
-        assert_eq!(before.current.bytes, b"title:: First\n\n- page\n");
-        assert_eq!(before.current.description, before.record.description);
-        assert_eq!(
-            before.current.file_resource_id,
-            before.record.file_resource_id
-        );
-        assert_eq!(before.current.link_count, 1);
-        assert_eq!(before.portable_members, [page_path.clone()]);
-        assert_eq!(before.resource_members, ["Page.md"]);
-        assert_eq!(before.semantic_members, [page_path.clone()]);
-
-        fs::write(root.join("Page.md"), b"title:: Second\n\n- changed\n").unwrap();
-        graph
-            .apply_graph_text_admission_event(
-                &token,
-                41,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .unwrap();
-        let changed_epoch = graph.graph_text_admission_epoch().unwrap();
-        let changed = graph
-            .graph_text_admission_exact(&changed_epoch, &page_path)
-            .unwrap()
-            .into_present();
-        assert_eq!(changed.record.semantic.name, "Second");
-        assert_eq!(
-            changed.record.description,
-            BlobDescription::of(b"title:: Second\n\n- changed\n")
-        );
-        assert_eq!(changed.record.format, Format::Md);
-        assert_eq!(changed.epoch.generation, epoch.generation + 1);
-        assert_eq!(changed.portable_members, [page_path.clone()]);
-        assert_eq!(changed.resource_members, ["Page.md"]);
-        assert_eq!(changed.semantic_members, [page_path.clone()]);
-
-        fs::remove_file(root.join("Page.md")).unwrap();
-        graph
-            .apply_graph_text_admission_event(
-                &token,
-                42,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .unwrap();
-        let removed_epoch = graph.graph_text_admission_epoch().unwrap();
-        assert!(matches!(
-            graph
-                .graph_text_admission_exact(&removed_epoch, &page_path)
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentRetained { .. }
-        ));
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                44,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let other = scratch("admission-feed-cross-instance");
-        let other_graph = Graph::open(&other);
-        let _other_lease = other_graph.arm_graph_text_admission_feed(0).unwrap();
-        other_graph
-            .initial_shadow_raw_managed_text_inventory()
-            .unwrap();
-        assert!(other_graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::DirectoryChanged { relative: None },
-            )
-            .is_err());
-        assert!(matches!(
-            &*other_graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        assert!(other_graph.graph_text_admission_epoch().is_err());
-
-        let disconnected = scratch("admission-disconnect-cross-instance");
-        let disconnected_graph = Graph::open(&disconnected);
-        let _disconnected_lease = disconnected_graph.arm_graph_text_admission_feed(0).unwrap();
-        disconnected_graph
-            .initial_shadow_raw_managed_text_inventory()
-            .unwrap();
-        assert!(disconnected_graph
-            .disconnect_graph_text_admission_feed(&token)
-            .is_err());
-        assert!(matches!(
-            &*disconnected_graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        assert!(disconnected_graph.graph_text_admission_epoch().is_err());
-        assert!(other_graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::DirectoryChanged { relative: None },
-            )
-            .is_err());
-        assert!(other_graph.graph_text_admission_epoch().is_err());
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&other);
-        let _ = fs::remove_dir_all(&disconnected);
-    }
-
-    #[test]
-    fn admission_exact_absence_distinguishes_retained_deletion_from_never_owned() {
-        let root = scratch("admission-retained-delete");
-        fs::write(root.join("Page.md"), b"title:: Retained Title\n\n- body\n").unwrap();
-        let graph = Graph::open(&root);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        fs::remove_file(root.join("Page.md")).unwrap();
-        graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        match graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Page.md").unwrap())
-            .unwrap()
-        {
-            GraphTextAdmissionExactObservation::AbsentRetained {
-                epoch: observed,
-                tombstone,
-            } => {
-                assert_eq!(observed.generation, epoch.generation);
-                assert_eq!(
-                    tombstone.prior_record.unwrap().semantic.name,
-                    "Retained Title"
-                );
-                assert_eq!(tombstone.prior_link_count, 1);
-            }
-            _ => panic!("deleted retained path must return tombstone evidence"),
-        }
-        match graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Never.md").unwrap())
-            .unwrap()
-        {
-            GraphTextAdmissionExactObservation::AbsentUnowned {
-                epoch: observed,
-                provisional,
-            } => {
-                assert_eq!(observed.generation, epoch.generation);
-                assert_eq!(provisional.name, "Never");
-            }
-            _ => panic!("never-owned path must remain distinct from retained deletion"),
-        }
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn admission_event_parent_replacement_and_hardlink_add_poison_before_publication() {
-        let parent_root = scratch("admission-event-parent-replacement");
-        fs::create_dir_all(parent_root.join("nested")).unwrap();
-        fs::write(parent_root.join("nested/Page.md"), b"- retained\n").unwrap();
-        let graph = Graph::open(&parent_root);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let retired = parent_root.join("retired");
-        GRAPH_TEXT_EVENT_REVALIDATION_RACE.with(|hook| {
-            let parent_root = parent_root.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::rename(parent_root.join("nested"), &retired)?;
-                fs::create_dir(parent_root.join("nested"))?;
-                fs::write(parent_root.join("nested/Page.md"), b"- retained\n")
-            }));
-        });
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "nested/Page.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let aba_root = scratch("admission-event-parent-aba");
-        fs::create_dir_all(aba_root.join("nested")).unwrap();
-        fs::write(aba_root.join("nested/Page.md"), b"- retained\n").unwrap();
-        let graph = Arc::new(Graph::open(&aba_root));
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let hook_graph = Arc::clone(&graph);
-        GRAPH_TEXT_EVENT_REVALIDATION_RACE.with(|hook| {
-            let aba_root = aba_root.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                let retired = aba_root.join("retired");
-                fs::rename(aba_root.join("nested"), &retired)?;
-                fs::rename(&retired, aba_root.join("nested"))?;
-                hook_graph.poison_graph_text_admission(
-                    "exact directory event requires a new bounded snapshot",
-                );
-                Ok(())
-            }));
-        });
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "nested/Page.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let link_root = scratch("admission-event-hardlink-add");
-        let outside = scratch("admission-event-hardlink-add-outside");
-        fs::write(link_root.join("Page.md"), b"- retained\n").unwrap();
-        let graph = Graph::open(&link_root);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        GRAPH_TEXT_EVENT_REVALIDATION_RACE.with(|hook| {
-            let source = link_root.join("Page.md");
-            let alias = outside.join("alias.bin");
-            *hook.borrow_mut() = Some(Box::new(move || fs::hard_link(source, alias)));
-        });
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let _ = fs::remove_dir_all(&parent_root);
-        let _ = fs::remove_dir_all(&aba_root);
-        let _ = fs::remove_dir_all(&link_root);
-        let _ = fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    fn admission_event_work_is_independent_of_unrelated_retained_files() {
-        fn one_event(unrelated: usize) -> GraphTextAdmissionTestCounters {
-            let root = scratch(&format!("admission-event-complexity-{unrelated}"));
-            fs::write(root.join("Target.md"), b"title:: Before\n").unwrap();
-            for index in 0..unrelated {
-                fs::write(
-                    root.join(format!("Unrelated-{index:04}.md")),
-                    format!("- ordinary {index}\n"),
-                )
-                .unwrap();
-            }
-            let graph = Graph::open(&root);
-            let token = graph.arm_graph_text_admission_feed(0).unwrap();
-            graph.initial_shadow_raw_managed_text_inventory().unwrap();
-            fs::write(root.join("Target.md"), b"title:: After\n").unwrap();
-            let before = graph_text_admission_test_counters();
-            graph
-                .apply_graph_text_admission_event(
-                    &token,
-                    1,
-                    GraphTextAdmissionExactEvent::FileUpsert {
-                        relative: "Target.md".to_owned(),
-                    },
-                )
-                .unwrap();
-            let counters = graph_text_admission_test_counters().difference_since(before);
-            let _ = fs::remove_dir_all(root);
-            counters
-        }
-
-        let small = one_event(8);
-        let large = one_event(512);
-        assert_eq!(small.builder_enumerations, 0);
-        assert_eq!(small.parser_invocations, large.parser_invocations);
-        assert_eq!(small.index_map_insertions, large.index_map_insertions);
-        assert_eq!(small.event_map_key_reads, large.event_map_key_reads);
-        assert_eq!(small.event_map_key_writes, large.event_map_key_writes);
-        assert_eq!(small.event_reverse_members, large.event_reverse_members);
-        assert_eq!(
-            small.persistent_payload_members,
-            large.persistent_payload_members
-        );
-        assert!(
-            large.persistent_node_allocations < small.persistent_node_allocations * 4,
-            "persistent path copies may grow only logarithmically: small={small:?}, large={large:?}"
-        );
-        assert_eq!(small.parser_invocations, 1);
-        assert!(small.event_map_key_reads > 0);
-        assert!(small.event_map_key_writes > 0);
-        assert!(small.event_reverse_members > 0);
-        assert!(small.persistent_node_allocations > 0);
-        assert!(small.persistent_payload_members > 0);
-    }
-
-    #[test]
-    fn admission_event_collision_is_retained_with_bounded_payload_work() {
-        let root = scratch("admission-event-bounded-collision");
-        fs::write(root.join("One.md"), b"title:: One\n").unwrap();
-        fs::write(root.join("Two.md"), b"title:: Two\n").unwrap();
-        let graph = Graph::open(&root);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        fs::write(root.join("Two.md"), b"title:: One\n").unwrap();
-
-        reset_graph_text_admission_test_counters();
-        graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "Two.md".to_owned(),
-                },
-            )
-            .unwrap();
-        let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.builder_enumerations, 0);
-        assert_eq!(counters.parser_invocations, 1);
-        assert!(
-            counters.persistent_payload_members <= 20,
-            "one touched collision group stays bounded: {counters:?}"
-        );
-        assert!(counters.persistent_node_allocations < 256);
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Complete(_)
-        ));
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let observation = graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Two.md").unwrap())
-            .unwrap()
-            .into_present();
-        assert_eq!(observation.semantic_members.len(), 2);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn admission_persistent_avl_ordered_keys_stay_logarithmic_and_share_large_values() {
         fn ordered_work(entries: usize) -> (GraphTextAdmissionTestCounters, u8) {
             reset_graph_text_admission_test_counters();
@@ -43224,309 +43566,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn admission_exact_live_hardlink_failure_poisons_permanently() {
-        let root = scratch("admission-exact-live-hardlink");
-        let outside = scratch("admission-exact-live-hardlink-outside");
-        fs::write(root.join("Page.md"), b"- retained\n").unwrap();
-        let graph = Graph::open(&root);
-        let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let path = ManagedPath::parse("Page.md").unwrap();
-
-        let alias = outside.join("alias.bin");
-        fs::hard_link(root.join("Page.md"), &alias).unwrap();
-        assert!(graph.graph_text_admission_exact(&epoch, &path).is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        fs::remove_file(alias).unwrap();
-        assert!(graph.graph_text_admission_epoch().is_err());
-        assert!(graph.graph_text_admission_exact(&epoch, &path).is_err());
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn admission_root_substitution_poison_survives_restoration_for_epoch_and_point() {
-        fn substitute(root: &Path, retained: &Path) {
-            let _ = fs::remove_dir_all(retained);
-            fs::rename(root, retained).unwrap();
-            fs::create_dir_all(root).unwrap();
-        }
-
-        fn restore(root: &Path, retained: &Path) {
-            crate::test_support::remove_dir_all(root);
-            fs::rename(retained, root).unwrap();
-        }
-
-        let point_root = scratch("admission-point-root-substitution");
-        fs::write(point_root.join("Page.md"), b"- point\n").unwrap();
-        let point_graph = Graph::open(&point_root);
-        let _point_lease = point_graph.arm_graph_text_admission_feed(0).unwrap();
-        point_graph
-            .initial_shadow_raw_managed_text_inventory()
-            .unwrap();
-        let point_epoch = point_graph.graph_text_admission_epoch().unwrap();
-        let point_path = ManagedPath::parse("Page.md").unwrap();
-        let point_retained = point_root.with_extension("retained");
-        substitute(&point_root, &point_retained);
-        assert!(point_graph
-            .graph_text_admission_exact(&point_epoch, &point_path)
-            .is_err());
-        restore(&point_root, &point_retained);
-        assert!(point_graph.graph_text_admission_epoch().is_err());
-        assert!(point_graph
-            .graph_text_admission_exact(&point_epoch, &point_path)
-            .is_err());
-
-        let epoch_root = scratch("admission-epoch-root-substitution");
-        fs::write(epoch_root.join("Page.md"), b"- epoch\n").unwrap();
-        let epoch_graph = Graph::open(&epoch_root);
-        let _epoch_lease = epoch_graph.arm_graph_text_admission_feed(0).unwrap();
-        epoch_graph
-            .initial_shadow_raw_managed_text_inventory()
-            .unwrap();
-        let epoch_retained = epoch_root.with_extension("retained");
-        substitute(&epoch_root, &epoch_retained);
-        assert!(epoch_graph.graph_text_admission_epoch().is_err());
-        restore(&epoch_root, &epoch_retained);
-        assert!(epoch_graph.graph_text_admission_epoch().is_err());
-
-        let _ = fs::remove_dir_all(&point_root);
-        let _ = fs::remove_dir_all(&epoch_root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn admission_exact_read_replacement_bytes_resource_and_link_poison() {
-        for kind in ["bytes", "resource", "link"] {
-            let root = scratch(&format!("admission-exact-{kind}-replacement"));
-            let outside = scratch(&format!("admission-exact-{kind}-replacement-outside"));
-            fs::write(root.join("Page.md"), b"- retained\n").unwrap();
-            let graph = Graph::open(&root);
-            let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
-            graph.initial_shadow_raw_managed_text_inventory().unwrap();
-            let epoch = graph.graph_text_admission_epoch().unwrap();
-            let path = ManagedPath::parse("Page.md").unwrap();
-            let target = root.join("Page.md");
-            let retired = root.join("Page.retired");
-            let alias = outside.join("alias.bin");
-            MANAGED_INVENTORY_READ_RACE.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || match kind {
-                    "bytes" => fs::write(&target, b"- changed\n"),
-                    "resource" => {
-                        fs::rename(&target, &retired)?;
-                        fs::write(&target, b"- retained\n")
-                    }
-                    "link" => fs::hard_link(&target, &alias),
-                    _ => unreachable!(),
-                }));
-            });
-            assert!(graph.graph_text_admission_exact(&epoch, &path).is_err());
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-            assert!(graph.graph_text_admission_epoch().is_err());
-
-            let _ = fs::remove_dir_all(&root);
-            let _ = fs::remove_dir_all(&outside);
-        }
-    }
-
-    #[test]
-    fn admission_exact_valid_current_proof_has_no_builder_enumeration() {
-        let root = scratch("admission-exact-valid-live-proof");
-        fs::create_dir_all(root.join("deep/tree")).unwrap();
-        fs::write(
-            root.join("deep/tree/Page.Markdown"),
-            b"title:: Current\n\n- body\n",
-        )
-        .unwrap();
-        let graph = Graph::open(&root);
-        let _lease = graph.arm_graph_text_admission_feed(8).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let path = ManagedPath::parse("deep/tree/Page.Markdown").unwrap();
-
-        PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
-        let (observation, counters) = measure_graph_text_admission_point_queries(|| {
-            graph
-                .graph_text_admission_exact(&epoch, &path)
-                .unwrap()
-                .into_present()
-        });
-        assert_eq!(observation.current.bytes, b"title:: Current\n\n- body\n");
-        assert_eq!(
-            observation.current.description,
-            observation.record.description
-        );
-        assert_eq!(
-            observation.current.file_resource_id,
-            observation.record.file_resource_id
-        );
-        assert_eq!(observation.current.link_count, 1);
-        assert_graph_text_admission_point_query_only(counters, 1);
-        PROJECTION_EXACT_OPEN_COUNT.with(|count| assert!(count.get() >= 4));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn admission_exact_concurrent_valid_feed_generation_cannot_return_old_observation() {
-        let root = scratch("admission-exact-concurrent-feed");
-        fs::write(root.join("Page.md"), b"- stable\n").unwrap();
-        let graph = Arc::new(Graph::open(&root));
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let path = ManagedPath::parse("Page.md").unwrap();
-        MANAGED_INVENTORY_READ_RACE.with(|hook| {
-            let graph = Arc::clone(&graph);
-            *hook.borrow_mut() = Some(Box::new(move || {
-                graph.apply_graph_text_admission_event(
-                    &token,
-                    1,
-                    GraphTextAdmissionExactEvent::FileUpsert {
-                        relative: "Page.md".to_owned(),
-                    },
-                )
-            }));
-        });
-
-        assert!(graph.graph_text_admission_exact(&epoch, &path).is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        assert!(graph.graph_text_admission_epoch().is_err());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn feed_overflow_disconnect_generation_wrap_and_build_bounds_poison_permanently() {
-        let prebuild = scratch("admission-feed-prebuild-event");
-        let graph = Graph::open(&prebuild);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Missing.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-        let building = scratch("admission-feed-building-event");
-        let graph = Graph::open(&building);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.begin_graph_text_admission_build().unwrap();
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Missing.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let overflow = scratch("admission-feed-overflow");
-        let graph = Graph::open(&overflow);
-        let token = graph.arm_graph_text_admission_feed(u64::MAX).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                0,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Missing.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(graph.graph_text_admission_epoch().is_err());
-
-        let generation = scratch("admission-generation-wrap");
-        let graph = Graph::open(&generation);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        graph.set_graph_text_admission_generation_for_test(u64::MAX);
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileRemove {
-                    relative: "Missing.md".to_owned(),
-                },
-            )
-            .is_err());
-
-        let disconnected = scratch("admission-feed-disconnect");
-        let graph = Graph::open(&disconnected);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        graph.disconnect_graph_text_admission_feed(&token).unwrap();
-        assert!(graph.graph_text_admission_epoch().is_err());
-
-        for (tag, limits) in [
-            (
-                "count",
-                InitialShadowLimits {
-                    managed_files: 0,
-                    ..INITIAL_SHADOW_LIMITS
-                },
-            ),
-            (
-                "permanent",
-                InitialShadowLimits {
-                    permanent_index_bytes: 1,
-                    ..INITIAL_SHADOW_LIMITS
-                },
-            ),
-            (
-                "peak",
-                InitialShadowLimits {
-                    peak_build_bytes: 1,
-                    ..INITIAL_SHADOW_LIMITS
-                },
-            ),
-        ] {
-            let root = scratch(&format!("admission-bound-{tag}"));
-            fs::write(root.join("Page.md"), b"- bounded\n").unwrap();
-            let graph = Graph::open(&root);
-            assert!(graph
-                .initial_shadow_raw_managed_text_inventory_with_limits(limits)
-                .is_err());
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-            assert!(graph.graph_text_admission_epoch().is_err());
-            let _ = fs::remove_dir_all(&root);
-        }
-
-        let _ = fs::remove_dir_all(&overflow);
-        let _ = fs::remove_dir_all(&generation);
-        let _ = fs::remove_dir_all(&disconnected);
-        let _ = fs::remove_dir_all(&prebuild);
-        let _ = fs::remove_dir_all(&building);
-    }
-
-    #[test]
-    fn admission_memory_preflights_capture_maps_parser_event_and_overflow() {
+    fn admission_memory_preflights_capture_maps_parser_and_overflow() {
         let capture_root = scratch("admission-capture-bound");
         for index in 0..8 {
             fs::write(
@@ -43586,19 +43627,10 @@ mod tests {
         let permit = graph.admit_retained_managed_text_writer().unwrap();
         let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
         let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-        let path = ManagedPath::parse("Page.md").unwrap();
-        let semantic_budget =
-            graph_text_observed_semantic_name_upper_bound(&graph, &path, &parser_content).unwrap();
-        let parse_peak = graph_text_present_parse_peak_upper_bound(
-            &graph,
-            &path,
-            &parser_content,
-            semantic_budget,
-        )
-        .unwrap();
+        let obsolete_parse_peak = managed_page_build_upper_bound(&parser_content).unwrap();
         let parser_limit = checked_add_bytes(
             checked_add_bytes(capture.peak_build_charge, permanent).unwrap(),
-            parse_peak - 1,
+            obsolete_parse_peak - 1,
         )
         .unwrap();
         reset_graph_text_admission_test_counters();
@@ -43607,56 +43639,10 @@ mod tests {
                 peak_build_bytes: parser_limit,
                 ..INITIAL_SHADOW_LIMITS
             })
-            .is_err());
+            .is_ok());
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.parser_invocations, 0);
+        assert_eq!(counters.parser_invocations, 1);
         assert!(counters.index_map_insertions > 0);
-
-        let event_root = scratch("admission-exact-large-title-bound");
-        fs::write(event_root.join("Page.md"), b"title:: Small\n\n- body\n").unwrap();
-        let graph = Graph::open(&event_root);
-        let token = graph.arm_graph_text_admission_feed(0).unwrap();
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        {
-            let mut state = graph.graph_text_admission.write().unwrap();
-            let GraphTextAdmissionState::Complete(index) = &*state else {
-                panic!("armed build must be complete");
-            };
-            let mut constrained = (**index).clone();
-            constrained.permanent_limit =
-                constrained.permanent_bytes.checked_add(20 * 1024).unwrap();
-            constrained.peak_limit = u64::MAX;
-            *state = GraphTextAdmissionState::Complete(Arc::new(constrained));
-        }
-        let event_title = "E".repeat(32 * 1024);
-        fs::write(
-            event_root.join("Page.md"),
-            format!("title:: {event_title}\n\n- changed\n"),
-        )
-        .unwrap();
-        reset_graph_text_admission_test_counters();
-        assert!(graph
-            .apply_graph_text_admission_event(
-                &token,
-                1,
-                GraphTextAdmissionExactEvent::FileUpsert {
-                    relative: "Page.md".to_owned(),
-                },
-            )
-            .is_err());
-        assert_eq!(
-            graph_text_admission_test_counters().parser_invocations,
-            0,
-            "the content-derived title bound must reject before parser allocation"
-        );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        assert!(graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Page.md").unwrap())
-            .is_err());
 
         let overflow_root = scratch("admission-capture-charge-overflow");
         let graph = Graph::open(&overflow_root);
@@ -43676,1377 +43662,7 @@ mod tests {
         let _ = fs::remove_dir_all(&capture_root);
         let _ = fs::remove_dir_all(&resource_root);
         let _ = fs::remove_dir_all(&parser_root);
-        let _ = fs::remove_dir_all(&event_root);
         let _ = fs::remove_dir_all(&overflow_root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn armed_semantic_and_portable_collisions_retain_exact_evidence() {
-        let portable = scratch("admission-armed-portable-collision");
-        fs::write(portable.join("Caf\u{e9}.md"), b"title:: One\n").unwrap();
-        fs::write(portable.join("Cafe\u{301}.MD"), b"title:: Two\n").unwrap();
-
-        let resource = scratch("admission-armed-resource-collision");
-        fs::write(resource.join("Page.md"), b"- page\n").unwrap();
-        fs::hard_link(resource.join("Page.md"), resource.join("alias.bin")).unwrap();
-
-        let semantic = scratch("admission-armed-semantic-collision");
-        fs::create_dir_all(semantic.join("a")).unwrap();
-        fs::create_dir_all(semantic.join("b")).unwrap();
-        fs::write(semantic.join("a/One.md"), b"title:: Shared\n").unwrap();
-        fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n").unwrap();
-
-        for (root, member, group_len) in
-            [(&portable, "Caf\u{e9}.md", 2), (&semantic, "a/One.md", 2)]
-        {
-            let graph = Graph::open(root);
-            let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
-            graph.initial_shadow_raw_managed_text_inventory().unwrap();
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Complete(_)
-            ));
-            let epoch = graph.graph_text_admission_epoch().unwrap();
-            let observation = graph
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse(member).unwrap())
-                .unwrap()
-                .into_present();
-            assert!(
-                observation.portable_members.len() == group_len
-                    || observation.semantic_members.len() == group_len
-            );
-        }
-
-        for (root, member) in [(&resource, "Page.md")] {
-            let graph = Graph::open(root);
-            let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
-            assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-            let forged = GraphTextAdmissionEpoch {
-                instance: Arc::clone(&graph.graph_text_admission_instance),
-                scope_binding: graph.graph_text_scope_binding().unwrap(),
-                graph_resource: graph.canonical_resource_id().unwrap(),
-                generation: 1,
-                feed_sequence: 0,
-            };
-            let member = ManagedPath::parse(member).unwrap();
-            let ((epoch, exact), counters) = measure_graph_text_admission_point_queries(|| {
-                (
-                    graph.graph_text_admission_epoch(),
-                    graph.graph_text_admission_exact(&forged, &member),
-                )
-            });
-            assert!(epoch.is_err());
-            assert!(exact.is_err());
-            assert_graph_text_admission_point_query_only(counters, 2);
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-        }
-
-        let defensive = scratch("admission-defensive-complete-collision");
-        fs::create_dir_all(defensive.join("a")).unwrap();
-        fs::create_dir_all(defensive.join("b")).unwrap();
-        fs::write(defensive.join("a/One.md"), b"title:: Shared\n").unwrap();
-        fs::write(defensive.join("b/Two.md"), b"title:: Shared\n").unwrap();
-        let graph = Graph::open(&defensive);
-        graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        {
-            let mut state = graph.graph_text_admission.write().unwrap();
-            let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-                panic!("unarmed collision must remain diagnostic-only");
-            };
-            let mut forced = (**index).clone();
-            forced.feed = Some(GraphTextAdmissionFeedFence { last_sequence: 9 });
-            *state = GraphTextAdmissionState::Complete(Arc::new(forced));
-        }
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        reset_graph_text_admission_test_counters();
-        let observation = graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("a/One.md").unwrap())
-            .unwrap()
-            .into_present();
-        assert_eq!(observation.semantic_members.len(), 2);
-        assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
-
-        let _ = fs::remove_dir_all(&portable);
-        let _ = fs::remove_dir_all(&resource);
-        let _ = fs::remove_dir_all(&semantic);
-        let _ = fs::remove_dir_all(&defensive);
-    }
-
-    fn staged_exact_feed_build(graph: &Graph, last_sequence: u64) -> GraphTextExactFeedLease {
-        let lease = graph.arm_graph_text_exact_feed(last_sequence).unwrap();
-        graph.build_graph_text_exact_feed(&lease).unwrap();
-        lease
-    }
-
-    #[test]
-    #[ignore = "release-mode 1k/5k/10k production census scaling receipt"]
-    fn graph_text_exact_feed_measured_scaling_harness() {
-        let mut samples = Vec::new();
-        for count in [1_000_usize, 5_000, 10_000] {
-            let root = scratch(&format!("exact-feed-scaling-{count}"));
-            fs::create_dir_all(root.join("content/nested pages/deep")).unwrap();
-            fs::create_dir_all(root.join("diary/archive")).unwrap();
-            fs::create_dir_all(root.join("other/资料/nested")).unwrap();
-            fs::create_dir_all(root.join("logseq")).unwrap();
-            fs::write(
-                root.join("logseq/config.edn"),
-                b"{:pages-directory \"content/nested pages\" :journals-directory \"diary/archive\"}\n",
-            )
-            .unwrap();
-            for index in 0..count {
-                let relative = match index % 3 {
-                    0 => format!("content/nested pages/deep/page-{index:05}.md"),
-                    1 => format!("diary/archive/2026_08_{:02}.org", index + 10),
-                    _ => format!("other/资料/nested/page-{index:05}.markdown"),
-                };
-                let path = root.join(relative);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                let bytes = if index % 3 == 1 {
-                    format!("#+title: Journal {index}\n* item {index}\n")
-                } else {
-                    format!("- page {index}\n")
-                };
-                fs::write(path, bytes).unwrap();
-            }
-
-            let graph = Graph::open(&root);
-            reset_graph_text_admission_builder_counter_for_runtime_test();
-            let lease = graph.arm_graph_text_exact_feed(0).unwrap();
-            let build_started = Instant::now();
-            graph.build_graph_text_exact_feed(&lease).unwrap();
-            let build_elapsed = build_started.elapsed();
-            let census_enumerations = graph_text_admission_builder_enumerations_for_runtime_test();
-            let scan_started = Instant::now();
-            let pass = graph
-                .capture_reconciliation_scan_pass(
-                    crate::oplog::reconciliation_scan::GraphTextScanLimits::default(),
-                )
-                .unwrap();
-            let scan_elapsed = scan_started.elapsed();
-            assert_eq!(
-                graph_text_admission_builder_enumerations_for_runtime_test(),
-                census_enumerations,
-                "the reconciliation pass must reuse the queue-fenced census"
-            );
-            assert_eq!(pass.instrumentation.eligible_files, count as u64);
-            assert_eq!(
-                pass.instrumentation.bytes_read,
-                pass.instrumentation.bytes_hashed
-            );
-            println!(
-                "exact_feed_{count} build_ms={} scan_from_admission_ms={} entries={} files={} \
-                 bytes={} census_directories={census_enumerations}",
-                build_elapsed.as_millis(),
-                scan_elapsed.as_millis(),
-                pass.instrumentation.directory_entries,
-                pass.instrumentation.eligible_files,
-                pass.instrumentation.bytes_read,
-            );
-            samples.push((count, build_elapsed, scan_elapsed));
-            let _ = fs::remove_dir_all(root);
-        }
-
-        let (_, build_1k, scan_1k) = samples[0];
-        let (_, build_5k, scan_5k) = samples[1];
-        let (_, build_10k, scan_10k) = samples[2];
-        assert!(build_10k < Duration::from_secs(10));
-        assert!(scan_10k < Duration::from_secs(2));
-        assert!(build_5k <= build_1k.saturating_mul(7) + Duration::from_millis(100));
-        assert!(build_10k <= build_5k.saturating_mul(3) + Duration::from_millis(100));
-        assert!(scan_5k <= scan_1k.saturating_mul(7) + Duration::from_millis(50));
-        assert!(scan_10k <= scan_5k.saturating_mul(3) + Duration::from_millis(50));
-    }
-
-    #[test]
-    #[ignore = "set TINE_RECONCILIATION_GRAPH to a read-only real-world corpus"]
-    fn graph_text_exact_feed_real_graph_harness() {
-        let root = PathBuf::from(
-            std::env::var_os("TINE_RECONCILIATION_GRAPH")
-                .expect("TINE_RECONCILIATION_GRAPH must name the benchmark graph"),
-        );
-        let graph = Graph::open(&root);
-        reset_graph_text_admission_builder_counter_for_runtime_test();
-        let lease = graph.arm_graph_text_exact_feed(0).unwrap();
-        let build_started = Instant::now();
-        graph.build_graph_text_exact_feed(&lease).unwrap();
-        let build_elapsed = build_started.elapsed();
-        let census_enumerations = graph_text_admission_builder_enumerations_for_runtime_test();
-        let scan_started = Instant::now();
-        let pass = graph
-            .capture_reconciliation_scan_pass(
-                crate::oplog::reconciliation_scan::GraphTextScanLimits::default(),
-            )
-            .unwrap();
-        let scan_elapsed = scan_started.elapsed();
-        assert_eq!(
-            graph_text_admission_builder_enumerations_for_runtime_test(),
-            census_enumerations
-        );
-        println!(
-            "exact_feed_real_graph build_ms={} scan_from_admission_ms={} entries={} files={} \
-             bytes={} census_directories={census_enumerations}",
-            build_elapsed.as_millis(),
-            scan_elapsed.as_millis(),
-            pass.instrumentation.directory_entries,
-            pass.instrumentation.eligible_files,
-            pass.instrumentation.bytes_read,
-        );
-        assert!(build_elapsed < Duration::from_secs(5));
-        assert!(scan_elapsed < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn staged_exact_feed_states_publish_only_at_the_exact_clean_fence() {
-        let root = scratch("staged-exact-feed-states");
-        let graph = Graph::open(&root);
-        let lease = graph.arm_graph_text_exact_feed(7).unwrap();
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Armed(_)
-        ));
-        assert!(graph.graph_text_admission_epoch().is_err());
-        graph.build_graph_text_exact_feed(&lease).unwrap();
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::CatchingUp(_)
-        ));
-        assert!(graph.graph_text_admission_epoch().is_err());
-        let empty = lease.batch(8, 10, Vec::new()).unwrap();
-        graph
-            .apply_graph_text_exact_feed_batch(&lease, empty)
-            .unwrap();
-        assert!(graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 9)
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let clean = Graph::open(&root);
-        let clean_lease = staged_exact_feed_build(&clean, 40);
-        clean
-            .publish_graph_text_exact_feed_caught_up(&clean_lease, 40)
-            .unwrap();
-        let epoch = clean.graph_text_admission_epoch().unwrap();
-        assert_eq!(epoch.feed_sequence, 40);
-        assert!(matches!(
-            &*clean.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Complete(_)
-        ));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn held_exact_feed_full_rebase_replaces_the_complete_configured_inventory_at_one_fence() {
-        let root = scratch("held-exact-feed-full-rebase");
-        fs::create_dir_all(root.join("logseq")).unwrap();
-        fs::write(
-            root.join("logseq/config.edn"),
-            "{:pages-directory \"content/nested pages\" :journals-directory \"diary/\u{65e5}\u{8a18}\"}\n",
-        )
-        .unwrap();
-        fs::create_dir_all(root.join("content/nested pages/deep")).unwrap();
-        fs::create_dir_all(root.join("diary/\u{65e5}\u{8a18}")).unwrap();
-        let markdown = "content/nested pages/deep/Caf\u{e9} note.MD";
-        let org = "diary/\u{65e5}\u{8a18}/2026_07_28.ORG";
-        fs::write(root.join(markdown), b"- original\r\n\t- nested\r\n").unwrap();
-        fs::write(root.join(org), b"#+title: Journal\r\n* original\r\n").unwrap();
-
-        let graph = Graph::open(&root);
-        let lease = staged_exact_feed_build(&graph, 0);
-        fs::write(
-            root.join(markdown),
-            b"- externally edited\r\n\t- CRLF stays\r\n",
-        )
-        .unwrap();
-        fs::remove_file(root.join(org)).unwrap();
-        let renamed = "diary/\u{65e5}\u{8a18}/renamed space.org";
-        fs::write(root.join(renamed), b"#+title: Renamed\r\n* imported\r\n").unwrap();
-
-        graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
-            .unwrap();
-        {
-            let state = graph.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                panic!("held rebase must preserve initial catch-up state");
-            };
-            assert_eq!(index.generation, 2);
-            assert_eq!(index.feed.as_ref().unwrap().last_sequence, 1);
-            assert!(index
-                .files_by_exact_path
-                .contains_key(&ManagedPath::parse(markdown).unwrap()));
-            assert!(!index
-                .files_by_exact_path
-                .contains_key(&ManagedPath::parse(org).unwrap()));
-            assert!(index
-                .files_by_exact_path
-                .contains_key(&ManagedPath::parse(renamed).unwrap()));
-        }
-        graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 1)
-            .unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        assert_eq!(epoch.feed_sequence, 1);
-        let markdown_observation = graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse(markdown).unwrap())
-            .unwrap()
-            .into_present();
-        assert_eq!(
-            markdown_observation.current.bytes,
-            b"- externally edited\r\n\t- CRLF stays\r\n"
-        );
-        assert!(matches!(
-            graph
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse(org).unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentUnowned { .. }
-        ));
-        let renamed_observation = graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse(renamed).unwrap())
-            .unwrap()
-            .into_present();
-        assert_eq!(
-            renamed_observation.current.bytes,
-            b"#+title: Renamed\r\n* imported\r\n"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn failed_held_exact_feed_rebase_keeps_the_prior_index_retryable_and_never_moves_backwards() {
-        let root = scratch("held-exact-feed-rebase-retry");
-        fs::write(root.join("Page.md"), b"- original\n").unwrap();
-        let graph = Graph::open(&root);
-        let lease = staged_exact_feed_build(&graph, 0);
-        graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 0)
-            .unwrap();
-        let before = {
-            let state = graph.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::Complete(index) = &*state else {
-                panic!("feed must be complete before the retry proof");
-            };
-            Arc::clone(index)
-        };
-
-        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(|| {
-                Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "injected unstable held rebase",
-                ))
-            }));
-        });
-        assert!(graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
-            .is_err());
-        {
-            let state = graph.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::Complete(index) = &*state else {
-                panic!("failed held rebase must preserve complete authority");
-            };
-            assert!(Arc::ptr_eq(index, &before));
-            assert_eq!(index.feed.as_ref().unwrap().last_sequence, 0);
-        }
-
-        fs::write(root.join("Page.md"), b"- retry succeeds\n").unwrap();
-        graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
-            .unwrap();
-        let after = graph.graph_text_admission_epoch().unwrap();
-        assert_eq!(after.feed_sequence, 1);
-        assert!(graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 0)
-            .is_err());
-        let still_after = graph.graph_text_admission_epoch().unwrap();
-        assert_eq!(still_after.feed_sequence, 1);
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Complete(_)
-        ));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn held_exact_feed_scope_loss_latches_the_lease_terminal() {
-        let root = scratch("held-exact-feed-scope-loss");
-        fs::write(root.join("Page.md"), b"- original\n").unwrap();
-        let graph = Graph::open(&root);
-        let mut lease = staged_exact_feed_build(&graph, 0);
-
-        let foreign_root = scratch("held-exact-feed-foreign-scope");
-        fs::write(foreign_root.join("Other.md"), b"- foreign\n").unwrap();
-        let foreign = Graph::open(&foreign_root);
-        lease.binding.scope_binding = foreign.graph_text_scope_binding().unwrap();
-
-        assert!(graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
-            .is_err());
-        assert!(lease.is_terminal());
-        assert!(graph
-            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
-            .is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(foreign_root);
-    }
-
-    #[test]
-    fn staged_exact_feed_lease_drop_is_terminal_in_every_owned_state() {
-        let armed_root = scratch("staged-exact-feed-drop-armed");
-        let armed = Graph::open(&armed_root);
-        drop(armed.arm_graph_text_exact_feed(0).unwrap());
-        assert!(matches!(
-            &*armed.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let building_root = scratch("staged-exact-feed-drop-building");
-        let building = Graph::open(&building_root);
-        let lease = building.arm_graph_text_exact_feed(0).unwrap();
-        building.begin_graph_text_admission_build().unwrap();
-        drop(lease);
-        assert!(matches!(
-            &*building.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let catching_root = scratch("staged-exact-feed-drop-catching");
-        let catching = Graph::open(&catching_root);
-        let lease = staged_exact_feed_build(&catching, 0);
-        drop(lease);
-        assert!(matches!(
-            &*catching.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let complete_root = scratch("staged-exact-feed-drop-complete");
-        let complete = Graph::open(&complete_root);
-        let lease = staged_exact_feed_build(&complete, 0);
-        complete
-            .publish_graph_text_exact_feed_caught_up(&lease, 0)
-            .unwrap();
-        drop(lease);
-        assert!(matches!(
-            &*complete.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        for root in [armed_root, building_root, catching_root, complete_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_explicit_disconnect_is_terminal_in_every_owned_state() {
-        for stage in ["armed", "building", "catching-up", "complete"] {
-            let root = scratch(&format!("staged-exact-feed-disconnect-{stage}"));
-            let graph = Graph::open(&root);
-            let lease = graph.arm_graph_text_exact_feed(0).unwrap();
-            match stage {
-                "armed" => {}
-                "building" => {
-                    graph.begin_graph_text_admission_build().unwrap();
-                }
-                "catching-up" => {
-                    graph.build_graph_text_exact_feed(&lease).unwrap();
-                }
-                "complete" => {
-                    graph.build_graph_text_exact_feed(&lease).unwrap();
-                    graph
-                        .publish_graph_text_exact_feed_caught_up(&lease, 0)
-                        .unwrap();
-                }
-                _ => unreachable!(),
-            }
-            graph
-                .poison_graph_text_exact_feed(
-                    &lease,
-                    GraphTextExactFeedFailure::ExplicitDisconnect,
-                    "platform session disconnected",
-                )
-                .unwrap();
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_build_time_final_states_are_idempotent() {
-        let upsert_root = scratch("staged-exact-feed-build-upsert");
-        let upsert = Graph::open(&upsert_root);
-        let lease = upsert.arm_graph_text_exact_feed(0).unwrap();
-        fs::write(upsert_root.join("During.MD"), b"- included\n").unwrap();
-        upsert.build_graph_text_exact_feed(&lease).unwrap();
-        upsert
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(1, 1, vec!["During.MD".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        upsert
-            .publish_graph_text_exact_feed_caught_up(&lease, 1)
-            .unwrap();
-        let epoch = upsert.graph_text_admission_epoch().unwrap();
-        assert!(matches!(
-            upsert
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("During.MD").unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::Present(_)
-        ));
-
-        let remove_root = scratch("staged-exact-feed-build-remove");
-        fs::write(remove_root.join("Gone.md"), b"- before arm\n").unwrap();
-        let remove = Graph::open(&remove_root);
-        let lease = remove.arm_graph_text_exact_feed(0).unwrap();
-        fs::remove_file(remove_root.join("Gone.md")).unwrap();
-        remove.build_graph_text_exact_feed(&lease).unwrap();
-        remove
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(1, 1, vec!["Gone.md".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        remove
-            .publish_graph_text_exact_feed_caught_up(&lease, 1)
-            .unwrap();
-        let epoch = remove.graph_text_admission_epoch().unwrap();
-        assert!(matches!(
-            remove
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("Gone.md").unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentUnowned { .. }
-        ));
-
-        let transient_root = scratch("staged-exact-feed-build-transient");
-        let transient = Graph::open(&transient_root);
-        let lease = transient.arm_graph_text_exact_feed(0).unwrap();
-        fs::write(transient_root.join("Transient.org"), b"* transient\n").unwrap();
-        fs::remove_file(transient_root.join("Transient.org")).unwrap();
-        transient.build_graph_text_exact_feed(&lease).unwrap();
-        transient
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 2, Vec::new()).unwrap())
-            .unwrap();
-        transient
-            .publish_graph_text_exact_feed_caught_up(&lease, 2)
-            .unwrap();
-        let epoch = transient.graph_text_admission_epoch().unwrap();
-        assert!(matches!(
-            transient
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("Transient.org").unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentUnowned { .. }
-        ));
-
-        for root in [upsert_root, remove_root, transient_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_atomic_rename_crossings_and_mixed_case_paths() {
-        let root = scratch("staged-exact-feed-atomic-renames");
-        fs::create_dir(root.join("nested")).unwrap();
-        fs::write(root.join("A.md"), b"title:: A\n").unwrap();
-        fs::write(root.join("Page.md"), b"title:: Page\n").unwrap();
-        fs::write(root.join("save.tmp"), b"title:: New\n").unwrap();
-        fs::write(root.join("nested/Old.org"), b"#+title: Old\n").unwrap();
-        let graph = Graph::open(&root);
-        let lease = staged_exact_feed_build(&graph, 0);
-
-        fs::rename(root.join("A.md"), root.join("B.Markdown")).unwrap();
-        fs::rename(root.join("Page.md"), root.join("Page.tmp")).unwrap();
-        fs::rename(root.join("save.tmp"), root.join("nested/New.ORG")).unwrap();
-        fs::rename(root.join("nested/Old.org"), root.join("nested/Mixed.Md")).unwrap();
-        let touched = [
-            "A.md",
-            "B.Markdown",
-            "Page.md",
-            "Page.tmp",
-            "save.tmp",
-            "nested/New.ORG",
-            "nested/Old.org",
-            "nested/Mixed.Md",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-        graph
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 4, touched).unwrap())
-            .unwrap();
-        assert!(graph.graph_text_admission_epoch().is_err());
-        graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 4)
-            .unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        for present in ["B.Markdown", "nested/New.ORG", "nested/Mixed.Md"] {
-            assert!(matches!(
-                graph
-                    .graph_text_admission_exact(&epoch, &ManagedPath::parse(present).unwrap())
-                    .unwrap(),
-                GraphTextAdmissionExactObservation::Present(_)
-            ));
-        }
-        for retained in ["A.md", "Page.md", "nested/Old.org"] {
-            assert!(matches!(
-                graph
-                    .graph_text_admission_exact(&epoch, &ManagedPath::parse(retained).unwrap())
-                    .unwrap(),
-                GraphTextAdmissionExactObservation::AbsentRetained { .. }
-            ));
-        }
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::Complete(index) = &*state else {
-            panic!("caught-up rename batch must publish one complete index");
-        };
-        assert_eq!(
-            index.file_is_graph_text_by_exact_relative.get("Page.tmp"),
-            Some(&false)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn staged_exact_feed_sequence_range_and_generation_failures_poison() {
-        fn catching(name: &str, sequence: u64) -> (PathBuf, Graph, GraphTextExactFeedLease) {
-            let root = scratch(name);
-            let graph = Graph::open(&root);
-            let lease = staged_exact_feed_build(&graph, sequence);
-            (root, graph, lease)
-        }
-
-        let (gap_root, gap, lease) = catching("staged-exact-feed-gap", 0);
-        let batch = lease.batch(2, 2, Vec::new()).unwrap();
-        assert!(gap
-            .apply_graph_text_exact_feed_batch(&lease, batch)
-            .is_err());
-
-        let (duplicate_root, duplicate, lease) = catching("staged-exact-feed-duplicate-range", 0);
-        duplicate
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 1, Vec::new()).unwrap())
-            .unwrap();
-        assert!(duplicate
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 1, Vec::new()).unwrap())
-            .is_err());
-
-        let (overlap_root, overlap, lease) = catching("staged-exact-feed-overlap", 0);
-        overlap
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 2, Vec::new()).unwrap())
-            .unwrap();
-        assert!(overlap
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(2, 3, Vec::new()).unwrap())
-            .is_err());
-
-        let (reverse_root, reverse, lease) = catching("staged-exact-feed-reverse", 0);
-        assert!(lease.batch(2, 1, Vec::new()).is_err());
-        assert!(matches!(
-            &*reverse.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let (wrap_root, wrap, lease) = catching("staged-exact-feed-wrap", u64::MAX);
-        let batch = lease.batch(u64::MAX, u64::MAX, Vec::new()).unwrap();
-        assert!(wrap
-            .apply_graph_text_exact_feed_batch(&lease, batch)
-            .is_err());
-
-        let (generation_root, generation, lease) = catching("staged-exact-feed-generation-wrap", 0);
-        generation
-            .publish_graph_text_exact_feed_caught_up(&lease, 0)
-            .unwrap();
-        generation.set_graph_text_admission_generation_for_test(u64::MAX);
-        assert!(generation
-            .apply_graph_text_exact_feed_batch(&lease, lease.batch(1, 1, Vec::new()).unwrap())
-            .is_err());
-
-        for graph in [&gap, &duplicate, &overlap, &wrap, &generation] {
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-        }
-        for root in [
-            gap_root,
-            duplicate_root,
-            overlap_root,
-            reverse_root,
-            wrap_root,
-            generation_root,
-        ] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_final_state_retention_and_superseded_writes() {
-        let root = scratch("staged-exact-feed-final-state");
-        fs::write(root.join("Page.md"), b"title:: Page\n- first\n").unwrap();
-        let graph = Graph::open(&root);
-        let lease = staged_exact_feed_build(&graph, 0);
-        graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 0)
-            .unwrap();
-        let original_epoch = graph.graph_text_admission_epoch().unwrap();
-
-        graph
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(1, 1, vec!["Page.md".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        fs::write(root.join("Page.md"), b"title:: Page\n- second\n").unwrap();
-        fs::write(root.join("Page.md"), b"title:: Page\n- final\n").unwrap();
-        graph
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(2, 3, vec!["Page.md".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        let GraphTextAdmissionExactObservation::Present(observation) = graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Page.md").unwrap())
-            .unwrap()
-        else {
-            panic!("superseded writes publish the current final file");
-        };
-        assert_eq!(
-            observation.record.description,
-            BlobDescription::of(b"title:: Page\n- final\n")
-        );
-
-        fs::remove_file(root.join("Page.md")).unwrap();
-        graph
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(4, 4, vec!["Page.md".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        graph
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease.batch(5, 5, vec!["Never.md".to_owned()]).unwrap(),
-            )
-            .unwrap();
-        let epoch = graph.graph_text_admission_epoch().unwrap();
-        assert!(matches!(
-            graph
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("Page.md").unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentRetained { .. }
-        ));
-        assert!(matches!(
-            graph
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("Never.md").unwrap())
-                .unwrap(),
-            GraphTextAdmissionExactObservation::AbsentUnowned { .. }
-        ));
-        assert!(graph
-            .graph_text_admission_exact(&original_epoch, &ManagedPath::parse("Page.md").unwrap())
-            .is_err());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn staged_exact_feed_retains_logical_collisions_but_rejects_aliases() {
-        let portable_root = scratch("staged-exact-feed-portable-collision");
-        let portable = Graph::open(&portable_root);
-        let lease = staged_exact_feed_build(&portable, 0);
-        fs::write(portable_root.join("A.md"), b"- upper\n").unwrap();
-        fs::write(portable_root.join("a.MD"), b"- lower\n").unwrap();
-        portable
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease
-                    .batch(1, 2, vec!["A.md".to_owned(), "a.MD".to_owned()])
-                    .unwrap(),
-            )
-            .unwrap();
-        portable
-            .publish_graph_text_exact_feed_caught_up(&lease, 2)
-            .unwrap();
-        let epoch = portable.graph_text_admission_epoch().unwrap();
-        assert_eq!(
-            portable
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("A.md").unwrap())
-                .unwrap()
-                .into_present()
-                .portable_members
-                .len(),
-            2
-        );
-
-        let semantic_root = scratch("staged-exact-feed-semantic-collision");
-        let semantic = Graph::open(&semantic_root);
-        let lease = staged_exact_feed_build(&semantic, 0);
-        fs::write(semantic_root.join("One.md"), b"title:: Shared\n- one\n").unwrap();
-        fs::write(semantic_root.join("Two.org"), b"#+title: Shared\n* two\n").unwrap();
-        semantic
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease
-                    .batch(1, 2, vec!["One.md".to_owned(), "Two.org".to_owned()])
-                    .unwrap(),
-            )
-            .unwrap();
-        semantic
-            .publish_graph_text_exact_feed_caught_up(&lease, 2)
-            .unwrap();
-        let epoch = semantic.graph_text_admission_epoch().unwrap();
-        assert_eq!(
-            semantic
-                .graph_text_admission_exact(&epoch, &ManagedPath::parse("One.md").unwrap())
-                .unwrap()
-                .into_present()
-                .semantic_members
-                .len(),
-            2
-        );
-
-        let resource_root = scratch("staged-exact-feed-resource-collision");
-        let resource = Graph::open(&resource_root);
-        let lease = staged_exact_feed_build(&resource, 0);
-        fs::write(resource_root.join("One.md"), b"- linked\n").unwrap();
-        fs::hard_link(
-            resource_root.join("One.md"),
-            resource_root.join("alias.bin"),
-        )
-        .unwrap();
-        assert!(resource
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease
-                    .batch(1, 2, vec!["One.md".to_owned(), "alias.bin".to_owned()])
-                    .unwrap()
-            )
-            .is_err());
-
-        for graph in [&portable, &semantic] {
-            assert!(graph.graph_text_admission_epoch().is_ok());
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Complete(_)
-            ));
-        }
-        assert!(resource.graph_text_admission_epoch().is_err());
-        assert!(matches!(
-            &*resource.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        for root in [portable_root, semantic_root, resource_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_races_config_directory_and_root_controls_poison() {
-        let race_root = scratch("staged-exact-feed-race");
-        fs::write(race_root.join("A.md"), b"- before\n").unwrap();
-        fs::write(race_root.join("B.md"), b"- stable\n").unwrap();
-        let race = Graph::open(&race_root);
-        let lease = staged_exact_feed_build(&race, 0);
-        fs::write(race_root.join("A.md"), b"- prepared\n").unwrap();
-        let changed_while_b_prepared = Rc::new(Cell::new(false));
-        GRAPH_TEXT_EXACT_FEED_PREPARE_PATH.with(|hook| {
-            let race_root = race_root.clone();
-            let changed_while_b_prepared = Rc::clone(&changed_while_b_prepared);
-            *hook.borrow_mut() = Some(Box::new(move |relative| {
-                if relative == "B.md" {
-                    changed_while_b_prepared.set(true);
-                    fs::write(race_root.join("A.md"), b"- raced\n")?;
-                }
-                Ok(())
-            }));
-        });
-        assert!(race
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease
-                    .batch(1, 1, vec!["A.md".to_owned(), "B.md".to_owned()])
-                    .unwrap()
-            )
-            .is_err());
-        GRAPH_TEXT_EXACT_FEED_PREPARE_PATH.with(|hook| {
-            hook.borrow_mut().take();
-        });
-        assert!(
-            changed_while_b_prepared.get(),
-            "A must change only after its own preparation, when B starts"
-        );
-        let state = race.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::Poisoned { cause, .. } = &*state else {
-            panic!("the final all-path sweep must poison");
-        };
-        assert!(
-            cause.contains("final proof"),
-            "the final all-path sweep must be the causal detector: {cause}"
-        );
-        drop(state);
-
-        let config_root = scratch("staged-exact-feed-config");
-        fs::create_dir(config_root.join("logseq")).unwrap();
-        let config = Graph::open(&config_root);
-        let lease = staged_exact_feed_build(&config, 0);
-        fs::write(
-            config_root.join("logseq/config.edn"),
-            b"{:hidden [\"x\"]}\n",
-        )
-        .unwrap();
-        assert!(config
-            .apply_graph_text_exact_feed_batch(
-                &lease,
-                lease
-                    .batch(1, 1, vec!["logseq/config.edn".to_owned()])
-                    .unwrap()
-            )
-            .is_err());
-
-        let directory_root = scratch("staged-exact-feed-directory");
-        let directory = Graph::open(&directory_root);
-        let lease = staged_exact_feed_build(&directory, 0);
-        directory
-            .poison_graph_text_exact_feed(
-                &lease,
-                GraphTextExactFeedFailure::DirectoryMutation,
-                "non-excluded directory created",
-            )
-            .unwrap();
-
-        let root_root = scratch("staged-exact-feed-root");
-        let root_graph = Graph::open(&root_root);
-        let lease = staged_exact_feed_build(&root_graph, 0);
-        root_graph
-            .poison_graph_text_exact_feed(
-                &lease,
-                GraphTextExactFeedFailure::RootMutation,
-                "root watch invalidated",
-            )
-            .unwrap();
-
-        assert_eq!(
-            config
-                .classify_graph_text_exact_feed_path("logseq/config.edn")
-                .unwrap(),
-            GraphTextExactFeedPathClass::Configuration
-        );
-        assert_eq!(
-            config
-                .classify_graph_text_exact_feed_path("assets/ignored.md")
-                .unwrap(),
-            GraphTextExactFeedPathClass::Excluded
-        );
-        assert_eq!(
-            config
-                .classify_graph_text_exact_feed_path("nested/Page.md")
-                .unwrap(),
-            GraphTextExactFeedPathClass::RetainedFile
-        );
-        for graph in [&race, &config, &directory, &root_graph] {
-            assert!(matches!(
-                &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
-            ));
-        }
-        for root in [race_root, config_root, directory_root, root_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_post_preflight_actual_charges_poison_before_overrun() {
-        fn batch_scratch(relatives: &[&str]) -> u64 {
-            let mut scratch = conservative_vec_capacity_upper_bound::<
-                PreparedGraphTextAdmissionFinalState,
-            >(usize_to_u64(relatives.len()).unwrap())
-            .unwrap();
-            for relative in relatives {
-                scratch = checked_add_bytes(
-                    scratch,
-                    graph_text_event_scratch_upper_bound(relative).unwrap(),
-                )
-                .unwrap();
-            }
-            scratch
-        }
-
-        fn constrain(graph: &Graph, permanent_limit: Option<u64>, peak_limit: Option<u64>) {
-            let mut state = graph.graph_text_admission.write().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                panic!("staged exact feed must be catching up");
-            };
-            let mut constrained = (**index).clone();
-            if let Some(limit) = permanent_limit {
-                constrained.permanent_limit = limit;
-            }
-            if let Some(limit) = peak_limit {
-                constrained.peak_limit = limit;
-            }
-            *state = GraphTextAdmissionState::CatchingUp(Arc::new(constrained));
-        }
-
-        fn assert_poisoned_with(graph: &Graph, expected: &str) {
-            let state = graph.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::Poisoned { cause, .. } = &*state else {
-                panic!("actual charge overrun must poison");
-            };
-            assert!(
-                cause.contains(expected),
-                "expected poison cause containing {expected:?}, got {cause:?}"
-            );
-        }
-
-        let raw_root = scratch("staged-exact-feed-post-preflight-raw");
-        let raw = Graph::open(&raw_root);
-        let raw_lease = staged_exact_feed_build(&raw, 0);
-        GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT.with(|hook| {
-            let raw_root = raw_root.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::File::create(raw_root.join("A.bin"))?.set_len(33 * 1024 * 1024)?;
-                fs::File::create(raw_root.join("B.bin"))?.set_len(33 * 1024 * 1024)
-            }));
-        });
-        assert!(raw
-            .apply_graph_text_exact_feed_batch(
-                &raw_lease,
-                raw_lease
-                    .batch(1, 1, vec!["A.bin".to_owned(), "B.bin".to_owned()])
-                    .unwrap(),
-            )
-            .is_err());
-        assert_poisoned_with(&raw, "aggregate raw bytes");
-
-        let peak_root = scratch("staged-exact-feed-post-preflight-peak");
-        let peak = Graph::open(&peak_root);
-        let peak_lease = staged_exact_feed_build(&peak, 0);
-        let peak_scratch = batch_scratch(&["A.bin"]);
-        let peak_base = {
-            let state = peak.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                unreachable!()
-            };
-            index.permanent_bytes
-        };
-        constrain(
-            &peak,
-            Some(u64::MAX),
-            Some(
-                checked_add_bytes(peak_base, peak_scratch)
-                    .and_then(|bytes| checked_add_bytes(bytes, 16 * 1024))
-                    .unwrap(),
-            ),
-        );
-        GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT.with(|hook| {
-            let peak_root = peak_root.clone();
-            *hook.borrow_mut() = Some(Box::new(move || fs::write(peak_root.join("A.bin"), b"x")));
-        });
-        assert!(peak
-            .apply_graph_text_exact_feed_batch(
-                &peak_lease,
-                peak_lease.batch(1, 1, vec!["A.bin".to_owned()]).unwrap(),
-            )
-            .is_err());
-        assert_poisoned_with(&peak, "peak build memory");
-
-        let parser_root = scratch("staged-exact-feed-post-preflight-parser");
-        let parser = Graph::open(&parser_root);
-        let parser_lease = staged_exact_feed_build(&parser, 0);
-        let parser_content = b"- parser allocation\n".to_vec();
-        let parser_scratch = batch_scratch(&["Page.md"]);
-        let parser_base = {
-            let state = parser.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                unreachable!()
-            };
-            index.permanent_bytes
-        };
-        constrain(
-            &parser,
-            Some(u64::MAX),
-            Some(
-                checked_add_bytes(parser_base, parser_scratch)
-                    .and_then(|bytes| checked_add_bytes(bytes, parser_content.len() as u64))
-                    .and_then(|bytes| checked_add_bytes(bytes, 16 * 1024))
-                    .unwrap(),
-            ),
-        );
-        GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT.with(|hook| {
-            let parser_root = parser_root.clone();
-            let parser_content = parser_content.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(parser_root.join("Page.md"), parser_content)
-            }));
-        });
-        reset_graph_text_admission_test_counters();
-        assert!(parser
-            .apply_graph_text_exact_feed_batch(
-                &parser_lease,
-                parser_lease
-                    .batch(1, 1, vec!["Page.md".to_owned()])
-                    .unwrap(),
-            )
-            .is_err());
-        assert_eq!(
-            graph_text_admission_test_counters().parser_invocations,
-            0,
-            "post-preflight parser growth must fail before parser allocation"
-        );
-        assert_poisoned_with(&parser, "peak build memory");
-
-        let permanent_root = scratch("staged-exact-feed-post-preflight-permanent");
-        let permanent = Graph::open(&permanent_root);
-        let permanent_lease = staged_exact_feed_build(&permanent, 0);
-        let (permanent_base, admitted_growth) = {
-            let state = permanent.graph_text_admission.read().unwrap();
-            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
-                unreachable!()
-            };
-            (
-                index.permanent_bytes,
-                permanent
-                    .graph_text_exact_feed_worst_permanent_growth(index, "Page.md", None)
-                    .unwrap(),
-            )
-        };
-        constrain(
-            &permanent,
-            Some(checked_add_bytes(permanent_base, admitted_growth).unwrap()),
-            Some(u64::MAX),
-        );
-        GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT.with(|hook| {
-            let permanent_root = permanent_root.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(
-                    permanent_root.join("Page.md"),
-                    format!("title:: {}\n", "P".repeat(32 * 1024)),
-                )
-            }));
-        });
-        let read_started = Rc::new(Cell::new(false));
-        BOUNDED_READ_AFTER_METADATA.with(|hook| {
-            let read_started = Rc::clone(&read_started);
-            *hook.borrow_mut() = Some(Box::new(move || {
-                read_started.set(true);
-                Ok(())
-            }));
-        });
-        assert!(permanent
-            .apply_graph_text_exact_feed_batch(
-                &permanent_lease,
-                permanent_lease
-                    .batch(1, 1, vec!["Page.md".to_owned()])
-                    .unwrap(),
-            )
-            .is_err());
-        BOUNDED_READ_AFTER_METADATA.with(|hook| {
-            hook.borrow_mut().take();
-        });
-        assert!(
-            !read_started.get(),
-            "post-preflight permanent growth must fail before raw allocation"
-        );
-        assert_poisoned_with(&permanent, "permanent index memory");
-
-        for root in [raw_root, peak_root, parser_root, permanent_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_bounds_duplicate_paths_and_cause_text() {
-        let maximum_root = scratch("staged-exact-feed-maximum-count");
-        let maximum = Graph::open(&maximum_root);
-        let maximum_lease = staged_exact_feed_build(&maximum, 0);
-        let maximum_paths = (0..GraphTextExactFeedBatch::MAX_TOUCHED_PATHS)
-            .map(|index| {
-                let relative = format!("Maximum-{index:04}.md");
-                fs::write(maximum_root.join(&relative), b"- bounded\n").unwrap();
-                relative
-            })
-            .collect::<Vec<_>>();
-        maximum
-            .apply_graph_text_exact_feed_batch(
-                &maximum_lease,
-                maximum_lease.batch(1, 1, maximum_paths).unwrap(),
-            )
-            .unwrap();
-
-        let duplicate_root = scratch("staged-exact-feed-duplicate-path");
-        let duplicate = Graph::open(&duplicate_root);
-        let lease = staged_exact_feed_build(&duplicate, 0);
-        assert!(lease
-            .batch(1, 1, vec!["Page.md".to_owned(), "Page.md".to_owned()])
-            .is_err());
-        assert!(matches!(
-            &*duplicate.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-
-        let count_root = scratch("staged-exact-feed-count-bound");
-        let count = Graph::open(&count_root);
-        let lease = staged_exact_feed_build(&count, 0);
-        let paths = (0..=GraphTextExactFeedBatch::MAX_TOUCHED_PATHS)
-            .map(|index| format!("Page-{index:04}.md"))
-            .collect::<Vec<_>>();
-        assert!(lease.batch(1, 1, paths).is_err());
-
-        let path_root = scratch("staged-exact-feed-path-bound");
-        let path = Graph::open(&path_root);
-        let lease = staged_exact_feed_build(&path, 0);
-        let prefix = (0..20)
-            .map(|index| format!("component-{index:02}-{}", "a".repeat(180)))
-            .collect::<Vec<_>>()
-            .join("/");
-        let oversized_aggregate = (0..17)
-            .map(|index| format!("{prefix}/Page-{index:02}.md"))
-            .collect::<Vec<_>>();
-        assert!(lease.batch(1, 1, oversized_aggregate).is_err());
-
-        let cause_root = scratch("staged-exact-feed-cause-bound");
-        let cause_graph = Graph::open(&cause_root);
-        let lease = staged_exact_feed_build(&cause_graph, 0);
-        cause_graph
-            .poison_graph_text_exact_feed(
-                &lease,
-                GraphTextExactFeedFailure::BackendError,
-                &"é".repeat(MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES),
-            )
-            .unwrap();
-        let state = cause_graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::Poisoned { cause, .. } = &*state else {
-            panic!("backend error must poison");
-        };
-        assert!(cause.len() <= MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES);
-        assert!(cause.is_char_boundary(cause.len()));
-
-        for root in [
-            maximum_root,
-            duplicate_root,
-            count_root,
-            path_root,
-            cause_root,
-        ] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn staged_exact_feed_foreign_lease_second_arm_and_same_resource_instances_poison() {
-        let root = scratch("staged-exact-feed-foreign");
-        let first = Graph::open(&root);
-        let first_lease = staged_exact_feed_build(&first, 0);
-        let second = Graph::open(&root);
-        let second_lease = staged_exact_feed_build(&second, 0);
-        let foreign_batch = first_lease.batch(1, 1, Vec::new()).unwrap();
-        assert!(second
-            .apply_graph_text_exact_feed_batch(&second_lease, foreign_batch)
-            .is_err());
-        assert!(matches!(
-            &*second.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        assert!(matches!(
-            &*first.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::CatchingUp(_)
-        ));
-        drop(second_lease);
-
-        let arm_root = scratch("staged-exact-feed-second-arm");
-        let armed = Graph::open(&arm_root);
-        let _lease = armed.arm_graph_text_exact_feed(0).unwrap();
-        assert!(armed.arm_graph_text_exact_feed(0).is_err());
-        assert!(matches!(
-            &*armed.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(arm_root);
-    }
-
-    #[test]
-    fn staged_exact_feed_work_is_independent_of_unrelated_files() {
-        fn one_batch(unrelated: usize) -> GraphTextAdmissionTestCounters {
-            let root = scratch(&format!("staged-exact-feed-work-{unrelated}"));
-            fs::write(root.join("Target.md"), b"title:: Before\n").unwrap();
-            for index in 0..unrelated {
-                fs::write(
-                    root.join(format!("Unrelated-{index:04}.md")),
-                    format!("- ordinary {index}\n"),
-                )
-                .unwrap();
-            }
-            let graph = Graph::open(&root);
-            let lease = staged_exact_feed_build(&graph, 0);
-            fs::write(root.join("Target.md"), b"title:: After\n").unwrap();
-            reset_graph_text_admission_test_counters();
-            graph
-                .apply_graph_text_exact_feed_batch(
-                    &lease,
-                    lease.batch(1, 1, vec!["Target.md".to_owned()]).unwrap(),
-                )
-                .unwrap();
-            let counters = graph_text_admission_test_counters();
-            let _ = fs::remove_dir_all(root);
-            counters
-        }
-
-        let small = one_batch(8);
-        let large = one_batch(512);
-        assert_eq!(small.builder_enumerations, 0);
-        assert_eq!(small.parser_invocations, large.parser_invocations);
-        assert_eq!(small.index_map_insertions, large.index_map_insertions);
-        assert_eq!(small.event_map_key_reads, large.event_map_key_reads);
-        assert_eq!(small.event_map_key_writes, large.event_map_key_writes);
-        assert_eq!(small.event_reverse_members, large.event_reverse_members);
-        assert_eq!(
-            small.persistent_payload_members,
-            large.persistent_payload_members
-        );
-        assert!(
-            large.persistent_node_allocations < small.persistent_node_allocations * 4,
-            "batch path copying may grow only logarithmically: small={small:?}, large={large:?}"
-        );
-    }
-
-    #[test]
-    fn staged_exact_feed_fresh_import_inventory_is_independent() {
-        let root = scratch("staged-exact-feed-fresh-import");
-        fs::write(root.join("Initial.md"), b"- initial\n").unwrap();
-        let graph = Graph::open(&root);
-        let lease = staged_exact_feed_build(&graph, 0);
-        graph
-            .publish_graph_text_exact_feed_caught_up(&lease, 0)
-            .unwrap();
-        let before = graph.graph_text_admission_epoch().unwrap();
-        fs::write(root.join("Later.Markdown"), b"- later\n").unwrap();
-        let inventory = crate::oplog::inventory_initial_shadow(&graph).unwrap();
-        assert!(inventory.present("Initial.md").is_some());
-        assert!(inventory.present("Later.Markdown").is_some());
-        let after = graph.graph_text_admission_epoch().unwrap();
-        assert_eq!(before.generation, after.generation);
-        assert_eq!(before.feed_sequence, after.feed_sequence);
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Complete(_)
-        ));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -46667,6 +45283,46 @@ mod tests {
     }
 
     #[test]
+    fn rename_collision_merges_content_and_rewrites_graph_refs() {
+        let dir = scratch("rename-collision-merge");
+        fs::write(
+            dir.join("pages/Old.md"),
+            "- old body links [[Old]] and [[Old/Child]]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/New.md"), "- new body links [[Old]]\n").unwrap();
+        // The default page filename format is Legacy, so a namespace slash is
+        // percent-encoded. Using the TripleLowbar spelling here made the file a
+        // literal `Old___Child` page and left the test's descendant assertion
+        // outside the behavior it claimed to exercise.
+        fs::write(dir.join("pages/Old%2FChild.md"), "- child of [[Old]]\n").unwrap();
+        fs::write(dir.join("pages/Referrer.md"), "- see [[Old]] and #Old\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        graph
+            .merge_pages_after_rename("pages/Old.md", "pages/New.md", "Old", "New")
+            .unwrap();
+
+        let merged = fs::read_to_string(dir.join("pages/New.md")).unwrap();
+        assert!(merged.contains("new body links [[New]]"), "{merged}");
+        assert!(
+            merged.contains("old body links [[New]] and [[New/Child]]"),
+            "{merged}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Referrer.md")).unwrap(),
+            "- see [[New]] and #New\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/New%2FChild.md")).unwrap(),
+            "- child of [[New]]\n"
+        );
+        assert!(!dir.join("pages/Old.md").exists());
+        assert!(!dir.join("pages/Old%2FChild.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rename_file_to_page_rescues_stray_and_refuses_collision() {
         let dir = dup_day_graph("renamefile");
         let g = Graph::open(&dir);
@@ -46897,7 +45553,7 @@ mod tests {
         .unwrap();
         let title_named = "Thursday, 25-06-2026.org";
         fs::write(dir.join("journals").join(title_named), "* migrate me\n").unwrap();
-        let conflict = "Foo.sync-conflict-20260705-141233-A1B2C3D.md";
+        let conflict = "Foo.sync-conflict-20260705-141233-A2B2C3D.md";
         fs::write(dir.join("pages").join(conflict), "- trash me\n").unwrap();
 
         let graph = Arc::new(Graph::open(&dir));
@@ -47462,33 +46118,20 @@ mod tests {
                 (target_entry.clone(), Arc::new(target_doc.clone())),
             ],
         );
-        assert!(
-            accepted_snapshot
-                .reference_candidate_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| index.complete),
-            "depth-128 reference index must be complete",
-        );
         let target_names = vec![crate::refs::page_key("Deep target")];
         let accepted_candidates =
             accepted_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
-        assert!(accepted_candidates.indexed);
+        assert!(!accepted_candidates.indexed);
         assert_eq!(
             candidate_paths(&accepted_candidates),
-            vec!["pages/Source.md".to_owned()],
+            vec![
+                "pages/Deep target.md".to_owned(),
+                "pages/Source.md".to_owned(),
+            ],
+            "without an attached current SQLite projection, exact parser fallback must retain the complete snapshot",
         );
         let accepted_counts = accepted_snapshot.block_ref_counts().unwrap();
         assert_eq!(accepted_counts.get(TARGET_ID).copied(), Some(1));
-        assert!(
-            accepted_snapshot
-                .block_ref_count_cache
-                .read()
-                .unwrap()
-                .is_some(),
-            "complete depth-128 counts should be memoized",
-        );
 
         let accepted_graph = Graph::open(&dir);
         *accepted_graph.cache.write().unwrap() =
@@ -47521,14 +46164,6 @@ mod tests {
                 (target_entry, Arc::new(target_doc)),
             ],
         );
-        assert!(
-            rejected_snapshot
-                .reference_candidate_index
-                .read()
-                .unwrap()
-                .is_none(),
-            "an over-depth build must not publish a partial candidate index",
-        );
         for _ in 0..2 {
             let candidates =
                 rejected_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
@@ -47538,40 +46173,15 @@ mod tests {
                 candidate_paths(&candidates).contains(&"pages/Source.md".to_owned()),
                 "the deepest possible referrer must remain in the fallback set",
             );
-            assert!(
-                rejected_snapshot
-                    .reference_candidate_index
-                    .read()
-                    .unwrap()
-                    .is_none(),
-                "fallback must not memoize a partial candidate index",
-            );
-
             assert_eq!(
                 rejected_snapshot.block_ref_counts().unwrap_err().kind(),
                 io::ErrorKind::InvalidData,
-            );
-            assert!(
-                rejected_snapshot
-                    .block_ref_count_cache
-                    .read()
-                    .unwrap()
-                    .is_none(),
-                "over-depth counting must not memoize partial counts",
             );
         }
 
         let rejected_graph = Graph::open(&dir);
         *rejected_graph.cache.write().unwrap() = Some(Arc::new(vec![(entry, Arc::new(rejected))]));
         assert!(rejected_graph.referenced_page_names().is_empty());
-        assert!(
-            rejected_graph
-                .referenced_names_cache
-                .read()
-                .unwrap()
-                .is_none(),
-            "over-depth traversal must not memoize a partial cache result",
-        );
 
         let accepted_markdown =
             markdown_page_dto("Depth 128", "Depth 128", &nested_markdown(128)).unwrap();
@@ -48622,11 +47232,71 @@ mod tests {
                 ),
             ]
         );
-        capture
+        assert_eq!(capture.instrumentation().parser_calls, 5);
+        let final_proof = capture
             .verify_before_inactive_bootstrap_authoring(&graph)
             .unwrap();
+        assert_eq!(final_proof.parser_calls, 0);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&capture_scratch);
+    }
+
+    #[test]
+    fn portable_bootstrap_identity_ignores_local_filesystem_identity_but_not_content() {
+        let first_root = scratch("portable-bootstrap-identity-first");
+        let second_root = scratch("portable-bootstrap-identity-second");
+        for root in [&first_root, &second_root] {
+            fs::create_dir_all(root.join("logseq")).unwrap();
+            fs::write(
+                root.join("logseq/config.edn"),
+                r#"{:pages-directory "notes" :journals-directory "diary"}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("notes/層")).unwrap();
+            fs::write(
+                root.join("notes/層/計画.md"),
+                "title:: Shared 計画\n\n- café\n",
+            )
+            .unwrap();
+        }
+        let first_scratch = bootstrap_capture_scratch("portable-identity-first");
+        let second_scratch = bootstrap_capture_scratch("portable-identity-second");
+        let changed_scratch = bootstrap_capture_scratch("portable-identity-changed");
+        let first = Graph::open(&first_root)
+            .capture_inactive_bootstrap_sources(&first_scratch)
+            .unwrap();
+        let second_graph = Graph::open(&second_root);
+        let second = second_graph
+            .capture_inactive_bootstrap_sources(&second_scratch)
+            .unwrap();
+
+        assert_ne!(
+            first.capture_identity().unwrap(),
+            second.capture_identity().unwrap()
+        );
+        assert_eq!(
+            first.portable_capture_identity().unwrap(),
+            second.portable_capture_identity().unwrap()
+        );
+
+        fs::write(
+            second_root.join("notes/層/計画.md"),
+            "title:: Shared 計画\n\n- changed café\n",
+        )
+        .unwrap();
+        let changed = Graph::open(&second_root)
+            .capture_inactive_bootstrap_sources(&changed_scratch)
+            .unwrap();
+        assert_ne!(
+            first.portable_capture_identity().unwrap(),
+            changed.portable_capture_identity().unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&first_root);
+        let _ = fs::remove_dir_all(&second_root);
+        let _ = fs::remove_dir_all(&first_scratch);
+        let _ = fs::remove_dir_all(&second_scratch);
+        let _ = fs::remove_dir_all(&changed_scratch);
     }
 
     #[test]
@@ -48699,38 +47369,181 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations() {
-        let root = scratch("bootstrap-source-mutation");
+    fn inactive_bootstrap_capture_seals_one_pass_and_final_proof_rejects_later_mutations() {
+        for mutation in ["modify", "add", "delete", "rename"] {
+            let root = scratch(&format!("bootstrap-source-mutation-{mutation}"));
+            let source = root.join("pages/one.md");
+            let added = root.join("pages/added.md");
+            let renamed = root.join("pages/renamed.md");
+            fs::write(&source, b"title:: Before\n\n- body\n").unwrap();
+            let scratch = bootstrap_capture_scratch(&format!("mutation-{mutation}"));
+            let graph = Graph::open(&root);
+            BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let added = added.clone();
+                    let renamed = renamed.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"title:: After\n\n- body\n"),
+                        "add" => fs::write(added, b"- added externally\n"),
+                        "delete" => fs::remove_file(source),
+                        "rename" => fs::rename(source, renamed),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
+            assert_eq!(capture.instrumentation().passes, 1);
+            assert!(
+                capture
+                    .verify_before_inactive_bootstrap_authoring(&graph)
+                    .is_err(),
+                "final source proof admitted an external {mutation} after capture"
+            );
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&scratch);
+        }
+
+        let root = scratch("bootstrap-source-final-proof-mutation");
         let source = root.join("pages/one.md");
-        fs::write(&source, b"title:: Before\n\n- body\n").unwrap();
-        let scratch = bootstrap_capture_scratch("mutation");
+        fs::write(&source, b"- before final proof\n").unwrap();
+        let scratch = bootstrap_capture_scratch("final-proof-mutation");
         let graph = Graph::open(&root);
-        BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                move || fs::write(source, b"title:: After\n\n- body\n")
-            }));
-        });
-        assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
         let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
             *hook.borrow_mut() = Some(Box::new({
                 let source = source.clone();
-                move || fs::write(source, b"title:: Changed before C\n\n- body\n")
+                move || fs::write(source, b"- changed immediately before final proof\n")
             }));
         });
         assert!(capture
             .verify_before_inactive_bootstrap_authoring(&graph)
             .is_err());
-        BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                move || fs::remove_file(source)
-            }));
-        });
-        assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// A capture-change refusal has to say WHAT moved.
+    ///
+    /// It reaches the user as a `Retryable` activation failure and nothing
+    /// else: on CI 32108957903 the whole report was `Retryable { durable_stage:
+    /// Absent, detail: "source capture changed before final inventory proof" }`
+    /// — not the path, not the field, not whether one row moved or a thousand.
+    /// Both directions are pinned. A file that merely APPEARED matters most:
+    /// it changes no source-file and no source-chunk count, so every other
+    /// check in the final proof is blind to it.
+    #[test]
+    fn final_proof_refusal_names_the_rows_that_changed() {
+        for (mutation, expect) in [
+            ("modify", "changed:"),
+            ("add-source", "appeared:"),
+            ("add-other", "appeared:"),
+            ("delete", "gone:"),
+        ] {
+            let root = scratch(&format!("bootstrap-source-named-change-{mutation}"));
+            let source = root.join("pages/one.md");
+            let second = root.join("pages/two.md");
+            fs::write(&source, b"- before the final proof\n").unwrap();
+            fs::write(&second, b"- untouched\n").unwrap();
+            let capture_scratch = bootstrap_capture_scratch(&format!("named-change-{mutation}"));
+            let graph = Graph::open(&root);
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let root = root.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"- changed under the activation\n"),
+                        "add-source" => fs::write(root.join("pages/three.md"), b"- new page\n"),
+                        "add-other" => fs::write(root.join("pages/notes.txt"), b"not a page\n"),
+                        "delete" => fs::remove_file(source),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let error = capture
+                .verify_before_inactive_bootstrap_authoring(&graph)
+                .expect_err("the final proof must refuse a graph that moved");
+            let detail = error.to_string();
+            if mutation == "add-other" {
+                // The only mutation of the four that leaves both counts equal,
+                // so the inventory report is the ONLY thing that localises it.
+                assert!(
+                    detail.contains("source capture changed before final inventory proof"),
+                    "{mutation}: {detail}"
+                );
+                assert!(detail.contains("pages/notes.txt"), "{mutation}: {detail}");
+                assert!(detail.contains("1 row(s) differ"), "{mutation}: {detail}");
+            }
+            if mutation == "modify" {
+                assert!(detail.contains("pages/one.md"), "{mutation}: {detail}");
+                assert!(detail.contains("content:"), "{mutation}: {detail}");
+            }
+            if detail.contains("inventory proof") {
+                assert!(detail.contains(expect), "{mutation}: {detail}");
+            } else {
+                // A count mismatch is caught before the spools are compared, so
+                // it reports the counts rather than the rows.
+                assert!(
+                    detail.contains("source files") && detail.contains("source chunks"),
+                    "{mutation}: {detail}"
+                );
+            }
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&capture_scratch);
+        }
+    }
+
+    /// A named row is worth nothing if the name cannot be told from its twin.
+    ///
+    /// CI 32115065229 reported `changed: file pages/\u{17d} pilot notes
+    /// #pilot.md … -> file pages/\u{17d} pilot notes #pilot.md …` for a graph
+    /// holding TWO files whose names differ only by Unicode normalization
+    /// (`U+017D` against `Z` + `U+030C`). Both spellings print as the same
+    /// glyph sequence in every log, so the refusal could not say which file
+    /// moved, and the first reading of that evidence — content normalization —
+    /// was wrong. The report escapes non-ASCII; ASCII paths are untouched.
+    #[test]
+    fn a_capture_change_refusal_distinguishes_two_spellings_of_one_glyph() {
+        let root = scratch("bootstrap-source-normalization-twins");
+        let precomposed = root.join("pages/\u{17d} pilot notes.md");
+        let decomposed = root.join("pages/Z\u{30c} pilot notes.md");
+        fs::write(&precomposed, b"- precomposed\n").unwrap();
+        fs::write(&decomposed, b"- decomposed\n").unwrap();
+        let capture_scratch = bootstrap_capture_scratch("normalization-twins");
+        let graph = Graph::open(&root);
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new({
+                let decomposed = decomposed.clone();
+                move || fs::write(decomposed, b"- decomposed, changed under the activation\n")
+            }));
+        });
+        let detail = capture
+            .verify_before_inactive_bootstrap_authoring(&graph)
+            .expect_err("the final proof must refuse a graph that moved")
+            .to_string();
+        assert!(detail.contains("1 row(s) differ"), "{detail}");
+        assert!(
+            detail.contains("pages/Z\\u{30c} pilot notes.md"),
+            "the refusal must name the DECOMPOSED twin as the row that moved: {detail}"
+        );
+        assert!(
+            !detail.contains("pages/\u{17d} pilot notes.md")
+                && !detail.contains("pages/Z\u{30c} pilot notes.md"),
+            "no raw glyph spelling may reach the refusal, or the twins read alike: {detail}"
+        );
+        // An ASCII path is still reported exactly as it is on disk.
+        assert_eq!(
+            bootstrap_source_change_report_path("pages/one.md"),
+            "pages/one.md"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&capture_scratch);
     }
 
     #[test]
@@ -48897,6 +47710,7 @@ mod tests {
                     file_resource: ContentDigest::from_bytes([1; 32]),
                     link_count: 1,
                     chunk_count: 0,
+                    activation_page: BlobDescription::from_parts([2; 32], 0),
                 },
                 &mut instrumentation,
             )
@@ -48963,6 +47777,148 @@ mod tests {
         page.activation = Some(handle.activation.as_u64());
         page.blocks[0].raw = "mine".into();
         (root, path, graph, page)
+    }
+
+    #[test]
+    fn concord_live_save_conflict_uses_editor_base_and_guarded_resolution() {
+        let root = scratch("concord-live-save-conflict");
+        let path = root.join("pages/Note.md");
+        fs::write(&path, "- one\n- two\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        let activation = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        page.activation = Some(activation.activation.as_u64());
+        page.blocks[0].raw = "mine one".into();
+        fs::write(&path, "- one\n- disk two\n").unwrap();
+
+        let refusal = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = gh254_shown(&refusal);
+        let diff = graph
+            .live_save_conflict_diff(&page, page.rev.as_deref(), shown)
+            .unwrap();
+        assert!(
+            diff.three_way,
+            "the live editor activation must retain a real base"
+        );
+
+        fn accept_suggestions(
+            rows: &[crate::sync_diff::DiffRow],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            for row in rows {
+                if row.kind != crate::sync_diff::RowKind::Unchanged {
+                    out.insert(
+                        row.id.clone(),
+                        row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                    );
+                }
+                accept_suggestions(&row.children, out);
+            }
+        }
+        let mut decisions = std::collections::HashMap::new();
+        accept_suggestions(&diff.rows, &mut decisions);
+        graph
+            .resolve_live_save_conflict(&page, page.rev.as_deref(), shown, &decisions, "union")
+            .unwrap();
+        let resolved = fs::read_to_string(&path).unwrap();
+        assert!(
+            resolved.contains("mine one"),
+            "mine-only edit must survive: {resolved}"
+        );
+        assert!(
+            resolved.contains("disk two"),
+            "theirs-only edit must survive: {resolved}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
+        let root = scratch("concord-live-save-restart");
+        let path = root.join("pages/Note.md");
+        fs::write(&path, "- one\n- two\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        let activation = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        page.activation = Some(activation.activation.as_u64());
+        page.blocks[0].raw = "mine one".into();
+        fs::write(&path, "- one\n- disk two\n").unwrap();
+        let shown = gh254_shown(&graph.save_page(&page, page.rev.as_deref()).unwrap_err());
+        let capture = graph
+            .capture_live_save_conflict(&page, page.rev.as_deref(), shown)
+            .unwrap();
+        assert!(capture.diff.three_way);
+        drop(graph);
+
+        // A later process has no activation registry or one-shot token. The
+        // app-private capsule is sufficient to reconstruct the same review.
+        let reopened = Graph::open(&root);
+        reopened.warm_cache();
+        let diff = reopened
+            .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+            .unwrap();
+        assert!(diff.three_way);
+        assert_eq!(diff.conflict_rev, capture.disk_rev);
+
+        let decisions = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        // An unseen external write invalidates the durable authority rather than
+        // being overwritten by choices computed for the prior disk revision.
+        fs::write(&path, "- one\n- newer disk two\n").unwrap();
+        assert!(reopened
+            .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union",)
+            .is_err());
+
+        let refreshed = reopened
+            .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+            .unwrap();
+        let refreshed_decisions = refreshed
+            .rows
+            .iter()
+            .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        reopened
+            .resolve_durable_live_save_conflict(
+                &page,
+                &refreshed.conflict_rev,
+                &refreshed_decisions,
+                "union",
+            )
+            .unwrap();
+        let resolved = fs::read_to_string(&path).unwrap();
+        assert!(resolved.contains("mine one"));
+        assert!(resolved.contains("newer disk two"));
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Make `dto` an EDITOR's DTO, the way the frontend does.

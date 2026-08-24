@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
+#[cfg(target_os = "android")]
+use std::fs;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
@@ -15,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+#[cfg(not(target_os = "android"))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use fs2::FileExt as _;
@@ -23,28 +26,40 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::object_store::{
-    ensure_directory_nofollow, is_temp_name, open_dir_nofollow, publish_immutable_exact,
-    read_optional_regular, require_regular_entry, sync_dir_required, StoreError,
+    is_temp_name, open_dir_nofollow as open_dir_nofollow_strict,
+    publish_immutable_exact as publish_immutable_exact_strict,
+    read_optional_regular as read_optional_regular_strict, require_regular_entry,
+    sync_dir_required, StoreError,
+};
+use super::sync_layout::{
+    INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
+    MUTATION_AUTHORITY_LEASE_SUFFIX, MUTATION_AUTHORITY_SUFFIX,
+    PROJECTION_ATTEMPTS_DIR as ATTEMPTS_DIR, PROJECTION_BASES_DIR as BASES_DIR,
+    PROJECTION_CLEANUP_ROUND_0_DIR, PROJECTION_CLEANUP_ROUND_1_DIR,
+    PROJECTION_CLEANUP_ROUND_STATE_FILE as PENDING_CLEANUP_ROUND_STATE,
+    PROJECTION_COMPLETIONS_DIR as COMPLETIONS_DIR, PROJECTION_FORENSICS_DIR as FORENSICS_DIR,
+    PROJECTION_INTENTS_DIR as INTENTS_DIR,
+    PROJECTION_PENDING_CLEANUP_AUTHORITY_FILE as PENDING_CLEANUP_AUTHORITY,
+    PROJECTION_PENDING_CLEANUP_DIR as PENDING_CLEANUP_DIR,
+    PROJECTION_PENDING_CLEANUP_SUFFIX as PENDING_CLEANUP_SUFFIX,
+    PROJECTION_STORE_CLAIM_FILE as STORE_CLAIM_FILE, PROJECTION_STORE_INIT_FILE as STORE_INIT_FILE,
 };
 use super::{
     BaseBlob, BlobDescription, CapabilityCapturedProjectionInput,
     CapabilityCapturedProjectionState, ContentDigest, ManagedPath, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionDirectCompletionAuthority, ProjectionEndpointBinding,
-    ProjectionIntent, ProjectionIntentId, ProjectionPrecondition, ProjectionReceiptStoreId,
-    ProjectionWork, ProjectionWorkCompletionAuthority, ProjectionWorkTarget, ReceiptError,
+    ProjectionCompletion, ProjectionEndpointBinding, ProjectionIntent, ProjectionIntentId,
+    ProjectionPrecondition, ProjectionReceiptStoreId, ProjectionWorkTarget, ReceiptError,
     WorkspaceId,
 };
 #[cfg(test)]
 use crate::model::ProjectionRecoveryCleanup;
 use crate::model::{Graph, ProjectionRecoveryEvidence, ProjectionWriteProof};
 
-const STORE_CLAIM_FILE: &str = "projection-receipts.claim";
-const BASES_DIR: &str = "bases";
-const INTENTS_DIR: &str = "intents";
-const COMPLETIONS_DIR: &str = "completions";
-const ATTEMPTS_DIR: &str = "attempts";
-const FORENSICS_DIR: &str = "forensics";
-const STORE_INIT_FILE: &str = "projection-receipts.init";
+const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = [
+    PROJECTION_CLEANUP_ROUND_0_DIR,
+    PROJECTION_CLEANUP_ROUND_1_DIR,
+];
+
 const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR5\0";
 const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 2] = [b"TINEPR4\0", b"TINEPR3\0"];
 const STORE_INIT_MAGIC: &[u8; 8] = b"TINEPI5\0";
@@ -59,11 +74,6 @@ const MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES: usize = 4_000_000;
 const LOCAL_ATTEMPT_SCHEMA_VERSION: u32 = 1;
 const LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 2;
 const PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 1;
-const PENDING_CLEANUP_SUFFIX: &str = ".projection-cleanup";
-const PENDING_CLEANUP_DIR: &str = ".pending-cleanup";
-const PENDING_CLEANUP_AUTHORITY: &str = ".pending-cleanup.authority";
-const PENDING_CLEANUP_ROUND_STATE: &str = "round-robin.state";
-const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = ["round-0", "round-1"];
 const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
 const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -72,14 +82,362 @@ pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
 const INTENT_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
-const INTENT_NAMESPACE_RESERVATION_SUFFIX: &str = ".namespace-reservation";
-const INTENT_NAMESPACE_AUTHORITY_SUFFIX: &str = ".namespace-authority";
-const MUTATION_AUTHORITY_SUFFIX: &str = ".mutation-authority";
-const MUTATION_AUTHORITY_LEASE_SUFFIX: &str = ".mutation-authority.lock";
 const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
 
 type DirectoryIdentity = [u8; 32];
+
+fn open_dir_nofollow(root: &Dir, name: &str) -> Result<Dir, StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(name);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt directory name is not one normal component: {name}"
+            )));
+        }
+        let name = CString::new(name)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt directory"))?;
+        // Android app-private receipt state has one honest Tine writer. Avoid
+        // the Linux hostile-replacement flag that physical Android storage may
+        // reject; the final handle is still checked to be a directory.
+        let fd = unsafe {
+            libc::openat(
+                root.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return Err(StoreError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: openat returned one newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_dir() {
+            return Err(StoreError::UnsafeEntry(
+                "private receipt handle is not a directory".into(),
+            ));
+        }
+        return Ok(Dir::from_std_file(file));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    open_dir_nofollow_strict(root, name)
+}
+
+/// Open one app-private receipt directory through Android's ordinary file API.
+///
+/// `cap_std::Dir::open_ambient_dir` deliberately retains a Linux-style
+/// capability handle.  Some physical Android kernels permit ordinary access
+/// to the app's private data directory but reject operations issued relative
+/// to that handle.  The private receipt tree is single-writer Tine state, so
+/// the honest-local boundary is the real-directory check before and after the
+/// open, not the particular Linux descriptor flags used to reach it.
+#[cfg(target_os = "android")]
+fn open_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| {
+            error.at(format!(
+                "inspect Android private directory {}",
+                path.display()
+            ))
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProjectionStoreError::UnsafeEntry(format!(
+            "Android private receipt path is not a real directory: {}",
+            path.display()
+        )));
+    }
+    let file = File::open(path)
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| error.at(format!("open Android private directory {}", path.display())))?;
+    if !file
+        .metadata()
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| {
+            error.at(format!(
+                "verify Android private directory {}",
+                path.display()
+            ))
+        })?
+        .is_dir()
+    {
+        return Err(ProjectionStoreError::UnsafeEntry(format!(
+            "Android private receipt handle is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(target_os = "android")]
+fn create_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "Android private receipt path is not a real directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ProjectionStoreError::from(error).at(format!(
+                    "create Android private directory {}",
+                    path.display()
+                )));
+            }
+        },
+        Err(error) => {
+            return Err(ProjectionStoreError::from(error).at(format!(
+                "inspect Android private directory {}",
+                path.display()
+            )));
+        }
+    }
+    open_android_private_directory(path)
+}
+
+fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(name);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "private receipt directory name is not one normal component: {name}"
+            )));
+        }
+        let component = CString::new(name).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "invalid private receipt directory")
+        })?;
+        // Keep this on the same ordinary Android syscall boundary as the
+        // directory open below. cap-std's create_dir adds Linux capability
+        // preflights which some physical app-private filesystems reject even
+        // though mkdirat/openat themselves are permitted.
+        let created =
+            unsafe { libc::mkdirat(root.as_fd().as_raw_fd(), component.as_ptr(), libc::S_IRWXU) };
+        if created < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        // Reopen and classify the actual handle. Android app-private state has
+        // one honest Tine writer, so an fstatat-style preflight adds no safety
+        // but is rejected by some physical devices even when mkdir/open work.
+        open_dir_nofollow(root, name)?;
+        crate::filesystem_durability::sync_reconstructible_directory(root)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+}
+
+fn read_optional_regular(
+    dir: &Dir,
+    path: &str,
+    limit: u64,
+    expected_length: Option<u64>,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(path);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt filename is not one normal component: {path}"
+            )));
+        }
+        let name = CString::new(path)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt filename"))?;
+        // Do not ask Android's app-private filesystem for Linux hostile-path
+        // flags or an fstatat preflight. Open the honest-local name normally,
+        // then validate the retained handle before reading any bytes.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: openat returned one newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt path is not a regular file: {path}"
+            )));
+        }
+        let length = metadata.len();
+        if let Some(expected) = expected_length {
+            if length != expected {
+                return Err(StoreError::StoredLengthMismatch {
+                    path: path.into(),
+                    expected,
+                    actual: length,
+                });
+            }
+        }
+        if length > limit {
+            return Err(StoreError::StoredFileTooLarge {
+                path: path.into(),
+                length,
+                limit,
+            });
+        }
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(StoreError::StoredFileTooLarge {
+                path: path.into(),
+                length: bytes.len() as u64,
+                limit,
+            });
+        }
+        if bytes.len() as u64 != length {
+            return Err(StoreError::StoredLengthMismatch {
+                path: path.into(),
+                expected: length,
+                actual: bytes.len() as u64,
+            });
+        }
+        return Ok(Some(bytes));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    read_optional_regular_strict(dir, path, limit, expected_length)
+}
+
+fn publish_immutable_exact(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        return publish_android_private_immutable(dir, filename, bytes, kind);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    publish_immutable_exact_strict(dir, filename, bytes, kind)
+}
+
+/// Android's app-private filesystem is single-writer from Tine's point of
+/// view, but some devices reject the hard-link primitive used by the generic
+/// no-replace publisher. Keep the crash-safe temporary-file publication and
+/// exact collision check while using the ordinary atomic rename supported by
+/// Android app storage. A concurrent hostile namespace writer is outside the
+/// managed-storage threat model; honest concurrent Tine writers are excluded
+/// by the runtime lease before this store becomes authoritative.
+#[cfg(target_os = "android")]
+fn publish_android_private_immutable(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    let verify_existing = || -> Result<bool, StoreError> {
+        match read_optional_regular(dir, filename, bytes.len() as u64, Some(bytes.len() as u64)) {
+            Ok(Some(existing)) if existing == bytes => Ok(true),
+            Ok(Some(_)) => Err(StoreError::ImmutableCollision(kind)),
+            Ok(None) => Ok(false),
+            Err(
+                StoreError::StoredLengthMismatch { .. } | StoreError::StoredFileTooLarge { .. },
+            ) => Err(StoreError::ImmutableCollision(kind)),
+            Err(error) => Err(error),
+        }
+    };
+
+    if verify_existing()? {
+        return Ok(());
+    }
+
+    let temp_name = format!(".tmp-{}", Uuid::new_v4());
+    let temp_name_c = CString::new(temp_name.as_str())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt temp filename"))?;
+    let filename_c = CString::new(filename)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt filename"))?;
+    // As for receipt directories, use the ordinary Android primitive without
+    // the hostile-namespace flags added by the generic capability publisher.
+    // The retained file is still create-new, fully synced, and verified byte
+    // for byte before this pre-promotion store is accepted.
+    let temp_fd = unsafe {
+        libc::openat(
+            dir.as_fd().as_raw_fd(),
+            temp_name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            libc::S_IRUSR | libc::S_IWUSR,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: openat returned one newly owned descriptor.
+    let mut temp = unsafe { File::from_raw_fd(temp_fd) };
+    let result = (|| {
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        drop(temp);
+
+        if verify_existing()? {
+            return Ok(());
+        }
+
+        let renamed = unsafe {
+            libc::renameat(
+                dir.as_fd().as_raw_fd(),
+                temp_name_c.as_ptr(),
+                dir.as_fd().as_raw_fd(),
+                filename_c.as_ptr(),
+            )
+        };
+        if renamed < 0 {
+            return Err(StoreError::Io(io::Error::last_os_error()));
+        }
+        crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+        if !verify_existing()? {
+            return Err(StoreError::Io(io::Error::new(
+                ErrorKind::NotFound,
+                format!("Android private immutable publication lost {filename}"),
+            )));
+        }
+        Ok(())
+    })();
+    let cleanup = match unsafe { libc::unlinkat(dir.as_fd().as_raw_fd(), temp_name_c.as_ptr(), 0) }
+    {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    };
+    if let Err(error) = result {
+        let _ = cleanup;
+        return Err(error);
+    }
+    if cleanup
+        .as_ref()
+        .is_err_and(|error| error.kind() != ErrorKind::NotFound)
+    {
+        cleanup?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 thread_local! {
@@ -747,8 +1105,13 @@ impl ProjectionReceiptStore {
             ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
         })?;
         let canonical_parent = std::fs::canonicalize(parent)?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-        let capability = open_dir_nofollow(&parent_capability, name)?;
+        #[cfg(target_os = "android")]
+        let capability = open_android_private_directory(&canonical_parent.join(name))?;
+        #[cfg(not(target_os = "android"))]
+        let capability = {
+            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
+            open_dir_nofollow(&parent_capability, name)?
+        };
         let store_id = canonical_receipt_store_id(&capability)?;
         if store_id != expected_store_id {
             return Err(ProjectionStoreError::EndpointBindingMismatch);
@@ -792,12 +1155,27 @@ impl ProjectionReceiptStore {
         let parent = root.parent().ok_or_else(|| {
             ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
         })?;
-        let canonical_parent = std::fs::canonicalize(parent)?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-        ensure_directory_nofollow(&parent_capability, name)?;
-        let capability = open_dir_nofollow(&parent_capability, name)?;
-        let store_id = canonical_receipt_store_id(&capability)?;
-        let namespaces = Self::initialize(&capability, store_id, workspace_id, endpoint)?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("canonicalize private receipt parent"))?;
+        #[cfg(target_os = "android")]
+        let capability = create_android_private_directory(&canonical_parent.join(name))
+            .map_err(|error| error.at("create Android private receipt root"))?;
+        #[cfg(not(target_os = "android"))]
+        let capability = {
+            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("open private receipt parent"))?;
+            ensure_directory_nofollow(&parent_capability, name)
+                .map_err(|error| error.at("create private receipt root"))?;
+            open_dir_nofollow(&parent_capability, name)
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("open private receipt root"))?
+        };
+        let store_id = canonical_receipt_store_id(&capability)
+            .map_err(|error| error.at("identify private receipt root"))?;
+        let namespaces = Self::initialize(&capability, store_id, workspace_id, endpoint)
+            .map_err(|error| error.at("initialize private receipt store"))?;
 
         Ok(Self {
             root_path: canonical_parent.join(name),
@@ -1476,79 +1854,6 @@ impl ProjectionReceiptStore {
         Ok((intent, completion))
     }
 
-    pub(crate) fn completed_direct_authority(
-        &self,
-        intent: &ProjectionIntent,
-        target: ProjectionWorkTarget,
-        engine_history_generation: u64,
-        engine_history_root: super::ContentDigest,
-    ) -> Result<ProjectionDirectCompletionAuthority, ProjectionStoreError> {
-        let endpoint = self
-            .endpoint
-            .ok_or(ProjectionStoreError::EndpointBindingMismatch)?;
-        self.require_endpoint(endpoint)?;
-        self.require_workspace(intent)?;
-        let completion = self
-            .load_completion(intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        completion.validate_against(intent)?;
-        let target_matches = match target {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(description) => intent.target() == description,
-        };
-        if !target_matches {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        Ok(
-            ProjectionDirectCompletionAuthority::from_durable_completion(
-                endpoint.endpoint_id,
-                endpoint.graph_resource_id,
-                self.store_id,
-                engine_history_generation,
-                engine_history_root,
-                target,
-                intent,
-                &completion,
-            ),
-        )
-    }
-
-    pub(crate) fn completed_work_authority(
-        &self,
-        work: &ProjectionWork,
-        intent: &ProjectionIntent,
-    ) -> Result<ProjectionWorkCompletionAuthority, ProjectionStoreError> {
-        let endpoint = self
-            .endpoint
-            .ok_or(ProjectionStoreError::EndpointBindingMismatch)?;
-        self.require_endpoint(endpoint)?;
-        let target_matches = match work.target() {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(target) => intent.target() == target,
-        };
-        if work.workspace_id() != self.workspace_id
-            || work.endpoint_id() != endpoint.endpoint_id
-            || work.graph_resource_id() != endpoint.graph_resource_id
-            || intent.workspace_id() != work.workspace_id()
-            || intent.page_id() != work.page_id()
-            || intent.path() != work.path()
-            || intent.frontier() != work.post_frontier()
-            || !target_matches
-        {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let completion = self
-            .load_completion(intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        completion.validate_against(intent)?;
-        Ok(ProjectionWorkCompletionAuthority::from_durable_completion(
-            work,
-            self.store_id,
-            completion.intent_id(),
-            completion.logical_completion_id(),
-        ))
-    }
-
     pub fn local_forensic_evidence(
         &self,
         intent: &ProjectionIntent,
@@ -2017,7 +2322,9 @@ impl ProjectionReceiptStore {
         workspace_id: WorkspaceId,
         endpoint: Option<ProjectionEndpointBinding>,
     ) -> Result<ReceiptNamespaces, ProjectionStoreError> {
-        let existing = read_optional_regular(capability, STORE_CLAIM_FILE, 512, None)?;
+        let existing = read_optional_regular(capability, STORE_CLAIM_FILE, 512, None)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("read private receipt store claim"))?;
         if let Some(bytes) = existing {
             let expected = validate_claim(&bytes, store_id, workspace_id, endpoint)?;
             let namespaces = open_receipt_namespaces(capability, store_id)?;
@@ -2030,7 +2337,10 @@ impl ProjectionReceiptStore {
         }
 
         let expected_init = init_claim_bytes(store_id, workspace_id, endpoint);
-        match read_optional_regular(capability, STORE_INIT_FILE, 256, None)? {
+        match read_optional_regular(capability, STORE_INIT_FILE, 256, None)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("read private receipt initialization claim"))?
+        {
             Some(bytes) => {
                 if bytes != expected_init {
                     return Err(ProjectionStoreError::MalformedStoreClaim);
@@ -2045,7 +2355,9 @@ impl ProjectionReceiptStore {
                     STORE_INIT_FILE,
                     &expected_init,
                     "projection receipt store initialization claim",
-                )?;
+                )
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("publish private receipt initialization claim"))?;
             }
         }
 
@@ -2056,17 +2368,22 @@ impl ProjectionReceiptStore {
             ATTEMPTS_DIR,
             FORENSICS_DIR,
         ] {
-            ensure_directory_nofollow(capability, namespace)?;
+            ensure_directory_nofollow(capability, namespace).map_err(|error| {
+                error.at(format!("create private receipt namespace {namespace}"))
+            })?;
         }
         require_incomplete_store_is_empty(capability)?;
-        let namespaces = open_receipt_namespaces(capability, store_id)?;
+        let namespaces = open_receipt_namespaces(capability, store_id)
+            .map_err(|error| error.at("open private receipt namespaces"))?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
         publish_immutable_exact(
             capability,
             STORE_CLAIM_FILE,
             &claim,
             "projection receipt store claim",
-        )?;
+        )
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| error.at("publish private receipt store claim"))?;
         Ok(namespaces)
     }
 
@@ -2828,6 +3145,10 @@ fn validate_live_intent_namespace(
 pub enum ProjectionStoreError {
     Io(std::io::Error),
     Store(Box<StoreError>),
+    Operation {
+        operation: String,
+        source: Box<ProjectionStoreError>,
+    },
     Receipt(ReceiptError),
     UnsafeEntry(String),
     UnknownStoreVersion(u32),
@@ -2880,6 +3201,7 @@ impl fmt::Display for ProjectionStoreError {
         match self {
             Self::Io(error) => error.fmt(f),
             Self::Store(error) => error.fmt(f),
+            Self::Operation { operation, source } => write!(f, "{operation}: {source}"),
             Self::Receipt(error) => error.fmt(f),
             Self::UnsafeEntry(message) => write!(f, "unsafe projection store entry: {message}"),
             Self::UnknownStoreVersion(version) => {
@@ -2980,12 +3302,22 @@ impl fmt::Display for ProjectionStoreError {
     }
 }
 
+impl ProjectionStoreError {
+    fn at(self, operation: impl Into<String>) -> Self {
+        Self::Operation {
+            operation: operation.into(),
+            source: Box::new(self),
+        }
+    }
+}
+
 impl std::error::Error for ProjectionStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Receipt(error) => Some(error),
+            Self::Operation { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -3654,13 +3986,9 @@ fn read_optional_mutation_authority_bounded(
         )));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(ProjectionStoreError::UnsafeEntry(format!(
-            "projection mutation authority has unsafe ownership or links: {name}"
+            "projection mutation authority has unexpected links: {name}"
         )));
     }
     #[cfg(windows)]
@@ -3830,13 +4158,9 @@ fn validate_mutation_authority_lease_file(
         )));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(ProjectionStoreError::UnsafeEntry(format!(
-            "projection mutation lease has unsafe ownership or links: {name}"
+            "projection mutation lease has unexpected links: {name}"
         )));
     }
     #[cfg(windows)]
@@ -6889,12 +7213,5 @@ mod tests {
                     && limit == MAX_PROJECTION_EVIDENCE_BYTES
             ));
         }
-    }
-
-    mod crash_corpus {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/oplog/projection_crash_corpus_tests.rs"
-        ));
     }
 }

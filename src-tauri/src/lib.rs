@@ -3,6 +3,8 @@
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 
 mod android_folder_picker;
+#[cfg(all(target_os = "android", debug_assertions))]
+mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
@@ -28,29 +30,36 @@ mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
+mod storage_mode_supervisor;
 mod sync_runtime;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    activate_absent_editor, activate_editor, asset_trash_stats, block_ref_counts, block_referrers,
-    capture_quick_switch, close_graph_window, copy_guide_into_graph, delete_page,
-    detect_media_editor, edit_asset_external, empty_asset_trash, existing_page_names,
+    activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
+    block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
+    close_graph_window, conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
+    durable_live_save_conflict_diff, edit_asset_external, empty_asset_trash, existing_page_names,
     export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page, get_page_by_path,
     get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
-    journal_content_days, journal_feed_page, list_journal_conflicts, list_orphan_assets,
-    list_pages, list_sync_conflicts, list_templates, load_workspaces, merge_pages, open_asset,
-    open_page_file, open_pdf, page_aliases, page_icons, page_print_html, prepare_tine_quit,
+    journal_content_days, journal_feed_page, list_journal_conflicts,
+    list_journal_filename_migrations, list_orphan_assets, list_pages, list_sync_conflicts,
+    list_templates, list_vcs_marker_conflicts, live_save_conflict_diff, load_workspaces,
+    merge_pages, move_managed_application_subtrees, open_asset, open_page_file, open_pdf,
+    page_aliases, page_icons, page_print_html, preflight_managed_page_mutation, prepare_tine_quit,
     present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
     read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
-    referenced_page_names, rename_file_to_page, rename_page, resolve_block, resolve_blocks,
-    resolve_sync_conflict, retire_editor_activation, run_advanced_query, run_graph_search,
-    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
-    set_default_journal_template, set_doc_mode_enter_for_new_block, set_favorites,
-    set_guide_announced, set_journal_title_format, set_logical_outdenting, set_preferred_format,
-    set_preferred_workflow, set_show_brackets, set_start_of_week, set_timetracking_enabled,
-    stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
+    recover_managed_application_subtrees, referenced_page_names, rename_file_to_page, rename_page,
+    rescan_graph_now, resolve_block, resolve_blocks, resolve_durable_live_save_conflict,
+    resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
+    retire_editor_activation, run_advanced_query, run_graph_search, run_query, save_asset,
+    save_page, save_pdf_area_image, save_workspaces, search, set_default_journal_template,
+    set_doc_mode_enter_for_new_block, set_favorites, set_guide_announced, set_journal_title_format,
+    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
+    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
+    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
+    write_pdf_view_state,
 };
 use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use git::{
@@ -79,14 +88,15 @@ use state::AppState;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 use sync_runtime::{
-    activate_sparse_v2, cancel_sparse_v2, cancel_sparse_v2_cold, join_sparse_v2_shared,
-    prepare_sparse_v2_share, sparse_v2_clean_shutdown, sparse_v2_editor_load,
-    sparse_v2_editor_save, sparse_v2_query, sparse_v2_status, sparse_v2_tick,
+    activate_sparse_v2, adopt_sparse_v2_shared, cancel_sparse_v2, cancel_sparse_v2_cold,
+    join_sparse_v2_shared, prepare_sparse_v2_share, sparse_v2_clean_shutdown,
+    sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query, sparse_v2_recovery_location,
+    sparse_v2_status, sparse_v2_tick,
 };
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
-use watcher::{get_watch_mode, set_watch_mode, start_watcher};
+use watcher::{get_watch_mode, set_watch_mode, start_watcher, watcher_latency_recent};
 
 #[cfg(desktop)]
 const MAIN_WINDOW_REVEAL_FALLBACK_MS: u64 = 3_000;
@@ -647,11 +657,10 @@ pub fn run() {
         })
         .manage(AppState {
             graphs: RwLock::new(state::GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(std::collections::HashMap::new()),
             sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
@@ -731,12 +740,17 @@ pub fn run() {
             get_page,
             graph_source_files,
             save_page,
+            move_managed_application_subtrees,
+            recover_managed_application_subtrees,
+            preflight_managed_page_mutation,
             sparse_v2_status,
             activate_sparse_v2,
             cancel_sparse_v2,
             cancel_sparse_v2_cold,
             prepare_sparse_v2_share,
             join_sparse_v2_shared,
+            adopt_sparse_v2_shared,
+            sparse_v2_recovery_location,
             sparse_v2_query,
             sparse_v2_editor_load,
             sparse_v2_editor_save,
@@ -785,10 +799,24 @@ pub fn run() {
             trash_asset,
             asset_trash_stats,
             empty_asset_trash,
+            apply_journal_filename_migrations,
             list_journal_conflicts,
+            list_journal_filename_migrations,
             list_sync_conflicts,
+            list_vcs_marker_conflicts,
             sync_conflict_diff,
+            vcs_marker_conflict_diff,
+            conflict_queue,
+            text_block_diff,
+            text_block_diff3,
+            live_save_conflict_diff,
+            capture_live_save_conflict,
+            durable_live_save_conflict_diff,
+            resolve_durable_live_save_conflict,
+            resolve_live_save_conflict,
             resolve_sync_conflict,
+            rescan_graph_now,
+            resolve_vcs_marker_conflict,
             trash_sync_conflict,
             trash_journal_file,
             read_journal_file,
@@ -827,6 +855,7 @@ pub fn run() {
             set_link_first_match,
             get_watch_mode,
             set_watch_mode,
+            watcher_latency_recent,
             list_backups,
             restore_backup,
             load_session,

@@ -14,6 +14,7 @@ import {
   setDoc,
   extendFeedForScroll,
   flushPage,
+  holdPageMutationUi,
   isDirty,
   pageToDto,
   setBlockMoving,
@@ -412,7 +413,7 @@ describe("Journals feed generation lifecycle", () => {
     await expect(extendFeedForScroll()).resolves.toBe(false);
   });
 
-  it.each(["active edit", "dirty", "saving", "conflict", "moving"] as const)("defers a %s feed gate then retries on its real release", async (gate) => {
+  it.each(["active edit", "dirty", "saving", "conflict", "moving", "explicit mutation"] as const)("defers a %s feed gate then retries on its real release", async (gate) => {
     const api = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("initial")]))
     const mounted = mount(() => <PageView />);
     await flushMicrotasks();
@@ -428,6 +429,7 @@ describe("Journals feed generation lifecycle", () => {
     if (gate === "dirty" || gate === "saving") setRaw("feed", "dirty");
     if (gate === "conflict") markConflict(today);
     if (gate === "moving") setBlockMoving(true, today);
+    const releaseMutation = gate === "explicit mutation" ? holdPageMutationUi([today]) : null;
     let saved: Promise<boolean> | null = null;
     let releaseSave: (() => void) | null = null;
     if (gate === "saving") {
@@ -456,10 +458,52 @@ describe("Journals feed generation lifecycle", () => {
       }
       if (gate === "conflict") clearConflict(today);
       if (gate === "moving") setBlockMoving(false);
+      releaseMutation?.();
       await flushMicrotasks();
       await flushMicrotasks();
       expect(api).toHaveBeenCalledTimes(1);
       expect(doc.feed).toContain(`released-${gate}`);
+    } finally {
+      mounted.dispose();
+    }
+  });
+
+  it("keeps today visible when Concord acquires it while a journal refresh is in flight", async () => {
+    const today = journalTitle(new Date());
+    const older = "August 21st, 2026";
+    setDoc({
+      byId: {
+        today: node("today", "visible today", today),
+        older: node("older", "visible older", older),
+      },
+      pages: [page(today, "journal", ["today"]), page(older, "journal", ["older"])],
+      feed: [today, older],
+      loaded: true,
+    });
+    let land!: (response: JournalFeedPage) => void;
+    const api = vi.spyOn(backend(), "journalFeedPage")
+      .mockImplementationOnce(() => new Promise((resolve) => { land = resolve; }))
+      .mockResolvedValue(feedResponse([
+        journalDto(today, "fresh today"),
+        journalDto(older, "fresh older"),
+      ]));
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(api).toHaveBeenCalledTimes(1);
+      const release = holdPageMutationUi([today]);
+      land(feedResponse([
+        journalDto(today, "response today"),
+        journalDto(older, "response older"),
+      ]));
+      await flushMicrotasks();
+      expect(doc.feed).toEqual([today, older]);
+      expect(pageByName(today)?.roots.map((id) => doc.byId[id].raw)).toEqual(["visible today"]);
+
+      release();
+      await vi.waitFor(() => expect(api).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(pageByName(today)?.roots.map((id) => doc.byId[id].raw)).toEqual(["fresh today"]));
+      expect(doc.feed).toEqual([today, older]);
     } finally {
       mounted.dispose();
     }

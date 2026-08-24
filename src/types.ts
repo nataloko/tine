@@ -66,7 +66,7 @@ export interface PageDto {
   rev?: string | null;
   /** Format this page is stored in (drives org vs markdown inline rendering). */
   format?: Format;
-  /** True for an org page Tine can't round-trip byte-for-byte: shown but not
+  /** True for a source page Tine can't structurally round-trip: shown but not
    *  editable, so Tine never rewrites (and risks corrupting) it. */
   read_only?: boolean;
   /** Graph-root-relative path of the file this page was loaded from
@@ -193,6 +193,14 @@ export interface JournalConflict {
   files: JournalFile[];
 }
 
+/** A journal file whose name doesn't round-trip to its date, and the name it
+ *  would get. Concord invariant 4: Tine proposes these renames; opening a graph
+ *  no longer performs them. */
+export interface JournalFilenameMigration {
+  from: string;
+  to: string;
+}
+
 /** A sync-tool conflict copy (Syncthing/Dropbox) shadowing a real page — a
  *  `*.sync-conflict-*.md` (or Dropbox `(conflicted copy)`) file. Excluded from
  *  the page list; surfaced here so the user can review + merge it. */
@@ -208,6 +216,20 @@ export interface SyncConflict {
   tag: string;
   /** One-line content preview of the conflict copy. */
   preview: string;
+}
+
+/** A page whose on-disk bytes carry unresolved VCS merge-conflict markers
+ *  (git/Fossil). It stays readable, but saves to it are refused so Tine never
+ *  rewrites (and thereby mangles) the markers — the user resolves the merge in
+ *  their VCS or an external editor. */
+export interface VcsMarkerConflict {
+  /** Graph-root-relative path of the marker-bearing file. */
+  path: string;
+  /** Display name of the page (decoded page name / journal title). */
+  name: string;
+  kind: PageKind;
+  /** Distinct marker kinds found, e.g. ["<<<<<<<", "=======", ">>>>>>>"]. */
+  markers: string[];
 }
 
 export interface SparseV2WatcherStatus {
@@ -248,6 +270,10 @@ export interface SparseV2RuntimeStatus {
   shared_role: "initiator" | "joiner" | null;
   shared_phase: "share_prepared" | "joining" | "active" | null;
   provider_pending: number;
+  /** The actor's own scheduling predicate: shared-active and holding provider
+   * work a tick can advance. Diagnostic only; `provider_pending` is a broad
+   * inventory that legitimately stays non-zero. */
+  provider_runnable: boolean;
 }
 
 export type SparseV2Availability =
@@ -255,8 +281,8 @@ export type SparseV2Availability =
   | { state: "joinable"; descriptor_digest: string }
   | { state: "active" }
   | { state: "retryable"; stage: "absent" | "shadow_import" | "verified_local" | "local_active"; detail: string }
-  | { state: "blocked"; reason_code: string }
-  | { state: "refused"; reason_code: string; detail: string | null };
+  | { state: "blocked"; reason_code: string; scenario_id: string }
+  | { state: "refused"; reason_code: string; scenario_id: string; detail: string | null };
 
 /** Native, binding-scoped advisory envelope for pre-mutation bulk admission.
  * The managed actor remains the final save authority. */
@@ -270,6 +296,139 @@ export type ApplicationPageAdmission =
       application_page_max_depth: number;
     }
   | { binding_generation: number; authority: "managed_unavailable" };
+
+export interface ManagedApplicationMoveRawRewrite {
+  expected_raw: string;
+  desired_raw: string;
+}
+
+export interface ManagedApplicationMoveRoot {
+  identity: string;
+  raw_rewrite: ManagedApplicationMoveRawRewrite | null;
+}
+
+export type ManagedApplicationMovePlacement =
+  | { placement: "root"; position: number }
+  | { placement: "child"; parent_identity: string; position: number };
+
+export interface ManagedApplicationMoveSubtreesRequest {
+  episode_id: string;
+  source_path: string;
+  source_revision: string;
+  destination_path: string;
+  destination_revision: string;
+  roots: ManagedApplicationMoveRoot[];
+  placement: ManagedApplicationMovePlacement;
+  admission: {
+    application_save_page_blocks: number;
+    application_page_request_text_bytes: number;
+    application_page_max_depth: number;
+  };
+}
+
+export type ManagedApplicationMoveConflict =
+  | "stale_source"
+  | "stale_destination"
+  | "missing_source"
+  | "missing_destination"
+  | "ambiguous_source"
+  | "ambiguous_destination"
+  | "same_page"
+  | "read_only"
+  | "missing_or_foreign_root"
+  | "duplicate_root"
+  | "nested_root"
+  | "missing_or_foreign_parent"
+  | "invalid_placement"
+  | "expected_raw_changed"
+  | "admission_changed"
+  | "destination_too_large"
+  | "destination_too_deep"
+  | "destination_text_too_large"
+  | "episode_mismatch"
+  | "episode_not_committed"
+  | "batch_collision";
+
+export interface ManagedApplicationMovedPage {
+  page: PageDto;
+  revision: string;
+}
+
+export type ManagedApplicationMovePhase =
+  | "bindings"
+  | "planning"
+  | "draft"
+  | "capture"
+  | "finalize"
+  | "tail_reservation"
+  | "publication"
+  | "archive_stage"
+  | "tail_admission"
+  | "sqlite_drain"
+  | "projection_drain";
+
+export type ManagedApplicationMoveDeferred =
+  | { status: "retryable_external_work" }
+  | {
+      status: "retryable_retained_publication";
+      batch_id: string;
+      phase: ManagedApplicationMovePhase;
+    }
+  | {
+      status: "blocked_recovery";
+      batch_id: string | null;
+      phase: ManagedApplicationMovePhase;
+      retained_publication: boolean;
+    }
+  | {
+      status: "revoked";
+      batch_id: string | null;
+      phase: ManagedApplicationMovePhase;
+    };
+
+export type ManagedApplicationMoveSubtreesOutcome =
+  | {
+      status: "committed";
+      episode_id: string;
+      batch_id: string;
+      recovered: boolean;
+      source: ManagedApplicationMovedPage;
+      destination: ManagedApplicationMovedPage;
+    }
+  | { status: "no_commit"; episode_id: string; reason: ManagedApplicationMoveConflict }
+  | { status: "deferred"; episode_id: string; state: ManagedApplicationMoveDeferred };
+
+/** Binding-tagged X1 result. X2 may install it only if this generation and its
+ * page instances still own the busy episode. */
+export interface ManagedApplicationMoveSubtreesResult {
+  binding_generation: number;
+  application_page_admission: ApplicationPageAdmission;
+  outcome: ManagedApplicationMoveSubtreesOutcome;
+}
+
+/** Exact X1.5 replay observation. A successor generation is present only when
+ * the predecessor actor was already stopped and recovery reopened it. */
+export interface ManagedApplicationMoveSubtreesRecoveryResult {
+  previous_binding_generation: number;
+  binding_generation: number;
+  status: SparseV2Status;
+  application_page_admission: ApplicationPageAdmission;
+  episode_id: string;
+  outcome: ManagedApplicationMoveSubtreesOutcome;
+}
+
+/** Opaque one-shot acknowledgement that exact managed save preparation
+ * completed without authoring. It is useful only to the immutable frontend
+ * plan that requested it; the real save revalidates everything. */
+export type ManagedPageMutationPreflightResult =
+  | {
+      status: "accepted";
+      binding_generation: number;
+      page_name: string;
+      page_path: string;
+      base_revision: string | null;
+    }
+  | { status: "refused" | "deferred" };
 
 export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
@@ -294,24 +453,57 @@ export interface SparseV2CancelResult {
   recovery_statement: string;
 }
 
-/** Privacy-safe native progress shared by terminal diagnostics and cold-start UI. */
-export type StartupProgressPhase =
-  | "lookup.entry"
-  | "lookup.app_data"
-  | "lookup.settings_stat"
-  | "lookup.settings_read"
-  | "lookup.settings_parse"
-  | "lookup.complete"
-  | `managed_open.${string}`;
+/**
+ * The receipt for adopting a graph shared by another device on a device that
+ * held a managed graph of its own. `archive_location` is where that own
+ * history went; it is absent only when there was no retained history to keep.
+ */
+export interface SparseV2AdoptionResult {
+  status: SparseV2Status;
+  binding_generation: number;
+  archive_location: string | null;
+  adoption_statement: string;
+}
 
-export interface StartupProgressEvent {
-  phase: StartupProgressPhase;
-  elapsed_ms: number;
+export type StorageTransitionKind =
+  | "lookup"
+  | "open_direct"
+  | "open_managed"
+  | "activate_managed"
+  | "join_managed"
+  | "return_gracefully"
+  | "return_emergency";
+
+export type StorageTransitionPhase =
+  | "requested"
+  | "waiting_for_transition"
+  | "looking_up_selection"
+  | "validating_target"
+  | "opening_direct"
+  | "opening_managed"
+  | "activating_managed"
+  | "joining_managed"
+  | "draining_managed"
+  | "confirming_projection"
+  | "quarantining_managed_selection"
+  | "publishing_direct";
+
+/** Sole native storage-transition receipt. The frontend renders this identity;
+ * it never infers ownership or failure from text prefixes or elapsed time. */
+export interface StorageTransitionEvent {
+  operationId: number;
+  window: string;
+  canonicalRoot?: string;
+  kind: StorageTransitionKind;
+  phase: StorageTransitionPhase;
+  elapsedMs: number;
   terminal: boolean;
-  outcome?: "ok" | "error";
+  outcome?: "succeeded" | "failed" | "cancelled" | "superseded";
+  outcomeCode?: string;
 }
 
 export type SparseV2ActivationPhase =
+  | "private_setup"
   | "source_capture"
   | "bootstrap_import_preparation"
   | "immutable_publication_install"
@@ -319,7 +511,11 @@ export type SparseV2ActivationPhase =
   | "sqlite_open_build"
   | "shadow_reconstruction_byte_verification"
   | "promotion_receipt_confirmation"
-  | "reconciliation_baseline_actor_open";
+  | "reconciliation_baseline_actor_open"
+  | "retained_runtime_open"
+  | "retained_runtime_tail_replay"
+  | "retained_runtime_projection_repair"
+  | "retained_runtime_actor_open";
 
 export type SparseV2BootstrapPreparationSubphase =
   | "source_protocol"
@@ -335,6 +531,8 @@ export interface SparseV2BootstrapPreparationSummary {
   operations: number;
   parts: number;
   prepared_bytes: number;
+  operation_builder_retained_bytes: number;
+  operation_builder_spilled: boolean;
   source_protocol_micros: number;
   operation_spool_micros: number;
   partition_micros: number;
@@ -346,7 +544,8 @@ export type SparseV2ActivationProgress =
   | { kind: "phase"; phase: SparseV2ActivationPhase }
   | { kind: "bootstrap_preparation_subphase"; subphase: SparseV2BootstrapPreparationSubphase }
   | { kind: "bootstrap_detached_authoring"; completed: number; total: number }
-  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary };
+  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary }
+  | { kind: "readiness_sample"; largest_page_path: string | null };
 
 export interface SparseV2ActivationProgressEvent {
   binding_generation: number;
@@ -499,6 +698,10 @@ export interface BlockView {
   child_count: number;
 }
 
+/** How a row relates to the 3-way BASE (the Concord ledger's last-agreed text).
+ *  Only present on 3-way diffs. */
+export type Diff3Verdict = "mine-only" | "theirs-only" | "both-changed";
+
 /** One aligned position in the two block trees. `id` is a stable path ("2.1")
  *  that the resolve step reproduces, so a decision maps back to the same block. */
 export interface DiffRow {
@@ -507,6 +710,11 @@ export interface DiffRow {
   mine: BlockView | null;
   theirs: BlockView | null;
   children: DiffRow[];
+  /** 3-way classification against the base (absent on 2-way diffs). */
+  verdict?: Diff3Verdict | null;
+  /** Pre-selected decision the base justifies ("mine"/"theirs"); the modal only
+   *  pre-selects it — nothing applies without the user's confirm. */
+  suggestion?: "mine" | "theirs" | null;
 }
 
 /** The full block-level diff of a conflict copy against its winner. */
@@ -518,10 +726,77 @@ export interface SyncConflictDiff {
   theirs_pre: string | null;
   pre_differs: boolean;
   blocks_identical: boolean;
+  /** True when rows carry 3-way verdicts computed against a real base. */
+  three_way?: boolean;
 }
 
 /** A user's per-row merge decision. */
 export type MergeDecision = "mine" | "theirs" | "both";
+
+/** Where a conflict object came from (Concord L3). */
+export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save";
+
+export interface LiveSaveConflictSnapshot {
+  page: PageDto;
+  base_rev: string | null;
+  conflict_epoch: number;
+  draft_version: number;
+  /** Exact editor base captured before watcher admission could advance caches. */
+  base_text?: string | null;
+  /** Exact disk revision the current review is aligned against. */
+  disk_rev?: string;
+  /** This retained draft was rehydrated after process restart. The ordinary
+   * disk-loaded editor is not its replacement authority. */
+  restored?: boolean;
+}
+
+export interface LiveSaveConflictCapture {
+  diff: SyncConflictDiff;
+  base_text: string | null;
+  disk_rev: string;
+}
+
+/** Which version of the page a side is. Three roles, not two — a diff3/Fossil
+ *  marker block and a ledger-backed conflict copy both supply a base. */
+export type SideRole = "mine" | "theirs" | "base";
+
+/** One version of a page participating in a conflict. */
+export interface ConflictSide {
+  role: SideRole;
+  label: string;
+  /** Graph-root-relative path, when the side is a file of its own. */
+  path?: string | null;
+}
+
+/** One item in the Concord conflict queue: a page that needs the user's
+ *  judgement. Entirely DERIVED from what is on disk (no metadata is stored in
+ *  the graph), so the queue survives restarts by being recomputed. */
+export interface ConflictObject {
+  /** Stable derived id — `copy:<path>` / `markers:<path>`. */
+  id: string;
+  source: ConflictSource;
+  page_name: string;
+  /** Path of the page to navigate to (the winner, or the marker file). */
+  page_path: string;
+  kind: PageKind;
+  sides: ConflictSide[];
+  /** Rows needing a decision, when it was cheap to compute (absent ≠ zero). */
+  block_conflicts?: number | null;
+  /** Marker tokens present, for a `vcs-markers` object. */
+  markers?: string[];
+  /** Present only for an in-memory editor draft whose guarded Direct Files save
+   * was refused. It carries the exact unconsumed authority presentation. */
+  live?: LiveSaveConflictSnapshot;
+}
+
+/** A marker-bearing page's own conflict, parsed out of its `<<<<<<<` sections
+ *  and diffed with the same block machinery as a conflict copy (Concord L5). */
+export interface MarkerConflictDiff {
+  mine_label: string;
+  theirs_label: string;
+  regions: number;
+  diff: SyncConflictDiff;
+}
 
 export interface RefGroup {
   page: string;

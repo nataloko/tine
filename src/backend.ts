@@ -7,6 +7,9 @@ import type {
   ActivationExpectedRevision,
   ActivationIntent,
   ApplicationPageAdmission,
+  ManagedApplicationMoveSubtreesRecoveryResult,
+  ManagedApplicationMoveSubtreesRequest,
+  ManagedApplicationMoveSubtreesResult,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
@@ -25,12 +28,19 @@ import type {
   TemplateDto,
   TrashStats,
   JournalConflict,
+  JournalFilenameMigration,
   SyncConflict,
   SyncConflictDiff,
+  VcsMarkerConflict,
+  ConflictObject,
+  LiveSaveConflictCapture,
+  MarkerConflictDiff,
   MergeDecision,
+  ManagedPageMutationPreflightResult,
   PrintOpts,
   SparseV2Status,
   SparseV2CancelResult,
+  SparseV2AdoptionResult,
   SparseV2ActivationProgressEvent,
   SparseV2Tick,
   SparseV2RuntimeStatusEvent,
@@ -41,7 +51,7 @@ import type {
   SparseV2EditorLoadRequest,
   SparseV2EditorSaveRequest,
   SparseV2EditorOutcome,
-  StartupProgressEvent,
+  StorageTransitionEvent,
   PdfState,
   QueryExecution,
   QueryPageScope,
@@ -206,8 +216,8 @@ export interface Backend {
   approveExternalAssets(graphRoot: string, assetsPath: string): Promise<void>;
   loadGraph(path: string): Promise<LoadGraphResult>;
   openGraphWindow(path: string): Promise<LoadGraphResult>;
-  startupGraphPath(attempt: number): Promise<string | null>;
-  onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void>;
+  startupGraphPath(): Promise<string | null>;
+  onStorageTransition(cb: (progress: StorageTransitionEvent) => void): Promise<() => void>;
   captureTarget(): Promise<string>;
   /** Lease the graph selected for this Quick Capture show before issuing
    * graph-scoped reads from its independent WebView. */
@@ -274,6 +284,22 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
+  /** X1 native bridge only. Production gesture routing remains disabled until
+   * X2 owns quiescence, leases, publication, and semantic history. */
+  moveManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ): Promise<ManagedApplicationMoveSubtreesResult>;
+  /** Resolve one exact deferred move episode without routing a new gesture. */
+  recoverManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ): Promise<ManagedApplicationMoveSubtreesRecoveryResult>;
+  preflightManagedPageMutation(
+    page: PageDto,
+    baseRevision: string | null,
+    bindingGeneration: number,
+  ): Promise<ManagedPageMutationPreflightResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
   onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
@@ -284,9 +310,13 @@ export interface Backend {
   ): Promise<() => void>;
   activateSparseV2(): Promise<SparseV2Status>;
   cancelSparseV2(): Promise<SparseV2CancelResult>;
-  cancelSparseV2Cold(path: string, attempt: number): Promise<SparseV2CancelResult>;
+  cancelSparseV2Cold(path: string): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
   joinSparseV2Shared(): Promise<SparseV2Status>;
+  /** Adopt another device's shared graph, archiving this device's own managed history. */
+  adoptSparseV2Shared(): Promise<SparseV2AdoptionResult>;
+  /** Where a set-aside managed history is archived, knowable before adoption runs. */
+  sparseV2RecoveryLocation(): Promise<string>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
   sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
   sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
@@ -383,6 +413,16 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
+  /** Request one watcher full pass. The returned sequence is completed by a
+   *  later `graph-rescan-complete` event, after ordinary change events emit. */
+  rescanGraphNow(): Promise<number>;
+  onGraphRescanComplete(cb: (sequence: number) => void): Promise<() => void>;
+  /** Journal files whose names don't round-trip to a date, with the names they
+   *  would get. Proposed only — see `applyJournalFilenameMigrations`. */
+  listJournalFilenameMigrations(): Promise<JournalFilenameMigration[]>;
+  /** Apply the proposed journal renames after taking a snapshot. Returns how
+   *  many files were renamed. */
+  applyJournalFilenameMigrations(): Promise<number>;
   /** Move one journal file (by exact filename) to the recoverable trash. */
   trashJournalFile(name: string): Promise<void>;
   /** Raw contents of one journal file (by exact filename), for inspecting a
@@ -417,16 +457,73 @@ export interface Backend {
   ): Promise<"authorised" | "superseded" | "withdrawn">;
   /** Append the blocks of `src` (graph-root-relative path) onto `dst`, then trash
    *  `src` — fold a duplicate-day stray into the canonical day (#21). */
-  mergePages(src: string, dst: string): Promise<void>;
+  mergePages(src: string, dst: string, rename?: { from: string; to: string }): Promise<void>;
   /** Move a stray file (graph-root-relative path) to a uniquely-named page so it
    *  stops colliding and becomes normally navigable (#21). */
   renameFileToPage(path: string, newName: string): Promise<void>;
   /** Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
    *  user to review + merge instead of them showing as garbage pages. */
   listSyncConflicts(): Promise<SyncConflict[]>;
+  /** Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+   *  (git/Fossil): readable, but quarantined from saves. */
+  listVcsMarkerConflicts(): Promise<VcsMarkerConflict[]>;
   /** Block-level diff of a conflict copy against its winner (graph-root-relative
    *  paths). Read-only; null if a path is invalid or the file is gone. */
   syncConflictDiff(winner: string, conflict: string): Promise<SyncConflictDiff | null>;
+  /** Path-free block-level 2-way diff of two raw page texts (Concord P3 seam —
+   *  no graph or path coupling; future in-page conflict UI builds on it). */
+  textBlockDiff(mine: string, theirs: string, format?: "md" | "org"): Promise<SyncConflictDiff>;
+  /** Path-free 3-way variant: rows are classified against `base` and carry
+   *  pre-selectable suggestions (ADR 0056). */
+  textBlockDiff3(
+    base: string,
+    mine: string,
+    theirs: string,
+    format?: "md" | "org"
+  ): Promise<SyncConflictDiff>;
+  liveSaveConflictDiff(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+  ): Promise<SyncConflictDiff>;
+  captureLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+  ): Promise<LiveSaveConflictCapture>;
+  durableLiveSaveConflictDiff(page: PageDto, baseText: string | null): Promise<SyncConflictDiff>;
+  resolveDurableLiveSaveConflict(
+    page: PageDto,
+    expectedDiskRev: string,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
+  resolveLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
+  /** The Concord conflict queue (L3): one derived inventory of every page that
+   *  needs the user's judgement, from BOTH artifact sources (conflict copies and
+   *  VCS-marker pages). Derived from disk on every call — nothing is stored, so
+   *  it survives a restart by being recomputed. */
+  conflictQueue(): Promise<ConflictObject[]>;
+  /** A marker-bearing page's own conflict: its `<<<<<<<` sections parsed into
+   *  complete page texts and run through the same block diff (Concord L5).
+   *  Read-only; null when the page has no (parseable) markers. */
+  vcsMarkerConflictDiff(path: string): Promise<MarkerConflictDiff | null>;
+  /** Apply per-row decisions to a marker-bearing page and write the CLEAN merged
+   *  result — the one write Tine ever makes to such a file, and only as the
+   *  direct result of this confirmation. `baseRev` guards against the VCS moving
+   *  the file under the review (throws "conflict" if it did). */
+  resolveVcsMarkerConflict(
+    path: string,
+    decisions: Record<string, MergeDecision>,
+    baseRev: string,
+    preChoice?: "mine" | "theirs" | "union"
+  ): Promise<void>;
   /** Merge a conflict copy into its winner per the user's per-row decisions
    *  (row id → mine/theirs/both), via the normal save path, then trash the copy.
    *  `baseRev` guards against the winner changing under the merge (throws
@@ -438,7 +535,7 @@ export interface Backend {
     baseRev: string,
     conflictRev: string,
     preChoice?: "mine" | "theirs" | "union"
-  ): Promise<void>;
+  ): Promise<PageDto>;
   /** Discard a conflict copy without merging (move it to the recoverable trash). */
   trashSyncConflict(conflict: string): Promise<void>;
   /** Subscribe to the watcher's `conflicts-changed` event (a conflict copy
@@ -533,6 +630,9 @@ export interface Backend {
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
+  /** Subscribe to coalesced external bulk revisions (Concord P2): one event
+   *  per reconcile cycle that changed more than the bulk threshold of pages. */
+  onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
   /** Subscribe to an admitted aggregate managed-storage change. */
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
@@ -680,6 +780,14 @@ export interface GraphChange {
   removed: boolean;
 }
 
+/** One aggregate watcher notification for an external bulk revision (a VCS
+ *  checkout, branch switch, or big sync): emitted instead of N `graph-changed`
+ *  events when one reconcile cycle changed more than the backend's bulk
+ *  threshold of pages. Carries the same per-page change shape. */
+export interface GraphChangedBulk {
+  changes: GraphChange[];
+}
+
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -755,12 +863,12 @@ class TauriBackend implements Backend {
   openGraphWindow(path: string) {
     return this.call<LoadGraphResult>("open_graph_window", { path });
   }
-  startupGraphPath(attempt: number) {
-    return this.call<string | null>("startup_graph_path", { attempt });
+  startupGraphPath() {
+    return this.call<string | null>("startup_graph_path");
   }
-  async onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void> {
+  async onStorageTransition(cb: (progress: StorageTransitionEvent) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
-    return listen<StartupProgressEvent>("startup-progress", (event) => cb(event.payload));
+    return listen<StorageTransitionEvent>("storage-transition", (event) => cb(event.payload));
   }
   captureTarget() {
     return this.call<string>("capture_target");
@@ -872,6 +980,35 @@ class TauriBackend implements Backend {
       })
     );
   }
+  moveManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ) {
+    return this.call<ManagedApplicationMoveSubtreesResult>("move_managed_application_subtrees", {
+      bindingGeneration,
+      request,
+    });
+  }
+  recoverManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ) {
+    return this.call<ManagedApplicationMoveSubtreesRecoveryResult>(
+      "recover_managed_application_subtrees",
+      { bindingGeneration, request },
+    );
+  }
+  preflightManagedPageMutation(
+    page: PageDto,
+    baseRevision: string | null,
+    bindingGeneration: number,
+  ) {
+    return this.call<ManagedPageMutationPreflightResult>("preflight_managed_page_mutation", {
+      page,
+      baseRevision,
+      bindingGeneration,
+    });
+  }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");
   }
@@ -906,8 +1043,8 @@ class TauriBackend implements Backend {
     this.bindingGeneration = result.binding_generation;
     return result;
   }
-  async cancelSparseV2Cold(path: string, attempt: number) {
-    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path, attempt });
+  async cancelSparseV2Cold(path: string) {
+    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path });
     this.bindingGeneration = result.binding_generation;
     return result;
   }
@@ -920,6 +1057,14 @@ class TauriBackend implements Backend {
     const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
     this.bindingGeneration = result.binding_generation;
     return result;
+  }
+  async adoptSparseV2Shared() {
+    const result = await this.call<SparseV2AdoptionResult>("adopt_sparse_v2_shared");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  sparseV2RecoveryLocation() {
+    return this.call<string>("sparse_v2_recovery_location");
   }
   sparseV2Query(request: SparseV2QueryRequest) {
     return this.call<SparseV2QueryReply>("sparse_v2_query", { request });
@@ -1122,6 +1267,19 @@ class TauriBackend implements Backend {
   listJournalConflicts() {
     return this.call<JournalConflict[]>("list_journal_conflicts");
   }
+  rescanGraphNow() {
+    return this.call<number>("rescan_graph_now");
+  }
+  async onGraphRescanComplete(cb: (sequence: number) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<{ sequence: number }>("graph-rescan-complete", (event) => cb(event.payload.sequence));
+  }
+  listJournalFilenameMigrations() {
+    return this.call<JournalFilenameMigration[]>("list_journal_filename_migrations");
+  }
+  applyJournalFilenameMigrations() {
+    return this.call<number>("apply_journal_filename_migrations");
+  }
   trashJournalFile(name: string) {
     return this.call<void>("trash_journal_file", { name });
   }
@@ -1161,8 +1319,13 @@ class TauriBackend implements Backend {
       conflictEpoch,
     });
   }
-  mergePages(src: string, dst: string) {
-    return this.call<void>("merge_pages", { src, dst });
+  mergePages(src: string, dst: string, rename?: { from: string; to: string }) {
+    return this.call<void>("merge_pages", {
+      src,
+      dst,
+      renameFrom: rename?.from ?? null,
+      renameTo: rename?.to ?? null,
+    });
   }
   renameFileToPage(path: string, newName: string) {
     return this.call<void>("rename_file_to_page", { path, newName });
@@ -1170,8 +1333,81 @@ class TauriBackend implements Backend {
   listSyncConflicts() {
     return this.call<SyncConflict[]>("list_sync_conflicts");
   }
+  listVcsMarkerConflicts() {
+    return this.call<VcsMarkerConflict[]>("list_vcs_marker_conflicts");
+  }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });
+  }
+  conflictQueue() {
+    return this.call<ConflictObject[]>("conflict_queue");
+  }
+  vcsMarkerConflictDiff(path: string) {
+    return this.call<MarkerConflictDiff | null>("vcs_marker_conflict_diff", { path });
+  }
+  resolveVcsMarkerConflict(
+    path: string,
+    decisions: Record<string, MergeDecision>,
+    baseRev: string,
+    preChoice?: "mine" | "theirs" | "union"
+  ) {
+    return this.call<void>("resolve_vcs_marker_conflict", {
+      path,
+      decisions,
+      baseRev,
+      preChoice: preChoice ?? "union",
+    });
+  }
+  textBlockDiff(mine: string, theirs: string, format?: "md" | "org") {
+    return this.call<SyncConflictDiff>("text_block_diff", { mine, theirs, format });
+  }
+  textBlockDiff3(base: string, mine: string, theirs: string, format?: "md" | "org") {
+    return this.call<SyncConflictDiff>("text_block_diff3", { base, mine, theirs, format });
+  }
+  liveSaveConflictDiff(page: PageDto, baseRev: string | null, conflictEpoch: number) {
+    return this.call<SyncConflictDiff>("live_save_conflict_diff", {
+      page,
+      baseRev,
+      conflictEpoch,
+    });
+  }
+  captureLiveSaveConflict(page: PageDto, baseRev: string | null, conflictEpoch: number) {
+    return this.call<LiveSaveConflictCapture>("capture_live_save_conflict", {
+      page,
+      baseRev,
+      conflictEpoch,
+    });
+  }
+  durableLiveSaveConflictDiff(page: PageDto, baseText: string | null) {
+    return this.call<SyncConflictDiff>("durable_live_save_conflict_diff", { page, baseText });
+  }
+  resolveDurableLiveSaveConflict(
+    page: PageDto,
+    expectedDiskRev: string,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    return this.call<PageDto>("resolve_durable_live_save_conflict", {
+      page,
+      expectedDiskRev,
+      decisions,
+      preChoice,
+    });
+  }
+  resolveLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    return this.call<PageDto>("resolve_live_save_conflict", {
+      page,
+      baseRev,
+      conflictEpoch,
+      decisions,
+      preChoice,
+    });
   }
   resolveSyncConflict(
     winner: string,
@@ -1181,7 +1417,7 @@ class TauriBackend implements Backend {
     conflictRev: string,
     preChoice?: "mine" | "theirs" | "union"
   ) {
-    return this.call<void>("resolve_sync_conflict", {
+    return this.call<PageDto>("resolve_sync_conflict", {
       winner,
       conflict,
       decisions,
@@ -1304,6 +1540,10 @@ class TauriBackend implements Backend {
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+  }
+  async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
   async onSparseV2Changed(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
@@ -1428,6 +1668,11 @@ export function backend(): Backend {
     _backend = isTauri() ? new TauriBackend() : mockBackend();
   }
   return _backend;
+}
+
+/** Test-only backend injection for delayed/rejected native-boundary proofs. */
+export function __setBackendForTest(value: Backend | null): void {
+  if (import.meta.env.MODE === "test") _backend = value;
 }
 
 /** OG-visible graph property keys/values for the block editor. Kept separate

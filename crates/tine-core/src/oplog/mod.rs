@@ -1,103 +1,70 @@
-//! Candidate primitives and fenced storage substrate for Tine's sparse-first
-//! operation log.
+//! Production storage substrate for Tine's opt-in managed-storage runtime.
 //!
-//! The batch and object bytes enforce a deterministic candidate encoding, but
-//! that encoding is not frozen until the later receipt and engine work lands.
-//! Nothing here is wired to graph startup, enrollment, or mutation paths; the
-//! store persists only when explicitly opened on a caller-supplied root.
+//! Enrollment, activation, mutation, projection, reconciliation, SQLite
+//! materialization, and shared-provider synchronization are composed by
+//! `crate::sync_runtime`. Direct Files does not enter this module tree: the
+//! application selects that mutually exclusive runtime before opening a graph.
+//! Immutable operation/object bytes are authoritative; SQLite, scratch, and
+//! projection-work state are disposable derived data.
 
-pub(crate) mod authenticated_patricia;
 pub mod batch;
-// P2N4 bootstrap import evidence is a pure, inactive identity/validation
-// boundary.  Import execution and acceptance remain deliberately unwired.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
+pub(crate) mod content_patricia;
 pub(crate) mod dependency_queue;
-// P2.N11 discovery remains read-only and is consumed only by the explicit,
-// inactive `sync_runtime` host.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and diagnostic surface
 pub(crate) mod discovery;
 pub(crate) mod document_state;
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained compatibility surface
 pub(crate) mod enrollment;
 // The only keyed enrollment compatibility code.  Current enrollment state is
 // integrity-checked, while immutable v1/v5 history remains verifiable.
 pub(crate) mod enrollment_legacy_hmac;
 pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
 pub(crate) mod evidence_index;
-#[allow(dead_code)]
-pub(crate) mod exact_external_feed;
 pub(crate) mod external_import;
 pub mod hot_engine;
 #[cfg(test)]
 mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
-// P2N7 composes the single VerifiedLocal -> LocalActive runtime boundary. It
-// is deliberately not reachable from startup, Tauri, or a watcher yet.
-#[allow(dead_code)]
+#[cfg(test)]
+mod import_integration_tests;
+pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
-#[allow(dead_code)] // routed by the later sync-runtime lane
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
-// Schema-2 authority is deliberately inert until the managed-runtime rollover
-// packet wires this codec and selector into startup and mutation.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
-#[allow(dead_code)]
-pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
-#[allow(dead_code)]
-pub(crate) mod shadow_projection;
-#[allow(dead_code)] // routed by the later sync-runtime lane
-pub(crate) mod trusted_local_commit;
-// P2N2 I1-I3 deliberately expose a foundation seam without activating it.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test-construction surface
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
 pub mod projection;
+#[cfg(test)]
+mod projection_integration_tests;
 pub mod projection_manifest;
 pub mod projection_store;
-pub mod projection_work_index;
+pub mod projection_work;
 pub mod receipt;
-// P2N4I installs a device-local disposable substrate without activating scans.
-#[allow(dead_code)]
-pub(crate) mod reconciliation_baseline;
-// P2N4K persists stable-scan evidence into the disposable baseline without
-// activating scanning, scheduling, importing, or session execution.
-#[allow(dead_code)]
-pub(crate) mod reconciliation_baseline_adapter;
-// P2N4J bridges stable discovery evidence to the existing point-revalidated
-// coordinator without activating a scanner or scheduler.
-#[allow(dead_code)]
-pub(crate) mod reconciliation_import;
-// P2N4I keeps the scheduler/scan boundary crate-private and inactive.
-#[allow(dead_code)]
-pub(crate) mod reconciliation_scan;
-// P2N4K composes one inactive endpoint scheduler with the existing scan and
-// coordinator paths. It deliberately adds no lifecycle or persistence owner.
-#[allow(dead_code)]
-pub(crate) mod reconciliation_session;
 pub mod reference_catalog;
-// P2N9 owns the runtime resume-point format, its publication, and the retained
-// scratch-run reclamation it authorizes. It is deliberately inert: nothing in
-// startup, enrollment, the coordinator, or Tauri reads or publishes a resume
-// point yet, and an RRP never authorizes a write, frontier, or projection.
-#[allow(dead_code)]
+pub mod refusal;
+#[allow(dead_code)] // retained recovery format plus test construction surface
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
-pub mod simulator;
 pub mod sqlite;
+mod sqlite_identity;
 pub mod sqlite_materialization;
+pub mod sync_layout;
+pub mod text_merge;
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
+pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
-// P2N9 W5a owns the graph-text watcher event queue inside the core so its drain
-// becomes provable. It is deliberately not wired to LocalActive, enrollment,
-// startup, or Tauri: this packet only builds the primitive and its proof.
-#[allow(dead_code)]
-pub(crate) mod watcher_queue;
+pub(crate) mod wire;
 
 /// Diagnostic trace gates, resolved once per process.
 ///
@@ -131,23 +98,24 @@ pub use batch::{
     OPLOG_PROTOCOL_VERSION,
 };
 pub(crate) use hot_engine::{
-    append_managed_local_record, ManagedLocalAppendError, ManagedLocalAppendProof,
+    append_managed_local_record, CleanTombstoneAuthorization, CleanTombstoneDeferral,
+    CleanTombstoneSupersession, ManagedLocalAppendError, ManagedLocalAppendProof,
     ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
 };
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
-    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
-    CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
-    EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
-    ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,
-    LogseqUuidClaim, LogseqUuidResolution, ManagedLocalApplyOutcome,
-    ManagedLocalJournalPayloadKind, ManagedLocalPrefixState, ManagedLocalProjection,
-    ManagedLocalRecord, ManagedLocalRecordError, ManagedLocalWork, MaterializationStats,
-    MaterializedBlock, MaterializedPage, OperationTransaction, PagePreambleRewrite, PageRename,
-    PortablePathConflict, PortablePathConflictParticipant, PreparedManagedLocalRecord,
-    ProjectionEndpointBinding, ProjectionPageState, ProjectionRequirement,
-    ProjectionRequirementState, ProjectionWriteAuthorization, SemanticOperation, ShardedHotEngine,
-    StageOutcome, WorkspaceStatus,
+    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation, BlockRestore,
+    CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, ConflictPair,
+    ConflictResolutionIntent, CurrentPageAtPath, EngineError, EngineInstrumentation, EngineStatus,
+    FatalEvidenceHandle, ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence,
+    LogseqIdentityMutation, LogseqIdentityTrigger, LogseqUuidClaim, LogseqUuidResolution,
+    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalPrefixState,
+    ManagedLocalProjection, ManagedLocalRecord, ManagedLocalRecordError, ManagedLocalWork,
+    MaterializationStats, MaterializedBlock, MaterializedPage, OperationTransaction,
+    PagePreambleRewrite, PageRename, PortablePathConflict, PortablePathConflictParticipant,
+    PreparedManagedLocalRecord, ProjectionEndpointBinding, ProjectionPageState,
+    ProjectionRequirement, ProjectionRequirementState, ProjectionWriteAuthorization,
+    SemanticOperation, ShardedHotEngine, StageOutcome, WorkspaceStatus,
 };
 #[cfg(test)]
 pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
@@ -157,13 +125,12 @@ pub use identity::{
     SessionId, WorkspaceId,
 };
 pub use import::{
-    classify_conflict_copy, inventory_affected, inventory_initial_shadow, plan_affected_import,
-    BlockImportMatch, BlockMatchBasis, ConflictClassificationError, ConflictCopyClass, ExactBytes,
-    ImportBlock, ImportBlockReason, ImportInstrumentation, ImportMatches, ImportPlan,
-    ImportPlanStatus, InventoryError, PageImportMatch, PageMatchBasis, RawInventory,
-    RawObservation, RejectedRawId, RejectedRawIdReason, MAX_IMPORT_CATALOG_ENTRIES,
-    MAX_IMPORT_DEPTH, MAX_IMPORT_FILES, MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES,
-    MAX_IMPORT_RAW_BYTES,
+    classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlockImportMatch,
+    BlockMatchBasis, ConflictClassificationError, ConflictCopyClass, ExactBytes, ImportBlock,
+    ImportBlockReason, ImportInstrumentation, ImportMatches, ImportPlan, ImportPlanStatus,
+    InventoryError, PageImportMatch, PageMatchBasis, RawInventory, RawObservation, RejectedRawId,
+    RejectedRawIdReason, MAX_IMPORT_CATALOG_ENTRIES, MAX_IMPORT_DEPTH, MAX_IMPORT_FILES,
+    MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES, MAX_IMPORT_RAW_BYTES,
 };
 pub(crate) use local_journal_v2_anchor::{
     classify_managed_local_anchor, managed_local_v2_anchor_name,
@@ -183,9 +150,9 @@ pub use portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 pub use projection::{
-    derive_receiver_local_projection, execute_manifested_projection_work, plan_projection,
-    recover_incomplete_projections, write_projection_exact, PolicyGeneratedAnchor, ProjectionError,
-    ProjectionPlan, ProjectionWrite,
+    derive_receiver_local_projection, plan_projection, recover_incomplete_projections,
+    write_projection_exact, PolicyGeneratedAnchor, ProjectionError, ProjectionPlan,
+    ProjectionWrite,
 };
 pub use projection_manifest::{
     annotated_base_document_id, projection_intent_document_id, AnnotatedProjectionBase,
@@ -198,15 +165,8 @@ pub use projection_store::{
     LocalProjectionEvidenceRecord, ProjectionAttemptReservation, ProjectionReceiptStore,
     ProjectionStoreError,
 };
-pub(crate) use projection_work_index::{
-    ProjectionCompletedReceipt, ProjectionDirectCompletionAuthority, ProjectionWorkBlockAuthority,
-    ProjectionWorkCompletionAuthority,
-};
-pub use projection_work_index::{
-    ProjectionPendingActivation, ProjectionPendingCursor, ProjectionPendingPage, ProjectionWork,
-    ProjectionWorkCursor, ProjectionWorkError, ProjectionWorkId, ProjectionWorkIndex,
-    ProjectionWorkIndexStats, ProjectionWorkPage, ProjectionWorkStatus, ProjectionWorkTarget,
-};
+pub(crate) use projection_work::ProjectionCompletedReceipt;
+pub use projection_work::{ProjectionWork, ProjectionWorkId, ProjectionWorkTarget};
 pub(crate) use receipt::managed_component_is_portable;
 pub use receipt::{
     AnnotatedIdentity, BaseBlob, BlobDescription, CrdtPeerCounter, DocumentCausalDigest,
@@ -220,27 +180,18 @@ pub use receipt::{
 };
 pub use reference_catalog::{
     BlockReferenceFactV1, BlockReferenceKindV1, PageNameReferenceFactV1, PageReferenceKindV1,
-    ReferenceCatalogDeltaV2, ReferenceCatalogError, ReferenceCatalogPolicyV1,
-    ReferenceCatalogRootV2, ReferenceFactV1, ReferenceSourceLocatorV1, ReferenceSourcePostingV2,
-    MAX_REFERENCE_CATALOG_DELTA_BYTES, MAX_REFERENCE_CATALOG_DELTA_SOURCES,
-    REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
-    REFERENCE_CATALOG_ROOT_SCHEMA_VERSION, REFERENCE_CATALOG_SCHEMA_VERSION,
+    ReferenceCatalogError, ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1,
+    ReferenceSourcePostingV2, REFERENCE_CATALOG_EXTRACTOR_VERSION,
+    REFERENCE_CATALOG_POLICY_VERSION, REFERENCE_CATALOG_SCHEMA_VERSION,
 };
+pub use refusal::ManagedStorageRefusalScenario;
+pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
     BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
     LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageNameKeyDigest,
     PagePreambleDelta, PagePreambleState, PageState, PolicyGeneratedAnchorReason, SemanticEffect,
     SemanticError, VisibleMembership, CATALOG_PAGE_STATE_SCHEMA_VERSION,
     MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
-};
-pub use simulator::{
-    CoordinatorAction, CoordinatorDurableBoundary, CoordinatorExpectedState,
-    CoordinatorFailureWitness, CoordinatorFault, CoordinatorHandoffState, CoordinatorObservation,
-    CoordinatorOracle, CoordinatorOracleIdentity, CoordinatorReadGate, CoordinatorRunOutcome,
-    CoordinatorSqliteMutation, DeterministicSimulator, FailureCapsule, FailureIdentity,
-    FrozenCandidateId, InvariantFailureKind, MinimizedScenario, Scenario, ScenarioAction,
-    ScenarioDevice, ScenarioError, SimulatorDeviceState, FAILURE_CAPSULE_SCHEMA_VERSION,
-    SCENARIO_SCHEMA_VERSION,
 };
 pub use sqlite::{
     AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence,
@@ -262,3 +213,4 @@ pub use sqlite_materialization::{
     MAX_MATERIALIZATION_PREAMBLE_BYTES, MAX_MATERIALIZATION_QUERY_BYTES,
     MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
 };
+pub use wire::SHARED_PROVIDER_TREE_NAMESPACES;

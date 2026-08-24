@@ -1,11 +1,28 @@
 import { describe, expect, it, vi } from "vitest";
 import { createManagedStorageRuntimeBridge, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import type {
+  ManagedApplicationMoveSubtreesRecoveryResult,
   SparseV2RuntimeStatus,
   SparseV2RuntimeStatusEvent,
   SparseV2Status,
   SparseV2Tick,
 } from "./types";
+
+function recovery(
+  previousBinding: number,
+  binding: number,
+  episodeId = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1",
+): ManagedApplicationMoveSubtreesRecoveryResult {
+  const status = active(binding);
+  return {
+    previous_binding_generation: previousBinding,
+    binding_generation: binding,
+    status,
+    application_page_admission: status.application_page_admission,
+    episode_id: episodeId,
+    outcome: { status: "no_commit", episode_id: episodeId, reason: "episode_not_committed" },
+  };
+}
 
 function runtime(lastTick: SparseV2Tick | null = null): SparseV2RuntimeStatus {
   return {
@@ -26,6 +43,7 @@ function runtime(lastTick: SparseV2Tick | null = null): SparseV2RuntimeStatus {
     shared_role: null,
     shared_phase: null,
     provider_pending: 0,
+    provider_runnable: false,
   };
 }
 
@@ -105,6 +123,129 @@ describe("managed-storage runtime event bridge", () => {
     for (const dispose of unlisten) expect(dispose).toHaveBeenCalledOnce();
   });
 
+  it("reports one repeating reconciliation failure once, and again only after real recovery", () => {
+    // The device receipt: managed storage enabled, then an unbounded stream of
+    // IDENTICAL red toasts for ONE condition. The native watcher suppresses a
+    // repeated error only until some other tick intervenes, and the retry cycle
+    // supplies one every time — so the surface, not the actor, is what has to
+    // stay calm (GH: Android, 2026-08-18).
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn(),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+    bridge.bind(3);
+    const message = 'Failed("clean external reconciliation failed during Planning: decoded '
+      + 'destination logical page name X is already owned by page 00000000-0000-0000-0000-000000000001")';
+    const notices: number[] = [];
+    const observe = () => {
+      const notice = bridge.snapshot().notice;
+      if (notice && notices.at(-1) !== notice.sequence) notices.push(notice.sequence);
+    };
+
+    // Six identical retry cycles: error, in-flight recovery step, failure tick.
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      bridge.receiveError({ binding_generation: 3, message });
+      observe();
+      bridge.receiveTick({ binding_generation: 3, tick: { state: "recovering", detail: null, epoch: null } });
+      // An in-flight retry step is not recovery. Treating it as one is what
+      // re-armed both the native repeat-suppression and this store, so the very
+      // next identical error read as news.
+      expect(bridge.snapshot().error).toBe(message);
+      observe();
+      bridge.receiveTick({ binding_generation: 3, tick: { state: "failed", detail: message, epoch: null } });
+      observe();
+    }
+    expect(notices).toEqual([1]);
+    expect(bridge.snapshot().error).toBe(message);
+
+    // A genuinely healthy tick is the recovery signal; the panel and the toast
+    // both clear, so a later recurrence is news again.
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "admitted_noop", detail: null, epoch: 9 } });
+    expect(bridge.snapshot().error).toBeNull();
+    expect(bridge.snapshot().notice).toBeNull();
+    bridge.receiveError({ binding_generation: 3, message });
+    observe();
+    expect(notices).toEqual([1, 2]);
+
+    // A DIFFERENT condition is always its own report.
+    bridge.receiveError({ binding_generation: 3, message: 'Blocked("something else")' });
+    observe();
+    expect(notices).toEqual([1, 2, 3]);
+  });
+
+  const silentBridge = () =>
+    createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn(),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+  it("keeps one notice object while a condition is still the same report", () => {
+    // The sequence is the dedupe, but the consumer subscribes to the notice by
+    // REFERENCE. Minting an equal-but-new object per repeat re-armed the very
+    // toast the sequence exists to suppress.
+    const bridge = silentBridge();
+    bridge.bind(3);
+    const message = 'Failed("clean external reconciliation failed")';
+    bridge.receiveError({ binding_generation: 3, message });
+    const first = bridge.snapshot().notice;
+    expect(first).toMatchObject({ message, sequence: 1 });
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "recovering", detail: null, epoch: null } });
+    bridge.receiveError({ binding_generation: 3, message });
+    expect(bridge.snapshot().notice).toBe(first);
+  });
+
+  it("never reports the retired-actor window an enrollment cut opens on purpose", () => {
+    // A successful share/join cut STOPS the actor that committed it
+    // (`observe_retired_actor`), so the watcher lane reports a runtime failure
+    // for the seconds before the command republishes a reopened actor. That
+    // window is expected and self-resolving; a red toast followed by a green
+    // one is worse than silence.
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: "sync actor is unavailable" });
+    expect(bridge.snapshot().notice).toBeNull();
+    // The panel still knows, so the condition is not hidden from the user who
+    // goes looking for it.
+    expect(bridge.snapshot().error).toBe("sync actor is unavailable");
+    bridge.receiveError({ binding_generation: 3, message: "Blocked(\"provider scan\")" });
+    expect(bridge.snapshot().notice).toBeNull();
+
+    // The command finishes by publishing its reopened runtime.
+    expect(bridge.acceptNativeTransition(active(4))).toBe(true);
+    bridge.endTransition();
+    expect(bridge.snapshot().notice).toBeNull();
+    expect(bridge.snapshot().error).toBeNull();
+  });
+
+  it("reports a failure that outlives the transition exactly once", () => {
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: 'Terminal("projection repair failed")' });
+    expect(bridge.snapshot().notice).toBeNull();
+    bridge.endTransition();
+    const notice = bridge.snapshot().notice;
+    expect(notice).toMatchObject({ message: 'Terminal("projection repair failed")', sequence: 1 });
+    bridge.receiveError({ binding_generation: 3, message: 'Terminal("projection repair failed")' });
+    expect(bridge.snapshot().notice).toBe(notice);
+  });
+
+  it("drops a held report the runtime resolved on its own before the transition ended", () => {
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: "sync actor is unavailable" });
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "idle", detail: null, epoch: 7 } });
+    bridge.endTransition();
+    expect(bridge.snapshot().notice).toBeNull();
+    expect(bridge.snapshot().error).toBeNull();
+  });
+
   it("drops events and late status reads from a graph binding that has been replaced", async () => {
     let resolveStatus: ((status: SparseV2Status) => void) | undefined;
     const bridge = createManagedStorageRuntimeBridge({
@@ -130,7 +271,7 @@ describe("managed-storage runtime event bridge", () => {
     expect(bridge.snapshot().error).toBe("current graph failure");
   });
 
-  it("installs the load-route authority atomically and cannot let an old managed transition replace Direct", () => {
+  it("reacts to the native terminal transition without a second frontend generation veto", () => {
     const bridge = createManagedStorageRuntimeBridge({
       sparseV2Status: vi.fn().mockResolvedValue(active(31)),
       onSparseV2Status: async () => () => {},
@@ -150,10 +291,10 @@ describe("managed-storage runtime event bridge", () => {
       authority: "direct",
     });
     expect(bridge.receiveStatus(active(31))).toBe(false);
-    expect(bridge.transitionTo(active(31), 31)).toBe(false);
-    expect(bridge.snapshot().applicationPageAdmission).toEqual({
-      binding_generation: 32,
-      authority: "direct",
+    expect(bridge.acceptNativeTransition(active(33))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({
+      binding_generation: 33,
+      authority: "managed_writable",
     });
   });
 
@@ -196,5 +337,85 @@ describe("managed-storage runtime event bridge", () => {
     bridge.bind(63, active(63).application_page_admission);
     expect(bridge.receiveRuntimeStatus(runtimeEvent(61, "active"))).toBe(false);
     expect(bridge.snapshot().applicationPageAdmission).toEqual(active(63).application_page_admission);
+  });
+
+  it("accepts a recovery handoff only behind the live episode and page-instance owner", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(71)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+    const episode = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1";
+    bridge.bind(71, active(71).application_page_admission);
+
+    expect(bridge.transitionMoveRecovery(recovery(71, 72, episode), episode, 71, () => false)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(71);
+
+    const mismatchedAdmission = recovery(71, 72, episode);
+    mismatchedAdmission.application_page_admission = {
+      binding_generation: 72,
+      authority: "managed_unavailable",
+    };
+    expect(bridge.transitionMoveRecovery(mismatchedAdmission, episode, 71, () => true)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(71);
+
+    const handoff = recovery(71, 72, episode);
+    expect(bridge.transitionMoveRecovery(handoff, episode, 71, () => true)).toBe(true);
+    expect(bridge.snapshot().bindingGeneration).toBe(72);
+    expect(bridge.receiveRuntimeStatus(runtimeEvent(71, "active"))).toBe(false);
+    expect(bridge.transitionMoveRecovery(handoff, episode, 71, () => true)).toBe(false);
+
+    bridge.bind(73, active(73).application_page_admission);
+    expect(bridge.transitionMoveRecovery(recovery(72, 74, episode), episode, 72, () => true)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(73);
+  });
+  it("revokes a writable admission when the actor reports an error, and restores it only from a status", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(61)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+    bridge.bind(61);
+    expect(bridge.receiveStatus(active(61))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_writable" });
+
+    // The native watcher suppresses a REPEATED error, so a persistently failing
+    // actor may send nothing else at all after this one (GH #324).
+    expect(bridge.receiveError({ binding_generation: 61, message: "actor tick failed" })).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 61,
+      authority: "managed_unavailable",
+    });
+    expect(bridge.snapshot().status?.application_page_admission).toEqual({
+      binding_generation: 61,
+      authority: "managed_unavailable",
+    });
+
+    // A tick alone is not evidence of a writer; only an authoritative status is.
+    expect(bridge.receiveTick({ binding_generation: 61, tick: { state: "idle", detail: null, epoch: null } })).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_unavailable" });
+
+    expect(bridge.receiveStatus(active(61))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_writable" });
+  });
+
+  it("leaves a Direct admission alone when a managed error arrives", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(62)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+    bridge.bind(62, { binding_generation: 62, authority: "direct" });
+    expect(bridge.receiveError({ binding_generation: 62, message: "actor tick failed" })).toBe(true);
+
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 62,
+      authority: "direct",
+    });
   });
 });

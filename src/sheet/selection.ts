@@ -1,5 +1,15 @@
 import { createRoot, createSignal } from "solid-js";
-import { doc, clearSelection, selectBlock, prevVisible, nextVisible, blockIsGridView, withUndoUnit, blockPageReadOnly, formatForBlock } from "../store";
+import {
+  doc,
+  clearSelection,
+  selectBlock,
+  prevVisible,
+  nextVisible,
+  blockIsGridView,
+  blockPageReadOnly,
+  formatForBlock,
+  type PageMutationAuthority,
+} from "../store";
 import { endEdit, startEditing } from "../editorController";
 import { isSheetCellHidden, splitProps } from "../editor/properties";
 import {
@@ -19,8 +29,7 @@ import {
   deleteRow,
   deleteRows,
   fillSheetSelection,
-  insertColumn,
-  insertRow,
+  insertSheetSeam,
   materializeCell,
   moveSheetSelection,
   pasteTextIntoSheetSelection,
@@ -136,9 +145,21 @@ const [emptyTagColumns, writeEmptyTagColumns] = createRoot(() =>
   createSignal<ReadonlyMap<string, ReadonlySet<string>>>(new Map())
 );
 const lastByGrid = new Map<string, { row: number; col: number }>();
-const adapters = new Map<string, SheetViewAdapter>();
+interface MountedSheetAdapter {
+  adapter: SheetViewAdapter;
+  token: number;
+}
+
+const adapters = new Map<string, MountedSheetAdapter>();
 const visibilityHooks = new Map<string, (sel: SheetSel) => void>();
 const instanceKey = (gridId: string, surfaceId?: string) => `${surfaceId ?? ""}\0${gridId}`;
+let sheetSelectionGeneration = 0;
+let mountedSheetTokenClock = 0;
+
+function publishCellSelection(selection: SheetSel | null): void {
+  sheetSelectionGeneration++;
+  writeCellSel(selection);
+}
 
 let hooks: CellSelectionHooks = {
   clearOutlineSelection: clearSelection,
@@ -160,9 +181,13 @@ export function installCellSelectionHooks(next: Partial<CellSelectionHooks>): ()
 
 export function registerSheetViewAdapter(gridId: string, adapter: SheetViewAdapter, surfaceId?: string): () => void {
   const key = instanceKey(gridId, surfaceId);
-  adapters.set(key, adapter);
+  const mounted = { adapter, token: ++mountedSheetTokenClock };
+  adapters.set(key, mounted);
   return () => {
-    if (adapters.get(key) === adapter) adapters.delete(key);
+    if (adapters.get(key) === mounted) {
+      adapters.delete(key);
+      mountedSheetTokenClock++;
+    }
   };
 }
 
@@ -176,16 +201,64 @@ export function registerSheetVisibilityHook(gridId: string, hook: (sel: SheetSel
 
 function adapterFor(gridId: string, surfaceId?: string): SheetViewAdapter | null {
   const exact = adapters.get(instanceKey(gridId, surfaceId)) ?? adapters.get(instanceKey(gridId));
-  if (exact) return exact;
+  if (exact) return exact.adapter;
   if (surfaceId === undefined) {
     const matches = [...adapters].filter(([key]) => key.endsWith(`\0${gridId}`));
-    if (matches.length === 1) return matches[0][1];
+    if (matches.length === 1) return matches[0][1].adapter;
   }
   return null;
 }
 
+function sheetSelectionSnapshot(selection: SheetSel): string {
+  return JSON.stringify({
+    ...selection,
+    surfaceId: selection.surfaceId ?? null,
+    rowId: "rowId" in selection ? selection.rowId ?? null : null,
+    columnId: "columnId" in selection ? selection.columnId ?? null : null,
+    anchorRowId: "anchorRowId" in selection ? selection.anchorRowId ?? null : null,
+    focusRowId: "focusRowId" in selection ? selection.focusRowId ?? null : null,
+    anchorColumnId: "anchorColumnId" in selection ? selection.anchorColumnId ?? null : null,
+    focusColumnId: "focusColumnId" in selection ? selection.focusColumnId ?? null : null,
+  });
+}
+
+function sameSheetSelection(left: SheetSel | null, right: SheetSel | null): boolean {
+  if (!left || !right) return left === right;
+  return sheetSelectionSnapshot(left) === sheetSelectionSnapshot(right);
+}
+
+/** Capture the mounted surface targeted by one Sheet command separately from
+ * the live selection that owns its pending UI continuation. Synthetic edge
+ * seams are operation targets, not selections; an empty grid therefore records
+ * an explicit absent selection. A later selection publication or adapter
+ * unmount/remount invalidates the token even when coordinates look identical. */
+export function captureSheetMutationAuthority<T>(
+  target: SheetSel,
+  selection: SheetSel | null = target,
+): PageMutationAuthority<T> {
+  const generation = sheetSelectionGeneration;
+  const targetSnapshot = normalizeSel(target);
+  const selectionSnapshot = selection ? normalizeSel(selection) : null;
+  const key = instanceKey(targetSnapshot.gridId, targetSnapshot.surfaceId);
+  const mounted = adapters.get(key)
+    ?? (targetSnapshot.surfaceId === undefined ? adapters.get(instanceKey(targetSnapshot.gridId)) : undefined);
+  return Object.freeze({
+    token: Object.freeze({
+      selection_generation: generation,
+      selection_snapshot: selectionSnapshot ? sheetSelectionSnapshot(selectionSnapshot) : null,
+      grid_id: targetSnapshot.gridId,
+      surface_id: targetSnapshot.surfaceId ?? "",
+      mounted_surface_token: mounted?.token ?? null,
+    }),
+    isCurrent: () =>
+      sheetSelectionGeneration === generation
+      && sameSheetSelection(activeCellSel(), selectionSnapshot)
+      && (!mounted || adapters.get(key) === mounted),
+  });
+}
+
 function clearCellSelectionOnly(): void {
-  writeCellSel(null);
+  publishCellSelection(null);
 }
 
 export function resetCellSelectionForTests(): void {
@@ -330,10 +403,10 @@ export function setCellSel(sel: SheetSelInput | null): void {
     rememberSelection(normalized);
     hooks.clearOutlineSelection();
     hooks.endActiveEdit();
-    writeCellSel(normalized);
+    publishCellSelection(normalized);
     return;
   }
-  writeCellSel(null);
+  publishCellSelection(null);
 }
 
 /** Re-anchor one selected table cell after reactive sorting without ending its edit. */
@@ -347,7 +420,7 @@ export function rebaseSelectedCell(
   const sel = activeCellSel();
   if (sel?.kind !== "cell" || sel.gridId !== gridId || sel.surfaceId !== surfaceId || sel.rowId !== rowId ||
       (sel.row === point.row && sel.col === point.col)) return;
-  writeCellSel(withCellMeta(
+  publishCellSelection(withCellMeta(
     { ...sel, surfaceId: undefined, rowId: undefined, columnId: undefined, ...point },
     surfaceId,
     rowId,
@@ -370,7 +443,7 @@ export function rebaseSelectedRange(
       sel.anchorRowId !== anchorRowId || sel.focusRowId !== focusRowId ||
       (sel.anchor.row === anchor.row && sel.anchor.col === anchor.col &&
        sel.focus.row === focus.row && sel.focus.col === focus.col)) return;
-  writeCellSel(withCellMeta(withRangeRows({
+  publishCellSelection(withCellMeta(withRangeRows({
     ...sel,
     anchor,
     focus,
@@ -379,7 +452,7 @@ export function rebaseSelectedRange(
 
 export function clearSelectedSheetInstance(gridId: string, surfaceId?: string): void {
   const sel = activeCellSel();
-  if (sel?.gridId === gridId && sel.surfaceId === surfaceId) writeCellSel(null);
+  if (sel?.gridId === gridId && sel.surfaceId === surfaceId) publishCellSelection(null);
 }
 
 export function lastCellFor(gridId: string, surfaceId?: string): { row: number; col: number } | null {
@@ -432,9 +505,9 @@ export function cellForBlockId(blockId: string, preferredSurfaceId?: string): Ce
       preferredSurfaceId ?? inferUniqueMountedSurface(gridId)
     );
   }
-  for (const [key, adapter] of adapters) {
+  for (const [key, mounted] of adapters) {
     if (preferredSurfaceId !== undefined && !key.startsWith(`${preferredSurfaceId}\0`)) continue;
-    const cell = adapter.cellForBlock?.(blockId);
+    const cell = mounted.adapter.cellForBlock?.(blockId);
     if (cell) return cell;
   }
   return null;
@@ -839,12 +912,25 @@ function replaceThroughMountedEditor(sel: CellSelInput, text: string): void {
 function overtypeCell(sel: CellSel, text: string): boolean {
   const adapter = adapterFor(sel.gridId, sel.surfaceId);
   if (adapter?.overtype) return adapter.overtype(sel, text);
+  const beginEditing = () => {
+    // A managed preflight may settle after this mounted Sheet instance has
+    // gone away. Do not transfer its post-commit edit into another surface.
+    if (adapter && adapterFor(sel.gridId, sel.surfaceId) !== adapter) return;
+    if (!startCellEditing(sel, 0)) return;
+    replaceThroughMountedEditor(sel, text);
+  };
   if (!cellBlockId(sel)) {
-    const made = materializeCell(sel.gridId, sel.row, sel.col);
+    const made = materializeCell(
+      sel.gridId,
+      sel.row,
+      sel.col,
+      beginEditing,
+      captureSheetMutationAuthority(sel),
+    );
     if (!made) return true;
+    return true;
   }
-  if (!startCellEditing(sel, 0)) return true;
-  replaceThroughMountedEditor(sel, text);
+  beginEditing();
   return true;
 }
 
@@ -856,43 +942,54 @@ function pageForGrid(gridId: string): string | null {
   return doc.byId[gridId]?.page ?? null;
 }
 
-function seamInsertTarget(sel: RowSeamSel | ColSeamSel): CellSel | null {
+function seamInsertTarget(
+  sel: RowSeamSel | ColSeamSel,
+  afterApply?: (target: CellSel) => void,
+): CellSel | null {
   const page = pageForGrid(sel.gridId);
   if (!page) return null;
-  let target: CellSel | null = null;
-  withUndoUnit("sheet:seam-insert", [page], () => {
-    if (sel.kind === "row-seam") {
-      const rowId = insertRow(sel.gridId, sel.at);
-      if (!rowId) return;
-      const col = Math.max(0, sel.anchor.col);
-      if (!materializeCell(sel.gridId, sel.at, col)) return;
-      target = withCellMeta({ kind: "cell", gridId: sel.gridId, row: sel.at, col } as CellSel, sel.surfaceId);
-      return;
-    }
-    insertColumn(sel.gridId, sel.at);
-    const row = Math.max(0, sel.anchor.row);
-    if (!materializeCell(sel.gridId, row, sel.at)) return;
-    target = withCellMeta({ kind: "cell", gridId: sel.gridId, row, col: sel.at } as CellSel, sel.surfaceId);
-  });
-  return target;
+  const active = activeCellSel();
+  const point = insertSheetSeam(
+    sel.gridId,
+    sel.kind === "row-seam" ? "row" : "col",
+    sel.at,
+    sel.kind === "row-seam" ? sel.anchor.col : sel.anchor.row,
+    (applied) => afterApply?.(withCellMeta({
+      kind: "cell",
+      gridId: sel.gridId,
+      row: applied.row,
+      col: applied.col,
+    } as CellSel, sel.surfaceId)),
+    captureSheetMutationAuthority(sel, active),
+  );
+  return point ? withCellMeta({ kind: "cell", gridId: sel.gridId, ...point } as CellSel, sel.surfaceId) : null;
 }
 
-export function growSheetEdge(gridId: string, edge: "row" | "col", surfaceId?: string): CellSel | null {
+export function growSheetEdge(
+  gridId: string,
+  edge: "row" | "col",
+  surfaceId?: string,
+  afterApply?: (target: CellSel) => void,
+): CellSel | null {
   const b = boundsForGrid(gridId, surfaceId);
+  const commit = (target: CellSel) => {
+    setCellSel(target);
+    afterApply?.(target);
+  };
   const target =
     edge === "col"
-      ? seamInsertTarget(colSeamSel(gridId, b.cols, 0, surfaceId))
-      : seamInsertTarget(rowSeamSel(gridId, b.rows, 0, surfaceId));
+      ? seamInsertTarget(colSeamSel(gridId, b.cols, 0, surfaceId), commit)
+      : seamInsertTarget(rowSeamSel(gridId, b.rows, 0, surfaceId), commit);
   if (!target) return null;
-  setCellSel(target);
   return target;
 }
 
 function editInsertedFromSeam(sel: RowSeamSel | ColSeamSel, text: string | null): boolean {
-  const target = seamInsertTarget(sel);
+  const target = seamInsertTarget(sel, (applied) => {
+    if (!startCellEditing(applied, 0)) return;
+    if (text !== null) replaceThroughMountedEditor(applied, text);
+  });
   if (!target) return true;
-  if (!startCellEditing(target, 0)) return true;
-  if (text !== null) replaceThroughMountedEditor(target, text);
   return true;
 }
 
@@ -933,6 +1030,7 @@ function reselectAfterRemoval(gridId: string, row: number, col: number, surfaceI
 // block — clears contents. Martin's rule: selection shape disambiguates, so
 // there's no separate "delete row" command to reach for.
 function removeCellsOrClear(sel: CellSel | RangeSel): boolean {
+  const authority = captureSheetMutationAuthority<true>(sel);
   const bounds = boundsForGrid(sel.gridId, sel.surfaceId);
   if (bounds.rows <= 0 || bounds.cols <= 0) return false;
   if (sel.kind === "range") {
@@ -940,43 +1038,46 @@ function removeCellsOrClear(sel: CellSel | RangeSel): boolean {
     const fullRows = rect.left === 0 && rect.right === bounds.cols - 1;
     const fullCols = rect.top === 0 && rect.bottom === bounds.rows - 1;
     if (fullRows) {
-      deleteRows(sel.gridId, rect.top, rect.bottom);
-      reselectAfterRemoval(sel.gridId, rect.top, 0, sel.surfaceId);
+      deleteRows(sel.gridId, rect.top, rect.bottom, () =>
+        reselectAfterRemoval(sel.gridId, rect.top, 0, sel.surfaceId), authority);
       return true;
     }
     if (fullCols) {
-      deleteColumns(sel.gridId, rect.left, rect.right);
-      reselectAfterRemoval(sel.gridId, 0, rect.left, sel.surfaceId);
+      deleteColumns(sel.gridId, rect.left, rect.right, () =>
+        reselectAfterRemoval(sel.gridId, 0, rect.left, sel.surfaceId), authority);
       return true;
     }
   }
-  return clearSheetSelection(sel);
+  return clearSheetSelection(sel, undefined, authority);
 }
 
 function deleteFromSeam(sel: RowSeamSel | ColSeamSel, side: "before" | "after"): boolean {
+  const authority = captureSheetMutationAuthority<true>(sel);
   if (sel.kind === "row-seam") {
     const row = side === "before" ? sel.at - 1 : sel.at;
     if (row < 0 || row >= rowsForGrid(sel.gridId).length) return true;
-    deleteRow(sel.gridId, row);
-    const next = nearestAfterRowDelete(sel.gridId, row, sel.anchor.col, sel.surfaceId);
-    if (next) setCellSel(next);
-    else {
-      clearCellSelectionOnly();
-      selectBlock(sel.gridId);
-    }
+    deleteRow(sel.gridId, row, () => {
+      const next = nearestAfterRowDelete(sel.gridId, row, sel.anchor.col, sel.surfaceId);
+      if (next) setCellSel(next);
+      else {
+        clearCellSelectionOnly();
+        selectBlock(sel.gridId);
+      }
+    }, authority);
     return true;
   }
 
   const col = side === "before" ? sel.at - 1 : sel.at;
   const bounds = boundsForGrid(sel.gridId, sel.surfaceId);
   if (col < 0 || col >= bounds.cols) return true;
-  deleteColumn(sel.gridId, col);
-  const next = nearestAfterColumnDelete(sel.gridId, sel.anchor.row, col, sel.surfaceId);
-  if (next) setCellSel(next);
-  else {
-    clearCellSelectionOnly();
-    selectBlock(sel.gridId);
-  }
+  deleteColumn(sel.gridId, col, () => {
+    const next = nearestAfterColumnDelete(sel.gridId, sel.anchor.row, col, sel.surfaceId);
+    if (next) setCellSel(next);
+    else {
+      clearCellSelectionOnly();
+      selectBlock(sel.gridId);
+    }
+  }, authority);
   return true;
 }
 
@@ -985,13 +1086,19 @@ export function handleSheetPasteEvent(e: ClipboardEvent): boolean {
   if (!sel || isSeamSel(sel)) return false;
   const text = e.clipboardData?.getData("text/plain") ?? "";
   if (text === "") return false;
-  const structural = splatStructuralSheetSelection(sel, text);
+  const applySelection = (next: import("./mutations").SheetMutationSelection) =>
+    setCellSel(withCellMeta(next, sel.surfaceId));
+  const authority = captureSheetMutationAuthority<{ overwroteNonEmpty: boolean } | true>(sel);
+  const structural = splatStructuralSheetSelection(
+    sel,
+    text,
+    applySelection,
+    authority as PageMutationAuthority<{ overwroteNonEmpty: boolean }>,
+  );
   if (structural !== undefined) {
-    if (structural) setCellSel(withCellMeta(structural, sel.surfaceId));
     return !!structural;
   }
-  const next = pasteTextIntoSheetSelection(sel, text);
-  if (next) setCellSel(withCellMeta(next, sel.surfaceId));
+  const next = pasteTextIntoSheetSelection(sel, text, applySelection, authority);
   return !!next;
 }
 
@@ -1011,23 +1118,36 @@ export function handleCellSelectionKey(e: KeyboardEvent): boolean {
     const cell = focusCell(sel);
     const adapter = adapterFor(cell.gridId, cell.surfaceId);
     if (adapter?.moveWithMod) return adapter.moveWithMod(cell, arrowDir);
-    const next = moveSheetSelection(sel, arrowDir as SheetMoveDirection);
-    if (next) {
+    const applySelection = (next: import("./mutations").SheetMutationSelection) => {
       const rowId = next.kind === "cell"
         ? adapterFor(next.gridId, sel.surfaceId)?.rowIdAt?.(next.row) ?? undefined
         : undefined;
       setCellSel(withCellMeta(next, sel.surfaceId, rowId));
+    };
+    const next = moveSheetSelection(
+      sel,
+      arrowDir as SheetMoveDirection,
+      applySelection,
+      captureSheetMutationAuthority(sel),
+    );
+    if (next) {
+      // Direct mode invokes applySelection in this call stack; managed mode
+      // invokes it only after accepted preflight + atomic publication.
     }
     return true;
   }
-  if (mod && !e.altKey && !e.shiftKey && key === "d" && !isSeamSel(sel)) return fillSheetSelection(sel, "down");
-  if (mod && !e.altKey && !e.shiftKey && key === "r" && !isSeamSel(sel)) return fillSheetSelection(sel, "right");
+  if (mod && !e.altKey && !e.shiftKey && key === "d" && !isSeamSel(sel)) {
+    return fillSheetSelection(sel, "down", undefined, captureSheetMutationAuthority(sel));
+  }
+  if (mod && !e.altKey && !e.shiftKey && key === "r" && !isSeamSel(sel)) {
+    return fillSheetSelection(sel, "right", undefined, captureSheetMutationAuthority(sel));
+  }
   if (mod && !e.altKey && !e.shiftKey && key === "c" && !isSeamSel(sel)) {
     void copySheetSelection(sel);
     return true;
   }
   if (mod && !e.altKey && !e.shiftKey && key === "x" && !isSeamSel(sel)) {
-    cutSheetSelection(sel);
+    cutSheetSelection(sel, undefined, captureSheetMutationAuthority(sel));
     return true;
   }
   if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "Tab" || e.code === "Tab")) {

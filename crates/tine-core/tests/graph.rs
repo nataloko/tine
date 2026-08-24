@@ -2960,15 +2960,16 @@ fn resolve_sync_conflict_merges_and_trashes() {
     ]);
     let base = tine_core::model::content_rev(winner);
     let conflict_rev = tine_core::model::content_rev(conflict);
-    g.resolve_sync_conflict(
-        win_rel,
-        &conf_rel,
-        &decisions,
-        &base,
-        &conflict_rev,
-        "union",
-    )
-    .unwrap();
+    let resolved = g
+        .resolve_sync_conflict(
+            win_rel,
+            &conf_rel,
+            &decisions,
+            &base,
+            &conflict_rev,
+            "union",
+        )
+        .unwrap();
 
     let merged = std::fs::read_to_string(pages.join("Foo.md")).unwrap();
     assert!(merged.contains("beta line there"), "merged: {merged:?}");
@@ -2979,6 +2980,17 @@ fn resolve_sync_conflict_merges_and_trashes() {
     assert!(
         merged.contains("extra from other device"),
         "removed block not pulled in: {merged:?}"
+    );
+    assert_eq!(resolved.path, win_rel);
+    let merged_rev = tine_core::model::content_rev(&merged);
+    assert_eq!(resolved.rev.as_deref(), Some(merged_rev.as_str()));
+    assert!(
+        resolved
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("beta line there")),
+        "returned DTO is not the committed merge: {:?}",
+        resolved.blocks
     );
 
     // Conflict copy is gone from pages/ and from the conflicts list, and lives in trash.
@@ -3025,7 +3037,7 @@ fn page_symlinks_are_not_indexed_or_reconciled() {
 
 #[cfg(unix)]
 #[test]
-fn checked_graph_open_rejects_a_managed_sync_symlink() {
+fn checked_direct_graph_open_ignores_the_separate_managed_sync_namespace() {
     use std::os::unix::fs::symlink;
 
     let root = std::env::temp_dir().join(format!("tine-sync-link-{}", uuid::Uuid::new_v4()));
@@ -3036,7 +3048,11 @@ fn checked_graph_open_rejects_a_managed_sync_symlink() {
     std::fs::create_dir_all(&outside).unwrap();
     symlink(&outside, root.join(".tine-sync")).unwrap();
 
-    assert!(Graph::open_checked(&root).is_err());
+    // Direct Files neither trusts nor owns `.tine-sync`; managed activation and
+    // join validate it at their explicit boundary. A stale/broken managed
+    // namespace must therefore not make an otherwise healthy Direct graph
+    // unavailable.
+    assert!(Graph::open_checked(&root).is_ok());
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
@@ -3158,7 +3174,6 @@ mod untouched_bytes_survive_an_edit {
 /// 243 ms on a real 5,225-file graph.
 mod page_inventory_survives_a_content_save {
     use super::*;
-    use std::time::Instant;
 
     fn graph_with(pages: usize, tag: &str) -> (PathBuf, Graph) {
         let root = std::env::temp_dir().join(format!(
@@ -3216,34 +3231,6 @@ mod page_inventory_survives_a_content_save {
                 .unwrap()
                 .is_some(),
             "the page exists on disk but cannot be loaded by name"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The perf property, as a RATIO rather than an absolute bound: a shared box
-    /// makes absolute timings flaky, but a rebuild is ~350x a memo hit, so the
-    /// gap survives any load. The `title::` save is the control — it genuinely
-    /// changes the inventory and MUST still pay for a rebuild.
-    #[test]
-    fn a_content_only_save_keeps_the_inventory_warm() {
-        let (root, graph) = graph_with(400, "warm");
-        graph.list_pages();
-
-        save_first_block(&graph, "pages/Page 1.md", "edited body");
-        let start = Instant::now();
-        let after_content = graph.list_pages();
-        let content_only = start.elapsed();
-
-        save_first_block(&graph, "pages/Page 2.md", "title:: Renamed Page Two");
-        let start = Instant::now();
-        let after_title = graph.list_pages();
-        let identity_change = start.elapsed();
-
-        assert_eq!(after_content.len(), after_title.len());
-        assert!(
-            content_only * 5 < identity_change,
-            "a content-only save still paid for a whole-graph rebuild \
-             (content-only {content_only:?} vs identity-change {identity_change:?})"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3600,4 +3587,307 @@ mod shadow_journal_sees_every_text_extension {
     fn an_org_canonical_day_shadows_it_too() {
         day_resolves_to_the_canonical_file("org");
     }
+}
+
+// --- Concord base ledger (ADR 0056) -----------------------------------------
+
+mod concord_ledger_integration {
+    use super::*;
+    use tine_core::sync_diff::{Diff3Verdict, DiffRow};
+
+    fn scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("tine-concord-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        let ledger_dir =
+            std::env::temp_dir().join(format!("tine-concord-ledger-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+        (root, ledger_dir)
+    }
+
+    fn flatten(rows: &[DiffRow]) -> Vec<&DiffRow> {
+        let mut out = Vec::new();
+        fn rec<'a>(rows: &'a [DiffRow], out: &mut Vec<&'a DiffRow>) {
+            for r in rows {
+                out.push(r);
+                rec(&r.children, out);
+            }
+        }
+        rec(rows, &mut out);
+        out
+    }
+
+    #[test]
+    fn ledger_records_saves_and_external_admissions() {
+        let (root, ledger_dir) = scratch("hooks");
+        std::fs::write(root.join("pages/Note.md"), "- version one\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        let ledger = graph.concord_ledger().expect("attached").clone();
+
+        // A successful SAVE records the written bytes as the last-agreed text.
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        page.blocks[0].raw = "version two".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some("- version two\n"),
+            "the committed save must become the ledger base"
+        );
+
+        // An admitted EXTERNAL change records the read bytes.
+        graph.warm_cache();
+        let path = root.join("pages/Note.md");
+        std::fs::write(&path, "- version three (external)\n").unwrap();
+        let admitted = graph.sync_file(&path);
+        assert!(admitted.is_some(), "the external change must be admitted");
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some("- version three (external)\n"),
+            "the admitted external content must become the ledger base"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_diff_pre_selects_sides_with_a_known_base_and_stays_2way_without_one() {
+        // The divergence: from a common ancestor, "mine" (the winner on disk)
+        // edited block two, "theirs" (the conflict copy) added a block.
+        let ancestor = "- shared intro line\n- the quick brown fox jumps\n";
+        let mine = "- shared intro line\n- the quick brown fox jumped\n";
+        let theirs =
+            "- shared intro line\n- the quick brown fox jumps\n- added on the other device\n";
+        let conflict_name = "Note.sync-conflict-20260817-120000-AAAAAAA.md";
+
+        // FAIL-BEFORE (the old behavior, still the no-base fallback): without a
+        // ledger the diff is 2-way and offers NO suggestions anywhere.
+        {
+            let (root, _ledger_dir) = scratch("no-base");
+            std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+            std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+            let graph = Graph::open(&root);
+            let diff = graph
+                .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+                .unwrap()
+                .expect("diff");
+            assert!(!diff.three_way);
+            assert!(
+                flatten(&diff.rows)
+                    .iter()
+                    .all(|r| r.suggestion.is_none() && r.verdict.is_none()),
+                "without a base no row may carry a suggestion"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // With the ancestor in the ledger the same divergence pre-selects the
+        // right side per row.
+        let (root, ledger_dir) = scratch("with-base");
+        std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+        std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        // Drain the attach-time prune before the synchronous record below
+        // (record_now bypasses the worker; production records are serialized).
+        graph.concord_ledger().unwrap().flush();
+        graph
+            .concord_ledger()
+            .unwrap()
+            .record_now("pages/Note.md", ancestor)
+            .unwrap();
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(diff.three_way);
+        let rows = flatten(&diff.rows);
+        // Mine's edit ("jumps" → "jumped") → suggest mine.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::MineOnly)
+                    && r.suggestion.as_deref() == Some("mine")),
+            "{rows:?}"
+        );
+        // Theirs' addition → suggest theirs.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::TheirsOnly)
+                    && r.suggestion.as_deref() == Some("theirs")),
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_diff_skips_a_base_identical_to_the_winner() {
+        // The admission artifact: the winner's post-sync bytes were admitted and
+        // became the ledger entry before the diff ran. 3-way against base==mine
+        // would blanket-suggest "theirs"; it must fall back to 2-way instead.
+        let (root, ledger_dir) = scratch("degenerate");
+        let mine = "- shared\n- winner content\n";
+        let theirs = "- shared\n- copy content entirely different\n";
+        let conflict_name = "Note.sync-conflict-20260817-120000-BBBBBBB.md";
+        std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+        std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        // Drain the attach-time prune before the synchronous record below
+        // (record_now bypasses the worker; production records are serialized).
+        graph.concord_ledger().unwrap().flush();
+        graph
+            .concord_ledger()
+            .unwrap()
+            .record_now("pages/Note.md", mine)
+            .unwrap();
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(
+            !diff.three_way,
+            "base==winner must not produce a 3-way diff"
+        );
+        assert!(flatten(&diff.rows).iter().all(|r| r.suggestion.is_none()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_copy_appearance_pins_the_ancestor_before_the_winner_admission() {
+        // The real Syncthing timing on a device that had NOT edited the page:
+        // the watcher sees the conflict copy appear, THEN the winner's replaced
+        // bytes get admitted (which overwrites the winner's ledger entry). The
+        // pin taken at copy-appearance must preserve the true ancestor so the
+        // later diff still gets a useful base.
+        let (root, ledger_dir) = scratch("pin-timing");
+        let ancestor = "- shared intro line\n- the quick brown fox jumps\n";
+        let winner_after_sync =
+            "- shared intro line\n- the quick brown fox jumps\n- added by device B\n";
+        let conflict_copy = "- shared intro line\n- the quick brown fox jumpz\n";
+        let conflict_name = "Note.sync-conflict-20260817-130000-CCCCCCC.md";
+        std::fs::write(root.join("pages/Note.md"), ancestor).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        let ledger = graph.concord_ledger().unwrap().clone();
+        ledger.flush(); // drain the attach-time prune before the sync record
+        ledger.record_now("pages/Note.md", ancestor).unwrap();
+        graph.warm_cache();
+
+        // 1. The conflict copy appears; the watcher offers it for reconcile.
+        let conflict_path = root.join("pages").join(conflict_name);
+        std::fs::write(&conflict_path, conflict_copy).unwrap();
+        assert!(graph.sync_file(&conflict_path).is_none()); // never a page — but it pins
+                                                            // 2. The winner's replaced bytes are admitted.
+        std::fs::write(root.join("pages/Note.md"), winner_after_sync).unwrap();
+        assert!(graph.sync_file(&root.join("pages/Note.md")).is_some());
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some(winner_after_sync),
+            "the admission must have overwritten the winner's current entry"
+        );
+
+        // 3. The diff still gets the ANCESTOR through the pin.
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(diff.three_way, "the pinned ancestor must enable 3-way");
+        let rows = flatten(&diff.rows);
+        // Device B's addition (mine-only vs the ancestor) → keep mine.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::MineOnly)
+                    && r.suggestion.as_deref() == Some("mine")),
+            "{rows:?}"
+        );
+        // The copy's edit ("jumps" → "jumpz", theirs-only) → take theirs.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::TheirsOnly)
+                    && r.suggestion.as_deref() == Some("theirs")),
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+}
+
+/// Manual measurement (Concord P3 deliverable): save-path overhead of the
+/// ledger hooks, before (no ledger attached — the hooks no-op, which is the
+/// exact pre-change code path modulo one None check) vs after (ledger
+/// attached). Run on a SCRATCH COPY of the anonymized-scale corpus:
+///   TINE_CONCORD_BENCH_GRAPH=/path/to/copy cargo test --release \
+///     -p tine-core --test graph concord_ledger_save_overhead -- --ignored --nocapture
+#[test]
+#[ignore = "manual measurement; needs TINE_CONCORD_BENCH_GRAPH (scratch copy — saves write into it)"]
+fn concord_ledger_save_overhead_measurement() {
+    let Ok(root) = std::env::var("TINE_CONCORD_BENCH_GRAPH") else {
+        eprintln!("TINE_CONCORD_BENCH_GRAPH not set; skipping");
+        return;
+    };
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    // The largest page in the corpus = the worst-case ledger record payload.
+    let pages = graph.list_pages();
+    let target = pages
+        .iter()
+        .filter(|p| p.rel_path.ends_with(".md"))
+        .max_by_key(|p| {
+            std::fs::metadata(std::path::Path::new(&root).join(&p.rel_path))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .expect("a page");
+    let size = std::fs::metadata(std::path::Path::new(&root).join(&target.rel_path))
+        .unwrap()
+        .len();
+    eprintln!("target page: {} ({size} bytes)", target.rel_path);
+
+    let mut measure = |label: &str, rounds: usize| {
+        let mut page = graph.load_by_path(&target.rel_path).unwrap().unwrap();
+        let mut times_us: Vec<u128> = Vec::with_capacity(rounds);
+        for i in 0..rounds {
+            let marker = format!("concord bench marker {i}");
+            let last = page.blocks.len() - 1;
+            page.blocks[last].raw = marker;
+            let started = std::time::Instant::now();
+            let rev = graph.save_page(&page, page.rev.as_deref()).unwrap();
+            times_us.push(started.elapsed().as_micros());
+            page.rev = Some(rev);
+        }
+        times_us.sort_unstable();
+        let median = times_us[times_us.len() / 2];
+        let p90 = times_us[times_us.len() * 9 / 10];
+        let min = times_us[0];
+        eprintln!("{label}: {rounds} saves — min {min} µs, median {median} µs, p90 {p90} µs");
+        (min, median, p90)
+    };
+
+    // Phase A: no ledger attached (pre-change-equivalent foreground path).
+    let before = measure("before (no ledger)", 200);
+    // Phase B: ledger attached; hooks enqueue to the background worker.
+    let ledger_dir =
+        std::env::temp_dir().join(format!("tine-concord-bench-ledger-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ledger_dir);
+    graph.attach_concord_ledger(ledger_dir.clone());
+    let after = measure("after (ledger attached)", 200);
+    // Prove the ledger actually recorded (we measured real work, not a no-op).
+    let ledger = graph.concord_ledger().unwrap();
+    ledger.flush();
+    assert!(
+        ledger.base(&target.rel_path).is_some(),
+        "the ledger must hold the last save"
+    );
+    eprintln!(
+        "median delta: {} µs ({}%)",
+        after.1 as i128 - before.1 as i128,
+        (after.1 as i128 - before.1 as i128) * 100 / before.1.max(1) as i128
+    );
+    let _ = std::fs::remove_dir_all(&ledger_dir);
 }

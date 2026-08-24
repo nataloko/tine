@@ -1,21 +1,24 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, type FeedPage } from "../store";
-import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, type PaneRouter } from "../router";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, pageMutationBusy, type FeedPage } from "../store";
+import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
   isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
+  vcsMarkerConflictFor, conflictObjectFor,
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
-import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename } from "../graph";
+import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
 import { Block, OutlineScopeContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
+import { PageConflictResolution } from "./ConflictResolution";
+import { ExternalChangeBar } from "./ExternalChangeBar";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
@@ -53,7 +56,17 @@ function feedHasActiveEdit(): boolean {
   // feed page is unsafe here.
   if (edited && doc.byId[edited] && doc.feed.includes(doc.byId[edited].page)) return true;
   return doc.feed.some((name) =>
-    isDirty(name) || isSaving(name) || isConflicted(name) || isBlockMoving(name)
+    isDirty(name)
+    || isSaving(name)
+    || isConflicted(name)
+    || isBlockMoving(name)
+    // An explicit native mutation (Concord resolution, managed move, etc.)
+    // owns the exact live page until its committed DTO is installed. A watcher
+    // restart that enters loadFeed during that window cannot install this day,
+    // and loadFeed correctly publishes only successful installations — which
+    // used to drop today's journal from the feed until restart. Treat the
+    // ownership hold like every other feed safety gate and replay on release.
+    || pageMutationBusy(name)
   );
 }
 
@@ -91,14 +104,27 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
       if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
       return;
     }
+    // The page can become owned while the backend request is in flight. Never
+    // begin installing a feed response that is already known to be unsafe.
+    if (feedHasActiveEdit()) {
+      pendingFeedRestart = true;
+      return;
+    }
     // Clear the deferred flag before loadFeed synchronously updates doc.feed;
     // otherwise the intentionally reactive pending-retry effect observes the
     // old true value during that store write and starts a duplicate restart.
     pendingFeedRestart = false;
-    await loadFeed(withToday(response.pages), {
+    const installed = await loadFeed(withToday(response.pages), {
       endEdit: false,
       expectedGraphBinding: owner.graphBinding,
     });
+    // Installation rechecks every page at its final replacement boundary. A
+    // mutation may begin after the post-request check above; in that case keep
+    // the old feed atomically and replay after ownership releases.
+    if (!installed) {
+      pendingFeedRestart = true;
+      return;
+    }
     journalAsOfDay = response.as_of_day;
     nextBeforeDay = response.next_before_day;
     feedDone = response.done;
@@ -704,8 +730,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         alert("Couldn't save pending edits — resolve the conflict before renaming.");
         return;
       }
-      if (props.page.path) await backend().renamePage(props.page.name, next, props.page.path);
-      else await backend().renamePage(props.page.name, next);
+      const outcome = await renameOrMergePage(props.page.name, next, props.page.path);
+      if (outcome === "cancelled") return;
       // The backend rewrote refs across many pages via the self-write guard (no
       // watcher reload), so every in-memory page is now potentially stale; reset
       // + reload so a stale copy can't be saved back and revert the rename.
@@ -719,7 +745,27 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   };
 
   return (
-    <div class="page-section">
+    <div
+      class="page-section"
+      classList={{ "page-mutation-busy": pageMutationBusy(props.page.name) }}
+      inert={pageMutationBusy(props.page.name) ? true : undefined}
+      aria-busy={pageMutationBusy(props.page.name) ? "true" : undefined}
+    >
+      <Show when={vcsMarkerConflictFor(props.page.path)}>
+        {(conflict) => (
+          <div class="vcs-marker-banner" role="alert">
+            This file contains unresolved version-control merge markers ({conflict().markers.join(" ")}).
+            It stays readable, and Tine won’t save changes to it until the merge is resolved — either
+            below, block by block, or in your version-control tool.
+          </div>
+        )}
+      </Show>
+      {/* Concord P5: with "always ask" on, an external change waits here. */}
+      <ExternalChangeBar name={props.page.name} />
+      {/* Concord L4: the conflict is resolved AT the page, block by block. */}
+      <Show when={conflictObjectFor(props.page.path, props.page.name)}>
+        {(conflict) => <PageConflictResolution conflict={conflict()} />}
+      </Show>
       <Show when={props.page.kind === "page"}>
         <NamespaceCrumb name={props.page.name} />
       </Show>
@@ -730,6 +776,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             <input
               class="page-title-input"
               value={newName()}
+              disabled={pageMutationBusy(props.page.name)}
               ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
               onInput={(e) => setNewName(e.currentTarget.value)}
               onKeyDown={(e) => {
@@ -752,10 +799,11 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               if (e.shiftKey && !props.page.guide) openPageInSidebar(pageTarget());
               else router.openPageTarget(pageTarget());
             }}
+            onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
             onAuxClick={(e) => {
               if (e.button === 1) {
                 e.preventDefault(); // middle-click → background tab, like a body link
-                router.openPageTargetInNewTab(pageTarget());
+                openPageTargetInNewTab(pageTarget());
               }
             }}
             onDblClick={startRename}

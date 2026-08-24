@@ -19,9 +19,6 @@ use tine_storage::{
 };
 use uuid::Uuid;
 
-use super::authenticated_patricia::{
-    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexStore,
-};
 use super::bootstrap_import::{
     BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapPartitionProfileV1,
     BootstrapProfileDigestV1, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
@@ -29,6 +26,10 @@ use super::bootstrap_import::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
+use super::lazy_genesis::{
+    LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
+    LazyGenesisProviderIndexV1,
+};
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
     CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
@@ -47,13 +48,7 @@ use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
     PortablePathReleased,
 };
-use super::reference_catalog::{
-    affected_reference_sources, reference_source_is_org, AuthenticatedReferenceCatalogRootNodes,
-    ReferenceCandidateTargetV2, ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2,
-    ReferenceCatalogError, ReferenceCatalogPolicyV1, ReferenceCatalogPreparedCandidateV2,
-    ReferenceCatalogRootV2, ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1,
-    ReferenceSourcePageV1,
-};
+use super::reference_catalog::ReferenceCatalogPolicyV1;
 #[cfg(test)]
 use super::reference_catalog::{
     reference_evidence_parse_calls, reset_reference_evidence_parse_calls,
@@ -66,7 +61,6 @@ use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
 };
-use super::shadow_projection::BootstrapProjectionAuthority;
 use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
@@ -79,7 +73,7 @@ use super::{
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
     ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionWork, ProjectionWorkTarget,
     SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
@@ -101,14 +95,15 @@ const MAX_PREAUTHORING_CAPTURE_PATHS: usize = MAX_TRANSACTION_OPERATIONS * 2;
 const MAX_PREAUTHORING_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
+const LAZY_GENESIS_PEER_ID: u64 = 0x5449_4e45_4745_4e31;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
 const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
-const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 13;
+const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 6;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 5;
+const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
+const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -158,6 +153,10 @@ pub(crate) struct LocalMutationDetailTimings {
     pub(crate) before_projection_affine_fallbacks: usize,
     pub(crate) before_projection_affine_snapshot_blocks: usize,
     pub(crate) post_projection_pages: usize,
+    pub(crate) post_projection_affine_attempts: usize,
+    pub(crate) post_projection_affine_reuses: usize,
+    pub(crate) post_projection_affine_fallbacks: usize,
+    pub(crate) post_projection_affine_candidate_blocks: usize,
     pub(crate) projection_requirements: usize,
     pub(crate) draft_calls: usize,
     pub(crate) finalize_captured_inputs: usize,
@@ -210,6 +209,10 @@ thread_local! {
             before_projection_affine_fallbacks: 0,
             before_projection_affine_snapshot_blocks: 0,
             post_projection_pages: 0,
+            post_projection_affine_attempts: 0,
+            post_projection_affine_reuses: 0,
+            post_projection_affine_fallbacks: 0,
+            post_projection_affine_candidate_blocks: 0,
             projection_requirements: 0,
             draft_calls: 0,
             finalize_captured_inputs: 0,
@@ -269,6 +272,10 @@ pub(crate) const MAX_CURRENT_PATH_CURSORS: usize = 32;
 pub(crate) struct CurrentPathCursorProbe {
     pub(crate) rows: usize,
     pub(crate) catalog_document_validations: usize,
+    /// Total page-map entries visited by those shape validations. Unlike the
+    /// call count, this distinguishes many one-page home documents from
+    /// repeatedly validating one graph-sized catalog document.
+    pub(crate) catalog_entries_validated: usize,
     pub(crate) walk_micros: u128,
     pub(crate) portable_path_micros: u128,
     pub(crate) catalog_state_micros: u128,
@@ -280,6 +287,7 @@ thread_local! {
         const { Cell::new(CurrentPathCursorProbe {
             rows: 0,
             catalog_document_validations: 0,
+            catalog_entries_validated: 0,
             walk_micros: 0,
             portable_path_micros: 0,
             catalog_state_micros: 0,
@@ -314,11 +322,10 @@ pub(crate) fn take_current_path_cursor_probe() -> CurrentPathCursorProbe {
 /// One exact current page path supplied by the authenticated cursor.
 ///
 /// This semantic row intentionally carries no projected blob or projection
-/// generation. Reconciliation integration must join it to one pinned
-/// `ProjectionWorkIndex` head and require the exact-path completed receipt to
-/// match this `page_id` and `path`; only that receipt's `Present` target is the
-/// projected `BlobDescription`. The joined epoch must retain the projection
-/// head generation/completed-path root beside this cursor's accepted frontier.
+/// generation. The clean runtime joins it to the frontier-matched SQLite
+/// projection and reconstructs any projection predecessor from the immutable
+/// baseline or accepted manifest tail; no persistent projection-work authority
+/// participates in current-path admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct CurrentPathCatalogRow {
@@ -385,14 +392,17 @@ impl CurrentPathCatalogBinding {
         self.accepted_frontier
     }
 
+    #[cfg(test)]
     pub(crate) const fn history_generation(self) -> u64 {
         self.history_generation
     }
 
+    #[cfg(test)]
     pub(crate) const fn history_root(self) -> ContentDigest {
         self.history_root
     }
 
+    #[cfg(test)]
     pub(crate) const fn catalog_root(self) -> ContentDigest {
         self.catalog_root
     }
@@ -613,68 +623,6 @@ pub(crate) struct AuthenticatedPageLocalEffectiveTransition {
     selected_intent: ManifestedProjectionIntent,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthenticatedEffectiveProjectionClosure {
-    transition: AuthenticatedPageLocalEffectiveTransition,
-    lifecycle_completion: ProjectionCompletedReceipt,
-}
-
-#[derive(Clone)]
-pub(crate) struct AuthenticatedEffectiveTitleProjectionCandidate {
-    seal: EffectiveTitleTransitionSeal,
-    state: ProjectionPageState,
-    source: ManifestedProjectionIntent,
-    lifecycle_completion: ProjectionCompletedReceipt,
-    accepted_frontier: AuthenticatedProjectionAcceptedFrontier,
-}
-
-impl AuthenticatedEffectiveTitleProjectionCandidate {
-    pub(crate) const fn lifecycle_completion(&self) -> &ProjectionCompletedReceipt {
-        &self.lifecycle_completion
-    }
-
-    pub(crate) const fn source(&self) -> &ManifestedProjectionIntent {
-        &self.source
-    }
-}
-
-/// Run-local proof that one materialized projection state was selected while
-/// this exact engine capability agreed with the live durable-history head and
-/// its current accepted-frontier point authority.
-///
-/// This is intentionally transient and nonconstructible outside this module.
-/// The accepted root is the bounded commitment to the whole frontier; callers
-/// never receive authority by enumerating its documents or direct heads.
-#[derive(Clone)]
-struct AuthenticatedProjectionAcceptedFrontier {
-    runtime_authority: EngineAuthority,
-    accepted_frontier_root: AcceptedFrontierRoot,
-    durable_history: super::object_store::EngineHistoryAuthority,
-}
-
-impl AuthenticatedProjectionAcceptedFrontier {
-    fn matches(&self, other: &Self) -> bool {
-        self.runtime_authority.matches(&other.runtime_authority)
-            && self.accepted_frontier_root == other.accepted_frontier_root
-            && self.durable_history == other.durable_history
-    }
-}
-
-fn same_projection_state_authority(
-    left: &ProjectionPageState,
-    right: &ProjectionPageState,
-) -> bool {
-    left.frontier == right.frontier
-        && left.claim_evidence == right.claim_evidence
-        && left.page.page_id == right.page.page_id
-        && left.page.home_document_id == right.page.home_document_id
-        && left.page.name == right.page.name
-        && left.page.path == right.page.path
-        && left.page.kind == right.page.kind
-        && left.page.preamble == right.page.preamble
-        && left.page.blocks == right.page.blocks
-}
-
 impl AuthenticatedPageLocalEffectiveTransition {
     pub(crate) const fn page_id(&self) -> PageId {
         self.page_id
@@ -721,6 +669,33 @@ impl AuthenticatedPageLocalEffectiveTransition {
 pub(crate) struct AuthenticatedEffectiveSemanticView {
     effect: SemanticEffect,
     transitions: Vec<AuthenticatedPageLocalEffectiveTransition>,
+}
+
+/// Bounded causal-containment proof for one accepted batch. Identity
+/// transitions use this ordinary oplog fact after the Patricia indexes are
+/// removed; it is not an identity-specific authority.
+pub(crate) struct AcceptedBatchCausalContainment {
+    batch_id: BatchId,
+    clock: Vec<(CausalPeerId, u64)>,
+}
+
+impl AcceptedBatchCausalContainment {
+    /// The batch's transitive causal clock: per peer, the highest counter in
+    /// its causal past including its own dot. Clocks are downward-closed (a
+    /// peer's dots are gapless), so the counters sum to the exact size of
+    /// `past(batch) ∪ {batch}`.
+    pub(crate) fn clock(&self) -> &[(CausalPeerId, u64)] {
+        &self.clock
+    }
+
+    pub(crate) fn contains(&self, dot: BatchCausalDot, batch_id: BatchId) -> bool {
+        batch_id == self.batch_id
+            || self
+                .clock
+                .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+                .ok()
+                .is_some_and(|index| self.clock[index].1 >= dot.counter())
+    }
 }
 
 impl AuthenticatedEffectiveSemanticView {
@@ -878,120 +853,6 @@ struct ValidatedReferenceSourceSnapshot {
     memberships: BTreeMap<BlockId, MembershipClaim>,
 }
 
-struct ValidatedReferenceSourceView<'a> {
-    #[cfg(test)]
-    origin: ValidatedReferenceSourceOrigin,
-    page_id: Option<PageId>,
-    preamble: Option<&'a str>,
-    blocks: &'a BTreeMap<BlockId, BlockState>,
-    memberships: &'a BTreeMap<BlockId, MembershipClaim>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-enum ValidatedReferenceSourceOrigin {
-    NewShard,
-    AfterSnapshot,
-}
-
-enum ReferenceSourceData<'a> {
-    Carried(ValidatedReferenceSourceView<'a>),
-    Reconstructed {
-        page_id: Option<PageId>,
-        preamble: Option<String>,
-        blocks: BTreeMap<BlockId, BlockState>,
-        memberships: BTreeMap<BlockId, MembershipClaim>,
-    },
-}
-
-impl ReferenceSourceData<'_> {
-    fn page_id(&self) -> Option<PageId> {
-        match self {
-            Self::Carried(source) => source.page_id,
-            Self::Reconstructed { page_id, .. } => *page_id,
-        }
-    }
-
-    fn preamble(&self) -> Option<String> {
-        match self {
-            Self::Carried(source) => source.preamble.map(str::to_owned),
-            Self::Reconstructed { preamble, .. } => preamble.clone(),
-        }
-    }
-
-    fn blocks(&self) -> &BTreeMap<BlockId, BlockState> {
-        match self {
-            Self::Carried(source) => source.blocks,
-            Self::Reconstructed { blocks, .. } => blocks,
-        }
-    }
-
-    fn memberships(&self) -> &BTreeMap<BlockId, MembershipClaim> {
-        match self {
-            Self::Carried(source) => source.memberships,
-            Self::Reconstructed { memberships, .. } => memberships,
-        }
-    }
-}
-
-struct ValidatedReferenceSourceObservations<'a> {
-    catalog_pages: Option<&'a BTreeMap<PageId, PageState>>,
-    exact_current_documents: &'a BTreeSet<DocumentId>,
-    after_snapshots: &'a BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    new_shards: &'a ValidatedNewShardEffects,
-}
-
-impl ValidatedReferenceSourceObservations<'_> {
-    fn source(&self, document_id: DocumentId) -> Option<ValidatedReferenceSourceView<'_>> {
-        if !self.exact_current_documents.contains(&document_id) {
-            return None;
-        }
-        if let Some(snapshot) = self.new_shards.sources.get(&document_id) {
-            return Some(ValidatedReferenceSourceView {
-                #[cfg(test)]
-                origin: ValidatedReferenceSourceOrigin::NewShard,
-                page_id: Some(snapshot.page_id),
-                preamble: snapshot.preamble.as_deref(),
-                blocks: &snapshot.blocks,
-                memberships: &snapshot.memberships,
-            });
-        }
-        let SemanticDocumentSnapshot::Shard {
-            page_id,
-            page_preamble,
-            blocks,
-            memberships,
-        } = self.after_snapshots.get(&document_id)?
-        else {
-            return None;
-        };
-        Some(ValidatedReferenceSourceView {
-            #[cfg(test)]
-            origin: ValidatedReferenceSourceOrigin::AfterSnapshot,
-            page_id: *page_id,
-            preamble: page_preamble
-                .as_ref()
-                .and_then(|preamble| preamble.preamble.as_deref()),
-            blocks,
-            memberships,
-        })
-    }
-}
-
-enum ReferenceCandidateDocument<'a> {
-    Borrowed(&'a LoroDoc),
-    Owned(LoroDoc),
-}
-
-impl ReferenceCandidateDocument<'_> {
-    fn document(&self) -> &LoroDoc {
-        match self {
-            Self::Borrowed(document) => document,
-            Self::Owned(document) => document,
-        }
-    }
-}
-
 struct IdentityPublicationCandidate {
     blocked: bool,
     scratch_roots: ScratchRoots,
@@ -1005,6 +866,15 @@ struct PortablePathPublicationCandidate {
     root: PortablePathIndexRoot,
     changed: Vec<(PortablePathKeyDigest, PortablePathRecord)>,
     conflicts: Vec<PortablePathConflict>,
+}
+
+/// Test-only differential-oracle rows read from the retired Patricia roots.
+/// Production identity replay is derived from SQLite plus the accepted event.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
+pub(crate) struct AcceptedIdentityProjectionRecords {
+    pub(crate) page_names: Vec<(ContentDigest, Vec<u8>)>,
+    pub(crate) portable_paths: Vec<(ContentDigest, Vec<u8>)>,
 }
 
 struct TerminalPublicationCandidate {
@@ -1366,8 +1236,10 @@ pub struct FatalEvidenceHandle {
     pub(crate) canonical_digest: ContentDigest,
 }
 
+#[cfg(test)]
 const MAX_FATAL_EVIDENCE_PAGE_CONFLICTS: usize = 32;
 
+#[cfg(test)]
 /// Opaque continuation for one authenticated fatal-evidence root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FatalEvidenceCursor {
@@ -1375,6 +1247,7 @@ pub struct FatalEvidenceCursor {
     after: BlockId,
 }
 
+#[cfg(test)]
 /// A fixed-size inspection result for terminal conflict evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FatalEvidencePage {
@@ -1382,6 +1255,7 @@ pub struct FatalEvidencePage {
     next: Option<FatalEvidenceCursor>,
 }
 
+#[cfg(test)]
 impl FatalEvidencePage {
     pub fn conflicts(&self) -> &[ImmutableHomeConflict] {
         &self.conflicts
@@ -1445,6 +1319,132 @@ pub struct PagePreambleRewrite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockRestore {
+    pub block: BlockLocation,
+    pub claim: MembershipClaim,
+}
+
+/// A concurrent same-block conflict pair, ordered by batch id so every
+/// device derives the identical pair from the same two batches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictPair {
+    pub min_batch: BatchId,
+    pub min_author_device: DeviceId,
+    pub max_batch: BatchId,
+    pub max_author_device: DeviceId,
+}
+
+impl ConflictPair {
+    fn from_manifests(left: &OperationBatch, right: &OperationBatch) -> Self {
+        let (min, max) = if left.batch_id() <= right.batch_id() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        Self {
+            min_batch: min.batch_id(),
+            min_author_device: min.author_device_id(),
+            max_batch: max.batch_id(),
+            max_author_device: max.author_device_id(),
+        }
+    }
+}
+
+/// Deterministic resolution work derived from an accepted batch that raced
+/// concurrent history on the same block (GH #351, the git-like rule). The
+/// intents are a pure function of the accepted batch set plus the merged
+/// state, so every device that observes the completed pair derives the same
+/// resolution; authoring is restricted to the pair's own author devices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictResolutionIntent {
+    /// edit-vs-delete: the tombstone won the owner-register race, but a
+    /// concurrent edit proves the deletion removed state its author never
+    /// saw. Re-assert the edited block; its text survives in the content
+    /// container the tombstone never touched.
+    RestoreEdited {
+        page_id: PageId,
+        block: BlockLocation,
+        claim: MembershipClaim,
+        pair: ConflictPair,
+    },
+    /// move-vs-delete: the tombstone won the owner-register race against a
+    /// concurrent move. Re-assert the move's destination ownership so the
+    /// outcome is move-wins regardless of register luck.
+    RestoreMoved {
+        page_id: PageId,
+        block: BlockLocation,
+        claim: MembershipClaim,
+        pair: ConflictPair,
+    },
+    /// Overlapping same-block text edits: the CRDT merge is an interleave
+    /// nobody typed. Keep both authored versions as adjacent sibling blocks,
+    /// original block first in batch-id order.
+    KeepBothTexts {
+        page_id: PageId,
+        block: BlockLocation,
+        keep_text: String,
+        sibling_text: String,
+        merged_text: String,
+        pair: ConflictPair,
+    },
+}
+
+fn block_delta_edit_page(delta: &BlockDelta) -> Option<PageId> {
+    match (&delta.before, &delta.after) {
+        (Some(before), Some(after)) => match (before.owner, after.owner) {
+            (BlockOwner::Page(page), BlockOwner::Page(same))
+                if page == same && before.content != after.content =>
+            {
+                Some(page)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn block_delta_is_delete(delta: &BlockDelta) -> bool {
+    matches!(
+        (&delta.before, &delta.after),
+        (Some(before), Some(after))
+            if matches!(before.owner, BlockOwner::Page(_))
+                && after.owner == BlockOwner::Tombstone
+    )
+}
+
+fn block_delta_move_target(delta: &BlockDelta) -> Option<PageId> {
+    match (&delta.before, &delta.after) {
+        (Some(before), Some(after)) => match (before.owner, after.owner) {
+            (BlockOwner::Page(source), BlockOwner::Page(target)) if source != target => {
+                Some(target)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn membership_claim_in_effect(
+    effect: &SemanticEffect,
+    page_id: PageId,
+    block_id: BlockId,
+    after: bool,
+) -> Option<MembershipClaim> {
+    effect
+        .memberships()
+        .iter()
+        .find(|delta| delta.page_id == page_id && delta.block_id == block_id)
+        .and_then(|delta| {
+            if after {
+                delta.after.clone()
+            } else {
+                delta.before.clone()
+            }
+        })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SemanticOperation {
     CreatePage {
@@ -1505,6 +1505,15 @@ pub enum SemanticOperation {
         page_changes: Vec<PageRename>,
         block_rewrites: Vec<BlockContentRewrite>,
         page_preamble_rewrites: Vec<PagePreambleRewrite>,
+    },
+    /// Deterministic conflict-resolution restore (GH #351): re-assert page
+    /// ownership and membership for blocks whose visibility lost a race with
+    /// a concurrent tombstone. Writes only owner/membership map registers —
+    /// never text — so independently authored restores with equal values
+    /// converge.
+    RestoreSubtree {
+        page_id: PageId,
+        blocks: Vec<BlockRestore>,
     },
     ReconcileExternalPageState {
         page_id: PageId,
@@ -1572,6 +1581,28 @@ impl OperationTransaction {
 }
 
 fn validate_operation_shape(operation: &SemanticOperation) -> Result<(), EngineError> {
+    if let SemanticOperation::RestoreSubtree { blocks, .. } = operation {
+        if blocks.is_empty() {
+            return Err(EngineError::InvalidTransaction(
+                "restore requires at least one block".into(),
+            ));
+        }
+        if blocks.len() > super::semantic::MAX_SEMANTIC_DELTA_ENTRIES {
+            return Err(EngineError::InvalidTransaction(format!(
+                "restore entry count {} exceeds the semantic bound",
+                blocks.len()
+            )));
+        }
+        if !blocks.windows(2).all(|pair| {
+            (pair[0].block.home_document_id, pair[0].block.block_id)
+                < (pair[1].block.home_document_id, pair[1].block.block_id)
+        }) {
+            return Err(EngineError::InvalidTransaction(
+                "restore blocks must be sorted and unique by home and block ID".into(),
+            ));
+        }
+        return Ok(());
+    }
     let SemanticOperation::RenamePagesAndRewriteReferrers {
         page_changes,
         block_rewrites,
@@ -1903,7 +1934,6 @@ pub(crate) struct DetachedBootstrapAcceptedEngineMaterial {
     history_binding: super::object_store::EngineHistoryBinding,
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog_root: ReferenceCatalogRootV2,
 }
 
 #[allow(dead_code)]
@@ -1928,10 +1958,6 @@ impl DetachedBootstrapAcceptedEngineMaterial {
         &self.reference_catalog_policy
     }
 
-    pub(crate) const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {
-        &self.reference_catalog_root
-    }
-
     pub(crate) fn encode_history_record(
         &self,
         part: BootstrapPartDescriptorV1,
@@ -1939,11 +1965,6 @@ impl DetachedBootstrapAcceptedEngineMaterial {
     ) -> Result<Vec<u8>, EngineError> {
         if self.accepted_evidence.batch_id != part.batch_id()
             || self.accepted_evidence.acceptance_sequence != u64::from(part.acceptance_sequence())
-            || self
-                .accepted_evidence
-                .post_frontier_root
-                .reference_catalog_root
-                != self.reference_catalog_root
         {
             return Err(EngineError::Archive(
                 "detached bootstrap material does not match its aggregate part".into(),
@@ -1965,7 +1986,6 @@ impl DetachedBootstrapAcceptedEngineMaterial {
             page_names: self.history_binding.page_names.clone(),
             logseq_claim_root: self.logseq_claim_root,
             reference_catalog_policy: self.reference_catalog_policy.clone(),
-            reference_catalog_root: self.reference_catalog_root.clone(),
             status: ArchiveStatus::Accepted {
                 no_op: self.no_op,
                 evidence: self.accepted_evidence.clone(),
@@ -2006,12 +2026,6 @@ struct DetachedBootstrapContinuity {
 }
 
 #[derive(Debug, Default)]
-struct DetachedBootstrapReferenceCatalogPlan {
-    sources: BTreeMap<PageId, Option<ReferenceSourcePageV1>>,
-    terminal_part: bool,
-}
-
-#[derive(Debug, Default)]
 struct DetachedBootstrapCurrentPathCatalogPlan {
     rows: BTreeMap<PageId, Option<CurrentPathCatalogStoredRow>>,
     terminal_part: bool,
@@ -2035,154 +2049,6 @@ struct DetachedBootstrapPageNamePlan {
     creations: BTreeMap<super::PageNameKeyDigest, DetachedBootstrapPageNameCreation>,
     page_ids: BTreeSet<PageId>,
     terminal_part: bool,
-}
-
-/// The retained immutable bootstrap publication of a promoted lineage, plus the
-/// exact aggregate ordinal of every bootstrap `BatchId`.
-///
-/// Only the validated handle and a bounded ordinal map are held; part payloads
-/// are loaded on demand from the immutable archive and never cached here.
-struct RetainedBootstrapParts {
-    publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
-    ordinals: BTreeMap<BatchId, usize>,
-}
-
-/// The bounded, payload-free plan for one promoted recovery replay.
-///
-/// Only refcounted handles the engine already holds and the aggregate part
-/// count live here. It exists so recovery can stage through `&mut self` one
-/// ordinal at a time instead of materializing every bootstrap part first.
-struct BootstrapRecoveryPlan {
-    store: Arc<ObjectStore>,
-    publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
-    part_count: usize,
-}
-
-/// Engine-side bootstrap-part residency of a promoted recovery replay.
-///
-/// `max_live_bootstrap_parts` is the engine counterpart of the SQLite rebuild's
-/// identically named counter: it is the greatest number of bootstrap part
-/// payloads that were simultaneously resident, and it must stay at one.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BootstrapRecoveryInstrumentation {
-    pub(crate) bootstrap_part_reads: usize,
-    pub(crate) bootstrap_object_reads: usize,
-    pub(crate) max_live_bootstrap_parts: usize,
-}
-
-/// The shared residency ledger behind [`BootstrapRecoveryInstrumentation`].
-///
-/// What it measures is **payload ownership**, not a staging bracket: a part is
-/// counted from the instant recovery takes ownership of the loaded payload
-/// until the wrapper that owns it is dropped. Every increment happens inside
-/// [`BootstrapResidencyLedger::own`] and the only decrement is
-/// [`BootstrapResidency::drop`], so collecting `N` loaded or prepared parts in
-/// a vector — the preload shape the streaming replay must never take — reports
-/// `max_live_bootstrap_parts == N` rather than one.
-#[derive(Debug, Default)]
-struct BootstrapResidencyLedger {
-    live: AtomicUsize,
-    max_live: AtomicUsize,
-    part_reads: AtomicUsize,
-    object_reads: AtomicUsize,
-}
-
-impl BootstrapResidencyLedger {
-    /// Take counted ownership of one payload, charging `object_count` objects.
-    fn own<T>(self: &Arc<Self>, payload: T, object_count: usize) -> ResidentBootstrapPayload<T> {
-        self.part_reads.fetch_add(1, Ordering::Relaxed);
-        self.object_reads.fetch_add(object_count, Ordering::Relaxed);
-        let live = self.live.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        self.max_live.fetch_max(live, Ordering::Relaxed);
-        ResidentBootstrapPayload {
-            payload,
-            residency: BootstrapResidency {
-                ledger: Arc::clone(self),
-            },
-        }
-    }
-
-    /// Take counted ownership of one freshly loaded immutable bootstrap part.
-    ///
-    /// This is the single entry point for recovery residency: the loaded
-    /// payload is consumed by value here, so the count begins at the instant
-    /// the archive read hands ownership over rather than at any later bracket.
-    fn own_loaded_part(
-        self: &Arc<Self>,
-        loaded: super::object_store::LoadedBootstrapPartV1,
-    ) -> ResidentBootstrapPayload<super::object_store::LoadedBootstrapPartV1> {
-        let object_count = loaded.objects().len();
-        self.own(loaded, object_count)
-    }
-
-    fn snapshot(&self) -> BootstrapRecoveryInstrumentation {
-        BootstrapRecoveryInstrumentation {
-            bootstrap_part_reads: self.part_reads.load(Ordering::Relaxed),
-            bootstrap_object_reads: self.object_reads.load(Ordering::Relaxed),
-            max_live_bootstrap_parts: self.max_live.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Payloads owned right now. Zero once a replay has released everything.
-    fn live(&self) -> usize {
-        self.live.load(Ordering::Relaxed)
-    }
-}
-
-/// One unit of counted bootstrap-payload residency.
-///
-/// It is only ever created by [`BootstrapResidencyLedger::own`] and only ever
-/// released by this `Drop`, so every `?`, early return, error, and unwind path
-/// decrements without a matching call site to forget.
-#[derive(Debug)]
-struct BootstrapResidency {
-    ledger: Arc<BootstrapResidencyLedger>,
-}
-
-impl Drop for BootstrapResidency {
-    fn drop(&mut self) {
-        self.ledger.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// A bootstrap recovery payload whose residency is counted while it is owned.
-///
-/// `try_map` moves the *same* residency unit into the transformed wrapper, so
-/// the `LoadedBootstrapPartV1` → `PreparedBatch` conversion neither
-/// double-counts nor opens a gap in which the payload is owned but uncounted.
-#[derive(Debug)]
-struct ResidentBootstrapPayload<T> {
-    payload: T,
-    residency: BootstrapResidency,
-}
-
-impl<T> ResidentBootstrapPayload<T> {
-    fn get(&self) -> &T {
-        &self.payload
-    }
-
-    /// Transform the owned payload, carrying its one residency unit across.
-    ///
-    /// A failing transform drops the payload and its residency together here.
-    fn try_map<U, E>(
-        self,
-        transform: impl FnOnce(T) -> Result<U, E>,
-    ) -> Result<ResidentBootstrapPayload<U>, E> {
-        let Self { payload, residency } = self;
-        Ok(ResidentBootstrapPayload {
-            payload: transform(payload)?,
-            residency,
-        })
-    }
-
-    /// Hand the payload to its final consumer and release residency only after
-    /// that consumer has returned, so staging is inside the counted window.
-    fn consume<R>(self, consume: impl FnOnce(T) -> R) -> R {
-        let Self { payload, residency } = self;
-        let outcome = consume(payload);
-        drop(residency);
-        outcome
-    }
 }
 
 struct DetachedBootstrapScratchRoot {
@@ -2287,32 +2153,16 @@ impl DetachedBootstrapIndexDurability {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BootstrapCatalogWorkStats {
+pub(crate) struct BootstrapIndexWorkStats {
     pub(crate) authenticated_page_identity_lookups: usize,
     pub(crate) full_catalog_author_clones: usize,
     pub(crate) detached_index_persistent_node_reads: usize,
     pub(crate) reference_fallback_document_reconstructions: usize,
-    pub(crate) reference_catalog_peak_resident_bytes: usize,
-    pub(crate) reference_catalog_buffer_flushes: usize,
-    pub(crate) reference_catalog_prepared_validations: usize,
-    pub(crate) reference_catalog_full_delta_validations: usize,
-    pub(crate) reference_catalog_extraction_nanos: u128,
-    pub(crate) reference_catalog_posting_transition_publication_nanos: u128,
-    pub(crate) reference_catalog_facts_coverage_patricia_nanos: u128,
-    pub(crate) reference_catalog_reverse_patricia_nanos: u128,
-    pub(crate) reference_catalog_facts_coverage_patricia_reads: usize,
-    pub(crate) reference_catalog_reverse_patricia_reads: usize,
-    pub(crate) reference_catalog_prepared_sources: usize,
-    pub(crate) reference_catalog_fact_updates: usize,
-    pub(crate) reference_catalog_reverse_updates: usize,
-    pub(crate) reference_catalog_persistent_node_reads: usize,
-    pub(crate) reference_catalog_persistent_node_writes: usize,
 }
 
 #[cfg(test)]
-fn bootstrap_catalog_work_stats(engine: &ShardedHotEngine) -> BootstrapCatalogWorkStats {
+fn bootstrap_index_work_stats(engine: &ShardedHotEngine) -> BootstrapIndexWorkStats {
     let reference = engine.reference_source_observations.get();
-    let construction = engine.reference_catalog.construction_work_stats();
     let detached_index_persistent_node_reads = engine
         .portable_path_index
         .as_ref()
@@ -2329,27 +2179,11 @@ fn bootstrap_catalog_work_stats(engine: &ShardedHotEngine) -> BootstrapCatalogWo
                 .as_ref()
                 .map_or(0, |index| index.stats().reads),
         );
-    BootstrapCatalogWorkStats {
+    BootstrapIndexWorkStats {
         authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
         full_catalog_author_clones: engine.read_only_catalog_clones.get(),
         detached_index_persistent_node_reads,
         reference_fallback_document_reconstructions: reference.fallback_document_reconstructions,
-        reference_catalog_peak_resident_bytes: construction.peak_resident_bytes,
-        reference_catalog_buffer_flushes: construction.buffer_flushes,
-        reference_catalog_prepared_validations: construction.prepared_candidate_validations,
-        reference_catalog_full_delta_validations: construction.full_delta_validations,
-        reference_catalog_extraction_nanos: construction.extraction_nanos,
-        reference_catalog_posting_transition_publication_nanos: construction
-            .posting_transition_publication_nanos,
-        reference_catalog_facts_coverage_patricia_nanos: construction.facts_coverage_patricia_nanos,
-        reference_catalog_reverse_patricia_nanos: construction.reverse_patricia_nanos,
-        reference_catalog_facts_coverage_patricia_reads: construction.facts_coverage_patricia_reads,
-        reference_catalog_reverse_patricia_reads: construction.reverse_patricia_reads,
-        reference_catalog_prepared_sources: construction.prepared_sources,
-        reference_catalog_fact_updates: construction.fact_updates,
-        reference_catalog_reverse_updates: construction.reverse_updates,
-        reference_catalog_persistent_node_reads: construction.persistent_node_reads,
-        reference_catalog_persistent_node_writes: construction.persistent_node_writes,
     }
 }
 
@@ -2385,7 +2219,7 @@ impl DetachedBootstrapCandidate {
             DetachedBootstrapIndexDurability::Authored(completed) => {
                 let packed = completed
                     .packed_construction_stats()
-                    .expect("authored candidates retain four Patricia completions");
+                    .expect("authored candidates retain three Patricia completions");
                 Some(DetachedBootstrapPublicationStats {
                     immutable_publications: completed.publication_count(),
                     verified_existing_publications: completed.existing_publication_count(),
@@ -2429,8 +2263,8 @@ impl DetachedBootstrapCandidate {
     }
 
     #[cfg(test)]
-    pub(crate) fn bootstrap_catalog_work_stats(&self) -> BootstrapCatalogWorkStats {
-        bootstrap_catalog_work_stats(&self.engine)
+    pub(crate) fn bootstrap_index_work_stats(&self) -> BootstrapIndexWorkStats {
+        bootstrap_index_work_stats(&self.engine)
     }
 
     #[cfg(test)]
@@ -2490,10 +2324,6 @@ impl DetachedBootstrapCandidate {
                 "detached bootstrap candidate is not an exact quiescent durable predecessor".into(),
             ));
         }
-        engine
-            .reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         let (terminal_batch_id, terminal_evidence) = engine
             .accepted_batch_entry_at(u64::from(self.part_count))?
             .ok_or_else(|| {
@@ -2584,10 +2414,6 @@ impl DetachedBootstrapCandidate {
                     .into(),
             ));
         }
-        engine
-            .reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         let (terminal_batch_id, terminal_evidence) = engine
             .accepted_batch_entry_at(u64::from(self.part_count))?
             .ok_or_else(|| {
@@ -2656,7 +2482,7 @@ impl DetachedBootstrapCandidate {
 /// dependency queue, accepted-frontier working roots — and is destroyed with
 /// the session. The reference catalog is deliberately *not* isolated: its root
 /// is bound into every accepted cold history record, so it must be built in the
-/// same durable authenticated Patricia store the promoted runtime later opens.
+/// same durable content-addressed Patricia store the promoted runtime later opens.
 /// The caller therefore supplies an explicit
 /// [`BootstrapAuthoringCapability`] over the target archive.
 #[allow(dead_code)]
@@ -2671,6 +2497,7 @@ pub(crate) struct DetachedBootstrapAuthoringSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct DetachedBootstrapReplayIdentity {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -2680,7 +2507,9 @@ pub(crate) struct DetachedBootstrapReplayIdentity {
     archive_identity: super::object_store::ControlDirectoryIdentity,
 }
 
+#[cfg(test)]
 impl DetachedBootstrapReplayIdentity {
+    #[cfg(test)]
     pub(crate) fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
@@ -2699,6 +2528,7 @@ impl DetachedBootstrapReplayIdentity {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn storage(&self) -> ProjectionStorageBinding {
         self.storage
     }
@@ -2782,35 +2612,25 @@ impl DetachedBootstrapAuthoringSession {
                 "detached bootstrap authoring capability belongs to another workspace".into(),
             ));
         }
-        let (
-            publication,
-            reference_catalog,
-            portable_path_index,
-            logseq_claim_index,
-            page_name_index,
-            construction_resident_budget_bytes,
-        ) = if private_construction {
-            let (publication, indexes) = indexes
-                .begin_detached_authoring()
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            (
-                Some(publication),
-                indexes.reference_catalog(),
-                indexes.portable_path_index(),
-                indexes.logseq_claim_index(),
-                indexes.page_name_index(),
-                indexes.construction_resident_budget_bytes(),
-            )
-        } else {
-            (
-                None,
-                indexes.reference_catalog(),
-                indexes.portable_path_index(),
-                indexes.logseq_claim_index(),
-                indexes.page_name_index(),
-                super::authenticated_patricia::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
-            )
-        };
+        let (publication, portable_path_index, logseq_claim_index, page_name_index) =
+            if private_construction {
+                let (publication, indexes) = indexes
+                    .begin_detached_authoring()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                (
+                    Some(publication),
+                    indexes.portable_path_index(),
+                    indexes.logseq_claim_index(),
+                    indexes.page_name_index(),
+                )
+            } else {
+                (
+                    None,
+                    indexes.portable_path_index(),
+                    indexes.logseq_claim_index(),
+                    indexes.page_name_index(),
+                )
+            };
         let (scratch_root, scratch, block_claim_index) = match ephemeral_scratch {
             Some((scratch, block_claim_index)) => {
                 if scratch.workspace_id() != workspace_id {
@@ -2853,20 +2673,6 @@ impl DetachedBootstrapAuthoringSession {
         candidate.logseq_claim_index = Some(logseq_claim_index);
         candidate.page_name_index = Some(page_name_index);
         candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
-        if private_construction {
-            candidate
-                .reference_catalog
-                .attach_construction_store_with_budget(
-                    reference_catalog,
-                    construction_resident_budget_bytes,
-                )
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        } else {
-            candidate
-                .reference_catalog
-                .attach_store(reference_catalog)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
         Ok(Self {
             candidate: Some(candidate),
             scratch_root,
@@ -2954,10 +2760,10 @@ impl DetachedBootstrapAuthoringSession {
                     after_prepare.delta(before_prepare.as_ref().expect("trace snapshot exists")),
                 );
             }
+            candidate.configure_detached_bootstrap_terminal_plans(evidence)?;
             let before_advance =
                 trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
             let advance_started = trace_enabled.then(std::time::Instant::now);
-            candidate.configure_detached_bootstrap_reference_catalog(evidence)?;
             let (prepared, no_op, accepted_evidence) = candidate
                 .advance_authored_detached_bootstrap_candidate(
                     prepared,
@@ -2983,8 +2789,7 @@ impl DetachedBootstrapAuthoringSession {
                 accepted_evidence,
                 history_binding: candidate.durable_history_binding(),
                 logseq_claim_root: candidate.logseq_claim_root,
-                reference_catalog_policy: candidate.reference_catalog.policy().clone(),
-                reference_catalog_root: candidate.reference_catalog.root().clone(),
+                reference_catalog_policy: candidate.reference_catalog_policy.clone(),
             };
             Ok(DetachedBootstrapAuthoredPart {
                 prepared,
@@ -3011,7 +2816,7 @@ impl DetachedBootstrapAuthoringSession {
     }
 
     pub(crate) fn finish(self) -> Result<DetachedBootstrapCandidate, EngineError> {
-        let mut candidate = self.candidate.ok_or_else(|| {
+        let candidate = self.candidate.ok_or_else(|| {
             EngineError::InvalidTransaction(
                 "detached bootstrap authoring session is poisoned or consumed".into(),
             )
@@ -3025,17 +2830,6 @@ impl DetachedBootstrapAuthoringSession {
             ));
         }
         let trace_enabled = candidate.activation_trace_enabled;
-        let finish_started = trace_enabled.then(Instant::now);
-        let reference_construction = candidate
-            .reference_catalog
-            .finish_construction()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if let Some(started) = finish_started {
-            eprintln!(
-                "bootstrap finish reference catalog: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
         let portable_started = trace_enabled.then(Instant::now);
         let portable_path_construction = if let Some(index) = candidate.portable_path_index.as_ref()
         {
@@ -3081,8 +2875,7 @@ impl DetachedBootstrapAuthoringSession {
         }
         if trace_enabled {
             eprintln!(
-                "bootstrap construction stats: reference={:?} portable={:?} logseq={:?} page_names={:?}",
-                reference_construction.as_ref().map(|completed| completed.stats()),
+                "bootstrap construction stats: portable={:?} logseq={:?} page_names={:?}",
                 portable_path_construction
                     .as_ref()
                     .map(|completed| completed.stats()),
@@ -3097,17 +2890,15 @@ impl DetachedBootstrapAuthoringSession {
         let publication_started = trace_enabled.then(Instant::now);
         let index_durability = match self.publication {
             Some(publication) => {
-                let require_completion = |completion: Option<
-                    super::authenticated_patricia::CompletedPatriciaConstruction,
-                >| {
-                    completion.ok_or_else(|| {
-                        EngineError::Archive(
-                            "detached bootstrap Patricia construction is incomplete".into(),
-                        )
-                    })
-                };
+                let require_completion =
+                    |completion: Option<super::content_patricia::CompletedPatriciaConstruction>| {
+                        completion.ok_or_else(|| {
+                            EngineError::Archive(
+                                "detached bootstrap Patricia construction is incomplete".into(),
+                            )
+                        })
+                    };
                 let packed_constructions = [
-                    require_completion(reference_construction)?,
                     require_completion(portable_path_construction)?,
                     require_completion(logseq_claim_construction)?,
                     require_completion(page_name_construction)?,
@@ -3174,7 +2965,7 @@ impl DetachedBootstrapAuthoringSession {
                     "direct-loaded bootstrap part changes aggregate continuity".into(),
                 ));
             }
-            candidate.configure_detached_bootstrap_reference_catalog(evidence)?;
+            candidate.configure_detached_bootstrap_terminal_plans(evidence)?;
             let (no_op, accepted_evidence) =
                 candidate.advance_detached_bootstrap_candidate(prepared)?;
             Ok(DetachedBootstrapAcceptedEngineMaterial {
@@ -3182,8 +2973,7 @@ impl DetachedBootstrapAuthoringSession {
                 accepted_evidence,
                 history_binding: candidate.durable_history_binding(),
                 logseq_claim_root: candidate.logseq_claim_root,
-                reference_catalog_policy: candidate.reference_catalog.policy().clone(),
-                reference_catalog_root: candidate.reference_catalog.root().clone(),
+                reference_catalog_policy: candidate.reference_catalog_policy.clone(),
             })
         })();
         match result {
@@ -3213,6 +3003,7 @@ impl DetachedBootstrapAuthoringSession {
     }
 }
 
+#[cfg(test)]
 fn replay_direct_loaded_bootstrap_with<F>(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -3241,7 +3032,7 @@ where
     }
     // Replay reproduces the accepted roots the installed cold records bind, so
     // it must use the same durable construction authoring used: this exact
-    // archive's authenticated Patricia stores.
+    // archive's content-addressed Patricia stores.
     let indexes = store
         .bootstrap_authoring_capability()
         .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -3284,6 +3075,7 @@ where
     Ok(candidate)
 }
 
+#[cfg(test)]
 pub(crate) fn replay_direct_loaded_bootstrap(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -3292,6 +3084,7 @@ pub(crate) fn replay_direct_loaded_bootstrap(
     replay_direct_loaded_bootstrap_with(store, publication, preparation, None, |_, _| Ok(()))
 }
 
+#[cfg(test)]
 pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -3328,174 +3121,6 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
         },
     )?;
     Ok((candidate, terminal_history_binding))
-}
-
-/// Reconstruct a promoted bootstrap directly into the enrolled archive's
-/// disposable scratch namespace and seal it for one immediate enrolled open.
-///
-/// This is deliberately separate from retained resume migration: a retention
-/// policy that selected `Ephemeral` has denied permission to mint another
-/// retained run. The returned capability therefore cannot be serialized,
-/// cloned, published, or revived after this process; it only lets the current
-/// open avoid replaying an already authenticated bootstrap prefix a second
-/// time.
-pub(crate) fn replay_promoted_bootstrap_into_ephemeral_predecessor(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    storage: ProjectionStorageBinding,
-    history: &super::object_store::DurableEngineHistoryStore,
-    history_root: ContentDigest,
-    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-    live_history: super::object_store::EngineHistoryAuthority,
-) -> Result<Box<EphemeralBootstrapPredecessor>, EngineError> {
-    let terminal = publication
-        .aggregate()
-        .parts()
-        .last()
-        .copied()
-        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
-    let bytes = history
-        .lookup(history_root, terminal.batch_id())
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        .ok_or_else(|| {
-            EngineError::Archive(
-                "promoted bootstrap terminal record is absent from durable history".into(),
-            )
-        })?;
-    let record = decode_history_record(terminal.batch_id(), &bytes)?;
-    if record.generation != u64::from(bootstrap.part_count())
-        || record.bootstrap != Some(bootstrap)
-        || !matches!(record.status, ArchiveStatus::Accepted { .. })
-    {
-        return Err(EngineError::Archive(
-            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
-        ));
-    }
-    let terminal_binding = history_record_binding(&record);
-    let replay_identity = DetachedBootstrapReplayIdentity::new(
-        workspace_id,
-        lineage_digest,
-        catalog_document_id,
-        record.reference_catalog_policy,
-        storage,
-        store
-            .canonical_archive_identity()
-            .map_err(|error| EngineError::Archive(error.to_string()))?,
-    );
-    let (scratch, block_claim_index) = store
-        .start_engine_scratch()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let candidate = replay_direct_loaded_bootstrap_with(
-        store,
-        publication,
-        &replay_identity,
-        Some((scratch, Arc::new(block_claim_index))),
-        |descriptor, material| {
-            let found = history
-                .lookup(history_root, descriptor.batch_id())
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "fresh history is missing an aggregate-bound cold record".into(),
-                    )
-                })?;
-            let replayed = validate_bootstrap_history_record_against_material(
-                descriptor, &found, bootstrap, material,
-            )?;
-            if replayed != terminal_binding && descriptor == terminal {
-                return Err(EngineError::Archive(
-                    "ephemeral bootstrap replay changed the terminal history binding".into(),
-                ));
-            }
-            Ok(())
-        },
-    )?;
-    candidate.seal_ephemeral_bootstrap_predecessor(
-        live_history,
-        terminal.batch_id(),
-        &terminal_binding,
-        lineage_digest,
-        catalog_document_id,
-    )
-}
-
-/// Reconstruct a promoted bootstrap into one detached candidate, deriving the
-/// catalog policy from the authenticated terminal bootstrap record.
-///
-/// This is the restart counterpart of same-process promotion. It avoids the
-/// ordinary enrolled engine's per-part cold recovery path while preserving the
-/// same immutable-part and durable-history checks. The finished candidate is
-/// still only an accelerator; callers migrate it into a resume snapshot and
-/// the enrolled open authenticates that snapshot before replaying any records
-/// written after the bootstrap anchor.
-pub(crate) fn replay_promoted_bootstrap_validating_history(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    storage: ProjectionStorageBinding,
-    history: &super::object_store::DurableEngineHistoryStore,
-    history_root: ContentDigest,
-    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-) -> Result<
-    (
-        DetachedBootstrapCandidate,
-        super::object_store::EngineHistoryBinding,
-    ),
-    EngineError,
-> {
-    let terminal = publication
-        .aggregate()
-        .parts()
-        .last()
-        .copied()
-        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
-    let bytes = history
-        .lookup(history_root, terminal.batch_id())
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        .ok_or_else(|| {
-            EngineError::Archive(
-                "promoted bootstrap terminal record is absent from durable history".into(),
-            )
-        })?;
-    let record = decode_history_record(terminal.batch_id(), &bytes)?;
-    if record.generation != u64::from(bootstrap.part_count())
-        || record.bootstrap != Some(bootstrap)
-        || !matches!(record.status, ArchiveStatus::Accepted { .. })
-    {
-        return Err(EngineError::Archive(
-            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
-        ));
-    }
-    let terminal_binding = history_record_binding(&record);
-    let replay_identity = DetachedBootstrapReplayIdentity::new(
-        workspace_id,
-        lineage_digest,
-        catalog_document_id,
-        record.reference_catalog_policy,
-        storage,
-        store
-            .canonical_archive_identity()
-            .map_err(|error| EngineError::Archive(error.to_string()))?,
-    );
-    let (candidate, replayed_terminal_binding) = replay_direct_loaded_bootstrap_validating_history(
-        store,
-        publication,
-        &replay_identity,
-        history,
-        history_root,
-        bootstrap,
-    )?;
-    if replayed_terminal_binding != terminal_binding {
-        return Err(EngineError::Archive(
-            "detached bootstrap replay changed the terminal history binding".into(),
-        ));
-    }
-    Ok((candidate, terminal_binding))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3598,11 +3223,44 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) completion: Option<ProjectionCompletion>,
     pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
     pub(crate) managed_local_authority: Option<(u64, BatchId)>,
-    /// This predecessor was reproved from the authenticated completed-path
-    /// authority and the live file, rather than from an old receipt base.
-    /// Finalization repeats the same live-layout proof, not a canonical
-    /// historical re-render that could reject harmless preserved trivia.
-    pub(crate) receipt_backed_live_authority: bool,
+    /// The exact latest source-endpoint work row reconstructed from accepted
+    /// clean manifests. It is a run-local proof handle, not durable queue
+    /// state; finalization re-derives and compares the current head.
+    pub(crate) clean_manifest_authority: Option<ProjectionWork>,
+}
+
+/// Exact current graph-projection predecessor for the clean
+/// baseline-plus-manifest runtime.  The value is reconstructed from immutable
+/// authority on demand; it is deliberately not a second persistent path
+/// index.  External reconciliation consumes it to preserve the established
+/// page/block matching semantics without reopening `ProjectionWorkIndex`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CleanImportProjectionPredecessor {
+    Present {
+        page: MaterializedPage,
+        bytes: Vec<u8>,
+        intent: ProjectionIntent,
+        completion: ProjectionCompletion,
+        from_baseline: bool,
+    },
+    Released {
+        prior_page_id: PageId,
+        intent: ProjectionIntent,
+        completion: ProjectionCompletion,
+    },
+}
+
+/// Exact bytes expected at one clean-runtime projection path while deciding
+/// whether an external observation needs semantic reconciliation.
+///
+/// This deliberately carries no mutation authority.  A changed path still
+/// goes through `clean_import_projection_predecessor`, which performs the
+/// complete semantic proof before authoring.  The watcher only needs a
+/// no-false-negative byte comparison, so making every unchanged page replay
+/// its parser and projection plan is both redundant and prohibitively slow.
+pub(crate) enum CleanObservedProjection {
+    Present(Vec<u8>),
+    Released,
 }
 
 impl CapabilityCapturedPriorProjection {
@@ -3611,12 +3269,14 @@ impl CapabilityCapturedPriorProjection {
             &self.completion,
             self.bootstrap_owner_binding,
             self.managed_local_authority,
-            self.receipt_backed_live_authority,
+            &self.clean_manifest_authority,
         ) {
-            (Some(completion), None, None, _) => completion
+            (Some(completion), None, None, None) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None, false) | (None, None, Some(_), false) => Ok(()),
+            (None, Some(_), None, None)
+            | (None, None, Some(_), None)
+            | (None, None, None, Some(_)) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3687,8 +3347,6 @@ pub struct CapabilityCapturedProjectionInput {
     receipt_store_id: super::ProjectionReceiptStoreId,
     state: CapabilityCapturedProjectionState,
     material: CapabilityCapturedProjectionMaterial,
-    draft_completed_path: Option<Vec<super::ProjectionCompletedReceipt>>,
-    draft_completed_receipts: Option<Vec<(ProjectionIntent, ProjectionCompletion)>>,
 }
 
 impl CapabilityCapturedProjectionInput {
@@ -3715,7 +3373,7 @@ impl CapabilityCapturedProjectionInput {
                     completion: Some(prior_completion.clone()),
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
-                    receipt_backed_live_authority: false,
+                    clean_manifest_authority: None,
                 }),
             },
         };
@@ -3725,8 +3383,6 @@ impl CapabilityCapturedProjectionInput {
             receipt_store_id,
             state,
             material,
-            draft_completed_path: None,
-            draft_completed_receipts: None,
         }
     }
 
@@ -3765,8 +3421,6 @@ impl CapabilityCapturedProjectionInput {
             receipt_store_id,
             state,
             material,
-            draft_completed_path: None,
-            draft_completed_receipts: None,
         }
     }
 
@@ -3897,7 +3551,7 @@ impl CaptureSealedPendingLocalPredecessor {
         };
         if prior.completion.is_some()
             || prior.bootstrap_owner_binding.is_some()
-            || prior.receipt_backed_live_authority
+            || prior.clean_manifest_authority.is_some()
             || before.page.page_id != requirement.page_id
             || before.page.path != requirement.path
             || current != Some(prior.bytes.as_slice())
@@ -4039,6 +3693,21 @@ fn affine_before_projection_frontier_documents_are_exact(
             == BTreeSet::from([page_home_document_id, catalog_document_id])
 }
 
+fn projection_frontiers_match_except_catalog(
+    current: &FrontierV2,
+    retained: &FrontierV2,
+    catalog_document_id: DocumentId,
+) -> bool {
+    current
+        .documents()
+        .iter()
+        .filter(|document| document.document_id() != catalog_document_id)
+        .eq(retained
+            .documents()
+            .iter()
+            .filter(|document| document.document_id() != catalog_document_id))
+}
+
 fn capture_sealed_pending_local_predecessor_enabled() -> bool {
     #[cfg(test)]
     {
@@ -4073,7 +3742,6 @@ pub struct AcceptedBatchEvidence {
     prior_frontier_root: AcceptedFrontierRoot,
     post_frontier_root: AcceptedFrontierRoot,
     affected_documents: Vec<DocumentDependencies>,
-    reference_catalog_delta: ReferenceCatalogDeltaV2,
 }
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
@@ -4098,7 +3766,7 @@ pub struct AcceptedFrontierRoot {
     // causal dot, and authenticated sparse-clock root.
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
-    reference_catalog_root: ReferenceCatalogRootV2,
+    genesis: Option<LazyGenesisFrontierBindingV1>,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 }
@@ -4123,7 +3791,7 @@ pub(crate) struct AcceptedFrontierIdentity<'a> {
     document_map_root_digest: &'a ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: &'a ContentDigest,
-    reference_catalog_root: &'a ReferenceCatalogRootV2,
+    genesis: &'a Option<LazyGenesisFrontierBindingV1>,
     state_digest: &'a ContentDigest,
 }
 
@@ -4147,7 +3815,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest: &self.document_map_root_digest,
             batch_map_root_key: self.batch_map_root_key,
             batch_map_root_digest: &self.batch_map_root_digest,
-            reference_catalog_root: &self.reference_catalog_root,
+            genesis: &self.genesis,
             state_digest: &self.state_digest,
         }
     }
@@ -4182,7 +3850,6 @@ impl AcceptedBatchEvidence {
         let (batch_map_root_key, batch_map_root_digest) =
             authenticated_map_root(&accepted_batch_entries)
                 .expect("canonical test authenticated batch map");
-        let reference_catalog_root = prior_frontier_root.reference_catalog_root.clone();
         let post_frontier_root = next_accepted_frontier_root(
             &prior_frontier_root,
             event_binding_digest,
@@ -4194,7 +3861,6 @@ impl AcceptedBatchEvidence {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
-            reference_catalog_root.clone(),
             None,
         )
         .expect("canonical test accepted-frontier transition");
@@ -4207,9 +3873,6 @@ impl AcceptedBatchEvidence {
             prior_frontier_root,
             post_frontier_root,
             affected_documents,
-            reference_catalog_delta: ReferenceCatalogDeltaV2::empty_transition(
-                reference_catalog_root,
-            ),
         }
     }
 
@@ -4260,10 +3923,6 @@ impl AcceptedBatchEvidence {
         &self.affected_documents
     }
 
-    pub const fn reference_catalog_delta(&self) -> &ReferenceCatalogDeltaV2 {
-        &self.reference_catalog_delta
-    }
-
     pub(crate) fn validate(&self) -> Result<(), EngineError> {
         validate_accepted_evidence(self)
     }
@@ -4290,7 +3949,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest: ContentDigest::of(b"saturated document map"),
             batch_map_root_key: Some([0xff; 16]),
             batch_map_root_digest: ContentDigest::of(b"saturated batch map"),
-            reference_catalog_root: empty_accepted_frontier_root().reference_catalog_root,
+            genesis: None,
             state_digest: ContentDigest::of(b"saturated frontier state"),
             scratch_root: Some(super::scratch_store::ScratchLsmRoot::saturated_for_test(
                 key_bytes,
@@ -4330,6 +3989,10 @@ impl AcceptedFrontierRoot {
         self.state_digest
     }
 
+    pub(crate) const fn genesis(&self) -> Option<LazyGenesisFrontierBindingV1> {
+        self.genesis
+    }
+
     /// This root without its run-local scratch-store reference.
     ///
     /// `scratch_root` says *where* this run keeps the frontier's maps; it is
@@ -4344,10 +4007,6 @@ impl AcceptedFrontierRoot {
         normalized
     }
 
-    pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {
-        &self.reference_catalog_root
-    }
-
     pub(crate) const fn has_persistent_point_index(&self) -> bool {
         self.scratch_root.is_some()
     }
@@ -4359,7 +4018,7 @@ impl AcceptedFrontierRoot {
     /// offset legitimately differs between two runs over the identical accepted
     /// history — exactly as durable history-record validation already treats
     /// accepted evidence and the catalog checkpoint. Every authenticated field,
-    /// including `state_digest` and the reference-catalog root, is compared.
+    /// including `state_digest`, is compared.
     pub(crate) fn same_accepted_authority(&self, other: &Self) -> bool {
         let Self {
             schema_version,
@@ -4370,7 +4029,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
-            reference_catalog_root,
+            genesis,
             state_digest,
             scratch_root: _,
         } = self;
@@ -4382,7 +4041,7 @@ impl AcceptedFrontierRoot {
             && *document_map_root_digest == other.document_map_root_digest
             && *batch_map_root_key == other.batch_map_root_key
             && *batch_map_root_digest == other.batch_map_root_digest
-            && *reference_catalog_root == other.reference_catalog_root
+            && *genesis == other.genesis
             && *state_digest == other.state_digest
     }
 
@@ -4406,7 +4065,6 @@ impl AcceptedFrontierRoot {
             post.document_map_root_digest,
             post.batch_map_root_key,
             post.batch_map_root_digest,
-            post.reference_catalog_root.clone(),
             post.scratch_root.clone(),
         )? == *post)
     }
@@ -4499,14 +4157,12 @@ enum StatusHistorySource {
     Failed(EngineError),
     Cold {
         store: Arc<super::object_store::DurableEngineHistoryStore>,
-        catalog_store: Option<Arc<ReferenceCatalogStore>>,
         through_generation: u64,
         history_root: ContentDigest,
         active: Vec<ColdHistoryRecord>,
     },
     DurableAndScratch {
         history_store: Arc<super::object_store::DurableEngineHistoryStore>,
-        catalog_store: Option<Arc<ReferenceCatalogStore>>,
         through_generation: u64,
         history_root: ContentDigest,
         scratch_store: Arc<ScratchStore>,
@@ -4525,34 +4181,24 @@ impl StatusHistorySource {
             Self::Failed(error) => return Err(error.clone()),
             Self::Cold {
                 store,
-                catalog_store,
                 through_generation,
                 history_root,
                 active,
             } => {
-                let mut records = validated_history_records(
-                    store,
-                    catalog_store.as_deref(),
-                    *through_generation,
-                    *history_root,
-                )?;
+                let mut records =
+                    validated_history_records(store, *through_generation, *history_root)?;
                 records.extend(active.iter().cloned());
                 records
             }
             Self::DurableAndScratch {
                 history_store,
-                catalog_store,
                 through_generation,
                 history_root,
                 scratch_store,
                 scratch_roots,
             } => {
-                let durable = validated_history_records(
-                    history_store,
-                    catalog_store.as_deref(),
-                    *through_generation,
-                    *history_root,
-                )?;
+                let durable =
+                    validated_history_records(history_store, *through_generation, *history_root)?;
                 let scratch = super::dependency_queue::all_records(scratch_store, scratch_roots)
                     .map_err(|error| EngineError::Archive(error.to_string()))?
                     .into_iter()
@@ -4588,8 +4234,6 @@ impl StatusHistorySource {
                             page_names: super::object_store::PageNameDurableBinding::empty(),
                             logseq_claim_root: LogseqClaimIndexRoot::empty(),
                             reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
-                            reference_catalog_root: empty_accepted_frontier_root()
-                                .reference_catalog_root,
                             status,
                         })
                     })
@@ -4636,8 +4280,6 @@ impl StatusHistorySource {
                         page_names: super::object_store::PageNameDurableBinding::empty(),
                         logseq_claim_root: LogseqClaimIndexRoot::empty(),
                         reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
-                        reference_catalog_root: empty_accepted_frontier_root()
-                            .reference_catalog_root,
                         status,
                     })
                 })
@@ -4750,7 +4392,6 @@ struct ColdHistoryRecord {
     page_names: super::object_store::PageNameDurableBinding,
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog_root: ReferenceCatalogRootV2,
     status: ArchiveStatus,
 }
 
@@ -4770,7 +4411,6 @@ struct CurrentDurableAuthorityProof {
     history: super::object_store::EngineHistoryAuthority,
     latest_batch_id: BatchId,
     record: ColdHistoryRecord,
-    reference_catalog_root_nodes: AuthenticatedReferenceCatalogRootNodes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4986,6 +4626,9 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
     /// engine's current claim authority. Historical roots can reuse document
     /// loading, but must resolve claims through the current fallback.
     current_claim_root_proven: bool,
+    /// Sequence-zero candidates retained only while rebuilding disposable
+    /// SQLite for a clean lazy-genesis runtime.
+    rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
     catalog: LoroDoc,
     catalog_version: DecodedDocumentVersion,
     catalog_dependencies: DocumentDependencies,
@@ -5000,6 +4643,7 @@ impl BootstrapBulkMaterializer<'_> {
         self.exact_document_loads.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn projection_claim_resolution_stats(
         &self,
     ) -> BootstrapProjectionClaimResolutionStats {
@@ -5021,6 +4665,36 @@ impl BootstrapBulkMaterializer<'_> {
                     session.borrow().stats()
                 }),
         )
+    }
+
+    /// Enumerate compact current path rows from the catalog this terminal
+    /// materializer has already authenticated and decoded. Clean lazy-genesis
+    /// rebuilds use this instead of retaining or rebuilding the legacy
+    /// current-path Patricia catalog merely to discover which pages to lower
+    /// into disposable SQLite.
+    pub(crate) fn terminal_current_path_rows(
+        &self,
+    ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
+        if DecodedDocumentVersion::of(&self.catalog) != self.catalog_version {
+            return Err(EngineError::Archive(
+                "terminal catalog changed while deriving current path rows".into(),
+            ));
+        }
+        read_all_pages(&self.catalog).map(|pages| {
+            pages
+                .into_iter()
+                .filter_map(|(page_id, state)| {
+                    current_path_catalog_row_from_page_state(&state).map(|state| {
+                        CurrentPathCatalogRow {
+                            page_id,
+                            path: state.path,
+                            kind: state.kind,
+                            accepted_name_digest: state.accepted_name_digest,
+                        }
+                    })
+                })
+                .collect()
+        })
     }
 
     fn materialize_chunk(&self, page_ids: &[PageId]) -> Result<BootstrapBulkChunk, EngineError> {
@@ -5233,16 +4907,12 @@ impl BootstrapBulkMaterializer<'_> {
         if !self.current_claim_root_proven {
             return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
         }
-        let record = self
-            .engine
-            .logseq_claim_record(self.engine.logseq_claim_root, logseq_uuid)?;
-        let participants: Vec<_> = record
-            .introductions
-            .iter()
-            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
         if participants.is_empty() {
             return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
         }
@@ -5255,17 +4925,24 @@ impl BootstrapBulkMaterializer<'_> {
         }
 
         let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
-        let resolution = self.engine.resolve_logseq_uuid_from_document_lookup(
-            logseq_uuid,
-            &evidence,
-            |document_id| {
-                if document_id == self.engine.catalog_document_id {
-                    Some(&self.catalog)
-                } else {
-                    documents.get(&document_id).map(|(_, document)| document)
-                }
-            },
-        )?;
+        let validated_catalog = ValidatedCatalogDocument {
+            catalog_document_id: self.engine.catalog_document_id,
+            document: &self.catalog,
+        };
+        let resolution = self
+            .engine
+            .resolve_logseq_uuid_from_document_lookup_with_page_state(
+                logseq_uuid,
+                &evidence,
+                |document_id| {
+                    if document_id == self.engine.catalog_document_id {
+                        Some(&self.catalog)
+                    } else {
+                        documents.get(&document_id).map(|(_, document)| document)
+                    }
+                },
+                |page_id| read_validated_catalog_page(validated_catalog, page_id),
+            )?;
         let dependencies = evidence
             .participants()
             .iter()
@@ -5294,7 +4971,26 @@ impl BootstrapBulkMaterializer<'_> {
         ),
         EngineError,
     > {
-        let (resolution, evidence, homes) = self.engine.resolve_logseq_uuid_current(logseq_uuid)?;
+        // A current-root materializer proved this immutable catalog once, and
+        // `materialize_chunk` rechecked its decoded version immediately before
+        // this projection pass. Reuse that window for cross-page UUID claims.
+        // A historical materializer must still ask the current engine for its
+        // current catalog rather than treating the historical page set as live.
+        let catalog = self
+            .current_claim_root_proven
+            .then_some(ValidatedCatalogDocument {
+                catalog_document_id: self.engine.catalog_document_id,
+                document: &self.catalog,
+            });
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
+        let (resolution, evidence, homes) = self
+            .engine
+            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)?;
         let dependencies = homes
             .into_iter()
             .map(|(home_document_id, home)| {
@@ -5400,20 +5096,12 @@ impl BootstrapBulkMaterializer<'_> {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut bulk.page)?;
         }
+        frontier_documents.insert(
+            self.engine.catalog_document_id,
+            self.engine
+                .current_hot_document_dependencies_by_id(self.engine.catalog_document_id)?,
+        );
         let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
-        let (frontier, effective_closure) = match self.engine.page_stable_projection_frontier(
-            &mut bulk.page,
-            &frontier,
-            &claim_evidence,
-            effective_selection.as_ref(),
-            effective_transition.as_ref(),
-        )? {
-            Some((stable, closure)) => (stable, closure),
-            None => (frontier, None),
-        };
-        if effective_closure.is_some() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
         Ok(ProjectionPageState {
             page: bulk.page,
             frontier,
@@ -5610,6 +5298,123 @@ pub struct ProjectionPageState {
     pub claim_evidence: Vec<ProjectionClaimEvidence>,
 }
 
+/// Candidate source for the current external-UUID identity frontier.
+///
+/// The clean runtime deliberately has no native Patricia identity indexes.
+/// Its disposable SQLite projection therefore supplies bounded candidates;
+/// the engine still loads and validates the current CRDT documents before a
+/// candidate can authorize projection or publication.
+pub(crate) trait ProjectionClaimSource {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError>;
+
+    /// Return the exact baseline owner for one path, when this source carries
+    /// path facts. A clean suffix remains authoritative for any occupied,
+    /// released, or colliding key; this bounded baseline lookup is consulted
+    /// only when the suffix has no event for the key at all.
+    fn exact_page_owner(&self, _path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
+        Ok(None)
+    }
+}
+
+/// Rebuild-local copy of the sequence-zero external-UUID candidate rows.
+///
+/// Clean lazy genesis deliberately omits a resident identity index. A terminal
+/// SQLite rebuild still needs the complete baseline candidate set while it
+/// lowers authenticated CRDT pages, including ambiguous claims that must not
+/// authorize either block. This snapshot exists only for that one rebuild and
+/// is dropped with its materializer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RebuildProjectionClaimSnapshot {
+    participants: BTreeMap<LogseqUuid, Vec<ProjectionClaimParticipant>>,
+}
+
+impl RebuildProjectionClaimSnapshot {
+    fn from_lazy_genesis(candidate: &LazyGenesisCandidate) -> Result<Self, EngineError> {
+        let mut participants = BTreeMap::<LogseqUuid, BTreeSet<ProjectionClaimParticipant>>::new();
+        for page_id in candidate.page_ids() {
+            let page = candidate
+                .page(page_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "lazy-genesis page disappeared while deriving rebuild UUID candidates"
+                            .into(),
+                    )
+                })?;
+            for block in page.blocks {
+                for logseq_uuid in block.external_uuid_claims {
+                    participants.entry(logseq_uuid).or_default().insert(
+                        ProjectionClaimParticipant::new(block.block_id, block.home_document_id),
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            participants: participants
+                .into_iter()
+                .map(|(uuid, participants)| (uuid, participants.into_iter().collect()))
+                .collect(),
+        })
+    }
+}
+
+impl ProjectionClaimSource for RebuildProjectionClaimSnapshot {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        Ok(self
+            .participants
+            .get(&logseq_uuid)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        let rows = self
+            .logseq_uuid_introductions(
+                logseq_uuid,
+                super::sqlite_materialization::MAX_MATERIALIZATION_QUERY_ROWS,
+            )
+            .map_err(|error| {
+                EngineError::ProjectionManifest(format!(
+                    "clean SQLite Logseq UUID candidate lookup failed: {error}"
+                ))
+            })?;
+        if rows.len() == super::sqlite_materialization::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(EngineError::ProjectionManifest(
+                "clean SQLite Logseq UUID candidate lookup reached its bounded row limit".into(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectionClaimParticipant::new(row.block_id, row.home_document_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
+    fn exact_page_owner(&self, path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
+        let rows = self.pages_by_path(path, 2).map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "clean SQLite exact-path owner lookup failed: {error}"
+            ))
+        })?;
+        Ok(match rows.as_slice() {
+            [page] if page.path == *path => Some(page.page_id),
+            [] | [_, ..] => None,
+        })
+    }
+}
+
 /// Engine-issued proof that projection state came from accepted durable
 /// batches at the exact returned frontier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5658,6 +5463,42 @@ impl ProjectionTombstoneAuthorization {
     pub(crate) fn frontier(&self) -> &FrontierV2 {
         &self.frontier
     }
+}
+
+/// Outcome of authorizing one receiver-local deletion on the clean runtime.
+///
+/// Every arm is a convergent answer. A deletion is applied, is proven already
+/// overtaken by later accepted work, or is deferred with a named reason — it
+/// is never a refusal without a scenario.
+pub(crate) enum CleanTombstoneAuthorization {
+    /// Remove the page's exact path.
+    Authorized(Box<ProjectionTombstoneAuthorization>),
+    /// Later accepted work owns the exact path this deletion releases, so the
+    /// intent is historical evidence only. Completing it without touching the
+    /// file is the convergent outcome: the current owner projects that path.
+    Superseded(CleanTombstoneSupersession),
+    /// Nothing is wrong, but this device cannot answer yet. The caller retains
+    /// a continuation, the batch stays `DurablePending`, and `clean_shutdown`
+    /// keeps refusing `Safe` while naming the retained batch.
+    Deferred(CleanTombstoneDeferral),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanTombstoneSupersession {
+    /// A live page owns the exact path in the current accepted projection.
+    PathIsOwned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanTombstoneDeferral {
+    /// The batch carrying the intent has not finished arriving.
+    BatchNotArchiveReady,
+    /// The batch carrying the intent is not accepted by this runtime yet.
+    BatchNotAccepted,
+    /// A declared frontier head has not become durable on this device.
+    FrontierNotDurable,
+    /// The disposable SQLite projection has not reached the accepted frontier.
+    SqliteBehindAcceptedFrontier,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5769,7 +5610,7 @@ struct BootstrapAuthoringTraceSnapshot {
     visible_document_heads: usize,
     detached_manifests: usize,
     #[cfg(test)]
-    catalog_work: BootstrapCatalogWorkStats,
+    index_work: BootstrapIndexWorkStats,
 }
 
 impl BootstrapAuthoringTraceSnapshot {
@@ -5783,7 +5624,7 @@ impl BootstrapAuthoringTraceSnapshot {
             visible_document_heads: engine.visible_document_heads.len(),
             detached_manifests: engine.detached_accepted_manifests.len(),
             #[cfg(test)]
-            catalog_work: bootstrap_catalog_work_stats(engine),
+            index_work: bootstrap_index_work_stats(engine),
         }
     }
 
@@ -5837,63 +5678,23 @@ impl BootstrapAuthoringTraceSnapshot {
         #[cfg(test)]
         let delta = {
             let mut delta = delta;
-            let before_catalog_work = before.catalog_work;
+            let before_index_work = before.index_work;
             delta.push_str(&format!(
-                " page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} reference_extraction_us={} reference_posting_transition_publication_us={} reference_facts_coverage_patricia_us={} reference_reverse_patricia_us={} reference_facts_coverage_reads={} reference_reverse_reads={} reference_sources={} reference_fact_updates={} reference_reverse_updates={} reference_persistent_node_reads={} reference_persistent_node_writes={}",
-            self.catalog_work
+                " page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} detached_index_persistent_node_reads={}",
+            self.index_work
                 .authenticated_page_identity_lookups
-                .saturating_sub(before_catalog_work.authenticated_page_identity_lookups),
-            self.catalog_work
+                .saturating_sub(before_index_work.authenticated_page_identity_lookups),
+            self.index_work
                 .full_catalog_author_clones
-                .saturating_sub(before_catalog_work.full_catalog_author_clones),
-            self.catalog_work
+                .saturating_sub(before_index_work.full_catalog_author_clones),
+            self.index_work
                 .reference_fallback_document_reconstructions
                 .saturating_sub(
-                    before_catalog_work.reference_fallback_document_reconstructions,
+                    before_index_work.reference_fallback_document_reconstructions,
                 ),
-            self.catalog_work
-                .reference_catalog_extraction_nanos
-                .saturating_sub(before_catalog_work.reference_catalog_extraction_nanos)
-                / 1_000,
-            self.catalog_work
-                .reference_catalog_posting_transition_publication_nanos
-                .saturating_sub(
-                    before_catalog_work.reference_catalog_posting_transition_publication_nanos,
-                )
-                / 1_000,
-            self.catalog_work
-                .reference_catalog_facts_coverage_patricia_nanos
-                .saturating_sub(
-                    before_catalog_work.reference_catalog_facts_coverage_patricia_nanos,
-                )
-                / 1_000,
-            self.catalog_work
-                .reference_catalog_reverse_patricia_nanos
-                .saturating_sub(before_catalog_work.reference_catalog_reverse_patricia_nanos)
-                / 1_000,
-            self.catalog_work
-                .reference_catalog_facts_coverage_patricia_reads
-                .saturating_sub(
-                    before_catalog_work.reference_catalog_facts_coverage_patricia_reads,
-                ),
-            self.catalog_work
-                .reference_catalog_reverse_patricia_reads
-                .saturating_sub(before_catalog_work.reference_catalog_reverse_patricia_reads),
-            self.catalog_work
-                .reference_catalog_prepared_sources
-                .saturating_sub(before_catalog_work.reference_catalog_prepared_sources),
-            self.catalog_work
-                .reference_catalog_fact_updates
-                .saturating_sub(before_catalog_work.reference_catalog_fact_updates),
-            self.catalog_work
-                .reference_catalog_reverse_updates
-                .saturating_sub(before_catalog_work.reference_catalog_reverse_updates),
-            self.catalog_work
-                .reference_catalog_persistent_node_reads
-                .saturating_sub(before_catalog_work.reference_catalog_persistent_node_reads),
-            self.catalog_work
-                .reference_catalog_persistent_node_writes
-                .saturating_sub(before_catalog_work.reference_catalog_persistent_node_writes),
+            self.index_work
+                .detached_index_persistent_node_reads
+                .saturating_sub(before_index_work.detached_index_persistent_node_reads),
             ));
             delta
         };
@@ -6231,64 +6032,6 @@ impl fmt::Display for RetainedScratchResumeFailure {
     }
 }
 
-/// The complete authenticated Patricia inventory owned by a store-backed hot
-/// engine. Keeping this closed list beside the shared builder makes adding a
-/// fifth store impossible without updating both ordinary ownership and
-/// maintenance accounting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AuthenticatedPatriciaIndexKind {
-    LogseqUuidClaims,
-    PortablePaths,
-    PageNames,
-    ReferenceCatalog,
-}
-
-impl AuthenticatedPatriciaIndexKind {
-    const ALL: [Self; 4] = [
-        Self::LogseqUuidClaims,
-        Self::PortablePaths,
-        Self::PageNames,
-        Self::ReferenceCatalog,
-    ];
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PackedPatriciaMaintenanceOutcome {
-    Reclaimed(PatriciaIndexReclamationReport),
-    Busy,
-    Unavailable(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PackedPatriciaIndexMaintenance {
-    pub(crate) kind: AuthenticatedPatriciaIndexKind,
-    pub(crate) outcome: PackedPatriciaMaintenanceOutcome,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PackedPatriciaMaintenanceReport {
-    pub(crate) indexes: [PackedPatriciaIndexMaintenance; 4],
-}
-
-struct AuthenticatedPatriciaIndexes<'a> {
-    stores: [Option<&'a PatriciaIndexStore>; 4],
-}
-
-impl<'a> AuthenticatedPatriciaIndexes<'a> {
-    fn iter(
-        &'a self,
-    ) -> impl Iterator<
-        Item = (
-            AuthenticatedPatriciaIndexKind,
-            Option<&'a PatriciaIndexStore>,
-        ),
-    > + 'a {
-        AuthenticatedPatriciaIndexKind::ALL
-            .into_iter()
-            .zip(self.stores.iter().copied())
-    }
-}
-
 /// The exact run-local engine state one cross-process resume needs.
 ///
 /// **Derivation.** `reconstruct_run_local_state` is the same-process
@@ -6491,7 +6234,6 @@ fn accepted_frontier_cross_run_facts(
     ContentDigest,
     Option<[u8; 16]>,
     ContentDigest,
-    &ReferenceCatalogRootV2,
 ) {
     (
         root.acceptance_sequence,
@@ -6500,7 +6242,6 @@ fn accepted_frontier_cross_run_facts(
         root.document_map_root_digest,
         root.batch_map_root_key,
         root.batch_map_root_digest,
-        &root.reference_catalog_root,
     )
 }
 
@@ -7504,11 +7245,284 @@ impl Default for CommittedLocalOverlay {
     }
 }
 
+/// Builds ordinary Loro document snapshots directly from the canonical
+/// terminal page stream. It never authors semantic-operation batches and it
+/// retains only the graph catalog plus the page currently being encoded.
+///
+/// The snapshots are a shadow candidate until activation also supplies the
+/// globally accepted external-UUID assignments. That assignment is a graph
+/// identity decision and cannot be guessed independently by each page.
+pub(crate) struct LazyGenesisCheckpointBuilder {
+    catalog_document_id: DocumentId,
+    catalog: LoroDoc,
+    /// Re-importing every checkpoint is a useful constructor oracle, but it is
+    /// not part of activation authority. Production cold open validates the
+    /// sealed baseline before use; repeating that readback here would turn one
+    /// direct construction pass into a second graph-sized CRDT pass.
+    #[cfg(test)]
+    verify_checkpoints: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LazyGenesisCheckpointInstrumentation {
+    pub(crate) catalog_micros: u64,
+    pub(crate) page_document_micros: u64,
+    pub(crate) export_micros: u64,
+    pub(crate) verification_micros: u64,
+    pub(crate) dependencies_micros: u64,
+}
+
+impl LazyGenesisCheckpointBuilder {
+    pub(crate) fn new(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
+        let catalog = LoroDoc::new();
+        catalog
+            .set_peer_id(LAZY_GENESIS_PEER_ID)
+            .map_err(loro_error)?;
+        Ok(Self {
+            catalog_document_id,
+            catalog,
+            #[cfg(test)]
+            verify_checkpoints: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_verifying(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
+        let mut builder = Self::new(catalog_document_id)?;
+        builder.verify_checkpoints = true;
+        Ok(builder)
+    }
+
+    pub(crate) fn push_page(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        self.push_page_instrumented(page, accepted_external_uuids, None)
+    }
+
+    pub(crate) fn push_page_with_instrumentation(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+        instrumentation: &mut LazyGenesisCheckpointInstrumentation,
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        self.push_page_instrumented(page, accepted_external_uuids, Some(instrumentation))
+    }
+
+    fn push_page_instrumented(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+        instrumentation: Option<&mut LazyGenesisCheckpointInstrumentation>,
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        let catalog_started = std::time::Instant::now();
+        if page.home_document_id == self.catalog_document_id
+            || read_page_state(&self.catalog, page.page_id)?.is_some()
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis repeats or aliases a catalog/page identity".into(),
+            ));
+        }
+        let logical_name = LogicalPageName::parse(page.name.clone())
+            .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        insert_page_state(
+            &self.catalog,
+            page.page_id,
+            &PageState::Live {
+                name: logical_name,
+                path: page.path.clone(),
+                home_document_id: page.home_document_id,
+                kind: page.kind,
+            },
+        )?;
+        let catalog_micros = catalog_started.elapsed().as_micros() as u64;
+
+        let page_document_started = std::time::Instant::now();
+        let document = LoroDoc::new();
+        document
+            .set_peer_id(LAZY_GENESIS_PEER_ID)
+            .map_err(loro_error)?;
+        document
+            .get_map(SHARD_META)
+            .insert(SHARD_PAGE_ID, page.page_id.to_string())
+            .map_err(loro_error)?;
+        if let Some(preamble) = &page.preamble {
+            document
+                .get_map(SHARD_PAGE_PREAMBLE)
+                .insert(SHARD_PAGE_PREAMBLE_VALUE, preamble.clone())
+                .map_err(loro_error)?;
+        }
+        let page_blocks: BTreeSet<_> = page.blocks.iter().map(|block| block.block_id).collect();
+        if accepted_external_uuids
+            .keys()
+            .any(|block_id| !page_blocks.contains(block_id))
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis UUID assignment names a block outside its page".into(),
+            ));
+        }
+        for block in &page.blocks {
+            let claim =
+                MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
+            document
+                .get_map(SHARD_OWNERS)
+                .insert(&block.block_id.to_string(), page.page_id.to_string())
+                .map_err(loro_error)?;
+            document
+                .get_map(SHARD_CONTENT)
+                .ensure_mergeable_text(&block.block_id.to_string())
+                .map_err(loro_error)?
+                .insert(0, &block.content)
+                .map_err(loro_error)?;
+            insert_membership(&document, block.block_id, &claim)?;
+            if let Some(logseq_uuid) = accepted_external_uuids.get(&block.block_id) {
+                document
+                    .get_map(SHARD_LOGSEQ_UUIDS)
+                    .insert(&block.block_id.to_string(), logseq_uuid.to_string())
+                    .map_err(loro_error)?;
+                document
+                    .get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS)
+                    .insert(
+                        &block.block_id.to_string(),
+                        encode_canonical(&LogseqIdentityOrigin::ExternalImported)?,
+                    )
+                    .map_err(loro_error)?;
+            }
+        }
+        document.commit();
+        let page_document_micros = page_document_started.elapsed().as_micros() as u64;
+        let export_started = std::time::Instant::now();
+        let snapshot = document
+            .export(ExportMode::all_updates())
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let export_micros = export_started.elapsed().as_micros() as u64;
+        let verification_started = std::time::Instant::now();
+        #[cfg(test)]
+        {
+            if self.verify_checkpoints {
+                verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
+            }
+        }
+        let verification_micros = verification_started.elapsed().as_micros() as u64;
+        let dependencies_started = std::time::Instant::now();
+        let dependencies = DocumentDependencies::new(
+            page.home_document_id,
+            canonical_peer_counters(&document.oplog_vv())?,
+            Vec::new(),
+        )
+        .map_err(|error| {
+            EngineError::InvalidTransaction(format!(
+                "lazy genesis page {} dependencies are invalid: {error}",
+                page.page_id
+            ))
+        })?;
+        let dependencies_micros = dependencies_started.elapsed().as_micros() as u64;
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.catalog_micros = instrumentation
+                .catalog_micros
+                .saturating_add(catalog_micros);
+            instrumentation.page_document_micros = instrumentation
+                .page_document_micros
+                .saturating_add(page_document_micros);
+            instrumentation.export_micros =
+                instrumentation.export_micros.saturating_add(export_micros);
+            instrumentation.verification_micros = instrumentation
+                .verification_micros
+                .saturating_add(verification_micros);
+            instrumentation.dependencies_micros = instrumentation
+                .dependencies_micros
+                .saturating_add(dependencies_micros);
+        }
+        Ok((snapshot, dependencies))
+    }
+
+    pub(crate) fn finish(self) -> Result<(Vec<u8>, Option<DocumentDependencies>), EngineError> {
+        self.catalog.commit();
+        let peer_counters = canonical_peer_counters(&self.catalog.oplog_vv())?;
+        let dependencies = if peer_counters.is_empty() {
+            None
+        } else {
+            Some(
+                DocumentDependencies::new(self.catalog_document_id, peer_counters, Vec::new())
+                    .map_err(|error| {
+                        EngineError::InvalidTransaction(format!(
+                            "lazy genesis catalog dependencies are invalid: {error}"
+                        ))
+                    })?,
+            )
+        };
+        let checkpoint = self
+            .catalog
+            .export(ExportMode::all_updates())
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        Ok((checkpoint, dependencies))
+    }
+}
+
+#[cfg(test)]
+fn verify_lazy_genesis_page_checkpoint(
+    expected: &LazyGenesisPageInput,
+    accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+    snapshot: &[u8],
+) -> Result<(), EngineError> {
+    let document = LoroDoc::new();
+    import_complete(expected.home_document_id, &document, &[snapshot.to_vec()])?;
+    if shard_page_id(&document)? != Some(expected.page_id)
+        || read_page_preamble(expected.home_document_id, &document)? != expected.preamble
+    {
+        return Err(EngineError::InvalidCrdt(
+            "lazy genesis page checkpoint header differs from its capsule".into(),
+        ));
+    }
+    let blocks = read_all_blocks(expected.home_document_id, &document)?;
+    let memberships = read_memberships(expected.home_document_id, &document)?;
+    if blocks.len() != expected.blocks.len() || memberships.len() != expected.blocks.len() {
+        return Err(EngineError::InvalidCrdt(
+            "lazy genesis page checkpoint block coverage differs from its capsule".into(),
+        ));
+    }
+    for block in &expected.blocks {
+        let state = blocks.get(&block.block_id).ok_or_else(|| {
+            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a block".into())
+        })?;
+        let membership = memberships.get(&block.block_id).ok_or_else(|| {
+            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a membership".into())
+        })?;
+        if state.owner != BlockOwner::Page(expected.page_id)
+            || state.content != block.content
+            || membership.home_document_id != block.home_document_id
+            || membership.parent != block.parent
+            || membership.order != block.order
+            || state.logseq_uuid != accepted_external_uuids.get(&block.block_id).copied()
+        {
+            return Err(EngineError::InvalidCrdt(
+                "lazy genesis page checkpoint differs from its capsule".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct ShardedHotEngine {
+    /// Lazy cache for `nonlinear_accepted_since` (audit 4, P2). `nonlinear_watermark`
+    /// holds the highest acceptance sequence whose batch is known causally
+    /// non-linear (0 = none known); `linearity_scanned_count` /
+    /// `linearity_scanned_sequence` record how far classification has scanned.
+    /// The accepted set only grows within a run, so all three are monotonic;
+    /// Relaxed atomics suffice (the engine is actor-owned, and a racy
+    /// duplicate scan is benign).
+    nonlinear_watermark: std::sync::atomic::AtomicU64,
+    linearity_scanned_count: std::sync::atomic::AtomicU64,
+    linearity_scanned_sequence: std::sync::atomic::AtomicU64,
     runtime_authority: EngineAuthority,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
+    /// Immutable baseline for pages that have no ordinary accepted receipt
+    /// yet. The catalog is installed once; page documents are point-loaded
+    /// only for reads or their first mutation.
+    lazy_genesis: Option<Arc<LazyGenesisCandidate>>,
     archive: BTreeMap<BatchId, ValidatedBatch>,
     // Inactive detached bootstrap authoring retains only canonical manifests
     // after validation. Prior object envelopes live in neither this map nor
@@ -7518,17 +7532,6 @@ pub struct ShardedHotEngine {
     // manifests so checkpoint authentication does not rehash a whole part for
     // each document materialized from it.
     detached_accepted_manifest_fingerprints: BTreeMap<BatchId, ContentDigest>,
-    // A promoted lineage's oldest accepted batches were published in the
-    // archive's immutable bootstrap namespace, not the ordinary object
-    // namespace. This retains only the validated publication handle and the
-    // exact part ordinal of each bootstrap BatchId, so cold manifest and
-    // document reloads for those batches read the right immutable bytes
-    // without holding any part payload resident.
-    bootstrap_parts: Option<RetainedBootstrapParts>,
-    /// Ownership-counted residency of this engine's bootstrap recovery replay.
-    /// Recovery streams one part at a time, so the observed maximum number of
-    /// simultaneously owned part payloads must stay at one.
-    bootstrap_residency: Arc<BootstrapResidencyLedger>,
     /// Authenticated offered batches retained only across bounded slices.
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
@@ -7538,13 +7541,12 @@ pub struct ShardedHotEngine {
     archive_store: Option<Arc<ObjectStore>>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
-    projection_work_index: Option<Arc<ProjectionWorkIndex>>,
+    /// Latest source-endpoint projection row per exact path for the clean
+    /// runtime. This is reconstructed from accepted immutable manifests when
+    /// an endpoint attaches and advanced only after a new manifest commits;
+    /// it is never persisted as a second projection-work authority.
+    clean_projection_heads: BTreeMap<ManagedPath, ProjectionWork>,
     scratch: Option<Arc<ScratchStore>>,
-    /// Durable identity of the retained run this engine owns, when it was
-    /// opened through the retained entry points. Absent for the ordinary
-    /// ephemeral open, which is exactly why an ephemeral engine can never
-    /// produce a resume snapshot.
-    retained_scratch: Option<super::object_store::RetainedScratchIdentity>,
     scratch_roots: ScratchRoots,
     ephemeral_causal_chain: RefCell<BTreeMap<CausalPeerId, (u64, BatchId)>>,
     history_store: Option<Arc<super::object_store::DurableEngineHistoryStore>>,
@@ -7604,11 +7606,10 @@ pub struct ShardedHotEngine {
     page_name_root: PageNameOwnershipRootV1,
     ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
-    reference_catalog: ReferenceCatalogStateV2,
-    // Bootstrap V2 keeps physical operation parts bounded but derives the
-    // reference catalog once from terminal state. V1 replay leaves this absent
-    // and reproduces its historical per-part roots.
-    detached_bootstrap_reference_catalog: Option<DetachedBootstrapReferenceCatalogPlan>,
+    // Immutable parser/extraction configuration. Reference facts themselves
+    // are derived directly into the disposable SQLite projection; they are
+    // not duplicated in an engine-owned Patricia authority.
+    reference_catalog_policy: ReferenceCatalogPolicyV1,
     detached_bootstrap_current_path_catalog: Option<DetachedBootstrapCurrentPathCatalogPlan>,
     detached_bootstrap_logseq_claims: Option<DetachedBootstrapLogseqClaimPlan>,
     detached_bootstrap_portable_paths: Option<DetachedBootstrapPortablePathPlan>,
@@ -7655,15 +7656,6 @@ pub struct ShardedHotEngine {
     // record matches it: each document still proves its own descriptor digest
     // and manifest fingerprint against the manifest below.
     observed_manifest_point_cache: RefCell<BTreeMap<BatchId, Arc<OperationBatch>>>,
-    // The retained bootstrap part behind those manifests, memoized under the
-    // same operation scope, together with its document -> CrdtUpdate index.
-    //
-    // Resolving one document's archive object otherwise reloaded the entire
-    // retained part from disk AND scanned every object in it — the second
-    // per-document whole-graph cost in the same anchor validation. The index is
-    // built once per memoized part so the per-document step is a lookup.
-    retained_bootstrap_part_point_cache:
-        RefCell<BTreeMap<BatchId, Arc<BTreeMap<DocumentId, OperationObject>>>>,
     // At most one decoded page catalog, reused across accepted events by
     // content identity alone. Unlike the two point caches above this is *not*
     // cleared per operation: a content-only save leaves the catalog's causal
@@ -7732,6 +7724,33 @@ impl fmt::Debug for ShardedHotEngine {
 }
 
 impl ShardedHotEngine {
+    /// Return the exact annotations of the process-local projection predecessor
+    /// when the latest durable-local overlay entry names this page, path and byte
+    /// sequence. This is rebuildable acceleration evidence, never authority;
+    /// draft capture re-authenticates the same entry before consuming it.
+    pub(crate) fn current_local_projection_predecessor_annotations(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+        exact_base: &[u8],
+    ) -> Option<Vec<AnnotatedIdentity>> {
+        let last = self.local_overlay.entries.last()?;
+        let intent = &last.projection.intent;
+        if last.batch_id != intent.source_batch_id()
+            || intent.page_id() != page_id
+            || intent.path() != path
+        {
+            return None;
+        }
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return None;
+        };
+        (bytes.as_slice() == exact_base).then(|| annotations.clone())
+    }
+
     pub fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
@@ -7739,31 +7758,26 @@ impl ShardedHotEngine {
     ) -> Self {
         let page_name_root = PageNameOwnershipRootV1::empty();
         let logseq_claim_root = LogseqClaimIndexRoot::empty();
-        let reference_catalog = ReferenceCatalogStateV2::empty(
-            ReferenceCatalogPolicyV1::default(),
-            &page_name_root,
-            logseq_claim_root.digest(),
-        )
-        .expect("empty reference catalog has a fixed canonical binding");
         Self {
+            nonlinear_watermark: std::sync::atomic::AtomicU64::new(0),
+            linearity_scanned_count: std::sync::atomic::AtomicU64::new(0),
+            linearity_scanned_sequence: std::sync::atomic::AtomicU64::new(0),
             runtime_authority: EngineAuthority::mint(),
             workspace_id,
             lineage_digest,
             catalog_document_id,
+            lazy_genesis: None,
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
             detached_accepted_manifest_fingerprints: BTreeMap::new(),
-            bootstrap_parts: None,
-            bootstrap_residency: Arc::new(BootstrapResidencyLedger::default()),
             bounded_staging_cache: BTreeMap::new(),
             transient_effective_views: BTreeMap::new(),
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             projection_endpoint: None,
             projection_receipt_store_id: None,
-            projection_work_index: None,
+            clean_projection_heads: BTreeMap::new(),
             scratch: None,
-            retained_scratch: None,
             scratch_roots: ScratchRoots::default(),
             ephemeral_causal_chain: RefCell::new(BTreeMap::new()),
             history_store: None,
@@ -7799,8 +7813,7 @@ impl ShardedHotEngine {
             page_name_root,
             ephemeral_page_names: EphemeralPageNameOwnershipStateV1::default(),
             page_name_conflicts: BTreeMap::new(),
-            reference_catalog,
-            detached_bootstrap_reference_catalog: None,
+            reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
             detached_bootstrap_current_path_catalog: None,
             detached_bootstrap_logseq_claims: None,
             detached_bootstrap_portable_paths: None,
@@ -7820,7 +7833,6 @@ impl ShardedHotEngine {
             status_point_cache: RefCell::new(BTreeMap::new()),
             external_anchor_point_cache: RefCell::new(BTreeSet::new()),
             observed_manifest_point_cache: RefCell::new(BTreeMap::new()),
-            retained_bootstrap_part_point_cache: RefCell::new(BTreeMap::new()),
             retained_accepted_catalog: RefCell::new(None),
             retained_catalog_dependency_anchor: Cell::new(None),
             #[cfg(test)]
@@ -7859,6 +7871,266 @@ impl ShardedHotEngine {
         }
     }
 
+    pub(crate) fn install_lazy_genesis_baseline(
+        &mut self,
+        candidate: Arc<LazyGenesisCandidate>,
+    ) -> Result<(), EngineError> {
+        if self.lazy_genesis.is_some()
+            || candidate.workspace_id() != self.workspace_id
+            || candidate.lineage_digest() != self.lineage_digest
+            || !self.visible_documents.is_empty()
+            || !self.visible_document_heads.is_empty()
+            || !self.accepted_frontier.is_empty()
+            || self.accepted_frontier_root.acceptance_sequence() != 0
+            || self.accepted_frontier_root.document_count() != 0
+            || self.accepted_frontier_root.genesis().is_some()
+            || self.history_generation != 0
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis can only initialize an empty matching engine".into(),
+            ));
+        }
+        let catalog_snapshot = candidate
+            .catalog_checkpoint()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let catalog = LoroDoc::new();
+        import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
+        catalog.set_peer_id(1).map_err(loro_error)?;
+        validate_catalog(self.catalog_document_id, &catalog)?;
+        let documents = candidate.frontier_documents();
+        let accepted_frontier_root = accepted_frontier_root_for_lazy_genesis(&candidate)?;
+        if self.scratch.is_none() {
+            self.accepted_frontier = documents
+                .into_iter()
+                .map(|document| (document.document_id(), document))
+                .collect();
+        }
+        self.accepted_frontier_root = accepted_frontier_root.clone();
+        self.current_path_catalog.accepted_frontier_root = accepted_frontier_root;
+        self.current_path_cursor_book.borrow_mut().active.clear();
+        self.visible_documents
+            .insert(self.catalog_document_id, catalog);
+        self.lazy_genesis = Some(candidate);
+        Ok(())
+    }
+
+    pub(crate) fn lazy_genesis_baseline_frontier_root(
+        &self,
+    ) -> Result<Option<AcceptedFrontierRoot>, EngineError> {
+        self.lazy_genesis
+            .as_deref()
+            .map(accepted_frontier_root_for_lazy_genesis)
+            .transpose()
+    }
+
+    pub(crate) fn clean_transient_projection_claim_snapshot(
+        &self,
+    ) -> Result<Option<Arc<RebuildProjectionClaimSnapshot>>, EngineError> {
+        self.lazy_genesis
+            .as_deref()
+            .map(RebuildProjectionClaimSnapshot::from_lazy_genesis)
+            .transpose()
+            .map(|snapshot| snapshot.map(Arc::new))
+    }
+
+    pub(crate) fn clean_baseline_provider_index(
+        &self,
+    ) -> Result<LazyGenesisProviderIndexV1, EngineError> {
+        self.lazy_genesis
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive("clean runtime has no lazy-genesis baseline".into())
+            })?
+            .provider_index()
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn clean_baseline_provider_file(&self, name: &str) -> Result<Vec<u8>, EngineError> {
+        self.lazy_genesis
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive("clean runtime has no lazy-genesis baseline".into())
+            })?
+            .read_provider_file(name)
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    /// Enumerate the exact sparse document overlay only for the clean
+    /// in-memory runtime. Immutable baseline documents remain in the
+    /// lazy-genesis pack; only documents whose current dependencies differ
+    /// from that baseline belong in the accepted frontier's authenticated map.
+    /// This is used while rebuilding disposable SQLite in one terminal pass;
+    /// it is not a persistent index or a normal query path.
+    pub(crate) fn clean_current_frontier_overlay_documents(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<Vec<DocumentDependencies>, EngineError> {
+        self.authenticate_accepted_frontier_root(root)?;
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || root != &self.accepted_frontier_root
+            || self.accepted_frontier.len() as u64 != root.document_count()
+        {
+            return Err(EngineError::Archive(
+                "clean terminal frontier enumeration is unavailable or incomplete".into(),
+            ));
+        }
+        let baseline = self.lazy_genesis.as_ref().ok_or_else(|| {
+            EngineError::Archive("clean terminal frontier has no lazy-genesis baseline".into())
+        })?;
+        let documents = self
+            .accepted_frontier
+            .values()
+            .filter(|document| {
+                baseline.frontier_document(document.document_id()).as_ref() != Some(*document)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let (root_key, root_digest) = authenticated_document_map_root(&documents)?;
+        if root_key != root.document_map_root_key()
+            || root_digest != root.document_map_root_digest()
+        {
+            return Err(EngineError::Archive(
+                "clean terminal overlay does not authenticate to its accepted frontier".into(),
+            ));
+        }
+        for document in &documents {
+            if self
+                .accepted_frontier_document(root, document.document_id())?
+                .as_ref()
+                != Some(document)
+            {
+                return Err(EngineError::FrontierVectorMismatch(document.document_id()));
+            }
+        }
+        Ok(documents)
+    }
+
+    fn lazy_genesis_checkpoint(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let Some(candidate) = &self.lazy_genesis else {
+            return Ok(None);
+        };
+        let snapshot = if document_id == self.catalog_document_id {
+            Some(
+                candidate
+                    .catalog_checkpoint()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            )
+        } else {
+            candidate
+                .document_checkpoint(document_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        };
+        Ok(snapshot)
+    }
+
+    fn validate_lazy_genesis_document(
+        &self,
+        document_id: DocumentId,
+        document: &LoroDoc,
+    ) -> Result<(), EngineError> {
+        if document_id == self.catalog_document_id {
+            validate_catalog(self.catalog_document_id, document)?;
+        } else {
+            validate_shard(self.catalog_document_id, document_id, document)?;
+        }
+        Ok(())
+    }
+
+    fn lazy_genesis_document(
+        &self,
+        document_id: DocumentId,
+        peer: u64,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
+            return Ok(None);
+        };
+        let document = LoroDoc::new();
+        import_complete(document_id, &document, &[snapshot])?;
+        document.set_peer_id(peer).map_err(loro_error)?;
+        self.validate_lazy_genesis_document(document_id, &document)?;
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_engine_document(
+        &self,
+        document_id: DocumentId,
+        peer: u64,
+    ) -> Result<Option<EngineDocument>, EngineError> {
+        let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
+            return Ok(None);
+        };
+        let document = match &self.scratch {
+            Some(store) => {
+                let external = super::document_state::ExternalDocument::empty(Arc::clone(store))
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                import_complete(document_id, external.document(), &[snapshot])?;
+                external.document().set_peer_id(peer).map_err(loro_error)?;
+                self.validate_lazy_genesis_document(document_id, external.document())?;
+                EngineDocument::External(external)
+            }
+            None => {
+                let document = LoroDoc::new();
+                import_complete(document_id, &document, &[snapshot])?;
+                document.set_peer_id(peer).map_err(loro_error)?;
+                self.validate_lazy_genesis_document(document_id, &document)?;
+                EngineDocument::InMemory(document)
+            }
+        };
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_dependency_engine_document(
+        &self,
+        dependencies: &DocumentDependencies,
+        peer: u64,
+    ) -> Result<Option<EngineDocument>, EngineError> {
+        if !dependencies.direct_dependency_heads().is_empty() {
+            return Ok(None);
+        }
+        let Some(document) = self.lazy_genesis_engine_document(dependencies.document_id(), peer)?
+        else {
+            return Ok(None);
+        };
+        if canonical_peer_counters(&document.document().oplog_vv())? != dependencies.peer_counters()
+        {
+            return Err(EngineError::FrontierVectorMismatch(
+                dependencies.document_id(),
+            ));
+        }
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_dependency_document(
+        &self,
+        dependencies: &DocumentDependencies,
+        peer: u64,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        if !dependencies.direct_dependency_heads().is_empty() {
+            return Ok(None);
+        }
+        let Some(document) = self.lazy_genesis_document(dependencies.document_id(), peer)? else {
+            return Ok(None);
+        };
+        if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(
+                dependencies.document_id(),
+            ));
+        }
+        Ok(Some(document))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lazy_genesis_resident_page_documents_for_test(&self) -> usize {
+        self.visible_documents
+            .keys()
+            .filter(|document_id| **document_id != self.catalog_document_id)
+            .count()
+    }
+
     /// Construct a sparse engine that follows compact direct heads through
     /// immutable manifests on cold fallback. Accepted non-catalog shards are
     /// evicted from hot memory and reconstructed from authenticated DAG
@@ -7867,25 +8139,6 @@ impl ShardedHotEngine {
         store: ObjectStore,
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
-    ) -> Self {
-        Self::with_archive_store_scratch(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            EngineScratchOpen::Fresh,
-        )
-    }
-
-    /// The one construction that installs this engine's run-local scratch.
-    ///
-    /// A fresh open mints a disposable run. Retained and already-created
-    /// ephemeral inputs are capabilities produced by their respective narrow
-    /// lifecycle paths; neither is reconstructed from a marker or pathname.
-    fn with_archive_store_scratch(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        scratch_open: EngineScratchOpen,
     ) -> Self {
         let workspace_id = store.workspace_id();
         let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
@@ -7901,112 +8154,677 @@ impl ShardedHotEngine {
             Ok(index) => engine.page_name_index = Some(Arc::new(index)),
             Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
         }
-        match store.open_reference_catalog() {
-            Ok(catalog) => {
-                if let Err(error) = engine.reference_catalog.attach_store(Arc::new(catalog)) {
-                    engine.history_failure = Some(EngineError::ReferenceCatalog(error.to_string()));
-                }
-            }
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        match scratch_open {
-            EngineScratchOpen::Retained(retained) => {
-                let (scratch, index, identity) = retained.into_parts();
+        match store.start_engine_scratch() {
+            Ok((scratch, index)) => {
                 engine.scratch = Some(scratch);
                 engine.block_claim_index = Some(Arc::new(index));
-                engine.retained_scratch = Some(identity);
             }
-            EngineScratchOpen::ExistingEphemeral {
-                scratch,
-                block_claim_index,
-            } => {
-                if scratch.workspace_id() != workspace_id {
-                    engine.history_failure = Some(EngineError::Archive(
-                        "ephemeral bootstrap scratch belongs to another workspace".into(),
-                    ));
-                } else {
-                    engine.scratch = Some(scratch);
-                    engine.block_claim_index = Some(block_claim_index);
-                }
-            }
-            EngineScratchOpen::Fresh => match store.start_engine_scratch() {
-                Ok((scratch, index)) => {
-                    engine.scratch = Some(scratch);
-                    engine.block_claim_index = Some(Arc::new(index));
-                }
-                Err(error) => {
-                    engine.history_failure = Some(EngineError::Archive(error.to_string()));
-                }
-            },
+            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
         }
         engine.archive_store = Some(Arc::new(store));
         engine
     }
 
-    /// Build the complete maintenance inventory from the same live store
-    /// handles ordinary engine work owns. No path is reopened and no directory
-    /// is enumerated while constructing this view.
-    fn authenticated_patricia_indexes(&self) -> AuthenticatedPatriciaIndexes<'_> {
-        AuthenticatedPatriciaIndexes {
-            stores: [
-                self.logseq_claim_index.as_deref(),
-                self.portable_path_index
-                    .as_deref()
-                    .map(PortablePathIndexStore::patricia_index),
-                self.page_name_index
-                    .as_deref()
-                    .map(PageNameOwnershipStore::patricia_index),
-                self.reference_catalog
-                    .store_ref()
-                    .map(ReferenceCatalogStore::patricia_index),
-            ],
+    /// Attach accepted operation storage to an already-open clean baseline
+    /// without changing its run-local engine identity.
+    ///
+    /// Keeping the identity is load-bearing: the SQLite genesis candidate was
+    /// constructed for this exact accepted frontier and is bound to this exact
+    /// engine when it is adopted under the workspace lease.
+    pub(crate) fn attach_clean_archive_store(
+        &mut self,
+        store: ObjectStore,
+    ) -> Result<(), EngineError> {
+        if store.workspace_id() != self.workspace_id
+            || self.archive_store.is_some()
+            || self.scratch.is_some()
+            || self.has_native_semantic_index_stores()
+        {
+            return Err(EngineError::Archive(
+                "clean operation archive can only attach once to a matching index-free engine"
+                    .into(),
+            ));
+        }
+        self.archive_store = Some(Arc::new(store));
+        Ok(())
+    }
+
+    /// Replay the complete manifest-committed accepted tail over a clean
+    /// sequence-zero baseline.
+    ///
+    /// The private clean archive admits only fully validated accepted
+    /// operations. Its immutable manifest is published after every object and
+    /// is therefore the durable membership/commit marker. BatchId directory
+    /// order is deliberately not causal; ordinary dependency staging reaches
+    /// a fixed point, after which every committed manifest must be accepted.
+    /// A rejected, quarantined, incomplete, or missing-object terminal state is
+    /// archive corruption, not an alternative status stored in a second
+    /// persistent index.
+    pub(crate) fn replay_clean_committed_tail(
+        &mut self,
+        baseline_claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<usize, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || self.accepted_frontier_root.acceptance_sequence() != 0
+            || self.next_acceptance_sequence != 0
+        {
+            return Err(EngineError::Archive(
+                "clean tail replay requires an index-free sequence-zero baseline".into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        let manifests = store
+            .committed_manifests()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut pending = BTreeMap::new();
+        for manifest in &manifests {
+            let validated = match store
+                .inspect_batch(manifest.batch_id())
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            {
+                BatchInspection::Ready(batch) => batch,
+                BatchInspection::Absent => {
+                    return Err(EngineError::Archive(format!(
+                        "clean accepted manifest {} disappeared during replay",
+                        manifest.batch_id()
+                    )));
+                }
+                BatchInspection::Staged { missing, .. } => {
+                    return Err(EngineError::Archive(format!(
+                        "clean accepted manifest {} is missing {} immutable objects",
+                        manifest.batch_id(),
+                        missing.len()
+                    )));
+                }
+            };
+            pending.insert(manifest.batch_id(), validated);
+        }
+        // Dependency heads are a pure function of each validated batch, but
+        // recomputing them per readiness probe re-validates the projection
+        // object set — decoding every object of the batch, including whole
+        // rendered file blobs — and made the staging fixed point quadratic in
+        // history length (audit 4, P1). Compute them exactly once per batch.
+        let mut dependency_heads = BTreeMap::new();
+        for (batch_id, batch) in &pending {
+            dependency_heads.insert(*batch_id, clean_replay_dependency_heads(batch)?);
+        }
+        // Kahn-style ready tracking over the memoized heads. A dependency is
+        // either pending here (satisfied exactly when its own staging
+        // completes) or external — accepted effects with no committed manifest
+        // in this archive, e.g. manifestless no-op ancestry — which can flip
+        // to contained only as a side effect of staging some other batch.
+        // External deps are re-probed after every staging, so `ready` always
+        // holds precisely the batches the original per-round scan would have
+        // found, and popping the smallest keeps the original deterministic
+        // staging order.
+        let mut unmet: BTreeMap<BatchId, BTreeSet<BatchId>> = BTreeMap::new();
+        let mut waiters: BTreeMap<BatchId, Vec<BatchId>> = BTreeMap::new();
+        let mut external_unmet: BTreeMap<BatchId, Vec<BatchId>> = BTreeMap::new();
+        let mut ready: BTreeSet<BatchId> = BTreeSet::new();
+        for (batch_id, heads) in &dependency_heads {
+            let mut missing = BTreeSet::new();
+            for dependency in heads {
+                if pending.contains_key(dependency) {
+                    missing.insert(*dependency);
+                    waiters.entry(*dependency).or_default().push(*batch_id);
+                } else if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                    missing.insert(*dependency);
+                    external_unmet
+                        .entry(*dependency)
+                        .or_default()
+                        .push(*batch_id);
+                }
+            }
+            if missing.is_empty() {
+                ready.insert(*batch_id);
+            } else {
+                unmet.insert(*batch_id, missing);
+            }
+        }
+        while !pending.is_empty() {
+            let Some(batch_id) = ready.pop_first() else {
+                let mut blocked = Vec::new();
+                for batch_id in pending.keys() {
+                    let missing = unmet
+                        .get(batch_id)
+                        .map(|dependencies| {
+                            dependencies
+                                .iter()
+                                .map(|dependency| dependency.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    blocked.push(format!("{} -> [{}]", batch_id, missing.join(",")));
+                }
+                return Err(EngineError::Archive(format!(
+                    "manifest-committed clean tail has no causally ready operation: {}",
+                    blocked.join("; ")
+                )));
+            };
+            let validated = pending
+                .remove(&batch_id)
+                .expect("ready clean replay batch remains pending");
+            let outcome = self.stage_ready_with_claim_source(validated, baseline_claim_source);
+            if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
+                return Err(EngineError::Archive(format!(
+                    "manifest-committed clean operation {batch_id} did not validate as accepted: {:?}",
+                    outcome.disposition()
+                )));
+            }
+            let mut satisfied = Vec::new();
+            if let Some(waiting) = waiters.remove(&batch_id) {
+                satisfied.push((batch_id, waiting));
+            }
+            // This staging may have accepted external no-op ancestry as a side
+            // effect; each probe is a constant-count point proof.
+            let candidates: Vec<BatchId> = external_unmet.keys().copied().collect();
+            for dependency in candidates {
+                if self.accepted_frontier_contains_batch_effects(dependency)? {
+                    let waiting = external_unmet
+                        .remove(&dependency)
+                        .expect("probed external dependency remains indexed");
+                    satisfied.push((dependency, waiting));
+                }
+            }
+            for (dependency, waiting) in satisfied {
+                for waiter in waiting {
+                    if let Some(missing) = unmet.get_mut(&waiter) {
+                        missing.remove(&dependency);
+                        if missing.is_empty() {
+                            unmet.remove(&waiter);
+                            ready.insert(waiter);
+                        }
+                    }
+                }
+            }
+        }
+        for manifest in &manifests {
+            self.accepted_batch_evidence(manifest.batch_id())
+                .map_err(|error| {
+                    EngineError::Archive(format!(
+                        "manifest-committed clean operation {} did not reach the accepted fixed point: {error}",
+                        manifest.batch_id()
+                    ))
+                })?;
+        }
+        let accepted = self.accepted_batch_count()?;
+        let expected = u64::try_from(manifests.len()).map_err(|_| {
+            EngineError::Archive("clean accepted manifest count exceeds u64".into())
+        })?;
+        if accepted != expected {
+            return Err(EngineError::Archive(format!(
+                "clean accepted tail contains {expected} manifests but replay produced {accepted} accepted operations"
+            )));
+        }
+        Ok(manifests.len())
+    }
+
+    /// Validate one local candidate completely, then publish its manifest as
+    /// the durable accepted-operation commit point.
+    ///
+    /// This method mutates only this encapsulated run-local engine before the
+    /// archive commit. Callers must not expose the speculative state until the
+    /// method succeeds. If publication fails, the engine is poisoned and must
+    /// be discarded; cold open reconstructs the last manifest-committed state.
+    pub(crate) fn commit_clean_prepared(
+        &mut self,
+        prepared: &PreparedBatch,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<StageOutcome, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || !matches!(
+                prepared.manifest().origin(),
+                BatchOrigin::LocalMutation | BatchOrigin::ExternalReconciliation { .. }
+            )
+        {
+            return Err(EngineError::Archive(
+                "clean commit requires an index-free baseline runtime and an ordinary local or external mutation"
+                    .into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        if store
+            .read_manifest(prepared.manifest().batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .is_some()
+        {
+            return Err(EngineError::Archive(format!(
+                "clean batch {} is already manifest-committed",
+                prepared.manifest().batch_id()
+            )));
+        }
+
+        let outcome =
+            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
+        let accepted_exactly_once =
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
+                && outcome.newly_accepted().len() == 1
+                && outcome.newly_accepted()[0].batch_id == prepared.manifest().batch_id();
+        if !accepted_exactly_once {
+            return match outcome.disposition() {
+                BatchDisposition::Rejected { error } => Err(error),
+                other => Err(EngineError::Archive(format!(
+                    "clean candidate {} did not validate as one accepted operation: {other:?}",
+                    prepared.manifest().batch_id()
+                ))),
+            };
+        }
+
+        let projection_updates = if let Some(endpoint) = self.projection_endpoint {
+            let accepted = self
+                .archive
+                .get(&prepared.manifest().batch_id())
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "clean accepted operation disappeared from the run-local archive".into(),
+                    )
+                })?;
+            self.clean_projection_locators_for_batch(accepted, endpoint)?
+        } else {
+            Vec::new()
+        };
+
+        if let Err(error) = store.publish_prepared(prepared) {
+            let error = EngineError::Archive(format!(
+                "clean accepted operation {} could not publish its manifest: {error}",
+                prepared.manifest().batch_id()
+            ));
+            self.history_failure = Some(error.clone());
+            return Err(error);
+        }
+        for work in projection_updates {
+            self.clean_projection_heads
+                .insert(work.path().clone(), work);
+        }
+        Ok(outcome)
+    }
+
+    /// Accept an already journal-durable, exactly archived local batch beneath
+    /// the foreground overlay that made its Markdown target immediately
+    /// visible. This is the background half of the clean foreground commit:
+    /// no manifest is published here, and no scratch/Patricia runtime is
+    /// required.
+    pub(crate) fn accept_clean_prepared_below_managed_local_overlay(
+        &mut self,
+        prepared: &PreparedBatch,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<StageOutcome, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || !matches!(prepared.manifest().origin(), BatchOrigin::LocalMutation)
+        {
+            return Err(EngineError::Archive(
+                "clean foreground acceptance requires an index-free baseline runtime and an ordinary local mutation"
+                    .into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        let retained = store
+            .read_manifest(prepared.manifest().batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean foreground batch {} is not manifest-committed",
+                    prepared.manifest().batch_id()
+                ))
+            })?;
+        if retained != *prepared.manifest() {
+            return Err(EngineError::Archive(format!(
+                "clean foreground batch {} differs from its retained manifest",
+                prepared.manifest().batch_id()
+            )));
+        }
+
+        let overlay = std::mem::take(&mut self.local_overlay);
+        let outcome =
+            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
+        self.local_overlay = overlay;
+        let accepted_exactly_once =
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
+                && outcome.newly_accepted().len() == 1
+                && outcome.newly_accepted()[0].batch_id == prepared.manifest().batch_id();
+        if !accepted_exactly_once {
+            return match outcome.disposition() {
+                BatchDisposition::Rejected { error } => Err(error.clone()),
+                other => Err(EngineError::Archive(format!(
+                    "clean foreground batch {} did not validate as one accepted operation: {other:?}",
+                    prepared.manifest().batch_id()
+                ))),
+            };
+        }
+        self.refresh_clean_projection_head_for_batch(prepared.manifest().batch_id())?;
+        Ok(outcome)
+    }
+
+    /// Attach only the graph/receipt identities required by ordinary clean
+    /// runtime authoring. Projection work is derived from accepted manifests;
+    /// this path deliberately does not open the legacy Patricia work queue or
+    /// any enrollment/history/semantic index.
+    pub(crate) fn attach_clean_projection_endpoint(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+    ) -> Result<(), EngineError> {
+        let endpoint = receipts.endpoint_binding().ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "clean projection receipt namespace has no endpoint enrollment".into(),
+            )
+        })?;
+        if receipts.workspace_id() != self.workspace_id
+            || self.projection_endpoint.is_some()
+            || self.projection_receipt_store_id.is_some()
+            || graph
+                .canonical_resource_id()
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+                != endpoint.graph_resource_id
+        {
+            return Err(EngineError::ProjectionWork(
+                "clean projection endpoint does not match the runtime graph/workspace".into(),
+            ));
+        }
+        self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no operation archive".into())
+        })?;
+        let mut heads = BTreeMap::new();
+        for batch_id in self.accepted_sequence.values().copied() {
+            let batch = self.archive.get(&batch_id).ok_or_else(|| {
+                EngineError::ProjectionWork(format!(
+                    "accepted clean batch {batch_id} is absent from the run-local archive"
+                ))
+            })?;
+            for work in self.clean_projection_locators_for_batch(batch, endpoint)? {
+                heads.insert(work.path().clone(), work);
+            }
+        }
+        self.projection_endpoint = Some(endpoint);
+        self.projection_receipt_store_id = Some(receipts.store_id());
+        self.clean_projection_heads = heads;
+        Ok(())
+    }
+
+    fn clean_projection_runtime_binding(
+        &self,
+    ) -> Result<(Arc<ObjectStore>, ProjectionEndpointBinding), EngineError> {
+        self.ensure_not_blocked()?;
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        let archive = self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no operation archive".into())
+        })?;
+        let endpoint = self.projection_endpoint.ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no projection endpoint".into())
+        })?;
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.projection_receipt_store_id.is_none()
+        {
+            return Err(EngineError::ProjectionWork(
+                "runtime is not an index-free clean projection runtime".into(),
+            ));
+        }
+        Ok((Arc::clone(archive), endpoint))
+    }
+
+    pub(crate) fn require_index_free_clean_projection_runtime(&self) -> Result<(), EngineError> {
+        self.clean_projection_runtime_binding().map(|_| ())
+    }
+
+    /// Reconstruct the exact current projection predecessor required by a
+    /// clean-runtime external import.  Present baseline pages come directly
+    /// from the immutable lazy-genesis capsule; later present or released
+    /// paths come from the latest accepted manifest selected by the run-local
+    /// head map rebuilt during open.
+    pub(crate) fn clean_import_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        sqlite_owner: Option<PageId>,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<Option<CleanImportProjectionPredecessor>, EngineError> {
+        self.require_index_free_clean_projection_runtime()?;
+        match sqlite_owner {
+            Some(page_id) => {
+                let current =
+                    self.authorize_projection_write_with_claim_source(page_id, claim_source)?;
+                if current.state().page.path != *path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean SQLite path owner for {path} differs from its materialized page"
+                    )));
+                }
+                let (prior, from_baseline) = if let Some(prior) = self
+                    .clean_manifest_projection_predecessor(
+                        path,
+                        page_id,
+                        current.state(),
+                        None,
+                        false,
+                    )? {
+                    (prior, false)
+                } else {
+                    let prior = self
+                        .lazy_genesis_projection_predecessor(
+                            path,
+                            page_id,
+                            current.state(),
+                            None,
+                            false,
+                        )?
+                        .ok_or_else(|| {
+                            EngineError::ProjectionManifest(format!(
+                                "clean import has no baseline or manifest predecessor for {path}"
+                            ))
+                        })?;
+                    (prior, true)
+                };
+                prior.validate_authority()?;
+                let completion = ProjectionCompletion::for_intent(&prior.intent, &prior.bytes)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                Ok(Some(CleanImportProjectionPredecessor::Present {
+                    page: current.state().page.clone(),
+                    bytes: prior.bytes,
+                    intent: prior.intent,
+                    completion,
+                    from_baseline,
+                }))
+            }
+            None => {
+                let Some(work) = self.clean_projection_heads.get(path) else {
+                    return Ok(None);
+                };
+                if work.path() != path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} differs from its accepted manifest head"
+                    )));
+                }
+                if !matches!(work.target(), ProjectionWorkTarget::Absent) {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean SQLite has no owner for present manifest path {path}"
+                    )));
+                }
+                let (archive, _) = self.clean_projection_runtime_binding()?;
+                let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if decoded.target_bytes().is_some() {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} has a present manifested target"
+                    )));
+                }
+                let intent = decoded.receiver_local_intent().clone();
+                if intent.page_id() != work.page_id()
+                    || intent.path() != path
+                    || intent.target() != BlobDescription::of(&[])
+                {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} has a mismatched manifested intent"
+                    )));
+                }
+                let completion = ProjectionCompletion::for_intent(&intent, &[])
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                Ok(Some(CleanImportProjectionPredecessor::Released {
+                    prior_page_id: work.page_id(),
+                    intent,
+                    completion,
+                }))
+            }
         }
     }
 
-    /// Best-effort packed-file maintenance for every live authenticated
-    /// Patricia store. Each store authenticates its own current packed head
-    /// before scanning; a busy or malformed store never suppresses the other
-    /// independent attempts.
-    pub(crate) fn reclaim_unreachable_packed_patricia_files(
+    /// Read the exact currently accepted projection bytes for watcher
+    /// comparison without constructing semantic mutation authority.
+    ///
+    /// Accepted manifest work supersedes the immutable activation baseline.
+    /// Identity and path bindings are still checked here; if bytes differ,
+    /// external reconciliation repeats the stronger semantic proof before it
+    /// can mutate anything.
+    pub(crate) fn clean_observed_projection(
         &self,
-    ) -> PackedPatriciaMaintenanceReport {
-        let inventory = self.authenticated_patricia_indexes();
-        let mut indexes = inventory
-            .iter()
-            .map(|(kind, store)| PackedPatriciaIndexMaintenance {
-                kind,
-                outcome: match store {
-                    Some(store) => match store.reclaim_unreachable_packed_files() {
-                        Ok(report) => PackedPatriciaMaintenanceOutcome::Reclaimed(report),
-                        Err(PatriciaIndexReclamationError::Busy) => {
-                            PackedPatriciaMaintenanceOutcome::Busy
+        path: &ManagedPath,
+        sqlite_owner: Option<PageId>,
+    ) -> Result<Option<CleanObservedProjection>, EngineError> {
+        self.require_index_free_clean_projection_runtime()?;
+        match sqlite_owner {
+            Some(page_id) => {
+                if let Some(work) = self.clean_projection_heads.get(path).cloned() {
+                    if work.page_id() != page_id || work.path() != path {
+                        return Err(EngineError::ProjectionManifest(format!(
+                            "clean observed projection head for {path} is misbound"
+                        )));
+                    }
+                    let bytes = match work.target() {
+                        ProjectionWorkTarget::Present(_) => {
+                            let (archive, _) = self.clean_projection_runtime_binding()?;
+                            let decoded = super::projection::decode_manifested_projection_work(
+                                &archive, &work,
+                            )
+                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                            let recorded =
+                                decoded.target_bytes().map(<[u8]>::to_vec).ok_or_else(|| {
+                                    EngineError::ProjectionManifest(format!(
+                                        "clean observed projection for {path} has no present bytes"
+                                    ))
+                                })?;
+                            // A head batch superseded by concurrently accepted
+                            // history recorded only a locator: observers (the
+                            // watcher and the reopen scan) compare disk against
+                            // these bytes to decide whether a path needs
+                            // reconciling, so they must see the deterministic
+                            // CURRENT rendering — comparing against the stale
+                            // recorded bytes would classify a superseded disk
+                            // file as up to date forever (GH #351 audit
+                            // finding 1). Supersession includes a LINEAR head
+                            // followed by a later concurrent merge (audit 4,
+                            // D2): the merge can change this page's rendering
+                            // from another document without re-rendering it,
+                            // and the full scan would otherwise never
+                            // reconcile the stale file. Pages whose current
+                            // path moved away are left to the recorded bytes;
+                            // the move's own projection work owns that path
+                            // transition.
+                            if self.accepted_batch_projection_is_superseded(work.batch_id())? {
+                                let current = self.authorize_projection_write(page_id)?;
+                                if current.state().page.path == *path {
+                                    let replay =
+                                        super::projection::plan_projection_with_layout_annotations(
+                                            self.workspace_id,
+                                            current.state(),
+                                            decoded
+                                                .annotated_base()
+                                                .map(AnnotatedProjectionBase::bytes),
+                                            decoded
+                                                .annotated_base()
+                                                .map(AnnotatedProjectionBase::annotations),
+                                        )
+                                        .map_err(
+                                            |error| {
+                                                EngineError::ProjectionManifest(error.to_string())
+                                            },
+                                        )?;
+                                    return Ok(Some(CleanObservedProjection::Present(
+                                        replay.target().to_vec(),
+                                    )));
+                                }
+                            }
+                            recorded
                         }
-                        Err(error) => {
-                            PackedPatriciaMaintenanceOutcome::Unavailable(error.to_string())
+                        ProjectionWorkTarget::Absent => {
+                            return Err(EngineError::ProjectionManifest(format!(
+                                "clean observed projection for live path {path} is released"
+                            )))
                         }
-                    },
-                    None => PackedPatriciaMaintenanceOutcome::Unavailable(
-                        "authenticated Patricia store is unavailable".to_owned(),
-                    ),
-                },
-            });
-        PackedPatriciaMaintenanceReport {
-            indexes: [
-                indexes.next().expect("closed Patricia inventory entry"),
-                indexes.next().expect("closed Patricia inventory entry"),
-                indexes.next().expect("closed Patricia inventory entry"),
-                indexes.next().expect("closed Patricia inventory entry"),
-            ],
+                    };
+                    return Ok(Some(CleanObservedProjection::Present(bytes)));
+                }
+                let genesis = self.lazy_genesis.as_ref().ok_or_else(|| {
+                    EngineError::ProjectionWork(
+                        "clean runtime has no immutable activation baseline".into(),
+                    )
+                })?;
+                let page = genesis
+                    .page(page_id)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::ProjectionManifest(format!(
+                            "clean observed projection for {path} has no baseline page {page_id}"
+                        ))
+                    })?;
+                if page.path != *path || page.page_id != page_id {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean observed baseline projection for {path} is misbound"
+                    )));
+                }
+                Ok(Some(CleanObservedProjection::Present(
+                    page.exact_source_bytes,
+                )))
+            }
+            None => {
+                let Some(work) = self.clean_projection_heads.get(path) else {
+                    return Ok(None);
+                };
+                if work.path() != path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean observed released projection for {path} is misbound"
+                    )));
+                }
+                match work.target() {
+                    ProjectionWorkTarget::Absent => Ok(Some(CleanObservedProjection::Released)),
+                    ProjectionWorkTarget::Present(_) => {
+                        Err(EngineError::ProjectionManifest(format!(
+                            "clean observed projection for unowned path {path} remains present"
+                        )))
+                    }
+                }
+            }
         }
+    }
+
+    fn has_native_semantic_index_stores(&self) -> bool {
+        self.block_claim_index.is_some()
+            || self.logseq_claim_index.is_some()
+            || self.portable_path_index.is_some()
+            || self.page_name_index.is_some()
     }
 
     #[cfg(test)]
-    pub(crate) fn packed_patricia_reclamation_attempts(&self) -> usize {
-        self.authenticated_patricia_indexes()
-            .iter()
-            .filter_map(|(_, store)| store)
-            .map(PatriciaIndexStore::reclamation_attempts)
-            .sum()
+    pub(crate) fn has_native_semantic_index_stores_for_test(&self) -> bool {
+        self.has_native_semantic_index_stores()
     }
 
     pub(crate) fn runtime_authority(&self) -> &EngineAuthority {
@@ -8042,13 +8860,6 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
-    /// The durable promoted lineage this engine's history open authorized.
-    pub(crate) fn promoted_lineage(&self) -> Option<&super::object_store::PromotedRuntimeStateV1> {
-        self.history_store
-            .as_ref()
-            .and_then(|history| history.promoted_lineage())
-    }
-
     /// The retained archive capability this engine opened, when it has one.
     pub(crate) fn archive_store(&self) -> Option<&ObjectStore> {
         self.archive_store.as_deref()
@@ -8066,1220 +8877,10 @@ impl ShardedHotEngine {
         self.archive_store.as_ref().map(Arc::clone)
     }
 
-    /// Open the enrolled projection capabilities without replaying non-empty
-    /// operational history.
-    ///
-    /// A non-empty operational engine remains recovery-gated. Production
-    /// startup should normally use [`Self::open_enrolled_projection`], which
-    /// does not expose the engine until complete immutable history has been
-    /// authenticated and pending projection work has been reconciled.
-    pub fn with_enrolled_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-    ) -> Self {
-        Self::with_enrolled_projection_promoted(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            None,
-            EngineScratchOpen::Fresh,
-            false,
-        )
-    }
-
-    /// Open the enrolled projection capabilities for a promoted
-    /// bootstrap-anchored runtime.
-    ///
-    /// Identical to [`Self::with_enrolled_projection`] except that the durable
-    /// history control is sealed through the promoted path, which is the only
-    /// construction that unfences a bootstrap-bound history for writes.
-    pub(crate) fn with_promoted_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: &super::object_store::PromotedRuntimeStateV1,
-    ) -> Self {
-        Self::with_enrolled_projection_promoted(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            Some(promotion),
-            EngineScratchOpen::Fresh,
-            false,
-        )
-    }
-
-    /// Open the enrolled projection capabilities and complete startup recovery
-    /// for a promoted bootstrap-anchored runtime.
-    pub(crate) fn open_promoted_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: &super::object_store::PromotedRuntimeStateV1,
-        committed_manifests: &[OperationBatch],
-    ) -> Result<(Self, Vec<StageOutcome>), EngineError> {
-        let mut engine = Self::with_promoted_projection(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            promotion,
-        );
-        if engine.history_failure.is_none() {
-            if let Err(error) = engine.attach_promoted_bootstrap_parts() {
-                engine.history_failure = Some(error);
-            }
-        }
-        let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
-        Ok((engine, outcomes))
-    }
-
-    /// Open an enrolled runtime — promoted when `promotion` is supplied — on a
-    /// **retained** run, resuming from `resume` when every authority that
-    /// snapshot records still holds.
-    ///
-    /// This is the whole adoption decision in one place, because the decision is
-    /// only safe if its fallback is unconditional. Adoption is a pure
-    /// accelerator: it selects which reconstructible run-local bytes may be
-    /// reused instead of recomputed, and it authorizes nothing else. Any doubt —
-    /// an absent, foreign, ephemeral, re-created, leased, or torn run; a
-    /// snapshot whose durable authority the live sealed history does not
-    /// descend from; a predecessor record that is not at the recorded
-    /// generation, or that carries conflicts or terminal evidence; a run-local
-    /// root that fails its own authenticated read — refuses, and a refusal
-    /// costs exactly one full replay into a *fresh* retained run.
-    ///
-    /// A refused run is left byte-for-byte intact and is deliberately **not**
-    /// reclaimed here. Publication and reclamation ordering belongs to the
-    /// lifecycle wiring; this packet never deletes a run or a resume point.
-    pub(crate) fn open_enrolled_projection_resuming(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
-        committed_manifests: &[OperationBatch],
-        resume: Option<&RuntimeResumeSnapshot>,
-    ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
-        Self::open_enrolled_projection_with_retention(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            promotion,
-            committed_manifests,
-            EngineOpenRetention::Retained { resume },
-            None,
-        )
-    }
-
-    /// The same open, with the retention decision made by the caller.
-    ///
-    /// This exists because the lifecycle open has to choose between a retained
-    /// and an ephemeral run *from one call site*. Selecting between the two
-    /// sibling entry points at the caller materialises a second engine-sized
-    /// result slot in the caller's frame, and `mint_promoted_runtime` is
-    /// deliberately a single-frame function for exactly that reason (a debug
-    /// build overflows the test thread's stack). Carrying the choice into the
-    /// one construction path keeps the caller at exactly one engine value.
-    ///
-    /// [`EngineOpenRetention::Ephemeral`] is byte-for-byte the pre-adoption
-    /// behaviour: a disposable run and a full replay, with `resume` unreachable
-    /// by construction. It is what an open takes when retaining another run
-    /// would grow a population nothing can later prove unreachable.
-    pub(crate) fn open_enrolled_projection_with_retention(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
-        committed_manifests: &[OperationBatch],
-        retention: EngineOpenRetention<'_>,
-        bootstrap_publication: Option<Arc<super::object_store::ValidatedBootstrapPublicationV1>>,
-    ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
-        reset_engine_open_stages();
-        #[cfg(test)]
-        reset_enrolled_projection_open_instrumentation();
-        #[cfg(test)]
-        let open_started = Instant::now();
-        // Stage one: try to take the named run, on the still-borrowed archive
-        // capability, before anything is moved into an engine. A refusal here
-        // is a plain fallback, so the fresh run is minted from the same
-        // capability and the candidate's bytes are never opened for writing.
-        let (
-            scratch_open,
-            migrated_resume,
-            adopted,
-            ephemeral_predecessor,
-            mut refused_run_id,
-            mut refusal,
-        ) = match retention {
-            EngineOpenRetention::Ephemeral => {
-                (EngineScratchOpen::Fresh, None, None, None, None, None)
-            }
-            EngineOpenRetention::Retained {
-                resume: Some(snapshot),
-            } => match store.adopt_retained_engine_scratch(
-                snapshot.scratch_run_id,
-                snapshot.scratch_binding_digest,
-            ) {
-                Ok(retained) => (
-                    EngineScratchOpen::Retained(retained),
-                    None,
-                    Some(snapshot),
-                    None,
-                    None,
-                    None,
-                ),
-                Err(error) => (
-                    EngineScratchOpen::Retained(
-                        store
-                            .create_retained_engine_scratch()
-                            .map_err(|error| EngineError::Archive(error.to_string()))?,
-                    ),
-                    None,
-                    None,
-                    None,
-                    Some(snapshot.scratch_run_id),
-                    Some(EngineError::Archive(error.to_string())),
-                ),
-            },
-            EngineOpenRetention::Retained { resume: None } => (
-                EngineScratchOpen::Retained(
-                    store
-                        .create_retained_engine_scratch()
-                        .map_err(|error| EngineError::Archive(error.to_string()))?,
-                ),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            EngineOpenRetention::MigratedBootstrap { retained, resume } => (
-                EngineScratchOpen::Retained(*retained),
-                Some(resume),
-                None,
-                None,
-                None,
-                None,
-            ),
-            EngineOpenRetention::EphemeralBootstrap { predecessor } => {
-                let (scratch, block_claim_index, snapshot) = predecessor.into_parts();
-                (
-                    EngineScratchOpen::ExistingEphemeral {
-                        scratch,
-                        block_claim_index,
-                    },
-                    None,
-                    None,
-                    Some(snapshot),
-                    None,
-                    None,
-                )
-            }
-        };
-        let predecessor = match ephemeral_predecessor {
-            Some(snapshot) => Some(RecoveryPredecessor::EphemeralBootstrap(snapshot)),
-            None => migrated_resume
-                .as_deref()
-                .map(RecoveryPredecessor::Retained)
-                .or(adopted.map(RecoveryPredecessor::Retained)),
-        };
-        #[cfg(test)]
-        let phase_started = Instant::now();
-        let mut engine = Self::with_enrolled_projection_promoted(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            promotion,
-            scratch_open,
-            predecessor.is_some(),
-        );
-        #[cfg(test)]
-        update_enrolled_projection_open_instrumentation(|timing| {
-            timing.engine_construction = phase_started.elapsed();
-        });
-        // An archive-boundary refusal — absent, leased, ephemeral or foreign
-        // marker, torn entry set, binding mismatch — is a refusal exactly like a
-        // restore-time one. It happens before the engine exists, so it is
-        // recorded here rather than by `rotate_to_fresh_retained_scratch`;
-        // `prepare_operational_recovery_replay` carries the observation into the
-        // replay baseline, so the standing
-        // `EngineInstrumentation::resume.refused` signal reports every refusal
-        // class and not only the post-engine ones.
-        if refusal.is_some() {
-            engine.resume_observation.refused = true;
-        }
-        if engine.history_failure.is_none() {
-            let attached = match bootstrap_publication {
-                Some(publication) => engine.attach_promoted_bootstrap_publication(publication),
-                None => engine.attach_promoted_bootstrap_parts(),
-            };
-            if let Err(error) = attached {
-                engine.history_failure = Some(error);
-            }
-        }
-        if refusal.is_some() && engine.history_failure.is_none() {
-            if let Err(error) = engine.validate_retained_bootstrap_publication() {
-                engine.history_failure = Some(error);
-            }
-        }
-        let (outcomes, rotated) = engine
-            .complete_enrolled_projection_recovery_resuming(committed_manifests, predecessor)?;
-        #[cfg(test)]
-        update_enrolled_projection_open_instrumentation(|timing| {
-            timing.total = open_started.elapsed();
-        });
-        if let Some((run_id, error)) = rotated {
-            refused_run_id = Some(run_id);
-            refusal = Some(error);
-        }
-        let receipt = RuntimeResumeReceipt {
-            observation: engine.resume_observation,
-            engine_run_id: engine
-                .retained_scratch
-                .map(|identity| identity.run_id())
-                .unwrap_or_default(),
-            refused_run_id,
-            refusal,
-        };
-        Ok((engine, receipt, outcomes))
-    }
-
-    fn with_enrolled_projection_promoted(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
-        scratch_open: EngineScratchOpen,
-        retain_current_authority: bool,
-    ) -> Self {
-        let workspace_id = store.workspace_id();
-        let endpoint = receipts.endpoint_binding();
-        let receipt_store_id = receipts.store_id();
-        let enrollment_error = if receipts.workspace_id() != workspace_id {
-            Some("projection receipt workspace does not match archive workspace".to_owned())
-        } else if endpoint.is_none() {
-            Some("projection receipt namespace has no endpoint enrollment".to_owned())
-        } else {
-            match graph.canonical_resource_id() {
-                Ok(graph_resource_id)
-                    if Some(graph_resource_id)
-                        == endpoint.map(|binding| binding.graph_resource_id) =>
-                {
-                    None
-                }
-                Ok(_) => {
-                    Some("projection receipt enrollment does not match graph capability".to_owned())
-                }
-                Err(error) => Some(format!(
-                    "projection graph capability identity could not be verified: {error}"
-                )),
-            }
-        };
-        if let Some(error) = enrollment_error {
-            return Self::failed_archive_open(
-                store,
-                lineage_digest,
-                catalog_document_id,
-                EngineError::Archive(error),
-            );
-        }
-        let binding = ProjectionStorageBinding {
-            endpoint: endpoint.expect("validated enrolled endpoint"),
-            receipt_store_id,
-        };
-        let sealed = match promotion {
-            Some(promotion) => store.seal_promoted_projection(binding, promotion),
-            None => store.seal_enrolled_projection(binding),
-        };
-        match sealed {
-            Ok(open) => Self::with_archive_store_for_endpoint_scratch(
-                open,
-                lineage_digest,
-                catalog_document_id,
-                scratch_open,
-                retain_current_authority,
-            ),
-            Err((store, error)) => Self::failed_archive_open(
-                store,
-                lineage_digest,
-                catalog_document_id,
-                EngineError::Archive(error.to_string()),
-            ),
-        }
-    }
-
-    /// Open an enrolled projection engine and complete its startup recovery.
-    ///
-    /// `committed_manifests` must be the caller's complete current manifest
-    /// enumeration for `store`. Recovery reopens and authenticates every batch
-    /// from the immutable archive; the supplied values select the bounded set
-    /// to replay and do not themselves grant authority. Operational non-empty
-    /// history remains inaccessible until replay coverage, durable bindings,
-    /// and the reference catalog root all validate. Terminal authority is
-    /// restored directly and never enters operational replay.
-    pub fn open_enrolled_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        committed_manifests: &[OperationBatch],
-    ) -> Result<(Self, Vec<StageOutcome>), EngineError> {
-        let mut engine = Self::with_enrolled_projection(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-        );
-        let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
-        Ok((engine, outcomes))
-    }
-
-    pub(crate) fn with_archive_store_for_endpoint(
-        open: super::object_store::EnrolledProjectionOpen,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-    ) -> Self {
-        Self::with_archive_store_for_endpoint_scratch(
-            open,
-            lineage_digest,
-            catalog_document_id,
-            EngineScratchOpen::Fresh,
-            false,
-        )
-    }
-
-    fn with_archive_store_for_endpoint_scratch(
-        open: super::object_store::EnrolledProjectionOpen,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        scratch_open: EngineScratchOpen,
-        retain_current_authority: bool,
-    ) -> Self {
-        let binding = open.binding();
-        let endpoint = binding.endpoint;
-        let (store, history, projection_work_index) = match open.into_runtime() {
-            Ok(runtime) => runtime,
-            Err((store, error)) => {
-                return Self::failed_archive_open(
-                    store,
-                    lineage_digest,
-                    catalog_document_id,
-                    EngineError::Archive(error.to_string()),
-                );
-            }
-        };
-        let history_current = history.current_with_binding();
-        let work_current = projection_work_index.validate_runtime_open();
-        if let Err(error) = &history_current {
-            return Self::failed_archive_open(
-                store,
-                lineage_digest,
-                catalog_document_id,
-                EngineError::Archive(error.to_string()),
-            );
-        }
-        if let Err(error) = &work_current {
-            return Self::failed_archive_open(
-                store,
-                lineage_digest,
-                catalog_document_id,
-                EngineError::ProjectionWork(error.to_string()),
-            );
-        }
-        let mut engine = Self::with_archive_store_scratch(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            scratch_open,
-        );
-        engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
-        // An enrolled runtime may use the persistent page-name index only
-        // after the authenticated history root and its latest record prove the
-        // exact same typed binding.
-        let page_name_index = engine.page_name_index.take();
-        match history_current {
-            Ok((generation, root, latest_batch_id, binding)) => {
-                engine.history_generation = generation;
-                engine.history_root = root;
-                engine.history_store = Some(Arc::new(history));
-                if binding.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION {
-                    engine.history_failure = Some(EngineError::Archive(
-                        "durable history portable-path key version mismatch".into(),
-                    ));
-                } else {
-                    let portable_root =
-                        PortablePathIndexRoot::from_digest(binding.portable_path_root);
-                    match engine
-                        .portable_path_index
-                        .as_ref()
-                        .ok_or_else(|| {
-                            EngineError::Archive(
-                                "durable history has no portable-path index".into(),
-                            )
-                        })
-                        .and_then(|index| {
-                            index
-                                .validate_root(portable_root)
-                                .map_err(|error| EngineError::Archive(error.to_string()))
-                        }) {
-                        Ok(()) => engine.portable_path_root = portable_root,
-                        Err(error) => engine.history_failure = Some(error),
-                    }
-                }
-                if let Some(terminal) = binding.terminal_evidence {
-                    engine.fatal_handle = Some(FatalEvidenceHandle {
-                        conflict_root: terminal.conflict_root,
-                        conflicting_block_count: terminal.conflict_count,
-                        claim_count: terminal.participant_count,
-                        canonical_digest: terminal.canonical_digest,
-                    });
-                }
-                engine.portable_path_conflicts = binding
-                    .portable_path_conflicts
-                    .iter()
-                    .cloned()
-                    .map(|conflict| (conflict.key_digest(), conflict))
-                    .collect();
-                if !engine.portable_path_conflicts.is_empty() {
-                    let expected = portable_path_evidence_handle(&engine.portable_path_conflicts);
-                    if engine.fatal_handle != Some(expected) {
-                        engine.history_failure = Some(EngineError::Archive(
-                            "durable portable-path evidence binding mismatch".into(),
-                        ));
-                    }
-                }
-                let page_name_proof = (|| {
-                    binding
-                        .page_names
-                        .validate()
-                        .map_err(|error| EngineError::Archive(error.to_string()))?;
-                    let index = page_name_index.as_ref().ok_or_else(|| {
-                        EngineError::Archive(
-                            "durable history has no page-name ownership index".into(),
-                        )
-                    })?;
-                    index
-                        .validate_root(&binding.page_names.ownership_root)
-                        .map_err(|error| EngineError::Archive(error.to_string()))?;
-                    match (generation, latest_batch_id) {
-                        (0, None) => {
-                            if binding.page_names
-                                != super::object_store::PageNameDurableBinding::empty()
-                            {
-                                return Err(EngineError::Archive(
-                                    "empty durable history has non-empty page-name authority"
-                                        .into(),
-                                ));
-                            }
-                        }
-                        (0, Some(_)) | (_, None) => {
-                            return Err(EngineError::Archive(
-                                "durable page-name authority has no latest history record".into(),
-                            ));
-                        }
-                        (_, Some(latest_batch_id)) => {
-                            let bytes = engine
-                                .history_store
-                                .as_ref()
-                                .expect("history store installed before page-name proof")
-                                .lookup(root, latest_batch_id)
-                                .map_err(|error| EngineError::Archive(error.to_string()))?
-                                .ok_or_else(|| {
-                                    EngineError::Archive(
-                                        "durable page-name authority latest record is absent"
-                                            .into(),
-                                    )
-                                })?;
-                            engine
-                                .history_store
-                                .as_ref()
-                                .expect("history store installed before page-name proof")
-                                .note_history_decode();
-                            let record = if retain_current_authority {
-                                decode_authenticated_current_history_leaf(latest_batch_id, &bytes)?
-                            } else {
-                                decode_history_record(latest_batch_id, &bytes)?
-                            };
-                            if !retain_current_authority {
-                                engine.validate_record_catalog_transition(&record)?;
-                            }
-                            if record.generation != generation
-                                || history_record_binding(&record) != binding
-                                || (!record.page_names.conflicts.is_empty()
-                                    && !matches!(record.status, ArchiveStatus::Quarantined))
-                            {
-                                return Err(EngineError::Archive(
-                                    "durable page-name record/root binding mismatch".into(),
-                                ));
-                            }
-                            engine
-                                .logseq_claim_index
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    EngineError::Archive(
-                                        "durable history has no external UUID-claim index".into(),
-                                    )
-                                })?
-                                .validate_root(record.logseq_claim_root)
-                                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                            record
-                                .reference_catalog_root
-                                .validate_bound(
-                                    &record.reference_catalog_policy,
-                                    &record.page_names.ownership_root,
-                                    record.logseq_claim_root.digest(),
-                                )
-                                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                            engine.logseq_claim_root = record.logseq_claim_root;
-                            let reference_store =
-                                engine.reference_catalog.store_handle().ok_or_else(|| {
-                                    EngineError::Archive(
-                                        "durable history has no reference catalog store".into(),
-                                    )
-                                })?;
-                            engine.reference_catalog =
-                                ReferenceCatalogStateV2::restore_recovery_required(
-                                    record.reference_catalog_policy.clone(),
-                                    record.reference_catalog_root.clone(),
-                                    &record.page_names.ownership_root,
-                                    record.logseq_claim_root.digest(),
-                                    reference_store,
-                                )
-                                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                            if retain_current_authority {
-                                let reference_catalog_root_nodes =
-                                    engine.reference_catalog.authenticate_root_nodes().map_err(
-                                        |error| EngineError::ReferenceCatalog(error.to_string()),
-                                    )?;
-                                engine.current_durable_authority =
-                                    Some(CurrentDurableAuthorityProof {
-                                        history: super::object_store::EngineHistoryAuthority {
-                                            generation,
-                                            index_root: root,
-                                        },
-                                        latest_batch_id,
-                                        record,
-                                        reference_catalog_root_nodes,
-                                    });
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-                match page_name_proof {
-                    Ok(()) => {
-                        engine.page_name_root = binding.page_names.ownership_root.clone();
-                        engine.page_name_conflicts = binding
-                            .page_names
-                            .conflicts
-                            .iter()
-                            .map(|evidence| {
-                                evidence
-                                    .digest()
-                                    .map(|digest| (digest, evidence.clone()))
-                                    .map_err(|error| EngineError::Archive(error.to_string()))
-                            })
-                            .collect::<Result<_, _>>()
-                            .unwrap_or_else(|error| {
-                                engine.history_failure = Some(error);
-                                BTreeMap::new()
-                            });
-                        if engine.history_failure.is_none() {
-                            engine.page_name_index = page_name_index;
-                        }
-                    }
-                    Err(error) => engine.history_failure = Some(error),
-                }
-            }
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        if engine.history_failure.is_none() {
-            engine.projection_endpoint = Some(endpoint);
-            engine.projection_receipt_store_id = Some(binding.receipt_store_id);
-            engine.projection_work_index = Some(Arc::new(projection_work_index));
-            if engine.fatal_handle.is_none()
-                && engine.page_name_conflicts.is_empty()
-                && engine.reference_catalog.ensure_ready().is_ok()
-            {
-                if let Err(error) = engine.reconcile_pending_projection_work(None) {
-                    engine.history_failure = Some(error);
-                }
-            }
-        }
-        engine
-    }
-
-    fn failed_archive_open(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        error: EngineError,
-    ) -> Self {
-        let workspace_id = store.workspace_id();
-        let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
-        engine.archive_store = Some(Arc::new(store));
-        engine.history_failure = Some(error);
-        engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
-        engine
-    }
-
-    fn complete_enrolled_projection_recovery(
-        &mut self,
-        committed_manifests: &[OperationBatch],
-    ) -> Result<Vec<StageOutcome>, EngineError> {
-        Ok(self
-            .complete_enrolled_projection_recovery_resuming(committed_manifests, None)?
-            .0)
-    }
-
-    /// Complete startup recovery, optionally restoring a revalidated retained
-    /// or one-process ephemeral bootstrap predecessor instead of replaying its
-    /// already authenticated prefix from nothing.
-    ///
-    /// `resume` is `None` on every path that existed before runtime-resume
-    /// adoption. On those paths `replay_base_generation` stays zero, no batch is
-    /// ever skipped, and the coverage proof reduces to exactly the predicate it
-    /// enforced before, so full-replay recovery is unchanged in behaviour and in
-    /// what it proves.
-    ///
-    /// The returned `Option` reports a run this call refused to resume from and
-    /// rotated away from. Refusal is never an error: adoption is an accelerator
-    /// with an always-available fallback.
-    fn complete_enrolled_projection_recovery_resuming(
-        &mut self,
-        committed_manifests: &[OperationBatch],
-        predecessor: Option<RecoveryPredecessor<'_>>,
-    ) -> Result<(Vec<StageOutcome>, Option<(Uuid, EngineError)>), EngineError> {
-        if let Some(error) = &self.history_failure {
-            return Err(error.clone());
-        }
-        if !matches!(self.workspace_status(), WorkspaceStatus::Operational) {
-            return Ok((Vec::new(), None));
-        }
-        match self.reference_catalog.ensure_ready() {
-            Ok(()) => return Ok((Vec::new(), None)),
-            Err(ReferenceCatalogError::RecoveryRequired) => {}
-            Err(error) => return Err(EngineError::ReferenceCatalog(error.to_string())),
-        }
-
-        let prepare_started = Instant::now();
-        self.prepare_operational_recovery_replay()?;
-        update_engine_open_stages(|stages| stages.prepare_replay = prepare_started.elapsed());
-        let mut rotation = None;
-        if let Some(predecessor) = predecessor {
-            let (snapshot, kind) = match &predecessor {
-                RecoveryPredecessor::Retained(snapshot) => (*snapshot, PredecessorKind::Retained),
-                RecoveryPredecessor::EphemeralBootstrap(snapshot) => {
-                    (snapshot.as_ref(), PredecessorKind::EphemeralBootstrap)
-                }
-            };
-            #[cfg(test)]
-            let phase_started = Instant::now();
-            let restore_started = Instant::now();
-            let restore_result = self.restore_predecessor_state(snapshot, kind);
-            update_engine_open_stages(|stages| {
-                stages.predecessor_restore = restore_started.elapsed();
-            });
-            if let Err(refusal) = restore_result {
-                // The restore is all-or-nothing: it validates everything before
-                // it installs anything, so the engine is still exactly at the
-                // baseline `prepare_operational_recovery_replay` produced. All
-                // that is left is to stop using the candidate scratch and replay
-                // everything. A retained refusal preserves its old run; an
-                // ephemeral predecessor is disposable and may be replaced with
-                // another ephemeral run, never a retained one.
-                self.validate_retained_bootstrap_publication()?;
-                match kind {
-                    PredecessorKind::Retained => {
-                        let refused = self.rotate_to_fresh_retained_scratch()?;
-                        rotation = Some((refused, refusal));
-                    }
-                    PredecessorKind::EphemeralBootstrap => {
-                        self.rotate_to_fresh_ephemeral_scratch()?;
-                    }
-                }
-            }
-            #[cfg(test)]
-            update_enrolled_projection_open_instrumentation(|timing| {
-                timing.resume_restore = phase_started.elapsed();
-            });
-        }
-        let outcomes = self.replay_operational_history(committed_manifests, true)?;
-        Ok((outcomes, rotation))
-    }
-
-    /// Replay every immutable record not covered by an authenticated adopted
-    /// predecessor, then close the operational recovery proof.
-    ///
-    /// Startup normally enters here after adoption has either succeeded or
-    /// rotated away. Deferred-catalog recovery also uses this exact loop after
-    /// it has rotated the already-open engine to a fresh retained run, which
-    /// keeps the exceptional recovery path identical to ordinary full replay.
-    fn replay_operational_history(
-        &mut self,
-        committed_manifests: &[OperationBatch],
-        _record_open_timing: bool,
-    ) -> Result<Vec<StageOutcome>, EngineError> {
-        let mut outcomes = Vec::with_capacity(committed_manifests.len());
-        // A promoted lineage's oldest durable records are its bootstrap parts,
-        // which live in the immutable bootstrap namespace. They are replayed
-        // first, in exact aggregate order, so the ordinary archived tail
-        // extends the same accepted state the bootstrap published.
-        //
-        // The plan clones only the retained archive/publication handles and the
-        // bounded part count, which is all that is needed to break the borrow
-        // conflict with `&mut self` staging. Each part is then loaded, staged,
-        // and dropped before the next ordinal is read, so restart resident
-        // memory is one bootstrap part rather than the whole graph.
-        let bootstrap_started = Instant::now();
-        #[cfg(test)]
-        let phase_started = Instant::now();
-        if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
-            if !self.adopted_predecessor_covers_bootstrap(&plan)? {
-                #[cfg(test)]
-                if _record_open_timing {
-                    update_enrolled_projection_open_instrumentation(|timing| {
-                        timing.bootstrap_parts_examined = plan.part_count;
-                    });
-                }
-                for ordinal in 0..plan.part_count {
-                    let part = plan
-                        .publication
-                        .aggregate()
-                        .parts()
-                        .get(ordinal)
-                        .ok_or_else(|| {
-                            EngineError::Archive(
-                                "retained bootstrap publication lost a part ordinal".into(),
-                            )
-                        })?
-                        .batch_id();
-                    // Historical point coverage remains the fallback for a
-                    // stale adopted predecessor that does not cover the whole
-                    // aggregate prefix.
-                    let covered = self.covered_by_predecessor_state(part)?;
-                    if covered {
-                        continue;
-                    }
-                    self.validated_run_local_current_authority = None;
-                    let outcome = self.stage_one_retained_bootstrap_part(&plan, ordinal)?;
-                    if let Some(error) = &self.history_failure {
-                        return Err(error.clone());
-                    }
-                    outcomes.push(outcome);
-                }
-            }
-        }
-        #[cfg(test)]
-        if _record_open_timing {
-            update_enrolled_projection_open_instrumentation(|timing| {
-                timing.bootstrap_part_recovery = phase_started.elapsed();
-            });
-        }
-        let bootstrap_replayed = outcomes.len();
-        update_engine_open_stages(|stages| {
-            stages.bootstrap_part_replay = bootstrap_started.elapsed();
-            stages.bootstrap_parts_replayed = bootstrap_replayed;
-            stages.archived_manifests_offered = committed_manifests.len();
-        });
-        let tail_started = Instant::now();
-        for manifest in committed_manifests {
-            if self.covered_by_predecessor_state(manifest.batch_id())? {
-                continue;
-            }
-            self.validated_run_local_current_authority = None;
-            let outcome = self.stage_archive_batch_for_recovery(manifest.batch_id())?;
-            if let Some(error) = &self.history_failure {
-                return Err(error.clone());
-            }
-            outcomes.push(outcome);
-        }
-        let tail_replayed = outcomes.len().saturating_sub(bootstrap_replayed);
-        update_engine_open_stages(|stages| {
-            stages.archived_tail_replay = tail_started.elapsed();
-            stages.archived_manifests_replayed = tail_replayed;
-        });
-        let finish_started = Instant::now();
-        self.finish_operational_recovery_replay()?;
-        update_engine_open_stages(|stages| stages.finish_replay = finish_started.elapsed());
-        Ok(outcomes)
-    }
-
-    /// Whether one durable batch is already covered by the authenticated
-    /// predecessor state this replay adopted.
-    ///
-    /// The oracle is the batch's own authenticated durable record, read at the
-    /// live sealed root — not the adopted run's accepted set — so a record that
-    /// was *rejected* or *quarantined* before the base generation counts as
-    /// covered exactly like an accepted one, which is what keeps the coverage
-    /// proof's generation range contiguous.
-    ///
-    /// `replay_base_generation` is zero on every non-adopting path and durable
-    /// generations start at one, so this is unconditionally `false` there and
-    /// costs no lookup.
-    fn covered_by_predecessor_state(&self, batch_id: BatchId) -> Result<bool, EngineError> {
-        if self.replay_base_generation == 0 {
-            return Ok(false);
-        }
-        Ok(self
-            .authenticated_recovery_history_record(batch_id)?
-            .is_some_and(|record| record.generation <= self.replay_base_generation))
-    }
-
-    /// O(1) proof that an adopted predecessor covers the exact immutable
-    /// bootstrap prefix installed by this promoted lineage.
-    ///
-    /// `ExactBootstrapHistoryBuilderV1` is the sole mint of a bootstrap-bound
-    /// history root: it installs every aggregate descriptor in ordinal order,
-    /// assigns generations `1..=part_count`, and only then publishes the root
-    /// carrying the aggregate binding. Every later promoted history root keeps
-    /// that binding unchanged. Adoption has already proved the live history is
-    /// an insertion-only descendant of `replay_base_generation` and that its
-    /// accepted frontier is the predecessor record's frontier. Therefore the
-    /// compact generation and accepted-count checks below cover the whole
-    /// prefix without decoding each immutable cold record again.
-    fn adopted_predecessor_covers_bootstrap(
-        &self,
-        plan: &BootstrapRecoveryPlan,
-    ) -> Result<bool, EngineError> {
-        if self.replay_base_generation == 0 {
-            return Ok(false);
-        }
-        let binding = super::object_store::BootstrapAggregateHistoryBindingV1::for_aggregate(
-            plan.publication.aggregate(),
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let part_count = u64::from(binding.part_count());
-        Ok(self
-            .promoted_lineage()
-            .is_some_and(|promotion| promotion.bootstrap() == binding)
-            && plan.part_count == binding.part_count() as usize
-            && self.replay_base_generation >= part_count
-            && self.next_acceptance_sequence >= part_count
-            && self.scratch_roots.accepted_batch_map_root.count() >= part_count)
-    }
-
-    fn validate_retained_bootstrap_publication(&self) -> Result<(), EngineError> {
-        let Some(retained) = &self.bootstrap_parts else {
-            return Ok(());
-        };
-        self.archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
-            .validate_bootstrap_publication(&retained.publication)
-            .map_err(|error| EngineError::Archive(error.to_string()))
-    }
-
-    /// Stop using the retained run this open was given and mint a fresh one.
-    ///
-    /// The abandoned run is left byte-for-byte intact: nothing here truncates,
-    /// rewrites, unlinks, or reclaims it. It simply stops being the run this
-    /// engine appends to, and stops being reachable once lifecycle wiring
-    /// publishes a resume point naming the new run.
-    fn rotate_to_fresh_retained_scratch(&mut self) -> Result<Uuid, EngineError> {
-        let refused = self
-            .retained_scratch
-            .ok_or_else(|| {
-                EngineError::Archive("runtime resume rotation requires a retained run".into())
-            })?
-            .run_id();
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
-        let fresh = store
-            .create_retained_engine_scratch()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let (scratch, claim_index, identity) = fresh.into_parts();
-        self.forget_retained_accepted_documents();
-        self.scratch = Some(scratch);
-        self.block_claim_index = Some(Arc::new(claim_index));
-        self.retained_scratch = Some(identity);
-        self.resume_observation.refused = true;
-        Ok(refused)
-    }
-
-    /// Discard an untrusted one-process ephemeral predecessor and rebuild the
-    /// ordinary disposable scratch baseline. Unlike retained rotation this
-    /// cannot publish, preserve, or add a retained run; the original ephemeral
-    /// run is removed with its last owner.
-    fn rotate_to_fresh_ephemeral_scratch(&mut self) -> Result<(), EngineError> {
-        if self.retained_scratch.is_some() {
-            return Err(EngineError::Archive(
-                "ephemeral bootstrap fallback cannot rotate a retained run".into(),
-            ));
-        }
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
-        let (scratch, claim_index) = store
-            .start_engine_scratch()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.forget_retained_accepted_documents();
-        self.scratch = Some(scratch);
-        self.block_claim_index = Some(Arc::new(claim_index));
-        Ok(())
-    }
-
-    /// Retain this promoted lineage's immutable bootstrap publication and the
-    /// exact aggregate ordinal of every bootstrap `BatchId`.
-    ///
-    /// The publication identity comes from the authorized durable promotion
-    /// state, never from a caller-supplied value, and the loaded aggregate must
-    /// reproduce exactly that identity. An unpromoted engine retains nothing.
-    fn attach_promoted_bootstrap_parts(&mut self) -> Result<(), EngineError> {
-        let Some(promotion) = self.promoted_lineage().cloned() else {
-            return Ok(());
-        };
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
-        let publication = store
-            .load_bootstrap_publication(promotion.bootstrap().publication_id())
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.attach_promoted_bootstrap_publication(Arc::new(publication))
-    }
-
-    fn attach_promoted_bootstrap_publication(
-        &mut self,
-        publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
-    ) -> Result<(), EngineError> {
-        let promotion = self.promoted_lineage().cloned().ok_or_else(|| {
-            EngineError::Archive(
-                "bootstrap publication attachment requires a promoted lineage".into(),
-            )
-        })?;
-        let aggregate = publication.aggregate();
-        if super::object_store::BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            != promotion.bootstrap()
-            || aggregate.workspace_id() != self.workspace_id
-            || aggregate.lineage_digest() != self.lineage_digest
-        {
-            return Err(EngineError::Archive(
-                "retained bootstrap publication is not the promoted lineage".into(),
-            ));
-        }
-        let mut ordinals = BTreeMap::new();
-        for (ordinal, descriptor) in aggregate.parts().iter().enumerate() {
-            if ordinals.insert(descriptor.batch_id(), ordinal).is_some() {
-                return Err(EngineError::Archive(
-                    "retained bootstrap publication repeats a batch identity".into(),
-                ));
-            }
-        }
-        self.bootstrap_parts = Some(RetainedBootstrapParts {
-            publication,
-            ordinals,
-        });
-        Ok(())
-    }
-
-    /// Load one retained immutable bootstrap part by its accepted `BatchId`.
-    ///
-    /// Returns `None` for every batch that is not one of this promoted
-    /// lineage's bootstrap parts, so ordinary archived batches keep using the
-    /// ordinary object namespace.
-    fn load_retained_bootstrap_part(
-        &self,
-        batch_id: BatchId,
-    ) -> Result<Option<super::object_store::LoadedBootstrapPartV1>, EngineError> {
-        let Some(retained) = &self.bootstrap_parts else {
-            return Ok(None);
-        };
-        let Some(ordinal) = retained.ordinals.get(&batch_id).copied() else {
-            return Ok(None);
-        };
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or(EngineError::MissingDependency(batch_id))?;
-        let loaded = store
-            .load_bootstrap_part(&retained.publication, ordinal)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if loaded.manifest().batch_id() != batch_id {
-            return Err(EngineError::Archive(
-                "retained bootstrap part does not carry its aggregate batch identity".into(),
-            ));
-        }
-        if loaded.manifest().lineage_digest() != self.lineage_digest {
-            return Err(EngineError::LineageMismatch {
-                expected: self.lineage_digest,
-                found: loaded.manifest().lineage_digest(),
-            });
-        }
-        Ok(Some(loaded))
-    }
-
-    /// The bounded plan for replaying this promoted lineage's bootstrap parts.
-    ///
-    /// It holds no part payload at all: two refcounted handles the engine
-    /// already owns, plus the aggregate part count. That is exactly enough to
-    /// let the caller stage each part through `&mut self` without keeping the
-    /// engine immutably borrowed across the loop.
-    fn retained_bootstrap_recovery_plan(
-        &self,
-    ) -> Result<Option<BootstrapRecoveryPlan>, EngineError> {
-        let Some(retained) = &self.bootstrap_parts else {
-            return Ok(None);
-        };
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
-        Ok(Some(BootstrapRecoveryPlan {
-            part_count: retained.publication.aggregate().parts().len(),
-            store: Arc::clone(store),
-            publication: Arc::clone(&retained.publication),
-        }))
-    }
-
-    /// Load, authenticate, stage, and release exactly one bootstrap part.
-    ///
-    /// Residency is counted from payload ownership, not from a staging bracket:
-    /// [`BootstrapResidencyLedger::own_loaded_part`] consumes the archive read's
-    /// return value directly, `try_map` carries that same residency unit into
-    /// the `PreparedBatch`, and `consume` releases it only after staging has
-    /// returned. So exactly one part payload is owned for the whole span in
-    /// which one exists, and none afterwards, on every return path.
-    /// `stage_bootstrap_part_for_recovery` still performs the authenticated
-    /// cold-record check, so nothing about the replay's generation proofs, its
-    /// bootstrap-namespace separation, or its exact multipart ordering changes.
-    fn stage_one_retained_bootstrap_part(
-        &mut self,
-        plan: &BootstrapRecoveryPlan,
-        ordinal: usize,
-    ) -> Result<StageOutcome, EngineError> {
-        let descriptor = plan
-            .publication
-            .aggregate()
-            .parts()
-            .get(ordinal)
-            .ok_or_else(|| {
-                EngineError::Archive("retained bootstrap publication lost a part ordinal".into())
-            })?;
-        let expected = descriptor.batch_id();
-        // Detached bootstrap authoring may defer every graph-wide index until
-        // the terminal part. Full archive replay must select that same
-        // authenticated construction profile before it derives this part's
-        // candidate roots; otherwise the first intermediate part is compared
-        // against a durable record that deliberately commits the deferred
-        // root, and the unconditional predecessor-refusal fallback cannot
-        // reproduce its existing authority.
-        self.configure_detached_bootstrap_reference_catalog(descriptor.evidence())?;
-        let loaded = self.bootstrap_residency.own_loaded_part(
-            plan.store
-                .load_bootstrap_part(&plan.publication, ordinal)
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-        );
-        if loaded.get().manifest().batch_id() != expected {
-            return Err(EngineError::Archive(
-                "retained bootstrap part does not carry its aggregate batch identity".into(),
-            ));
-        }
-        if loaded.get().manifest().lineage_digest() != self.lineage_digest {
-            return Err(EngineError::LineageMismatch {
-                expected: self.lineage_digest,
-                found: loaded.get().manifest().lineage_digest(),
-            });
-        }
-        let prepared = loaded.try_map(|loaded| {
-            let (manifest, objects) = loaded.into_manifest_and_objects();
-            PreparedBatch::new(manifest, objects)
-        })?;
-        prepared.consume(|prepared| self.stage_bootstrap_part_for_recovery(prepared))
-    }
-
-    /// Observed bootstrap-part residency of this engine's recovery replay.
-    ///
-    /// The exact counterpart of [`super::sqlite::BootstrapSqliteRebuildInstrumentation`]
-    /// for the engine side of a promoted open, so a regression can assert that
-    /// the observed maximum is one part rather than the whole publication.
-    pub(crate) fn bootstrap_recovery_instrumentation(&self) -> BootstrapRecoveryInstrumentation {
-        self.bootstrap_residency.snapshot()
-    }
-
-    /// Test-only proof that the residency ledger measures payload ownership.
-    ///
-    /// It loads every retained bootstrap part through exactly the production
-    /// `own_loaded_part`/`try_map` wrappers and deliberately holds all of them
-    /// at once — the all-parts preload shape the production replay must never
-    /// take. It uses its own ledger, so the engine's production instrumentation
-    /// is untouched, and it returns that ledger's snapshot while everything was
-    /// held together with the live count after releasing it all.
-    ///
-    /// Production recovery never calls this. It exists so the streaming
-    /// regression's fail-before claim is executable: an instrument that only
-    /// bracketed staging would report one part here too.
-    #[cfg(test)]
-    pub(crate) fn probe_preloaded_bootstrap_part_residency(
-        &self,
-    ) -> Result<(BootstrapRecoveryInstrumentation, usize), EngineError> {
-        let plan = self.retained_bootstrap_recovery_plan()?.ok_or_else(|| {
-            EngineError::Archive("engine retains no bootstrap publication to preload".into())
-        })?;
-        let ledger = Arc::new(BootstrapResidencyLedger::default());
-        let mut held = Vec::with_capacity(plan.part_count);
-        for ordinal in 0..plan.part_count {
-            let loaded = ledger.own_loaded_part(
-                plan.store
-                    .load_bootstrap_part(&plan.publication, ordinal)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?,
-            );
-            held.push(loaded.try_map(|loaded| {
-                let (manifest, objects) = loaded.into_manifest_and_objects();
-                PreparedBatch::new(manifest, objects)
-            })?);
-        }
-        let preloaded = ledger.snapshot();
-        drop(held);
-        Ok((preloaded, ledger.live()))
-    }
-
-    /// The retained run this engine appends to, when it owns one.
-    pub(crate) fn retained_scratch_run_id(&self) -> Option<Uuid> {
-        self.retained_scratch.map(|identity| identity.run_id())
-    }
-
     fn document_state_error(
         &self,
         error: super::document_state::DocumentStateError,
     ) -> EngineError {
-        if self.resume_observation.adopted {
-            if let (Some(run_id), super::document_state::DocumentStateError::Scratch(scratch)) =
-                (self.retained_scratch_run_id(), &error)
-            {
-                if let Some(failure) = RetainedScratchResumeFailure::from_scratch(run_id, scratch) {
-                    return EngineError::RetainedScratchResumeFailure(failure);
-                }
-            }
-        }
         EngineError::Archive(error.to_string())
     }
 
@@ -9288,635 +8889,6 @@ impl ShardedHotEngine {
         self.resume_observation
     }
 
-    /// Snapshot the exact run-local state a cross-process resume must carry,
-    /// or `None` when this engine is not in a publishable state.
-    ///
-    /// `None` is never an error and never a diagnosis the caller must act on:
-    /// it means "reuse nothing, replay everything", which is always available
-    /// and always correct. The refusals fall into three groups:
-    ///
-    /// * **not a retained runtime** — no scratch, no *retained* run, no durable
-    ///   history, no enrolled authority, or an empty history. There is nothing
-    ///   a resume point could name;
-    /// * **not quiescent** — an unresolved author buffer, undrained dependency
-    ///   registration/fanout/ready work, or an active authenticated replay. The
-    ///   run-local roots are still moving, so recording them would record a
-    ///   state the engine cannot honour;
-    /// * **not clean** — a page-name or portable-path conflict, terminal
-    ///   evidence, a latched history or pre-commit publication failure, an
-    ///   unavailable current-path catalog authority, or a reference catalog
-    ///   still in recovery. Every one of these already blocks writes, and their
-    ///   evidence maps are unbounded, so excluding them is what keeps the record
-    ///   provably small as well as correct;
-    /// * **not adoptable** — the durable head record this point would name is
-    ///   not itself a clean accepted state (a rejection or a quarantine at the
-    ///   head, conflicts, terminal evidence, a stale portable-path key
-    ///   version). The restore would refuse such a record, so refusing at the
-    ///   mint keeps the reason where it is diagnosable instead of turning it
-    ///   into a silent full replay on every later restart.
-    ///
-    /// This is a quiescent lifecycle read. It performs one head-root read, one
-    /// authenticated lookup of that head record, one canonical marker digest,
-    /// and a handful of clones of roots the engine already holds. Nothing is
-    /// written and no scratch page is touched. It is not on, and must never be
-    /// moved onto, the keystroke, admission, authoring, or acceptance path.
-    pub(crate) fn runtime_resume_snapshot(
-        &self,
-    ) -> Result<Option<RuntimeResumeSnapshot>, EngineError> {
-        let (Some(scratch), Some(retained), Some(history)) = (
-            self.scratch.as_ref(),
-            self.retained_scratch,
-            self.history_store.as_ref(),
-        ) else {
-            return Ok(None);
-        };
-        if self.durable_authority_mode != DurableAuthorityMode::EnrolledRequired
-            || self.history_failure.is_some()
-            || self.precommit_history_publication_failure.is_some()
-            || self.authenticated_history_replay
-            || !matches!(self.workspace_status(), WorkspaceStatus::Operational)
-            || self.is_blocked()
-            || !self.portable_path_conflicts.is_empty()
-            || self.has_pending_author_work()
-            || self.has_durable_stage_work()
-            || !self.current_path_catalog.available
-            || self.reference_catalog.ensure_ready().is_err()
-        {
-            return Ok(None);
-        }
-        // Authenticate the durable history authority this snapshot records
-        // against the store's own live head, not against the engine's
-        // remembered copy, and require it to name the record that commits every
-        // durable-derived root the restore will need.
-        let (generation, index_root, latest_batch_id, _) = history
-            .current_with_binding()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let Some(latest_batch_id) = latest_batch_id else {
-            return Ok(None);
-        };
-        if generation == 0
-            || generation != self.history_generation
-            || index_root != self.history_root
-        {
-            return Ok(None);
-        }
-        // The head record is the one every durable-derived root would be
-        // restored from, so refuse to mint a record no restore could adopt. An
-        // endpoint whose newest durable record is a rejection or a quarantine
-        // reports "nothing to publish this cycle" here, where the reason is
-        // visible, rather than publishing a point that every later restart
-        // silently refuses into a full replay.
-        let authority = super::object_store::EngineHistoryAuthority {
-            generation,
-            index_root,
-        };
-        let already_authenticated =
-            self.adoptable_current_history_head == Some((authority, latest_batch_id));
-        if !already_authenticated
-            && !self
-                .sealed_history_record(latest_batch_id)?
-                .as_ref()
-                .is_some_and(record_is_adoptable_predecessor)
-        {
-            return Ok(None);
-        }
-        // Authenticate the retained scratch binding: the live run must still be
-        // exactly the run this engine was opened on, with the same canonical
-        // marker, so the recorded identity cannot name a re-created sibling.
-        let binding_digest = scratch
-            .binding_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if scratch.run_id() != retained.run_id()
-            || scratch.workspace_id() != self.workspace_id
-            || binding_digest != retained.binding_digest()
-        {
-            return Ok(None);
-        }
-        // These two are derived rather than independent, and the restore
-        // re-checks both. Refusing here keeps an inconsistent engine from ever
-        // producing a record whose own fields disagree.
-        if self.next_acceptance_sequence != self.accepted_frontier_root.acceptance_sequence
-            || self.current_path_catalog.accepted_frontier_root != self.accepted_frontier_root
-        {
-            return Ok(None);
-        }
-        // An exact-current adopted open deliberately keeps the graph-sized
-        // catalog document cold. Its absent hot heads are therefore cache
-        // state, not semantic authority. The automatic post-open publication
-        // can run after replay has advanced the live scratch roots, so first
-        // re-authenticate the deferred snapshot's cheap state record and bind
-        // those exact heads to the successor roots. Using
-        // `visible_document_heads` here would mint an empty-head binding that
-        // the retained catalog bytes correctly refuse on the next open.
-        let catalog_checkpoint_binding = if let Some(checkpoint) = &self.deferred_catalog_checkpoint
-        {
-            let catalog_heads = self.load_run_local_catalog_heads(&checkpoint.roots)?;
-            let adopted_binding = self.catalog_checkpoint_binding_for(
-                &checkpoint.roots,
-                Some(&catalog_heads).filter(|heads| !heads.is_empty()),
-            );
-            if adopted_binding != checkpoint.binding {
-                return Err(EngineError::Archive(
-                    "adopted run does not reproduce the recorded catalog checkpoint binding".into(),
-                ));
-            }
-            self.catalog_checkpoint_binding_for(
-                &self.scratch_roots,
-                Some(&catalog_heads).filter(|heads| !heads.is_empty()),
-            )
-        } else {
-            self.catalog_checkpoint_binding()
-        };
-        Ok(Some(RuntimeResumeSnapshot {
-            history_generation: generation,
-            history_index_root: index_root,
-            history_latest_batch_id: latest_batch_id,
-            scratch_run_id: retained.run_id(),
-            scratch_binding_digest: binding_digest,
-            scratch_roots: self.scratch_roots.clone(),
-            block_claim_root: self.block_claim_root,
-            accepted_frontier_root: self.accepted_frontier_root.clone(),
-            next_acceptance_sequence: self.next_acceptance_sequence,
-            current_path_catalog_root: self.current_path_catalog.root.clone(),
-            current_path_catalog_available: self.current_path_catalog.available,
-            current_path_catalog_frontier: self.current_path_catalog.accepted_frontier_root.clone(),
-            catalog_checkpoint_binding,
-        }))
-    }
-
-    /// Install one adopted snapshot as this replay's authenticated predecessor
-    /// state, or refuse without touching anything.
-    ///
-    /// Called exactly once, immediately after
-    /// [`Self::prepare_operational_recovery_replay`], so the engine it mutates
-    /// is the full-replay baseline. **Every check runs before the first
-    /// install**, so a refusal leaves that baseline byte-for-byte intact and the
-    /// caller's only remaining job is to rotate off the suspect run.
-    ///
-    /// Nothing durable is taken from the snapshot. The snapshot names a durable
-    /// record; this reads that record at the live sealed root and restores every
-    /// durable-derived root from it, re-validating each against this archive's
-    /// own authenticated indexes. What the snapshot actually supplies is only
-    /// the run-local roots no durable record commits — and even those are bound:
-    ///
-    /// * the accepted frontier's content-addressed facts — acceptance sequence,
-    ///   document count, the accepted document and batch map roots, and the
-    ///   reference-catalog root — must equal the predecessor record's own
-    ///   accepted evidence, which is what makes a snapshot claiming a frontier
-    ///   *ahead of* authenticated durable history fail closed rather than
-    ///   authorize state;
-    /// * the two scratch document lanes and the catalog document's direct heads
-    ///   must reproduce the recorded catalog checkpoint binding;
-    /// * a bounded, constant-count set of the remaining roots is read through
-    ///   its own authenticated reader against the adopted run
-    ///   ([`Self::probe_adopted_run_local_roots`] documents exactly which), so a
-    ///   truncated or tampered `pages.index` fails here rather than at some
-    ///   later hot read.
-    ///
-    /// **Hot state, not only roots.** Restoring the roots is not sufficient. A
-    /// full replay leaves the catalog document resident in `visible_documents`,
-    /// and `materialize_page_inner`, `canonical_snapshot` and
-    /// `resolve_logseq_uuid_current` resolve it out of hot state with no lazy
-    /// load; an adopted replay stages only the tail, and an ordinary
-    /// content-edit tail never touches the catalog. So the catalog document is
-    /// restored here too, from the adopted run's own authenticated visible
-    /// document lane — the same bytes and the same reader ordinary hot reads
-    /// use. Every other hot member is either reloaded from the run on demand
-    /// (`clone_visible_document`, `document_dependency_heads`) or provably
-    /// empty while a scratch run is attached (`accepted_frontier`,
-    /// `accepted_sequence`, every `ephemeral_*` map), so the catalog document is
-    /// the whole gap between an adopted engine and the engine a full replay
-    /// produces.
-    fn restore_predecessor_state(
-        &mut self,
-        snapshot: &RuntimeResumeSnapshot,
-        kind: PredecessorKind,
-    ) -> Result<(), EngineError> {
-        #[cfg(test)]
-        if matches!(kind, PredecessorKind::EphemeralBootstrap)
-            && FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE.replace(false)
-        {
-            return Err(EngineError::Archive(
-                "injected ephemeral bootstrap predecessor restore refusal".into(),
-            ));
-        }
-        if !self.authenticated_history_replay || self.replay_base_generation != 0 {
-            return Err(EngineError::Archive(
-                "runtime resume restore requires a fresh authenticated replay baseline".into(),
-            ));
-        }
-        match kind {
-            PredecessorKind::Retained => {
-                let identity = self.retained_scratch.ok_or_else(|| {
-                    EngineError::Archive("runtime resume restore requires a retained run".into())
-                })?;
-                if identity.run_id() != snapshot.scratch_run_id
-                    || identity.binding_digest() != snapshot.scratch_binding_digest
-                {
-                    return Err(EngineError::Archive(
-                        "adopted retained run is not the run this resume snapshot names".into(),
-                    ));
-                }
-            }
-            PredecessorKind::EphemeralBootstrap => {
-                if self.retained_scratch.is_some() {
-                    return Err(EngineError::Archive(
-                        "ephemeral bootstrap predecessor unexpectedly owns a retained run".into(),
-                    ));
-                }
-                let scratch = self.scratch.as_ref().ok_or_else(|| {
-                    EngineError::Archive(
-                        "ephemeral bootstrap predecessor has no run-local scratch".into(),
-                    )
-                })?;
-                if scratch.run_id() != snapshot.scratch_run_id
-                    || scratch
-                        .binding_digest()
-                        .map_err(|error| EngineError::Archive(error.to_string()))?
-                        != snapshot.scratch_binding_digest
-                {
-                    return Err(EngineError::Archive(
-                        "ephemeral bootstrap scratch is not the sealed predecessor run".into(),
-                    ));
-                }
-            }
-        }
-        if snapshot.history_generation == 0 {
-            return Err(EngineError::Archive(
-                "a runtime resume snapshot must name a durable predecessor record".into(),
-            ));
-        }
-        if snapshot.next_acceptance_sequence != snapshot.accepted_frontier_root.acceptance_sequence
-            || snapshot.current_path_catalog_frontier != snapshot.accepted_frontier_root
-            || !snapshot.current_path_catalog_available
-        {
-            return Err(EngineError::Archive(
-                "runtime resume snapshot is internally inconsistent".into(),
-            ));
-        }
-        // The mint refuses a non-quiescent engine, and the restore re-checks
-        // every other derived invariant, so it re-checks this one too: the
-        // recorded roots carry the dependency-registration, fanout and
-        // ready-queue counters, and adoption installs them wholesale. A record
-        // that disagreed with its own mint gate would hand the engine phantom
-        // pending staging work that no batch will ever resolve.
-        if !scratch_roots_are_stage_quiescent(&snapshot.scratch_roots) {
-            return Err(EngineError::Archive(
-                "runtime resume snapshot carries undrained run-local staging work".into(),
-            ));
-        }
-
-        // The enrolled construction already authenticated the current durable
-        // record and compact roots once. An exact-current snapshot may consume
-        // that move-only proof; a stale snapshot takes the ordinary descendant
-        // and historical-record path below.
-        let exact_current = self.current_durable_authority_proof_is_live()?
-            && self
-                .current_durable_authority
-                .as_ref()
-                .is_some_and(|proof| {
-                    proof.history.generation == snapshot.history_generation
-                        && proof.history.index_root == snapshot.history_index_root
-                        && proof.latest_batch_id == snapshot.history_latest_batch_id
-                });
-        let current_proof = exact_current.then(|| {
-            self.current_durable_authority
-                .take()
-                .expect("exact-current proof was present")
-        });
-
-        // 1. The live sealed history must be exactly, or insertion-only
-        //    descended from, the authority the snapshot records. That is what
-        //    turns "records at or below the base are already covered" into a
-        //    proof: no record in that range can have changed.
-        if current_proof.is_none() {
-            let transition = self.authenticate_history_descends_from(
-                super::object_store::EngineHistoryAuthority {
-                    generation: snapshot.history_generation,
-                    index_root: snapshot.history_index_root,
-                },
-            )?;
-            if transition.after().generation != self.history_generation
-                || transition.after().index_root != self.history_root
-            {
-                return Err(EngineError::Archive(
-                    "durable history moved during a runtime resume restore".into(),
-                ));
-            }
-        }
-
-        // 2. Read the predecessor record itself, at the live sealed root.
-        let (record, reference_catalog_root_nodes, exact_current_authority) = match current_proof {
-            Some(proof) => (
-                proof.record,
-                Some(proof.reference_catalog_root_nodes),
-                Some(proof.history),
-            ),
-            None => (
-                self.authenticated_recovery_history_record(snapshot.history_latest_batch_id)?
-                    .ok_or_else(|| {
-                        EngineError::Archive(
-                            "runtime resume predecessor record is absent from durable history"
-                                .into(),
-                        )
-                    })?,
-                None,
-                None,
-            ),
-        };
-        if record.generation != snapshot.history_generation {
-            return Err(EngineError::Archive(
-                "runtime resume predecessor record is not at the recorded generation".into(),
-            ));
-        }
-        if !record_is_adoptable_predecessor(&record) {
-            return Err(EngineError::Archive(
-                "runtime resume predecessor record is not a clean accepted quiescent state".into(),
-            ));
-        }
-        // The predecessor's own accepted evidence commits the accepted frontier
-        // at that generation. A snapshot whose frontier is ahead of, behind, or
-        // simply different from authenticated durable history stops here.
-        // (`record_is_adoptable_predecessor` already required `Accepted`; this
-        // is the binding, expressed as a refusal rather than a panic so the
-        // restore stays fail-closed on every path.)
-        let ArchiveStatus::Accepted { evidence, .. } = &record.status else {
-            return Err(EngineError::Archive(
-                "runtime resume predecessor record is not an accepted batch".into(),
-            ));
-        };
-        if accepted_frontier_cross_run_facts(&evidence.post_frontier_root)
-            != accepted_frontier_cross_run_facts(&snapshot.accepted_frontier_root)
-        {
-            return Err(EngineError::Archive(
-                "runtime resume accepted frontier is not the predecessor record's authority".into(),
-            ));
-        }
-        // 3. Re-authenticate every durable-derived root against this archive's
-        //    own indexes, exactly as an enrolled open does at the live head.
-        let portable_path_root = record.portable_path_root;
-        let reference_store = self.reference_catalog.store_handle().ok_or_else(|| {
-            EngineError::Archive("enrolled runtime has no reference catalog store".into())
-        })?;
-        let mut recovered_reference_catalog = ReferenceCatalogStateV2::restore_recovery_required(
-            record.reference_catalog_policy.clone(),
-            record.reference_catalog_root.clone(),
-            &record.page_names.ownership_root,
-            record.logseq_claim_root.digest(),
-            reference_store,
-        )
-        .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if reference_catalog_root_nodes.is_none() {
-            record
-                .page_names
-                .validate()
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            self.page_name_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Archive("enrolled runtime has no page-name ownership index".into())
-                })?
-                .validate_root(&record.page_names.ownership_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            self.portable_path_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Archive("enrolled runtime has no portable-path index".into())
-                })?
-                .validate_root(portable_path_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            self.logseq_claim_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Archive("enrolled runtime has no external UUID-claim index".into())
-                })?
-                .validate_root(record.logseq_claim_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            // Stale candidates retain the complete historical validation.
-            recovered_reference_catalog
-                .finish_recovery()
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
-        // 4. Read the run-local roots back out of the adopted run. This is the
-        //    step a truncated or tampered `pages.index` cannot survive: every
-        //    read below is digest- and kind-checked against the recorded root.
-        //    It also returns the run-local hot state the restore installs, so
-        //    that state is read under exactly the same all-or-nothing proof.
-        let run_local = self.probe_adopted_run_local_roots(
-            snapshot,
-            &record,
-            reference_catalog_root_nodes.is_some(),
-        )?;
-        // 5. Everything is proved. Install.
-        self.page_name_root = record.page_names.ownership_root.clone();
-        self.page_name_conflicts = BTreeMap::new();
-        self.portable_path_root = portable_path_root;
-        self.portable_path_conflicts = BTreeMap::new();
-        self.logseq_claim_root = record.logseq_claim_root;
-        if let Some(root_nodes) = reference_catalog_root_nodes {
-            recovered_reference_catalog
-                .finish_recovery_from_root_nodes(root_nodes)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
-        self.reference_catalog = recovered_reference_catalog;
-        self.forget_retained_accepted_documents();
-        self.scratch_roots = snapshot.scratch_roots.clone();
-        self.block_claim_root = snapshot.block_claim_root;
-        self.accepted_frontier_root = snapshot.accepted_frontier_root.clone();
-        self.next_acceptance_sequence = snapshot.next_acceptance_sequence;
-        self.current_path_catalog = CurrentPathCatalog {
-            root: snapshot.current_path_catalog_root.clone(),
-            available: snapshot.current_path_catalog_available,
-            accepted_frontier_root: snapshot.current_path_catalog_frontier.clone(),
-        };
-        // The hot catalog state a full replay would have staged. Without it
-        // every projection read of an adopted engine returns `PageNotFound`,
-        // `canonical_snapshot` silently returns an empty graph, and the first
-        // local authoring round is diverted into external reconciliation
-        // against a `None` semantic pre-state.
-        match run_local {
-            Some(run_local) => run_local.install(self),
-            None => {
-                self.deferred_catalog_checkpoint = Some(DeferredCatalogCheckpoint {
-                    roots: snapshot.scratch_roots.clone(),
-                    binding: snapshot.catalog_checkpoint_binding,
-                });
-            }
-        }
-        self.replay_base_generation = snapshot.history_generation;
-        self.validated_run_local_current_authority = exact_current_authority;
-        self.adoptable_current_history_head =
-            exact_current_authority.map(|authority| (authority, record.batch_id));
-        if matches!(kind, PredecessorKind::Retained) {
-            self.resume_observation.adopted = true;
-        }
-        Ok(())
-    }
-
-    /// Read the adopted run through a **bounded, constant-count** set of its
-    /// recorded roots, prove each reproduces the predecessor record's durable
-    /// bindings, and return the run-local hot state the restore installs.
-    ///
-    /// This deliberately reads through the *recorded* roots rather than the
-    /// engine's current (baseline-empty) ones, so it exercises exactly the bytes
-    /// adoption is about to trust.
-    ///
-    /// **Exactly what is read, and what is not.** This is a fixed number of
-    /// authenticated point reads — it is deliberately *not* a scan, so its cost
-    /// does not grow with the graph or with the run's history:
-    ///
-    /// * for a stale candidate, the two external document lanes through
-    ///   `document_state::load_external_current`; an exact-current candidate
-    ///   defers that authenticated catalog read until an engine operation needs
-    ///   it;
-    /// * `accepted_batch_map_root` — cardinality only;
-    /// * `batch_status_root`, through `dependency_queue::lookup` of the
-    ///   predecessor batch;
-    /// * `accepted_sequence_root`, at the recorded frontier;
-    /// * `current_path_catalog_root`, through one authenticated trie lookup;
-    /// * `block_claim_root`, through one authenticated multi-key lookup.
-    ///
-    /// The remaining members of [`ScratchRoots`] — `document_current_root`,
-    /// `document_state_root`, `document_after_batch_root`, `blob_dedup_root`,
-    /// `conflict_root`, the accepted-frontier LSM root and the remaining point
-    /// roots — are installed **unread**. That is deliberate and it is safe
-    /// rather than complete: every later read of those roots is digest- and
-    /// kind-checked against the root it was reached through, so damage there
-    /// still fails closed; it simply surfaces during a user operation rather
-    /// than at adoption, where the consequence is a refusal into a full replay.
-    /// Widening this into a scan of every root would make startup cost grow with
-    /// the graph, which is exactly what adoption exists to avoid.
-    fn probe_adopted_run_local_roots(
-        &self,
-        snapshot: &RuntimeResumeSnapshot,
-        record: &ColdHistoryRecord,
-        defer_catalog_document: bool,
-    ) -> Result<Option<RunLocalCatalogHotState>, EngineError> {
-        let scratch = self.scratch.as_ref().ok_or_else(|| {
-            EngineError::Archive("runtime resume restore requires a run-local scratch".into())
-        })?;
-        // The reference catalog root the predecessor record commits must be the
-        // one the accepted frontier carries. Cheap, and it is the link between
-        // the durable authority and the run-local frontier.
-        if record.reference_catalog_root != snapshot.accepted_frontier_root.reference_catalog_root {
-            return Err(EngineError::Archive(
-                "adopted accepted frontier does not carry the predecessor reference catalog root"
-                    .into(),
-            ));
-        }
-        // The accepted batch map commits one entry per accepted batch, so its
-        // cardinality is the acceptance sequence. A frontier claiming more
-        // accepted work than the adopted run holds stops here.
-        if snapshot.scratch_roots.accepted_batch_map_root.count()
-            != snapshot.next_acceptance_sequence
-        {
-            return Err(EngineError::Archive(
-                "adopted accepted batch map does not carry the recorded acceptance sequence".into(),
-            ));
-        }
-        // Stale candidates retain the complete eager read. Exact-current
-        // candidates already have an independently authenticated SQLite read
-        // projection and defer this graph-sized catalog load. The first engine
-        // operation that needs catalog state repeats this same load and checks
-        // the snapshot binding before exposing or mutating engine state.
-        let hot_state = if defer_catalog_document {
-            None
-        } else {
-            Some(self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?)
-        };
-        // The snapshot's own catalog checkpoint binding commits the two external
-        // document lanes together with these heads, so reproducing it is one
-        // O(1) equality that covers all three at once — and it is what makes the
-        // un-carried catalog heads an authenticated derivation rather than a
-        // guess.
-        //
-        // Deliberately the *snapshot's* binding and not the durable record's:
-        // that binding addresses one specific scratch run's LSM roots, so a
-        // record published by an earlier run legitimately disagrees with the
-        // current one. The cross-run authority is the accepted frontier's
-        // content-addressed facts, checked above.
-        if let Some(hot_state) = &hot_state {
-            let restored_binding = self.catalog_checkpoint_binding_for(
-                &snapshot.scratch_roots,
-                Some(&hot_state.catalog_heads).filter(|heads| !heads.is_empty()),
-            );
-            if restored_binding != snapshot.catalog_checkpoint_binding {
-                return Err(EngineError::Archive(
-                    "adopted run does not reproduce the recorded catalog checkpoint binding".into(),
-                ));
-            }
-        }
-        // The adopted run must know the predecessor batch as a final accepted
-        // record at exactly the recorded acceptance sequence. Both reads walk
-        // real authenticated pages of the adopted `pages.index`.
-        let staged =
-            super::dependency_queue::lookup(scratch, &snapshot.scratch_roots, record.batch_id)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "adopted run has no staged record for the predecessor batch".into(),
-                    )
-                })?;
-        if !matches!(
-            staged.status(),
-            super::dependency_queue::CompactBatchStatus::Final
-        ) {
-            return Err(EngineError::Archive(
-                "adopted run's predecessor batch is not final".into(),
-            ));
-        }
-        let accepted = scratch
-            .lookup_accepted_sequence(
-                &snapshot.scratch_roots.accepted_sequence_root,
-                snapshot.next_acceptance_sequence,
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "adopted run has no accepted-sequence entry at the recorded frontier".into(),
-                )
-            })?;
-        if accepted.batch_id != record.batch_id {
-            return Err(EngineError::Archive(
-                "adopted accepted sequence does not end at the predecessor batch".into(),
-            ));
-        }
-        // The current-path catalog trie has no durable binding of its own, so
-        // its proof is that its recorded root reads.
-        scratch
-            .authenticated_catalog_lookup(
-                &snapshot.current_path_catalog_root,
-                *record.batch_id.as_uuid().as_bytes(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        // Neither does the run-local block-claim index: a fabricated or stale
-        // root that does not address this run's pages fails closed here.
-        self.block_claim_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive("enrolled runtime has no block-claim index".into())
-            })?
-            .lookup_many(snapshot.block_claim_root, &[[0_u8; 16]])
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(hot_state)
-    }
-
-    /// Re-derive the catalog document and its authenticated direct heads from
-    /// one set of run-local scratch roots.
-    ///
-    /// The single reader for both engine seams that discard hot state and keep
-    /// the run: cross-process adoption and the same-process
-    /// [`Self::reconstruct_run_local_state`]. Both need it because
-    /// `materialize_page_inner`, `canonical_snapshot` and
-    /// `resolve_logseq_uuid_current` resolve the catalog document out of hot
-    /// state with no lazy load, and `prospective_catalog_heads` reads the heads
-    /// straight out of `visible_document_heads` to build the durable
-    /// catalog-checkpoint binding of the next accepted batch.
-    ///
-    /// This is a read, not a transport: the bytes come from the run's own
-    /// authenticated visible document lane, and the checkpoint record is
-    /// anchor-validated against the immutable archive exactly as an ordinary hot
-    /// read would validate it.
     fn load_run_local_catalog_hot_state(
         &self,
         roots: &ScratchRoots,
@@ -10047,359 +9019,6 @@ impl ShardedHotEngine {
         Ok(())
     }
 
-    /// Retire an adopted run whose deferred catalog could not authenticate.
-    ///
-    /// The refused run is reconstructible accelerator state, never authority.
-    /// Rotate away from it, reset every run-local derivative, and take the
-    /// ordinary authenticated full-replay path over the immutable bootstrap
-    /// and oplog records. The caller may publish the resulting clean retained
-    /// run only after this returns; until then the original refusal remains the
-    /// result of the attempted mutation.
-    pub(crate) fn recover_from_deferred_catalog_refusal(&mut self) -> Result<(), EngineError> {
-        if self.deferred_catalog_checkpoint.is_none() {
-            return Err(EngineError::Archive(
-                "deferred catalog recovery requires an adopted catalog checkpoint".into(),
-            ));
-        }
-        let committed_manifests = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
-            .committed_manifests()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.validate_retained_bootstrap_publication()?;
-        self.rotate_to_fresh_retained_scratch()?;
-        self.prepare_operational_recovery_replay()?;
-        self.resume_observation.adopted = false;
-        self.replay_operational_history(&committed_manifests, false)?;
-        Ok(())
-    }
-
-    /// Recover once from a late read failure in the exact retained run adopted
-    /// at open.  This boundary is intentionally narrower than generic SQLite
-    /// recovery: it accepts only typed reconstructible-scratch faults tied to
-    /// the selected run, revalidates immutable bootstrap authority, leaves the
-    /// old run untouched, and replays the complete authenticated history into
-    /// a fresh retained run.
-    pub(crate) fn recover_from_retained_scratch_resume_failure(
-        &mut self,
-        failure: &RetainedScratchResumeFailure,
-    ) -> Result<(), EngineError> {
-        if !self.resume_observation.adopted
-            || self.retained_scratch_run_id() != Some(failure.run_id())
-        {
-            return Err(EngineError::Archive(
-                "retained scratch recovery is not bound to the adopted resume run".into(),
-            ));
-        }
-        let committed_manifests = self
-            .archive_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
-            .committed_manifests()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.validate_retained_bootstrap_publication()?;
-        eprintln!(
-            "[tine] retained scratch resume read failed ({}) ; rebuilding from immutable history",
-            failure.fault()
-        );
-        self.rotate_to_fresh_retained_scratch()?;
-        self.prepare_operational_recovery_replay()?;
-        self.resume_observation.adopted = false;
-        self.replay_operational_history(&committed_manifests, false)?;
-        Ok(())
-    }
-
-    /// Rebuild every run-local derived structure from the retained
-    /// authenticated durable roots, without replaying immutable history.
-    ///
-    /// This is the same-process engine-reconstruction seam. Nothing derived is
-    /// carried across: hot archive caches, statuses, visible CRDT documents,
-    /// point caches, and every ephemeral index candidate are discarded. Only
-    /// the retained capabilities and their authenticated roots survive — in
-    /// particular the scratch roots, which are the sole continuation authority
-    /// for point-paged dependency registration and dependent fanout.
-    ///
-    /// One piece of hot state is **re-derived** rather than discarded, for the
-    /// same reason cross-process adoption re-derives it: the catalog document
-    /// and its authenticated direct heads are resolved out of hot state with no
-    /// lazy load by `materialize_page_inner`, `canonical_snapshot`,
-    /// `resolve_logseq_uuid_current` and `prospective_catalog_heads`. Discarding
-    /// them leaves a reconstructed engine that cannot project any page and whose
-    /// next accepted batch computes its durable catalog-checkpoint binding from
-    /// empty heads. The bytes come from the run's own authenticated visible
-    /// document lane through [`Self::load_run_local_catalog_hot_state`], so this
-    /// is a re-derivation from the retained run, not a carried-across cache.
-    /// It is read *before* anything moves, so a failure leaves this engine
-    /// untouched.
-    ///
-    /// The runtime authority is carried so a retained same-process `Graph`
-    /// handoff, tail overlay, and SQLite frontier keep their exact enrollment
-    /// and resource bindings. This deliberately does not claim process-restart
-    /// writer exclusion: the managed-text latch is still process-local, and
-    /// persisted enrollment owns reconstructing it before writer admission.
-    #[allow(dead_code)] // activated only by the later persisted-enrollment packet
-    pub(crate) fn reconstruct_run_local_state(&mut self) -> Result<(), EngineError> {
-        if self.scratch.is_none() {
-            return Err(EngineError::Archive(
-                "engine reconstruction requires an authenticated run-local scratch".into(),
-            ));
-        }
-        if self.authenticated_history_replay {
-            return Err(EngineError::Archive(
-                "engine reconstruction cannot interrupt an authenticated history replay".into(),
-            ));
-        }
-        // Read before anything moves, so a failure here leaves this engine
-        // exactly as it was. A blocked engine keeps its catalog in the terminal
-        // lane and every reader of `visible_documents` is already refused by
-        // `ensure_not_blocked`, so re-deriving the visible lane for one would
-        // install state the pre-reconstruction engine did not hold.
-        let catalog_hot_state = if self.is_blocked() {
-            None
-        } else {
-            Some(self.load_run_local_catalog_hot_state(&self.scratch_roots)?)
-        };
-        let mut rebuilt = Self::new(
-            self.workspace_id,
-            self.lineage_digest,
-            self.catalog_document_id,
-        );
-        rebuilt.runtime_authority = self.runtime_authority.clone();
-        // The reference catalog root and its attached durable store are
-        // authenticated authority, not a run-local derivative, so they move
-        // across reconstruction unchanged.
-        std::mem::swap(&mut rebuilt.reference_catalog, &mut self.reference_catalog);
-        rebuilt.archive_store = self.archive_store.take();
-        rebuilt.bootstrap_parts = self.bootstrap_parts.take();
-        rebuilt.projection_endpoint = self.projection_endpoint;
-        rebuilt.projection_receipt_store_id = self.projection_receipt_store_id;
-        rebuilt.projection_work_index = self.projection_work_index.take();
-        rebuilt.scratch = self.scratch.take();
-        rebuilt.retained_scratch = self.retained_scratch;
-        rebuilt.scratch_roots = std::mem::take(&mut self.scratch_roots);
-        rebuilt.history_store = self.history_store.take();
-        rebuilt.history_generation = self.history_generation;
-        rebuilt.history_root = self.history_root;
-        rebuilt.history_failure = self.history_failure.clone();
-        rebuilt.durable_authority_mode = self.durable_authority_mode;
-        rebuilt.current_durable_authority = self.current_durable_authority.take();
-        rebuilt.validated_run_local_current_authority = self.validated_run_local_current_authority;
-        rebuilt.adoptable_current_history_head = self.adoptable_current_history_head;
-        rebuilt.block_claim_index = self.block_claim_index.take();
-        rebuilt.block_claim_root = self.block_claim_root.clone();
-        rebuilt.logseq_claim_index = self.logseq_claim_index.take();
-        rebuilt.logseq_claim_root = self.logseq_claim_root;
-        rebuilt.portable_path_index = self.portable_path_index.take();
-        rebuilt.portable_path_root = self.portable_path_root;
-        rebuilt.portable_path_conflicts = std::mem::take(&mut self.portable_path_conflicts);
-        rebuilt.page_name_index = self.page_name_index.take();
-        rebuilt.page_name_root = self.page_name_root.clone();
-        rebuilt.page_name_conflicts = std::mem::take(&mut self.page_name_conflicts);
-        rebuilt.accepted_frontier_root = self.accepted_frontier_root.clone();
-        rebuilt.next_acceptance_sequence = self.next_acceptance_sequence;
-        rebuilt.current_path_catalog = self.current_path_catalog.clone();
-        rebuilt.fatal_evidence = self.fatal_evidence.clone();
-        rebuilt.lazy_catalog_hot_state = std::mem::take(&mut self.lazy_catalog_hot_state);
-        rebuilt.deferred_catalog_checkpoint = self.deferred_catalog_checkpoint.take();
-        // Telemetry is observational rather than continuation authority; keep
-        // cumulative work accounting across the reconstructed journey.
-        rebuilt.history_work.set(self.history_work.get());
-        rebuilt
-            .catalog_hot_state_loads
-            .set(self.catalog_hot_state_loads.get());
-        rebuilt.resume_observation = self.resume_observation;
-        rebuilt.bootstrap_residency = Arc::clone(&self.bootstrap_residency);
-        if let Some(catalog_hot_state) = catalog_hot_state {
-            catalog_hot_state.install(&mut rebuilt);
-        }
-        *self = rebuilt;
-        Ok(())
-    }
-
-    /// Reset only reconstructible run-local state before replaying an
-    /// operational enrolled archive. The enrolled history, projection, index,
-    /// archive, and scratch capabilities remain attached; replay recomputes
-    /// their roots from the immutable batches and validates each already
-    /// authenticated final record instead of publishing it again.
-    pub(crate) fn prepare_operational_recovery_replay(&mut self) -> Result<(), EngineError> {
-        if !matches!(self.workspace_status(), WorkspaceStatus::Operational) {
-            return Err(EngineError::Archive(
-                "terminal enrolled authority cannot enter operational recovery replay".into(),
-            ));
-        }
-        if !self.current_durable_authority_proof_is_live()? {
-            self.current_durable_authority = None;
-            self.verify_current_durable_page_name_authority()?;
-        }
-        let reference_policy = self.reference_catalog.policy().clone();
-        let catalog_hot_state_loads = self.catalog_hot_state_loads.get();
-        let mut replay = Self::new(
-            self.workspace_id,
-            self.lineage_digest,
-            self.catalog_document_id,
-        );
-        replay.runtime_authority = self.runtime_authority.clone();
-        replay.configure_reference_catalog_policy(reference_policy)?;
-        replay.archive_store = self.archive_store.take();
-        replay.bootstrap_parts = self.bootstrap_parts.take();
-        replay.projection_endpoint = self.projection_endpoint;
-        replay.projection_receipt_store_id = self.projection_receipt_store_id;
-        replay.projection_work_index = self.projection_work_index.take();
-        replay.scratch = self.scratch.take();
-        replay.retained_scratch = self.retained_scratch;
-        replay.history_store = self.history_store.take();
-        replay.history_generation = self.history_generation;
-        replay.history_root = self.history_root;
-        replay.durable_authority_mode = self.durable_authority_mode;
-        replay.authenticated_history_replay = true;
-        replay.current_durable_authority = self.current_durable_authority.take();
-        // A fresh replay baseline covers nothing. Only
-        // `restore_adopted_predecessor_state` may raise this, and only after it
-        // has authenticated the predecessor it names.
-        replay.replay_base_generation = 0;
-        replay.resume_observation = self.resume_observation;
-        replay.catalog_hot_state_loads.set(catalog_hot_state_loads);
-        replay.block_claim_index = self.block_claim_index.take();
-        replay.logseq_claim_index = self.logseq_claim_index.take();
-        replay.portable_path_index = self.portable_path_index.take();
-        replay.page_name_index = self.page_name_index.take();
-        if let Some(store) = replay.archive_store.as_ref() {
-            let catalog = store
-                .open_reference_catalog()
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            replay
-                .reference_catalog
-                .attach_store(Arc::new(catalog))
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
-        *self = replay;
-        Ok(())
-    }
-
-    pub(crate) fn finish_operational_recovery_replay(&mut self) -> Result<(), EngineError> {
-        if !self.authenticated_history_replay {
-            return Err(EngineError::Archive(
-                "operational recovery finish requires an active authenticated history replay"
-                    .into(),
-            ));
-        }
-        let replayed_records =
-            u64::try_from(self.authenticated_replayed_batches.len()).map_err(|_| {
-                EngineError::Archive(
-                    "authenticated recovery replay record count exceeds durable generation range"
-                        .into(),
-                )
-            })?;
-        // Durable history generation advances exactly once for each new
-        // BatchId record. This set gains a BatchId only after either its
-        // current-root record matched every authenticated binding or recovery
-        // durably finalized that exact manifest.
-        //
-        // The proof obligation is *coverage of every durable record not already
-        // covered by an authenticated predecessor state*. `replay_base_generation`
-        // names that predecessor, and it is only ever nonzero after
-        // `restore_adopted_predecessor_state` proved three things: the live
-        // sealed history is an insertion-only descendant of the base authority,
-        // so no record at or below the base can have changed; the durable record
-        // *at* the base generation exists and authenticates every durable-derived
-        // root the restored state installed; and that record's own accepted
-        // evidence commits the restored accepted frontier. So records
-        // `1..=base` are covered by an authenticated state rather than by an
-        // unproved assumption, and this replay must cover exactly
-        // `base+1..=generation`.
-        //
-        // On every path that does not adopt, the base is zero and both
-        // predicates below reduce to exactly the ones they replaced. The
-        // evidence stays O(1) in the graph: two integers and one contiguous
-        // range comparison over the replayed set, with no finish-time scan.
-        let base = self.replay_base_generation;
-        if base > self.history_generation {
-            return Err(EngineError::Archive(format!(
-                "authenticated recovery predecessor generation {base} is ahead of durable history {}",
-                self.history_generation
-            )));
-        }
-        let expected_records = self.history_generation - base;
-        if replayed_records != expected_records {
-            return Err(EngineError::Archive(format!(
-                "authenticated recovery replay covered {replayed_records} of {expected_records} durable final history records after generation {base}",
-            )));
-        }
-        if self
-            .authenticated_replayed_generations
-            .keys()
-            .copied()
-            .ne(base + 1..=self.history_generation)
-        {
-            return Err(EngineError::Archive(
-                "authenticated recovery replay history generations are incomplete or duplicated"
-                    .into(),
-            ));
-        }
-        self.resume_observation.live_history_generation = self.history_generation;
-        self.resume_observation.replay_base_generation = base;
-        self.resume_observation.replayed_generations = replayed_records;
-        if !self.validated_run_local_current_authority_is_live()? {
-            self.verify_current_durable_page_name_authority()?;
-        }
-        let history_transition = self.authenticated_projection_history_transition()?;
-        self.reference_catalog
-            .finish_recovery()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if self.fatal_handle.is_none() && self.page_name_conflicts.is_empty() {
-            self.reconcile_pending_projection_work(history_transition)?;
-        }
-        self.authenticated_history_replay = false;
-        Ok(())
-    }
-
-    pub(crate) fn enrolled_projection_runtime(
-        &self,
-    ) -> Result<(Arc<ObjectStore>, Arc<ProjectionWorkIndex>), EngineError> {
-        self.ensure_not_blocked()?;
-        self.reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if self.authenticated_history_replay {
-            return Err(EngineError::ProjectionWork(
-                "projection runtime is unavailable during authenticated history replay".into(),
-            ));
-        }
-        let archive = self.archive_store.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection archive".into())
-        })?;
-        let index = self.projection_work_index.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection work index".into())
-        })?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        if archive.workspace_id() != self.workspace_id
-            || index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || index.receipt_store_id()
-                != self.projection_receipt_store_id.ok_or_else(|| {
-                    EngineError::ProjectionWork(
-                        "engine has no enrolled projection receipt store".into(),
-                    )
-                })?
-        {
-            return Err(EngineError::ProjectionWork(
-                "engine-owned projection runtime binding mismatch".into(),
-            ));
-        }
-        Ok((Arc::clone(archive), Arc::clone(index)))
-    }
-
-    pub fn projection_work_index(&self) -> Result<&ProjectionWorkIndex, EngineError> {
-        self.ensure_not_blocked()?;
-        self.projection_work_index.as_deref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection work index".into())
-        })
-    }
-
     pub const fn projection_endpoint_binding(&self) -> Option<ProjectionEndpointBinding> {
         self.projection_endpoint
     }
@@ -10427,6 +9046,7 @@ impl ShardedHotEngine {
         self.lineage_digest
     }
 
+    #[cfg(test)]
     pub fn managed_local_work(&self) -> ManagedLocalWork {
         self.local_overlay.work.get()
     }
@@ -10437,6 +9057,34 @@ impl ShardedHotEngine {
             records_applied: self.local_overlay.entries.len(),
             commitment: self.local_overlay.commitment,
         }
+    }
+
+    /// Restore the journal cursor represented by an authenticated drain
+    /// checkpoint. Checkpointed records already live in canonical accepted
+    /// history, so replaying them into the hot overlay would apply them twice;
+    /// nevertheless the next foreground append must continue after that
+    /// durable prefix rather than starting again at sequence zero.
+    pub(crate) fn resume_checkpointed_managed_local_prefix(
+        &mut self,
+        next_sequence: u64,
+    ) -> Result<(), ManagedLocalRecordError> {
+        if self.local_overlay.next_sequence == next_sequence {
+            return Ok(());
+        }
+        if self.local_overlay.next_sequence != 0
+            || !self.local_overlay.entries.is_empty()
+            || !self.local_overlay.documents.is_empty()
+            || !self.local_overlay.document_heads.is_empty()
+            || !self.local_overlay.block_claims.is_empty()
+        {
+            return Err(ManagedLocalRecordError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: next_sequence,
+            });
+        }
+        self.local_overlay.next_sequence = next_sequence;
+        self.advance_author_mutation_generation();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -10537,7 +9185,7 @@ impl ShardedHotEngine {
 
     /// Remove the complete pending overlay only after authenticated accepted
     /// state proves the same prefix and exact resulting documents.
-    pub fn collapse_managed_local_prefix(
+    pub(crate) fn collapse_managed_local_prefix(
         &mut self,
         expected_accepted_frontier: &AcceptedFrontierRoot,
     ) -> Result<usize, ManagedLocalRecordError> {
@@ -10571,63 +9219,28 @@ impl ShardedHotEngine {
         Ok(removed)
     }
 
-    /// Restore the logical cursor represented by a compacted physical journal.
-    ///
-    /// The discarded frames are never reconstructed. The caller must instead
-    /// supply the authenticated accepted-batch evidence embedded in the
-    /// generation anchor. Only a genuinely empty overlay may be seeded, and
-    /// the current accepted engine must still prove that evidence active.
-    pub(crate) fn seed_compacted_managed_local_prefix(
-        &mut self,
-        next_sequence: u64,
-        accepted_batch_id: BatchId,
-    ) -> Result<(), ManagedLocalRecordError> {
-        let prefix = self.managed_local_prefix_state();
-        if prefix.next_sequence != 0 || prefix.records_applied != 0 {
-            return Err(ManagedLocalRecordError::OutOfOrder {
-                expected: 0,
-                found: prefix.next_sequence,
-            });
-        }
-        if !self.accepted_batch_is_active(accepted_batch_id)? {
-            return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
-        }
-        self.local_overlay.next_sequence = next_sequence;
-        self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
-        self.advance_author_mutation_generation();
-        Ok(())
-    }
-
     pub fn configure_reference_catalog_policy(
         &mut self,
         policy: ReferenceCatalogPolicyV1,
     ) -> Result<(), EngineError> {
         self.ensure_not_blocked()?;
-        if self.next_acceptance_sequence != 0
-            || self.history_generation != 0
-            || self.reference_catalog.root().source_count() != 0
-        {
+        if self.next_acceptance_sequence != 0 || self.history_generation != 0 {
             return Err(EngineError::ReferenceCatalog(
                 "reference policy is immutable after the first accepted frontier".into(),
             ));
         }
-        let reference_store = self.reference_catalog.store_handle();
-        self.reference_catalog = ReferenceCatalogStateV2::empty(
-            policy,
-            &self.page_name_root,
-            self.logseq_claim_root.digest(),
-        )
-        .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if let Some(store) = reference_store {
-            self.reference_catalog
-                .attach_store(store)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
-        self.accepted_frontier_root =
-            empty_accepted_frontier_root_with_catalog(self.reference_catalog.root().clone());
+        self.reference_catalog_policy = policy;
+        self.accepted_frontier_root = empty_accepted_frontier_root();
         self.current_path_catalog.accepted_frontier_root = self.accepted_frontier_root.clone();
         self.current_path_cursor_book.borrow_mut().active.clear();
         Ok(())
+    }
+
+    /// Restore the reference extraction policy from an authenticated durable
+    /// history record. This is recovery of existing configuration, not a
+    /// request to mutate the policy of an accepted frontier.
+    fn install_authenticated_reference_catalog_policy(&mut self, policy: ReferenceCatalogPolicyV1) {
+        self.reference_catalog_policy = policy;
     }
 
     pub const fn catalog_document_id(&self) -> DocumentId {
@@ -10692,29 +9305,6 @@ impl ShardedHotEngine {
     }
 
     #[cfg(test)]
-    fn record_carried_reference_catalog_page(&self) {
-        let mut observations = self.reference_source_observations.get();
-        observations.carried_catalog_pages = observations.carried_catalog_pages.saturating_add(1);
-        self.reference_source_observations.set(observations);
-    }
-
-    #[cfg(test)]
-    fn record_carried_reference_shard(&self, origin: ValidatedReferenceSourceOrigin) {
-        let mut observations = self.reference_source_observations.get();
-        observations.carried_shards = observations.carried_shards.saturating_add(1);
-        match origin {
-            ValidatedReferenceSourceOrigin::NewShard => {
-                observations.carried_new_shards = observations.carried_new_shards.saturating_add(1);
-            }
-            ValidatedReferenceSourceOrigin::AfterSnapshot => {
-                observations.carried_after_snapshots =
-                    observations.carried_after_snapshots.saturating_add(1);
-            }
-        }
-        self.reference_source_observations.set(observations);
-    }
-
-    #[cfg(test)]
     fn record_reference_source_fallback(&self) {
         let mut observations = self.reference_source_observations.get();
         observations.fallback_document_reconstructions = observations
@@ -10755,11 +9345,6 @@ impl ShardedHotEngine {
             .scratch
             .as_ref()
             .map(|store| store.stats())
-            .unwrap_or_default();
-        let projection_work = self
-            .projection_work_index
-            .as_ref()
-            .map(|index| index.stats())
             .unwrap_or_default();
         EngineInstrumentation {
             catalog_hot_state_loads: self.catalog_hot_state_loads.get(),
@@ -10832,14 +9417,14 @@ impl ShardedHotEngine {
             portable_path_index_writes: portable_paths.writes,
             portable_path_index_bytes_read: portable_paths.bytes_read,
             portable_path_index_bytes_written: portable_paths.bytes_written,
-            projection_work_node_reads: projection_work.node_reads,
-            projection_work_root_reads: projection_work.root_reads,
-            projection_work_prepared_reads: projection_work.prepared_reads,
-            projection_pending_entries_read: projection_work.pending_entries_read,
-            projection_preflight_nodes: projection_work.preflight_nodes,
-            projection_preflight_records: projection_work.preflight_records,
-            projection_preflight_roots: projection_work.preflight_roots,
-            projection_preflight_bytes: projection_work.preflight_bytes,
+            projection_work_node_reads: 0,
+            projection_work_root_reads: 0,
+            projection_work_prepared_reads: 0,
+            projection_pending_entries_read: 0,
+            projection_preflight_nodes: 0,
+            projection_preflight_records: 0,
+            projection_preflight_roots: 0,
+            projection_preflight_bytes: 0,
             block_claim_validation_nanos: work.block_claim_validation_nanos,
             block_claim_lookup_nanos: work.block_claim_lookup_nanos,
             block_claim_encode_nanos: work.block_claim_encode_nanos,
@@ -10867,8 +9452,7 @@ impl ShardedHotEngine {
                     self.archive_fingerprints[batch_id],
                     binding,
                     self.logseq_claim_root,
-                    self.reference_catalog.policy().clone(),
-                    self.reference_catalog.root().clone(),
+                    self.reference_catalog_policy.clone(),
                     status.clone(),
                 )
             })
@@ -10878,7 +9462,6 @@ impl ShardedHotEngine {
             (None, Some(scratch_store), Some(history_store)) => {
                 StatusHistorySource::DurableAndScratch {
                     history_store: Arc::clone(history_store),
-                    catalog_store: self.reference_catalog.store_handle(),
                     through_generation: self.history_generation,
                     history_root: self.history_root,
                     scratch_store: Arc::clone(scratch_store),
@@ -10891,7 +9474,6 @@ impl ShardedHotEngine {
             },
             (None, None, Some(store)) => StatusHistorySource::Cold {
                 store: Arc::clone(store),
-                catalog_store: self.reference_catalog.store_handle(),
                 through_generation: self.history_generation,
                 history_root: self.history_root,
                 active,
@@ -11592,7 +10174,14 @@ impl ShardedHotEngine {
         validate_accepted_frontier_root(root)?;
         let Some(scratch_root) = &root.scratch_root else {
             if root == &self.accepted_frontier_root {
-                return Ok(self.accepted_frontier.get(&document_id).cloned());
+                return Ok(self
+                    .accepted_frontier
+                    .get(&document_id)
+                    .cloned()
+                    .or_else(|| self.lazy_genesis_frontier_document(root, document_id)));
+            }
+            if let Some(document) = self.lazy_genesis_frontier_document(root, document_id) {
+                return Ok(Some(document));
             }
             return Err(EngineError::Archive(
                 "historical frontier point queries require store-backed accepted history".into(),
@@ -11610,9 +10199,22 @@ impl ShardedHotEngine {
                 document_id.as_uuid().as_bytes(),
             )
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        bytes
+        let overlay = bytes
             .map(|bytes| decode_accepted_document(document_id, &bytes))
-            .transpose()
+            .transpose()?;
+        Ok(overlay.or_else(|| self.lazy_genesis_frontier_document(root, document_id)))
+    }
+
+    fn lazy_genesis_frontier_document(
+        &self,
+        root: &AcceptedFrontierRoot,
+        document_id: DocumentId,
+    ) -> Option<DocumentDependencies> {
+        let binding = root.genesis()?;
+        let candidate = self.lazy_genesis.as_ref()?;
+        (candidate.frontier_binding().ok()? == binding)
+            .then(|| candidate.frontier_document(document_id))
+            .flatten()
     }
 
     fn accepted_frontier_documents_many_authenticated_with_session(
@@ -11627,6 +10229,13 @@ impl ShardedHotEngine {
         }
         let Some(scratch_root) = &root.scratch_root else {
             if root != &self.accepted_frontier_root {
+                let baseline = document_ids
+                    .iter()
+                    .map(|document_id| self.lazy_genesis_frontier_document(root, *document_id))
+                    .collect::<Vec<_>>();
+                if baseline.iter().any(Option::is_some) {
+                    return Ok(baseline);
+                }
                 return Err(EngineError::Archive(
                     "historical frontier multi-point queries require store-backed accepted history"
                         .into(),
@@ -11634,7 +10243,12 @@ impl ShardedHotEngine {
             }
             return Ok(document_ids
                 .iter()
-                .map(|document_id| self.accepted_frontier.get(document_id).cloned())
+                .map(|document_id| {
+                    self.accepted_frontier
+                        .get(document_id)
+                        .cloned()
+                        .or_else(|| self.lazy_genesis_frontier_document(root, *document_id))
+                })
                 .collect());
         };
         let store = self.scratch.as_ref().ok_or_else(|| {
@@ -11667,6 +10281,9 @@ impl ShardedHotEngine {
                 bytes
                     .map(|bytes| decode_accepted_document(*document_id, &bytes))
                     .transpose()
+                    .map(|overlay| {
+                        overlay.or_else(|| self.lazy_genesis_frontier_document(root, *document_id))
+                    })
             })
             .collect()
     }
@@ -11750,9 +10367,24 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         validate_accepted_frontier_root(root)?;
         if root.acceptance_sequence() == 0 {
-            if root != &AcceptedFrontierRoot::empty() {
+            if root == &AcceptedFrontierRoot::empty() {
+                return Ok(());
+            }
+            let Some(binding) = root.genesis() else {
                 return Err(EngineError::Archive(
-                    "requested empty accepted frontier is not canonical".into(),
+                    "requested sequence-zero accepted frontier is not canonical".into(),
+                ));
+            };
+            let candidate = self.lazy_genesis.as_ref().ok_or_else(|| {
+                EngineError::Archive("requested genesis frontier has no immutable baseline".into())
+            })?;
+            if candidate
+                .frontier_binding()
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                != binding
+            {
+                return Err(EngineError::Archive(
+                    "requested genesis frontier names a different immutable baseline".into(),
                 ));
             }
             return Ok(());
@@ -11849,6 +10481,7 @@ impl ShardedHotEngine {
         self.bootstrap_bulk_materializer_with_lookup_budget(
             root,
             BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+            None,
         )
     }
 
@@ -11857,13 +10490,27 @@ impl ShardedHotEngine {
         root: &AcceptedFrontierRoot,
         budget_bytes_per_root: usize,
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root)
+        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root, None)
+    }
+
+    pub(crate) fn bootstrap_bulk_materializer_with_rebuild_claims(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+        claim_source: Arc<RebuildProjectionClaimSnapshot>,
+    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
+        self.bootstrap_bulk_materializer_with_lookup_budget(
+            root,
+            budget_bytes_per_root,
+            Some(claim_source),
+        )
     }
 
     fn bootstrap_bulk_materializer_with_lookup_budget(
         &self,
         root: &AcceptedFrontierRoot,
         budget_bytes_per_root: usize,
+        rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
@@ -11907,6 +10554,7 @@ impl ShardedHotEngine {
             engine: self,
             root: root.clone(),
             current_claim_root_proven,
+            rebuild_claim_source,
             catalog,
             catalog_version,
             catalog_dependencies,
@@ -12025,7 +10673,6 @@ impl ShardedHotEngine {
         replacements: &BTreeMap<DocumentId, EngineDocument>,
         replacement_heads: &BTreeMap<DocumentId, BTreeSet<BatchId>>,
         candidate_roots: &ScratchRoots,
-        reference_catalog_delta: &ReferenceCatalogDeltaV2,
     ) -> Result<
         (
             Option<BTreeMap<DocumentId, DocumentDependencies>>,
@@ -12126,7 +10773,13 @@ impl ShardedHotEngine {
                         &authenticated_records,
                     )
                     .map_err(|error| EngineError::Archive(error.to_string()))?;
-                if roots.accepted_document_map_root.count() != new_document_count {
+                let overlay_count = roots.accepted_document_map_root.count();
+                let invalid_count = if prior_frontier_root.genesis().is_some() {
+                    overlay_count > new_document_count
+                } else {
+                    overlay_count != new_document_count
+                };
+                if invalid_count {
                     return Err(EngineError::Archive(
                         "authenticated document map count differs from accepted frontier".into(),
                     ));
@@ -12140,8 +10793,20 @@ impl ShardedHotEngine {
             } else {
                 let mut post_documents = self.accepted_frontier.clone();
                 post_documents.extend(changed_documents.clone());
-                let all_documents = post_documents.values().cloned().collect::<Vec<_>>();
-                let (root_key, root_digest) = authenticated_document_map_root(&all_documents)?;
+                let overlay_documents = post_documents
+                    .values()
+                    .filter(|document| {
+                        self.lazy_genesis
+                            .as_ref()
+                            .and_then(|candidate| {
+                                candidate.frontier_document(document.document_id())
+                            })
+                            .as_ref()
+                            != Some(*document)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (root_key, root_digest) = authenticated_document_map_root(&overlay_documents)?;
                 (Some(post_documents), None, root_key, root_digest)
             };
         let manifest_fingerprint = self
@@ -12217,7 +10882,6 @@ impl ShardedHotEngine {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
-            reference_catalog_delta.post_root().clone(),
             scratch_root,
         )?;
         let evidence = AcceptedBatchEvidence {
@@ -12229,7 +10893,6 @@ impl ShardedHotEngine {
             prior_frontier_root,
             post_frontier_root,
             affected_documents,
-            reference_catalog_delta: reference_catalog_delta.clone(),
         };
         if let Some(store) = &self.scratch {
             roots.accepted_sequence_root = store
@@ -12651,12 +11314,14 @@ impl ShardedHotEngine {
         Ok(self.accepted_frontier.get(&document_id).cloned())
     }
 
+    #[cfg(test)]
     /// Legacy no-store evidence snapshot. Store-backed engines retain only an
     /// authenticated handle and must be inspected through bounded pages.
     pub fn fatal_evidence(&self) -> Option<&ImmutableHomeEvidence> {
         self.fatal_evidence.as_ref()
     }
 
+    #[cfg(test)]
     pub fn fatal_evidence_handle(&self) -> Option<FatalEvidenceHandle> {
         self.fatal_handle
     }
@@ -12671,67 +11336,248 @@ impl ShardedHotEngine {
         Ok(&self.page_name_root)
     }
 
-    pub fn reference_catalog_root(&self) -> Result<&ReferenceCatalogRootV2, EngineError> {
-        self.ensure_not_blocked()?;
-        Ok(self.reference_catalog.root())
+    /// Read only the requested catalog page states at one authenticated
+    /// accepted root. This is an ordinary oplog/catalog observation, not an
+    /// identity-index lookup, and therefore remains after Patricia removal.
+    pub(crate) fn accepted_catalog_page_states(
+        &self,
+        root: &AcceptedFrontierRoot,
+        page_ids: &[PageId],
+    ) -> Result<BTreeMap<PageId, Option<PageState>>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        if page_ids.len() > super::page_name_index::MAX_PAGE_NAME_POINT_BATCH
+            || page_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(EngineError::Archive(
+                "accepted catalog page-state request is not canonical or exceeds its bound".into(),
+            ));
+        }
+        if root == &AcceptedFrontierRoot::empty() {
+            return Ok(page_ids.iter().map(|page_id| (*page_id, None)).collect());
+        }
+        let catalog = self.load_document_at_accepted_frontier(root, self.catalog_document_id)?;
+        if let Some(catalog) = &catalog {
+            validate_catalog(self.catalog_document_id, catalog)?;
+        }
+        page_ids
+            .iter()
+            .map(|page_id| {
+                let state = catalog
+                    .as_ref()
+                    .map(|catalog| {
+                        validate_catalog_page(self.catalog_document_id, catalog, *page_id)
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok((*page_id, state))
+            })
+            .collect()
     }
 
-    pub fn reference_source_posting(
+    /// Materialize the already-authenticated causal clock used by ordinary
+    /// operation admission. SQLite identity preflight consumes this instead
+    /// of retaining a second identity-specific ancestry structure.
+    pub(crate) fn batch_causal_containment(
         &self,
-        page_id: PageId,
-    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
+        batch_id: BatchId,
+        causal_dot: BatchCausalDot,
+        causal_dependency_heads: &[BatchId],
+    ) -> Result<AcceptedBatchCausalContainment, EngineError> {
         self.ensure_not_blocked()?;
-        self.reference_catalog
-            .posting(page_id)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+        let record = self
+            .scratch
+            .as_ref()
+            .map(|store| super::causal_index::batch_record(store, &self.scratch_roots, batch_id))
+            .transpose()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .flatten();
+        let clock = if let Some(record) = record {
+            record.clock().to_vec()
+        } else {
+            self.derive_inline_causal_clock(
+                &self.scratch_roots,
+                causal_dot,
+                causal_dependency_heads,
+            )?
+        };
+        if !clock
+            .binary_search_by_key(&causal_dot.peer_id(), |(peer, _)| *peer)
+            .ok()
+            .is_some_and(|index| clock[index].1 >= causal_dot.counter())
+        {
+            return Err(EngineError::Archive(
+                "accepted batch causal clock does not contain its own dot".into(),
+            ));
+        }
+        Ok(AcceptedBatchCausalContainment { batch_id, clock })
     }
 
-    /// Point-read one source at a catalog root already bound by accepted
-    /// frontier evidence.  This is the only historical catalog read exposed to
-    /// the SQLite adapter; callers cannot enumerate a root or derive facts from
-    /// SQLite/Markdown.
-    pub(crate) fn reference_source_posting_at(
+    /// Read the retired Patricia result for bounded differential tests. No
+    /// production runtime or SQLite rebuild calls this oracle.
+    #[cfg(test)]
+    pub(crate) fn accepted_identity_projection_records(
         &self,
-        root: &ReferenceCatalogRootV2,
-        page_id: PageId,
-    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
+        batch_id: BatchId,
+        effect: &SemanticEffect,
+    ) -> Result<AcceptedIdentityProjectionRecords, EngineError> {
         self.ensure_not_blocked()?;
-        self.reference_catalog
-            .posting_at_root(root, page_id)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+        let (Some(page_name_index), Some(portable_path_index), Some(_)) = (
+            &self.page_name_index,
+            &self.portable_path_index,
+            &self.history_store,
+        ) else {
+            // Storeless engines exist only in bounded semantic tests. They do
+            // not provide a historical post-batch root to shadow.
+            return Ok(AcceptedIdentityProjectionRecords::default());
+        };
+        let record = self.sealed_history_record(batch_id)?.ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted batch {batch_id} has no sealed identity-history record"
+            ))
+        })?;
+        match &record.status {
+            ArchiveStatus::Accepted { evidence, .. } if evidence.batch_id() == batch_id => {}
+            _ => {
+                return Err(EngineError::Archive(format!(
+                    "batch {batch_id} has no accepted identity-history state"
+                )));
+            }
+        }
+
+        let mut page_name_keys = BTreeSet::new();
+        let mut portable_path_keys = BTreeSet::new();
+        for delta in effect.pages() {
+            for state in [&delta.before, &delta.after].into_iter().flatten() {
+                page_name_keys.insert(state.name().key_digest());
+                if let Some(path) = state.path() {
+                    portable_path_keys.insert(path.portable_key().digest());
+                }
+            }
+        }
+        let page_name_keys = page_name_keys.into_iter().collect::<Vec<_>>();
+        let portable_path_keys = portable_path_keys.into_iter().collect::<Vec<_>>();
+        let old_page_names = page_name_index
+            .lookup_many(&record.page_names.ownership_root, &page_name_keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut page_names = Vec::with_capacity(old_page_names.len());
+        for (key, old) in old_page_names {
+            let occupied = old
+                .occupied()
+                .map(|occupied| {
+                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityOccupiedV1::new(
+                        occupied.page_id(),
+                        page_name_index
+                            .read_exact_name(key, occupied.exact_name())
+                            .map_err(|error| EngineError::Archive(error.to_string()))?,
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            occupied.acquisition_batch(),
+                            occupied.acquisition_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            occupied.exact_state_batch(),
+                            occupied.exact_state_dot(),
+                        ),
+                    ))
+                })
+                .transpose()?;
+            let latest_release = old
+                .latest_release()
+                .map(|released| {
+                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityReleasedV1::new(
+                        released.prior_page_id(),
+                        page_name_index
+                            .read_exact_name(key, released.prior_exact_name())
+                            .map_err(|error| EngineError::Archive(error.to_string()))?,
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.prior_acquisition_batch(),
+                            released.prior_acquisition_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.prior_exact_state_batch(),
+                            released.prior_exact_state_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.release_batch(),
+                            released.release_dot(),
+                        ),
+                    ))
+                })
+                .transpose()?;
+            let clean = super::sqlite_identity::PageNameIdentityRecordV1::new(
+                key,
+                occupied,
+                latest_release,
+            )
+            .map_err(EngineError::Archive)?;
+            page_names.push((
+                ContentDigest::from_bytes(*key.as_bytes()),
+                clean.encode().map_err(EngineError::Archive)?,
+            ));
+        }
+        let old_portable_paths = portable_path_index
+            .lookup_many(record.portable_path_root, &portable_path_keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut portable_paths = Vec::with_capacity(old_portable_paths.len());
+        for (key, old) in old_portable_paths {
+            let occupied = old.occupied().map(|occupied| {
+                super::sqlite_identity::PortablePathIdentityOccupiedV1::new(
+                    occupied.page_id(),
+                    occupied.exact_path().clone(),
+                    super::sqlite_identity::IdentityOriginV1::accepted(
+                        occupied.acquisition_batch(),
+                        occupied.causal_dot(),
+                    ),
+                )
+            });
+            let latest_release = old
+                .latest_release()
+                .map(|released| {
+                    let acquisition_dot = self
+                        .load_observed_manifest(released.prior_acquisition_batch())?
+                        .causal_dot();
+                    Ok::<_, EngineError>(
+                        super::sqlite_identity::PortablePathIdentityReleasedV1::new(
+                            released.prior_page_id(),
+                            released.prior_exact_path().clone(),
+                            super::sqlite_identity::IdentityOriginV1::accepted(
+                                released.prior_acquisition_batch(),
+                                acquisition_dot,
+                            ),
+                            super::sqlite_identity::IdentityOriginV1::accepted(
+                                released.release_batch(),
+                                released.causal_dot(),
+                            ),
+                        ),
+                    )
+                })
+                .transpose()?;
+            let clean = super::sqlite_identity::PortablePathIdentityRecordV1::new(
+                key,
+                occupied,
+                latest_release,
+            )
+            .map_err(EngineError::Archive)?;
+            portable_paths.push((
+                ContentDigest::from_bytes(*key.as_bytes()),
+                clean.encode().map_err(EngineError::Archive)?,
+            ));
+        }
+        Ok(AcceptedIdentityProjectionRecords {
+            page_names,
+            portable_paths,
+        })
     }
 
-    pub(crate) fn reference_source_posting_index_at(
+    /// The parser-owned reference policy used by both accepted-history
+    /// extraction and the disposable SQLite projection.  Exposing the policy,
+    /// rather than catalog rows, lets derived projections reproduce semantic
+    /// facts without making the catalog part of accepted authority.
+    pub(crate) fn reference_catalog_policy(
         &self,
-        root: &ReferenceCatalogRootV2,
-    ) -> Result<super::reference_catalog::ReferenceCatalogPostingDigestIndex, EngineError> {
+    ) -> Result<&ReferenceCatalogPolicyV1, EngineError> {
         self.ensure_not_blocked()?;
-        self.reference_catalog
-            .posting_digest_index_at_root(root)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
-    }
-
-    pub(crate) fn reference_source_posting_from_index(
-        &self,
-        index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
-        page_id: PageId,
-    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
-        self.ensure_not_blocked()?;
-        self.reference_catalog
-            .posting_from_digest_index(index, page_id)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
-    }
-
-    pub(crate) fn reference_candidates_at(
-        &self,
-        root: &ReferenceCatalogRootV2,
-        target: ReferenceCandidateTargetV2,
-        limit: usize,
-    ) -> Result<BTreeSet<PageId>, EngineError> {
-        self.ensure_not_blocked()?;
-        self.reference_catalog
-            .reverse_candidates_at_root(root, target, limit)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+        Ok(&self.reference_catalog_policy)
     }
 
     /// Resolve a logical name through the authenticated exact-name owner.
@@ -12857,14 +11703,6 @@ impl ShardedHotEngine {
             .page_names
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.reference_catalog
-            .root()
-            .validate_bound(
-                self.reference_catalog.policy(),
-                &binding.page_names.ownership_root,
-                self.logseq_claim_root.digest(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
         if let Some(index) = &self.logseq_claim_index {
             index
                 .validate_root(self.logseq_claim_root)
@@ -12909,11 +11747,10 @@ impl ShardedHotEngine {
                     ));
                 }
                 if record.logseq_claim_root != self.logseq_claim_root
-                    || record.reference_catalog_policy != *self.reference_catalog.policy()
-                    || record.reference_catalog_root != *self.reference_catalog.root()
+                    || record.reference_catalog_policy != self.reference_catalog_policy
                 {
                     return Err(EngineError::Archive(
-                        "durable reference authority record/root binding mismatch".into(),
+                        "durable derived-state policy record mismatch".into(),
                     ));
                 }
                 Ok(())
@@ -12960,6 +11797,7 @@ impl ShardedHotEngine {
         Ok(self.portable_path_conflicts.values().cloned().collect())
     }
 
+    #[cfg(test)]
     pub fn fatal_evidence_page(
         &self,
         cursor: Option<FatalEvidenceCursor>,
@@ -13067,6 +11905,7 @@ impl ShardedHotEngine {
         }
     }
 
+    #[cfg(test)]
     pub fn stage_from_store(
         &mut self,
         store: &ObjectStore,
@@ -13152,7 +11991,63 @@ impl ShardedHotEngine {
         let overlay = std::mem::take(&mut self.local_overlay);
         let outcome = self.stage_archive_batch_bounded(batch_id, max_work);
         self.local_overlay = overlay;
-        outcome
+        let outcome = outcome?;
+
+        // Clean runtimes have no Patricia projection-work index. A managed
+        // local journal frame is first made durable and only later expanded
+        // beneath the hot overlay through this path, so it bypasses
+        // `commit_clean_prepared`, which normally advances the run-local map
+        // from paths to their latest accepted projection work. Advance that
+        // disposable locator here as soon as the accepted base catches up.
+        // Otherwise collapse removes the overlay's predecessor and the next
+        // external edit incorrectly falls back to immutable genesis bytes.
+        if matches!(
+            outcome.outcome().disposition(),
+            BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. }
+        ) {
+            self.refresh_clean_projection_head_for_batch(batch_id)?;
+        }
+        Ok(outcome)
+    }
+
+    fn refresh_clean_projection_head_for_batch(
+        &mut self,
+        batch_id: BatchId,
+    ) -> Result<(), EngineError> {
+        if self.lazy_genesis.is_none() || self.scratch.is_some() || self.history_store.is_some() {
+            return Ok(());
+        }
+        let (_, endpoint) = self.clean_projection_runtime_binding()?;
+        let accepted = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted managed-local batch {batch_id} disappeared before projection indexing"
+            ))
+        })?;
+        for work in self.clean_projection_locators_for_batch(accepted, endpoint)? {
+            self.clean_projection_heads
+                .insert(work.path().clone(), work);
+        }
+        Ok(())
+    }
+
+    /// Move the latest projection locator for every journal-committed local
+    /// derivative into the clean runtime's disposable path map before the hot
+    /// overlay is collapsed. The accepted archive remains the authority; this
+    /// only prevents a later external reconciliation from mistaking genesis
+    /// for the current predecessor in the same process.
+    pub(crate) fn refresh_clean_projection_heads_for_managed_local_overlay(
+        &mut self,
+    ) -> Result<(), EngineError> {
+        let batches = self
+            .local_overlay
+            .entries
+            .iter()
+            .map(|entry| entry.batch_id)
+            .collect::<Vec<_>>();
+        for batch_id in batches {
+            self.refresh_clean_projection_head_for_batch(batch_id)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn stage_archive_batch_for_recovery(
@@ -13222,6 +12117,7 @@ impl ShardedHotEngine {
             true,
             Some(history_record),
             None,
+            None,
         );
         self.resolve_pending_author(batch_id, &outcome.disposition);
         self.prune_persisted_archive_cache();
@@ -13238,7 +12134,7 @@ impl ShardedHotEngine {
         let bounded = budget.is_some();
         if recovery_history_record.is_none() && bounded {
             if let Some(batch) = self.bounded_staging_cache.get(&batch_id).cloned() {
-                let outcome = self.stage_ready_internal(batch, true, None, budget);
+                let outcome = self.stage_ready_internal(batch, true, None, budget, None);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 if !self.has_durable_stage_work() {
@@ -13297,7 +12193,7 @@ impl ShardedHotEngine {
                     self.bounded_staging_cache.insert(batch_id, batch.clone());
                 }
                 let outcome =
-                    self.stage_ready_internal(batch, true, recovery_history_record, budget);
+                    self.stage_ready_internal(batch, true, recovery_history_record, budget, None);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 if bounded && !self.has_durable_stage_work() {
@@ -13323,6 +12219,7 @@ impl ShardedHotEngine {
         }))
     }
 
+    #[cfg(test)]
     pub fn stage_ready(&mut self, batch: ValidatedBatch) -> StageOutcome {
         let batch_id = batch.manifest().batch_id();
         // A terminal workspace still admits immutable validated history into
@@ -13333,7 +12230,21 @@ impl ShardedHotEngine {
         if let Err(error) = self.ensure_terminal_staging_authority() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
-        let outcome = self.stage_ready_internal(batch, false, None, None);
+        let outcome = self.stage_ready_internal(batch, false, None, None, None);
+        self.resolve_pending_author(batch_id, &outcome.disposition);
+        outcome
+    }
+
+    fn stage_ready_with_claim_source(
+        &mut self,
+        batch: ValidatedBatch,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> StageOutcome {
+        let batch_id = batch.manifest().batch_id();
+        if let Err(error) = self.ensure_terminal_staging_authority() {
+            return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
+        }
+        let outcome = self.stage_ready_internal(batch, false, None, None, Some(claim_source));
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
     }
@@ -13369,6 +12280,7 @@ impl ShardedHotEngine {
         persisted: bool,
         recovery_history_record: Option<ColdHistoryRecord>,
         budget: Option<&mut StageWorkBudget>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> StageOutcome {
         self.begin_point_operation();
         // Staging may alter accepted, staged, rejected, or quarantined state.
@@ -13376,7 +12288,6 @@ impl ShardedHotEngine {
         // entering the transition, including a transition that later refuses.
         self.advance_author_mutation_generation();
         let batch_id = batch.manifest().batch_id();
-        let resumable_final_fanout = persisted && self.is_resumable_final_fanout(batch_id);
         if let Some(error) = &self.history_failure {
             return self.outcome(
                 batch_id,
@@ -13385,14 +12296,6 @@ impl ShardedHotEngine {
                 },
                 Vec::new(),
             );
-        }
-        if !resumable_final_fanout {
-            if let Err(catalog_error) = self.reference_catalog.ensure_ready() {
-                let error = self
-                    .workspace_blocked_error()
-                    .unwrap_or_else(|| EngineError::ReferenceCatalog(catalog_error.to_string()));
-                return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
-            }
         }
         if self.authenticated_history_replay && recovery_history_record.is_none() {
             return self.outcome(
@@ -13434,27 +12337,6 @@ impl ShardedHotEngine {
                 let error = EngineError::BatchCollision(batch_id);
                 return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
             }
-            if matches!(existing.status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(
-                    &batch,
-                    self.authenticated_history_replay && is_bootstrap_generation(&existing),
-                ) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-                if let Err(error) = self.activate_projection_work(batch_id, fingerprint) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-            }
             let disposition = disposition_from_final_status(existing.status, true);
             return self.outcome(batch_id, disposition, Vec::new());
         }
@@ -13466,28 +12348,12 @@ impl ShardedHotEngine {
             if matches!(self.statuses.get(&batch_id), Some(ArchiveStatus::Staged))
                 && self.is_blocked()
             {
-                self.drain_blocked_evidence();
+                self.drain_blocked_evidence(claim_source);
             }
             let disposition = match self.statuses.get(&batch_id).cloned() {
                 Some(ArchiveStatus::Rejected(error)) => BatchDisposition::Rejected { error },
                 Some(ArchiveStatus::Staged) => self.incomplete_staged_disposition(batch_id),
                 Some(ArchiveStatus::Accepted { no_op, .. }) => {
-                    if let Err(error) = self.prepare_projection_work(batch_id) {
-                        self.history_failure = Some(error.clone());
-                        return self.outcome(
-                            batch_id,
-                            BatchDisposition::Rejected { error },
-                            Vec::new(),
-                        );
-                    }
-                    if let Err(error) = self.activate_projection_work(batch_id, fingerprint) {
-                        self.history_failure = Some(error.clone());
-                        return self.outcome(
-                            batch_id,
-                            BatchDisposition::Rejected { error },
-                            Vec::new(),
-                        );
-                    }
                     BatchDisposition::DuplicateAccepted { no_op }
                 }
                 Some(ArchiveStatus::Quarantined) => BatchDisposition::Quarantined,
@@ -13503,10 +12369,10 @@ impl ShardedHotEngine {
             self.persisted_staged.insert(batch_id);
         }
         let accepted = if self.is_blocked() {
-            self.drain_blocked_evidence();
+            self.drain_blocked_evidence(claim_source);
             Vec::new()
         } else {
-            self.drain_staged()
+            self.drain_staged(claim_source)
         };
         if let Some(error) = self.precommit_history_publication_failure.take() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
@@ -14084,27 +12950,6 @@ impl ShardedHotEngine {
                     Vec::new(),
                 );
             }
-            if matches!(status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(
-                    &batch,
-                    self.authenticated_history_replay && replaying_bootstrap_generation,
-                ) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        offered_batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-                if let Err(error) = self.activate_projection_work(offered_batch_id, fingerprint) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        offered_batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-            }
         }
 
         let mut supplied = (!offered_already_final).then_some(batch);
@@ -14257,6 +13102,7 @@ impl ShardedHotEngine {
                             allow_publication,
                             Some(causal_roots),
                             Some(ready_record.event_binding_digest()),
+                            None,
                         ) {
                             Ok(BatchApplication::Accepted { no_op, evidence }) => {
                                 accepted.push(AcceptedBatch { batch_id, no_op });
@@ -14316,12 +13162,6 @@ impl ShardedHotEngine {
             {
                 self.history_failure = Some(error);
                 break;
-            }
-            if matches!(final_status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.activate_projection_work(batch_id, ready_fingerprint) {
-                    self.history_failure = Some(error);
-                    break;
-                }
             }
             self.statuses.remove(&batch_id);
             self.archive_fingerprints.remove(&batch_id);
@@ -14398,27 +13238,11 @@ impl ShardedHotEngine {
         )
     }
 
-    fn configure_detached_bootstrap_reference_catalog(
+    fn configure_detached_bootstrap_terminal_plans(
         &mut self,
         evidence: BootstrapImportPartEvidenceV1,
     ) -> Result<(), EngineError> {
         let terminal_part = evidence.ordinal().saturating_add(1) == evidence.part_count();
-        let terminal_catalog =
-            BootstrapPartitionProfileV1::uses_terminal_reference_catalog(evidence.profile_digest())
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if !terminal_catalog {
-            if self.detached_bootstrap_reference_catalog.is_some() {
-                return Err(EngineError::Archive(
-                    "bootstrap reference-catalog construction profile changed mid-replay".into(),
-                ));
-            }
-            return Ok(());
-        }
-        let plan = self
-            .detached_bootstrap_reference_catalog
-            .get_or_insert_with(DetachedBootstrapReferenceCatalogPlan::default);
-        plan.terminal_part = terminal_part;
-
         let terminal_current_path =
             BootstrapPartitionProfileV1::uses_terminal_current_path_catalog(
                 evidence.profile_digest(),
@@ -14478,15 +13302,11 @@ impl ShardedHotEngine {
     ) -> Result<(bool, AcceptedBatchEvidence), EngineError> {
         debug_assert!(self.archive_store.is_none());
         debug_assert!(self.history_store.is_none());
-        debug_assert!(self.projection_work_index.is_none());
         self.begin_point_operation();
         self.advance_author_mutation_generation();
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
-        self.reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         let batch = ValidatedBatch::new(prepared);
         self.check_batch_namespace(&batch)?;
         if batch.manifest().origin() != BatchOrigin::BootstrapImport {
@@ -14544,6 +13364,7 @@ impl ShardedHotEngine {
             true,
             Some(causal_roots),
             Some(event_binding_digest),
+            None,
         )? {
             BatchApplication::Accepted { no_op, evidence } => (no_op, evidence),
             BatchApplication::Quarantined => {
@@ -14599,15 +13420,11 @@ impl ShardedHotEngine {
         let admission_started = trace_enabled.then(Instant::now);
         debug_assert!(self.archive_store.is_none());
         debug_assert!(self.history_store.is_none());
-        debug_assert!(self.projection_work_index.is_none());
         self.begin_point_operation();
         self.advance_author_mutation_generation();
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
-        self.reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         let batch = ValidatedBatch::new(prepared);
         self.check_batch_namespace(&batch)?;
         if batch.manifest().origin() != BatchOrigin::BootstrapImport {
@@ -14902,38 +13719,16 @@ impl ShardedHotEngine {
                 started.elapsed().as_secs_f64() * 1_000.0
             );
         }
-        let exact_current_documents = replacements.keys().copied().collect::<BTreeSet<_>>();
-        let validated_new_shards = ValidatedNewShardEffects::default();
         let catalog_pages = after_snapshots
             .values()
             .find_map(|snapshot| match snapshot {
                 SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
                 SemanticDocumentSnapshot::Shard { .. } => None,
             });
-        let observations = ValidatedReferenceSourceObservations {
-            catalog_pages,
-            exact_current_documents: &exact_current_documents,
-            after_snapshots: &after_snapshots,
-            new_shards: &validated_new_shards,
-        };
         let post_page_name_root = page_names
             .as_ref()
             .map(|candidate| candidate.root.clone())
             .unwrap_or_else(|| self.page_name_root.clone());
-        let reference_catalog_started = self.activation_trace_enabled.then(Instant::now);
-        let reference_catalog = self.prepare_reference_catalog_updates(
-            effective_view.effect(),
-            &replacements,
-            &observations,
-            &post_page_name_root,
-            logseq_claim_candidate.0,
-        )?;
-        if let Some(started) = reference_catalog_started {
-            eprintln!(
-                "bootstrap authored reference catalog: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
         self.record_replay_timing_elapsed(claims_started, |timing, elapsed| {
             timing.claim_and_catalog_preparation_nanos = timing
                 .claim_and_catalog_preparation_nanos
@@ -14966,7 +13761,6 @@ impl ShardedHotEngine {
                 &replacements,
                 &replacement_heads,
                 &candidate_roots,
-                reference_catalog.delta(),
             )?;
         self.record_replay_timing_elapsed(acceptance_started, |timing, elapsed| {
             timing.current_checkpoint_preparation_nanos = timing
@@ -15010,8 +13804,6 @@ impl ShardedHotEngine {
             },
             binding,
             logseq_claim_candidate.0,
-            reference_catalog.root().clone(),
-            reference_catalog.prepared_candidate(),
         )?;
         self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
             timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
@@ -15022,7 +13814,6 @@ impl ShardedHotEngine {
         self.commit_logseq_claim_updates(logseq_claim_candidate);
         self.commit_portable_path_updates(portable_paths);
         self.commit_page_name_updates(page_names);
-        self.commit_reference_catalog_updates(reference_catalog);
         self.commit_acceptance_evidence(post_documents, accepted_evidence.clone(), candidate_roots);
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
         if let Some(started) = commit_started {
@@ -15101,6 +13892,28 @@ impl ShardedHotEngine {
         authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
+        self.draft_admitted_local_author_transaction_with_batch_id(
+            authority,
+            BatchId::new(),
+            transaction,
+            prepared_editor_projection,
+            claim_source,
+        )
+    }
+
+    /// Draft one admitted local transaction with an actor-derived stable batch
+    /// identity. This is reserved for application operations whose public
+    /// contract includes durable idempotence across an uncertain acknowledgement.
+    /// The caller still cannot select device, session, or CRDT peer identity.
+    pub(crate) fn draft_admitted_local_author_transaction_with_batch_id(
+        &self,
+        authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
+        batch_id: BatchId,
+        transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
@@ -15108,7 +13921,6 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let batch_id = BatchId::new();
         let mut prepared_editor_projection = prepared_editor_projection;
         for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
             let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
@@ -15133,6 +13945,7 @@ impl ShardedHotEngine {
                 transaction,
                 None,
                 prepared_editor_projection.take(),
+                claim_source,
             ) {
                 Ok(draft) => {
                     #[cfg(test)]
@@ -15160,13 +13973,14 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
     ) -> Result<AuthorTransactionDraft, EngineError> {
-        #[cfg(not(test))]
-        if self.promoted_lineage().is_some() && origin == BatchOrigin::LocalMutation {
-            return Err(EngineError::InvalidTransaction(
-                "raw local author identity is unavailable on a promoted production runtime".into(),
-            ));
-        }
-        self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
+        self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -15182,6 +13996,7 @@ impl ShardedHotEngine {
             transaction,
             None,
             Some(prepared_editor_projection),
+            None,
         )
     }
 
@@ -15282,140 +14097,12 @@ impl ShardedHotEngine {
 
     /// Replay one complete recovered record through the same transition used
     /// by live admission.
-    pub fn replay_managed_local_record(
+    pub(crate) fn replay_managed_local_record(
         &mut self,
         frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let record = decode_managed_local_record(frame)?;
         self.apply_managed_local_record(record, frame.payload())
-    }
-
-    /// Restore one journal-prefix position after the accepted engine base has
-    /// reopened. A derivative drain may have accepted the exact batch before a
-    /// crash without reaching its final checkpoint. In that state replaying
-    /// the CRDT update again would correctly report a stale base, but the
-    /// runtime still has to restore the journal sequence, causal predecessor,
-    /// projection predecessor, and rolling commitment before serving another
-    /// local edit.
-    ///
-    /// Exact unaccepted records continue through the ordinary replay
-    /// transition above. An already-accepted record is adopted only after its
-    /// authenticated accepted-history manifest fingerprint matches the
-    /// canonical journal manifest and the record still satisfies the strict
-    /// managed-local shape. No document or graph mutation occurs in the
-    /// accepted branch.
-    pub fn restore_managed_local_record(
-        &mut self,
-        frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    ) -> Result<(), ManagedLocalRecordError> {
-        let record = decode_managed_local_record(frame)?;
-        let batch_id = record.prepared_batch.manifest().batch_id();
-        if self.accepted_batch_is_active(batch_id)? {
-            self.adopt_accepted_managed_local_record(record, frame.payload())
-        } else {
-            self.apply_managed_local_record(record, frame.payload())?;
-            Ok(())
-        }
-    }
-
-    fn adopt_accepted_managed_local_record(
-        &mut self,
-        record: ManagedLocalRecord,
-        bytes: &[u8],
-    ) -> Result<(), ManagedLocalRecordError> {
-        let manifest = record.prepared_batch.manifest();
-        if manifest.workspace_id() != self.workspace_id {
-            return Err(EngineError::WorkspaceMismatch {
-                expected: self.workspace_id,
-                found: manifest.workspace_id(),
-            }
-            .into());
-        }
-        if manifest.lineage_digest() != self.lineage_digest {
-            return Err(EngineError::LineageMismatch {
-                expected: self.lineage_digest,
-                found: manifest.lineage_digest(),
-            }
-            .into());
-        }
-        if record.sequence != self.local_overlay.next_sequence {
-            return Err(ManagedLocalRecordError::OutOfOrder {
-                expected: self.local_overlay.next_sequence,
-                found: record.sequence,
-            });
-        }
-        if manifest.origin() != BatchOrigin::LocalMutation
-            || !record.semantic_effect.pages().is_empty()
-            || record.semantic_effect.blocks().iter().any(|delta| {
-                match (&delta.before, &delta.after) {
-                    (Some(before), Some(after)) => {
-                        before.logseq_uuid != after.logseq_uuid
-                            || before.logseq_identity_origin != after.logseq_identity_origin
-                    }
-                    (None, Some(after)) => {
-                        after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
-                    }
-                    (Some(_), None) | (None, None) => false,
-                }
-            })
-        {
-            return Err(ManagedLocalRecordError::Unsupported(
-                "accepted journal record is not an ordinary existing-page managed-local edit"
-                    .into(),
-            ));
-        }
-        let affected = affected_projection_pages(&record.semantic_effect);
-        if affected.len() != 1 || !affected.contains(&record.projection.intent.page_id()) {
-            return Err(ManagedLocalRecordError::Unsupported(
-                "accepted journal record does not affect exactly its one projected page".into(),
-            ));
-        }
-        let evidence = self.accepted_batch_evidence(manifest.batch_id())?;
-        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(manifest) {
-            return Err(ManagedLocalRecordError::CorruptPayload(
-                "accepted history differs from the canonical journal manifest".into(),
-            ));
-        }
-        if let Some(prior) = self.local_overlay.entries.last() {
-            let dot = manifest.causal_dot();
-            let expected_counter = prior.causal_dot.counter().checked_add(1).ok_or_else(|| {
-                ManagedLocalRecordError::CorruptPayload(
-                    "accepted journal causal counter overflow".into(),
-                )
-            })?;
-            if dot.peer_id() != prior.causal_dot.peer_id()
-                || dot.counter() != expected_counter
-                || !manifest.causal_dependency_heads().contains(&prior.batch_id)
-            {
-                return Err(ManagedLocalRecordError::CorruptPayload(
-                    "accepted journal prefix lost its exact causal predecessor".into(),
-                ));
-            }
-        }
-        let next_sequence = self
-            .local_overlay
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| ManagedLocalRecordError::CorruptPayload("sequence overflow".into()))?;
-        let payload_digest = ContentDigest::of(bytes);
-        let mut commitment = Vec::with_capacity(96);
-        commitment.extend_from_slice(b"tine/managed-local-prefix/v1\0");
-        commitment.extend_from_slice(self.local_overlay.commitment.as_bytes());
-        commitment.extend_from_slice(payload_digest.as_bytes());
-        commitment.extend_from_slice(&record.sequence.to_be_bytes());
-        self.local_overlay.commitment = ContentDigest::of(&commitment);
-        self.local_overlay.entries.push(CommittedLocalOverlayEntry {
-            sequence: record.sequence,
-            batch_id: manifest.batch_id(),
-            causal_dot: manifest.causal_dot(),
-            projection: record.projection,
-        });
-        self.local_overlay.next_sequence = next_sequence;
-        let mut work = self.local_overlay.work.get();
-        work.commits_applied = work.commits_applied.saturating_add(1);
-        self.local_overlay.work.set(work);
-        self.advance_author_mutation_generation();
-        Ok(())
     }
 
     fn validate_managed_local_candidate(
@@ -16026,8 +14713,14 @@ impl ShardedHotEngine {
             .get()
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(true);
-        let oracle =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
+        let oracle = self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        );
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
         let oracle_shape_visits = self
             .history_work
@@ -16041,8 +14734,14 @@ impl ShardedHotEngine {
             .get()
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(false);
-        let optimized =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
+        let optimized = self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        );
         let optimized_copies = self.prospective_catalog_document_copies() - optimized_copies;
         let optimized_shape_visits = self
             .history_work
@@ -16131,6 +14830,24 @@ impl ShardedHotEngine {
         author: AuthorBatch,
         material: ImportExecutionMaterial,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_external_import_transaction_inner(author, material, None)
+    }
+
+    pub(crate) fn draft_clean_external_import_transaction(
+        &self,
+        author: AuthorBatch,
+        material: ImportExecutionMaterial,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_external_import_transaction_inner(author, material, Some(claim_source))
+    }
+
+    fn draft_external_import_transaction_inner(
+        &self,
+        author: AuthorBatch,
+        material: ImportExecutionMaterial,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
         let (import_id, transaction, observation) = material.into_parts();
         if author.batch_id != import_id.batch_id() {
             return Err(EngineError::InvalidTransaction(
@@ -16143,6 +14860,7 @@ impl ShardedHotEngine {
             &transaction,
             Some(observation),
             None,
+            claim_source,
         )
     }
 
@@ -16153,6 +14871,7 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
         mut prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
@@ -16183,6 +14902,7 @@ impl ShardedHotEngine {
                 &parts.semantic_effect,
                 parts.projection_before_snapshots.as_ref(),
                 prepared_editor_projection.as_mut(),
+                claim_source,
             )?;
             #[cfg(test)]
             note_local_mutation_detail(|detail| {
@@ -16193,13 +14913,61 @@ impl ShardedHotEngine {
             });
             #[cfg(test)]
             let post_projection_started = Instant::now();
-            let after = self.prospective_projection_page(
-                page_id,
-                author.batch_id,
-                &parts.prospective_documents,
-                &parts.semantic_effect,
-                before.as_ref(),
-            )?;
+            let affine_after = if origin == BatchOrigin::LocalMutation {
+                prepared_editor_projection.as_ref().map(|prepared| {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_attempts =
+                            detail.post_projection_affine_attempts.saturating_add(1);
+                    });
+                    self.prospective_projection_page_from_editor_candidate(
+                        page_id,
+                        author.batch_id,
+                        &parts.prospective_documents,
+                        &parts.semantic_effect,
+                        before.as_ref(),
+                        prepared.requested_page_candidate(),
+                    )
+                })
+            } else {
+                None
+            };
+            let after = match affine_after.transpose()? {
+                Some(Some(after)) => {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_reuses =
+                            detail.post_projection_affine_reuses.saturating_add(1);
+                        detail.post_projection_affine_candidate_blocks = detail
+                            .post_projection_affine_candidate_blocks
+                            .saturating_add(after.page.blocks.len());
+                    });
+                    Some(after)
+                }
+                Some(None) => {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_fallbacks =
+                            detail.post_projection_affine_fallbacks.saturating_add(1);
+                    });
+                    self.prospective_projection_page(
+                        page_id,
+                        author.batch_id,
+                        &parts.prospective_documents,
+                        &parts.semantic_effect,
+                        before.as_ref(),
+                        claim_source,
+                    )?
+                }
+                None => self.prospective_projection_page(
+                    page_id,
+                    author.batch_id,
+                    &parts.prospective_documents,
+                    &parts.semantic_effect,
+                    before.as_ref(),
+                    claim_source,
+                )?,
+            };
             let post_frontier = match &after {
                 Some(after) => after.frontier.clone(),
                 None => self.prospective_absent_frontier(
@@ -16269,6 +15037,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
         prepared_editor_projection: Option<&mut super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         let affine =
             if origin == BatchOrigin::LocalMutation && before_projection_affine_reuse_enabled() {
@@ -16299,6 +15068,7 @@ impl ShardedHotEngine {
                     exact_base_matches,
                     &accepted_target,
                     &accepted_annotations,
+                    claim_source,
                 )? {
                     #[cfg(test)]
                     note_local_mutation_detail(|detail| {
@@ -16324,7 +15094,11 @@ impl ShardedHotEngine {
                 .before_projection_full_materializations
                 .saturating_add(1);
         });
-        match self.materialize_page_for_projection(page_id) {
+        let materialized = match claim_source {
+            Some(source) => self.materialize_page_for_projection_with_claim_source(page_id, source),
+            None => self.materialize_page_for_projection(page_id),
+        };
+        match materialized {
             Ok(state) => Ok(Some(state)),
             Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
             Err(error) => Err(error),
@@ -16343,6 +15117,7 @@ impl ShardedHotEngine {
         exact_base_matches: bool,
         accepted_target: &[u8],
         accepted_annotations: &[AnnotatedIdentity],
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         if page.page_id != page_id
             || !page.path.as_str().ends_with(".md")
@@ -16436,10 +15211,17 @@ impl ShardedHotEngine {
         {
             return Ok(None);
         }
-        let CurrentPageAtPath::ExactOwner(owner) = self.current_page_at_path(&page.path)? else {
-            return Ok(None);
+        let exact_path_owner = match self.current_page_at_path(&page.path)? {
+            CurrentPageAtPath::ExactOwner(owner) => Some(owner.page_id()),
+            CurrentPageAtPath::Unowned => match claim_source {
+                Some(source) => source.exact_page_owner(&page.path)?,
+                None => None,
+            },
+            CurrentPageAtPath::Released(_)
+            | CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => None,
         };
-        if owner.page_id() != page_id {
+        if exact_path_owner != Some(page_id) {
             return Ok(None);
         }
 
@@ -16514,14 +15296,13 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<LocalAuthorCapture, EngineError> {
         if draft.origin != BatchOrigin::LocalMutation || draft.external_observation.is_some() {
             return Err(EngineError::ProjectionManifest(
                 "local author capture requires an unobserved LocalMutation draft".into(),
             ));
         }
-        match self.capture_author_transaction(draft, graph, receipts, source, false, bootstrap)? {
+        match self.capture_author_transaction(draft, graph, receipts, source, false)? {
             Ok(captured) => Ok(LocalAuthorCapture::Captured(captured)),
             Err(reconciliation) => Ok(LocalAuthorCapture::ReconciliationNeeded(reconciliation)),
         }
@@ -16537,6 +15318,7 @@ impl ShardedHotEngine {
         path: &ManagedPath,
         page_id: PageId,
         before: &ProjectionPageState,
+        prepared_predecessor: Option<(&[u8], &[AnnotatedIdentity])>,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
         let Some(entry) = self.local_overlay.entries.iter().rev().find(|entry| {
             entry.projection.intent.page_id() == page_id && entry.projection.intent.path() == path
@@ -16555,34 +15337,323 @@ impl ShardedHotEngine {
         if intent.workspace_id() != self.workspace_id
             || intent.page_id() != before.page.page_id
             || intent.path() != path
-            || intent.post_frontier() != &before.frontier
             || intent.claim_evidence() != before.claim_evidence
         {
             return Err(EngineError::ProjectionManifest(
                 "managed-local predecessor is not the current semantic page state".into(),
             ));
         }
-        let replay = super::projection::plan_projection_with_layout_annotations(
-            self.workspace_id,
-            before,
-            Some(bytes),
-            Some(annotations),
-        )
-        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
-            return Err(EngineError::ProjectionManifest(
-                "managed-local predecessor target is not its deterministic current rendering"
-                    .into(),
-            ));
-        }
+        let prepared_matches =
+            prepared_predecessor.is_some_and(|(prepared_bytes, prepared_annotations)| {
+                prepared_bytes == bytes.as_slice() && prepared_annotations == annotations.as_slice()
+            });
+        let predecessor_intent = if prepared_matches {
+            super::projection::note_capture_prepared_predecessor_use();
+            let description = BlobDescription::of(bytes);
+            ProjectionIntent::new(
+                self.workspace_id,
+                before.page.page_id,
+                path.clone(),
+                before.frontier.clone(),
+                before.claim_evidence.clone(),
+                ProjectionPrecondition::Base(description),
+                description,
+                annotations.clone(),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+        } else {
+            // An unrelated accepted page may advance the graph-wide frontier
+            // after this page's latest managed-local projection.  Frontier
+            // equality would then reject a perfectly valid predecessor.  The
+            // replay below is the authority: it re-renders this exact page
+            // from the current semantic state and must reproduce the retained
+            // bytes and annotations before they are admitted.
+            let replay = super::projection::plan_projection_with_layout_annotations(
+                self.workspace_id,
+                before,
+                Some(bytes),
+                Some(annotations),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
+                return Err(EngineError::ProjectionManifest(
+                    "managed-local predecessor target is not its deterministic current rendering"
+                        .into(),
+                ));
+            }
+            replay.intent().clone()
+        };
         Ok(Some(CapabilityCapturedPriorProjection {
             bytes: bytes.clone(),
-            intent: replay.intent().clone(),
+            intent: predecessor_intent,
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
-            receipt_backed_live_authority: false,
+            clean_manifest_authority: None,
         }))
+    }
+
+    /// Reprove one exact graph file directly from the immutable lazy-genesis
+    /// baseline.  A clean activation has no fabricated bootstrap operation and
+    /// therefore no per-page completion receipt to consult for the first edit.
+    /// The sealed baseline root is the aggregate owner; the ordinary exact
+    /// source planner still has to prove that the named bytes encode the whole
+    /// current semantic page before they may become an edit precondition.
+    fn lazy_genesis_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+        exact_local_bytes: Option<&[u8]>,
+        external_reconciliation: bool,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(genesis) = &self.lazy_genesis else {
+            return Ok(None);
+        };
+        let page = genesis
+            .page(page_id)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(format!(
+                    "lazy-genesis predecessor for {path} has no page {page_id}"
+                ))
+            })?;
+        if page.path != *path
+            || page.page_id != before.page.page_id
+            || page.home_document_id != before.page.home_document_id
+            || page.kind != before.page.kind
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor for {path} is stale or mismatched"
+            )));
+        }
+        let baseline = super::projection::plan_projection_adopting_exact_source(
+            self.workspace_id,
+            before,
+            &page.exact_source_bytes,
+        )
+        .map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor semantic proof for {path} failed: {error:?}"
+            ))
+        })?;
+        if baseline.target() != page.exact_source_bytes
+            || baseline.intent().workspace_id() != self.workspace_id
+            || baseline.intent().page_id() != page_id
+            || baseline.intent().path() != path
+            || baseline.intent().frontier() != &before.frontier
+            || baseline.intent().claim_evidence() != before.claim_evidence
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor for {path} did not bind its current semantic state"
+            )));
+        }
+        let (bytes, intent) = match exact_local_bytes {
+            Some(local) if local != page.exact_source_bytes => {
+                let local = match super::projection::plan_projection_adopting_exact_source(
+                    self.workspace_id,
+                    before,
+                    local,
+                ) {
+                    Ok(local) => local,
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_))
+                        if external_reconciliation =>
+                    {
+                        // The external bytes are the desired successor rather
+                        // than this accepted page's predecessor. Reconciliation
+                        // still starts from the immutable activation baseline;
+                        // local authoring takes the `None` path below and must
+                        // not overwrite unseen semantic changes.
+                        return Ok(Some(CapabilityCapturedPriorProjection {
+                            bytes: page.exact_source_bytes,
+                            intent: baseline.intent().clone(),
+                            completion: None,
+                            bootstrap_owner_binding: Some(genesis.root()),
+                            managed_local_authority: None,
+                            clean_manifest_authority: None,
+                        }));
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
+                        return Ok(None);
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Projection(error)) => {
+                        return Err(EngineError::ProjectionManifest(error.to_string()));
+                    }
+                };
+                (local.target().to_vec(), local.intent().clone())
+            }
+            _ => (page.exact_source_bytes, baseline.intent().clone()),
+        };
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes,
+            intent,
+            completion: None,
+            // The baseline root transitively authenticates this page capsule;
+            // the intent above supplies the exact page/path/byte binding.
+            bootstrap_owner_binding: Some(genesis.root()),
+            managed_local_authority: None,
+            clean_manifest_authority: None,
+        }))
+    }
+
+    /// Reprove the current exact graph file from the latest accepted clean
+    /// manifest after the page has moved beyond its lazy-genesis baseline.
+    /// `clean_projection_heads` is only a run-local locator; the immutable
+    /// work object and current semantic state are both revalidated here.
+    fn clean_manifest_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+        exact_local_bytes: Option<&[u8]>,
+        external_reconciliation: bool,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(work) = self.clean_projection_heads.get(path).cloned() else {
+            return Ok(None);
+        };
+        if work.page_id() != page_id
+            || before.page.page_id != page_id
+            || before.page.path != *path
+            || !matches!(work.target(), ProjectionWorkTarget::Present(_))
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "clean manifest predecessor for {path} is not the current semantic page"
+            )));
+        }
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, &work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let bytes = decoded.target_bytes().ok_or_else(|| {
+            EngineError::ProjectionManifest(format!(
+                "clean manifest predecessor for {path} unexpectedly has an absent target"
+            ))
+        })?;
+        let retained_intent = decoded.receiver_local_intent();
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            before,
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() != bytes
+            || !retained_intent.matches_replay_except_frontier(replay.intent())
+        {
+            // A concurrently accepted history superseded the head batch's
+            // recorded rendering: the head is then only a locator, and the
+            // deterministic current rendering — `replay`, computed above from
+            // the live accepted state — is the authority (GH #351). That
+            // supersession includes a LINEAR head followed by a later
+            // concurrent merge, which can change this page's rendering from
+            // another document without re-rendering it. Only a linear head
+            // with a purely linear tail holds the recorded bytes to the
+            // current rendering; that divergence is a real projection defect
+            // and stays a refusal.
+            if self.accepted_batch_is_causally_linear(work.batch_id())?
+                && !self.nonlinear_accepted_since(work.batch_id())?
+            {
+                return Err(EngineError::ProjectionManifest(format!(
+                    "clean manifest predecessor for {path} is not its deterministic current rendering"
+                )));
+            }
+        }
+        let bytes = replay.target();
+        let (bytes, intent) = match exact_local_bytes {
+            Some(local) if local != bytes => {
+                let local = match super::projection::plan_projection_adopting_exact_source(
+                    self.workspace_id,
+                    before,
+                    local,
+                ) {
+                    Ok(local) => local,
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_))
+                        if external_reconciliation =>
+                    {
+                        // The observed external file is the desired successor,
+                        // not the semantic predecessor. A real content change
+                        // therefore keeps the latest accepted managed
+                        // projection as the base for reconciliation. Local
+                        // authoring still returns None below and enters its
+                        // conflict/reconciliation path rather than overwriting
+                        // unseen external content.
+                        return Ok(Some(CapabilityCapturedPriorProjection {
+                            bytes: bytes.to_vec(),
+                            intent: replay.intent().clone(),
+                            completion: None,
+                            bootstrap_owner_binding: None,
+                            managed_local_authority: None,
+                            clean_manifest_authority: Some(work),
+                        }));
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
+                        return Ok(None);
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Projection(error)) => {
+                        return Err(EngineError::ProjectionManifest(error.to_string()));
+                    }
+                };
+                (local.target().to_vec(), local.intent().clone())
+            }
+            _ => (bytes.to_vec(), replay.intent().clone()),
+        };
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes,
+            intent,
+            completion: None,
+            bootstrap_owner_binding: None,
+            managed_local_authority: None,
+            clean_manifest_authority: Some(work),
+        }))
+    }
+
+    /// Authorize a point repair when the graph still contains the exact
+    /// immutable rendering of a clean-manifest head that a later concurrent
+    /// merge superseded.
+    ///
+    /// This is intentionally narrower than external reconciliation: unknown
+    /// bytes, a linear head, a different current owner, and an already-current
+    /// rendering all return no authority. The caller may use the returned page
+    /// only with a guarded projection write from `observed` as its exact base.
+    pub(crate) fn authorize_clean_superseded_projection_repair(
+        &self,
+        path: &ManagedPath,
+        observed: &[u8],
+    ) -> Result<Option<PageId>, EngineError> {
+        let Some(work) = self.clean_projection_heads.get(path) else {
+            return Ok(None);
+        };
+        let ProjectionWorkTarget::Present(_) = work.target() else {
+            return Ok(None);
+        };
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if decoded.target_bytes() != Some(observed) {
+            return Ok(None);
+        }
+        let superseded = self.accepted_batch_projection_is_superseded(work.batch_id())?;
+        if !superseded {
+            return Ok(None);
+        }
+        let current = self.authorize_projection_write(work.page_id())?;
+        if current.state().page.page_id != work.page_id() || current.state().page.path != *path {
+            return Ok(None);
+        }
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            current.state(),
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() == observed {
+            return Ok(None);
+        }
+        Ok(Some(work.page_id()))
     }
 
     fn validate_managed_local_projection_authority(
@@ -16608,13 +15679,134 @@ impl ShardedHotEngine {
         let target = intent.target();
         if intent.path() != path
             || intent.page_id() != prior.intent.page_id()
-            || intent.post_frontier() != prior.intent.frontier()
             || target.bytes() != Some(prior.bytes.as_slice())
             || target.description() != Some(prior.intent.target())
             || target.annotations() != prior.intent.annotations()
         {
             return Err(EngineError::ProjectionManifest(
                 "managed-local predecessor authority does not bind the captured exact target"
+                    .into(),
+            ));
+        }
+        // The entry's graph-wide frontier may be older because an unrelated
+        // page was accepted afterwards, or because this journal-durable edit
+        // has not drained into accepted history yet. The caller immediately
+        // below binds `prior.intent` to the draft's exact current semantic
+        // pre-state (frontier and claim evidence included), while the checks
+        // above bind its bytes and annotations to this retained journal entry.
+        Ok(())
+    }
+
+    fn validate_clean_manifest_projection_authority(
+        &self,
+        path: &ManagedPath,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<(), EngineError> {
+        let Some(work) = &prior.clean_manifest_authority else {
+            return Ok(());
+        };
+        if self.clean_projection_heads.get(path) != Some(work)
+            || !self
+                .clean_projection_locators_for_committed_batch(work.batch_id())?
+                .iter()
+                .any(|derived| derived == work)
+        {
+            return Err(EngineError::AuthorDraftStale);
+        }
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let current = self.authorize_projection_write(prior.intent.page_id())?;
+        // The catalog is shared by every page, so an unrelated page
+        // creation or rename can advance only its dependency after this
+        // page's projection was accepted. That must not invalidate the
+        // page-local predecessor. Every other document dependency remains
+        // exact, claim evidence remains exact below, and the semantic
+        // replay that follows proves that the retained bytes are still the
+        // deterministic rendering of the current page.
+        let frontier_matches = projection_frontiers_match_except_catalog(
+            &current.state().frontier,
+            work.post_frontier(),
+            self.catalog_document_id,
+        );
+        // A predecessor recorded by a concurrently merged (non-linear) batch
+        // carries the foreign author's frontier, while this device's current
+        // page frontier is the merged one — they can never be equal, and
+        // holding the page to that equality would refuse every later local
+        // mutation of a page whose last projection came from a contested
+        // batch (GH #351). A linear head is equally superseded once a later
+        // concurrent merge landed: the merge can advance this page's
+        // dependencies and rendering from another document without ever
+        // re-rendering the page. The receiver-local exact-source proof below
+        // stays fully strict and is what actually binds the captured bytes
+        // to the CURRENT semantic state.
+        let head_superseded = !self.accepted_batch_is_causally_linear(work.batch_id())?
+            || self.nonlinear_accepted_since(work.batch_id())?;
+        if current.state().page.path != *path
+            || (!frontier_matches && !head_superseded)
+            || current.state().claim_evidence != prior.intent.claim_evidence()
+        {
+            return Err(EngineError::ProjectionManifest(
+                "clean manifest predecessor authority is not the current semantic page".into(),
+            ));
+        }
+        let source_replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            current.state(),
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if source_replay.target() != decoded.target_bytes().unwrap_or_default()
+            || !decoded
+                .receiver_local_intent()
+                .matches_replay_except_frontier(source_replay.intent())
+        {
+            // Mirror of `clean_manifest_projection_predecessor`: a head batch
+            // superseded by a concurrently accepted history records only a
+            // locator, so the recorded target cannot be held to the current
+            // rendering. The captured predecessor is still proven against the
+            // CURRENT semantic state by the exact-source binding below, which
+            // stays fully strict (GH #351).
+            if !head_superseded {
+                return Err(EngineError::ProjectionManifest(
+                    "clean manifest predecessor authority has an invalid source projection".into(),
+                ));
+            }
+        }
+        if decoded.target_bytes() == Some(prior.bytes.as_slice())
+            && decoded
+                .receiver_local_intent()
+                .matches_replay_except_frontier(&prior.intent)
+        {
+            return Ok(());
+        }
+        // Mirror of the capture side for a superseded head: the recorded
+        // rendering was superseded by a concurrent merge, and the captured
+        // predecessor is the deterministic CURRENT rendering computed by the
+        // same planner. Prove it by recomputation rather than against the
+        // superseded record (GH #351).
+        if head_superseded
+            && source_replay.target() == prior.bytes.as_slice()
+            && source_replay.intent() == &prior.intent
+        {
+            return Ok(());
+        }
+        let local = super::projection::plan_projection_adopting_exact_source(
+            self.workspace_id,
+            current.state(),
+            &prior.bytes,
+        )
+        .map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "clean receiver-local predecessor semantic proof failed: {error:?}"
+            ))
+        })?;
+        if local.intent() != &prior.intent || local.target() != prior.bytes {
+            return Err(EngineError::ProjectionManifest(
+                "clean manifest predecessor authority does not bind the receiver-local exact target"
                     .into(),
             ));
         }
@@ -16627,7 +15819,6 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<CapturedAuthorTransaction, EngineError> {
         if !matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. })
             || draft.external_observation.is_none()
@@ -16636,7 +15827,7 @@ impl ShardedHotEngine {
                 "external author capture requires a sealed reconciliation draft".into(),
             ));
         }
-        self.capture_author_transaction(draft, graph, receipts, source, true, bootstrap)?
+        self.capture_author_transaction(draft, graph, receipts, source, true)?
             .map_err(|_| {
                 EngineError::ProjectionManifest(
                     "external author capture unexpectedly requested local reconciliation".into(),
@@ -16651,7 +15842,6 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
         external: bool,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<Result<CapturedAuthorTransaction, ReconciliationNeeded>, EngineError> {
         let mut draft = draft;
         self.ensure_not_blocked()?;
@@ -16665,10 +15855,10 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let (_, work_index) = self.enrolled_projection_runtime()?;
+        self.clean_projection_runtime_binding()?;
         if receipts.workspace_id() != self.workspace_id
             || receipts.endpoint_binding() != Some(source)
-            || receipts.store_id() != work_index.receipt_store_id()
+            || Some(receipts.store_id()) != self.projection_receipt_store_id
         {
             return Err(EngineError::ProjectionManifest(
                 "draft capture is not bound to the enrolled projection runtime".into(),
@@ -16729,6 +15919,10 @@ impl ShardedHotEngine {
         let mut captured_inputs = Vec::with_capacity(requirement_index.len());
         let mut sealed_pending_local_predecessor = None;
         let mut mismatches = Vec::new();
+        let prepared_predecessor = draft
+            .prepared_editor_projection
+            .as_ref()
+            .and_then(|prepared| prepared.accepted_predecessor_candidate());
         for indexed_path in requirement_index.entries() {
             let path = indexed_path.path(&draft.requirements);
             let roles = indexed_path.roles();
@@ -16742,9 +15936,6 @@ impl ShardedHotEngine {
                     "current graph bytes",
                 )?;
             }
-            let completed = work_index
-                .completed_receipts_for_path(path)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
             let mut authority_matches = true;
             let managed_prior = roles
                 .semantic_predecessor
@@ -16756,12 +15947,44 @@ impl ShardedHotEngine {
                         .map(|before| (requirement.page_id, before))
                 })
                 .map(|(page_id, before)| {
-                    self.managed_local_projection_predecessor(path, page_id, before)
+                    self.managed_local_projection_predecessor(
+                        path,
+                        page_id,
+                        before,
+                        prepared_predecessor,
+                    )
                 })
                 .transpose()?
                 .flatten();
+            let clean_manifest_prior = roles
+                .semantic_predecessor
+                .and_then(|requirement_index| {
+                    let requirement = &draft.requirements[requirement_index];
+                    draft.pages[&requirement.page_id]
+                        .before
+                        .as_ref()
+                        .map(|before| (requirement.page_id, before))
+                })
+                .map(|(page_id, before)| {
+                    self.clean_manifest_projection_predecessor(
+                        path,
+                        page_id,
+                        before,
+                        current.as_deref(),
+                        external,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            // `None` from the clean-manifest proof can mean that the exact
+            // graph bytes need reconciliation, not that the page still belongs
+            // to lazy genesis. Once a manifest head exists it supersedes the
+            // baseline for this path; falling through to genesis would either
+            // misbind a post-activation page or hide a real exact-byte drift.
+            let clean_manifest_head_present = self.clean_projection_heads.contains_key(path);
             let prior = if let Some(prior) = managed_prior {
-                authority_matches = true;
+                Some(prior)
+            } else if let Some(prior) = clean_manifest_prior {
                 Some(prior)
             } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
@@ -16769,160 +15992,29 @@ impl ShardedHotEngine {
                     .before
                     .as_ref()
                     .expect("prior requirement was selected from a semantic pre-state");
-                let receipt_backed_live = current
-                    .as_deref()
-                    .map(|live_bytes| {
-                        super::projection::receipt_backed_live_projection_predecessor(
-                            self.workspace_id,
-                            source,
-                            receipts,
-                            &work_index,
-                            before,
-                            live_bytes,
-                        )
-                    })
-                    .transpose()
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
-                    .flatten();
-                if let Some(live) = receipt_backed_live {
-                    charge_preauthoring_receipt_bytes(
-                        &mut retained_bytes,
-                        live.intent(),
-                        live.completion(),
-                        "live semantic predecessor receipt",
-                    )?;
-                    let bytes = current
-                        .as_ref()
-                        .expect("live receipt predecessor requires a present graph file")
-                        .clone();
-                    Some(CapabilityCapturedPriorProjection {
-                        bytes,
-                        intent: live.intent().clone(),
-                        completion: Some(live.completion().clone()),
-                        bootstrap_owner_binding: None,
-                        managed_local_authority: None,
-                        receipt_backed_live_authority: true,
-                    })
-                } else if let Some(authority) = match completed.as_slice() {
-                    [authority]
-                        if matches!(authority.target(), ProjectionWorkTarget::Present(_)) =>
-                    {
-                        Some(authority)
-                    }
-                    _ => {
-                        authority_matches = false;
-                        None
-                    }
-                } {
-                    let (intent, completion) = receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    charge_preauthoring_receipt_bytes(
-                        &mut retained_bytes,
-                        &intent,
-                        &completion,
-                        "semantic predecessor receipt",
-                    )?;
-                    let base = receipts
-                        .load_base(&intent)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    let replay = super::projection::plan_projection(
-                        self.workspace_id,
+                let lazy_genesis_prior = if !clean_manifest_head_present {
+                    self.lazy_genesis_projection_predecessor(
+                        path,
+                        requirement.page_id,
                         before,
-                        base.as_ref().map(super::BaseBlob::bytes),
-                    )
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    let replay_matches = replay.intent() == &intent
-                        || (external && intent.matches_replay_except_frontier(replay.intent()));
-                    if !replay_matches {
-                        authority_matches = false;
-                        None
-                    } else {
-                        charge_preauthoring_capture_bytes(
-                            &mut retained_bytes,
-                            replay.target().len(),
-                            "authenticated prior projection bytes",
-                        )?;
-                        Some(CapabilityCapturedPriorProjection {
-                            bytes: replay.target().to_vec(),
-                            intent,
-                            completion: Some(completion),
-                            bootstrap_owner_binding: None,
-                            managed_local_authority: None,
-                            receipt_backed_live_authority: false,
-                        })
-                    }
-                } else if completed.is_empty() {
-                    let baseline = bootstrap
-                        .map(|bootstrap| bootstrap.baseline_at(path))
-                        .transpose()
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
-                        .flatten();
-                    if let Some(baseline) = baseline {
-                        let before = draft.pages[&requirement.page_id]
-                            .before
-                            .as_ref()
-                            .expect("prior requirement was selected from a semantic pre-state");
-                        let owner = self
-                            .current_path_catalog_row_at_path(path)?
-                            .ok_or_else(|| {
-                                EngineError::ProjectionManifest(format!(
-                                    "aggregate bootstrap predecessor for {path} has no current owner"
-                                ))
-                            })?;
-                        if owner.page_id() != requirement.page_id
-                            || owner.path() != path
-                            || owner.kind() != baseline.kind()
-                            || baseline.intent().workspace_id() != self.workspace_id
-                            || baseline.intent().page_id() != requirement.page_id
-                            || baseline.intent().path() != path
-                            || baseline.intent().target()
-                                != super::BlobDescription::of(baseline.source_bytes())
-                        {
-                            return Err(EngineError::ProjectionManifest(format!(
-                                "aggregate bootstrap predecessor for {path} is stale or mismatched"
-                            )));
-                        } else {
-                            let replay = baseline
-                                .rebind_semantic_successor(self.workspace_id, before)
-                                .map_err(|error| {
-                                    EngineError::ProjectionManifest(format!(
-                                        "aggregate bootstrap predecessor semantic rebind for {path} failed: {error}"
-                                    ))
-                                })?;
-                            charge_preauthoring_capture_bytes(
-                                &mut retained_bytes,
-                                replay.target().len(),
-                                "aggregate bootstrap projection bytes",
-                            )?;
-                            authority_matches = true;
-                            Some(CapabilityCapturedPriorProjection {
-                                bytes: replay.target().to_vec(),
-                                intent: replay.intent().clone(),
-                                completion: None,
-                                bootstrap_owner_binding: Some(baseline.owner_binding()),
-                                managed_local_authority: None,
-                                receipt_backed_live_authority: false,
-                            })
-                        }
-                    } else {
-                        if bootstrap.is_some() {
-                            return Err(EngineError::ProjectionManifest(format!(
-                                "aggregate bootstrap predecessor for {path} is missing"
-                            )));
-                        }
-                        authority_matches = false;
-                        None
-                    }
+                        current.as_deref(),
+                        external,
+                    )?
                 } else {
+                    None
+                };
+                if let Some(prior) = lazy_genesis_prior {
+                    charge_preauthoring_capture_bytes(
+                        &mut retained_bytes,
+                        prior.bytes.len(),
+                        "lazy-genesis projection bytes",
+                    )?;
+                    Some(prior)
+                } else {
+                    authority_matches = false;
                     None
                 }
             } else {
-                authority_matches = match completed.as_slice() {
-                    [] => true,
-                    [authority] => matches!(authority.target(), ProjectionWorkTarget::Absent),
-                    _ => false,
-                };
                 None
             };
 
@@ -17006,24 +16098,6 @@ impl ShardedHotEngine {
                 receipts.store_id(),
                 material,
             );
-            let captured_receipts = completed
-                .iter()
-                .map(|authority| {
-                    receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            for (intent, completion) in &captured_receipts {
-                charge_preauthoring_receipt_bytes(
-                    &mut retained_bytes,
-                    intent,
-                    completion,
-                    "captured completion receipt",
-                )?;
-            }
-            input.draft_completed_path = Some(completed);
-            input.draft_completed_receipts = Some(captured_receipts);
             captured_inputs.push(input);
         }
 
@@ -17056,7 +16130,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
     ) -> Result<PreparedBatch, EngineError> {
-        match self.capture_local_author_transaction(draft, graph, receipts, source, None)? {
+        match self.capture_local_author_transaction(draft, graph, receipts, source)? {
             LocalAuthorCapture::Captured(captured) => {
                 self.finalize_captured_author_transaction(captured, receipts)
             }
@@ -17133,32 +16207,7 @@ impl ShardedHotEngine {
                 "captured author token requirement binding changed".into(),
             ));
         }
-        let (_, work_index) = self.enrolled_projection_runtime()?;
-        for input in &captured_inputs {
-            let expected = work_index
-                .completed_receipts_for_path(&input.path)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-            if input.draft_completed_path.as_ref() != Some(&expected) {
-                return Err(EngineError::ProjectionManifest(format!(
-                    "captured path {} no longer has its draft-owned completion authority",
-                    input.path
-                )));
-            }
-            let current_receipts = expected
-                .iter()
-                .map(|authority| {
-                    receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if input.draft_completed_receipts.as_ref() != Some(&current_receipts) {
-                return Err(EngineError::ProjectionManifest(format!(
-                    "captured path {} receipt bytes changed after draft capture",
-                    input.path
-                )));
-            }
-        }
+        self.clean_projection_runtime_binding()?;
         captured_inputs.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         if !captured_inputs
             .windows(2)
@@ -17231,6 +16280,7 @@ impl ShardedHotEngine {
             if let Some(prior) = prior {
                 prior.validate_authority()?;
                 self.validate_managed_local_projection_authority(path, prior)?;
+                self.validate_clean_manifest_projection_authority(path, prior)?;
                 let before = roles
                     .semantic_predecessor
                     .and_then(|index| {
@@ -17274,10 +16324,7 @@ impl ShardedHotEngine {
                         Some(prior.intent.annotations()),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    if replay.target() != prior.bytes
-                        || (prior.receipt_backed_live_authority
-                            && replay.intent().annotations() != prior.intent.annotations())
-                    {
+                    if replay.target() != prior.bytes {
                         return Err(EngineError::ProjectionManifest(format!(
                             "captured path {path} prior bytes are not the exact semantic pre-state"
                         )));
@@ -18404,6 +17451,133 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Admit the editor's already-built post-page only when the authored
+    /// transaction proves a pure, claim-free content transition to exactly
+    /// that page.  The candidate supplies no authority: page identity and
+    /// structure come from the authenticated pre-state, changed contents come
+    /// from `SemanticEffect`, and the post frontier is derived from the
+    /// prospective CRDT document.  Any richer transition uses the complete
+    /// materializer below.
+    fn prospective_projection_page_from_editor_candidate(
+        &self,
+        page_id: PageId,
+        batch_id: BatchId,
+        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        effect: &SemanticEffect,
+        prior: Option<&ProjectionPageState>,
+        candidate: &MaterializedPage,
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        let Some(prior) = prior else {
+            return Ok(None);
+        };
+        if candidate.page_id != page_id
+            || candidate.page_id != prior.page.page_id
+            || candidate.home_document_id != prior.page.home_document_id
+            || candidate.name != prior.page.name
+            || candidate.path != prior.page.path
+            || candidate.kind != prior.page.kind
+            || candidate.preamble != prior.page.preamble
+            || !candidate.path.as_str().ends_with(".md")
+            || candidate.blocks.len() != prior.page.blocks.len()
+            || effect.blocks().is_empty()
+            || !effect.pages().is_empty()
+            || !effect.page_preambles().is_empty()
+            || !effect.memberships().is_empty()
+            || !prior.claim_evidence.is_empty()
+            || !page_logseq_references(
+                &candidate.path,
+                candidate.preamble.as_deref(),
+                &candidate.blocks,
+            )
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let deltas = effect
+            .blocks()
+            .iter()
+            .map(|delta| (delta.block_id, delta))
+            .collect::<BTreeMap<_, _>>();
+        if deltas.len() != effect.blocks().len() {
+            return Ok(None);
+        }
+        let mut changed = 0_usize;
+        for (before, after) in prior.page.blocks.iter().zip(&candidate.blocks) {
+            if before.block_id != after.block_id
+                || before.home_document_id != candidate.home_document_id
+                || after.home_document_id != candidate.home_document_id
+                || before.parent != after.parent
+                || before.order != after.order
+                || before.logseq_uuid != after.logseq_uuid
+                || before.logseq_identity_origin != after.logseq_identity_origin
+                || before.logseq_uuid.is_some()
+                || before.logseq_identity_origin.is_some()
+            {
+                return Ok(None);
+            }
+            let delta = deltas.get(&before.block_id);
+            if before.content == after.content {
+                if delta.is_some() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let Some(delta) = delta else {
+                return Ok(None);
+            };
+            let (Some(delta_before), Some(delta_after)) = (&delta.before, &delta.after) else {
+                return Ok(None);
+            };
+            if delta.home_document_id != candidate.home_document_id
+                || delta_before.block_id != before.block_id
+                || delta_before.home_document_id != before.home_document_id
+                || delta_before.owner != BlockOwner::Page(page_id)
+                || delta_before.logseq_uuid != before.logseq_uuid
+                || delta_before.logseq_identity_origin != before.logseq_identity_origin
+                || delta_before.content != before.content
+                || delta_after.block_id != after.block_id
+                || delta_after.home_document_id != after.home_document_id
+                || delta_after.owner != BlockOwner::Page(page_id)
+                || delta_after.logseq_uuid != after.logseq_uuid
+                || delta_after.logseq_identity_origin != after.logseq_identity_origin
+                || delta_after.content != after.content
+            {
+                return Ok(None);
+            }
+            changed = changed.saturating_add(1);
+        }
+        if changed != deltas.len()
+            || !affine_before_projection_frontier_documents_are_exact(
+                &prior.frontier,
+                candidate.home_document_id,
+                self.catalog_document_id,
+            )
+        {
+            return Ok(None);
+        }
+
+        let home = self.prospective_document_ref(candidate.home_document_id, prospective)?;
+        let home_dependencies = self.prospective_document_dependencies(
+            candidate.home_document_id,
+            home.document(),
+            batch_id,
+            prospective,
+        )?;
+        let catalog_dependencies = prior
+            .frontier
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
+            .cloned()
+            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        Ok(Some(ProjectionPageState {
+            page: candidate.clone(),
+            frontier: FrontierV2::new(vec![home_dependencies, catalog_dependencies])?,
+            claim_evidence: Vec::new(),
+        }))
+    }
+
     fn prospective_projection_page(
         &self,
         page_id: PageId,
@@ -18411,6 +17585,7 @@ impl ShardedHotEngine {
         prospective: &BTreeMap<DocumentId, LoroDoc>,
         effect: &SemanticEffect,
         prior: Option<&ProjectionPageState>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         // A changed catalog must be read from the transaction's prospective
         // state. An unchanged catalog already has a fixed-depth, authenticated
@@ -18498,14 +17673,10 @@ impl ShardedHotEngine {
             .collect::<BTreeMap<_, _>>();
         let mut claim_evidence = Vec::new();
         for logseq_uuid in requested {
-            let record = self.logseq_claim_record(self.logseq_claim_root, logseq_uuid)?;
-            let mut participants = record
-                .introductions
-                .iter()
-                .map(|claim| {
-                    ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id)
-                })
-                .collect::<BTreeSet<_>>();
+            let mut participants: BTreeSet<ProjectionClaimParticipant> = self
+                .projection_claim_participants(logseq_uuid, claim_source)?
+                .into_iter()
+                .collect();
             if let Some(participant) = introduced.get(&logseq_uuid) {
                 participants.insert(*participant);
             }
@@ -18624,6 +17795,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         after: &BTreeMap<DocumentId, EngineDocument>,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
         let projection = super::projection_manifest::validate_projection_object_set(
@@ -18744,6 +17916,7 @@ impl ShardedHotEngine {
                         effect,
                         &page,
                         &documents,
+                        claim_source,
                     )?;
                     if expected_evidence != intent.claim_evidence() {
                         return Err(EngineError::ProjectionClaimEvidenceMismatch);
@@ -18830,7 +18003,7 @@ impl ShardedHotEngine {
                         )));
                     }
                 } else {
-                    self.validate_manifested_base(base)?;
+                    self.validate_manifested_base(base, claim_source)?;
                 }
             } else if external_observation.as_ref().is_some_and(|observation| {
                 observation
@@ -18851,7 +18024,7 @@ impl ShardedHotEngine {
                     .ok_or_else(|| {
                         EngineError::ProjectionManifest("render base is unavailable".into())
                     })?;
-                self.validate_manifested_base(base)?;
+                self.validate_manifested_base(base, claim_source)?;
             }
         }
         Ok(())
@@ -18934,15 +18107,26 @@ impl ShardedHotEngine {
         ))
     }
 
-    fn validate_manifested_base(&self, base: &AnnotatedProjectionBase) -> Result<(), EngineError> {
+    fn validate_manifested_base(
+        &self,
+        base: &AnnotatedProjectionBase,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<(), EngineError> {
         let state = match self.authorize_projection_recovery_inner(
             base.source_page_id(),
             base.prior_frontier(),
             base.claim_evidence(),
+            claim_source,
         ) {
             Ok(authorization) => authorization.into_state(),
             Err(EngineError::ProjectionAuthorizationUnavailable) if self.scratch.is_none() => {
-                self.materialize_page_for_projection(base.source_page_id())?
+                match claim_source {
+                    Some(source) => self.materialize_page_for_projection_with_claim_source(
+                        base.source_page_id(),
+                        source,
+                    )?,
+                    None => self.materialize_page_for_projection(base.source_page_id())?,
+                }
             }
             Err(error) => return Err(error),
         };
@@ -19033,6 +18217,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         page: &MaterializedPage,
         documents: &BTreeMap<DocumentId, LoroDoc>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Vec<ProjectionClaimEvidence>, EngineError> {
         let mut requested =
             page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks);
@@ -19055,10 +18240,16 @@ impl ShardedHotEngine {
         }
         let mut evidence = Vec::new();
         for uuid in requested {
-            let mut participants: BTreeSet<ProjectionClaimParticipant> = self
-                .logseq_claim_evidence_at_frontier(uuid, dependency_frontier)?
-                .map(|evidence| evidence.participants().iter().copied().collect())
-                .unwrap_or_default();
+            let mut participants: BTreeSet<ProjectionClaimParticipant> = match claim_source {
+                Some(source) => self
+                    .projection_claim_participants(uuid, Some(source))?
+                    .into_iter()
+                    .collect(),
+                None => self
+                    .logseq_claim_evidence_at_frontier(uuid, dependency_frontier)?
+                    .map(|evidence| evidence.participants().iter().copied().collect())
+                    .unwrap_or_default(),
+            };
             participants.extend(additions.remove(&uuid).unwrap_or_default());
             if participants.is_empty() {
                 continue;
@@ -19079,25 +18270,15 @@ impl ShardedHotEngine {
         Ok(evidence)
     }
 
-    fn prepare_projection_work(&mut self, batch_id: BatchId) -> Result<(), EngineError> {
-        let reconstructible_bootstrap = self.authenticated_history_replay
-            && self
-                .recovery_bootstrap_projection_batches
-                .contains(&batch_id);
-        self.prepare_projection_work_for_batch(&self.archive[&batch_id], reconstructible_bootstrap)
-    }
-
-    fn prepare_projection_work_for_batch(
+    /// Derive the exact source-endpoint projection rows carried by one
+    /// validated operation. The rows are a view of immutable manifest/object
+    /// evidence, not durable queue state. Both the legacy queue adapter and the
+    /// clean manifest-only runtime use this singular lowering.
+    fn projection_work_rows_for_batch(
         &self,
         batch: &ValidatedBatch,
-        reconstructible_bootstrap: bool,
-    ) -> Result<(), EngineError> {
-        let (Some(endpoint), Some(index)) = (
-            self.projection_endpoint,
-            self.projection_work_index.as_ref(),
-        ) else {
-            return Ok(());
-        };
+        endpoint: ProjectionEndpointBinding,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
         let batch_id = batch.manifest().batch_id();
         let projection = super::projection_manifest::validate_projection_object_set(
             batch.manifest(),
@@ -19105,7 +18286,6 @@ impl ShardedHotEngine {
         )
         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
         let mut work = Vec::new();
-        let mut superseded = Vec::new();
         for intent in projection
             .intents()
             .iter()
@@ -19145,405 +18325,329 @@ impl ShardedHotEngine {
                 intent.post_frontier().clone(),
                 target,
             );
-            if !self.authenticated_history_replay {
-                for older in index
-                    .pending_for_path(intent.path())
-                    .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-                {
-                    if older.work_id() == row.work_id() {
-                        continue;
-                    }
-                    if self.projection_frontier_dominates(
-                        intent.post_frontier(),
-                        older.post_frontier(),
-                    )? {
-                        superseded.push(older.work_id());
-                    }
-                }
-            }
             work.push(row);
         }
-        if self.authenticated_history_replay {
-            match index.require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work) {
-                Ok(()) => return Ok(()),
-                Err(super::projection_work_index::ProjectionWorkError::MissingPreparedBatch(
-                    missing,
-                )) if reconstructible_bootstrap && missing == batch_id => {}
-                Err(error) => return Err(EngineError::ProjectionWork(error.to_string())),
-            }
-            // Bootstrap history is installed before projection-work authority
-            // exists. A full authenticated replay may therefore be the first
-            // operation able to publish its prepared row. `prepare_batch`
-            // still refuses a missing file when this index already references
-            // the batch as pending or accepted, preserving the corruption
-            // boundary for unfinished and previously witnessed work.
-            return index
-                .prepare_batch(batch_id, batch_fingerprint(batch), &work, &[])
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()));
-        }
-        superseded.sort_unstable();
-        superseded.dedup();
-        index
-            .prepare_batch(batch_id, batch_fingerprint(batch), &work, &superseded)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
+        Ok(work)
     }
 
-    fn activate_projection_work(
+    /// Derive run-local locators for every accepted projection intent, not
+    /// only work authored by this endpoint.  A foreign locator is never fed to
+    /// the source-endpoint projection executor; it merely lets clean restart
+    /// and external reconciliation find the immutable intent that explains a
+    /// receiver-local file.  The map is rebuilt from manifests on every open.
+    fn clean_projection_locators_for_batch(
+        &self,
+        batch: &ValidatedBatch,
+        receiver: ProjectionEndpointBinding,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let batch_id = batch.manifest().batch_id();
+        let projection = super::projection_manifest::validate_projection_object_set(
+            batch.manifest(),
+            batch.objects(),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let mut locators = Vec::new();
+        for intent in projection.intents() {
+            if intent.source_endpoint_id() == receiver.endpoint_id
+                && intent.source_author_device_id() != receiver.device_id
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "source endpoint is not bound to the author device".into(),
+                ));
+            }
+            let descriptor = batch
+                .manifest()
+                .required_objects()
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind() == ObjectKind::ProjectionIntent
+                        && descriptor.document_id() == intent.descriptor_document_id()
+                })
+                .ok_or_else(|| {
+                    EngineError::ProjectionManifest(
+                        "projection intent descriptor disappeared".into(),
+                    )
+                })?;
+            let target = intent
+                .target()
+                .description()
+                .map_or(ProjectionWorkTarget::Absent, ProjectionWorkTarget::Present);
+            locators.push(ProjectionWork::new(
+                self.workspace_id,
+                intent.source_endpoint_id(),
+                receiver.graph_resource_id,
+                batch_id,
+                intent.page_id(),
+                intent.path().clone(),
+                intent.portable_path_index_root(),
+                ManifestObjectRef::from_descriptor(descriptor),
+                intent.post_frontier().clone(),
+                target,
+            ));
+        }
+        Ok(locators)
+    }
+
+    /// Reconstruct the projection rows of one manifest-committed accepted
+    /// operation in the clean runtime. No queue/status/index is consulted or
+    /// created: the immutable manifest is the commit marker, accepted engine
+    /// evidence authenticates it, and the projection object set is lowered by
+    /// the same function used by the legacy adapter.
+    pub(crate) fn clean_projection_work_for_batch(
         &self,
         batch_id: BatchId,
-        manifest_fingerprint: ContentDigest,
-    ) -> Result<(), EngineError> {
-        // Recovery may reconstruct accepted hot state, but it must not publish
-        // pending -> Ready projection authority one batch at a time. Finish
-        // first proves complete durable-history coverage and catalog
-        // readiness, then performs the bounded pending-work reconciliation.
-        if self.authenticated_history_replay {
-            return Ok(());
-        }
-        let Some(index) = self.projection_work_index.as_ref() else {
-            return Ok(());
-        };
-        let transition = self.authenticate_current_projection_history_extension(index)?;
-        index
-            .accept_batch_at_history(batch_id, manifest_fingerprint, transition)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    fn authenticate_current_projection_history_extension(
-        &self,
-        index: &ProjectionWorkIndex,
-    ) -> Result<super::object_store::AuthenticatedEngineHistoryTransition, EngineError> {
-        let before = index
-            .engine_history_authority()
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        self.history_store
-            .as_ref()
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        let manifest = store
+            .read_manifest(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
             .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection history transition has no durable engine history".into(),
-                )
-            })?
-            .authenticate_current_history_extension(before)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    fn authenticated_projection_history_transition(
-        &self,
-    ) -> Result<Option<super::object_store::AuthenticatedEngineHistoryTransition>, EngineError>
-    {
-        let Some(index) = self.projection_work_index.as_deref() else {
-            return Ok(None);
-        };
-        self.authenticate_current_projection_history_extension(index)
-            .map(Some)
-    }
-
-    fn reconcile_pending_projection_work(
-        &mut self,
-        transition: Option<super::object_store::AuthenticatedEngineHistoryTransition>,
-    ) -> Result<(), EngineError> {
-        let Some(index) = self.projection_work_index.as_ref().map(Arc::clone) else {
-            return Ok(());
-        };
-        self.begin_point_operation();
-        let authority = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection reconciliation has no durable engine history".into(),
-                )
-            })?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let transition = match transition {
-            Some(transition) if transition.after() == authority => transition,
-            Some(_) => {
-                return Err(EngineError::ProjectionWork(
-                    "authenticated projection history transition is not current".into(),
+                EngineError::Archive(format!(
+                    "clean projection batch {batch_id} has no committed manifest"
                 ))
+            })?;
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(&manifest) {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} manifest differs from accepted evidence"
+            )));
+        }
+        let batch = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "clean projection batch {batch_id} is not retained by the accepted runtime"
+            ))
+        })?;
+        if batch.manifest() != &manifest {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} runtime manifest differs from committed bytes"
+            )));
+        }
+        self.projection_work_rows_for_batch(batch, endpoint)
+    }
+
+    fn clean_projection_locators_for_committed_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        let manifest = store
+            .read_manifest(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean projection batch {batch_id} has no committed manifest"
+                ))
+            })?;
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(&manifest) {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} manifest differs from accepted evidence"
+            )));
+        }
+        let batch = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "clean projection batch {batch_id} is not retained by the accepted runtime"
+            ))
+        })?;
+        if batch.manifest() != &manifest {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} runtime manifest differs from committed bytes"
+            )));
+        }
+        self.clean_projection_locators_for_batch(batch, endpoint)
+    }
+
+    /// Whether an accepted batch's causal past is the entire accepted prefix
+    /// before it. A `false` answer means the batch was accepted concurrently
+    /// with other history, so any state it RECORDED at authoring time (semantic
+    /// after-values, rendered projection targets) is superseded by the merge
+    /// and must not be held to byte equality against current state (GH #351).
+    pub(crate) fn accepted_batch_is_causally_linear(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, EngineError> {
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        let manifest = self.load_observed_manifest(batch_id)?;
+        let containment = self.batch_causal_containment(
+            batch_id,
+            manifest.causal_dot(),
+            manifest.causal_dependency_heads(),
+        )?;
+        let causal_past: u64 = containment
+            .clock()
+            .iter()
+            .map(|(_, counter)| *counter)
+            .sum();
+        Ok(causal_past == evidence.acceptance_sequence())
+    }
+
+    /// True when any batch accepted after `work_batch` was causally
+    /// non-linear. A concurrent merge can change a page's deterministic
+    /// rendering without naming (or re-rendering) that page — the owner
+    /// registers it merges live in other documents — so a projection head
+    /// recorded before such a merge may legitimately disagree with the
+    /// current rendering even though the head itself was linear (GH #351).
+    fn nonlinear_accepted_since(&self, work_batch: BatchId) -> Result<bool, EngineError> {
+        let since = self
+            .accepted_batch_evidence(work_batch)?
+            .acceptance_sequence();
+        self.refresh_nonlinear_watermark()?;
+        Ok(self
+            .nonlinear_watermark
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > since)
+    }
+
+    /// Bring the non-linearity watermark up to date. O(1) when no batch was
+    /// accepted since the last refresh; otherwise classifies only the batches
+    /// not yet scanned, so the expensive causal-containment walk runs once
+    /// per accepted batch over the engine's lifetime instead of once per
+    /// query (audit 4, P2 — the eager per-save O(history) scan).
+    fn refresh_nonlinear_watermark(&self) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let status = self.status();
+        let accepted = status.accepted_batches()?;
+        let count = accepted.len() as u64;
+        if self.linearity_scanned_count.load(Relaxed) == count {
+            return Ok(());
+        }
+        let scanned = self.linearity_scanned_sequence.load(Relaxed);
+        let mut max_sequence = scanned;
+        let mut watermark = self.nonlinear_watermark.load(Relaxed);
+        let ids: Vec<BatchId> = accepted.iter().map(|entry| entry.batch_id).collect();
+        drop(status);
+        for batch_id in ids {
+            let evidence = match self.accepted_batch_evidence(batch_id) {
+                Ok(evidence) => evidence,
+                // An unreadable evidence row errs toward "linear", which is
+                // the strict (refusing) direction for every consumer of the
+                // watermark — same posture as the scan this replaces.
+                Err(_) => continue,
+            };
+            let sequence = evidence.acceptance_sequence();
+            if sequence <= scanned {
+                continue;
             }
-            None => self.authenticate_current_projection_history_extension(&index)?,
-        };
-        let mut cursor = None;
-        loop {
-            let page = index
-                .pending_activation_page(cursor.as_ref(), 256)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-            for pending in page.pending() {
-                let mut work = self.history_work.get();
-                work.projection_reconciliation_history_record_reads = work
-                    .projection_reconciliation_history_record_reads
-                    .saturating_add(1);
-                self.history_work.set(work);
-                match self.durable_endpoint_history_record_at_live_head(pending.batch_id())? {
-                    Some(record) => {
-                        if record.manifest_fingerprint != pending.manifest_fingerprint() {
-                            return Err(EngineError::ProjectionWork(format!(
-                                "pending projection batch {} does not match durable engine history",
-                                pending.batch_id()
-                            )));
-                        }
-                        match record.status {
-                            ArchiveStatus::Accepted { .. } => index
-                                .accept_batch_at_history(
-                                    pending.batch_id(),
-                                    pending.manifest_fingerprint(),
-                                    transition,
-                                )
-                                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                            ArchiveStatus::Rejected(_)
-                            | ArchiveStatus::Quarantined
-                            | ArchiveStatus::Staged => index
-                                .retire_pending_activation_at_history(pending, transition)
-                                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                        }
-                    }
-                    None => index
-                        .retire_pending_activation_at_history(pending, transition)
-                        .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                }
-            }
-            cursor = page.next().cloned();
-            if cursor.is_none() {
-                break;
+            max_sequence = max_sequence.max(sequence);
+            if !self.accepted_batch_is_causally_linear(batch_id)? {
+                watermark = watermark.max(sequence);
             }
         }
-        index
-            .bind_recovered_history_after_pending_reconciliation(transition)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        self.nonlinear_watermark.store(watermark, Relaxed);
+        self.linearity_scanned_sequence.store(max_sequence, Relaxed);
+        self.linearity_scanned_count.store(count, Relaxed);
         Ok(())
     }
 
-    /// Reconcile and bind expected-path projection authority to the current
-    /// authenticated durable engine history before a filesystem
-    /// reconciliation scan consumes it.
-    pub(crate) fn reconcile_expected_path_history(&mut self) -> Result<(), EngineError> {
-        self.ensure_not_blocked()?;
-        let transition = self.authenticated_projection_history_transition()?;
-        self.reconcile_pending_projection_work(transition)
+    /// Every accepted batch that was admitted against a concurrent prefix.
+    /// Used once per open to reseed the runtime's conflict-resolution queue:
+    /// the queue is process-local, so a crash between acceptance and
+    /// resolution authoring would otherwise strand the owed work forever
+    /// (audit 4, finding 3). Already-settled pairs are suppressed by the
+    /// descendant-touch gate during derivation, so reseeding is idempotent.
+    pub(crate) fn accepted_nonlinear_batch_ids(&self) -> Result<Vec<BatchId>, EngineError> {
+        let ids: Vec<BatchId> = self
+            .status()
+            .accepted_batches()?
+            .iter()
+            .map(|entry| entry.batch_id)
+            .collect();
+        let mut nonlinear = Vec::new();
+        for batch_id in ids {
+            if !self.accepted_batch_is_causally_linear(batch_id)? {
+                nonlinear.push(batch_id);
+            }
+        }
+        Ok(nonlinear)
     }
 
-    pub(crate) fn authorize_projection_work(
+    /// Whether later accepted history has superseded state recorded by this
+    /// batch. This includes both a batch admitted against a concurrent prefix
+    /// and a linear batch followed by a later concurrent merge.
+    pub(crate) fn accepted_batch_projection_is_superseded(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, EngineError> {
+        Ok(!self.accepted_batch_is_causally_linear(batch_id)?
+            || self.nonlinear_accepted_since(batch_id)?)
+    }
+
+    /// Rebuild the run-local terminal projection plan from accepted manifests.
+    /// Only the latest accepted row for each exact path can affect the final
+    /// Markdown/Org tree; older rows remain immutable history but are not a
+    /// durable queue to recover. The returned map is ordinary process memory
+    /// and is reconstructed on every cold open that needs reconciliation.
+    pub(crate) fn clean_terminal_projection_work(
+        &self,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        self.clean_projection_runtime_binding()?;
+        Ok(self.clean_projection_heads.values().cloned().collect())
+    }
+
+    /// Exact paths mentioned by the accepted clean tail.  This is a bounded
+    /// copy of the run-local manifest-derived head map, used only to include
+    /// released paths in a cold-open graph comparison.
+    pub(crate) fn clean_manifest_projection_paths(&self) -> Result<Vec<ManagedPath>, EngineError> {
+        self.clean_projection_runtime_binding()?;
+        Ok(self.clean_projection_heads.keys().cloned().collect())
+    }
+
+    /// Authorize one clean-runtime projection directly from the immutable
+    /// accepted manifest and the disposable SQLite current-state projection.
+    /// This deliberately has no persistent Ready/Completed/Superseded state:
+    /// stale work is rejected by current path ownership and, in the writer,
+    /// by replaying the current semantic page against the manifested target.
+    pub(crate) fn authorize_clean_projection_work(
         &mut self,
-        index: &ProjectionWorkIndex,
+        projection: &super::SqliteFrontier,
         work: &ProjectionWork,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Arc<ObjectStore>, EngineError> {
         self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        if endpoint.endpoint_id != work.endpoint_id()
-            || endpoint.graph_resource_id != work.graph_resource_id()
-            || index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || Some(index.receipt_store_id()) != self.projection_receipt_store_id
-            || work.workspace_id() != self.workspace_id
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        if work.workspace_id() != self.workspace_id
+            || work.endpoint_id() != endpoint.endpoint_id
+            || work.graph_resource_id() != endpoint.graph_resource_id
         {
             return Err(EngineError::ProjectionWork(
-                "projection work endpoint/workspace binding mismatch".into(),
+                "clean projection work endpoint/workspace binding mismatch".into(),
             ));
         }
-        let authority = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection authorization has no durable engine history".into(),
-                )
-            })?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        index
-            .require_current_history_binding(authority.generation, authority.index_root)
+        let current_root = self.accepted_frontier_root()?;
+        let projected_root = projection
+            .frontier_root()
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let record = self
-            .durable_endpoint_history_record(work.batch_id())?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection work batch has no authenticated durable status".into(),
-                )
-            })?;
-        if !matches!(record.status, ArchiveStatus::Accepted { .. }) {
+        if projected_root != current_root {
             return Err(EngineError::ProjectionWork(
-                "projection work batch is not accepted durable state".into(),
+                "clean SQLite projection is not at the engine's accepted frontier".into(),
             ));
         }
-        if self.visible_documents.is_empty() {
-            self.portable_path_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::ProjectionWork(
-                        "projection authorization has no portable-path index".into(),
-                    )
-                })?
-                .validate_root(record.portable_path_root)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-            self.portable_path_root = record.portable_path_root;
-        }
-        if record.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
-            || work.portable_path_key_version() != super::PORTABLE_PATH_KEY_VERSION
-            || work.portable_path_key_digest() != work.path().portable_key().digest()
-        {
+        let derived = self.clean_projection_work_for_batch(work.batch_id())?;
+        if !derived.iter().any(|candidate| candidate == work) {
             return Err(EngineError::ProjectionWork(
-                "projection work portable-path history binding mismatch".into(),
+                "clean projection work is not carried by its accepted manifest".into(),
             ));
         }
-        let key = work.portable_path_key_digest();
-        let current = self.portable_path_records_many(&[key])?.remove(&key);
-        let currently_owned = current.as_ref().and_then(PortablePathRecord::occupied);
+        let read = projection
+            .materialized_read()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        let owners = read
+            .pages_by_path(work.path(), 2)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
         match work.target() {
-            ProjectionWorkTarget::Present(_)
-                if currently_owned.is_none_or(|occupied| {
-                    occupied.page_id() != work.page_id() || occupied.exact_path() != work.path()
-                }) =>
+            ProjectionWorkTarget::Present(_) if !matches!(owners.as_slice(), [owner] if owner.page_id == work.page_id()) =>
             {
                 return Err(EngineError::ProjectionWork(
-                    "projection work path is not currently owned by its page".into(),
+                    "clean projection path is not currently owned by its page".into(),
                 ));
             }
-            ProjectionWorkTarget::Absent if currently_owned.is_some() => {
+            ProjectionWorkTarget::Absent if !owners.is_empty() => {
                 return Err(EngineError::ProjectionWork(
-                    "projection deletion path is currently owned".into(),
+                    "clean projection deletion path is currently owned".into(),
                 ));
             }
             ProjectionWorkTarget::Absent | ProjectionWorkTarget::Present(_) => {}
         }
-        index
-            .require_accepted_ready(work, record.manifest_fingerprint)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    pub(crate) fn authorize_projected_release(
-        &self,
-        index: &ProjectionWorkIndex,
-        release: &PortablePathReleased,
-        // `None` when the released path is absent. Only the guarded-conflict
-        // route needs bytes to authenticate against; an absent completion — an
-        // ordinary deletion — is authorized without any observation.
-        observed: Option<BlobDescription>,
-    ) -> Result<ProjectedReleaseAuthority, EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        let receipt_store_id = self.projection_receipt_store_id.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection receipt store".into())
-        })?;
-        if index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || index.receipt_store_id() != receipt_store_id
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release runtime binding mismatch".into(),
-            ));
-        }
-        let history = self.history_store.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "projection release authorization has no durable engine history".into(),
-            )
-        })?;
-        let (generation, history_root) = history
-            .current()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        index
-            .require_current_history_binding(generation, history_root)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let bytes = history
-            .lookup(history_root, release.release_batch())
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection release batch has no authenticated durable status".into(),
-                )
-            })?;
-        let record = decode_history_record(release.release_batch(), &bytes)?;
-        self.validate_record_catalog_transition(&record)?;
-        if record.generation == 0
-            || record.generation > generation
-            || !matches!(record.status, ArchiveStatus::Accepted { .. })
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release batch is not accepted durable state".into(),
-            ));
-        }
-        let key = release.prior_exact_path().portable_key().digest();
-        let current = self.portable_path_records_many(&[key])?.remove(&key);
-        if current
-            .as_ref()
-            .and_then(PortablePathRecord::occupied)
-            .is_some()
-            || current
-                .as_ref()
-                .and_then(PortablePathRecord::latest_release)
-                != Some(release)
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release is not the authenticated current path fence".into(),
-            ));
-        }
-        let completed = index
-            .completed_receipts_for_path(release.prior_exact_path())
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let mut exact = completed.into_iter().filter(|receipt| {
-            receipt.page_id() == release.prior_page_id()
-                && receipt.path() == release.prior_exact_path()
-                && receipt.target() == ProjectionWorkTarget::Absent
-        });
-        let completed = exact.next();
-        if exact.next().is_some() {
-            return Err(EngineError::ProjectionWork(
-                "projection release completion is not exact".into(),
-            ));
-        }
-        if let Some(completed) = completed {
-            if !self.projection_frontier_contains_path_acquisition(
-                completed.frontier(),
-                release.release_batch(),
-            )? {
-                return Err(EngineError::ProjectionWork(
-                    "projection release completion is not exact".into(),
-                ));
-            }
-            return Ok(ProjectedReleaseAuthority::Completed(completed));
-        }
-        let observed = observed.ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "projection release has no absent completion, and no replacement bytes to \
-                 authenticate a guarded conflict against"
-                    .into(),
-            )
-        })?;
-        let blocked = index
-            .blocked_release_for_observation(
-                release.release_batch(),
-                release.prior_page_id(),
-                release.prior_exact_path(),
-                observed,
-            )
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection release has neither an absent completion nor an exact guarded conflict"
-                        .into(),
-                )
-            })?;
-        if !self.projection_frontier_contains_path_acquisition(
-            blocked.0.post_frontier(),
-            release.release_batch(),
-        )? {
-            return Err(EngineError::ProjectionWork(
-                "guarded projection conflict is not exact for the release".into(),
-            ));
-        }
-        Ok(ProjectedReleaseAuthority::GuardedConflict {
-            work: blocked.0,
-            intent_id: blocked.1,
-        })
+        Ok(store)
     }
 
     fn projection_frontier_dominates(
@@ -19560,6 +18664,49 @@ impl ShardedHotEngine {
             };
             let new = &newer.documents()[index];
             if !self.document_dependencies_dominate(new, old)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A page transition can stop depending on a document (for example when a
+    /// subtree moves away from the page). In that case the document correctly
+    /// disappears from the page's compact projection frontier even though the
+    /// authoring batch still causally descends from its former head.
+    fn projection_transition_frontier_dominates(
+        &self,
+        newer: &FrontierV2,
+        older: &FrontierV2,
+    ) -> Result<bool, EngineError> {
+        let direct_heads = newer
+            .documents()
+            .iter()
+            .flat_map(|document| document.direct_dependency_heads().iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut ancestry = None;
+        for old in older.documents() {
+            if let Ok(index) = newer
+                .documents()
+                .binary_search_by_key(&old.document_id(), DocumentDependencies::document_id)
+            {
+                if !self.document_dependencies_dominate(&newer.documents()[index], old)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if old.direct_dependency_heads().is_empty() {
+                return Ok(false);
+            }
+            let ancestry = match &ancestry {
+                Some(ancestry) => ancestry,
+                None => ancestry.insert(self.projection_direct_head_ancestry(&direct_heads)?),
+            };
+            if !old
+                .direct_dependency_heads()
+                .iter()
+                .all(|head| direct_heads.contains(head) || ancestry.contains_key(head))
+            {
                 return Ok(false);
             }
         }
@@ -19606,8 +18753,19 @@ impl ShardedHotEngine {
         {
             return Ok(true);
         }
-        let ancestry = match self.collect_batch_ancestry(&direct_heads, self.is_blocked()) {
-            Ok(ancestry) => ancestry,
+        let ancestry = self.projection_direct_head_ancestry(&direct_heads)?;
+        Ok(older
+            .direct_dependency_heads()
+            .iter()
+            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
+    }
+
+    fn projection_direct_head_ancestry(
+        &self,
+        direct_heads: &BTreeSet<BatchId>,
+    ) -> Result<BTreeMap<BatchId, OperationBatch>, EngineError> {
+        match self.collect_batch_ancestry(direct_heads, self.is_blocked()) {
+            Ok(ancestry) => Ok(ancestry),
             Err(EngineError::MissingDependency(candidate))
                 if direct_heads.contains(&candidate)
                     && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
@@ -19621,30 +18779,49 @@ impl ShardedHotEngine {
                     .iter()
                     .copied()
                     .collect();
-                self.collect_batch_ancestry(&dependencies, self.is_blocked())?
+                self.collect_batch_ancestry(&dependencies, self.is_blocked())
             }
             Err(error) => return Err(error),
-        };
-        Ok(older
-            .direct_dependency_heads()
-            .iter()
-            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
+        }
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
-        self.materialize_page_inner(page_id, false)
-            .map(|(page, _, _, _)| page)
+        self.materialize_page_inner(page_id, false, None)
+            .map(|(page, _, _)| page)
+    }
+
+    /// Materialize one page from the accepted clean suffix while consulting
+    /// the disposable SQLite baseline for claims the suffix does not repeat.
+    /// Clean runtimes deliberately do not copy the full baseline into the hot
+    /// engine, so pending foreground reads must use this combined view.
+    pub(crate) fn materialize_page_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<MaterializedPage, EngineError> {
+        self.materialize_page_inner(page_id, false, Some(claim_source))
+            .map(|(page, _, _)| page)
     }
 
     pub fn materialize_page_for_projection(
         &self,
         page_id: PageId,
     ) -> Result<ProjectionPageState, EngineError> {
-        let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true)?;
-        if effective_closure.is_some() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
+        let (page, frontier, claim_evidence) = self.materialize_page_inner(page_id, true, None)?;
+        Ok(ProjectionPageState {
+            page,
+            frontier: frontier.expect("projection materialization requested a frontier"),
+            claim_evidence,
+        })
+    }
+
+    fn materialize_page_for_projection_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<ProjectionPageState, EngineError> {
+        let (page, frontier, claim_evidence) =
+            self.materialize_page_inner(page_id, true, Some(claim_source))?;
         Ok(ProjectionPageState {
             page,
             frontier: frontier.expect("projection materialization requested a frontier"),
@@ -19656,11 +18833,32 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        self.authorize_projection_write_inner(page_id, None)
+    }
+
+    fn authorize_projection_write_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        self.authorize_projection_write_inner(page_id, Some(claim_source))
+    }
+
+    fn authorize_projection_write_inner(
+        &self,
+        page_id: PageId,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let store = self
             .archive_store
             .as_ref()
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let state = self.materialize_page_for_projection(page_id)?;
+        let state = match claim_source {
+            Some(source) => {
+                self.materialize_page_for_projection_with_claim_source(page_id, source)?
+            }
+            None => self.materialize_page_for_projection(page_id)?,
+        };
         let mut accepted_heads = 0_usize;
         for document in state.frontier.documents() {
             for batch_id in document.direct_dependency_heads() {
@@ -19675,210 +18873,42 @@ impl ShardedHotEngine {
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
-                let bootstrap_ready =
-                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
-                if !accepted || (!ordinary_ready && !bootstrap_ready) {
+                if !accepted || !ordinary_ready {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
         }
         if accepted_heads == 0 {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
+            // A clean baseline is semantic authority without fabricated
+            // bootstrap operations. An untouched page therefore still has no
+            // direct batch heads after unrelated tail operations have advanced
+            // the graph-wide frontier. Prove each requested document against
+            // both the immutable baseline and the current accepted frontier;
+            // requiring the *whole* frontier to remain at sequence zero would
+            // make every untouched page unauthorizable after the first edit.
+            let baseline_is_exact = self.lazy_genesis.as_ref().is_some_and(|baseline| {
+                accepted_frontier_root_for_lazy_genesis(baseline).is_ok_and(|baseline_root| {
+                    state.frontier.documents().iter().all(|document| {
+                        document.direct_dependency_heads().is_empty()
+                            && self
+                                .accepted_frontier_document(&baseline_root, document.document_id())
+                                .is_ok_and(|accepted| accepted.as_ref() == Some(document))
+                            && self
+                                .accepted_frontier_document(
+                                    &self.accepted_frontier_root,
+                                    document.document_id(),
+                                )
+                                .is_ok_and(|accepted| accepted.as_ref() == Some(document))
+                    })
+                })
+            });
+            if !baseline_is_exact {
+                return Err(EngineError::ProjectionAuthorizationUnavailable);
+            }
         }
         Ok(ProjectionWriteAuthorization {
             state,
             claim_root: self.logseq_claim_root,
-        })
-    }
-
-    pub(crate) fn authenticate_effective_title_projection_candidate(
-        &self,
-        page_id: PageId,
-    ) -> Result<AuthenticatedEffectiveTitleProjectionCandidate, EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true)?;
-        let effective_closure =
-            effective_closure.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let source = effective_closure.transition.selected_intent.clone();
-        let state = ProjectionPageState {
-            page,
-            frontier: frontier.expect("projection materialization requested a frontier"),
-            claim_evidence,
-        };
-        let accepted_frontier = self.authenticate_projection_accepted_frontier()?;
-        Ok(AuthenticatedEffectiveTitleProjectionCandidate {
-            seal: EffectiveTitleTransitionSeal::Authenticated,
-            state,
-            source,
-            lifecycle_completion: effective_closure.lifecycle_completion,
-            accepted_frontier,
-        })
-    }
-
-    pub(crate) fn authorize_effective_title_projection_write(
-        &self,
-        candidate: &AuthenticatedEffectiveTitleProjectionCandidate,
-        source: &ManifestedProjectionIntent,
-        completed_intent: &ProjectionIntent,
-        completion: &ProjectionCompletion,
-        exact_local_base: &[u8],
-    ) -> Result<ProjectionWriteAuthorization, EngineError> {
-        let fresh = self.authenticate_effective_title_projection_candidate(source.page_id())?;
-        if candidate.seal != EffectiveTitleTransitionSeal::Authenticated
-            || candidate.source != *source
-            || fresh.seal != candidate.seal
-            || fresh.source != candidate.source
-            || fresh.lifecycle_completion != candidate.lifecycle_completion
-            || !fresh
-                .accepted_frontier
-                .matches(&candidate.accepted_frontier)
-            || !same_projection_state_authority(&fresh.state, &candidate.state)
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        completion
-            .validate_against(completed_intent)
-            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
-        let completed_intent_id = completed_intent
-            .id()
-            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
-        let lifecycle = &candidate.lifecycle_completion;
-        if completed_intent.workspace_id() != self.workspace_id
-            || lifecycle.page_id() != completed_intent.page_id()
-            || lifecycle.path() != completed_intent.path()
-            || lifecycle.frontier() != completed_intent.frontier()
-            || lifecycle.intent_id() != completed_intent_id
-            || lifecycle.logical_completion_id() != completion.logical_completion_id()
-            || lifecycle.target() != ProjectionWorkTarget::Present(completed_intent.target())
-            || completed_intent.page_id() != candidate.state.page.page_id
-            || completed_intent.path() != &candidate.state.page.path
-            || super::BlobDescription::of(exact_local_base) != completed_intent.target()
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let ManifestProjectionTarget::Present {
-            bytes, annotations, ..
-        } = source.target()
-        else {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        };
-        let replay = super::projection::plan_projection_with_layout_annotations(
-            self.workspace_id,
-            &candidate.state,
-            Some(exact_local_base),
-            Some(annotations),
-        )
-        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.target() != bytes || replay.intent().annotations() != annotations {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        Ok(ProjectionWriteAuthorization {
-            state: candidate.state.clone(),
-            claim_root: self.logseq_claim_root,
-        })
-    }
-
-    fn authenticate_projection_accepted_frontier(
-        &self,
-    ) -> Result<AuthenticatedProjectionAcceptedFrontier, EngineError> {
-        let mut work = self.history_work.get();
-        work.effective_title_projection_authority_calls = work
-            .effective_title_projection_authority_calls
-            .saturating_add(1);
-        self.history_work.set(work);
-
-        let accepted_frontier_root = self.accepted_frontier_root()?;
-        let accepted_documents =
-            usize::try_from(accepted_frontier_root.document_count()).unwrap_or(usize::MAX);
-        let mut work = self.history_work.get();
-        work.effective_title_projection_max_accepted_documents = work
-            .effective_title_projection_max_accepted_documents
-            .max(accepted_documents);
-        self.history_work.set(work);
-        let acceptance_sequence = accepted_frontier_root.acceptance_sequence();
-        if acceptance_sequence == 0 {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let (latest_accepted_batch, accepted_evidence) = self
-            .accepted_batch_entry_at(acceptance_sequence)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let accepted_evidence =
-            accepted_evidence.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-        if accepted_evidence.batch_id() != latest_accepted_batch
-            || accepted_evidence.acceptance_sequence() != acceptance_sequence
-            || accepted_evidence.post_frontier_root() != &accepted_frontier_root
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-
-        let accepted_no_op = self
-            .accepted_frontier_batch_no_op(latest_accepted_batch)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-
-        let history = self
-            .history_store
-            .as_ref()
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let durable_history = history
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if durable_history.generation != self.history_generation
-            || durable_history.index_root != self.history_root
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let durable_record = self
-            .durable_endpoint_history_record_at_live_head(latest_accepted_batch)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let confirmed_history = history
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-        if confirmed_history != durable_history {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let ArchiveStatus::Accepted {
-            no_op: durable_no_op,
-            evidence: durable_evidence,
-        } = &durable_record.status
-        else {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        };
-        if *durable_no_op != accepted_no_op
-            || durable_evidence.batch_id() != latest_accepted_batch
-            || durable_evidence.manifest_fingerprint() != accepted_evidence.manifest_fingerprint()
-            || durable_evidence.event_binding_digest() != accepted_evidence.event_binding_digest()
-            || durable_evidence.acceptance_sequence() != acceptance_sequence
-            || durable_evidence.affected_documents() != accepted_evidence.affected_documents()
-            || durable_evidence.reference_catalog_delta()
-                != accepted_evidence.reference_catalog_delta()
-            || accepted_frontier_cross_run_facts(durable_evidence.prior_frontier_root())
-                != accepted_frontier_cross_run_facts(accepted_evidence.prior_frontier_root())
-            || accepted_frontier_cross_run_facts(durable_evidence.post_frontier_root())
-                != accepted_frontier_cross_run_facts(&accepted_frontier_root)
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        Ok(AuthenticatedProjectionAcceptedFrontier {
-            runtime_authority: self.runtime_authority.clone(),
-            accepted_frontier_root,
-            durable_history,
         })
     }
 
@@ -20003,9 +19033,7 @@ impl ShardedHotEngine {
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
-                let bootstrap_ready =
-                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
-                if !accepted || (!ordinary_ready && !bootstrap_ready) {
+                if !accepted || !ordinary_ready {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
@@ -20037,6 +19065,189 @@ impl ShardedHotEngine {
         })
     }
 
+    /// Authorize receiver-local completion of one accepted foreign deletion on
+    /// the index-free clean runtime.
+    ///
+    /// [`Self::authorize_projection_tombstone`] proves its release against two
+    /// pre-0.7 durable trees the clean runtime deliberately does not build: the
+    /// endpoint history store and the persistent portable-path index. Those are
+    /// not different invariants, so this is not a weaker authorization — it is
+    /// the same questions asked of the structures the clean runtime keeps.
+    ///
+    /// * *Did this runtime accept the batch that carries this intent, and do
+    ///   the archived bytes still match what it accepted?* — answered by the
+    ///   accepted batch evidence rather than a durable history record.
+    /// * *Is the exact path free right now?* — answered by the disposable
+    ///   SQLite projection pinned to the engine's accepted frontier, which is
+    ///   the same question [`Self::authorize_clean_projection_work`] already
+    ///   asks for an own-endpoint deletion. It is the live fact rather than a
+    ///   historical release record, and unlike `ephemeral_portable_paths` it
+    ///   survives a restart.
+    ///
+    /// Path ownership — not the page's catalog lifecycle — is the whole
+    /// authorization, exactly as on the own-endpoint path. A rename releases
+    /// its old path while its page stays live, so requiring a catalog tombstone
+    /// here would refuse every delivered rename.
+    pub(crate) fn authorize_clean_projection_tombstone(
+        &self,
+        projection: &super::SqliteFrontier,
+        source: &ManifestedProjectionIntent,
+    ) -> Result<CleanTombstoneAuthorization, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let (store, _endpoint) = self.clean_projection_runtime_binding()?;
+        if source.workspace_id() != self.workspace_id
+            || !matches!(source.target(), ManifestProjectionTarget::Absent)
+            || !source.claim_evidence().is_empty()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The delivered bytes are transport evidence. Authority comes from this
+        // runtime's own acceptance of the batch that carries the intent, and
+        // from the archived manifest still matching what was accepted — the
+        // torn-write / partial-delivery check the durable history record used
+        // to perform.
+        let batch = match store
+            .inspect_batch(source.source_batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(batch) => batch,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Ok(CleanTombstoneAuthorization::Deferred(
+                    CleanTombstoneDeferral::BatchNotArchiveReady,
+                ));
+            }
+        };
+        let evidence = match self.accepted_batch_evidence(source.source_batch_id()) {
+            Ok(evidence) => evidence,
+            Err(EngineError::MissingDependency(_)) => {
+                return Ok(CleanTombstoneAuthorization::Deferred(
+                    CleanTombstoneDeferral::BatchNotAccepted,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if evidence.manifest_fingerprint != batch_fingerprint(&batch) {
+            return Err(EngineError::Archive(format!(
+                "clean tombstone batch {} archive bytes differ from its accepted manifest",
+                source.source_batch_id()
+            )));
+        }
+
+        // The intent must be carried by that batch, exactly once. A duplicate
+        // is malformed imported content, not an ambiguity to resolve.
+        let mut matched_source = false;
+        for object in batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+        {
+            let manifested = ManifestedProjectionIntent::decode(object.payload())
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if manifested == *source {
+                if matched_source {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                matched_source = true;
+            }
+        }
+        if !matched_source {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The declared render base, when present, must be the authenticated
+        // object the batch names and must bind to this page and path.
+        let prior_frontier = match source.precondition() {
+            ManifestProjectionPrecondition::Absent => None,
+            ManifestProjectionPrecondition::Present { base } => {
+                let object = batch
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        object.kind() == ObjectKind::AnnotatedBaseBlob
+                            && object.document_id() == base.document_id()
+                            && object.descriptor().is_ok_and(|descriptor| {
+                                descriptor.content_digest() == base.content_digest()
+                                    && descriptor.encoded_byte_length()
+                                        == base.encoded_byte_length()
+                            })
+                    })
+                    .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+                let base = AnnotatedProjectionBase::decode(object.payload())
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if base.workspace_id() != self.workspace_id
+                    || base.source_page_id() != source.page_id()
+                    || base.source_path() != source.path()
+                {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                Some(base.prior_frontier().clone())
+            }
+        };
+
+        // Every causal head the intent declares must be accepted and durable
+        // here. A provider tree that is still arriving is deferred, never
+        // treated as a licence to remove bytes.
+        let mut accepted_heads = 0_usize;
+        for document in source.post_frontier().documents() {
+            for batch_id in document.direct_dependency_heads() {
+                accepted_heads = accepted_heads.saturating_add(1);
+                let accepted = matches!(
+                    self.archive_status(*batch_id)?,
+                    Some(ArchiveStatus::Accepted { .. })
+                );
+                let ordinary_ready = matches!(
+                    store
+                        .inspect_batch(*batch_id)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                    BatchInspection::Ready(_)
+                );
+                if !accepted || !ordinary_ready {
+                    return Ok(CleanTombstoneAuthorization::Deferred(
+                        CleanTombstoneDeferral::FrontierNotDurable,
+                    ));
+                }
+            }
+        }
+        if accepted_heads == 0 {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The release itself: nobody may own this exact path in the current
+        // accepted state. Pin the projection to the engine's accepted frontier
+        // first, so the answer is the current one and not a stale read.
+        let current_root = self.accepted_frontier_root()?;
+        let projected_root = projection
+            .frontier_root()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if projected_root != current_root {
+            return Ok(CleanTombstoneAuthorization::Deferred(
+                CleanTombstoneDeferral::SqliteBehindAcceptedFrontier,
+            ));
+        }
+        let read = projection
+            .materialized_read()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        let owners = read
+            .pages_by_path(source.path(), 2)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if !owners.is_empty() {
+            return Ok(CleanTombstoneAuthorization::Superseded(
+                CleanTombstoneSupersession::PathIsOwned,
+            ));
+        }
+
+        Ok(CleanTombstoneAuthorization::Authorized(Box::new(
+            ProjectionTombstoneAuthorization {
+                page_id: source.page_id(),
+                path: source.path().clone(),
+                prior_frontier,
+                frontier: source.post_frontier().clone(),
+            },
+        )))
+    }
+
     pub(crate) fn projection_completion_history_authority(
         &self,
     ) -> Result<(u64, ContentDigest), EngineError> {
@@ -20059,7 +19270,7 @@ impl ShardedHotEngine {
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        self.authorize_projection_recovery_inner(page_id, frontier, expected_claim_evidence)
+        self.authorize_projection_recovery_inner(page_id, frontier, expected_claim_evidence, None)
     }
 
     fn authorize_projection_recovery_inner(
@@ -20067,6 +19278,7 @@ impl ShardedHotEngine {
         page_id: PageId,
         frontier: &FrontierV2,
         expected_claim_evidence: &[ProjectionClaimEvidence],
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let store = self
             .archive_store
@@ -20084,7 +19296,26 @@ impl ShardedHotEngine {
         requested.extend(page.blocks.iter().filter_map(|block| block.logseq_uuid));
         let mut actual_evidence = Vec::new();
         for logseq_uuid in requested {
-            let evidence = self.logseq_claim_evidence_at_frontier(logseq_uuid, frontier)?;
+            let evidence = match claim_source {
+                Some(source) => {
+                    let participants =
+                        self.projection_claim_participants(logseq_uuid, Some(source))?;
+                    let expected = expected_claim_evidence
+                        .binary_search_by_key(&logseq_uuid, ProjectionClaimEvidence::logseq_uuid)
+                        .ok()
+                        .map(|index| &expected_claim_evidence[index]);
+                    match (participants.is_empty(), expected) {
+                        (true, None) => None,
+                        (false, Some(expected))
+                            if participants.as_slice() == expected.participants() =>
+                        {
+                            Some(expected.clone())
+                        }
+                        _ => return Err(EngineError::ProjectionClaimEvidenceMismatch),
+                    }
+                }
+                None => self.logseq_claim_evidence_at_frontier(logseq_uuid, frontier)?,
+            };
             if let Some(evidence) = evidence {
                 let resolution =
                     self.resolve_logseq_uuid_from_documents(logseq_uuid, &evidence, &documents)?;
@@ -20146,9 +19377,7 @@ impl ShardedHotEngine {
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
-                let bootstrap_ready =
-                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
-                if !accepted || (!ordinary_ready && !bootstrap_ready) {
+                if !accepted || !ordinary_ready {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
@@ -20173,16 +19402,6 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         self.resolve_logseq_uuid_current(logseq_uuid)
             .map(|(resolution, _, _)| resolution)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reference_posting_for_test(
-        &self,
-        page_id: PageId,
-    ) -> Result<Option<super::reference_catalog::ReferenceSourcePostingV2>, EngineError> {
-        self.reference_catalog
-            .posting(page_id)
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
     fn logseq_claim_record(
@@ -20216,9 +19435,41 @@ impl ShardedHotEngine {
         })
     }
 
+    fn projection_claim_participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+        source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        let mut participants = self
+            .logseq_claim_record(self.logseq_claim_root, logseq_uuid)?
+            .introductions
+            .iter()
+            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
+            .collect::<BTreeSet<_>>();
+        if let Some(source) = source {
+            participants.extend(source.participants(logseq_uuid)?);
+        }
+        Ok(participants.into_iter().collect())
+    }
+
     fn resolve_logseq_uuid_current(
         &self,
         logseq_uuid: LogseqUuid,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
+        self.resolve_logseq_uuid_current_in_catalog_window(logseq_uuid, None)
+    }
+
+    fn resolve_logseq_uuid_current_in_catalog_window(
+        &self,
+        logseq_uuid: LogseqUuid,
+        catalog: Option<ValidatedCatalogDocument<'_>>,
     ) -> Result<
         (
             LogseqUuidResolution,
@@ -20235,6 +19486,41 @@ impl ShardedHotEngine {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        self.resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)
+    }
+
+    fn resolve_logseq_uuid_current_from_source(
+        &self,
+        logseq_uuid: LogseqUuid,
+        source: &dyn ProjectionClaimSource,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
+        self.resolve_logseq_uuid_current_from_participants(
+            logseq_uuid,
+            self.projection_claim_participants(logseq_uuid, Some(source))?,
+            None,
+        )
+    }
+
+    fn resolve_logseq_uuid_current_from_participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+        participants: Vec<ProjectionClaimParticipant>,
+        catalog: Option<ValidatedCatalogDocument<'_>>,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
         if participants.is_empty() {
             return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
         }
@@ -20261,7 +19547,12 @@ impl ShardedHotEngine {
             else {
                 continue;
             };
-            let page_is_live = match self.current_hot_page_state(page_id) {
+            let page_state = match catalog {
+                Some(catalog) => read_validated_catalog_page(catalog, page_id)?
+                    .ok_or(EngineError::PageNotFound(page_id)),
+                None => self.current_hot_page_state(page_id),
+            };
+            let page_is_live = match page_state {
                 Ok(PageState::Live { .. }) => true,
                 Ok(PageState::Tombstone { .. })
                 | Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => false,
@@ -20531,12 +19822,12 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
         include_frontier: bool,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<
         (
             MaterializedPage,
             Option<FrontierV2>,
             Vec<ProjectionClaimEvidence>,
-            Option<AuthenticatedEffectiveProjectionClosure>,
         ),
         EngineError,
     > {
@@ -20657,8 +19948,12 @@ impl ShardedHotEngine {
             let mut referenced = page_logseq_references(&path, preamble.as_deref(), &blocks);
             referenced.extend(block_claims.keys().copied());
             for logseq_uuid in referenced {
-                let (resolution, evidence, homes) =
-                    self.resolve_logseq_uuid_current(logseq_uuid)?;
+                let (resolution, evidence, homes) = match claim_source {
+                    Some(source) => {
+                        self.resolve_logseq_uuid_current_from_source(logseq_uuid, source)?
+                    }
+                    None => self.resolve_logseq_uuid_current(logseq_uuid)?,
+                };
                 if let Some((block_id, home_document_id, origin)) =
                     block_claims.get(&logseq_uuid).copied()
                 {
@@ -20729,303 +20024,16 @@ impl ShardedHotEngine {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut page)?;
         }
+        if include_frontier {
+            frontier_documents.insert(
+                self.catalog_document_id,
+                self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
+            );
+        }
         let frontier = include_frontier
-            .then(|| FrontierV2::new(frontier_documents.values().cloned().collect()))
+            .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
             .transpose()?;
-        let (frontier, effective_closure) = match frontier {
-            Some(frontier) => match self.page_stable_projection_frontier(
-                &mut page,
-                &frontier,
-                &claim_evidence,
-                effective_selection.as_ref(),
-                effective_transition.as_ref(),
-            )? {
-                Some((stable, closure)) => (Some(stable), closure),
-                None => {
-                    frontier_documents.insert(
-                        self.catalog_document_id,
-                        self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
-                    );
-                    (
-                        Some(FrontierV2::new(frontier_documents.into_values().collect())?),
-                        None,
-                    )
-                }
-            },
-            None => (None, None),
-        };
-        Ok((page, frontier, claim_evidence, effective_closure))
-    }
-
-    fn current_catalog_dependencies_dominate(
-        &self,
-        current: Option<&DocumentDependencies>,
-        candidate: &DocumentDependencies,
-    ) -> Result<bool, EngineError> {
-        if let Some(current) = current {
-            return self.document_dependencies_dominate(current, candidate);
-        }
-        if self.retained_accepted_catalog_matches(&self.accepted_frontier_root, candidate) {
-            return Ok(true);
-        }
-        let current = self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
-        self.document_dependencies_dominate(&current, candidate)
-    }
-
-    fn page_stable_projection_frontier(
-        &self,
-        page: &mut MaterializedPage,
-        current: &FrontierV2,
-        claim_evidence: &[ProjectionClaimEvidence],
-        effective_selection: Option<&AuthenticatedPageNameExactStateV1>,
-        effective_transition: Option<&AuthenticatedPageLocalEffectiveTransition>,
-    ) -> Result<Option<(FrontierV2, Option<AuthenticatedEffectiveProjectionClosure>)>, EngineError>
-    {
-        let path_key = page.path.portable_key().digest();
-        let Some(occupied) = self
-            .portable_path_records_many(&[path_key])?
-            .remove(&path_key)
-            .and_then(|record| record.occupied().cloned())
-            .filter(|occupied| {
-                occupied.page_id() == page.page_id && occupied.exact_path() == &page.path
-            })
-        else {
-            return Ok(None);
-        };
-        let Some(index) = self.projection_work_index.as_ref() else {
-            return Ok(None);
-        };
-        let completed = index
-            .completed_receipts_for_path(&page.path)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        // A remote page may not have a local completion yet; that is the
-        // first-projection case, not evidence of an external delete. Once this
-        // endpoint has completed the path, however, only the unique completion
-        // in the current acquisition lifecycle can authorize historical reuse.
-        let mut lifecycle_completion = None;
-        for completion in &completed {
-            if completion.page_id() != page.page_id || completion.path() != &page.path {
-                continue;
-            }
-            let ProjectionWorkTarget::Present(_) = completion.target() else {
-                continue;
-            };
-            if !self.projection_frontier_contains_path_acquisition(
-                completion.frontier(),
-                occupied.acquisition_batch(),
-            )? {
-                continue;
-            }
-            if lifecycle_completion.replace(completion.clone()).is_some() {
-                return Ok(None);
-            }
-        }
-        let derived_transition = if effective_transition.is_none() {
-            match (effective_selection, lifecycle_completion.as_ref()) {
-                // A same-key title revision can already supply the selected
-                // catalog name while its merged shard still has the other
-                // branch's explicit-title preamble. Reapply that authenticated
-                // revision even when its projection lifecycle is complete.
-                (Some(selection), Some(completion))
-                    if !self.projection_frontier_contains_path_acquisition(
-                        completion.frontier(),
-                        selection.exact_state_batch(),
-                    )? || selection.revises_acquired_exact_name() =>
-                {
-                    Some(self.authenticate_selected_title_transition(selection, None)?)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(transition) = &derived_transition {
-            transition.apply_to_materialized(page)?;
-        }
-        let effective_transition = effective_transition.or(derived_transition.as_ref());
-        let current_catalog = current
-            .documents()
-            .iter()
-            .find(|document| document.document_id() == self.catalog_document_id);
-        if let Some(transition) = effective_transition {
-            let intent = &transition.selected_intent;
-            if transition.seal != EffectiveTitleTransitionSeal::Authenticated
-                || transition.page_id != page.page_id
-                || transition.selected_name != page.name
-                || transition.selected_batch != intent.source_batch_id()
-                || transition.selected_dot
-                    != self
-                        .load_observed_manifest(transition.selected_batch)?
-                        .causal_dot()
-                || intent.page_id() != page.page_id
-                || intent.path() != &page.path
-                || intent.claim_evidence() != claim_evidence
-                || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
-                || !self.projection_frontier_contains_path_acquisition(
-                    intent.post_frontier(),
-                    occupied.acquisition_batch(),
-                )?
-            {
-                return Ok(None);
-            }
-            let mismatched_completion = lifecycle_completion.as_ref().filter(|completion| {
-                intent.post_frontier() != completion.frontier()
-                    || intent
-                        .target()
-                        .description()
-                        .map(ProjectionWorkTarget::Present)
-                        != Some(completion.target())
-            });
-            let Some(candidate_catalog) = intent
-                .post_frontier()
-                .documents()
-                .iter()
-                .find(|document| document.document_id() == self.catalog_document_id)
-            else {
-                return Ok(None);
-            };
-            if !self.current_catalog_dependencies_dominate(current_catalog, candidate_catalog)? {
-                return Ok(None);
-            }
-            let state = ProjectionPageState {
-                page: page.clone(),
-                frontier: intent.post_frontier().clone(),
-                claim_evidence: claim_evidence.to_vec(),
-            };
-            let target = intent.target().bytes();
-            let rendered = super::projection::plan_projection_with_layout_annotations(
-                self.workspace_id,
-                &state,
-                target,
-                Some(intent.target().annotations()),
-            )
-            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-            if rendered.target() != target.expect("Present target has bytes") {
-                return Err(EngineError::ProjectionAuthorizationUnavailable);
-            }
-            let effective_closure =
-                mismatched_completion.map(|completion| AuthenticatedEffectiveProjectionClosure {
-                    transition: transition.clone(),
-                    lifecycle_completion: completion.clone(),
-                });
-            return Ok(Some((intent.post_frontier().clone(), effective_closure)));
-        }
-
-        let mut candidate_batches = BTreeSet::new();
-        for document in current
-            .documents()
-            .iter()
-            .filter(|document| document.document_id() != self.catalog_document_id)
-        {
-            candidate_batches.extend(document.direct_dependency_heads().iter().copied());
-        }
-        let current_non_catalog = current
-            .documents()
-            .iter()
-            .filter(|document| document.document_id() != self.catalog_document_id)
-            .collect::<Vec<_>>();
-        let mut stable = None;
-        for batch_id in candidate_batches {
-            // A managed-local head is already authenticated by the durable
-            // journal prefix and is deliberately not present in accepted
-            // history yet. Use its one validated projection intent directly;
-            // admission requires one exact existing page/path and an empty
-            // page-effect set, so the record cannot change its authenticated
-            // path acquisition. Asking accepted history to reprove either the
-            // known absence or that unchanged acquisition makes foreground
-            // work proportional to unrelated history.
-            let managed_local_intent = self
-                .local_overlay
-                .entries
-                .iter()
-                .rev()
-                .find(|entry| entry.batch_id == batch_id)
-                .map(|entry| entry.projection.intent.clone());
-            let (intents, managed_local) = match managed_local_intent {
-                Some(intent) => (vec![intent], true),
-                None => (self.load_accepted_projection_intents(batch_id)?, false),
-            };
-            for intent in intents {
-                // The portable-path acquisition is the lifecycle identity.
-                // A prior A projection after A -> B -> A cannot authorize the
-                // next A acquisition because its causal frontier cannot contain
-                // that later acquisition batch.
-                if intent.page_id() != page.page_id
-                    || intent.path() != &page.path
-                    || intent.claim_evidence() != claim_evidence
-                    || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
-                    || (!managed_local
-                        && !self.projection_frontier_contains_path_acquisition(
-                            intent.post_frontier(),
-                            occupied.acquisition_batch(),
-                        )?)
-                {
-                    continue;
-                }
-                // An accepted intent still needs the endpoint completion to
-                // select its exact historical projection. A managed-local
-                // intent instead comes from the exact committed journal entry
-                // named by the current hot frontier; its completion normally
-                // predates that undrained prefix and cannot supersede the
-                // journal authority.
-                if !managed_local
-                    && lifecycle_completion.as_ref().is_some_and(|completion| {
-                        intent.post_frontier() != completion.frontier()
-                            || intent
-                                .target()
-                                .description()
-                                .map(ProjectionWorkTarget::Present)
-                                != Some(completion.target())
-                    })
-                {
-                    continue;
-                }
-                let candidate_non_catalog = intent
-                    .post_frontier()
-                    .documents()
-                    .iter()
-                    .filter(|document| document.document_id() != self.catalog_document_id)
-                    .collect::<Vec<_>>();
-                if candidate_non_catalog != current_non_catalog {
-                    continue;
-                }
-                let Some(candidate_catalog) = intent
-                    .post_frontier()
-                    .documents()
-                    .iter()
-                    .find(|document| document.document_id() == self.catalog_document_id)
-                else {
-                    continue;
-                };
-                if !self
-                    .current_catalog_dependencies_dominate(current_catalog, candidate_catalog)?
-                {
-                    continue;
-                }
-                let state = ProjectionPageState {
-                    page: page.clone(),
-                    frontier: intent.post_frontier().clone(),
-                    claim_evidence: claim_evidence.to_vec(),
-                };
-                let target = intent.target().bytes();
-                let rendered = super::projection::plan_projection_with_layout_annotations(
-                    self.workspace_id,
-                    &state,
-                    target,
-                    Some(intent.target().annotations()),
-                )
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if rendered.target() != target.expect("Present target has bytes") {
-                    continue;
-                }
-                match &stable {
-                    Some(existing) if existing != intent.post_frontier() => return Ok(None),
-                    Some(_) => {}
-                    None => stable = Some(intent.post_frontier().clone()),
-                }
-            }
-        }
-        Ok(stable.map(|frontier| (frontier, None)))
+        Ok((page, frontier, claim_evidence))
     }
 
     fn projection_frontier_contains_path_acquisition(
@@ -21144,6 +20152,41 @@ impl ShardedHotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn canonical_snapshot_from_lazy_genesis_for_test(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        catalog_snapshot: &[u8],
+        pages: impl IntoIterator<Item = (DocumentId, Vec<u8>)>,
+    ) -> Result<super::CanonicalSnapshot, EngineError> {
+        let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
+        let catalog = LoroDoc::new();
+        import_complete(catalog_document_id, &catalog, &[catalog_snapshot.to_vec()])?;
+        catalog
+            .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
+            .map_err(loro_error)?;
+        engine
+            .visible_documents
+            .insert(catalog_document_id, catalog);
+        for (document_id, snapshot) in pages {
+            if document_id == catalog_document_id
+                || engine.visible_documents.contains_key(&document_id)
+            {
+                return Err(EngineError::InvalidCrdt(
+                    "lazy genesis test constructor repeats a document identity".into(),
+                ));
+            }
+            let document = LoroDoc::new();
+            import_complete(document_id, &document, &[snapshot])?;
+            document
+                .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
+                .map_err(loro_error)?;
+            engine.visible_documents.insert(document_id, document);
+        }
+        engine.canonical_snapshot()
+    }
+
+    #[cfg(test)]
     pub(crate) fn canonical_snapshot_calls_for_test(&self) -> usize {
         self.canonical_snapshot_calls.get()
     }
@@ -21197,36 +20240,31 @@ impl ShardedHotEngine {
             return Err(error.clone());
         }
         if self.authenticated_history_replay {
-            return Err(EngineError::ReferenceCatalog(
-                "reference catalog recovery requires complete authenticated history replay".into(),
+            return Err(EngineError::Archive(
+                "authenticated history recovery must complete before this operation".into(),
             ));
         }
         if let Some(error) = self.workspace_blocked_error() {
             return Err(error);
         }
-        self.reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+        Ok(())
     }
 
     /// Ordinary ingress may extend a terminal workspace's non-visible evidence
-    /// lane, but it may not bypass incomplete authenticated recovery or missing
-    /// reference-catalog authority.
+    /// lane, but it may not bypass incomplete authenticated recovery.
     fn ensure_terminal_staging_authority(&self) -> Result<(), EngineError> {
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
         if self.authenticated_history_replay {
-            return Err(EngineError::ReferenceCatalog(
-                "reference catalog recovery requires complete authenticated history replay".into(),
+            return Err(EngineError::Archive(
+                "authenticated history recovery must complete before ordinary ingress".into(),
             ));
         }
         if self.workspace_blocked_error().is_some() {
             return Ok(());
         }
-        self.reference_catalog
-            .ensure_ready()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+        Ok(())
     }
 
     fn workspace_blocked_error(&self) -> Option<EngineError> {
@@ -21246,7 +20284,10 @@ impl ShardedHotEngine {
             })
     }
 
-    fn drain_staged(&mut self) -> Vec<AcceptedBatch> {
+    fn drain_staged(
+        &mut self,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Vec<AcceptedBatch> {
         let mut accepted = Vec::new();
         'drain: loop {
             if self.is_blocked() || self.history_failure.is_some() {
@@ -21305,20 +20346,13 @@ impl ShardedHotEngine {
                         }
                     }
                 }
-                match self.validate_and_apply(batch_id, true, None, None) {
+                match self.validate_and_apply(batch_id, true, None, None, claim_source) {
                     Ok(BatchApplication::Accepted { no_op, evidence }) => {
-                        let manifest_fingerprint = self.archive_fingerprints[&batch_id];
                         self.set_final_status(
                             batch_id,
                             ArchiveStatus::Accepted { no_op, evidence },
                         );
                         if self.history_failure.is_some() {
-                            break 'drain;
-                        }
-                        if let Err(error) =
-                            self.activate_projection_work(batch_id, manifest_fingerprint)
-                        {
-                            self.history_failure = Some(error);
                             break 'drain;
                         }
                         accepted.push(AcceptedBatch { batch_id, no_op });
@@ -21348,7 +20382,7 @@ impl ShardedHotEngine {
             }
         }
         if self.is_blocked() {
-            self.drain_blocked_evidence();
+            self.drain_blocked_evidence(claim_source);
         }
         accepted
     }
@@ -21356,7 +20390,7 @@ impl ShardedHotEngine {
     /// Validate already offered Ready batches after the terminal latch without
     /// publishing any replacement. Accepted and validated-unpublished parents
     /// are both eligible, and the loop reaches a deterministic fixed point.
-    fn drain_blocked_evidence(&mut self) {
+    fn drain_blocked_evidence(&mut self, claim_source: Option<&dyn ProjectionClaimSource>) {
         loop {
             if self.history_failure.is_some() {
                 break;
@@ -21414,7 +20448,7 @@ impl ShardedHotEngine {
                         }
                     }
                 }
-                match self.validate_and_apply(batch_id, false, None, None) {
+                match self.validate_and_apply(batch_id, false, None, None, claim_source) {
                     Ok(_) => {
                         self.set_final_status(batch_id, ArchiveStatus::Quarantined);
                     }
@@ -21557,8 +20591,6 @@ impl ShardedHotEngine {
             status,
             self.durable_history_binding(),
             self.logseq_claim_root,
-            self.reference_catalog.root().clone(),
-            None,
         )
     }
 
@@ -21569,8 +20601,6 @@ impl ShardedHotEngine {
         status: ArchiveStatus,
         binding: super::object_store::EngineHistoryBinding,
         logseq_claim_root: LogseqClaimIndexRoot,
-        reference_catalog_root: ReferenceCatalogRootV2,
-        prepared_reference_catalog: Option<ReferenceCatalogPreparedCandidateV2<'_>>,
     ) -> Result<(), EngineError> {
         if matches!(status, ArchiveStatus::Staged) {
             return Err(EngineError::Archive(
@@ -21581,34 +20611,15 @@ impl ShardedHotEngine {
             .page_names
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        reference_catalog_root
-            .validate_bound(
-                self.reference_catalog.policy(),
-                &binding.page_names.ownership_root,
-                logseq_claim_root.digest(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
         if let ArchiveStatus::Accepted { evidence, .. } = &status {
             validate_accepted_evidence(evidence)?;
             if evidence.batch_id != batch_id
                 || evidence.manifest_fingerprint != manifest_fingerprint
-                || evidence.post_frontier_root.reference_catalog_root != reference_catalog_root
             {
                 return Err(EngineError::Archive(
                     "accepted evidence is not cross-bound to durable history authority".into(),
                 ));
             }
-            match prepared_reference_catalog {
-                Some(prepared) => self.reference_catalog.validate_prepared_candidate(
-                    prepared,
-                    &evidence.reference_catalog_delta,
-                    &reference_catalog_root,
-                ),
-                None => self
-                    .reference_catalog
-                    .validate_delta(&evidence.reference_catalog_delta),
-            }
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
         if let Some(index) = &self.logseq_claim_index {
             index
@@ -21665,8 +20676,7 @@ impl ShardedHotEngine {
                 && existing.terminal_evidence == binding.terminal_evidence
                 && existing.page_names == binding.page_names
                 && existing.logseq_claim_root == logseq_claim_root
-                && existing.reference_catalog_policy == *self.reference_catalog.policy()
-                && existing.reference_catalog_root == reference_catalog_root
+                && existing.reference_catalog_policy == self.reference_catalog_policy
             {
                 if self.authenticated_history_replay {
                     self.note_authenticated_replayed_record(&existing)?;
@@ -21705,10 +20715,8 @@ impl ShardedHotEngine {
                 Some("page-name authority")
             } else if existing.logseq_claim_root != logseq_claim_root {
                 Some("external UUID-claim authority")
-            } else if existing.reference_catalog_policy != *self.reference_catalog.policy() {
+            } else if existing.reference_catalog_policy != self.reference_catalog_policy {
                 Some("reference-catalog policy")
-            } else if existing.reference_catalog_root != reference_catalog_root {
-                Some("reference-catalog authority")
             } else if existing.status != status {
                 let replayed = match &status {
                     ArchiveStatus::Accepted { .. } => "accepted".to_owned(),
@@ -21748,8 +20756,7 @@ impl ShardedHotEngine {
             manifest_fingerprint,
             binding.clone(),
             logseq_claim_root,
-            self.reference_catalog.policy().clone(),
-            reference_catalog_root,
+            self.reference_catalog_policy.clone(),
             status,
         );
         let bytes = encode_history_record(&record)?;
@@ -21990,13 +20997,8 @@ impl ShardedHotEngine {
 
     fn validate_record_catalog_transition(
         &self,
-        record: &ColdHistoryRecord,
+        _record: &ColdHistoryRecord,
     ) -> Result<(), EngineError> {
-        if let ArchiveStatus::Accepted { evidence, .. } = &record.status {
-            self.reference_catalog
-                .validate_delta(&evidence.reference_catalog_delta)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
         Ok(())
     }
 
@@ -22093,8 +21095,7 @@ impl ShardedHotEngine {
                         conflicts: self.page_name_conflicts.values().cloned().collect(),
                     },
                     logseq_claim_root: self.logseq_claim_root,
-                    reference_catalog_policy: self.reference_catalog.policy().clone(),
-                    reference_catalog_root: self.reference_catalog.root().clone(),
+                    reference_catalog_policy: self.reference_catalog_policy.clone(),
                     status,
                 }));
             }
@@ -22180,9 +21181,6 @@ impl ShardedHotEngine {
         self.status_point_cache.borrow_mut().clear();
         self.external_anchor_point_cache.borrow_mut().clear();
         self.observed_manifest_point_cache.borrow_mut().clear();
-        self.retained_bootstrap_part_point_cache
-            .borrow_mut()
-            .clear();
     }
 
     /// [`Self::load_observed_manifest`], memoized for this public operation.
@@ -22429,15 +21427,10 @@ impl ShardedHotEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         } else if let Some(store) = &self.history_store {
-            validated_history_records(
-                store,
-                self.reference_catalog.store_handle().as_deref(),
-                self.history_generation,
-                self.history_root,
-            )?
-            .into_iter()
-            .map(|record| (record.batch_id, record.status))
-            .collect()
+            validated_history_records(store, self.history_generation, self.history_root)?
+                .into_iter()
+                .map(|record| (record.batch_id, record.status))
+                .collect()
         } else {
             Vec::new()
         };
@@ -22628,6 +21621,12 @@ impl ShardedHotEngine {
     ) -> Result<bool, EngineError> {
         for dependencies in frontier.documents() {
             let document_id = dependencies.document_id();
+            if self
+                .lazy_genesis_dependency_document(dependencies, 1)?
+                .is_some()
+            {
+                continue;
+            }
             let current_heads = if self.is_blocked() {
                 self.terminal_document_heads
                     .get(&document_id)
@@ -22798,6 +21797,12 @@ impl ShardedHotEngine {
                 if dependencies.document_id() == self.catalog_document_id
                     && !requested_catalog_page_ids.is_empty()
                 {
+                    if let Some(document) =
+                        self.lazy_genesis_dependency_engine_document(dependencies, 1)?
+                    {
+                        documents.insert(dependencies.document_id(), document);
+                        continue;
+                    }
                     let (document, page_names) = self
                         .load_authenticated_catalog_frontier_document(
                             Some(dependencies),
@@ -22811,6 +21816,12 @@ impl ShardedHotEngine {
                     .remove(&dependencies.document_id())
                     .expect("one batched exact result per frontier document");
                 let Some((record, document, state_work)) = loaded else {
+                    if let Some(document) =
+                        self.lazy_genesis_dependency_engine_document(dependencies, 1)?
+                    {
+                        documents.insert(dependencies.document_id(), document);
+                        continue;
+                    }
                     return Err(EngineError::FrontierVectorMismatch(
                         dependencies.document_id(),
                     ));
@@ -22877,7 +21888,10 @@ impl ShardedHotEngine {
         }
         let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
-            let document = self.clone_validation_document(dependencies.document_id(), 1)?;
+            let document = match self.lazy_genesis_dependency_document(dependencies, 1)? {
+                Some(document) => document,
+                None => self.clone_validation_document(dependencies.document_id(), 1)?,
+            };
             self.record_stage_snapshot_clone(&document);
             if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
                 return Ok(None);
@@ -22911,6 +21925,7 @@ impl ShardedHotEngine {
         allow_publication: bool,
         candidate_roots: Option<ScratchRoots>,
         event_binding_digest: Option<ContentDigest>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<BatchApplication, EngineError> {
         let mut phase_started = self.replay_timing_started();
         let batch = self
@@ -22985,6 +22000,7 @@ impl ShardedHotEngine {
                 &updates,
                 &declared_effect,
                 pending_documents,
+                claim_source,
             ) {
                 Ok(Some(application)) => return Ok(application),
                 Err(error) if self.precommit_history_publication_failure.is_some() => {
@@ -23138,6 +22154,7 @@ impl ShardedHotEngine {
             &declared_effect,
             &after,
             &updates,
+            claim_source,
         )?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 5, &mut phase_started);
         // Prepare every current-state replacement first. No visible document is
@@ -23477,42 +22494,6 @@ impl ShardedHotEngine {
                 )?,
             )
         };
-        let reference_catalog = if quarantined {
-            None
-        } else {
-            let reference_source_observations = ValidatedReferenceSourceObservations {
-                catalog_pages: divergent_validated_catalog_pages.as_ref().or_else(|| {
-                    after_snapshots
-                        .values()
-                        .find_map(|snapshot| match snapshot {
-                            SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                            SemanticDocumentSnapshot::Shard { .. } => None,
-                        })
-                }),
-                exact_current_documents: &proven_exact_current_documents,
-                after_snapshots: &after_snapshots,
-                new_shards: &validated_new_shards,
-            };
-            let post_page_name_root = page_names
-                .as_ref()
-                .map(|candidate| candidate.root.clone())
-                .unwrap_or_else(|| self.page_name_root.clone());
-            Some(
-                self.prepare_reference_catalog_updates(
-                    effective_view
-                        .as_ref()
-                        .expect("visible batch has an effective semantic view")
-                        .effect(),
-                    &replacements,
-                    &reference_source_observations,
-                    &post_page_name_root,
-                    logseq_claim_candidate
-                        .as_ref()
-                        .expect("visible batch prepared UUID claims")
-                        .0,
-                )?,
-            )
-        };
         self.record_replay_timing_elapsed(claim_and_catalog_started, |timing, elapsed| {
             timing.claim_and_catalog_preparation_nanos = timing
                 .claim_and_catalog_preparation_nanos
@@ -23573,8 +22554,6 @@ impl ShardedHotEngine {
                 ArchiveStatus::Quarantined,
                 binding,
                 self.logseq_claim_root,
-                self.reference_catalog.root().clone(),
-                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -23598,10 +22577,6 @@ impl ShardedHotEngine {
                 &replacements,
                 &replacement_heads,
                 &candidate_roots,
-                reference_catalog
-                    .as_ref()
-                    .expect("visible batch prepared reference catalog")
-                    .delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
         let prospective_catalog_pages = divergent_validated_catalog_pages.as_ref().or_else(|| {
@@ -23634,14 +22609,6 @@ impl ShardedHotEngine {
             self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
         binding.portable_path_root = portable_paths.root.digest();
         let fingerprint = self.archive_fingerprints[&batch_id];
-        let reference_root = reference_catalog
-            .as_ref()
-            .expect("visible batch prepared reference catalog")
-            .root()
-            .clone();
-        let prepared_reference_catalog = reference_catalog
-            .as_ref()
-            .and_then(ReferenceCatalogCandidateV2::prepared_candidate);
         let durable_history_started = self.replay_timing_started();
         if let Err(error) = self.persist_durable_final_status_with_binding(
             batch_id,
@@ -23655,8 +22622,6 @@ impl ShardedHotEngine {
                 .as_ref()
                 .expect("visible batch prepared UUID claims")
                 .0,
-            reference_root,
-            prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
@@ -23664,16 +22629,12 @@ impl ShardedHotEngine {
         self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
             timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
         });
-        let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(
             logseq_claim_candidate.expect("visible batch prepared Logseq claim updates"),
         );
         self.commit_portable_path_updates(portable_paths);
         self.commit_page_name_updates(page_names);
-        self.commit_reference_catalog_updates(
-            reference_catalog.expect("visible batch prepared reference catalog"),
-        );
         self.commit_acceptance_evidence(post_documents, accepted_evidence, candidate_roots);
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
         let bulk_hot_documents = self.scratch.as_ref().and_then(|_| {
@@ -23741,9 +22702,6 @@ impl ShardedHotEngine {
                         .retain(|current| *current != document_id);
                 }
             }
-        }
-        if let Some(error) = projection_preparation_error {
-            self.history_failure = Some(error);
         }
         self.remember_effective_semantic_view(
             batch_id,
@@ -24344,6 +23302,305 @@ impl ShardedHotEngine {
         }
     }
 
+    fn accepted_semantic_effect(
+        &self,
+        batch: &ValidatedBatch,
+    ) -> Result<SemanticEffect, EngineError> {
+        let semantic_objects = batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::SemanticEffect)
+            .collect::<Vec<_>>();
+        if semantic_objects.len() != 1 {
+            return Err(EngineError::Archive(
+                "accepted batch has non-unique semantic effect".into(),
+            ));
+        }
+        if SemanticEffectDigest::of(semantic_objects[0].payload())
+            != batch.manifest().semantic_effect_digest()
+        {
+            return Err(EngineError::Archive(
+                "accepted semantic effect is not manifest-bound".into(),
+            ));
+        }
+        Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
+    }
+
+    /// Derive the deterministic conflict resolutions owed after accepting
+    /// `batch_id` (GH #351). Returns work only when the batch raced accepted
+    /// concurrent history on the same block: edit-vs-delete and
+    /// move-vs-delete pairs where the tombstone currently holds the owner
+    /// register, and overlapping same-block text edits whose CRDT merge is
+    /// an interleave nobody typed. Pure with respect to engine state: the
+    /// same accepted set and merged state yield the same intents on every
+    /// device.
+    pub fn conflict_resolution_intents(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
+        if self.accepted_batch_is_causally_linear(batch_id)? {
+            return Ok(Vec::new());
+        }
+        let x_batch = self.load_accepted_validated_batch(batch_id)?;
+        let x_effect = self.accepted_semantic_effect(&x_batch)?;
+        if x_effect.blocks().is_empty() {
+            return Ok(Vec::new());
+        }
+        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
+        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
+        let accepted = self.status().accepted_batches()?.to_vec();
+        let mut intents = Vec::new();
+        for candidate in accepted {
+            let z_id = candidate.batch_id;
+            if z_id == batch_id || x_ancestry.contains_key(&z_id) {
+                continue;
+            }
+            let z_batch = self.load_accepted_validated_batch(z_id)?;
+            let z_effect = self.accepted_semantic_effect(&z_batch)?;
+            let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
+                .blocks()
+                .iter()
+                .filter_map(|x_delta| {
+                    z_effect
+                        .blocks()
+                        .iter()
+                        .find(|z_delta| {
+                            z_delta.home_document_id == x_delta.home_document_id
+                                && z_delta.block_id == x_delta.block_id
+                        })
+                        .map(|z_delta| (x_delta, z_delta))
+                })
+                .collect();
+            if shared.is_empty() {
+                continue;
+            }
+            // Batches causally after `batch_id` (an already-accepted
+            // resolution, a later user action) are not concurrent with it.
+            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
+            if self
+                .collect_batch_ancestry(&z_heads, false)?
+                .contains_key(&batch_id)
+            {
+                continue;
+            }
+            let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
+            for (x_delta, z_delta) in shared {
+                self.classify_block_race(
+                    x_delta,
+                    &x_effect,
+                    z_delta,
+                    &z_effect,
+                    &pair,
+                    batch_id,
+                    &mut intents,
+                )?;
+            }
+        }
+        Ok(intents)
+    }
+
+    /// True when some accepted batch outside `pair` touches `block_id` and
+    /// causally descends from BOTH pair members — i.e. an authored post-race
+    /// decision about this block already exists (a keep-both resolution, a
+    /// restore, a later human edit, or a deliberate re-delete), so the pair
+    /// is settled and must not derive again.
+    fn pair_superseded_by_descendant_touch(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+    ) -> Result<bool, EngineError> {
+        let accepted = self.status().accepted_batches()?.to_vec();
+        for candidate in accepted {
+            let w_id = candidate.batch_id;
+            if w_id == pair.min_batch || w_id == pair.max_batch {
+                continue;
+            }
+            let w_batch = self.load_accepted_validated_batch(w_id)?;
+            let w_effect = self.accepted_semantic_effect(&w_batch)?;
+            if !w_effect
+                .blocks()
+                .iter()
+                .any(|delta| delta.block_id == block_id)
+            {
+                continue;
+            }
+            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
+            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
+            if w_ancestry.contains_key(&pair.min_batch) && w_ancestry.contains_key(&pair.max_batch)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn classify_block_race(
+        &self,
+        x_delta: &BlockDelta,
+        x_effect: &SemanticEffect,
+        z_delta: &BlockDelta,
+        z_effect: &SemanticEffect,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+        intents: &mut Vec<ConflictResolutionIntent>,
+    ) -> Result<(), EngineError> {
+        let home = x_delta.home_document_id;
+        let block_id = x_delta.block_id;
+        let block = BlockLocation {
+            block_id,
+            home_document_id: home,
+        };
+        // A race is owed a resolution only while the block's current state is
+        // the UNAUTHORED CRDT merge of the pair. Once any accepted non-pair
+        // batch that causally descends from BOTH pair members touches this
+        // block — our own resolution, a later human edit, or a deliberate
+        // re-delete — the current state is an authored post-race decision and
+        // deriving again would duplicate siblings or resurrect re-deleted
+        // content (audit 4, D1). Text equality with one authored version is
+        // NOT such evidence: an honest merge can land exactly on one side
+        // (e.g. one deletion subsuming the other) with the other author's
+        // text silently gone.
+        if self.pair_superseded_by_descendant_touch(block_id, pair)? {
+            return Ok(());
+        }
+        let merged_doc = self.clone_validation_document(home, 1)?;
+        let Some(merged_state) = read_block_state(home, &merged_doc, block_id)? else {
+            return Ok(());
+        };
+        let restore_after_tombstone =
+            |page_id: PageId,
+             claim: Option<MembershipClaim>,
+             moved: bool,
+             intents: &mut Vec<ConflictResolutionIntent>| {
+                // Only when the tombstone actually holds the merged register
+                // is there anything to re-assert; if the surviving side won
+                // the LWW race the outcome is already the resolved one.
+                if merged_state.owner != BlockOwner::Tombstone {
+                    return;
+                }
+                let Some(mut claim) = claim else {
+                    return;
+                };
+                if let Some(parent) = claim.parent {
+                    let parent_visible = read_block_state(home, &merged_doc, parent)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|state| state.owner == BlockOwner::Page(page_id));
+                    if !parent_visible {
+                        claim.parent = None;
+                    }
+                }
+                let intent = if moved {
+                    ConflictResolutionIntent::RestoreMoved {
+                        page_id,
+                        block,
+                        claim,
+                        pair: pair.clone(),
+                    }
+                } else {
+                    ConflictResolutionIntent::RestoreEdited {
+                        page_id,
+                        block,
+                        claim,
+                        pair: pair.clone(),
+                    }
+                };
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            };
+        match (
+            block_delta_edit_page(x_delta),
+            block_delta_is_delete(x_delta),
+            block_delta_move_target(x_delta),
+            block_delta_edit_page(z_delta),
+            block_delta_is_delete(z_delta),
+            block_delta_move_target(z_delta),
+        ) {
+            // edit-vs-delete, both orders.
+            (Some(page), _, _, _, true, _) => {
+                restore_after_tombstone(
+                    page,
+                    membership_claim_in_effect(z_effect, page, block_id, false),
+                    false,
+                    intents,
+                );
+            }
+            (_, true, _, Some(page), _, _) => {
+                restore_after_tombstone(
+                    page,
+                    membership_claim_in_effect(x_effect, page, block_id, false),
+                    false,
+                    intents,
+                );
+            }
+            // move-vs-delete, both orders.
+            (_, _, Some(target), _, true, _) => {
+                restore_after_tombstone(
+                    target,
+                    membership_claim_in_effect(x_effect, target, block_id, true),
+                    true,
+                    intents,
+                );
+            }
+            (_, true, _, _, _, Some(target)) => {
+                restore_after_tombstone(
+                    target,
+                    membership_claim_in_effect(z_effect, target, block_id, true),
+                    true,
+                    intents,
+                );
+            }
+            // edit-vs-edit: classify against the ancestor and the CRDT merge.
+            (Some(page), _, _, Some(_), _, _) => {
+                let BlockOwner::Page(current_page) = merged_state.owner else {
+                    // The block lost a separate race with a tombstone; that
+                    // pair produces its own restore intent.
+                    return Ok(());
+                };
+                let _ = page;
+                let x_before = x_delta.before.as_ref().expect("edit delta has before");
+                let z_before = z_delta.before.as_ref().expect("edit delta has before");
+                let x_after = x_delta.after.as_ref().expect("edit delta has after");
+                let z_after = z_delta.after.as_ref().expect("edit delta has after");
+                let classification = if x_before.content == z_before.content {
+                    super::text_merge::classify_concurrent_edits(
+                        &x_before.content,
+                        &x_after.content,
+                        &z_after.content,
+                        &merged_state.content,
+                    )
+                } else {
+                    // Divergent ancestors (chained concurrency): there is no
+                    // single base to classify against; never ship the
+                    // interleave.
+                    super::text_merge::TextMergeClassification::Conflict
+                };
+                if classification == super::text_merge::TextMergeClassification::CleanUnion {
+                    return Ok(());
+                }
+                let (keep_text, sibling_text) = if pair.min_batch == x_batch_id {
+                    (x_after.content.clone(), z_after.content.clone())
+                } else {
+                    (z_after.content.clone(), x_after.content.clone())
+                };
+                let intent = ConflictResolutionIntent::KeepBothTexts {
+                    page_id: current_page,
+                    block,
+                    keep_text,
+                    sibling_text,
+                    merged_text: merged_state.content.clone(),
+                    pair: pair.clone(),
+                };
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn load_accepted_validated_batch(
         &self,
         batch_id: BatchId,
@@ -24754,187 +24011,6 @@ impl ShardedHotEngine {
             ));
         }
         Ok(Some(selection))
-    }
-
-    fn prepare_reference_catalog_updates(
-        &mut self,
-        effect: &SemanticEffect,
-        replacements: &BTreeMap<DocumentId, EngineDocument>,
-        observations: &ValidatedReferenceSourceObservations<'_>,
-        page_name_root: &PageNameOwnershipRootV1,
-        logseq_claim_root: LogseqClaimIndexRoot,
-    ) -> Result<ReferenceCatalogCandidateV2, EngineError> {
-        let source_started = self.replay_timing_started();
-        let affected = affected_reference_sources(effect);
-        let authenticated_catalog_rows = if observations.catalog_pages.is_none()
-            && self.scratch.is_some()
-            && !affected.is_empty()
-        {
-            Some(self.authenticated_current_page_catalog_rows(&affected)?)
-        } else {
-            None
-        };
-        let mut sources = BTreeMap::new();
-        for page_id in affected {
-            let page_identity = if let Some(catalog_pages) = observations.catalog_pages {
-                #[cfg(test)]
-                self.record_carried_reference_catalog_page();
-                catalog_pages.get(&page_id).and_then(|state| match state {
-                    PageState::Live {
-                        path,
-                        home_document_id,
-                        ..
-                    } => Some((path.clone(), *home_document_id)),
-                    PageState::Tombstone { .. } => None,
-                })
-            } else if let Some(rows) = &authenticated_catalog_rows {
-                rows.get(&page_id)
-                    .map(|row| (row.path.clone(), row.home_document_id))
-            } else {
-                let catalog =
-                    self.reference_candidate_document(self.catalog_document_id, replacements)?;
-                validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
-                    .and_then(|state| match state {
-                        PageState::Live {
-                            path,
-                            home_document_id,
-                            ..
-                        } => Some((path, home_document_id)),
-                        PageState::Tombstone { .. } => None,
-                    })
-            };
-            let Some((path, home_document_id)) = page_identity else {
-                sources.insert(page_id, None);
-                continue;
-            };
-            let page_source =
-                self.reference_source_data(home_document_id, replacements, observations)?;
-            if page_source.page_id() != Some(page_id) {
-                return Err(EngineError::MalformedDocument {
-                    document_id: home_document_id,
-                    reason: "reference source page identity mismatch".into(),
-                });
-            }
-            let mut blocks = Vec::new();
-            let mut loaded_homes = BTreeMap::new();
-            for (block_id, claim) in page_source.memberships() {
-                let state = if claim.home_document_id == home_document_id {
-                    page_source.blocks().get(block_id)
-                } else {
-                    if !loaded_homes.contains_key(&claim.home_document_id) {
-                        let home = self.reference_source_data(
-                            claim.home_document_id,
-                            replacements,
-                            observations,
-                        )?;
-                        loaded_homes.insert(claim.home_document_id, home);
-                    }
-                    loaded_homes[&claim.home_document_id].blocks().get(block_id)
-                };
-                let Some(state) = state else {
-                    return Err(EngineError::MalformedDocument {
-                        document_id: claim.home_document_id,
-                        reason: format!(
-                            "reference source membership points to missing block {block_id}"
-                        ),
-                    });
-                };
-                if state.owner == BlockOwner::Page(page_id) {
-                    blocks.push(ReferenceSourceBlockV1 {
-                        block_id: *block_id,
-                        home_document_id: claim.home_document_id,
-                        content: state.content.clone(),
-                    });
-                }
-            }
-            blocks.sort_unstable_by_key(|block| (block.home_document_id, block.block_id));
-            sources.insert(
-                page_id,
-                Some(ReferenceSourcePageV1 {
-                    page_id,
-                    is_org: reference_source_is_org(&path),
-                    preamble: page_source.preamble(),
-                    blocks,
-                }),
-            );
-        }
-        self.record_replay_timing_elapsed(source_started, |timing, elapsed| {
-            timing.reference_catalog_source_nanos = timing
-                .reference_catalog_source_nanos
-                .saturating_add(elapsed);
-        });
-        let sources = if let Some(plan) = self.detached_bootstrap_reference_catalog.as_mut() {
-            plan.sources.extend(sources);
-            if !plan.terminal_part {
-                return self
-                    .reference_catalog
-                    .prepare_authority_binding(page_name_root, logseq_claim_root.digest())
-                    .map_err(|error| EngineError::ReferenceCatalog(error.to_string()));
-            }
-            let plan = self
-                .detached_bootstrap_reference_catalog
-                .take()
-                .expect("terminal bootstrap reference plan exists");
-            plan.sources
-        } else {
-            sources
-        };
-        let postings_patricia_started = self.replay_timing_started();
-        let candidate = self
-            .reference_catalog
-            .prepare(sources, page_name_root, logseq_claim_root.digest())
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()));
-        self.record_replay_timing_elapsed(postings_patricia_started, |timing, elapsed| {
-            timing.reference_catalog_postings_patricia_nanos = timing
-                .reference_catalog_postings_patricia_nanos
-                .saturating_add(elapsed);
-        });
-        candidate
-    }
-
-    fn reference_source_data<'a>(
-        &self,
-        document_id: DocumentId,
-        replacements: &BTreeMap<DocumentId, EngineDocument>,
-        observations: &'a ValidatedReferenceSourceObservations<'_>,
-    ) -> Result<ReferenceSourceData<'a>, EngineError> {
-        if let Some(source) = observations.source(document_id) {
-            #[cfg(test)]
-            self.record_carried_reference_shard(source.origin);
-            return Ok(ReferenceSourceData::Carried(source));
-        }
-        let document = self.reference_candidate_document(document_id, replacements)?;
-        let page_id = shard_page_id(document.document())?;
-        let (preamble, blocks, memberships) = validated_shard_source_data(
-            self.catalog_document_id,
-            document_id,
-            document.document(),
-        )?;
-        Ok(ReferenceSourceData::Reconstructed {
-            page_id,
-            preamble,
-            blocks,
-            memberships,
-        })
-    }
-
-    fn reference_candidate_document<'a>(
-        &self,
-        document_id: DocumentId,
-        replacements: &'a BTreeMap<DocumentId, EngineDocument>,
-    ) -> Result<ReferenceCandidateDocument<'a>, EngineError> {
-        #[cfg(test)]
-        self.record_reference_source_fallback();
-        match replacements.get(&document_id) {
-            Some(document) => Ok(ReferenceCandidateDocument::Borrowed(document.document())),
-            None => self
-                .clone_visible_document(document_id, 1)
-                .map(ReferenceCandidateDocument::Owned),
-        }
-    }
-
-    fn commit_reference_catalog_updates(&mut self, candidate: ReferenceCatalogCandidateV2) {
-        self.reference_catalog.commit(candidate);
     }
 
     fn prepare_page_name_conflicts(
@@ -25409,6 +24485,7 @@ impl ShardedHotEngine {
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
         declared_effect: &SemanticEffect,
         pending_documents: BTreeMap<DocumentId, LoroDoc>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<BatchApplication>, EngineError> {
         if !self.dependency_witnesses_are_current(frontier, updates, self.is_blocked())?
             || pending_documents
@@ -25461,6 +24538,7 @@ impl ShardedHotEngine {
             &declared_effect,
             &pending_engine_documents,
             updates,
+            claim_source,
         )?;
 
         let mut new_exact_shards = BTreeSet::new();
@@ -25578,8 +24656,6 @@ impl ShardedHotEngine {
                 ArchiveStatus::Quarantined,
                 binding,
                 self.logseq_claim_root,
-                self.reference_catalog.root().clone(),
-                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -25606,30 +24682,6 @@ impl ShardedHotEngine {
         effective_view.apply_to_snapshots(&mut after_snapshots)?;
         let logseq_claim_candidate =
             self.prepare_logseq_claim_updates(batch_id, causal_dot, effective_view.effect())?;
-        let post_page_name_root = page_names
-            .as_ref()
-            .map(|candidate| candidate.root.clone())
-            .unwrap_or_else(|| self.page_name_root.clone());
-        let exact_current_documents = updates.keys().copied().collect();
-        let validated_new_shards = ValidatedNewShardEffects::default();
-        let reference_source_observations = ValidatedReferenceSourceObservations {
-            catalog_pages: after_snapshots
-                .values()
-                .find_map(|snapshot| match snapshot {
-                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                    SemanticDocumentSnapshot::Shard { .. } => None,
-                }),
-            exact_current_documents: &exact_current_documents,
-            after_snapshots: &after_snapshots,
-            new_shards: &validated_new_shards,
-        };
-        let reference_catalog = self.prepare_reference_catalog_updates(
-            effective_view.effect(),
-            &pending_engine_documents,
-            &reference_source_observations,
-            &post_page_name_root,
-            logseq_claim_candidate.0,
-        )?;
         let (post_documents, accepted_evidence, candidate_roots) = self
             .prepare_acceptance_evidence(
                 batch_id,
@@ -25638,7 +24690,6 @@ impl ShardedHotEngine {
                 &pending_engine_documents,
                 &BTreeMap::new(),
                 &identity.scratch_roots,
-                reference_catalog.delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
         let prospective_catalog_pages =
@@ -25667,7 +24718,6 @@ impl ShardedHotEngine {
             self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
         binding.portable_path_root = portable_paths.root.digest();
         let fingerprint = self.archive_fingerprints[&batch_id];
-        let prepared_reference_catalog = reference_catalog.prepared_candidate();
         if let Err(error) = self.persist_durable_final_status_with_binding(
             batch_id,
             fingerprint,
@@ -25677,18 +24727,14 @@ impl ShardedHotEngine {
             },
             binding,
             logseq_claim_candidate.0,
-            reference_catalog.root().clone(),
-            prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
         }
-        let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(logseq_claim_candidate);
         self.commit_portable_path_updates(portable_paths);
         self.commit_page_name_updates(page_names);
-        self.commit_reference_catalog_updates(reference_catalog);
         self.commit_acceptance_evidence(post_documents, accepted_evidence, candidate_roots);
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
 
@@ -25736,9 +24782,6 @@ impl ShardedHotEngine {
                     .insert(document_id, before);
             }
         }
-        if let Some(error) = projection_preparation_error {
-            self.history_failure = Some(error);
-        }
         self.remember_effective_semantic_view(batch_id, &effective_view);
         Ok(Some(BatchApplication::Accepted {
             no_op: declared_effect.is_empty(),
@@ -25770,7 +24813,14 @@ impl ShardedHotEngine {
                     );
                 }
             }
-            let document = LoroDoc::new();
+            // A clean runtime's sequence-zero state lives in the immutable
+            // lazy-genesis checkpoint rather than in a fabricated bootstrap
+            // operation.  Replay only the accepted manifest tail on top of
+            // that checkpoint.  Pages created after activation legitimately
+            // have no baseline checkpoint and start empty.
+            let document = self
+                .lazy_genesis_document(document_id, 1)?
+                .unwrap_or_else(LoroDoc::new);
             import_complete(document_id, &document, &updates)?;
             let actual = canonical_peer_counters(&document.oplog_vv())?;
             if actual != dependencies.peer_counters() {
@@ -25860,7 +24910,9 @@ impl ShardedHotEngine {
                     self.validate_external_record_anchor(document_id, &record)?;
                     document.into_document()
                 }
-                None => LoroDoc::new(),
+                None => self
+                    .lazy_genesis_document(document_id, peer)?
+                    .unwrap_or_else(LoroDoc::new),
             };
             document.set_peer_id(peer).map_err(loro_error)?;
             return Ok(document);
@@ -25873,7 +24925,8 @@ impl ShardedHotEngine {
                     .get(&document_id)
                     .is_none_or(BTreeSet::is_empty)
                 {
-                    LoroDoc::new()
+                    self.lazy_genesis_document(document_id, peer)?
+                        .unwrap_or_else(LoroDoc::new)
                 } else {
                     self.reconstruct_document_from_heads(document_id, false)?
                 };
@@ -25929,9 +24982,12 @@ impl ShardedHotEngine {
                 self.record_document_state_work(*state_work);
                 self.validate_external_record_anchor(document_id, record)?;
             }
-            let document = loaded
-                .map(|(_, document, _)| document.into_document())
-                .unwrap_or_else(LoroDoc::new);
+            let document = match loaded {
+                Some((_, document, _)) => document.into_document(),
+                None => self
+                    .lazy_genesis_document(document_id, peer)?
+                    .unwrap_or_else(LoroDoc::new),
+            };
             document.set_peer_id(peer).map_err(loro_error)?;
             return Ok(document);
         }
@@ -25984,6 +25040,9 @@ impl ShardedHotEngine {
             self.validate_external_record_anchor(document_id, &record)?;
             let heads = record.exact_direct_heads().iter().copied().collect();
             return Ok((EngineDocument::External(document), heads));
+        }
+        if let Some(document) = self.lazy_genesis_engine_document(document_id, 1)? {
+            return Ok((document, BTreeSet::new()));
         }
         Ok((
             EngineDocument::External(
@@ -26053,6 +25112,8 @@ impl ShardedHotEngine {
                         document_id,
                         (EngineDocument::External(document), heads, true),
                     ))
+                } else if let Some(document) = self.lazy_genesis_engine_document(document_id, 1)? {
+                    Ok((document_id, (document, BTreeSet::new(), true)))
                 } else {
                     Ok((
                         document_id,
@@ -26462,9 +25523,6 @@ impl ShardedHotEngine {
         if let Some(manifest) = self.detached_accepted_manifests.get(&batch_id) {
             return Ok(manifest.clone());
         }
-        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
-            return Ok(loaded.manifest().clone());
-        }
         let store = self
             .archive_store
             .as_ref()
@@ -26516,40 +25574,6 @@ impl ShardedHotEngine {
         Ok(true)
     }
 
-    /// The retained bootstrap part's CrdtUpdate objects, indexed by document and
-    /// memoized for this public operation. Returns `None` exactly when
-    /// [`Self::load_retained_bootstrap_part`] finds no retained part, so the
-    /// caller's branch structure is unchanged.
-    fn retained_bootstrap_document_updates_for_point_operation(
-        &self,
-        batch_id: BatchId,
-    ) -> Result<Option<Arc<BTreeMap<DocumentId, OperationObject>>>, EngineError> {
-        const RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES: usize = 4;
-        if let Some(index) = self
-            .retained_bootstrap_part_point_cache
-            .borrow()
-            .get(&batch_id)
-        {
-            return Ok(Some(Arc::clone(index)));
-        }
-        let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? else {
-            return Ok(None);
-        };
-        let mut index = BTreeMap::new();
-        for object in loaded.objects() {
-            if object.kind() == ObjectKind::CrdtUpdate {
-                index.insert(object.document_id(), object.clone());
-            }
-        }
-        let index = Arc::new(index);
-        let mut cache = self.retained_bootstrap_part_point_cache.borrow_mut();
-        if cache.len() >= RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES {
-            cache.clear();
-        }
-        cache.insert(batch_id, Arc::clone(&index));
-        Ok(Some(index))
-    }
-
     fn load_archive_document_object(
         &self,
         batch_id: BatchId,
@@ -26563,17 +25587,6 @@ impl ShardedHotEngine {
                 .find(|object| {
                     object.kind() == ObjectKind::CrdtUpdate && object.document_id() == document_id
                 })
-                .cloned()
-                .ok_or(EngineError::MissingDocumentUpdate {
-                    document_id,
-                    dependency: batch_id,
-                });
-        }
-        if let Some(index) =
-            self.retained_bootstrap_document_updates_for_point_operation(batch_id)?
-        {
-            return index
-                .get(&document_id)
                 .cloned()
                 .ok_or(EngineError::MissingDocumentUpdate {
                     document_id,
@@ -26601,17 +25614,6 @@ impl ShardedHotEngine {
         }
         if let Some(batch) = self.archive.get(&batch_id) {
             return batch
-                .objects()
-                .iter()
-                .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
-                .map(|object| {
-                    ManifestedProjectionIntent::decode(object.payload())
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
-                })
-                .collect();
-        }
-        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
-            return loaded
                 .objects()
                 .iter()
                 .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
@@ -26664,7 +25666,17 @@ impl ShardedHotEngine {
                 );
             }
         }
-        let document = LoroDoc::new();
+        // Clean runtimes keep sequence-zero state in lazy genesis rather than
+        // in a fabricated bootstrap batch. A document with accepted tail
+        // heads must therefore replay those updates on its retained checkpoint
+        // (the same rule used by `reconstruct_frontier`), not on an empty
+        // document. Starting empty makes every first post-activation update
+        // whose Loro blob declares baseline dependencies permanently pending.
+        // Documents created after activation have no checkpoint and correctly
+        // start empty.
+        let document = self
+            .lazy_genesis_document(document_id, 1)?
+            .unwrap_or_else(LoroDoc::new);
         import_complete(document_id, &document, &updates)?;
         Ok(document)
     }
@@ -26828,6 +25840,12 @@ impl ShardedHotEngine {
             })?;
             let expected_home_document_id = if let Some(pages) = pages {
                 pages.get(&page_id).map(PageState::home_document_id)
+            } else if let Some(home_document_id) = self
+                .lazy_genesis
+                .as_ref()
+                .and_then(|genesis| genesis.page_home_document_id(page_id))
+            {
+                Some(home_document_id)
             } else {
                 self.authenticated_current_page_catalog_row(page_id)?
                     .map(|row| row.home_document_id)
@@ -27399,6 +26417,75 @@ impl ShardedHotEngine {
                         kind: state.kind(),
                     },
                 )?;
+            }
+            SemanticOperation::RestoreSubtree { page_id, blocks } => {
+                let page_home =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                // Restores re-assert values that one side of a concurrent race
+                // may already hold, and loro skips same-value map writes, so a
+                // touched document can end up with zero new operations. A
+                // zero-operation working document must not stay in the batch:
+                // its exported "update" would declare an empty start frontier
+                // and be refused by every receiver. Track which documents this
+                // operation pulled into the working set and evict the ones it
+                // did not actually change.
+                let mut touched: BTreeMap<DocumentId, (bool, VersionVector)> = BTreeMap::new();
+                for restore in blocks {
+                    if restore.claim.home_document_id != restore.block.home_document_id {
+                        return Err(EngineError::InvalidTransaction(
+                            "restore claim home must match the block home shard".into(),
+                        ));
+                    }
+                    restore.claim.validate()?;
+                    let vacant = !working.contains_key(&restore.block.home_document_id);
+                    let home = self.ensure_working_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        restore.block.home_document_id,
+                        peer_id,
+                    )?;
+                    touched
+                        .entry(restore.block.home_document_id)
+                        .or_insert_with(|| (vacant, home.oplog_vv()));
+                    if read_block_state(
+                        restore.block.home_document_id,
+                        home,
+                        restore.block.block_id,
+                    )?
+                    .is_none()
+                    {
+                        return Err(EngineError::BlockNotFound(restore.block.block_id));
+                    }
+                    set_owner(home, restore.block.block_id, BlockOwner::Page(*page_id))?;
+                }
+                let vacant = !working.contains_key(&page_home);
+                let destination = self.ensure_working_document(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    page_home,
+                    peer_id,
+                )?;
+                touched
+                    .entry(page_home)
+                    .or_insert_with(|| (vacant, destination.oplog_vv()));
+                for restore in blocks {
+                    insert_membership(destination, restore.block.block_id, &restore.claim)?;
+                }
+                for (document_id, (vacant, before_vv)) in touched {
+                    if !vacant {
+                        continue;
+                    }
+                    let unchanged = working
+                        .get(&document_id)
+                        .is_some_and(|document| document.document().oplog_vv() == before_vv);
+                    if unchanged {
+                        working.remove(&document_id);
+                        before_vectors.remove(&document_id);
+                        before_snapshots.remove(&document_id);
+                    }
+                }
             }
             SemanticOperation::CreateBlock {
                 block,
@@ -28060,6 +27147,9 @@ fn explicit_bootstrap_author_documents(
                         .map(|rewrite| rewrite.block.home_document_id),
                 );
             }
+            SemanticOperation::RestoreSubtree { blocks, .. } => {
+                documents.extend(blocks.iter().map(|restore| restore.block.home_document_id));
+            }
             SemanticOperation::SetPagePreamble { .. }
             | SemanticOperation::MoveSubtree { .. }
             | SemanticOperation::ReorderBlock { .. }
@@ -28684,6 +27774,29 @@ fn declared_batch_heads(frontier: &FrontierV2) -> BTreeSet<BatchId> {
         .collect()
 }
 
+/// Every manifest edge that clean replay may need before admitting a batch.
+///
+/// The compact causal-head list retains no-op ancestry that cannot appear in a
+/// document frontier, while the operation and manifested projection frontiers
+/// retain the exact update ancestry later validation reconstructs. Replay must
+/// gate on their union: gating on only the operation frontier can admit an
+/// unrelated edit before a projection post-frontier dependency that validation
+/// must reconstruct (for example, a delete authored after a target page was
+/// created but touching only the source page's semantic documents).
+fn clean_replay_dependency_heads(batch: &ValidatedBatch) -> Result<BTreeSet<BatchId>, EngineError> {
+    let manifest = batch.manifest();
+    let mut heads = declared_batch_heads(manifest.dependency_frontier());
+    heads.extend(manifest.causal_dependency_heads().iter().copied());
+    let projection =
+        super::projection_manifest::validate_projection_object_set(manifest, batch.objects())
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+    for intent in projection.intents() {
+        heads.extend(declared_batch_heads(intent.post_frontier()));
+    }
+    heads.remove(&manifest.batch_id());
+    Ok(heads)
+}
+
 fn validate_maximal_document_heads(
     frontier: &FrontierV2,
     ancestry: &BTreeMap<BatchId, OperationBatch>,
@@ -28800,25 +27913,6 @@ fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, Engin
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
-    let reference_catalog_root = ReferenceCatalogRootV2::empty(
-        &ReferenceCatalogPolicyV1::default(),
-        &PageNameOwnershipRootV1::empty(),
-        LogseqClaimIndexRoot::empty().digest(),
-    )
-    .expect("empty accepted frontier has a fixed reference catalog root");
-    empty_accepted_frontier_root_with_catalog(reference_catalog_root)
-}
-
-fn empty_accepted_frontier_root_with_catalog(
-    reference_catalog_root: ReferenceCatalogRootV2,
-) -> AcceptedFrontierRoot {
-    let mut state_bytes = b"tine/oplog/accepted-frontier/v4/empty\0".to_vec();
-    state_bytes.extend_from_slice(
-        reference_catalog_root
-            .external_digest()
-            .expect("validated empty reference root has a canonical digest")
-            .as_bytes(),
-    );
     AcceptedFrontierRoot {
         schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
         acceptance_sequence: 0,
@@ -28828,10 +27922,85 @@ fn empty_accepted_frontier_root_with_catalog(
         document_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
         batch_map_root_key: None,
         batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
-        reference_catalog_root,
-        state_digest: ContentDigest::of(&state_bytes),
+        genesis: None,
+        state_digest: ContentDigest::of(b"tine/oplog/accepted-frontier/v7/empty\0"),
         scratch_root: None,
     }
+}
+
+fn lazy_genesis_accepted_frontier_root(
+    binding: LazyGenesisFrontierBindingV1,
+    documents: &[DocumentDependencies],
+) -> Result<AcceptedFrontierRoot, EngineError> {
+    binding
+        .validate()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    if documents.len() as u64 != binding.document_count() {
+        return Err(EngineError::Archive(
+            "lazy genesis frontier document count differs from its binding".into(),
+        ));
+    }
+    // The immutable genesis manifest already authenticates every baseline
+    // dependency row. The accepted document map is therefore an overlay for
+    // documents changed after genesis, and starts empty instead of copying the
+    // entire graph into a second authenticated tree.
+    let document_map_root_key = None;
+    let document_map_root_digest = super::scratch_store::authenticated_map_empty_digest();
+    let state_digest = lazy_genesis_frontier_state_digest(
+        binding,
+        documents.len() as u64,
+        document_map_root_key,
+        document_map_root_digest,
+    )?;
+    let root = AcceptedFrontierRoot {
+        schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
+        acceptance_sequence: 0,
+        document_count: documents.len() as u64,
+        retained_bytes_total: 0,
+        document_map_root_key,
+        document_map_root_digest,
+        batch_map_root_key: None,
+        batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
+        genesis: Some(binding),
+        state_digest,
+        scratch_root: None,
+    };
+    validate_accepted_frontier_root(&root)?;
+    Ok(root)
+}
+
+pub(crate) fn accepted_frontier_root_for_lazy_genesis(
+    candidate: &LazyGenesisCandidate,
+) -> Result<AcceptedFrontierRoot, EngineError> {
+    lazy_genesis_accepted_frontier_root(
+        candidate
+            .frontier_binding()
+            .map_err(|error| EngineError::Archive(error.to_string()))?,
+        &candidate.frontier_documents(),
+    )
+}
+
+fn lazy_genesis_frontier_state_digest(
+    binding: LazyGenesisFrontierBindingV1,
+    document_count: u64,
+    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_digest: ContentDigest,
+) -> Result<ContentDigest, EngineError> {
+    let mut bytes = b"tine/oplog/accepted-frontier/v7/genesis\0".to_vec();
+    let binding =
+        postcard::to_allocvec(&binding).map_err(|error| EngineError::Archive(error.to_string()))?;
+    bytes.extend_from_slice(&(binding.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&binding);
+    bytes.extend_from_slice(&document_count.to_be_bytes());
+    match document_map_root_key {
+        Some(key) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&key);
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(document_map_root_digest.as_bytes());
+    Ok(ContentDigest::of(&bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28846,7 +28015,6 @@ fn next_accepted_frontier_root(
     document_map_root_digest: ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
-    reference_catalog_root: ReferenceCatalogRootV2,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 ) -> Result<AcceptedFrontierRoot, EngineError> {
     validate_accepted_frontier_root(prior)?;
@@ -28855,11 +28023,7 @@ fn next_accepted_frontier_root(
             "accepted frontier sequence is not contiguous".into(),
         ));
     }
-    reference_catalog_root
-        .encode()
-        .map(|_| ())
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut bytes = b"tine/oplog/accepted-frontier/v4\0".to_vec();
+    let mut bytes = b"tine/oplog/accepted-frontier/v7\0".to_vec();
     bytes.extend_from_slice(prior.state_digest.as_bytes());
     bytes.extend_from_slice(event_binding_digest.as_bytes());
     bytes.extend_from_slice(&acceptance_sequence.to_be_bytes());
@@ -28885,12 +28049,11 @@ fn next_accepted_frontier_root(
         None => bytes.push(0),
     }
     bytes.extend_from_slice(batch_map_root_digest.as_bytes());
-    bytes.extend_from_slice(
-        reference_catalog_root
-            .external_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .as_bytes(),
-    );
+    if let Some(genesis) = prior.genesis {
+        genesis
+            .validate()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+    }
     bytes.extend_from_slice(&(affected_documents.len() as u64).to_be_bytes());
     for document in affected_documents {
         let encoded = encode_accepted_document(document)?;
@@ -28906,13 +28069,15 @@ fn next_accepted_frontier_root(
         document_map_root_digest,
         batch_map_root_key,
         batch_map_root_digest,
-        reference_catalog_root,
+        genesis: prior.genesis,
         state_digest: ContentDigest::of(&bytes),
         scratch_root,
     })
 }
 
-fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), EngineError> {
+pub(crate) fn validate_accepted_frontier_root(
+    root: &AcceptedFrontierRoot,
+) -> Result<(), EngineError> {
     if root.schema_version != ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION {
         return Err(EngineError::Archive(format!(
             "unknown accepted-frontier root schema {}",
@@ -28920,32 +28085,49 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
         )));
     }
     if root.acceptance_sequence == 0 {
-        let empty_page_name_authority_root = PageNameOwnershipRootV1::empty()
-            .external_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let empty_uuid_claim_authority_root = LogseqClaimIndexRoot::empty().digest();
-        if root.document_count != 0
-            || root.retained_bytes_total != 0
-            || root.document_map_root_key.is_some()
-            || root.document_map_root_digest
-                != super::scratch_store::authenticated_map_empty_digest()
+        if root.retained_bytes_total != 0
             || root.batch_map_root_key.is_some()
             || root.batch_map_root_digest != super::scratch_store::authenticated_map_empty_digest()
-            || root.reference_catalog_root.source_count() != 0
-            || root.reference_catalog_root.page_name_authority_root()
-                != empty_page_name_authority_root
-            || root
-                .reference_catalog_root
-                .external_uuid_claim_authority_root()
-                != empty_uuid_claim_authority_root
-            || root.state_digest
-                != empty_accepted_frontier_root_with_catalog(root.reference_catalog_root.clone())
-                    .state_digest
             || root.scratch_root.is_some()
         {
             return Err(EngineError::Archive(
-                "malformed empty accepted-frontier root".into(),
+                "malformed sequence-zero accepted-frontier root".into(),
             ));
+        }
+        match root.genesis {
+            None => {
+                if root.document_count != 0
+                    || root.document_map_root_key.is_some()
+                    || root.document_map_root_digest
+                        != super::scratch_store::authenticated_map_empty_digest()
+                    || root.state_digest != empty_accepted_frontier_root().state_digest
+                {
+                    return Err(EngineError::Archive(
+                        "malformed empty accepted-frontier root".into(),
+                    ));
+                }
+            }
+            Some(genesis) => {
+                genesis
+                    .validate()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                if root.document_count != genesis.document_count()
+                    || root.document_map_root_key.is_some()
+                    || root.document_map_root_digest
+                        != super::scratch_store::authenticated_map_empty_digest()
+                    || root.state_digest
+                        != lazy_genesis_frontier_state_digest(
+                            genesis,
+                            root.document_count,
+                            root.document_map_root_key,
+                            root.document_map_root_digest,
+                        )?
+                {
+                    return Err(EngineError::Archive(
+                        "malformed lazy-genesis accepted-frontier root".into(),
+                    ));
+                }
+            }
         }
     } else if root.batch_map_root_key.is_none()
         || root.batch_map_root_digest == super::scratch_store::authenticated_map_empty_digest()
@@ -28953,7 +28135,8 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
             && (root.document_map_root_key.is_some()
                 || root.document_map_root_digest
                     != super::scratch_store::authenticated_map_empty_digest()))
-        || (root.document_count > 0
+        || (root.genesis.is_none()
+            && root.document_count > 0
             && (root.document_map_root_key.is_none()
                 || root.document_map_root_digest
                     == super::scratch_store::authenticated_map_empty_digest()))
@@ -28962,9 +28145,11 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
             "malformed nonempty accepted-frontier document map".into(),
         ));
     }
-    root.reference_catalog_root
-        .encode()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    if let Some(genesis) = root.genesis {
+        genesis
+            .validate()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -29226,19 +28411,6 @@ fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), En
             "accepted frontier affected documents are not canonical".into(),
         ));
     }
-    if evidence.reference_catalog_delta.prior_root()
-        != &evidence.prior_frontier_root.reference_catalog_root
-        || evidence.reference_catalog_delta.post_root()
-            != &evidence.post_frontier_root.reference_catalog_root
-    {
-        return Err(EngineError::Archive(
-            "accepted reference-catalog delta is misbound".into(),
-        ));
-    }
-    evidence
-        .reference_catalog_delta
-        .encode()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
     let expected = next_accepted_frontier_root(
         &evidence.prior_frontier_root,
         evidence.event_binding_digest,
@@ -29254,7 +28426,6 @@ fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), En
         evidence.post_frontier_root.document_map_root_digest,
         evidence.post_frontier_root.batch_map_root_key,
         evidence.post_frontier_root.batch_map_root_digest,
-        evidence.post_frontier_root.reference_catalog_root.clone(),
         evidence.post_frontier_root.scratch_root.clone(),
     )?;
     if expected != evidence.post_frontier_root {
@@ -29431,7 +28602,6 @@ fn new_history_record(
     binding: super::object_store::EngineHistoryBinding,
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog_root: ReferenceCatalogRootV2,
     status: ArchiveStatus,
 ) -> ColdHistoryRecord {
     ColdHistoryRecord {
@@ -29448,7 +28618,6 @@ fn new_history_record(
         page_names: binding.page_names,
         logseq_claim_root,
         reference_catalog_policy,
-        reference_catalog_root,
         status,
     }
 }
@@ -29474,8 +28643,6 @@ fn decode_history_record(
             validate_accepted_evidence(evidence).is_ok()
                 && evidence.batch_id == record.batch_id
                 && evidence.manifest_fingerprint == record.manifest_fingerprint
-                && evidence.post_frontier_root.reference_catalog_root
-                    == record.reference_catalog_root
         }
         _ => true,
     };
@@ -29508,12 +28675,6 @@ fn decode_authenticated_current_history_leaf(
                 && evidence.batch_id == record.batch_id
                 && evidence.manifest_fingerprint == record.manifest_fingerprint
                 && evidence.acceptance_sequence == evidence.post_frontier_root.acceptance_sequence
-                && evidence.reference_catalog_delta.prior_root()
-                    == &evidence.prior_frontier_root.reference_catalog_root
-                && evidence.reference_catalog_delta.post_root()
-                    == &evidence.post_frontier_root.reference_catalog_root
-                && evidence.post_frontier_root.reference_catalog_root
-                    == record.reference_catalog_root
                 && validate_accepted_frontier_root(&evidence.post_frontier_root).is_ok()
         }
         _ => true,
@@ -29534,14 +28695,6 @@ fn decode_authenticated_current_history_leaf(
                     .any(|pair| pair[0] >= pair[1])
         })
         || record.page_names.validate().is_err()
-        || record
-            .reference_catalog_root
-            .validate_bound(
-                &record.reference_catalog_policy,
-                &record.page_names.ownership_root,
-                record.logseq_claim_root.digest(),
-            )
-            .is_err()
         || !accepted_shape_valid
     {
         return Err(EngineError::Archive(
@@ -29551,6 +28704,7 @@ fn decode_authenticated_current_history_leaf(
     Ok(record)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_bootstrap_history_record(
     part: BootstrapPartDescriptorV1,
     bytes: &[u8],
@@ -29574,6 +28728,7 @@ pub(crate) fn validate_bootstrap_history_record(
     Ok(history_record_binding(&record))
 }
 
+#[cfg(test)]
 fn validate_bootstrap_history_record_against_material(
     part: BootstrapPartDescriptorV1,
     bytes: &[u8],
@@ -29600,6 +28755,7 @@ fn validate_bootstrap_history_record_against_material(
     Ok(record_binding)
 }
 
+#[cfg(test)]
 fn cold_history_record_difference(
     actual: &ColdHistoryRecord,
     expected: &ColdHistoryRecord,
@@ -29625,7 +28781,6 @@ fn cold_history_record_difference(
         page_names,
         logseq_claim_root,
         reference_catalog_policy,
-        reference_catalog_root,
     );
     match (&actual.status, &expected.status) {
         (
@@ -29657,7 +28812,6 @@ fn cold_history_record_difference(
                 prior_frontier_root,
                 post_frontier_root,
                 affected_documents,
-                reference_catalog_delta,
             );
         }
         _ if actual.status != expected.status => return "status",
@@ -29670,10 +28824,8 @@ fn validate_history_catalog(
     records: &[ColdHistoryRecord],
     through_generation: u64,
 ) -> Result<(), EngineError> {
-    let mut prior_reference_root = None;
     let mut policy = None;
     let mut bootstrap = None;
-    let mut accepted_transition_seen = false;
     for (index, record) in records.iter().enumerate() {
         if record.generation != index as u64 + 1 {
             return Err(EngineError::Archive(
@@ -29696,55 +28848,6 @@ fn validate_history_catalog(
             ));
         }
         policy.get_or_insert_with(|| record.reference_catalog_policy.clone());
-        match &record.status {
-            ArchiveStatus::Accepted { evidence, .. } => {
-                let initial_root = (!accepted_transition_seen)
-                    .then(|| {
-                        ReferenceCatalogRootV2::empty_for_authority_digests(
-                            &record.reference_catalog_policy,
-                            PageNameOwnershipRootV1::empty()
-                                .external_digest()
-                                .map_err(|error| EngineError::Archive(error.to_string()))?,
-                            LogseqClaimIndexRoot::empty().digest(),
-                        )
-                        .map_err(|error| EngineError::Archive(error.to_string()))
-                    })
-                    .transpose()?;
-                if initial_root
-                    .as_ref()
-                    .is_some_and(|initial| evidence.reference_catalog_delta.prior_root() != initial)
-                {
-                    return Err(EngineError::Archive(
-                        "initial engine history reference-catalog root is not canonical empty"
-                            .into(),
-                    ));
-                }
-                let expected_prior = prior_reference_root
-                    .as_ref()
-                    .or(initial_root.as_ref())
-                    .expect("the first accepted transition has a canonical initial root");
-                if evidence.reference_catalog_delta.prior_root() != expected_prior
-                    || evidence.reference_catalog_delta.post_root()
-                        != &record.reference_catalog_root
-                {
-                    return Err(EngineError::Archive(
-                        "engine history reference-catalog transition chain is broken".into(),
-                    ));
-                }
-                accepted_transition_seen = true;
-            }
-            _ => {
-                if prior_reference_root
-                    .as_ref()
-                    .is_some_and(|prior| prior != &record.reference_catalog_root)
-                {
-                    return Err(EngineError::Archive(
-                        "non-accepted engine history record changed reference authority".into(),
-                    ));
-                }
-            }
-        }
-        prior_reference_root = Some(record.reference_catalog_root.clone());
     }
     if records.len() as u64 != through_generation {
         return Err(EngineError::Archive(
@@ -29756,7 +28859,6 @@ fn validate_history_catalog(
 
 fn validated_history_records(
     store: &super::object_store::DurableEngineHistoryStore,
-    catalog_store: Option<&ReferenceCatalogStore>,
     through_generation: u64,
     history_root: ContentDigest,
 ) -> Result<Vec<ColdHistoryRecord>, EngineError> {
@@ -29767,13 +28869,6 @@ fn validated_history_records(
         .map(|(batch_id, bytes)| {
             store.note_history_decode();
             let record = decode_history_record(batch_id, &bytes)?;
-            if let (Some(catalog_store), ArchiveStatus::Accepted { evidence, .. }) =
-                (catalog_store, &record.status)
-            {
-                catalog_store
-                    .validate_delta(&evidence.reference_catalog_delta)
-                    .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-            }
             Ok::<ColdHistoryRecord, EngineError>(record)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -30037,11 +29132,14 @@ pub(super) fn validate_catalog_document(
     catalog_document_id: DocumentId,
     document: &LoroDoc,
 ) -> Result<ValidatedCatalogDocument<'_>, EngineError> {
+    let page_count = document.get_map(CATALOG_PAGES).len();
     update_cursor_probe(|probe| {
         probe.catalog_document_validations = probe.catalog_document_validations.saturating_add(1);
+        probe.catalog_entries_validated =
+            probe.catalog_entries_validated.saturating_add(page_count);
     });
     validate_document_roots(catalog_document_id, document, &[CATALOG_PAGES])?;
-    if document.get_map(CATALOG_PAGES).len() > MAX_DOCUMENT_ENTRIES {
+    if page_count > MAX_DOCUMENT_ENTRIES {
         return Err(EngineError::InvalidCrdt(
             "catalog entry bound exceeded".into(),
         ));
@@ -31969,13 +31067,7 @@ mod validation_tests {
     use crate::oplog::external_import::{
         ExternalImportObservationEntry, ExternalImportObservationState,
     };
-    use crate::oplog::projection_work_index::ProjectionExpectedPathReadBudget;
-    use crate::oplog::reconciliation_scan::{
-        scan_graph_text, AuthenticatedExpectedPath, AuthenticatedExpectedPathSource,
-        ExpectedPathCorruptField, ExpectedPathPageRequest, ExpectedPathPointRequest,
-        ExpectedPathSourceFailure, ExpectedPathStreamLimits, GraphTextCandidateKind,
-        GraphTextScanLimits, JoinedAuthenticatedExpectedPathSource,
-    };
+    use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
     use crate::oplog::{BlobDescription, ImportId, ProjectionReceiptStoreId};
 
     fn validated_transition(
@@ -32289,7 +31381,6 @@ mod validation_tests {
         assert!(engine.detached_accepted_manifests.is_empty());
         assert!(engine.archive_store.is_none());
         assert!(engine.history_store.is_none());
-        assert!(engine.projection_work_index.is_none());
     }
 
     #[test]
@@ -32388,8 +31479,7 @@ mod validation_tests {
             accepted_evidence,
             history_binding: candidate.durable_history_binding(),
             logseq_claim_root: candidate.logseq_claim_root,
-            reference_catalog_policy: candidate.reference_catalog.policy().clone(),
-            reference_catalog_root: candidate.reference_catalog.root().clone(),
+            reference_catalog_policy: candidate.reference_catalog_policy.clone(),
         };
         let binding = super::super::object_store::BootstrapAggregateHistoryBindingV1::new(
             BootstrapPublicationIdV1::from_bytes([0x11; 32]),
@@ -32404,7 +31494,7 @@ mod validation_tests {
         )
         .unwrap();
         let record = decode_history_record(descriptor.batch_id(), &bytes).unwrap();
-        assert_eq!(record.schema_version, 13);
+        assert_eq!(record.schema_version, ENGINE_HISTORY_SCHEMA_VERSION);
         assert_eq!(record.bootstrap, Some(binding));
         assert_eq!(
             match &record.status {
@@ -32421,7 +31511,6 @@ mod validation_tests {
                 history_record_binding(&record),
                 record.logseq_claim_root,
                 record.reference_catalog_policy.clone(),
-                record.reference_catalog_root.clone(),
                 record.status.clone(),
             )
             .bootstrap,
@@ -32854,7 +31943,7 @@ mod validation_tests {
         }
 
         let completed = session.finish().unwrap();
-        let work = completed.bootstrap_catalog_work_stats();
+        let work = completed.bootstrap_index_work_stats();
         let page_count = PART_COUNT as usize * PAGES_PER_PART;
         assert!(
             work.detached_index_persistent_node_reads <= page_count * 64,
@@ -32976,7 +32065,7 @@ mod validation_tests {
         let finish_started = std::time::Instant::now();
         let completed = session.finish().unwrap();
         let finished = finish_started.elapsed();
-        let work = completed.bootstrap_catalog_work_stats();
+        let work = completed.bootstrap_index_work_stats();
         let (sample_page, sample_content) = sample.unwrap();
         assert_eq!(
             completed
@@ -32997,7 +32086,7 @@ mod validation_tests {
             "detached bootstrap emitted one physical blob write per logical record: {scratch:?}"
         );
         eprintln!(
-            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_page_append_batches={} scratch_blob_append_batches={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
+            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_page_append_batches={} scratch_blob_append_batches={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} index_work={work:?}",
             authored.as_secs_f64() * 1_000.0,
             finished.as_secs_f64() * 1_000.0,
             scratch.page_reads,
@@ -33140,8 +32229,8 @@ mod validation_tests {
         assert_eq!(
             content_after.authenticated_page_identity_lookups
                 - content_before.authenticated_page_identity_lookups,
-            3,
-            "authoring, prospective-reference validation, and reference-source preparation each require one authenticated point lookup"
+            2,
+            "authoring and prospective-reference validation each require one authenticated point lookup; derived reference extraction is no longer an engine-authority lookup"
         );
         assert_eq!(
             session
@@ -33457,17 +32546,6 @@ mod validation_tests {
             );
             assert!(replayed.engine.archive_store.is_none());
             assert!(replayed.engine.history_store.is_none());
-            assert!(replayed.engine.projection_work_index.is_none());
-            let replay_validation = replayed.engine.reference_catalog.construction_work_stats();
-            assert_eq!(replay_validation.prepared_candidate_validations, 0);
-            if multipart {
-                assert!(
-                    replay_validation.full_delta_validations >= 2,
-                    "fresh direct-loaded replay must retain a full catalog-delta validation for every part"
-                );
-            } else {
-                assert_eq!(replay_validation.full_delta_validations, 0);
-            }
             drop(replayed);
             drop(expected);
             drop(store);
@@ -33705,7 +32783,6 @@ mod validation_tests {
         assert!(engine.archive.is_empty());
         assert!(engine.archive_store.is_none());
         assert!(engine.history_store.is_none());
-        assert!(engine.projection_work_index.is_none());
         assert!(engine.projection_endpoint.is_none());
         let scratch_root = completed
             .scratch_root
@@ -33755,8 +32832,6 @@ mod validation_tests {
         ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
         page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
         reference_catalog_policy: ReferenceCatalogPolicyV1,
-        reference_catalog_root: ReferenceCatalogRootV2,
-        reference_catalog_hot_entries: usize,
         fatal_evidence: Option<ImmutableHomeEvidence>,
         fatal_handle: Option<FatalEvidenceHandle>,
         visible_documents: BTreeMap<DocumentId, Vec<u8>>,
@@ -33772,7 +32847,6 @@ mod validation_tests {
         accepted_frontier_root: AcceptedFrontierRoot,
         accepted_sequence: BTreeMap<u64, BatchId>,
         next_acceptance_sequence: u64,
-        projection_pending: Vec<u8>,
     }
 
     fn document_updates(
@@ -33794,23 +32868,6 @@ mod validation_tests {
             .history_store
             .as_ref()
             .map(|store| postcard::to_allocvec(&store.current_with_binding().unwrap()).unwrap());
-        let projection_pending = engine
-            .projection_work_index
-            .as_ref()
-            .map(|index| {
-                let mut pending = Vec::new();
-                let mut cursor = None;
-                loop {
-                    let page = index.pending_activation_page(cursor.as_ref(), 64).unwrap();
-                    pending.extend_from_slice(page.pending());
-                    cursor = page.next().cloned();
-                    if cursor.is_none() {
-                        break;
-                    }
-                }
-                postcard::to_allocvec(&pending).unwrap()
-            })
-            .unwrap_or_default();
         ObservableEngineState {
             durable_history,
             history_generation: engine.history_generation,
@@ -33831,9 +32888,7 @@ mod validation_tests {
             page_name_root: engine.page_name_root.clone(),
             ephemeral_page_names: engine.ephemeral_page_names.clone(),
             page_name_conflicts: engine.page_name_conflicts.clone(),
-            reference_catalog_policy: engine.reference_catalog.policy().clone(),
-            reference_catalog_root: engine.reference_catalog.root().clone(),
-            reference_catalog_hot_entries: engine.reference_catalog.hot_entry_count(),
+            reference_catalog_policy: engine.reference_catalog_policy.clone(),
             fatal_evidence: engine.fatal_evidence.clone(),
             fatal_handle: engine.fatal_handle,
             visible_documents: document_updates(&engine.visible_documents),
@@ -33849,20 +32904,7 @@ mod validation_tests {
             accepted_frontier_root: engine.accepted_frontier_root.clone(),
             accepted_sequence: engine.accepted_sequence.clone(),
             next_acceptance_sequence: engine.next_acceptance_sequence,
-            projection_pending,
         }
-    }
-
-    fn enrolled_test_engine(
-        seed: u128,
-        lineage: LineageDigest,
-    ) -> (
-        std::path::PathBuf,
-        ObjectStore,
-        ShardedHotEngine,
-        DocumentId,
-    ) {
-        enrolled_test_engine_with_retention(seed, lineage, false)
     }
 
     fn independent_archive_author(
@@ -33891,16 +32933,9 @@ mod validation_tests {
         engine
     }
 
-    /// The same enrolled fixture, optionally opened on a **retained** run
-    /// through the resuming entry point.
-    ///
-    /// Retention is chosen before the first batch on purpose: a resume snapshot
-    /// only exists for a retained run, and authoring must happen in the same
-    /// process that opened it, so the choice cannot be made later by restarting.
-    fn enrolled_test_engine_with_retention(
+    fn archive_test_engine(
         seed: u128,
         lineage: LineageDigest,
-        retained: bool,
     ) -> (
         std::path::PathBuf,
         ObjectStore,
@@ -33915,46 +32950,17 @@ mod validation_tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("archive");
-        let graph_path = root.join("graph");
-        std::fs::create_dir(&graph_path).unwrap();
-        let graph = Graph::open(&graph_path);
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
-            DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let engine = if retained {
-            ShardedHotEngine::open_enrolled_projection_resuming(
-                ObjectStore::open(&archive_path, workspace).unwrap(),
-                lineage,
-                catalog,
-                &graph,
-                &receipts,
-                None,
-                &[],
-                None,
-            )
-            .expect("a fresh retained enrolled open has nothing to replay")
-            .0
-        } else {
-            ShardedHotEngine::with_enrolled_projection(
-                ObjectStore::open(&archive_path, workspace).unwrap(),
-                lineage,
-                catalog,
-                &graph,
-                &receipts,
-            )
-        };
+        let engine = ShardedHotEngine::with_archive_store(
+            ObjectStore::open(&archive_path, workspace).unwrap(),
+            lineage,
+            catalog,
+        );
         (root, writer, engine, catalog)
     }
 
     #[test]
-    fn runtime_authority_is_unique_per_engine_and_survives_in_place_recovery() {
+    fn runtime_authority_is_unique_per_engine() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_470));
         let lineage = LineageDigest::of(b"runtime-engine-authority");
         let catalog = DocumentId::from_uuid(Uuid::from_u128(89_471));
@@ -33963,17 +32969,6 @@ mod validation_tests {
         assert!(!first
             .runtime_authority()
             .matches(second.runtime_authority()));
-
-        let (root, writer, mut engine, _) = enrolled_test_engine(89_472, lineage);
-        let authority = engine.runtime_authority().clone();
-        engine.prepare_operational_recovery_replay().unwrap();
-        assert!(authority.matches(engine.runtime_authority()));
-        engine.finish_operational_recovery_replay().unwrap();
-        assert!(authority.matches(engine.runtime_authority()));
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 
     fn create_page_with_block(
@@ -34156,7 +33151,7 @@ mod validation_tests {
     #[test]
     fn bulk_projection_historical_root_uses_current_uuid_fallback_after_same_home_removal() {
         let lineage = LineageDigest::of(b"bulk-projection-historical-uuid-home-removal");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(93_050, lineage);
+        let (root, writer, mut engine, catalog) = archive_test_engine(93_050, lineage);
         let source_page = PageId::from_uuid(Uuid::from_u128(93_051));
         let source_membership = DocumentId::from_uuid(Uuid::from_u128(93_052));
         let reference_page = PageId::from_uuid(Uuid::from_u128(93_053));
@@ -34231,7 +33226,6 @@ mod validation_tests {
         let r2 = engine.accepted_frontier_root().unwrap();
         assert_ne!(r1, r2);
         assert!(engine.archive_store.is_some());
-        assert!(engine.history_store.is_some());
 
         let (fallback_resolution, fallback_evidence, fallback_homes) =
             engine.resolve_logseq_uuid_current(stale_uuid).unwrap();
@@ -34417,1947 +33411,6 @@ mod validation_tests {
         );
     }
 
-    struct PreauthorGateFixture {
-        root: std::path::PathBuf,
-        writer: ObjectStore,
-        graph: Graph,
-        receipts: ProjectionReceiptStore,
-        engine: ShardedHotEngine,
-        endpoint: ProjectionEndpointBinding,
-        pages: [(PageId, DocumentId, BlockId, ManagedPath); 3],
-    }
-
-    impl PreauthorGateFixture {
-        fn draft_edits(&self, seed: u128, edits: &[(usize, &str)]) -> AuthorTransactionDraft {
-            let operations = edits
-                .iter()
-                .map(|(index, content)| {
-                    let (_, home_document_id, block_id, _) = &self.pages[*index];
-                    SemanticOperation::EditBlockContent {
-                        block: BlockLocation {
-                            block_id: *block_id,
-                            home_document_id: *home_document_id,
-                        },
-                        content: (*content).into(),
-                    }
-                })
-                .collect();
-            self.engine
-                .draft_author_transaction(
-                    AuthorBatch {
-                        batch_id: BatchId::from_uuid(Uuid::from_u128(seed)),
-                        author_device_id: self.endpoint.device_id,
-                        author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 1)),
-                        crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 2),
-                    },
-                    BatchOrigin::LocalMutation,
-                    &OperationTransaction::new(operations).unwrap(),
-                )
-                .unwrap()
-        }
-
-        fn graph_path(&self, path: &ManagedPath) -> std::path::PathBuf {
-            self.root.join("graph").join(path.as_str())
-        }
-
-        /// Drive one complete ordinary local authoring cycle — draft, capture,
-        /// finalize, publish, accept, project — exactly as the enrolled runtime
-        /// does, and return the accepted batch id.
-        fn author_accepted_round(&mut self, seed: u128, content: &str) -> BatchId {
-            let draft = self.draft_edits(seed, &[(0, content)]);
-            let captured = match self
-                .engine
-                .capture_local_author_transaction(
-                    draft,
-                    &self.graph,
-                    &self.receipts,
-                    self.endpoint,
-                    None,
-                )
-                .unwrap()
-            {
-                LocalAuthorCapture::Captured(captured) => captured,
-                LocalAuthorCapture::ReconciliationNeeded(_) => {
-                    panic!("undisturbed local round unexpectedly requires reconciliation")
-                }
-            };
-            let prepared = self
-                .engine
-                .finalize_captured_author_transaction(captured, &self.receipts)
-                .unwrap();
-            let batch_id = prepared.manifest().batch_id();
-            self.writer.publish_prepared(&prepared).unwrap();
-            let disposition = self
-                .engine
-                .stage_archive_batch(batch_id)
-                .unwrap()
-                .disposition()
-                .clone();
-            assert!(
-                matches!(disposition, BatchDisposition::Accepted { .. }),
-                "seed {seed} did not accept: {disposition:?}"
-            );
-            let current = std::fs::read(self.graph_path(&self.pages[0].3)).unwrap();
-            crate::oplog::write_projection_exact(
-                &self.graph,
-                &self.receipts,
-                &self.engine,
-                self.pages[0].0,
-                Some(&current),
-            )
-            .unwrap();
-            batch_id
-        }
-    }
-
-    fn preauthor_gate_fixture(seed: u128) -> PreauthorGateFixture {
-        preauthor_gate_fixture_with_retention(seed, false)
-    }
-
-    fn preauthor_gate_fixture_with_retention(seed: u128, retained: bool) -> PreauthorGateFixture {
-        let lineage = LineageDigest::of(format!("preauthor-gate-{seed}").as_bytes());
-        let (root, writer, mut engine, _) =
-            enrolled_test_engine_with_retention(seed, lineage, retained);
-        std::fs::create_dir_all(root.join("graph/pages")).unwrap();
-        let graph = Graph::open(&root.join("graph"));
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        let receipts = ProjectionReceiptStore::open_for_endpoint(
-            &root.join("receipts"),
-            writer.workspace_id(),
-            endpoint,
-        )
-        .unwrap();
-        let pages = [
-            (
-                PageId::from_uuid(Uuid::from_u128(seed + 10)),
-                DocumentId::from_uuid(Uuid::from_u128(seed + 11)),
-                BlockId::from_uuid(Uuid::from_u128(seed + 12)),
-                ManagedPath::parse("pages/gate-a.md").unwrap(),
-            ),
-            (
-                PageId::from_uuid(Uuid::from_u128(seed + 20)),
-                DocumentId::from_uuid(Uuid::from_u128(seed + 21)),
-                BlockId::from_uuid(Uuid::from_u128(seed + 22)),
-                ManagedPath::parse("pages/gate-b.md").unwrap(),
-            ),
-            (
-                PageId::from_uuid(Uuid::from_u128(seed + 30)),
-                DocumentId::from_uuid(Uuid::from_u128(seed + 31)),
-                BlockId::from_uuid(Uuid::from_u128(seed + 32)),
-                ManagedPath::parse("pages/gate-c.md").unwrap(),
-            ),
-        ];
-        let mut operations = Vec::new();
-        for (index, (page_id, home_document_id, block_id, path)) in pages.iter().enumerate() {
-            operations.extend(
-                create_page_with_block(
-                    *page_id,
-                    *home_document_id,
-                    *block_id,
-                    &format!("Gate {index}"),
-                    path.as_str(),
-                )
-                .operations,
-            );
-        }
-        let local_id = BatchId::from_uuid(Uuid::from_u128(seed + 40));
-        let draft = engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: local_id,
-                    author_device_id: endpoint.device_id,
-                    author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 41)),
-                    crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 42),
-                },
-                BatchOrigin::LocalMutation,
-                &OperationTransaction::new(operations).unwrap(),
-            )
-            .unwrap();
-        let captured = match engine
-            .capture_local_author_transaction(draft, &graph, &receipts, endpoint, None)
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => {
-                panic!("fresh local fixture unexpectedly requires reconciliation")
-            }
-        };
-        let prepared = engine
-            .finalize_captured_author_transaction(captured, &receipts)
-            .unwrap();
-        writer.publish_prepared(&prepared).unwrap();
-        assert!(matches!(
-            engine.stage_archive_batch(local_id).unwrap().disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        for (page_id, _, _, _) in &pages {
-            crate::oplog::write_projection_exact(&graph, &receipts, &engine, *page_id, None)
-                .unwrap();
-        }
-        PreauthorGateFixture {
-            root,
-            writer,
-            graph,
-            receipts,
-            engine,
-            endpoint,
-            pages,
-        }
-    }
-
-    impl PreauthorGateFixture {
-        fn archive_path(&self) -> std::path::PathBuf {
-            self.root.join("archive")
-        }
-
-        /// Drop this fixture's engine, releasing its scratch lease, and reopen a
-        /// fresh one through the resuming entry point.
-        ///
-        /// This is the literal restart boundary: the old engine is gone before
-        /// the new one is constructed, and the new one authenticates everything
-        /// it uses from durable bytes.
-        fn reopen_resuming(
-            &mut self,
-            resume: Option<&RuntimeResumeSnapshot>,
-        ) -> RuntimeResumeReceipt {
-            let workspace = self.engine.workspace_id();
-            let lineage = self.engine.lineage_digest;
-            let catalog = self.engine.catalog_document_id;
-            self.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-            let manifests = self.writer.committed_manifests().unwrap();
-            let (engine, receipt, _) = ShardedHotEngine::open_enrolled_projection_resuming(
-                ObjectStore::open(&self.archive_path(), workspace).unwrap(),
-                lineage,
-                catalog,
-                &self.graph,
-                &self.receipts,
-                None,
-                &manifests,
-                resume,
-            )
-            .expect("a resuming open must succeed or fall back, never fail");
-            self.engine = engine;
-            receipt
-        }
-    }
-
-    type AcceptedFrontierCrossRunFacts = (
-        u64,
-        u64,
-        Option<[u8; 16]>,
-        ContentDigest,
-        Option<[u8; 16]>,
-        ContentDigest,
-        ReferenceCatalogRootV2,
-    );
-
-    type CrossRunEngineFacts = (
-        u64,
-        ContentDigest,
-        u64,
-        PageNameOwnershipRootV1,
-        ContentDigest,
-        ContentDigest,
-        ReferenceCatalogRootV2,
-        AcceptedFrontierCrossRunFacts,
-    );
-
-    /// The engine facts two runs that reached the same accepted closure must
-    /// agree on. Deliberately excludes every run-local member: two scratch runs
-    /// legitimately disagree about page offsets and retained byte totals.
-    ///
-    /// This is an authenticated-root comparison and nothing more. It is
-    /// necessary but **not** sufficient for engine equivalence: run-local hot
-    /// state can be missing with every root here equal. Pair it with
-    /// [`projection_observation_boundary`] wherever equivalence is the claim.
-    fn cross_run_engine_facts(engine: &ShardedHotEngine) -> CrossRunEngineFacts {
-        let frontier = accepted_frontier_cross_run_facts(&engine.accepted_frontier_root);
-        (
-            engine.history_generation,
-            engine.history_root,
-            engine.next_acceptance_sequence,
-            engine.page_name_root.clone(),
-            engine.portable_path_root.digest(),
-            engine.logseq_claim_root.digest(),
-            engine.reference_catalog.root().clone(),
-            (
-                frontier.0,
-                frontier.1,
-                frontier.2,
-                frontier.3,
-                frontier.4,
-                frontier.5,
-                frontier.6.clone(),
-            ),
-        )
-    }
-
-    fn run_directory_bytes(root: &std::path::Path, run_id: Uuid) -> BTreeMap<String, Vec<u8>> {
-        let run = root
-            .join("archive")
-            .join("engine-scratch-v2")
-            .join(format!("run-{run_id}"));
-        std::fs::read_dir(&run)
-            .unwrap_or_else(|error| panic!("retained run {run_id} must survive: {error}"))
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    std::fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect()
-    }
-
-    /// Every fixture page's complete projection state, with only the physical
-    /// read counters normalised away.
-    ///
-    /// Those two counters measure archive cache warmth, which two runs that
-    /// reached the same accepted closure legitimately disagree about. Everything
-    /// else — page identity, home shard, name, path, kind, preamble, the ordered
-    /// block list with its content and Logseq identity, the projection frontier
-    /// and the claim evidence — is semantic and must be identical.
-    fn projection_page_states(
-        engine: &ShardedHotEngine,
-        pages: &[PageId],
-    ) -> Vec<ProjectionPageState> {
-        pages
-            .iter()
-            .map(|page_id| {
-                let mut state = engine
-                    .materialize_page_for_projection(*page_id)
-                    .unwrap_or_else(|error| {
-                        panic!("page {page_id} must materialize for projection: {error:?}")
-                    });
-                state.page.stats.physical_manifest_reads = 0;
-                state.page.stats.physical_object_reads = 0;
-                state
-            })
-            .collect()
-    }
-
-    /// The complete observation-boundary state of one engine: the authenticated
-    /// cross-run roots *and* what a projector and a canonical-snapshot reader
-    /// actually see.
-    ///
-    /// The roots alone are not an equivalence oracle. Run-local hot state that
-    /// adoption fails to reconstitute leaves every root equal while every page
-    /// stops materializing, so an equivalence gate that stops at the roots
-    /// cannot observe the thing adoption exists to reconstitute.
-    fn projection_observation_boundary(
-        engine: &ShardedHotEngine,
-        pages: &[PageId],
-    ) -> (
-        CrossRunEngineFacts,
-        Vec<ProjectionPageState>,
-        crate::oplog::CanonicalSnapshot,
-    ) {
-        (
-            cross_run_engine_facts(engine),
-            projection_page_states(engine, pages),
-            engine
-                .canonical_snapshot()
-                .expect("an operational engine must produce a canonical snapshot"),
-        )
-    }
-
-    fn fixture_page_ids(fixture: &PreauthorGateFixture) -> Vec<PageId> {
-        fixture.pages.iter().map(|(page_id, ..)| *page_id).collect()
-    }
-
-    /// After an adopted restart every page of the graph must materialize, and
-    /// must materialize to exactly what a full replay of the same history
-    /// produces.
-    ///
-    /// This is the assertion `cross_run_engine_facts` structurally cannot make.
-    /// Restoring the adopted run's durable-derived and run-local *roots* without
-    /// restoring the run-local hot state those roots address leaves every root
-    /// equal and every projection read broken, because `materialize_page_inner`
-    /// resolves the catalog document out of hot state and has no lazy load for
-    /// it. Removing the restored catalog document from
-    /// `restore_adopted_predecessor_state` reds this on `PageNotFound` for the
-    /// first page and on an empty canonical snapshot.
-    #[test]
-    fn an_adopted_restart_projects_every_page_exactly_as_a_full_replay() {
-        let mut fixture = preauthor_gate_fixture_with_retention(707_000, true);
-        for round in 0..3u128 {
-            fixture.author_accepted_round(707_100 + round * 100, &format!("project {round}"));
-        }
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        // An ordinary tail: content edits only. This is the shape that never
-        // touches the catalog document, so nothing in the tail replay can
-        // accidentally rehydrate what adoption failed to restore.
-        for round in 0..2u128 {
-            fixture.author_accepted_round(707_500 + round * 100, &format!("project tail {round}"));
-        }
-        let pages = fixture_page_ids(&fixture);
-
-        let control = fixture.reopen_resuming(None);
-        assert!(!control.observation.adopted);
-        let (control_facts, control_pages, control_snapshot) =
-            projection_observation_boundary(&fixture.engine, &pages);
-        assert_eq!(
-            control_snapshot.pages.len(),
-            pages.len(),
-            "the control must actually see the whole graph"
-        );
-
-        let resumed = fixture.reopen_resuming(Some(&snapshot));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-        assert!(
-            resumed.observation.replayed_generations < resumed.observation.live_history_generation,
-            "the adopted restart must have skipped durable records, or this proves nothing"
-        );
-        let (adopted_facts, adopted_pages, adopted_snapshot) =
-            projection_observation_boundary(&fixture.engine, &pages);
-        assert_eq!(adopted_facts, control_facts);
-        assert_eq!(
-            adopted_pages, control_pages,
-            "every page must project after an adopted restart exactly as the full-replay control does"
-        );
-        assert_eq!(
-            adopted_snapshot, control_snapshot,
-            "an adopted restart must observe the same canonical semantic snapshot"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The first ordinary local authoring round after an adopted restart must be
-    /// `Captured`, and the work it accepts must reproduce under a later full
-    /// replay.
-    ///
-    /// This is the user-visible half of the same defect and it is *not*
-    /// fail-closed: `draft_author_transaction` swallows `PageNotFound` into a
-    /// `None` semantic pre-state, so a missing catalog document silently diverts
-    /// the user's first post-restart edit into external reconciliation instead
-    /// of refusing. `author_accepted_round` panics on
-    /// `LocalAuthorCapture::ReconciliationNeeded`, so that divergence is the
-    /// failure this test reports.
-    #[test]
-    fn an_authored_round_after_an_adopted_restart_is_captured_and_replays() {
-        let mut fixture = preauthor_gate_fixture_with_retention(708_000, true);
-        for round in 0..3u128 {
-            fixture.author_accepted_round(708_100 + round * 100, &format!("author {round}"));
-        }
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        for round in 0..2u128 {
-            fixture.author_accepted_round(708_500 + round * 100, &format!("author tail {round}"));
-        }
-        let pages = fixture_page_ids(&fixture);
-
-        let resumed = fixture.reopen_resuming(Some(&snapshot));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-        let live_before = resumed.observation.live_history_generation;
-
-        // The ordinary first round after the restart. Nothing external touched
-        // the graph, so this is the plain authoring path, not reconciliation.
-        let authored = fixture.author_accepted_round(708_700, "after adoption");
-        assert_eq!(
-            fixture.engine.history_generation,
-            live_before + 1,
-            "the post-adoption round must have advanced durable history"
-        );
-        assert!(fixture
-            .writer
-            .committed_manifests()
-            .unwrap()
-            .iter()
-            .any(|manifest| manifest.batch_id() == authored));
-        let after_adoption = projection_observation_boundary(&fixture.engine, &pages);
-
-        // A later full replay of the complete history — including the round
-        // authored on top of the adopted state — must reproduce it exactly.
-        let replay = fixture.reopen_resuming(None);
-        assert!(!replay.observation.adopted);
-        assert_eq!(
-            replay.observation.replayed_generations, replay.observation.live_history_generation,
-            "the control must be a complete replay"
-        );
-        assert_eq!(
-            projection_observation_boundary(&fixture.engine, &pages),
-            after_adoption,
-            "work authored after an adopted restart must reproduce under a full replay"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// Repeated crash/adopt cycles on one retained run stay semantically
-    /// equivalent to a single full replay of everything they accepted.
-    ///
-    /// A retained run deliberately survives restarts, so adoption compounds:
-    /// each cycle adopts state that a previous adoption installed. This is the
-    /// path where a hot-state omission that a lucky tail masked once would
-    /// accumulate.
-    #[test]
-    fn chained_crash_and_adopt_cycles_stay_semantically_equivalent() {
-        let mut fixture = preauthor_gate_fixture_with_retention(709_000, true);
-        fixture.author_accepted_round(709_100, "chain seed");
-        let pages = fixture_page_ids(&fixture);
-        let run = fixture
-            .engine
-            .retained_scratch_run_id()
-            .expect("a retained enrolled engine owns a run");
-
-        for cycle in 0..3u128 {
-            let snapshot = fixture
-                .engine
-                .runtime_resume_snapshot()
-                .unwrap()
-                .unwrap_or_else(|| panic!("cycle {cycle}: a quiescent engine is publishable"));
-            let receipt = fixture.reopen_resuming(Some(&snapshot));
-            assert!(
-                receipt.observation.adopted,
-                "cycle {cycle}: {:?}",
-                receipt.refusal
-            );
-            assert_eq!(
-                receipt.engine_run_id, run,
-                "cycle {cycle}: chained adoption must stay on the same retained run"
-            );
-            assert_eq!(
-                receipt.observation.replayed_generations, 0,
-                "cycle {cycle}: adopting an up-to-date snapshot leaves no durable tail"
-            );
-            // Every cycle both reads and writes through the adopted state.
-            assert_eq!(
-                projection_page_states(&fixture.engine, &pages).len(),
-                pages.len()
-            );
-            fixture.author_accepted_round(709_200 + cycle * 100, &format!("chain {cycle}"));
-        }
-        let chained = projection_observation_boundary(&fixture.engine, &pages);
-
-        let replay = fixture.reopen_resuming(None);
-        assert!(!replay.observation.adopted);
-        assert_eq!(
-            replay.observation.replayed_generations,
-            replay.observation.live_history_generation
-        );
-        assert_eq!(
-            projection_observation_boundary(&fixture.engine, &pages),
-            chained,
-            "chained crash/adopt cycles must be equivalent to one full replay"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The flagship causal proof: an adopted restart replays only the durable
-    /// tail, and the engine it produces is the one a full replay would produce.
-    ///
-    /// The falsifiable quantity is `replayed_generations`. A restart that merely
-    /// *succeeded* proves nothing — a full replay also succeeds. Disabling the
-    /// restore (or the coverage skip it enables) makes this equal
-    /// `live_history_generation` and the assertion fails on exactly that number.
-    #[test]
-    fn a_restart_adopting_a_retained_run_replays_only_the_durable_tail() {
-        let mut fixture = preauthor_gate_fixture_with_retention(701_000, true);
-        for round in 0..4u128 {
-            fixture.author_accepted_round(701_100 + round * 100, &format!("base {round}"));
-        }
-
-        // Quiescent snapshot, then genuinely new durable work on top of it.
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        let base = snapshot.history_generation();
-        assert!(base >= 5);
-        assert_eq!(
-            Some(snapshot.scratch_run_id()),
-            fixture.engine.retained_scratch_run_id()
-        );
-        for round in 0..2u128 {
-            fixture.author_accepted_round(701_600 + round * 100, &format!("tail {round}"));
-        }
-        let live = fixture.engine.history_generation;
-        assert_eq!(live, base + 2);
-
-        // Control: a restart with nothing to resume from replays every record
-        // into a fresh retained run. That is what adoption must be equivalent
-        // to, and it is the number the tail claim is measured against.
-        let control = fixture.reopen_resuming(None);
-        assert!(!control.observation.adopted);
-        assert!(!control.observation.refused);
-        assert_eq!(control.observation.replay_base_generation, 0);
-        assert_eq!(control.observation.live_history_generation, live);
-        assert_eq!(
-            control.observation.replayed_generations, live,
-            "a full replay must cover every durable record"
-        );
-        assert_ne!(control.engine_run_id, snapshot.scratch_run_id());
-        let control_state =
-            projection_observation_boundary(&fixture.engine, &fixture_page_ids(&fixture));
-
-        // Restart adopting the retained run the snapshot names.
-        let resumed = fixture.reopen_resuming(Some(&snapshot));
-        assert!(resumed.refusal.is_none(), "{:?}", resumed.refusal);
-        assert!(resumed.observation.adopted);
-        assert!(!resumed.observation.refused);
-        assert_eq!(resumed.engine_run_id, snapshot.scratch_run_id());
-        assert_eq!(resumed.observation.replay_base_generation, base);
-        assert_eq!(resumed.observation.live_history_generation, live);
-        assert_eq!(
-            resumed.observation.replayed_generations, 2,
-            "an adopted restart must replay only the durable tail, not every generation"
-        );
-        assert!(
-            resumed.observation.replayed_generations < control.observation.replayed_generations,
-            "the tail must be strictly shorter than the full replay it replaces"
-        );
-        assert_eq!(
-            fixture.engine.instrumentation().resume,
-            resumed.observation,
-            "the receipt and the standing instrumentation must report the same resume"
-        );
-        assert_eq!(
-            projection_observation_boundary(&fixture.engine, &fixture_page_ids(&fixture)),
-            control_state,
-            "adoption must reach exactly the accepted closure a full replay reaches, at the projection and snapshot boundary as well as at the roots"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The same-process reconstruction seam re-derives the same run-local
-    /// catalog hot state that cross-process adoption does.
-    ///
-    /// `reconstruct_run_local_state` discards hot state and keeps the run, which
-    /// is structurally the same situation adoption is in. Without the
-    /// re-derivation a reconstructed engine cannot project any page, silently
-    /// reports an empty canonical snapshot, and computes the durable
-    /// catalog-checkpoint binding of its next accepted batch from empty heads.
-    /// The seam has no production caller yet, so this is the assertion that
-    /// keeps it from being activated with the defect intact.
-    #[test]
-    fn same_process_reconstruction_keeps_the_run_local_catalog_hot_state() {
-        let mut fixture = preauthor_gate_fixture_with_retention(713_000, true);
-        for round in 0..2u128 {
-            fixture.author_accepted_round(713_100 + round * 100, &format!("reconstruct {round}"));
-        }
-        let pages = fixture_page_ids(&fixture);
-        let before = projection_observation_boundary(&fixture.engine, &pages);
-        let catalog_heads_before = fixture
-            .engine
-            .visible_document_heads
-            .get(&fixture.engine.catalog_document_id)
-            .cloned()
-            .expect("an accepted engine holds the catalog's direct heads");
-        assert!(!catalog_heads_before.is_empty());
-
-        fixture.engine.reconstruct_run_local_state().unwrap();
-
-        assert_eq!(
-            fixture
-                .engine
-                .visible_document_heads
-                .get(&fixture.engine.catalog_document_id),
-            Some(&catalog_heads_before),
-            "reconstruction must keep the catalog's direct heads, which the next accepted batch's durable checkpoint binding is computed from"
-        );
-        assert_eq!(
-            projection_observation_boundary(&fixture.engine, &pages),
-            before,
-            "a reconstructed engine must project exactly what it projected before"
-        );
-
-        // And it can still author: the catalog-checkpoint binding of the next
-        // accepted batch is built from those heads.
-        fixture.author_accepted_round(713_400, "after reconstruction");
-        let after = projection_observation_boundary(&fixture.engine, &pages);
-        let replay = fixture.reopen_resuming(None);
-        assert_eq!(
-            replay.observation.replayed_generations,
-            replay.observation.live_history_generation
-        );
-        assert_eq!(
-            projection_observation_boundary(&fixture.engine, &pages),
-            after,
-            "work authored after a reconstruction must reproduce under a full replay"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// A torn adopted run must fall back to a fresh retained run and a full
-    /// replay, and must leave the damaged run's bytes exactly as it found them.
-    #[test]
-    fn a_truncated_adopted_run_falls_back_to_a_fresh_run_without_touching_its_bytes() {
-        let mut fixture = preauthor_gate_fixture_with_retention(702_000, true);
-        for round in 0..3u128 {
-            fixture.author_accepted_round(702_100 + round * 100, &format!("torn {round}"));
-        }
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        let torn_run = snapshot.scratch_run_id();
-
-        // Release the run's lease, then damage it the way a truncating
-        // filesystem or an interrupted provider copy would.
-        let workspace = fixture.engine.workspace_id();
-        let lineage = fixture.engine.lineage_digest;
-        let catalog = fixture.engine.catalog_document_id;
-        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-        let pages = fixture
-            .archive_path()
-            .join("engine-scratch-v2")
-            .join(format!("run-{torn_run}"))
-            .join("pages.index");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&pages)
-            .unwrap()
-            .set_len(0)
-            .unwrap();
-        let damaged = run_directory_bytes(&fixture.root, torn_run);
-
-        let receipt = fixture.reopen_resuming(Some(&snapshot));
-        assert!(!receipt.observation.adopted);
-        assert!(receipt.observation.refused);
-        assert_eq!(receipt.refused_run_id, Some(torn_run));
-        assert!(receipt.refusal.is_some());
-        assert_ne!(
-            receipt.engine_run_id, torn_run,
-            "a refused run must not become the engine's run"
-        );
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-        assert_eq!(
-            receipt.observation.replayed_generations, receipt.observation.live_history_generation,
-            "a refused adoption must replay every durable record"
-        );
-        assert_eq!(
-            run_directory_bytes(&fixture.root, torn_run),
-            damaged,
-            "the refused run's bytes must be preserved exactly"
-        );
-        // The fresh run really is a different, complete retained run.
-        assert_eq!(
-            run_directory_bytes(&fixture.root, receipt.engine_run_id).len(),
-            4
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// A snapshot naming a run whose canonical marker binding does not match —
-    /// the shape a re-created run reusing the same identity produces — is
-    /// refused at the archive boundary, before the run is ever opened for use.
-    #[test]
-    fn a_binding_mismatched_retained_run_is_refused_and_preserved() {
-        let mut fixture = preauthor_gate_fixture_with_retention(703_000, true);
-        fixture.author_accepted_round(703_100, "binding");
-        let honest = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        let run_id = honest.scratch_run_id();
-        let forged = RuntimeResumeSnapshot {
-            scratch_binding_digest: ContentDigest::of(b"a different owner nonce"),
-            ..honest
-        };
-
-        let workspace = fixture.engine.workspace_id();
-        let lineage = fixture.engine.lineage_digest;
-        let catalog = fixture.engine.catalog_document_id;
-        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-        let before = run_directory_bytes(&fixture.root, run_id);
-
-        let receipt = fixture.reopen_resuming(Some(&forged));
-        assert!(!receipt.observation.adopted);
-        // The refusal happens at the archive boundary, before the engine
-        // exists. The standing instrumentation signal must still report it:
-        // lifecycle wiring bounds retained-run residue from this flag, so a
-        // refusal class it cannot see is a silent leak.
-        assert!(
-            receipt.observation.refused,
-            "an archive-boundary refusal must set the standing refused signal"
-        );
-        assert_eq!(
-            fixture.engine.instrumentation().resume,
-            receipt.observation,
-            "the receipt and the standing instrumentation must report the same resume"
-        );
-        assert_eq!(receipt.refused_run_id, Some(run_id));
-        assert_ne!(receipt.engine_run_id, run_id);
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-        assert_eq!(
-            run_directory_bytes(&fixture.root, run_id),
-            before,
-            "a binding-mismatched run must be preserved byte for byte"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// Every refusal class reports itself on the standing resume observation,
-    /// not only the ones detected after the engine is built.
-    ///
-    /// A run whose directory is simply gone — the ordinary consequence of a
-    /// provider-side removal, or of a lifecycle that reclaimed a run a stale
-    /// resume point still names — is refused inside
-    /// `adopt_retained_engine_scratch`, before an engine exists to rotate. That
-    /// is the most common refusal there is, and
-    /// `EngineInstrumentation::resume.refused` is the signal the lifecycle wiring
-    /// reads to bound retained-run residue.
-    #[test]
-    fn an_archive_boundary_refusal_reports_itself_on_the_standing_observation() {
-        let mut fixture = preauthor_gate_fixture_with_retention(710_000, true);
-        fixture.author_accepted_round(710_100, "absent run");
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        let absent_run = snapshot.scratch_run_id();
-
-        // Drop the engine's lease, then remove the run the snapshot names.
-        let workspace = fixture.engine.workspace_id();
-        let lineage = fixture.engine.lineage_digest;
-        let catalog = fixture.engine.catalog_document_id;
-        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-        std::fs::remove_dir_all(
-            fixture
-                .archive_path()
-                .join("engine-scratch-v2")
-                .join(format!("run-{absent_run}")),
-        )
-        .unwrap();
-
-        let receipt = fixture.reopen_resuming(Some(&snapshot));
-        assert!(!receipt.observation.adopted);
-        assert!(
-            receipt.observation.refused,
-            "an absent run is a refusal and must be observable as one"
-        );
-        assert_eq!(receipt.refused_run_id, Some(absent_run));
-        assert!(receipt.refusal.is_some());
-        assert_ne!(receipt.engine_run_id, absent_run);
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-        assert_eq!(
-            receipt.observation.replayed_generations, receipt.observation.live_history_generation,
-            "a refused adoption must replay every durable record"
-        );
-        assert_eq!(
-            fixture.engine.instrumentation().resume,
-            receipt.observation,
-            "the receipt and the standing instrumentation must report the same resume"
-        );
-        // And the engine it produced is a working one.
-        assert_eq!(
-            projection_page_states(&fixture.engine, &fixture_page_ids(&fixture)).len(),
-            3
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn semantically_wrong_current_path_rows_survive_a_restart_but_fail_before_join() {
-        let mut fixture = preauthor_gate_fixture_with_retention(710_500, true);
-        fixture.author_accepted_round(710_600, "semantic current-path binding");
-        let (digest_page, _, _, digest_path) = fixture.pages[0].clone();
-        let (kind_page, _, _, kind_path) = fixture.pages[1].clone();
-        fixture
-            .engine
-            .replace_current_path_catalog_row_with_name_for_test(
-                digest_page,
-                digest_path.clone(),
-                ManagedTextKind::Page,
-                LogicalPageName::parse("authenticated but wrong accepted name").unwrap(),
-            );
-        fixture
-            .engine
-            .replace_current_path_catalog_row_with_name_for_test(
-                kind_page,
-                kind_path.clone(),
-                ManagedTextKind::Journal,
-                LogicalPageName::parse("Gate 1").unwrap(),
-            );
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("the causal fixture must persist its authenticated wrong rows");
-
-        let resumed = fixture.reopen_resuming(Some(&snapshot));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-        assert_eq!(resumed.observation.replayed_generations, 0);
-
-        let projection = fixture
-            .engine
-            .projection_work_index
-            .as_ref()
-            .unwrap()
-            .clone();
-        let source =
-            JoinedAuthenticatedExpectedPathSource::new(&fixture.engine, projection.as_ref());
-        assert_eq!(
-            source.expected_path_at(&digest_path, joined_point_request()),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::EngineAuthority
-            )),
-            "an authenticated digest that disagrees with accepted PageId state must fail closed"
-        );
-        assert_eq!(
-            source.expected_path_at(&kind_path, joined_point_request()),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::EngineAuthority
-            )),
-            "an authenticated kind that disagrees with accepted PageId state must fail closed"
-        );
-
-        drop(source);
-        drop(projection);
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn schema_twelve_retained_marker_named_by_a_resume_point_refuses_and_fully_replays() {
-        let mut fixture = preauthor_gate_fixture_with_retention(710_700, true);
-        fixture.author_accepted_round(710_800, "old scratch format");
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a valid current-format resume point must name the retained run");
-        let old_run = snapshot.scratch_run_id();
-
-        let workspace = fixture.engine.workspace_id();
-        let lineage = fixture.engine.lineage_digest;
-        let catalog = fixture.engine.catalog_document_id;
-        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-        let old_marker = super::super::scratch_store::rewrite_retained_run_marker_schema_for_test(
-            &fixture.archive_path(),
-            old_run,
-            12,
-        );
-
-        let receipt = fixture.reopen_resuming(Some(&snapshot));
-        assert!(!receipt.observation.adopted);
-        assert!(receipt.observation.refused);
-        assert_eq!(receipt.refused_run_id, Some(old_run));
-        assert_ne!(receipt.engine_run_id, old_run);
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-        assert_eq!(
-            receipt.observation.replayed_generations, receipt.observation.live_history_generation,
-            "an incompatible retained run must be rebuilt only by full immutable-history replay"
-        );
-        assert_eq!(
-            run_directory_bytes(&fixture.root, old_run)["marker"],
-            old_marker,
-            "the incompatible marker must be preserved, never reinterpreted or migrated in place"
-        );
-        assert_eq!(
-            projection_page_states(&fixture.engine, &fixture_page_ids(&fixture)).len(),
-            3,
-            "the authorized fresh-run replay must restore all accepted pages"
-        );
-        assert_eq!(
-            super::super::scratch_store::SCRATCH_SCHEMA_VERSION,
-            13,
-            "this regression is the explicit scratch schema 12 -> 13 transition"
-        );
-        assert_eq!(
-            super::super::scratch_store::AUTHENTICATED_CATALOG_SCHEMA_VERSION,
-            2,
-            "current-path catalog roots and nodes transition from schema 1 -> 2"
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The restore re-checks the snapshot's own run-local quiescence instead of
-    /// installing phantom pending counters.
-    ///
-    /// `scratch_roots` carries the dependency-registration, fanout and
-    /// ready-queue counters, and adoption installs it wholesale. The mint
-    /// refuses a non-quiescent engine; the restore must not be the only step
-    /// that trusts that gate, because the roots it installs are the ones the
-    /// engine will then believe.
-    #[test]
-    fn a_resume_snapshot_with_undrained_staging_work_is_refused() {
-        let mut fixture = preauthor_gate_fixture_with_retention(711_000, true);
-        fixture.author_accepted_round(711_100, "quiescence");
-        let honest = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        assert!(scratch_roots_are_stage_quiescent(honest.scratch_roots()));
-
-        let mut roots = honest.scratch_roots.clone();
-        roots.ready_queue_len = 3;
-        let forged = RuntimeResumeSnapshot {
-            scratch_roots: roots,
-            ..honest.clone()
-        };
-
-        let workspace = fixture.engine.workspace_id();
-        let lineage = fixture.engine.lineage_digest;
-        let catalog = fixture.engine.catalog_document_id;
-        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-
-        let receipt = fixture.reopen_resuming(Some(&forged));
-        assert!(!receipt.observation.adopted);
-        assert!(receipt.observation.refused);
-        let refusal = receipt
-            .refusal
-            .as_ref()
-            .expect("a refused adoption reports why")
-            .to_string();
-        assert!(
-            refusal.contains("undrained run-local staging work"),
-            "run-local quiescence must be the refusal: {refusal}"
-        );
-        assert!(
-            !fixture.engine.has_durable_stage_work(),
-            "the fallback engine must not have inherited the phantom counters"
-        );
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-
-        // The honest snapshot of the same run is still adoptable, so the
-        // refusal was about the forged counters and not about the run.
-        let resumed = fixture.reopen_resuming(Some(&honest));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// A durable head record that no restore could adopt refuses at the mint,
-    /// where the reason is diagnosable, instead of producing a resume point that
-    /// every later restart silently declines into a full replay.
-    ///
-    /// A rejection advances durable history like an acceptance does, so an
-    /// endpoint whose newest durable record is a rejection has a perfectly valid
-    /// history and an unadoptable head. Before this gate the mint happily named
-    /// it and the only symptom was "adoption never works here."
-    #[test]
-    fn a_rejection_at_the_durable_head_refuses_the_resume_snapshot_mint() {
-        let mut fixture = preauthor_gate_fixture_with_retention(712_000, true);
-        fixture.author_accepted_round(712_100, "mint gate");
-        assert!(
-            fixture.engine.runtime_resume_snapshot().unwrap().is_some(),
-            "an accepted head is publishable"
-        );
-        let accepted_generation = fixture.engine.history_generation;
-
-        // An ordinary local round whose external document publication fails is
-        // durably recorded as a rejection, and that rejection becomes the newest
-        // durable record.
-        let draft = fixture.draft_edits(712_200, &[(1, "rejected round")]);
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => {
-                panic!("undisturbed local round unexpectedly requires reconciliation")
-            }
-        };
-        let prepared = fixture
-            .engine
-            .finalize_captured_author_transaction(captured, &fixture.receipts)
-            .unwrap();
-        fixture.writer.publish_prepared(&prepared).unwrap();
-        // The edit touches one membership shard, so the injected failure lands
-        // on that document's external publication.
-        fixture.engine.external_publication_failure_index = Some(0);
-        assert!(matches!(
-            fixture
-                .engine
-                .stage_archive_batch(prepared.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Rejected { .. }
-        ));
-        fixture.engine.external_publication_failure_index = None;
-        assert!(
-            fixture.engine.history_generation > accepted_generation,
-            "a rejection must still advance durable history, or this proves nothing"
-        );
-
-        assert!(
-            fixture.engine.runtime_resume_snapshot().unwrap().is_none(),
-            "a head record no restore could adopt must refuse at the mint, not at every later restart"
-        );
-
-        // The next acceptance restores publishability, and that snapshot really
-        // is adoptable — so the mint gate is about the head record, not about
-        // the endpoint.
-        fixture.author_accepted_round(712_300, "recovered");
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("an accepted head after a rejection is publishable again");
-        let resumed = fixture.reopen_resuming(Some(&snapshot));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// RRP-1: a snapshot whose accepted frontier is ahead of the durable history
-    /// authority it names must authorize no state at all.
-    ///
-    /// The forgery is built out of two honest snapshots of the same endpoint: a
-    /// later frontier grafted onto an earlier durable authority. Nothing about
-    /// it is malformed, its run really exists, its marker really binds, and its
-    /// history root really is an ancestor — only the frontier is ahead. The
-    /// predecessor record's own accepted evidence is what refuses it.
-    #[test]
-    fn a_resume_snapshot_ahead_of_durable_history_authorizes_nothing() {
-        let mut fixture = preauthor_gate_fixture_with_retention(704_000, true);
-        fixture.author_accepted_round(704_100, "ahead a");
-        let earlier = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        fixture.author_accepted_round(704_200, "ahead b");
-        fixture.author_accepted_round(704_300, "ahead c");
-        let later = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-        assert!(later.history_generation() > earlier.history_generation());
-        assert!(later.next_acceptance_sequence() > earlier.next_acceptance_sequence());
-
-        let forged = RuntimeResumeSnapshot {
-            history_generation: earlier.history_generation,
-            history_index_root: earlier.history_index_root,
-            history_latest_batch_id: earlier.history_latest_batch_id,
-            ..later.clone()
-        };
-        let honest_after_full_replay = {
-            let workspace = fixture.engine.workspace_id();
-            let lineage = fixture.engine.lineage_digest;
-            let catalog = fixture.engine.catalog_document_id;
-            fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
-            fixture.reopen_resuming(None);
-            cross_run_engine_facts(&fixture.engine)
-        };
-
-        let receipt = fixture.reopen_resuming(Some(&forged));
-        assert!(
-            !receipt.observation.adopted,
-            "a frontier ahead of durable history must not be adopted"
-        );
-        assert!(receipt.observation.refused);
-        // Pinned to the *frontier* refusal, not merely to "something refused":
-        // the predecessor record's own accepted evidence is the check that must
-        // fire here, and later run-local probes would otherwise mask its removal.
-        let refusal = receipt
-            .refusal
-            .as_ref()
-            .expect("a refused adoption reports why")
-            .to_string();
-        assert!(
-            refusal.contains("accepted frontier is not the predecessor record's authority"),
-            "the accepted-frontier authority must be the refusal, not a later probe: {refusal}"
-        );
-        assert_eq!(receipt.observation.replay_base_generation, 0);
-        assert_eq!(
-            receipt.observation.replayed_generations,
-            receipt.observation.live_history_generation
-        );
-        assert_eq!(
-            cross_run_engine_facts(&fixture.engine),
-            honest_after_full_replay,
-            "the refused snapshot must not have moved any authenticated root"
-        );
-
-        // The honest snapshot of the same run is still adoptable, so the
-        // refusal was about the forged frontier and not about the run.
-        let resumed = fixture.reopen_resuming(Some(&later));
-        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
-        assert_eq!(resumed.observation.replayed_generations, 0);
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The publishability gate: a snapshot exists only for a retained, enrolled,
-    /// quiescent engine with a nonempty durable history.
-    #[test]
-    fn a_resume_snapshot_is_refused_for_every_non_publishable_engine() {
-        // The ordinary ephemeral open holds no retained run at all, so it can
-        // never name one in a resume point.
-        let mut ephemeral = preauthor_gate_fixture(705_000);
-        assert!(ephemeral
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .is_none());
-        ephemeral.author_accepted_round(705_100, "ephemeral");
-        assert!(ephemeral
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .is_none());
-        finish_preauthor_gate_fixture(ephemeral);
-
-        let mut fixture = preauthor_gate_fixture_with_retention(705_200, true);
-        fixture.author_accepted_round(705_300, "publishable");
-        assert!(fixture.engine.runtime_resume_snapshot().unwrap().is_some());
-
-        // An engine inside an authenticated replay is not quiescent.
-        fixture
-            .engine
-            .prepare_operational_recovery_replay()
-            .unwrap();
-        assert!(fixture.engine.runtime_resume_snapshot().unwrap().is_none());
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The snapshot is a quiescent lifecycle read. It must add no admission or
-    /// authoring cost: no scratch page is read or written, no durable state
-    /// moves, and repeating it changes nothing.
-    #[test]
-    fn taking_a_resume_snapshot_costs_no_admission_or_authoring_work() {
-        let mut fixture = preauthor_gate_fixture_with_retention(706_000, true);
-        fixture.author_accepted_round(706_100, "cost");
-
-        let before = fixture.engine.instrumentation();
-        let token_before = fixture.engine.author_mutation_generation();
-        let first = fixture.engine.runtime_resume_snapshot().unwrap().unwrap();
-        let second = fixture.engine.runtime_resume_snapshot().unwrap().unwrap();
-        let after = fixture.engine.instrumentation();
-        assert_eq!(first, second, "a quiescent snapshot must be idempotent");
-        assert_eq!(
-            after.scratch_page_reads, before.scratch_page_reads,
-            "a resume snapshot must read no scratch page"
-        );
-        assert_eq!(
-            after.state_page_bytes_written,
-            before.state_page_bytes_written
-        );
-        assert_eq!(after.state_page_bytes_read, before.state_page_bytes_read);
-        assert_eq!(after.scratch_syncs, before.scratch_syncs);
-        assert_eq!(after.prepare_transactions, before.prepare_transactions);
-        assert_eq!(after.resume, before.resume);
-        assert_eq!(
-            fixture.engine.author_mutation_generation(),
-            token_before,
-            "a resume snapshot must not advance author freshness"
-        );
-        // Authoring never takes one, so the observation is startup-fixed.
-        let authored_before = fixture.engine.instrumentation().resume;
-        for round in 0..3u128 {
-            fixture.author_accepted_round(706_200 + round * 100, &format!("cost {round}"));
-        }
-        assert_eq!(fixture.engine.instrumentation().resume, authored_before);
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// The sealed record/snapshot pair, exercised on a real engine.
-    ///
-    /// `cross_run_engine_facts` and the projection oracle prove that an adopted
-    /// engine *behaves* like a full-replay one; this proves the far cheaper
-    /// property the persistent format has to carry on its own: a record sealed
-    /// from a live engine's snapshot, written to bytes, read back, and re-proved
-    /// against the live open's authority converts to **exactly** the snapshot the
-    /// engine emitted. If it did not, adoption would be resuming from a state no
-    /// engine ever produced, and every downstream proof would be about the wrong
-    /// object.
-    fn resume_point_authority(
-        point: &super::super::resume_point::RuntimeResumePointV2,
-    ) -> super::super::object_store::ResumeAdoptionAuthority {
-        super::super::object_store::ResumeAdoptionAuthority::for_test(
-            point.workspace_id(),
-            super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
-            point.promoted_state_digest(),
-            (
-                point.history_generation(),
-                point.history_index_root(),
-                Some(point.history_latest_batch_id()),
-            ),
-            super::super::resume_point::ResumeEnrollmentAdmission::SameSession(point.enrollment()),
-        )
-    }
-
-    fn seal_resume_point(
-        engine: &ShardedHotEngine,
-        snapshot: &RuntimeResumeSnapshot,
-    ) -> super::super::resume_point::RuntimeResumePointV2 {
-        super::super::resume_point::RuntimeResumePointV2::seal(
-            &super::super::object_store::ResumePointEndpointBinding::for_test(
-                engine.workspace_id(),
-                super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
-                ContentDigest::of(b"resume-record-promoted-state"),
-                1,
-            ),
-            super::super::enrollment::ResumePointEnrollmentBinding::unsafe_for_test(
-                3,
-                ContentDigest::of(b"resume-record-enrollment-head"),
-                SessionId::from_uuid(Uuid::from_u128(0x5127)),
-            ),
-            snapshot,
-        )
-        .expect("a quiescent snapshot seals into a resume point")
-    }
-
-    #[test]
-    fn a_sealed_record_reconstructs_the_exact_snapshot_the_engine_emitted() {
-        let mut fixture = preauthor_gate_fixture_with_retention(709_000, true);
-        for round in 0..3u128 {
-            fixture.author_accepted_round(709_100 + round * 100, &format!("record {round}"));
-        }
-        let snapshot = fixture
-            .engine
-            .runtime_resume_snapshot()
-            .unwrap()
-            .expect("a quiescent retained enrolled engine is publishable");
-
-        let point = seal_resume_point(&fixture.engine, &snapshot);
-        // Through the durable bytes, not around them.
-        let durable = super::super::resume_point::RuntimeResumePointV2::decode(
-            &point
-                .encode()
-                .expect("a live engine's state is publishable"),
-        )
-        .expect("the sealed record must read back");
-        assert_eq!(durable, point);
-
-        let authority = resume_point_authority(&durable);
-        let reconstructed = durable
-            .authenticate(&authority)
-            .expect("a record sealed from this open must re-prove its authority")
-            .into_adoption_snapshot();
-        assert_eq!(
-            reconstructed, snapshot,
-            "a valid record must reconstruct the exact snapshot the live engine emitted"
-        );
-
-        // And the reconstructed snapshot is the one the resuming open adopts.
-        let receipt = fixture.reopen_resuming(Some(&reconstructed));
-        assert!(receipt.observation.adopted, "{:?}", receipt.refusal);
-        assert_eq!(
-            receipt.observation.replay_base_generation,
-            snapshot.history_generation()
-        );
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// Record work is lifecycle work, and must stay out of the edit path.
-    ///
-    /// The snapshot read already has its own cost regression; this extends it
-    /// over the two operations the lifecycle assembly will actually perform each
-    /// publication cycle — sealing the durable record and encoding it — because
-    /// those are the ones a later refactor is most likely to move next to an
-    /// admission or an acceptance.
-    #[test]
-    fn sealing_a_resume_point_record_costs_no_admission_or_authoring_work() {
-        let mut fixture = preauthor_gate_fixture_with_retention(709_500, true);
-        fixture.author_accepted_round(709_600, "seal cost");
-
-        let before = fixture.engine.instrumentation();
-        let token_before = fixture.engine.author_mutation_generation();
-        let snapshot = fixture.engine.runtime_resume_snapshot().unwrap().unwrap();
-        let first = seal_resume_point(&fixture.engine, &snapshot);
-        let first_bytes = first.encode().unwrap();
-        let second = seal_resume_point(&fixture.engine, &snapshot);
-        let after = fixture.engine.instrumentation();
-
-        assert_eq!(
-            first, second,
-            "sealing a quiescent state must be idempotent"
-        );
-        assert_eq!(first_bytes, second.encode().unwrap());
-        assert_eq!(after.scratch_page_reads, before.scratch_page_reads);
-        assert_eq!(after.scratch_syncs, before.scratch_syncs);
-        assert_eq!(after.state_page_bytes_read, before.state_page_bytes_read);
-        assert_eq!(
-            after.state_page_bytes_written,
-            before.state_page_bytes_written
-        );
-        assert_eq!(after.prepare_transactions, before.prepare_transactions);
-        assert_eq!(after.resume, before.resume);
-        assert_eq!(
-            fixture.engine.author_mutation_generation(),
-            token_before,
-            "sealing a record must not advance author freshness"
-        );
-        // Ordinary authoring never seals one, so the standing observation is
-        // still exactly its startup value afterwards.
-        for round in 0..3u128 {
-            fixture.author_accepted_round(709_700 + round * 100, &format!("seal cost {round}"));
-        }
-        assert_eq!(fixture.engine.instrumentation().resume, before.resume);
-
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    fn finish_preauthor_gate_fixture(fixture: PreauthorGateFixture) {
-        let root = fixture.root.clone();
-        drop(fixture);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn projection_accepted_frontier_binding_is_point_bounded_and_rejects_advance() {
-        let mut fixture = preauthor_gate_fixture(89_000);
-        let before = fixture.engine.instrumentation();
-        let candidate = fixture
-            .engine
-            .authenticate_projection_accepted_frontier()
-            .unwrap();
-        let authenticated = fixture.engine.instrumentation();
-        assert_eq!(
-            authenticated.effective_title_projection_authority_calls
-                - before.effective_title_projection_authority_calls,
-            1
-        );
-        assert_eq!(
-            authenticated.effective_title_projection_point_proofs
-                - before.effective_title_projection_point_proofs,
-            3
-        );
-        assert_eq!(
-            authenticated.effective_title_projection_frontier_head_visits
-                - before.effective_title_projection_frontier_head_visits,
-            0
-        );
-
-        fixture.author_accepted_round(89_100, "accepted authority advanced");
-        let fresh = fixture
-            .engine
-            .authenticate_projection_accepted_frontier()
-            .unwrap();
-        assert!(
-            !candidate.matches(&fresh),
-            "a prior transient projection authority survived an accepted-state advance"
-        );
-        assert_eq!(
-            fixture
-                .engine
-                .materialize_page(fixture.pages[0].0)
-                .unwrap()
-                .blocks[0]
-                .content,
-            "accepted authority advanced"
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_same_page_external_edit_returns_reconciliation_without_batch() {
-        let fixture = preauthor_gate_fixture(90_000);
-        let draft = fixture.draft_edits(90_100, &[(0, "local")]);
-        std::fs::write(
-            fixture.graph_path(&fixture.pages[0].3),
-            b"- unseen external\n",
-        )
-        .unwrap();
-        let committed_before = fixture.writer.committed_manifests().unwrap();
-        let reconciliation = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(_) => panic!("unseen exact bytes passed capture"),
-            LocalAuthorCapture::ReconciliationNeeded(reconciliation) => reconciliation,
-        };
-        assert_eq!(reconciliation.paths(), &[fixture.pages[0].3.clone()]);
-        assert_eq!(
-            fixture.writer.committed_manifests().unwrap(),
-            committed_before
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_exact_match_returns_finalizable_sealed_token() {
-        let fixture = preauthor_gate_fixture(90_500);
-        let batch_id = BatchId::from_uuid(Uuid::from_u128(90_600));
-        let draft = fixture.draft_edits(90_600, &[(0, "accepted local")]);
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("exact base did not pass"),
-        };
-        let prepared = fixture
-            .engine
-            .finalize_captured_author_transaction(captured, &fixture.receipts)
-            .unwrap();
-        assert_eq!(prepared.manifest().batch_id(), batch_id);
-        assert_eq!(prepared.manifest().origin(), BatchOrigin::LocalMutation);
-        assert_eq!(
-            prepared
-                .objects()
-                .iter()
-                .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
-                .count(),
-            1
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_returns_complete_sorted_exact_set_and_ignores_unrelated_page() {
-        let fixture = preauthor_gate_fixture(91_000);
-        let draft = fixture.draft_edits(91_100, &[(0, "local a"), (1, "local b")]);
-        std::fs::write(fixture.graph_path(&fixture.pages[1].3), b"- external b\n").unwrap();
-        std::fs::write(fixture.graph_path(&fixture.pages[0].3), b"- external a\n").unwrap();
-        std::fs::write(
-            fixture.graph_path(&fixture.pages[2].3),
-            b"- unrelated external c\n",
-        )
-        .unwrap();
-        let reconciliation = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(_) => panic!("two stale paths passed capture"),
-            LocalAuthorCapture::ReconciliationNeeded(reconciliation) => reconciliation,
-        };
-        assert_eq!(
-            reconciliation.paths(),
-            &[fixture.pages[0].3.clone(), fixture.pages[1].3.clone()]
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_rename_includes_old_new_and_render_base_requirements() {
-        let fixture = preauthor_gate_fixture(92_000);
-        let new_path = ManagedPath::parse("pages/gate-renamed.md").unwrap();
-        let draft = fixture
-            .engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: BatchId::from_uuid(Uuid::from_u128(92_100)),
-                    author_device_id: fixture.endpoint.device_id,
-                    author_session_id: SessionId::from_uuid(Uuid::from_u128(92_101)),
-                    crdt_peer_id: CrdtPeerId::from_u64(92_102),
-                },
-                BatchOrigin::LocalMutation,
-                &OperationTransaction::new(vec![SemanticOperation::EditPagePath {
-                    page_id: fixture.pages[0].0,
-                    path: new_path.clone(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(draft.requirements.len(), 2);
-        assert!(draft
-            .requirements
-            .iter()
-            .any(|requirement| requirement.render_base_path() == Some(&fixture.pages[0].3)));
-        std::fs::write(fixture.graph_path(&fixture.pages[0].3), b"- changed old\n").unwrap();
-        std::fs::write(fixture.graph_path(&new_path), b"- occupied new\n").unwrap();
-        let reconciliation = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(_) => panic!("stale rename paths passed capture"),
-            LocalAuthorCapture::ReconciliationNeeded(reconciliation) => reconciliation,
-        };
-        assert_eq!(
-            reconciliation.paths(),
-            &[fixture.pages[0].3.clone(), new_path]
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_local_move_to_absent_destination_uses_prior_semantic_layout() {
-        let fixture = preauthor_gate_fixture(92_500);
-        let old_path = fixture.pages[0].3.clone();
-        let prior_bytes = std::fs::read(fixture.graph_path(&old_path)).unwrap();
-        let new_path = ManagedPath::parse("pages/gate-local-moved.md").unwrap();
-        assert!(!fixture.graph_path(&new_path).exists());
-        let draft = fixture
-            .engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: BatchId::from_uuid(Uuid::from_u128(92_600)),
-                    author_device_id: fixture.endpoint.device_id,
-                    author_session_id: SessionId::from_uuid(Uuid::from_u128(92_601)),
-                    crdt_peer_id: CrdtPeerId::from_u64(92_602),
-                },
-                BatchOrigin::LocalMutation,
-                &OperationTransaction::new(vec![SemanticOperation::EditPagePath {
-                    page_id: fixture.pages[0].0,
-                    path: new_path.clone(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => {
-                panic!("absent local move destination unexpectedly required reconciliation")
-            }
-        };
-        let prepared = fixture
-            .engine
-            .finalize_captured_author_transaction(captured, &fixture.receipts)
-            .unwrap();
-        let destination = prepared
-            .objects()
-            .iter()
-            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
-            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
-            .find(|intent| intent.path() == &new_path)
-            .expect("local move must manifest its destination");
-        assert!(matches!(
-            destination.precondition(),
-            ManifestProjectionPrecondition::Absent
-        ));
-        assert!(
-            destination.render_base().is_some(),
-            "an absent local destination must retain the prior-semantic render base"
-        );
-        let ManifestProjectionTarget::Present { bytes, .. } = destination.target() else {
-            panic!("local move destination must be present");
-        };
-        assert_eq!(
-            bytes, &prior_bytes,
-            "an absent local destination must render from authenticated prior semantics"
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_token_is_single_use_and_rejects_forgery_cross_draft_and_staleness() {
-        let mut fixture = preauthor_gate_fixture(93_000);
-        let forged_draft = fixture.draft_edits(93_100, &[(0, "forged")]);
-        let mut forged = match fixture
-            .engine
-            .capture_local_author_transaction(
-                forged_draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("fresh fixture was stale"),
-        };
-        forged.requirement_digest = ContentDigest::of(b"forged");
-        assert!(matches!(
-            fixture
-                .engine
-                .finalize_captured_author_transaction(forged, &fixture.receipts),
-            Err(EngineError::ProjectionManifest(message))
-                if message.contains("requirement binding")
-        ));
-
-        let first_draft = fixture.draft_edits(93_200, &[(0, "first")]);
-        let mut cross_draft = match fixture
-            .engine
-            .capture_local_author_transaction(
-                first_draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("fresh fixture was stale"),
-        };
-        cross_draft.draft = fixture.draft_edits(93_300, &[(1, "other draft")]);
-        assert!(matches!(
-            fixture
-                .engine
-                .finalize_captured_author_transaction(cross_draft, &fixture.receipts),
-            Err(EngineError::ProjectionManifest(message))
-                if message.contains("requirement binding")
-        ));
-
-        let stale_draft = fixture.draft_edits(93_400, &[(0, "eventually stale")]);
-        let stale = match fixture
-            .engine
-            .capture_local_author_transaction(
-                stale_draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("fresh fixture was stale"),
-        };
-        let advancing_draft = fixture.draft_edits(93_500, &[(1, "advance")]);
-        let advancing = match fixture
-            .engine
-            .capture_local_author_transaction(
-                advancing_draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("fresh fixture was stale"),
-        };
-        let advancing = fixture
-            .engine
-            .finalize_captured_author_transaction(advancing, &fixture.receipts)
-            .unwrap();
-        let advancing_batch = advancing.manifest().batch_id();
-        fixture.writer.publish_prepared(&advancing).unwrap();
-        fixture.engine.stage_archive_batch(advancing_batch).unwrap();
-        assert!(matches!(
-            fixture
-                .engine
-                .finalize_captured_author_transaction(stale, &fixture.receipts),
-            Err(EngineError::AuthorDraftStale)
-        ));
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn preauthor_gate_capture_bounds_block_before_retention_overflow() {
-        assert!(matches!(
-            enforce_preauthoring_path_bounds(MAX_PREAUTHORING_CAPTURE_PATHS + 1, 0),
-            Err(EngineError::ProjectionManifest(message))
-                if message.contains("path count")
-        ));
-        assert!(matches!(
-            enforce_preauthoring_path_bounds(1, MAX_PREAUTHORING_CAPTURE_PATH_BYTES + 1),
-            Err(EngineError::ProjectionManifest(message))
-                if message.contains("path bytes")
-        ));
-        let mut retained = MAX_PREAUTHORING_CAPTURE_BYTES - 1;
-        charge_preauthoring_capture_bytes(&mut retained, 1, "test bytes").unwrap();
-        assert_eq!(retained, MAX_PREAUTHORING_CAPTURE_BYTES);
-        assert!(matches!(
-            charge_preauthoring_capture_bytes(&mut retained, 1, "test bytes"),
-            Err(EngineError::ProjectionManifest(message))
-                if message.contains("exceed bound")
-        ));
-    }
-
-    #[test]
-    fn preauthor_gate_index_work_scales_with_requirements_and_observations() {
-        const REQUIREMENTS: usize = 20_000;
-        const EXACT_PATHS: usize = REQUIREMENTS * 2;
-
-        let mut requirements = Vec::with_capacity(REQUIREMENTS);
-        let mut pages = BTreeMap::new();
-        let mut observations = Vec::with_capacity(EXACT_PATHS);
-        for index in 0..REQUIREMENTS {
-            let page_id = PageId::from_uuid(Uuid::from_u128(100_000 + index as u128));
-            let home_document_id = DocumentId::from_uuid(Uuid::from_u128(200_000 + index as u128));
-            let path = ManagedPath::parse(&format!("pages/scale-new-{index:05}.md")).unwrap();
-            let render_base_path =
-                ManagedPath::parse(&format!("pages/scale-old-{index:05}.md")).unwrap();
-            requirements.push(ProjectionRequirement {
-                page_id,
-                path: path.clone(),
-                precondition: ProjectionRequirementState::Absent,
-                target: ProjectionRequirementState::Present,
-                render_base_path: Some(render_base_path.clone()),
-            });
-            pages.insert(
-                page_id,
-                DraftProjectionPage {
-                    before: Some(ProjectionPageState {
-                        page: MaterializedPage {
-                            page_id,
-                            home_document_id,
-                            name: LogicalPageName::parse(&format!("Scale {index}")).unwrap(),
-                            path: render_base_path.clone(),
-                            kind: ManagedTextKind::Page,
-                            preamble: None,
-                            blocks: Vec::new(),
-                            stats: MaterializationStats::default(),
-                        },
-                        frontier: FrontierV2::default(),
-                        claim_evidence: Vec::new(),
-                    }),
-                    after: None,
-                    post_frontier: FrontierV2::default(),
-                },
-            );
-            observations.push(
-                ExternalImportObservationEntry::new(
-                    path,
-                    ManagedTextKind::Page,
-                    ExternalImportObservationState::Absent,
-                )
-                .unwrap(),
-            );
-            observations.push(
-                ExternalImportObservationEntry::new(
-                    render_base_path,
-                    ManagedTextKind::Page,
-                    ExternalImportObservationState::Absent,
-                )
-                .unwrap(),
-            );
-        }
-        let observation = ExternalImportObservationMaterial::new(
-            WorkspaceId::from_uuid(Uuid::from_u128(300_000)),
-            ImportId::from_digest([0x5a; 32]),
-            observations,
-        )
-        .unwrap();
-
-        reset_preauthor_lookup_stats();
-        let (index, observation_index) =
-            derive_preauthoring_indexes(&requirements, &pages, Some(&observation)).unwrap();
-        assert_eq!(index.len(), EXACT_PATHS);
-        assert_eq!(
-            index.retained_bytes().unwrap(),
-            EXACT_PATHS * std::mem::size_of::<AuthorRequirementPathEntry>()
-                + std::mem::size_of::<AuthorRequirementIndex>()
-        );
-
-        let observation_index = observation_index.unwrap();
-        let mut predecessor_paths = 0;
-        let mut render_base_paths = 0;
-        for indexed_path in index.entries() {
-            let path = indexed_path.path(&requirements);
-            let roles = indexed_path.roles();
-            predecessor_paths += usize::from(roles.semantic_predecessor.is_some());
-            render_base_paths += usize::from(roles.render_base_owner.is_some());
-            assert!(
-                external_observation_for_path(&observation_index, &observation, path).is_some()
-            );
-        }
-        for indexed_path in index.entries() {
-            let _ = indexed_path.roles();
-        }
-        assert_eq!(predecessor_paths, REQUIREMENTS);
-        assert_eq!(render_base_paths, REQUIREMENTS);
-
-        let stats = preauthor_lookup_stats();
-        assert_eq!(stats.requirement_visits, REQUIREMENTS);
-        assert_eq!(stats.observation_visits, EXACT_PATHS);
-        assert_eq!(stats.requirement_lookups, EXACT_PATHS * 2);
-        assert_eq!(stats.observation_lookups, EXACT_PATHS);
-        assert_eq!(
-            stats.requirement_visits
-                + stats.observation_visits
-                + stats.requirement_lookups
-                + stats.observation_lookups,
-            REQUIREMENTS + EXACT_PATHS * 4
-        );
-    }
-
-    #[test]
-    fn post_capture_graph_race_is_still_blocked_by_projection_precondition() {
-        let mut fixture = preauthor_gate_fixture(94_000);
-        let draft = fixture.draft_edits(94_100, &[(0, "local after capture")]);
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => panic!("fresh fixture was stale"),
-        };
-        let external = b"- post-capture external\n";
-        std::fs::write(fixture.graph_path(&fixture.pages[0].3), external).unwrap();
-        let prepared = fixture
-            .engine
-            .finalize_captured_author_transaction(captured, &fixture.receipts)
-            .unwrap();
-        let batch_id = prepared.manifest().batch_id();
-        fixture.writer.publish_prepared(&prepared).unwrap();
-        fixture.engine.stage_archive_batch(batch_id).unwrap();
-        let work = fixture
-            .engine
-            .projection_work_index()
-            .unwrap()
-            .pending_for_path(&fixture.pages[0].3)
-            .unwrap()
-            .into_iter()
-            .find(|work| work.batch_id() == batch_id)
-            .unwrap();
-        assert!(crate::oplog::execute_manifested_projection_work(
-            &fixture.graph,
-            &fixture.receipts,
-            &mut fixture.engine,
-            &work,
-        )
-        .is_err());
-        assert_eq!(
-            std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap(),
-            external
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
     fn dependencies_for(
         engine: &ShardedHotEngine,
         document_id: DocumentId,
@@ -36526,685 +33579,6 @@ mod validation_tests {
         rows
     }
 
-    fn joined_page_limits(rows: usize) -> ExpectedPathStreamLimits {
-        ExpectedPathStreamLimits {
-            maximum_rows: rows.max(1),
-            maximum_path_bytes: MAX_CURRENT_PATH_CURSOR_PATH_BYTES,
-            maximum_aggregate_path_bytes: 4 * 1024 * 1024,
-            maximum_page_rows: rows.clamp(1, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
-            maximum_page_bytes: 1024 * 1024,
-            maximum_retained_rows: rows.max(1).saturating_add(8),
-            maximum_retained_bytes: 8 * 1024 * 1024,
-        }
-    }
-
-    fn joined_page_request(rows: usize) -> ExpectedPathPageRequest {
-        ExpectedPathPageRequest {
-            maximum_rows: rows.max(1),
-            maximum_path_bytes: MAX_CURRENT_PATH_CURSOR_PATH_BYTES,
-            maximum_aggregate_path_bytes: 1024 * 1024,
-            maximum_retained_rows: rows.max(1).saturating_add(4),
-            maximum_retained_bytes: 1024 * 1024,
-        }
-    }
-
-    fn joined_point_request() -> ExpectedPathPointRequest {
-        ExpectedPathPointRequest {
-            maximum_path_bytes: MAX_CURRENT_PATH_CURSOR_PATH_BYTES,
-            maximum_retained_rows: 8,
-            maximum_retained_bytes: 1024 * 1024,
-        }
-    }
-
-    fn joined_tight_page_request(
-        path: &ManagedPath,
-        validation_budget: u64,
-    ) -> ExpectedPathPageRequest {
-        let path_bytes = path.as_str().len();
-        let retained_page_bytes = std::mem::size_of::<CurrentPathCatalogRow>()
-            .saturating_add(std::mem::size_of::<AuthenticatedExpectedPath>())
-            .saturating_add(path_bytes.saturating_mul(2));
-        ExpectedPathPageRequest {
-            maximum_rows: 1,
-            maximum_path_bytes: path_bytes,
-            maximum_aggregate_path_bytes: path_bytes as u64,
-            maximum_retained_rows: 4,
-            maximum_retained_bytes: (retained_page_bytes as u64)
-                .checked_add(validation_budget)
-                .unwrap(),
-        }
-    }
-
-    fn record_joined_present_rows(
-        engine: &ShardedHotEngine,
-        seed: u128,
-    ) -> Vec<(CurrentPathCatalogRow, Vec<u8>)> {
-        let projection = engine.projection_work_index.as_ref().unwrap();
-        collect_cursor_rows(engine, 17)
-            .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let bytes =
-                    format!("joined:{}:{}", row.page_id(), row.path().as_str()).into_bytes();
-                projection
-                    .record_expected_completion_for_test(
-                        row.page_id(),
-                        row.path().clone(),
-                        ProjectionWorkTarget::Present(BlobDescription::of(&bytes)),
-                        seed.saturating_add(index as u128),
-                    )
-                    .unwrap();
-                (row, bytes)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn joined_expected_source_drives_real_scan_pagination_and_semantic_transitions() {
-        let lineage = LineageDigest::of(b"joined-scan-semantic-transitions");
-        let (root, writer, mut engine, _) = enrolled_test_engine(316_100, lineage);
-        let ids = stage_cursor_pages(&mut engine, 316_110, 316_200, 5);
-        stage_cursor_transaction(
-            &mut engine,
-            316_120,
-            OperationTransaction::new(vec![
-                SemanticOperation::RenamePagesAndRewriteReferrers {
-                    page_changes: vec![PageRename {
-                        page_id: ids[0],
-                        new_name: LogicalPageName::parse("Joined Journal").unwrap(),
-                        new_path: ManagedPath::parse("journals/2026_07_26.org").unwrap(),
-                    }],
-                    block_rewrites: Vec::new(),
-                    page_preamble_rewrites: Vec::new(),
-                },
-                SemanticOperation::SetPageKind {
-                    page_id: ids[0],
-                    kind: ManagedTextKind::Journal,
-                },
-                SemanticOperation::DeletePage { page_id: ids[1] },
-            ])
-            .unwrap(),
-        );
-        let rows = record_joined_present_rows(&engine, 316_300);
-        assert_eq!(rows.len(), 4);
-        assert!(rows.iter().any(|(row, _)| {
-            row.path().as_str() == "journals/2026_07_26.org"
-                && row.kind() == ManagedTextKind::Journal
-        }));
-
-        let graph_root = root.join("graph");
-        for (index, (row, bytes)) in rows.iter().enumerate() {
-            if index == 1 {
-                continue;
-            }
-            let path = graph_root.join(row.path().as_str());
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let content: &[u8] = if index == 2 {
-                b"external edit"
-            } else {
-                bytes.as_slice()
-            };
-            std::fs::write(path, content).unwrap();
-        }
-        std::fs::write(graph_root.join("root-created.MARKDOWN"), b"created").unwrap();
-        let graph = Graph::open(&graph_root);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        let scan = scan_graph_text(
-            &graph,
-            &source,
-            GraphTextScanLimits {
-                expected_page_rows: 2,
-                ..GraphTextScanLimits::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(scan.instrumentation.expected_pages, 2);
-        assert_eq!(scan.candidates.len(), 3);
-        assert!(scan.candidates.iter().any(|candidate| {
-            candidate.change == GraphTextCandidateKind::Creation
-                && candidate.path.as_str() == "root-created.MARKDOWN"
-                && candidate.managed_kind.is_none()
-        }));
-        assert!(scan.candidates.iter().any(|candidate| {
-            candidate.change == GraphTextCandidateKind::Absence && candidate.path == rows[1].0.path
-        }));
-        assert!(scan.candidates.iter().any(|candidate| {
-            candidate.change == GraphTextCandidateKind::Edit && candidate.path == rows[2].0.path
-        }));
-        assert!(scan
-            .candidates
-            .windows(2)
-            .all(|pair| pair[0].path <= pair[1].path));
-
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_manifested_completion_obeys_one_causal_budget() {
-        use super::super::projection_work_index::ProjectionExpectedPathBudgetReadKind;
-
-        let lineage = LineageDigest::of(b"joined-manifested-retained-budget");
-        let (root, writer, mut engine, _) = enrolled_test_engine(316_350, lineage);
-        stage_cursor_pages(&mut engine, 316_351, 316_360, 1);
-        let row = collect_cursor_rows(&engine, 1).pop().unwrap();
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        let batch_id = BatchId::from_uuid(Uuid::from_u128(316_365));
-        let descriptor = crate::oplog::ObjectDescriptor::new(
-            DocumentId::from_uuid(Uuid::from_u128(316_366)),
-            ObjectKind::ProjectionIntent,
-            ContentDigest::of(b"joined manifested budget intent"),
-            1,
-        )
-        .unwrap();
-        let work = ProjectionWork::new(
-            engine.workspace_id(),
-            endpoint.endpoint_id(),
-            endpoint.graph_resource_id(),
-            batch_id,
-            row.page_id(),
-            row.path().clone(),
-            PortablePathIndexRoot::empty(),
-            ManifestObjectRef::from_descriptor(&descriptor),
-            FrontierV2::default(),
-            ProjectionWorkTarget::Present(BlobDescription::of(b"manifested joined target")),
-        );
-        let manifest_fingerprint = ContentDigest::of(b"joined manifested budget manifest");
-        projection
-            .prepare_batch(
-                batch_id,
-                manifest_fingerprint,
-                std::slice::from_ref(&work),
-                &[],
-            )
-            .unwrap();
-        projection
-            .accept_batch_at_history_for_test(
-                batch_id,
-                manifest_fingerprint,
-                engine.history_generation,
-                engine.history_root,
-            )
-            .unwrap();
-        projection
-            .complete_manifested_work_for_test(&work, 316_370)
-            .unwrap();
-
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        let mut root_trace_budget = ProjectionExpectedPathReadBudget::new(1024 * 1024);
-        projection
-            .pin_expected_path_head(&mut root_trace_budget)
-            .unwrap();
-        let initial_root_read = root_trace_budget
-            .read_trace()
-            .into_iter()
-            .find(|read| read.kind == ProjectionExpectedPathBudgetReadKind::PinnedRoot)
-            .unwrap();
-        let initial_root_one_byte_short = initial_root_read
-            .consumed_before
-            .checked_add(initial_root_read.retained_bytes)
-            .and_then(|required| required.checked_sub(1))
-            .unwrap();
-        let mut initial_limits = joined_page_limits(1);
-        initial_limits.maximum_retained_bytes = initial_root_one_byte_short;
-        assert!(matches!(
-            source.open_expected_paths(initial_limits),
-            Err(ExpectedPathSourceFailure::BoundExceeded)
-        ));
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        let joined = source
-            .expected_path_at(row.path(), joined_point_request())
-            .unwrap()
-            .unwrap();
-        assert_eq!(joined.page_id, row.page_id());
-        assert_eq!(joined.path, *row.path());
-        let ProjectionWorkTarget::Present(expected_description) = work.target() else {
-            panic!("cursor fixture work must project a present target");
-        };
-        assert_eq!(joined.description, expected_description);
-
-        let mut pin_budget = ProjectionExpectedPathReadBudget::new(1024 * 1024);
-        let pinned = projection.pin_expected_path_head(&mut pin_budget).unwrap();
-        let (_, trace) = projection
-            .completed_receipt_budget_trace_for_test(pinned, row.path(), 1024 * 1024)
-            .unwrap();
-        let one_byte_short = |kind| {
-            let read = trace.iter().find(|read| read.kind == kind).unwrap();
-            read.consumed_before
-                .checked_add(read.retained_bytes)
-                .and_then(|required| required.checked_sub(1))
-                .unwrap()
-        };
-        let node_budget = one_byte_short(ProjectionExpectedPathBudgetReadKind::StateNode);
-        let prepared_budget = one_byte_short(ProjectionExpectedPathBudgetReadKind::PreparedBatch);
-        assert!(prepared_budget > node_budget);
-
-        let (_, mut trace_cursor) = source.open_expected_paths(joined_page_limits(1)).unwrap();
-        let trace_request = joined_page_request(1);
-        let (traced_page, joined_trace) =
-            source.read_expected_path_page_budget_trace_for_test(&mut trace_cursor, trace_request);
-        assert_eq!(traced_page.unwrap().rows.len(), 1);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-        let post_join_root_reads = joined_trace
-            .iter()
-            .filter(|read| read.kind == ProjectionExpectedPathBudgetReadKind::PinnedRoot)
-            .count();
-        let post_join_root = joined_trace
-            .iter()
-            .rev()
-            .find(|read| read.kind == ProjectionExpectedPathBudgetReadKind::PinnedRoot)
-            .unwrap();
-        let post_join_root_one_byte_short = post_join_root
-            .consumed_before
-            .checked_add(post_join_root.retained_bytes)
-            .and_then(|required| required.checked_sub(1))
-            .unwrap();
-        let (_, mut post_join_cursor) = source.open_expected_paths(joined_page_limits(1)).unwrap();
-        let mut post_join_request = trace_request;
-        post_join_request.maximum_retained_bytes = post_join_root_one_byte_short;
-        let (post_join_result, short_trace) = source.read_expected_path_page_budget_trace_for_test(
-            &mut post_join_cursor,
-            post_join_request,
-        );
-        assert!(matches!(
-            post_join_result,
-            Err(ExpectedPathSourceFailure::BoundExceeded)
-        ));
-        assert_eq!(
-            short_trace
-                .iter()
-                .filter(|read| read.kind == ProjectionExpectedPathBudgetReadKind::PinnedRoot)
-                .count(),
-            post_join_root_reads - 1
-        );
-        assert_eq!(
-            short_trace.last().map(|read| read.kind),
-            Some(ProjectionExpectedPathBudgetReadKind::Head)
-        );
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-        drop(trace_cursor);
-        drop(post_join_cursor);
-
-        let mut stable_budget = ProjectionExpectedPathReadBudget::new(1024 * 1024);
-        let stable_head = projection
-            .pin_expected_path_head(&mut stable_budget)
-            .unwrap();
-        for budget in [node_budget, prepared_budget] {
-            let (_, mut cursor) = source.open_expected_paths(joined_page_limits(1)).unwrap();
-            let result = source.read_expected_path_page(
-                &mut cursor,
-                joined_tight_page_request(row.path(), budget),
-            );
-            assert!(
-                matches!(result, Err(ExpectedPathSourceFailure::BoundExceeded)),
-                "one-byte-short validation budget {budget} returned {result:?}"
-            );
-            let mut current_budget = ProjectionExpectedPathReadBudget::new(1024 * 1024);
-            assert_eq!(
-                projection
-                    .pin_expected_path_head(&mut current_budget)
-                    .unwrap(),
-                stable_head
-            );
-            assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-        }
-
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_rejects_missing_ambiguous_absent_and_misbound_completion() {
-        let lineage = LineageDigest::of(b"joined-scan-completion-failures");
-        let (root, writer, engine, _) = enrolled_test_engine(316_400, lineage);
-        let mut engine = engine;
-        stage_cursor_pages(&mut engine, 316_410, 316_500, 4);
-        let rows = collect_cursor_rows(&engine, 4);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-
-        assert_eq!(
-            source.expected_path_at(rows[0].path(), joined_point_request()),
-            Err(ExpectedPathSourceFailure::Missing)
-        );
-        projection
-            .record_expected_completion_for_test(
-                rows[1].page_id(),
-                rows[1].path().clone(),
-                ProjectionWorkTarget::Absent,
-                316_600,
-            )
-            .unwrap();
-        assert_eq!(
-            source.expected_path_at(rows[1].path(), joined_point_request()),
-            Err(ExpectedPathSourceFailure::Missing)
-        );
-        projection
-            .record_expected_completion_for_test(
-                rows[2].page_id(),
-                rows[2].path().clone(),
-                ProjectionWorkTarget::Present(BlobDescription::of(b"first")),
-                316_601,
-            )
-            .unwrap();
-        projection
-            .record_expected_completion_for_test(
-                rows[2].page_id(),
-                rows[2].path().clone(),
-                ProjectionWorkTarget::Present(BlobDescription::of(b"second")),
-                316_602,
-            )
-            .unwrap();
-        assert_eq!(
-            source.expected_path_at(rows[2].path(), joined_point_request()),
-            Err(ExpectedPathSourceFailure::Ambiguous)
-        );
-        projection
-            .record_expected_completion_for_test(
-                PageId::from_uuid(Uuid::from_u128(999_999)),
-                rows[3].path().clone(),
-                ProjectionWorkTarget::Present(BlobDescription::of(b"wrong page")),
-                316_603,
-            )
-            .unwrap();
-        assert_eq!(
-            source.expected_path_at(rows[3].path(), joined_point_request()),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::CompletedReceiptIdentity
-            ))
-        );
-
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_rejects_projection_changes_between_pages_and_opens() {
-        let lineage = LineageDigest::of(b"joined-scan-projection-staleness");
-        let (root, writer, mut engine, _) = enrolled_test_engine(316_700, lineage);
-        stage_cursor_pages(&mut engine, 316_710, 316_800, 3);
-        let rows = record_joined_present_rows(&engine, 316_900);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        let (first_header, mut cursor) = source.open_expected_paths(joined_page_limits(3)).unwrap();
-        let first = source
-            .read_expected_path_page(&mut cursor, joined_page_request(1))
-            .unwrap();
-        assert_eq!(first.rows.len(), 1);
-        assert!(!first.done);
-        projection
-            .record_expected_completion_for_test(
-                PageId::from_uuid(Uuid::from_u128(316_999)),
-                ManagedPath::parse("pages/unrelated-projection-head.md").unwrap(),
-                ProjectionWorkTarget::Present(BlobDescription::of(b"unrelated")),
-                316_999,
-            )
-            .unwrap();
-        assert!(matches!(
-            source.read_expected_path_page(&mut cursor, joined_page_request(1)),
-            Err(ExpectedPathSourceFailure::Unavailable)
-        ));
-        drop(cursor);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        let (second_header, second_cursor) =
-            source.open_expected_paths(joined_page_limits(3)).unwrap();
-        assert_ne!(first_header.binding, second_header.binding);
-        assert_ne!(
-            first_header.source_commitment,
-            second_header.source_commitment
-        );
-        drop(second_cursor);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-        assert_eq!(rows.len(), 3);
-
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_rejects_stale_engine_frontier_and_history_cursor() {
-        let lineage = LineageDigest::of(b"joined-scan-engine-staleness");
-        let (root, writer, mut engine, _) = enrolled_test_engine(316_950, lineage);
-        stage_cursor_pages(&mut engine, 316_951, 316_960, 2);
-        record_joined_present_rows(&engine, 316_970);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let (stale_header, detached) = {
-            let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-            source
-                .open_detached_for_test(joined_page_limits(2))
-                .unwrap()
-        };
-
-        stage_cursor_pages(&mut engine, 316_980, 316_990, 1);
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        let current = source.current_binding(1024 * 1024).unwrap();
-        assert_ne!(
-            stale_header.binding.accepted_frontier,
-            current.accepted_frontier
-        );
-        let mut cursor = source.attach_detached_for_test(detached);
-        assert!(matches!(
-            source.read_expected_path_page(&mut cursor, joined_page_request(1)),
-            Err(ExpectedPathSourceFailure::Unavailable)
-        ));
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        drop(cursor);
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_cancels_abandoned_slots_and_rejects_authenticated_tamper() {
-        let lineage = LineageDigest::of(b"joined-scan-cancel-tamper");
-        let (root, writer, mut engine, _) = enrolled_test_engine(317_000, lineage);
-        stage_cursor_pages(&mut engine, 317_010, 317_100, 2);
-        record_joined_present_rows(&engine, 317_200);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        let mut too_few_rows = joined_page_limits(2);
-        too_few_rows.maximum_rows = 1;
-        assert!(matches!(
-            source.open_expected_paths(too_few_rows),
-            Err(ExpectedPathSourceFailure::BoundExceeded)
-        ));
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        let (_, abandoned) = source.open_expected_paths(joined_page_limits(2)).unwrap();
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 1);
-        drop(abandoned);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        let (_, mut over_requested) = source.open_expected_paths(joined_page_limits(2)).unwrap();
-        let mut oversized_request = joined_page_request(1);
-        oversized_request.maximum_rows = 3;
-        assert!(matches!(
-            source.read_expected_path_page(&mut over_requested, oversized_request),
-            Err(ExpectedPathSourceFailure::BoundExceeded)
-        ));
-        drop(over_requested);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        let first_path = collect_cursor_rows(&engine, 2)[0].path.clone();
-        let mut tiny_point = joined_point_request();
-        tiny_point.maximum_retained_bytes = 1;
-        assert!(matches!(
-            source.expected_path_at(&first_path, tiny_point),
-            Err(ExpectedPathSourceFailure::BoundExceeded)
-        ));
-
-        let (_, mut cursor) = source.open_expected_paths(joined_page_limits(2)).unwrap();
-        engine
-            .scratch
-            .as_ref()
-            .unwrap()
-            .tamper_authenticated_catalog_root_for_test(&engine.current_path_catalog.root);
-        assert!(matches!(
-            source.read_expected_path_page(&mut cursor, joined_page_request(1)),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::EngineAuthority
-            ))
-        ));
-
-        drop(cursor);
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_retries_authenticated_history_extension_and_rejects_cross_identity_indexes(
-    ) {
-        let lineage = LineageDigest::of(b"joined-scan-cross-identity");
-        let (root, writer, mut engine, _) = enrolled_test_engine(317_250, lineage);
-        stage_cursor_pages(&mut engine, 317_260, 317_270, 1);
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        let receipt_store_id = engine.projection_receipt_store_id().unwrap();
-
-        let open_index = |name: &str,
-                          workspace_id: WorkspaceId,
-                          endpoint_id: ProjectionEndpointId,
-                          receipt_store_id: ProjectionReceiptStoreId| {
-            let store = ObjectStore::open(&root.join(name), workspace_id).unwrap();
-            store
-                .open_projection_work_index(ProjectionStorageBinding {
-                    endpoint: ProjectionEndpointBinding {
-                        endpoint_id,
-                        device_id: endpoint.device_id(),
-                        graph_resource_id: endpoint.graph_resource_id(),
-                    },
-                    receipt_store_id,
-                })
-                .unwrap()
-        };
-
-        let stale_history = open_index(
-            "stale-history-index",
-            engine.workspace_id(),
-            endpoint.endpoint_id(),
-            receipt_store_id,
-        );
-        let stale_history_failure =
-            JoinedAuthenticatedExpectedPathSource::new(&engine, &stale_history)
-                .current_binding(1024 * 1024)
-                .unwrap_err();
-        assert_eq!(
-            stale_history_failure,
-            ExpectedPathSourceFailure::Unavailable,
-            "an authenticated insertion-only history extension must retry until projection authority is rebound"
-        );
-
-        let cross_workspace = open_index(
-            "cross-workspace-index",
-            WorkspaceId::from_uuid(Uuid::from_u128(317_280)),
-            endpoint.endpoint_id(),
-            receipt_store_id,
-        );
-        assert_eq!(
-            JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_workspace)
-                .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::WorkspaceId
-            ))
-        );
-
-        let cross_endpoint = open_index(
-            "cross-endpoint-index",
-            engine.workspace_id(),
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(317_281)),
-            receipt_store_id,
-        );
-        assert_eq!(
-            JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_endpoint)
-                .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::EndpointId
-            ))
-        );
-
-        let cross_receipt = open_index(
-            "cross-receipt-index",
-            engine.workspace_id(),
-            endpoint.endpoint_id(),
-            ProjectionReceiptStoreId::from_capability_identity(b"test", b"cross-receipt"),
-        );
-        assert_eq!(
-            JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_receipt)
-                .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::CorruptField(
-                ExpectedPathCorruptField::ReceiptStoreId
-            ))
-        );
-        let receipt_detail = JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_receipt)
-            .current_binding(1024 * 1024)
-            .unwrap_err()
-            .to_string();
-        assert!(receipt_detail.contains("receipt store ID mismatch"));
-
-        drop(cross_receipt);
-        drop(cross_endpoint);
-        drop(cross_workspace);
-        drop(stale_history);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn joined_expected_source_large_catalog_reads_bounded_pages() {
-        let lineage = LineageDigest::of(b"joined-scan-large-catalog");
-        let (root, writer, mut engine, _) = enrolled_test_engine(317_300, lineage);
-        stage_cursor_pages(&mut engine, 317_310, 317_400, 128);
-        record_joined_present_rows(&engine, 317_600);
-        let projection = engine.projection_work_index.as_ref().unwrap().clone();
-        let source = JoinedAuthenticatedExpectedPathSource::new(&engine, projection.as_ref());
-        engine.current_path_cursor_rows_visited.set(0);
-        let (_, mut cursor) = source.open_expected_paths(joined_page_limits(128)).unwrap();
-        let mut total = 0;
-        loop {
-            let page = source
-                .read_expected_path_page(&mut cursor, joined_page_request(7))
-                .unwrap();
-            assert!(page.rows.len() <= 7);
-            total += page.rows.len();
-            if page.done {
-                break;
-            }
-        }
-        assert_eq!(total, 128);
-        assert!(engine.current_path_cursor_rows_visited.get() <= 128 + 19);
-        assert_eq!(engine.current_path_active_cursor_count_for_test(), 0);
-
-        drop(cursor);
-        drop(source);
-        drop(projection);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
     #[test]
     fn current_path_cursor_paginates_in_deterministic_page_path_order() {
         let (root, engine, _) = cursor_fixture(310_000, 5);
@@ -37298,104 +33672,6 @@ mod validation_tests {
             decode_current_path_catalog_row(&encode_current_path_catalog_row(&stale).unwrap())
                 .is_err()
         );
-    }
-
-    #[test]
-    fn current_path_cursor_survives_reconstruction_and_later_block_only_transition() {
-        let (root, mut engine, ids) = cursor_fixture(310_200, 1);
-        let page_id = ids[0];
-        let home_document_id = engine
-            .page_state_for_test(page_id)
-            .unwrap()
-            .unwrap()
-            .home_document_id();
-        let block_id = BlockId::from_uuid(Uuid::from_u128(310_250));
-        let stale = engine.begin_current_path_cursor().unwrap();
-        stage_cursor_transaction(
-            &mut engine,
-            310_220,
-            OperationTransaction::new(vec![SemanticOperation::CreateBlock {
-                block: BlockLocation {
-                    block_id,
-                    home_document_id,
-                },
-                page_id,
-                parent: None,
-                order: "a".into(),
-                content: "before reconstruction".into(),
-            }])
-            .unwrap(),
-        );
-        assert!(matches!(
-            engine.current_path_cursor_page(stale, 1),
-            Err(EngineError::Archive(message)) if message.contains("frontier is stale")
-        ));
-        let expected = collect_cursor_rows(&engine, 1);
-
-        engine.reconstruct_run_local_state().unwrap();
-        assert_eq!(collect_cursor_rows(&engine, 1), expected);
-        stage_cursor_transaction(
-            &mut engine,
-            310_230,
-            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id,
-                    home_document_id,
-                },
-                content: "after reconstruction".into(),
-            }])
-            .unwrap(),
-        );
-        assert_eq!(collect_cursor_rows(&engine, 1), expected);
-        drop(engine);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn current_path_cursor_rebuilds_from_full_authenticated_history_replay() {
-        let lineage = LineageDigest::of(b"current-path-full-replay");
-        let (root, writer, mut engine, _) = enrolled_test_engine(310_300, lineage);
-        let ids = stage_cursor_pages(&mut engine, 310_310, 310_400, 3);
-        stage_cursor_transaction(
-            &mut engine,
-            310_320,
-            OperationTransaction::new(vec![
-                SemanticOperation::RenamePagesAndRewriteReferrers {
-                    page_changes: vec![PageRename {
-                        page_id: ids[0],
-                        new_name: LogicalPageName::parse("Replay Journal").unwrap(),
-                        new_path: ManagedPath::parse("journals/replay.org").unwrap(),
-                    }],
-                    block_rewrites: Vec::new(),
-                    page_preamble_rewrites: Vec::new(),
-                },
-                SemanticOperation::SetPageKind {
-                    page_id: ids[0],
-                    kind: ManagedTextKind::Journal,
-                },
-                SemanticOperation::DeletePage { page_id: ids[1] },
-            ])
-            .unwrap(),
-        );
-        let expected = collect_cursor_rows(&engine, 2);
-        let manifests = engine
-            .archive_store
-            .as_ref()
-            .unwrap()
-            .committed_manifests()
-            .unwrap();
-        engine.prepare_operational_recovery_replay().unwrap();
-        assert!(engine.begin_current_path_cursor().is_err());
-        for manifest in manifests {
-            engine
-                .stage_archive_batch_for_recovery(manifest.batch_id())
-                .unwrap();
-        }
-        engine.finish_operational_recovery_replay().unwrap();
-        assert_eq!(collect_cursor_rows(&engine, 2), expected);
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -40531,6 +36807,76 @@ mod validation_tests {
         crate::test_support::remove_dir_all(root);
     }
 
+    /// The clean write path has exactly three staging entry points.
+    ///
+    /// `stage_ready_internal` / `stage_ready_scratch` are reached from
+    /// production only through `stage_ready_with_claim_source`, and that
+    /// helper is called only by clean replay, clean commit, and the bounded
+    /// acceptance of a clean prepared batch below the managed-local overlay. The
+    /// legacy `stage_ready` / `stage_from_store` pair is `#[cfg(test)]` and
+    /// cannot reach it at all. Widening this set widens the audited write
+    /// path, so the set is pinned here rather than asserted in a comment.
+    #[test]
+    fn stage_ready_with_claim_source_has_exactly_the_three_clean_entry_points() {
+        let source = include_str!("hot_engine.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod validation_tests")
+            .next()
+            .expect("the hot-engine production half remains identifiable");
+        let mut enclosing = "<file scope>";
+        let mut definitions = Vec::new();
+        let mut callers = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                enclosing = rest
+                    .split(['(', '<'])
+                    .next()
+                    .expect("a function declaration names a function");
+            }
+            if !line.contains("stage_ready_with_claim_source(") {
+                continue;
+            }
+            if trimmed.starts_with("fn ") || trimmed.starts_with("pub") {
+                definitions.push(enclosing);
+            } else {
+                callers.push(enclosing);
+            }
+        }
+        assert_eq!(
+            definitions,
+            vec!["stage_ready_with_claim_source"],
+            "the claim-source staging helper must be declared exactly once"
+        );
+        assert_eq!(
+            callers,
+            vec![
+                "replay_clean_committed_tail",
+                "commit_clean_prepared",
+                "accept_clean_prepared_below_managed_local_overlay",
+            ],
+            "only the three audited clean paths may stage with a claim source"
+        );
+        assert_eq!(
+            production.matches("stage_ready_with_claim_source").count(),
+            4,
+            "one declaration plus exactly three clean-path call sites"
+        );
+        for legacy in [
+            "#[cfg(test)]\n    pub fn stage_ready(",
+            "#[cfg(test)]\n    pub fn stage_from_store(",
+        ] {
+            assert!(
+                production.contains(legacy),
+                "the legacy staging entry point {legacy:?} must stay test-only"
+            );
+        }
+    }
+
     #[test]
     fn no_store_page_name_preparation_source_guard_uses_direct_causal_heads() {
         let source = include_str!("hot_engine.rs");
@@ -40563,1269 +36909,6 @@ mod validation_tests {
             !clock.contains("collect_batch_ancestry") && !clock.contains("self.archive"),
             "inline causal-clock construction must use only direct-head lookups"
         );
-    }
-
-    #[test]
-    fn enrolled_history_head_swap_failure_preserves_visible_terminal_and_status_state() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(89_001));
-        let lineage = LineageDigest::of(b"enrolled-history-pre-head-swap");
-        let root = std::env::temp_dir().join(format!(
-            "tine-oplog-enrolled-history-failure-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let graph_path = root.join("graph");
-        std::fs::create_dir(&graph_path).unwrap();
-        let graph = Graph::open(&graph_path);
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_002)),
-            DeviceId::from_uuid(Uuid::from_u128(89_003)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        let mut reference_config = crate::config::Config::default();
-        reference_config.property_pages_enabled = !reference_config.property_pages_enabled;
-        let durable_reference_policy = ReferenceCatalogPolicyV1::from_config(&reference_config);
-        engine
-            .configure_reference_catalog_policy(durable_reference_policy.clone())
-            .unwrap();
-
-        let baseline = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_010, 89_010),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(89_011)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_012)),
-                    name: LogicalPageName::parse("Durable Baseline").unwrap(),
-                    path: ManagedPath::parse("pages/durable-baseline.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&baseline)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(baseline.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-
-        let prior_history = engine
-            .history_store
-            .as_ref()
-            .unwrap()
-            .current_with_binding()
-            .unwrap();
-        let prior_history_root = prior_history.1;
-        let prior_snapshot = engine.canonical_snapshot().unwrap();
-        let prior_page_name_root = engine.page_name_root.clone();
-        let prior_page_name_conflicts = engine.page_name_conflicts.clone();
-        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
-        let prior_logseq_claim_root = engine.logseq_claim_root;
-        let prior_frontier = engine.exact_frontier().unwrap();
-        let prior_frontier_root = engine.accepted_frontier_root().unwrap();
-        let prior_accepted_count = engine.accepted_batch_count().unwrap();
-        let prior_status = engine.history_records().unwrap();
-        let prior_workspace_status = engine.workspace_status();
-        let prior_visible_heads = engine.visible_document_heads.clone();
-        let prior_terminal_heads = engine.terminal_document_heads.clone();
-
-        let update = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_020, 89_020),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: PageId::from_uuid(Uuid::from_u128(89_021)),
-                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_022)),
-                        name: LogicalPageName::parse("Must Not Publish").unwrap(),
-                        path: ManagedPath::parse("pages/must-not-publish.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id: BlockId::from_uuid(Uuid::from_u128(89_023)),
-                            home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_022)),
-                        },
-                        page_id: PageId::from_uuid(Uuid::from_u128(89_021)),
-                        parent: None,
-                        order: "a".into(),
-                        content: "identity candidate".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        let malformed_base = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_040, 89_040),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(89_041)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_042)),
-                    name: LogicalPageName::parse("Malformed Archive Orphan").unwrap(),
-                    path: ManagedPath::parse("pages/malformed-archive-orphan.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let malformed_payload = b"not a semantic effect".to_vec();
-        let malformed_objects = malformed_base
-            .objects()
-            .iter()
-            .map(|object| {
-                if object.kind() == ObjectKind::SemanticEffect {
-                    OperationObject::new(
-                        object.workspace_id(),
-                        object.document_id(),
-                        object.kind(),
-                        malformed_payload.clone(),
-                    )
-                    .unwrap()
-                } else {
-                    object.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-        let malformed_descriptors = malformed_objects
-            .iter()
-            .map(OperationObject::descriptor)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let malformed_manifest = OperationBatch::new_with_causality(
-            malformed_base.manifest().workspace_id(),
-            malformed_base.manifest().lineage_digest(),
-            malformed_base.manifest().batch_id(),
-            malformed_base.manifest().author_device_id(),
-            malformed_base.manifest().author_session_id(),
-            malformed_base.manifest().origin(),
-            malformed_base.manifest().causal_dot(),
-            malformed_base.manifest().causal_dependency_heads().to_vec(),
-            malformed_base.manifest().dependency_frontier().clone(),
-            SemanticEffectDigest::of(&malformed_payload),
-            malformed_descriptors,
-        )
-        .unwrap();
-        let malformed_orphan = PreparedBatch::new(malformed_manifest, malformed_objects).unwrap();
-        let malformed_orphan_id = malformed_orphan.manifest().batch_id();
-        let incomplete_orphan = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_050, 89_050),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(89_051)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_052)),
-                    name: LogicalPageName::parse("Incomplete Archive Orphan").unwrap(),
-                    path: ManagedPath::parse("pages/incomplete-archive-orphan.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let incomplete_orphan_id = incomplete_orphan.manifest().batch_id();
-        let accepted_looking_orphan_id = update.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&update).unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&malformed_orphan)
-            .unwrap();
-        let missing_object = incomplete_orphan.objects()[0].descriptor().unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&incomplete_orphan)
-            .unwrap();
-        std::fs::remove_file(
-            writer
-                .root_path()
-                .join("objects")
-                .join(format!("{}.object", missing_object.content_digest())),
-        )
-        .unwrap();
-        assert!(matches!(
-            writer.inspect_batch(incomplete_orphan_id).unwrap(),
-            BatchInspection::Staged { .. }
-        ));
-        let prior_observable = observable_engine_state(&engine);
-        super::super::object_store::fail_next_engine_history_head_swap();
-        let outcome = engine
-            .stage_archive_batch(update.manifest().batch_id())
-            .unwrap();
-        assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-
-        assert_eq!(
-            engine
-                .history_store
-                .as_ref()
-                .unwrap()
-                .current_with_binding()
-                .unwrap(),
-            prior_history
-        );
-        assert_eq!(engine.canonical_snapshot().unwrap(), prior_snapshot);
-        assert_eq!(engine.page_name_root, prior_page_name_root);
-        assert_eq!(engine.page_name_conflicts, prior_page_name_conflicts);
-        assert_eq!(
-            engine.reference_catalog.root(),
-            &prior_reference_catalog_root
-        );
-        assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
-        assert_eq!(engine.exact_frontier().unwrap(), prior_frontier);
-        assert_eq!(
-            engine.accepted_frontier_root().unwrap(),
-            prior_frontier_root
-        );
-        assert_eq!(engine.accepted_batch_count().unwrap(), prior_accepted_count);
-        assert_eq!(engine.history_records().unwrap(), prior_status);
-        assert_eq!(engine.workspace_status(), prior_workspace_status);
-        assert_eq!(engine.visible_document_heads, prior_visible_heads);
-        assert_eq!(engine.terminal_document_heads, prior_terminal_heads);
-        assert_eq!(observable_engine_state(&engine), prior_observable);
-        assert_eq!(
-            engine.pending_author_fast_path_attempts, 0,
-            "the normal-lane durability regression must remain distinct from pending author"
-        );
-
-        drop(engine);
-        let mut reopened = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        assert!(matches!(
-            reopened.reference_catalog_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert_eq!(reopened.logseq_claim_root, prior_logseq_claim_root);
-        assert_eq!(
-            reopened.reference_catalog.policy(),
-            &durable_reference_policy
-        );
-        assert!(matches!(
-            reopened.reference_source_posting(PageId::from_uuid(Uuid::from_u128(89_011))),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.prepare_bootstrap_transaction(
-                test_author(89_030, 89_030),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(89_031)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_032)),
-                    name: LogicalPageName::parse("Recovery Must Gate").unwrap(),
-                    path: ManagedPath::parse("pages/recovery-must-gate.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            ),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        reopened.prepare_operational_recovery_replay().unwrap();
-        for orphan_id in [
-            BatchId::from_uuid(Uuid::from_u128(89_060)),
-            incomplete_orphan_id,
-        ] {
-            let before = observable_engine_state(&reopened);
-            let outcome = reopened
-                .stage_archive_batch_for_recovery(orphan_id)
-                .unwrap();
-            assert!(matches!(
-                outcome.disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::Archive(_),
-                }
-            ));
-            assert_eq!(observable_engine_state(&reopened), before);
-        }
-        for manifest in writer.committed_manifests().unwrap() {
-            if manifest.batch_id() == incomplete_orphan_id {
-                continue;
-            }
-            let orphan_requires_no_mutation = matches!(
-                manifest.batch_id(),
-                batch_id
-                    if batch_id == malformed_orphan_id
-                        || batch_id == accepted_looking_orphan_id
-            );
-            let before = orphan_requires_no_mutation.then(|| observable_engine_state(&reopened));
-            let outcome = reopened
-                .stage_archive_batch_for_recovery(manifest.batch_id())
-                .unwrap();
-            if let Some(before) = before {
-                assert!(matches!(
-                    outcome.disposition(),
-                    BatchDisposition::Rejected {
-                        error: EngineError::Archive(_),
-                    }
-                ));
-                assert_eq!(observable_engine_state(&reopened), before);
-                assert_eq!(reopened.history_root, prior_history_root);
-                assert_eq!(
-                    reopened
-                        .history_store
-                        .as_ref()
-                        .unwrap()
-                        .current_with_binding()
-                        .unwrap()
-                        .1,
-                    prior_history_root
-                );
-            }
-        }
-        reopened.finish_operational_recovery_replay().unwrap();
-        assert_eq!(
-            reopened.reference_catalog_root().unwrap(),
-            &prior_reference_catalog_root
-        );
-        assert!(reopened
-            .reference_source_posting(PageId::from_uuid(Uuid::from_u128(89_011)))
-            .unwrap()
-            .is_some());
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pending_author_fast_path_publishes_history_before_any_hot_authority() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_100));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(89_101));
-        let lineage = LineageDigest::of(b"pending-author-durable-before-hot");
-        let root = std::env::temp_dir().join(format!(
-            "tine-oplog-pending-author-history-failure-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let graph_path = root.join("graph");
-        std::fs::create_dir(&graph_path).unwrap();
-        let graph = Graph::open(&graph_path);
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_102)),
-            DeviceId::from_uuid(Uuid::from_u128(89_103)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        engine.scratch = None;
-        engine.block_claim_index = None;
-        engine.page_name_index = None;
-        let archive_runtime = engine.archive_store.take();
-
-        let prior_history = engine
-            .history_store
-            .as_ref()
-            .unwrap()
-            .current_with_binding()
-            .unwrap();
-        let prior_page_name_root = engine.page_name_root.clone();
-        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
-        let prior_logseq_claim_root = engine.logseq_claim_root;
-        let prior_portable_path_root = engine.portable_path_root;
-        let prior_frontier_root = engine.accepted_frontier_root.clone();
-        let prior_visible_heads = engine.visible_document_heads.clone();
-        let prior_attempts = engine.pending_author_fast_path_attempts;
-
-        let prepared = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_110, 89_110),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: PageId::from_uuid(Uuid::from_u128(89_111)),
-                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_112)),
-                        name: LogicalPageName::parse("Pending Must Not Publish").unwrap(),
-                        path: ManagedPath::parse("pages/pending-must-not-publish.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id: BlockId::from_uuid(Uuid::from_u128(89_113)),
-                            home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_112)),
-                        },
-                        page_id: PageId::from_uuid(Uuid::from_u128(89_111)),
-                        parent: None,
-                        order: "a".into(),
-                        content: "pending identity candidate".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        engine.archive_store = archive_runtime;
-        assert!(engine.pending_author_documents.borrow().is_some());
-        writer
-            .publish_bootstrap_prepared_for_test(&prepared)
-            .unwrap();
-        let ready = match writer
-            .inspect_batch(prepared.manifest().batch_id())
-            .unwrap()
-        {
-            BatchInspection::Ready(batch) => batch,
-            other => panic!("published pending-author batch was not ready: {other:?}"),
-        };
-        let prior_observable = observable_engine_state(&engine);
-        super::super::object_store::fail_next_engine_history_head_swap();
-        let outcome = engine.stage_ready(ready);
-        assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-        assert_eq!(engine.pending_author_fast_path_attempts, prior_attempts + 1);
-        assert_eq!(
-            engine
-                .history_store
-                .as_ref()
-                .unwrap()
-                .current_with_binding()
-                .unwrap(),
-            prior_history
-        );
-        assert_eq!(engine.page_name_root, prior_page_name_root);
-        assert_eq!(
-            engine.reference_catalog.root(),
-            &prior_reference_catalog_root
-        );
-        assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
-        assert_eq!(engine.portable_path_root, prior_portable_path_root);
-        assert_eq!(engine.accepted_frontier_root, prior_frontier_root);
-        assert_eq!(engine.visible_document_heads, prior_visible_heads);
-        assert!(engine.visible_documents.is_empty());
-        assert!(engine.statuses.is_empty());
-        assert!(engine.archive.is_empty());
-        assert!(engine.ephemeral_block_claims.is_empty());
-        assert!(engine.fatal_evidence.is_none());
-        assert!(engine.fatal_handle.is_none());
-        assert_eq!(observable_engine_state(&engine), prior_observable);
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn portable_path_terminal_candidate_waits_for_durable_history_publication() {
-        let lineage = LineageDigest::of(b"portable-terminal-durable-before-hot");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_200, lineage);
-        let workspace = writer.workspace_id();
-        let seed_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let seed = seed_author
-            .prepare_bootstrap_transaction(
-                test_author(89_204, 89_204),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_205)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_206)),
-                    BlockId::from_uuid(Uuid::from_u128(89_207)),
-                    "Portable Seed",
-                    "pages/portable-seed.md",
-                ),
-            )
-            .unwrap();
-        let mut left_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let mut right_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        assert!(matches!(
-            left_author
-                .stage_ready(ValidatedBatch::new(seed.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            right_author
-                .stage_ready(ValidatedBatch::new(seed.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let left = left_author
-            .prepare_bootstrap_transaction(
-                test_author(89_210, 89_210),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_211)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_212)),
-                    BlockId::from_uuid(Uuid::from_u128(89_213)),
-                    "Portable Left",
-                    "pages/portable-shared.md",
-                ),
-            )
-            .unwrap();
-        let right = right_author
-            .prepare_bootstrap_transaction(
-                test_author(89_220, 89_220),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_221)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_222)),
-                    BlockId::from_uuid(Uuid::from_u128(89_223)),
-                    "Portable Right",
-                    "PAGES/PORTABLE-SHARED.md",
-                ),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&seed).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(seed.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            engine
-                .stage_archive_batch(left.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let before = observable_engine_state(&engine);
-
-        super::super::object_store::fail_next_engine_history_head_swap();
-        let outcome = engine
-            .stage_archive_batch(right.manifest().batch_id())
-            .unwrap();
-        assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-        assert_eq!(observable_engine_state(&engine), before);
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pending_author_portable_terminal_candidate_waits_for_durable_history_publication() {
-        let lineage = LineageDigest::of(b"pending-portable-terminal-durable-before-hot");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_300, lineage);
-        let workspace = writer.workspace_id();
-        engine.scratch = None;
-        engine.block_claim_index = None;
-        engine.page_name_index = None;
-
-        let seed_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let seed = seed_author
-            .prepare_bootstrap_transaction(
-                test_author(89_304, 89_304),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_305)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_306)),
-                    BlockId::from_uuid(Uuid::from_u128(89_307)),
-                    "Pending Portable Seed",
-                    "pages/pending-portable-seed.md",
-                ),
-            )
-            .unwrap();
-        let mut first_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        assert!(matches!(
-            first_author
-                .stage_ready(ValidatedBatch::new(seed.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            engine.stage_ready(ValidatedBatch::new(seed)).disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let first = first_author
-            .prepare_bootstrap_transaction(
-                test_author(89_310, 89_310),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_311)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_312)),
-                    BlockId::from_uuid(Uuid::from_u128(89_313)),
-                    "Pending Portable Left",
-                    "pages/pending-portable-shared.md",
-                ),
-            )
-            .unwrap();
-        let second = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_320, 89_320),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_321)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_322)),
-                    BlockId::from_uuid(Uuid::from_u128(89_323)),
-                    "Pending Portable Right",
-                    "PAGES/PENDING-PORTABLE-SHARED.md",
-                ),
-            )
-            .unwrap();
-        assert!(engine.pending_author_documents.borrow().is_some());
-        assert!(matches!(
-            engine.stage_ready(ValidatedBatch::new(first)).disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(engine.pending_author_documents.borrow().is_some());
-        let before = observable_engine_state(&engine);
-        let prior_attempts = engine.pending_author_fast_path_attempts;
-
-        super::super::object_store::fail_next_engine_history_head_swap();
-        let outcome = engine.stage_ready(ValidatedBatch::new(second));
-        assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-        assert_eq!(engine.pending_author_fast_path_attempts, prior_attempts + 1);
-        assert_eq!(observable_engine_state(&engine), before);
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn recovery_required_rejects_persisted_scratch_before_staging_mutation() {
-        let lineage = LineageDigest::of(b"recovery-required-before-scratch-stage");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_400, lineage);
-        let workspace = writer.workspace_id();
-        let first_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let first = first_author
-            .prepare_bootstrap_transaction(
-                test_author(89_410, 89_410),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_411)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_412)),
-                    BlockId::from_uuid(Uuid::from_u128(89_413)),
-                    "Recovery Baseline",
-                    "pages/recovery-baseline.md",
-                ),
-            )
-            .unwrap();
-        let second_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let second = second_author
-            .prepare_bootstrap_transaction(
-                test_author(89_420, 89_420),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_421)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_422)),
-                    BlockId::from_uuid(Uuid::from_u128(89_423)),
-                    "Recovery Rejected",
-                    "pages/recovery-rejected.md",
-                ),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&first).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&second).unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(first.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        drop(engine);
-
-        let graph = Graph::open(&root.join("graph"));
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_402)),
-            DeviceId::from_uuid(Uuid::from_u128(89_403)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let mut reopened = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        let before = observable_engine_state(&reopened);
-        assert!(matches!(
-            reopened.stage_archive_batch(second.manifest().batch_id()),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert_eq!(observable_engine_state(&reopened), before);
-
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn operational_recovery_finish_requires_complete_authenticated_history_replay() {
-        let lineage = LineageDigest::of(b"operational-recovery-requires-complete-history");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_450, lineage);
-        let workspace = writer.workspace_id();
-        let page_id = PageId::from_uuid(Uuid::from_u128(89_451));
-        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(89_452));
-        let block_id = BlockId::from_uuid(Uuid::from_u128(89_453));
-        let first = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_454, 89_454),
-                &create_page_with_block(
-                    page_id,
-                    home_document_id,
-                    block_id,
-                    "Replay Baseline",
-                    "pages/replay-baseline.md",
-                ),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&first).unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(first.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { no_op: false }
-        ));
-        let second = engine
-            .prepare_bootstrap_transaction(
-                test_author(89_455, 89_455),
-                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                    block: BlockLocation {
-                        block_id,
-                        home_document_id,
-                    },
-                    content: "Replay Baseline identity".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&second).unwrap();
-        let second_outcome = engine
-            .stage_archive_batch(second.manifest().batch_id())
-            .unwrap();
-        assert!(
-            matches!(
-                second_outcome.disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::CrdtUpdateBaseMismatch(_)
-                }
-            ),
-            "unexpected second outcome: {second_outcome:?}"
-        );
-        assert_eq!(engine.history_generation, 2);
-        let first_batch_id = first.manifest().batch_id();
-        let accepted_root = engine.accepted_frontier_root().unwrap();
-        drop(engine);
-
-        let graph = Graph::open(&root.join("graph"));
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_452)),
-            DeviceId::from_uuid(Uuid::from_u128(89_453)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let mut reopened = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        let unclaimed = LogseqUuid::from_uuid(Uuid::from_u128(89_456));
-        assert!(matches!(
-            reopened.resolve_logseq_uuid(unclaimed),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.portable_path_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.page_name_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.reference_catalog_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.projection_work_index(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.accepted_frontier_document(&accepted_root, catalog),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.accepted_batch_evidence(first_batch_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.reference_source_posting(page_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.exact_frontier(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.finish_operational_recovery_replay(),
-            Err(EngineError::Archive(_))
-        ));
-        assert!(matches!(
-            reopened.reference_source_posting(page_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-
-        reopened.prepare_operational_recovery_replay().unwrap();
-        assert!(matches!(
-            reopened.resolve_logseq_uuid(unclaimed),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.portable_path_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.page_name_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.reference_catalog_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.projection_work_index(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.stage_archive_batch(first_batch_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.finish_operational_recovery_replay(),
-            Err(EngineError::Archive(_))
-        ));
-        assert!(matches!(
-            reopened.reference_source_posting(page_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.exact_frontier(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-
-        assert!(matches!(
-            reopened
-                .stage_archive_batch_for_recovery(first_batch_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { no_op: false }
-        ));
-        assert!(matches!(
-            reopened.accepted_frontier_document(&accepted_root, catalog),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            reopened.accepted_batch_evidence(first_batch_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        reopened
-            .verify_current_durable_page_name_authority()
-            .unwrap();
-        assert!(matches!(
-            reopened.finish_operational_recovery_replay(),
-            Err(EngineError::Archive(_))
-        ));
-        assert!(reopened.authenticated_history_replay);
-        assert!(matches!(
-            reopened.reference_source_posting(page_id),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-
-        assert!(matches!(
-            reopened
-                .stage_archive_batch_for_recovery(second.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::CrdtUpdateBaseMismatch(_)
-            }
-        ));
-        assert_eq!(reopened.authenticated_replayed_batches.len(), 2);
-        assert_eq!(
-            reopened.authenticated_replayed_generations,
-            BTreeMap::from([(1, first_batch_id), (2, second.manifest().batch_id()),])
-        );
-        let largest_record_bytes = [first_batch_id, second.manifest().batch_id()]
-            .into_iter()
-            .map(|batch_id| {
-                let record = reopened
-                    .authenticated_recovery_history_record(batch_id)
-                    .unwrap()
-                    .unwrap();
-                encode_history_record(&record).unwrap().len()
-            })
-            .max()
-            .unwrap();
-        let (retained_records, retained_payload_bytes) =
-            reopened.authenticated_replay_retained_history_payload();
-        assert!(
-            retained_records <= 1,
-            "recovery retained {retained_records} history record payloads after replaying two records"
-        );
-        assert!(
-            retained_payload_bytes <= largest_record_bytes,
-            "recovery retained payload bytes from more than its bounded point cache"
-        );
-        reopened.finish_operational_recovery_replay().unwrap();
-        assert!(reopened
-            .reference_source_posting(page_id)
-            .unwrap()
-            .is_some());
-
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn startup_coordinator_keeps_empty_enrolled_history_ready_without_replay() {
-        let lineage = LineageDigest::of(b"empty-enrolled-startup-needs-no-replay");
-        let (root, writer, engine, catalog) = enrolled_test_engine(89_470, lineage);
-        let workspace = writer.workspace_id();
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        assert!(writer.committed_manifests().unwrap().is_empty());
-        drop(engine);
-
-        let graph = Graph::open(&root.join("graph"));
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let (reopened, outcomes) = ShardedHotEngine::open_enrolled_projection(
-            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-            &[],
-        )
-        .unwrap();
-
-        assert!(outcomes.is_empty());
-        assert!(!reopened.authenticated_history_replay);
-        assert_eq!(reopened.instrumentation().recovery_history_record_reads, 0);
-        assert!(reopened.reference_catalog_root().is_ok());
-        assert!(reopened.projection_work_index().is_ok());
-
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn zero_history_draft_cannot_finalize_during_authenticated_replay() {
-        let lineage = LineageDigest::of(b"zero-history-draft-replay-gate");
-        let (root, writer, mut engine, _catalog) = enrolled_test_engine(89_480, lineage);
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        std::fs::create_dir_all(root.join("graph/pages")).unwrap();
-        let graph = Graph::open(&root.join("graph"));
-        let receipts = ProjectionReceiptStore::open_for_endpoint(
-            &root.join("receipts"),
-            writer.workspace_id(),
-            endpoint,
-        )
-        .unwrap();
-        let page_id = PageId::from_uuid(Uuid::from_u128(89_481));
-        let path = ManagedPath::parse("pages/zero-history-draft.md").unwrap();
-        let draft = engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: BatchId::from_uuid(Uuid::from_u128(89_482)),
-                    author_device_id: endpoint.device_id,
-                    author_session_id: SessionId::from_uuid(Uuid::from_u128(89_483)),
-                    crdt_peer_id: CrdtPeerId::from_u64(89_484),
-                },
-                BatchOrigin::LocalMutation,
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id,
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_485)),
-                    name: LogicalPageName::parse("Zero History Draft").unwrap(),
-                    path: path.clone(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        engine.prepare_operational_recovery_replay().unwrap();
-        assert_eq!(engine.history_generation, 0);
-        assert!(engine.authenticated_history_replay);
-        assert!(matches!(
-            engine.finalize_author_transaction(draft, &graph, &receipts, endpoint),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(engine.authenticated_history_replay);
-        engine.finish_operational_recovery_replay().unwrap();
-        assert!(!engine.authenticated_history_replay);
-        assert!(engine.portable_path_index_root().is_ok());
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn projection_reconciliation_failure_keeps_replay_retryable_and_authority_gated() {
-        let lineage = LineageDigest::of(b"projection-reconciliation-retry-gate");
-        let (root, writer, mut engine, _catalog) = enrolled_test_engine(89_490, lineage);
-        let endpoint = engine.projection_endpoint_binding().unwrap();
-        let work_head = root
-            .join("archive")
-            .join("projection-work-index-v1")
-            .join(endpoint.endpoint_id.to_string())
-            .join("projection-work.head");
-        let valid_head = std::fs::read(&work_head).unwrap();
-
-        engine.prepare_operational_recovery_replay().unwrap();
-        std::fs::write(&work_head, b"invalid projection work head").unwrap();
-        assert!(matches!(
-            engine.finish_operational_recovery_replay(),
-            Err(EngineError::ProjectionWork(_))
-        ));
-        assert!(engine.authenticated_history_replay);
-        assert!(matches!(
-            engine.resolve_logseq_uuid(LogseqUuid::from_uuid(Uuid::from_u128(89_491))),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            engine.portable_path_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            engine.page_name_index_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            engine.reference_catalog_root(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-        assert!(matches!(
-            engine.projection_work_index(),
-            Err(EngineError::ReferenceCatalog(_))
-        ));
-
-        std::fs::write(&work_head, valid_head).unwrap();
-        engine.finish_operational_recovery_replay().unwrap();
-        assert!(!engine.authenticated_history_replay);
-        assert!(engine
-            .resolve_logseq_uuid(LogseqUuid::from_uuid(Uuid::from_u128(89_491)))
-            .is_ok());
-        assert!(engine.portable_path_index_root().is_ok());
-        assert!(engine.page_name_index_root().is_ok());
-        assert!(engine.reference_catalog_root().is_ok());
-        assert!(engine.projection_work_index().is_ok());
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn terminal_evidence_precedes_catalog_recovery_for_queries_and_mutation() {
-        let lineage = LineageDigest::of(b"terminal-before-catalog-recovery");
-        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_500, lineage);
-        let workspace = writer.workspace_id();
-        let seed_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let seed = seed_author
-            .prepare_bootstrap_transaction(
-                test_author(89_504, 89_504),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_505)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_506)),
-                    BlockId::from_uuid(Uuid::from_u128(89_507)),
-                    "Terminal Seed",
-                    "pages/terminal-seed.md",
-                ),
-            )
-            .unwrap();
-        let mut left_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let mut right_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        assert!(matches!(
-            left_author
-                .stage_ready(ValidatedBatch::new(seed.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            right_author
-                .stage_ready(ValidatedBatch::new(seed.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let left = left_author
-            .prepare_bootstrap_transaction(
-                test_author(89_510, 89_510),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_511)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_512)),
-                    BlockId::from_uuid(Uuid::from_u128(89_513)),
-                    "Terminal Left",
-                    "pages/terminal-shared.md",
-                ),
-            )
-            .unwrap();
-        let right = right_author
-            .prepare_bootstrap_transaction(
-                test_author(89_520, 89_520),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_521)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_522)),
-                    BlockId::from_uuid(Uuid::from_u128(89_523)),
-                    "Terminal Right",
-                    "PAGES/TERMINAL-SHARED.md",
-                ),
-            )
-            .unwrap();
-        let mutation_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let mutation = mutation_author
-            .prepare_bootstrap_transaction(
-                test_author(89_530, 89_530),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(89_531)),
-                    DocumentId::from_uuid(Uuid::from_u128(89_532)),
-                    BlockId::from_uuid(Uuid::from_u128(89_533)),
-                    "Blocked Mutation",
-                    "pages/blocked-mutation.md",
-                ),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&seed).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&mutation)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(seed.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            engine
-                .stage_archive_batch(left.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let terminal_outcome = engine
-            .stage_archive_batch(right.manifest().batch_id())
-            .unwrap();
-        assert!(
-            matches!(
-                terminal_outcome.disposition(),
-                BatchDisposition::Quarantined
-            ),
-            "unexpected terminal outcome: {:?}",
-            terminal_outcome.disposition()
-        );
-        drop(engine);
-
-        let graph = Graph::open(&root.join("graph"));
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_502)),
-            DeviceId::from_uuid(Uuid::from_u128(89_503)),
-        )
-        .unwrap();
-        let receipts =
-            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
-                .unwrap();
-        let manifests = writer.committed_manifests().unwrap();
-        let (mut reopened, outcomes) = ShardedHotEngine::open_enrolled_projection(
-            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-            &manifests,
-        )
-        .unwrap();
-        assert!(outcomes.is_empty());
-        assert!(!reopened.authenticated_history_replay);
-        let expected = EngineError::WorkspaceBlocked(
-            reopened
-                .fatal_evidence_handle()
-                .expect("durable terminal evidence"),
-        );
-        assert!(matches!(
-            reopened.prepare_operational_recovery_replay(),
-            Err(EngineError::Archive(_))
-        ));
-        let fact = super::super::PageNameReferenceFactV1 {
-            source: super::super::ReferenceSourceLocatorV1::Preamble,
-            kind: super::super::PageReferenceKindV1::PageLink,
-            raw_target: "Terminal Target".into(),
-            normalized_target: "terminal target".into(),
-            target_key: LogicalPageName::parse("Terminal Target")
-                .unwrap()
-                .key_digest(),
-            byte_start: 0,
-            byte_end: 15,
-        };
-        assert_eq!(
-            reopened.reference_source_posting(PageId::from_uuid(Uuid::from_u128(89_511))),
-            Err(expected.clone())
-        );
-        assert_eq!(
-            reopened.resolve_reference_page_name(&fact),
-            Err(expected.clone())
-        );
-        assert_eq!(
-            reopened.configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default()),
-            Err(expected.clone())
-        );
-        let terminal_ingress = reopened
-            .stage_archive_batch(mutation.manifest().batch_id())
-            .unwrap();
-        assert_eq!(
-            terminal_ingress.disposition(),
-            BatchDisposition::Rejected {
-                error: expected.clone(),
-            }
-        );
-        assert_eq!(
-            terminal_ingress.status().workspace(),
-            reopened.status().workspace()
-        );
-        assert_eq!(reopened.workspace_blocked_error(), Some(expected));
-
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -42320,7 +37403,7 @@ mod validation_tests {
         let left_then_right = deliver(left.manifest().batch_id(), right.manifest().batch_id());
         let right_then_left = deliver(right.manifest().batch_id(), left.manifest().batch_id());
         assert_eq!(left_then_right, right_then_left);
-        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 13);
+        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 14);
         assert_eq!(
             super::super::page_name_index::PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
             2,
@@ -42432,7 +37515,6 @@ mod validation_tests {
         ));
         let prior_conflicts = receiver.page_name_conflicts.clone();
         let prior_page_name_root = receiver.page_name_root.clone();
-        let prior_reference_catalog_root = receiver.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = receiver.logseq_claim_root;
         let prior_fatal_handle = receiver.fatal_handle;
         let prior_fatal_evidence = receiver.fatal_evidence.clone();
@@ -42457,10 +37539,6 @@ mod validation_tests {
         );
         assert_eq!(receiver.page_name_conflicts, prior_conflicts);
         assert_eq!(receiver.page_name_root, prior_page_name_root);
-        assert_eq!(
-            receiver.reference_catalog.root(),
-            &prior_reference_catalog_root
-        );
         assert_eq!(receiver.logseq_claim_root, prior_logseq_claim_root);
         assert_eq!(receiver.fatal_handle, prior_fatal_handle);
         assert_eq!(receiver.fatal_evidence, prior_fatal_evidence);
@@ -42707,1370 +37785,6 @@ mod validation_tests {
     /// dependency of an offered manifest inside the single coarse unit charged
     /// for that manifest.
     #[test]
-    fn bounded_staging_charges_each_direct_dependency_and_resumes_after_reconstruction() {
-        const PARENTS: usize = 9;
-        const SLICE: usize = 3;
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(96_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(96_001));
-        let lineage = LineageDigest::of(b"charged-dependency-registration");
-        let root =
-            std::env::temp_dir().join(format!("tine-charged-registration-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        let blocks = (0..PARENTS)
-            .map(|index| BlockLocation {
-                block_id: BlockId::from_uuid(Uuid::from_u128(96_100 + index as u128)),
-                home_document_id: DocumentId::from_uuid(Uuid::from_u128(96_200 + index as u128)),
-            })
-            .collect::<Vec<_>>();
-        let mut bootstrap = Vec::new();
-        for (index, block) in blocks.iter().enumerate() {
-            let page_id = PageId::from_uuid(Uuid::from_u128(96_300 + index as u128));
-            bootstrap.push(SemanticOperation::CreatePage {
-                page_id,
-                home_document_id: block.home_document_id,
-                name: LogicalPageName::parse(&format!("Charged Dependency {index}")).unwrap(),
-                path: ManagedPath::parse(&format!("pages/charged-dependency-{index}.md")).unwrap(),
-                kind: ManagedTextKind::Page,
-            });
-            bootstrap.push(SemanticOperation::CreateBlock {
-                block: *block,
-                page_id,
-                parent: None,
-                order: "a".into(),
-                content: format!("base-{index}"),
-            });
-        }
-        let base = author
-            .prepare_bootstrap_transaction(
-                test_author(96_010, 96_010),
-                &OperationTransaction::new(bootstrap).unwrap(),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
-        author
-            .stage_archive_batch(base.manifest().batch_id())
-            .unwrap();
-        // One accepted batch per home document, so the wide batch below owns
-        // one distinct causal dependency head per document.
-        let mut parents = Vec::new();
-        for (index, block) in blocks.iter().enumerate() {
-            let prepared = author
-                .prepare_bootstrap_transaction(
-                    test_author(96_400 + index as u128, 96_400 + index as u64),
-                    &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                        block: *block,
-                        content: format!("parent-{index}"),
-                    }])
-                    .unwrap(),
-                )
-                .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
-            author
-                .stage_archive_batch(prepared.manifest().batch_id())
-                .unwrap();
-            parents.push(prepared.manifest().batch_id());
-        }
-        let wide = author
-            .prepare_bootstrap_transaction(
-                test_author(96_600, 96_600),
-                &OperationTransaction::new(
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .map(|(index, block)| SemanticOperation::EditBlockContent {
-                            block: *block,
-                            content: format!("wide-{index}"),
-                        })
-                        .collect(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&wide).unwrap();
-        let wide_id = wide.manifest().batch_id();
-        let dependencies = wide
-            .manifest()
-            .causal_dependency_heads()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len();
-        assert!(
-            dependencies > SLICE,
-            "the offered batch must own more direct dependencies than one slice"
-        );
-
-        let mut receiver = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        receiver
-            .stage_archive_batch(base.manifest().batch_id())
-            .unwrap();
-        for parent in &parents {
-            assert!(matches!(
-                receiver.stage_archive_batch(*parent).unwrap().disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
-        }
-        let parent_merge_work = wide
-            .manifest()
-            .causal_dependency_heads()
-            .iter()
-            .map(|parent| {
-                crate::oplog::causal_index::batch_clock_len(
-                    receiver.scratch.as_ref().unwrap(),
-                    &receiver.scratch_roots,
-                    *parent,
-                )
-                .unwrap()
-                .unwrap()
-                .saturating_add(1)
-            })
-            .sum::<u64>();
-        let validated_wide = match writer.inspect_batch(wide_id).unwrap() {
-            BatchInspection::Ready(batch) => batch,
-            other => panic!("wide batch is not ready: {other:?}"),
-        };
-        let accumulated_clock_points = wide
-            .manifest()
-            .causal_dependency_heads()
-            .iter()
-            .filter_map(|parent| {
-                crate::oplog::causal_index::batch_record(
-                    receiver.scratch.as_ref().unwrap(),
-                    &receiver.scratch_roots,
-                    *parent,
-                )
-                .unwrap()
-            })
-            .flat_map(|record| {
-                record
-                    .clock()
-                    .iter()
-                    .map(|(peer, _)| *peer)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<BTreeSet<_>>()
-            .len() as u64;
-        let expected_work = 1_u64
-            .saturating_add(parent_merge_work)
-            .saturating_add(accumulated_clock_points)
-            .saturating_add(bounded_finalization_work(&validated_wide));
-        let stage_before = receiver.instrumentation();
-        let scratch_before = receiver.scratch.as_ref().unwrap().stats();
-
-        let mut total_work = 0;
-        let mut slices = 0;
-        let mut interrupted = false;
-        let mut accepted = BTreeSet::new();
-        let mut prior_registered = 0_u32;
-        loop {
-            slices += 1;
-            let slice = receiver
-                .stage_archive_batch_bounded(wide_id, SLICE)
-                .unwrap();
-            assert!(slice.work() <= SLICE);
-            total_work += slice.work();
-            for event in slice.outcome().newly_accepted() {
-                assert!(accepted.insert(event.batch_id), "duplicate accepted event");
-            }
-            let record = crate::oplog::dependency_queue::lookup(
-                receiver.scratch.as_ref().unwrap(),
-                &receiver.scratch_roots,
-                wide_id,
-            )
-            .unwrap()
-            .unwrap();
-            assert!(
-                record.registered_ordinal() >= prior_registered,
-                "durable ordinal never rewinds"
-            );
-            prior_registered = record.registered_ordinal();
-            assert_eq!(
-                crate::oplog::dependency_queue::point_state_counts(
-                    receiver.scratch.as_ref().unwrap(),
-                    &receiver.scratch_roots,
-                    wide_id,
-                )
-                .unwrap(),
-                (record.registered_ordinal() as usize, 0),
-                "one authenticated identity point exists per visited ordinal and no accepted parent is unresolved"
-            );
-            if !slice.has_more() {
-                break;
-            }
-            // Interrupt exactly once while the registration cursor is still
-            // mid-sequence, and rebuild every run-local structure.
-            if !interrupted {
-                interrupted = true;
-                receiver.reconstruct_run_local_state().unwrap();
-            }
-            assert!(slices <= expected_work as usize + 2);
-        }
-        assert!(interrupted, "registration must span more than one slice");
-        assert_eq!(prior_registered as usize, dependencies);
-        assert_eq!(accepted, BTreeSet::from([wide_id]));
-        // Weighted accounting: one initial worst-case point unit, each selected
-        // parent's clock-entry/path-derived units, and the actual
-        // byte/object/CRDT/semantic-count-derived finalization prepayment.
-        assert_eq!(total_work as u64, expected_work);
-        let stage_after = receiver.instrumentation();
-        let scratch_after = receiver.scratch.as_ref().unwrap().stats();
-        let physical_io = scratch_after
-            .page_reads
-            .saturating_sub(scratch_before.page_reads)
-            .saturating_add(
-                scratch_after
-                    .page_writes
-                    .saturating_sub(scratch_before.page_writes),
-            )
-            .saturating_add(
-                scratch_after
-                    .blob_reads
-                    .saturating_sub(scratch_before.blob_reads),
-            )
-            .saturating_add(
-                scratch_after
-                    .blob_writes
-                    .saturating_sub(scratch_before.blob_writes),
-            ) as u64;
-        let physical_bytes = scratch_after
-            .page_bytes_read
-            .saturating_sub(scratch_before.page_bytes_read)
-            .saturating_add(
-                scratch_after
-                    .page_bytes_written
-                    .saturating_sub(scratch_before.page_bytes_written),
-            )
-            .saturating_add(
-                scratch_after
-                    .blob_bytes_read
-                    .saturating_sub(scratch_before.blob_bytes_read),
-            )
-            .saturating_add(
-                scratch_after
-                    .blob_bytes_written
-                    .saturating_sub(scratch_before.blob_bytes_written),
-            ) as u64;
-        assert!(
-            physical_io
-                <= (total_work as u64).saturating_mul(BOUNDED_STAGE_MAX_SCRATCH_IO_PER_UNIT),
-            "charged scratch I/O {physical_io} exceeds the documented unit bound"
-        );
-        assert!(
-            physical_bytes
-                <= (total_work as u64).saturating_mul(BOUNDED_STAGE_MAX_SCRATCH_BYTES_PER_UNIT),
-            "charged scratch bytes {physical_bytes} exceed the documented unit bound"
-        );
-        assert_eq!(
-            stage_after.store.inspected_manifest_operations
-                - stage_before.store.inspected_manifest_operations,
-            2,
-            "the offered batch authenticates once initially and once after reconstruction"
-        );
-        assert_eq!(
-            stage_after.store.inspected_object_operations
-                - stage_before.store.inspected_object_operations,
-            2 * wide.objects().len()
-        );
-        assert_eq!(
-            stage_after.store.inspected_manifest_bytes + stage_after.store.inspected_object_bytes
-                - stage_before.store.inspected_manifest_bytes
-                - stage_before.store.inspected_object_bytes,
-            2 * wide.retained_bytes().unwrap()
-        );
-        assert_eq!(
-            stage_after.dependency_head_visits - stage_before.dependency_head_visits,
-            dependencies
-        );
-        assert_eq!(
-            stage_after.causal_accumulator_parent_points
-                - stage_before.causal_accumulator_parent_points,
-            parent_merge_work as usize - dependencies
-        );
-        assert!(
-            stage_after.causal_accumulator_materialized_points
-                > stage_before.causal_accumulator_materialized_points
-        );
-        assert!(stage_after.staged_record_max_bytes < 1024);
-        assert_eq!(
-            stage_after.weighted_work_prepaid - stage_before.weighted_work_prepaid,
-            expected_work as usize - 1
-        );
-        assert!(stage_after.scratch_page_bytes_read > stage_before.scratch_page_bytes_read);
-        assert_eq!(
-            receiver.accepted_batch_count().unwrap(),
-            (PARENTS + 2) as u64
-        );
-        drop(receiver);
-        drop(author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    /// A reconstructed engine must rediscover the exact remaining dependent
-    /// fanout from the authenticated durable scratch roots alone.
-    ///
-    /// The prior construction kept fanout continuation in the run-local
-    /// `bounded_waiters`/`bounded_pending_fanout` maps. Reconstruction emptied
-    /// them while the durable wait edges stayed live under a `Final` parent, so
-    /// `has_more()` reported false and every remaining waiter was stranded.
-    #[test]
-    fn reconstructed_engine_rediscovers_durable_fanout_and_drains_each_edge_once() {
-        const CHILDREN: usize = 11;
-        const SLICE: usize = 3;
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(97_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(97_001));
-        let lineage = LineageDigest::of(b"reconstructed-stage-fanout");
-        let root = std::env::temp_dir().join(format!(
-            "tine-reconstructed-stage-fanout-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        let page_id = PageId::from_uuid(Uuid::from_u128(97_002));
-        let home = DocumentId::from_uuid(Uuid::from_u128(97_003));
-        let block = BlockLocation {
-            block_id: BlockId::from_uuid(Uuid::from_u128(97_004)),
-            home_document_id: home,
-        };
-        let base = author
-            .prepare_bootstrap_transaction(
-                test_author(97_010, 97_010),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id,
-                        home_document_id: home,
-                        name: LogicalPageName::parse("Reconstructed Fanout").unwrap(),
-                        path: ManagedPath::parse("pages/reconstructed-fanout.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block,
-                        page_id,
-                        parent: None,
-                        order: "a".into(),
-                        content: "base".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
-        author
-            .stage_archive_batch(base.manifest().batch_id())
-            .unwrap();
-        let parent = author
-            .prepare_bootstrap_transaction(
-                test_author(97_020, 97_020),
-                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                    block,
-                    content: "parent".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
-        author
-            .stage_archive_batch(parent.manifest().batch_id())
-            .unwrap();
-        let mut children = Vec::new();
-        for index in 0..CHILDREN {
-            let prepared = author
-                .prepare_bootstrap_transaction(
-                    test_author(97_100 + index as u128, 97_100 + index as u64),
-                    &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                        block,
-                        content: format!("child-{index}"),
-                    }])
-                    .unwrap(),
-                )
-                .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
-            children.push(prepared.manifest().batch_id());
-        }
-        // One grandchild depends on the first child, so resuming after
-        // reconstruction must also drive a recursive wakeup.
-        author.stage_archive_batch(children[0]).unwrap();
-        let grandchild = author
-            .prepare_bootstrap_transaction(
-                test_author(97_300, 97_300),
-                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                    block,
-                    content: "grandchild".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&grandchild)
-            .unwrap();
-        let grandchild_id = grandchild.manifest().batch_id();
-
-        let mut receiver = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        receiver
-            .stage_archive_batch(base.manifest().batch_id())
-            .unwrap();
-        for child in children.iter().rev() {
-            assert!(matches!(
-                receiver.stage_archive_batch(*child).unwrap().disposition(),
-                BatchDisposition::IncompleteStaged { .. }
-            ));
-        }
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(grandchild_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::IncompleteStaged { .. }
-        ));
-
-        // Use fixed small slices until the parent's weighted finalization is
-        // fully prepaid. The slice that finalizes it may resolve only a strict
-        // prefix of its durable fanout.
-        let mut accepted = BTreeSet::new();
-        let first = loop {
-            let slice = receiver
-                .stage_archive_batch_bounded(parent.manifest().batch_id(), SLICE)
-                .unwrap();
-            assert!(slice.work() <= SLICE);
-            for event in slice.outcome().newly_accepted() {
-                assert!(accepted.insert(event.batch_id), "duplicate accepted event");
-            }
-            if accepted.contains(&parent.manifest().batch_id()) {
-                break slice;
-            }
-            assert!(slice.has_more());
-        };
-        assert!(accepted.contains(&parent.manifest().batch_id()));
-        assert!(
-            accepted.len() < CHILDREN + 1,
-            "the first slice must stop on a strict prefix"
-        );
-        assert!(first.has_more());
-
-        // Destroy and reconstruct every run-local derived structure. Only the
-        // authenticated durable roots and retained capabilities survive.
-        receiver.reconstruct_run_local_state().unwrap();
-
-        // Resume through the public unbounded API before re-staging any child.
-        // It must consume the bounded call's durable fanout continuation,
-        // including the recursively awakened grandchild, exactly once.
-        let resumed = receiver
-            .stage_archive_batch(parent.manifest().batch_id())
-            .unwrap();
-        for event in resumed.newly_accepted() {
-            assert!(accepted.insert(event.batch_id), "duplicate accepted event");
-        }
-        assert_eq!(
-            crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots),
-            0
-        );
-        assert_eq!(receiver.scratch_roots.ready_queue_len, 0);
-        assert_eq!(
-            accepted.len(),
-            CHILDREN + 2,
-            "every remaining edge and the recursively ready grandchild drained"
-        );
-        assert!(children.iter().all(|child| accepted.contains(child)));
-        assert!(accepted.contains(&grandchild_id));
-        assert_eq!(
-            receiver.accepted_batch_count().unwrap(),
-            (CHILDREN + 3) as u64
-        );
-
-        // Re-staging each child after the fact is idempotent and neither
-        // reawakens nor duplicates any durable edge.
-        for child in children.iter().chain(std::iter::once(&grandchild_id)) {
-            assert!(matches!(
-                receiver.stage_archive_batch(*child).unwrap().disposition(),
-                BatchDisposition::DuplicateAccepted { .. } | BatchDisposition::Accepted { .. }
-            ));
-        }
-        assert_eq!(
-            receiver.accepted_batch_count().unwrap(),
-            (CHILDREN + 3) as u64
-        );
-        drop(receiver);
-        drop(author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rejected_parent_is_identical_before_or_after_child_registration() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(97_400));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(97_401));
-        let lineage = LineageDigest::of(b"rejected-parent-registration-order");
-        let root = std::env::temp_dir().join(format!(
-            "tine-rejected-parent-registration-order-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        let page = PageId::from_uuid(Uuid::from_u128(97_402));
-        let home = DocumentId::from_uuid(Uuid::from_u128(97_403));
-        let block = BlockLocation {
-            block_id: BlockId::from_uuid(Uuid::from_u128(97_404)),
-            home_document_id: home,
-        };
-        let parent_template = author
-            .prepare_bootstrap_transaction(
-                test_author(97_410, 97_410),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: page,
-                        home_document_id: home,
-                        name: LogicalPageName::parse("Rejected Parent").unwrap(),
-                        path: ManagedPath::parse("pages/rejected-parent.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block,
-                        page_id: page,
-                        parent: None,
-                        order: "a".into(),
-                        content: "parent".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        let parent_manifest = parent_template.manifest();
-        let peer = parent_manifest.causal_dot().peer_id();
-        let parent = PreparedBatch::new(
-            OperationBatch::new_with_causality(
-                workspace,
-                lineage,
-                parent_manifest.batch_id(),
-                parent_manifest.author_device_id(),
-                parent_manifest.author_session_id(),
-                parent_manifest.origin(),
-                BatchCausalDot::new(peer, 2).unwrap(),
-                Vec::new(),
-                parent_manifest.dependency_frontier().clone(),
-                parent_manifest.semantic_effect_digest(),
-                parent_manifest.required_objects().to_vec(),
-            )
-            .unwrap(),
-            parent_template.objects().to_vec(),
-        )
-        .unwrap();
-        let parent_id = parent.manifest().batch_id();
-
-        let child_template = author
-            .prepare_bootstrap_transaction(
-                test_author(97_420, 97_420),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(97_421)),
-                    DocumentId::from_uuid(Uuid::from_u128(97_422)),
-                    BlockId::from_uuid(Uuid::from_u128(97_423)),
-                    "Rejected Child",
-                    "pages/rejected-child.md",
-                ),
-            )
-            .unwrap();
-        let child_manifest = child_template.manifest();
-        let child = PreparedBatch::new(
-            OperationBatch::new_with_causality(
-                workspace,
-                lineage,
-                child_manifest.batch_id(),
-                child_manifest.author_device_id(),
-                child_manifest.author_session_id(),
-                child_manifest.origin(),
-                BatchCausalDot::new(child_manifest.causal_dot().peer_id(), 3).unwrap(),
-                vec![parent_id],
-                child_manifest.dependency_frontier().clone(),
-                child_manifest.semantic_effect_digest(),
-                child_manifest.required_objects().to_vec(),
-            )
-            .unwrap(),
-            child_template.objects().to_vec(),
-        )
-        .unwrap();
-        let child_id = child.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&child).unwrap();
-
-        for child_first in [false, true] {
-            let mut receiver = ShardedHotEngine::with_archive_store(
-                ObjectStore::open(&archive_path, workspace).unwrap(),
-                lineage,
-                catalog,
-            );
-            if child_first {
-                assert_eq!(
-                    receiver
-                        .stage_archive_batch(child_id)
-                        .unwrap()
-                        .disposition(),
-                    BatchDisposition::IncompleteStaged {
-                        missing_objects: 0,
-                        missing_dependencies: vec![parent_id],
-                    }
-                );
-            }
-            assert!(matches!(
-                receiver
-                    .stage_archive_batch(parent_id)
-                    .unwrap()
-                    .disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::InvalidCrdt(_),
-                }
-            ));
-            let child_outcome = receiver.stage_archive_batch(child_id).unwrap();
-            assert_eq!(
-                child_outcome.disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::RejectedDependencySet(rejected_dependency_set_commitment(
-                        &[parent_id]
-                    ),),
-                }
-            );
-            let child_record = crate::oplog::dependency_queue::lookup(
-                receiver.scratch.as_ref().unwrap(),
-                &receiver.scratch_roots,
-                child_id,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                child_record.status(),
-                crate::oplog::dependency_queue::CompactBatchStatus::Final
-            );
-            assert!(child_record.dependency_rejected());
-            assert_eq!(
-                child_record.dependency_set_commitment(),
-                rejected_dependency_set_commitment(&[parent_id])
-            );
-            assert_eq!(
-                crate::oplog::dependency_queue::point_state_counts(
-                    receiver.scratch.as_ref().unwrap(),
-                    &receiver.scratch_roots,
-                    child_id,
-                )
-                .unwrap(),
-                (1, 0)
-            );
-            assert_eq!(
-                crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots),
-                0
-            );
-            assert_eq!(
-                crate::oplog::dependency_queue::pending_registration(&receiver.scratch_roots),
-                0
-            );
-            assert_eq!(receiver.scratch_roots.ready_queue_len, 0);
-
-            let roots_before_reconstruction = receiver.scratch_roots.clone();
-            receiver.reconstruct_run_local_state().unwrap();
-            assert_eq!(receiver.scratch_roots, roots_before_reconstruction);
-            assert_eq!(
-                receiver
-                    .stage_archive_batch(child_id)
-                    .unwrap()
-                    .disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::RejectedDependencySet(rejected_dependency_set_commitment(
-                        &[parent_id]
-                    ),),
-                }
-            );
-            assert_eq!(receiver.scratch_roots, roots_before_reconstruction);
-        }
-        drop(author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn three_parent_rejection_matrix_is_order_and_reconstruction_independent() {
-        #[derive(Clone, Copy, Debug)]
-        enum RegistrationTiming {
-            Before,
-            During,
-            After,
-        }
-
-        fn drive_bounded_to_final(
-            engine: &mut ShardedHotEngine,
-            batch_id: BatchId,
-        ) -> BatchDisposition {
-            for step in 0_usize..20_000 {
-                let roots_before_slice = engine.scratch_roots.clone();
-                let slice = engine.stage_archive_batch_bounded(batch_id, 1).unwrap();
-                assert!(slice.work() <= 1);
-                if step.is_multiple_of(3) {
-                    let roots = engine.scratch_roots.clone();
-                    engine.reconstruct_run_local_state().unwrap();
-                    assert_eq!(engine.scratch_roots, roots);
-                }
-                let record = crate::oplog::dependency_queue::lookup(
-                    engine.scratch.as_ref().unwrap(),
-                    &engine.scratch_roots,
-                    batch_id,
-                )
-                .unwrap()
-                .unwrap();
-                if record.status() == crate::oplog::dependency_queue::CompactBatchStatus::Final {
-                    return slice.outcome().disposition();
-                }
-                assert_eq!(slice.work(), 1);
-                assert_ne!(
-                    engine.scratch_roots, roots_before_slice,
-                    "slice size one must make durable progress"
-                );
-                assert!(slice.has_more());
-            }
-            panic!("bounded slice-one staging did not reach finality");
-        }
-
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(98_400));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(98_401));
-        let lineage = LineageDigest::of(b"three-parent-rejection-matrix");
-        let root = std::env::temp_dir().join(format!(
-            "tine-three-parent-rejection-matrix-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let author = ShardedHotEngine::new(workspace, lineage, catalog);
-
-        let make_parent = |seed: u128, invalid_dot: bool| {
-            let template = author
-                .prepare_bootstrap_transaction(
-                    test_author(seed, seed as u64),
-                    &create_page_with_block(
-                        PageId::from_uuid(Uuid::from_u128(seed + 1)),
-                        DocumentId::from_uuid(Uuid::from_u128(seed + 2)),
-                        BlockId::from_uuid(Uuid::from_u128(seed + 3)),
-                        &format!("Matrix Parent {seed}"),
-                        &format!("pages/matrix-parent-{seed}.md"),
-                    ),
-                )
-                .unwrap();
-            if !invalid_dot {
-                return template;
-            }
-            let manifest = template.manifest();
-            PreparedBatch::new(
-                OperationBatch::new_with_causality(
-                    workspace,
-                    lineage,
-                    manifest.batch_id(),
-                    manifest.author_device_id(),
-                    manifest.author_session_id(),
-                    manifest.origin(),
-                    BatchCausalDot::new(manifest.causal_dot().peer_id(), 2).unwrap(),
-                    Vec::new(),
-                    manifest.dependency_frontier().clone(),
-                    manifest.semantic_effect_digest(),
-                    manifest.required_objects().to_vec(),
-                )
-                .unwrap(),
-                template.objects().to_vec(),
-            )
-            .unwrap()
-        };
-        let rejected_a = make_parent(98_410, true);
-        let accepted = make_parent(98_420, false);
-        let rejected_c = make_parent(98_430, true);
-        let rejected_a_id = rejected_a.manifest().batch_id();
-        let accepted_id = accepted.manifest().batch_id();
-        let rejected_c_id = rejected_c.manifest().batch_id();
-        let dependencies = vec![rejected_a_id, accepted_id, rejected_c_id];
-        assert!(dependencies.windows(2).all(|pair| pair[0] < pair[1]));
-
-        let child_template = author
-            .prepare_bootstrap_transaction(
-                test_author(98_440, 98_440),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(98_441)),
-                    DocumentId::from_uuid(Uuid::from_u128(98_442)),
-                    BlockId::from_uuid(Uuid::from_u128(98_443)),
-                    "Matrix Child",
-                    "pages/matrix-child.md",
-                ),
-            )
-            .unwrap();
-        let child_manifest = child_template.manifest();
-        let child = PreparedBatch::new(
-            OperationBatch::new_with_causality(
-                workspace,
-                lineage,
-                child_manifest.batch_id(),
-                child_manifest.author_device_id(),
-                child_manifest.author_session_id(),
-                child_manifest.origin(),
-                child_manifest.causal_dot(),
-                dependencies.clone(),
-                child_manifest.dependency_frontier().clone(),
-                child_manifest.semantic_effect_digest(),
-                child_manifest.required_objects().to_vec(),
-            )
-            .unwrap(),
-            child_template.objects().to_vec(),
-        )
-        .unwrap();
-        let child_id = child.manifest().batch_id();
-        for prepared in [&rejected_a, &accepted, &rejected_c, &child] {
-            writer
-                .publish_bootstrap_prepared_for_test(prepared)
-                .unwrap();
-        }
-
-        let expected_error =
-            EngineError::RejectedDependencySet(rejected_dependency_set_commitment(&dependencies));
-        let mut observed = Vec::new();
-        for timing in [
-            RegistrationTiming::Before,
-            RegistrationTiming::During,
-            RegistrationTiming::After,
-        ] {
-            for rejection_order in [
-                [rejected_a_id, rejected_c_id],
-                [rejected_c_id, rejected_a_id],
-            ] {
-                let mut receiver = ShardedHotEngine::with_archive_store(
-                    ObjectStore::open(&archive_path, workspace).unwrap(),
-                    lineage,
-                    catalog,
-                );
-                assert!(matches!(
-                    drive_bounded_to_final(&mut receiver, accepted_id),
-                    BatchDisposition::Accepted { .. }
-                ));
-
-                if matches!(timing, RegistrationTiming::Before) {
-                    for parent in rejection_order {
-                        assert!(matches!(
-                            drive_bounded_to_final(&mut receiver, parent),
-                            BatchDisposition::Rejected {
-                                error: EngineError::InvalidCrdt(_),
-                            }
-                        ));
-                    }
-                } else {
-                    let first = receiver.stage_archive_batch_bounded(child_id, 1).unwrap();
-                    assert_eq!(first.work(), 1);
-                    assert!(first.has_more());
-                    let roots = receiver.scratch_roots.clone();
-                    receiver.reconstruct_run_local_state().unwrap();
-                    assert_eq!(receiver.scratch_roots, roots);
-
-                    if matches!(timing, RegistrationTiming::During) {
-                        loop {
-                            let slice = receiver.stage_archive_batch_bounded(child_id, 1).unwrap();
-                            assert!(slice.work() <= 1);
-                            let record = crate::oplog::dependency_queue::lookup(
-                                receiver.scratch.as_ref().unwrap(),
-                                &receiver.scratch_roots,
-                                child_id,
-                            )
-                            .unwrap()
-                            .unwrap();
-                            if record.registered_ordinal() == 1 {
-                                assert_eq!(record.unresolved_count(), 1);
-                                break;
-                            }
-                        }
-                    } else {
-                        loop {
-                            let slice = receiver.stage_archive_batch_bounded(child_id, 1).unwrap();
-                            assert!(slice.work() <= 1);
-                            let record = crate::oplog::dependency_queue::lookup(
-                                receiver.scratch.as_ref().unwrap(),
-                                &receiver.scratch_roots,
-                                child_id,
-                            )
-                            .unwrap()
-                            .unwrap();
-                            if record.status()
-                                == crate::oplog::dependency_queue::CompactBatchStatus::Waiting
-                            {
-                                assert_eq!(record.registered_ordinal(), 3);
-                                assert_eq!(record.unresolved_count(), 2);
-                                break;
-                            }
-                        }
-                    }
-                    let roots = receiver.scratch_roots.clone();
-                    receiver.reconstruct_run_local_state().unwrap();
-                    assert_eq!(receiver.scratch_roots, roots);
-
-                    assert!(matches!(
-                        drive_bounded_to_final(&mut receiver, rejection_order[0]),
-                        BatchDisposition::Rejected {
-                            error: EngineError::InvalidCrdt(_),
-                        }
-                    ));
-                }
-
-                let child_disposition = drive_bounded_to_final(&mut receiver, child_id);
-                assert_eq!(
-                    child_disposition,
-                    BatchDisposition::Rejected {
-                        error: expected_error.clone(),
-                    }
-                );
-                let child_record = crate::oplog::dependency_queue::lookup(
-                    receiver.scratch.as_ref().unwrap(),
-                    &receiver.scratch_roots,
-                    child_id,
-                )
-                .unwrap()
-                .unwrap();
-                assert!(child_record.dependency_rejected());
-                assert_eq!(
-                    child_record.dependency_set_commitment(),
-                    rejected_dependency_set_commitment(child.manifest().causal_dependency_heads())
-                );
-                let roots = receiver.scratch_roots.clone();
-                receiver.reconstruct_run_local_state().unwrap();
-                assert_eq!(receiver.scratch_roots, roots);
-
-                if !matches!(timing, RegistrationTiming::Before) {
-                    assert!(matches!(
-                        drive_bounded_to_final(&mut receiver, rejection_order[1]),
-                        BatchDisposition::Rejected {
-                            error: EngineError::InvalidCrdt(_),
-                        }
-                    ));
-                }
-                for _ in 0..20_000 {
-                    let slice = receiver
-                        .stage_archive_batch_bounded(rejection_order[1], 1)
-                        .unwrap();
-                    assert!(slice.work() <= 1);
-                    if !slice.has_more() {
-                        break;
-                    }
-                }
-                assert_eq!(
-                    crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots),
-                    0,
-                    "{timing:?} {rejection_order:?} stranded a fanout parent"
-                );
-                assert_eq!(
-                    crate::oplog::dependency_queue::pending_registration(&receiver.scratch_roots),
-                    0
-                );
-                assert_eq!(receiver.scratch_roots.ready_queue_len, 0);
-                assert_eq!(
-                    crate::oplog::dependency_queue::point_state_counts(
-                        receiver.scratch.as_ref().unwrap(),
-                        &receiver.scratch_roots,
-                        child_id,
-                    )
-                    .unwrap()
-                    .1,
-                    0,
-                    "every durable unresolved edge must retire"
-                );
-                assert_eq!(
-                    receiver
-                        .stage_archive_batch(child_id)
-                        .unwrap()
-                        .disposition(),
-                    BatchDisposition::Rejected {
-                        error: expected_error.clone(),
-                    }
-                );
-                observed.push(child_disposition);
-            }
-        }
-        assert!(observed.iter().all(|result| result == &observed[0]));
-        drop(author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_duplicate_final_rejection_resumes_fanout_after_reconstruction() {
-        const CHILDREN: usize = 7;
-        const SLICE: usize = 1;
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(97_500));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(97_501));
-        let lineage = LineageDigest::of(b"bounded-duplicate-final-rejection");
-        let root = std::env::temp_dir().join(format!(
-            "tine-bounded-duplicate-final-rejection-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let parent_template = author
-            .prepare_bootstrap_transaction(
-                test_author(97_510, 97_510),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(97_511)),
-                    DocumentId::from_uuid(Uuid::from_u128(97_512)),
-                    BlockId::from_uuid(Uuid::from_u128(97_513)),
-                    "Rejected Fanout Parent",
-                    "pages/rejected-fanout-parent.md",
-                ),
-            )
-            .unwrap();
-        let manifest = parent_template.manifest();
-        let parent = PreparedBatch::new(
-            OperationBatch::new_with_causality(
-                workspace,
-                lineage,
-                manifest.batch_id(),
-                manifest.author_device_id(),
-                manifest.author_session_id(),
-                manifest.origin(),
-                BatchCausalDot::new(manifest.causal_dot().peer_id(), 2).unwrap(),
-                Vec::new(),
-                manifest.dependency_frontier().clone(),
-                manifest.semantic_effect_digest(),
-                manifest.required_objects().to_vec(),
-            )
-            .unwrap(),
-            parent_template.objects().to_vec(),
-        )
-        .unwrap();
-        let parent_id = parent.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
-
-        let mut children = Vec::new();
-        for index in 0..CHILDREN {
-            let template = author
-                .prepare_bootstrap_transaction(
-                    test_author(97_520 + index as u128, 97_520 + index as u64),
-                    &create_page_with_block(
-                        PageId::from_uuid(Uuid::from_u128(97_600 + index as u128)),
-                        DocumentId::from_uuid(Uuid::from_u128(97_700 + index as u128)),
-                        BlockId::from_uuid(Uuid::from_u128(97_800 + index as u128)),
-                        &format!("Rejected Fanout Child {index}"),
-                        &format!("pages/rejected-fanout-child-{index}.md"),
-                    ),
-                )
-                .unwrap();
-            let child_manifest = template.manifest();
-            let child = PreparedBatch::new(
-                OperationBatch::new_with_causality(
-                    workspace,
-                    lineage,
-                    child_manifest.batch_id(),
-                    child_manifest.author_device_id(),
-                    child_manifest.author_session_id(),
-                    child_manifest.origin(),
-                    child_manifest.causal_dot(),
-                    vec![parent_id],
-                    child_manifest.dependency_frontier().clone(),
-                    child_manifest.semantic_effect_digest(),
-                    child_manifest.required_objects().to_vec(),
-                )
-                .unwrap(),
-                template.objects().to_vec(),
-            )
-            .unwrap();
-            writer.publish_bootstrap_prepared_for_test(&child).unwrap();
-            children.push(child.manifest().batch_id());
-        }
-
-        let mut receiver = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        for child in &children {
-            assert!(matches!(
-                receiver.stage_archive_batch(*child).unwrap().disposition(),
-                BatchDisposition::IncompleteStaged { .. }
-            ));
-        }
-
-        let final_slice = loop {
-            let slice = receiver
-                .stage_archive_batch_bounded(parent_id, SLICE)
-                .unwrap();
-            assert!(slice.work() <= SLICE);
-            let final_record = crate::oplog::dependency_queue::lookup(
-                receiver.scratch.as_ref().unwrap(),
-                &receiver.scratch_roots,
-                parent_id,
-            )
-            .unwrap()
-            .unwrap();
-            if final_record.status() == crate::oplog::dependency_queue::CompactBatchStatus::Final {
-                break slice;
-            }
-            assert!(slice.has_more());
-        };
-        assert!(matches!(
-            final_slice.outcome().disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::InvalidCrdt(_),
-            }
-        ));
-        assert!(final_slice.has_more());
-        assert!(crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots) > 0);
-
-        receiver.reconstruct_run_local_state().unwrap();
-        let resumed = receiver.stage_archive_batch(parent_id).unwrap();
-        assert!(matches!(
-            resumed.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::InvalidCrdt(_),
-            }
-        ));
-        assert_eq!(
-            crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots),
-            0
-        );
-        assert_eq!(receiver.scratch_roots.ready_queue_len, 0);
-        let drained_roots = receiver.scratch_roots.clone();
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(parent_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::InvalidCrdt(_),
-            }
-        ));
-        assert_eq!(
-            receiver.scratch_roots, drained_roots,
-            "the public duplicate-final continuation drains every edge exactly once"
-        );
-        for child in children {
-            let expected = rejected_dependency_set_commitment(&[parent_id]);
-            assert_eq!(
-                receiver.stage_archive_batch(child).unwrap().disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::RejectedDependencySet(expected),
-                }
-            );
-        }
-        drop(receiver);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_duplicate_final_quarantine_resumes_fanout_after_reconstruction() {
-        const CHILDREN: usize = 3;
-        const SLICE: usize = 1;
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(97_900));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(97_901));
-        let lineage = LineageDigest::of(b"bounded-duplicate-final-quarantine");
-        let root = std::env::temp_dir().join(format!(
-            "tine-bounded-duplicate-final-quarantine-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-
-        let mut left_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        let base = left_author
-            .prepare_bootstrap_transaction(
-                test_author(97_910, 97_910),
-                &create_page_with_block(
-                    PageId::from_uuid(Uuid::from_u128(97_911)),
-                    DocumentId::from_uuid(Uuid::from_u128(97_912)),
-                    BlockId::from_uuid(Uuid::from_u128(97_913)),
-                    "Quarantine Seed",
-                    "pages/quarantine-seed.md",
-                ),
-            )
-            .unwrap();
-        assert!(matches!(
-            left_author
-                .stage_ready(ValidatedBatch::new(base.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let mut right_author = ShardedHotEngine::new(workspace, lineage, catalog);
-        assert!(matches!(
-            right_author
-                .stage_ready(ValidatedBatch::new(base.clone()))
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let left = left_author
-            .prepare_bootstrap_transaction(
-                test_author(97_920, 97_920),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(97_921)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(97_922)),
-                    name: LogicalPageName::parse("Bounded Shared Name").unwrap(),
-                    path: ManagedPath::parse("pages/bounded-left.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let right = right_author
-            .prepare_bootstrap_transaction(
-                test_author(97_930, 97_930),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(97_931)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(97_932)),
-                    name: LogicalPageName::parse("bounded shared name").unwrap(),
-                    path: ManagedPath::parse("pages/bounded-right.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let right_id = right.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
-
-        let mut children = Vec::new();
-        for index in 0..CHILDREN {
-            let mut child_author = ShardedHotEngine::new(workspace, lineage, catalog);
-            assert!(matches!(
-                child_author
-                    .stage_ready(ValidatedBatch::new(base.clone()))
-                    .disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
-            assert!(matches!(
-                child_author
-                    .stage_ready(ValidatedBatch::new(right.clone()))
-                    .disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
-            let child = child_author
-                .prepare_bootstrap_transaction(
-                    test_author(97_940 + index as u128, 97_940 + index as u64),
-                    &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                        page_id: PageId::from_uuid(Uuid::from_u128(98_000 + index as u128)),
-                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(
-                            98_100 + index as u128,
-                        )),
-                        name: LogicalPageName::parse(format!("Quarantine Child {index}")).unwrap(),
-                        path: ManagedPath::parse(format!("pages/quarantine-child-{index}.md"))
-                            .unwrap(),
-                        kind: ManagedTextKind::Page,
-                    }])
-                    .unwrap(),
-                )
-                .unwrap();
-            assert_eq!(child.manifest().causal_dependency_heads(), &[right_id]);
-            writer.publish_bootstrap_prepared_for_test(&child).unwrap();
-            children.push(child.manifest().batch_id());
-        }
-
-        let mut receiver = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(base.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(left.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        for child in &children {
-            assert!(matches!(
-                receiver.stage_archive_batch(*child).unwrap().disposition(),
-                BatchDisposition::IncompleteStaged { .. }
-            ));
-        }
-
-        let final_slice = loop {
-            let slice = receiver
-                .stage_archive_batch_bounded(right_id, SLICE)
-                .unwrap();
-            assert!(slice.work() <= SLICE);
-            let final_record = crate::oplog::dependency_queue::lookup(
-                receiver.scratch.as_ref().unwrap(),
-                &receiver.scratch_roots,
-                right_id,
-            )
-            .unwrap()
-            .unwrap();
-            if final_record.status() == crate::oplog::dependency_queue::CompactBatchStatus::Final {
-                break slice;
-            }
-            assert!(slice.has_more());
-        };
-        assert_eq!(
-            final_slice.outcome().disposition(),
-            BatchDisposition::Quarantined
-        );
-        assert!(final_slice.has_more());
-        receiver.reconstruct_run_local_state().unwrap();
-
-        assert_eq!(
-            receiver
-                .stage_archive_batch(right_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Quarantined
-        );
-        assert_eq!(
-            crate::oplog::dependency_queue::pending_fanout(&receiver.scratch_roots),
-            0
-        );
-        assert_eq!(receiver.scratch_roots.ready_queue_len, 0);
-        for child in children {
-            let record = crate::oplog::dependency_queue::lookup(
-                receiver.scratch.as_ref().unwrap(),
-                &receiver.scratch_roots,
-                child,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                record.status(),
-                crate::oplog::dependency_queue::CompactBatchStatus::Final
-            );
-        }
-        drop(receiver);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
     fn late_external_publication_failure_preserves_all_engine_visible_state_roots() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(88_000));
         let lineage = LineageDigest::of(b"late-external-publication");
@@ -44124,7 +37838,6 @@ mod validation_tests {
         let prior_accepted = engine.status().accepted_batch_ids().unwrap();
         let prior_roots = engine.scratch_roots.clone();
         let prior_claim_root = engine.block_claim_root;
-        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = engine.logseq_claim_root;
         let prior_fatal_handle = engine.fatal_handle;
         let prior_fatal_evidence = engine.fatal_evidence.clone();
@@ -44178,10 +37891,6 @@ mod validation_tests {
             prior_accepted
         );
         assert_eq!(engine.block_claim_root, prior_claim_root);
-        assert_eq!(
-            engine.reference_catalog.root(),
-            &prior_reference_catalog_root
-        );
         assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
         assert_eq!(engine.fatal_handle, prior_fatal_handle);
         assert_eq!(engine.fatal_evidence, prior_fatal_evidence);
@@ -44223,39 +37932,6 @@ mod validation_tests {
         drop(engine);
         drop(writer);
         crate::test_support::remove_dir_all(root);
-    }
-
-    /// Observing author freshness must remain in-memory and constant-work even
-    /// as accepted history grows, while every accepted transition invalidates
-    /// an earlier observation.
-    #[test]
-    fn ordinary_accepted_authoring_keeps_author_freshness_observation_constant_work() {
-        let mut fixture = preauthor_gate_fixture(97_800);
-        let mut observations = Vec::new();
-        for round in 0..8u128 {
-            let before_token = fixture.engine.author_mutation_generation();
-            fixture.author_accepted_round(97_900 + round * 100, &format!("flat {round}"));
-            let before = fixture.engine.instrumentation();
-            let observation = fixture.engine.local_author_generation().unwrap();
-            let after = fixture.engine.instrumentation();
-
-            assert_ne!(
-                observation.mutation_token, before_token,
-                "round {round} acceptance did not invalidate earlier author work"
-            );
-            assert_eq!(observation.generation, fixture.engine.history_generation);
-            assert_eq!(after.external_point_reads, before.external_point_reads);
-            assert_eq!(after.external_range_scans, before.external_range_scans);
-            assert_eq!(after.state_page_bytes_read, before.state_page_bytes_read);
-            assert_eq!(after.scratch_page_reads, before.scratch_page_reads);
-            observations.push(observation.mutation_token);
-        }
-        assert_eq!(
-            observations.iter().collect::<BTreeSet<_>>().len(),
-            observations.len(),
-            "each accepted transition must yield a distinct freshness observation"
-        );
-        finish_preauthor_gate_fixture(fixture);
     }
 
     /// Out-of-order staging and the later acceptance are both engine state
@@ -44358,111 +38034,6 @@ mod validation_tests {
             Some(ArchiveStatus::Accepted { .. })
         ));
         assert_ne!(receiver.author_mutation_generation(), staged);
-    }
-
-    /// Replacing the archive-derived token must not weaken
-    /// draft/capture/finalize staleness. An undisturbed cycle still captures
-    /// and finalizes; a draft or capture that spans an acceptance is stale.
-    #[test]
-    fn author_draft_capture_and_finalize_staleness_stays_exact() {
-        let mut fixture = preauthor_gate_fixture(98_200);
-
-        // Undisturbed: no spurious staleness anywhere in the cycle.
-        fixture.author_accepted_round(98_300, "exact-baseline");
-
-        // A draft taken before another acceptance is stale at capture.
-        let stale_draft = fixture.draft_edits(98_400, &[(0, "exact-stale-draft")]);
-        fixture.author_accepted_round(98_500, "exact-intervening-a");
-        assert!(matches!(
-            fixture.engine.capture_local_author_transaction(
-                stale_draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            ),
-            Err(EngineError::AuthorDraftStale)
-        ));
-
-        // A capture taken before another acceptance is stale at finalize.
-        let draft = fixture.draft_edits(98_600, &[(0, "exact-stale-capture")]);
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => {
-                panic!("undisturbed capture unexpectedly requires reconciliation")
-            }
-        };
-        fixture.author_accepted_round(98_700, "exact-intervening-b");
-        assert!(matches!(
-            fixture
-                .engine
-                .finalize_captured_author_transaction(captured, &fixture.receipts),
-            Err(EngineError::AuthorDraftStale)
-        ));
-
-        // The engine is still authorable after both stale rejections.
-        fixture.author_accepted_round(98_800, "exact-after");
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    /// Authenticated recovery replays every durable final record. It must not
-    /// rebuild an accepted fingerprint map proportional to that history.
-    #[test]
-    fn authenticated_recovery_repopulates_no_accepted_fingerprint_state() {
-        let mut fixture = preauthor_gate_fixture(99_000);
-        for round in 0..4u128 {
-            fixture.author_accepted_round(99_100 + round * 100, &format!("recovered {round}"));
-        }
-        let PreauthorGateFixture {
-            root,
-            writer,
-            graph,
-            receipts,
-            engine,
-            ..
-        } = fixture;
-        let workspace = engine.workspace_id();
-        let lineage = engine.lineage_digest;
-        let catalog = engine.catalog_document_id;
-        let accepted_before = engine.next_acceptance_sequence;
-        assert!(accepted_before >= 5);
-        drop(engine);
-
-        let manifests = writer.committed_manifests().unwrap();
-        let mut reopened = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        reopened.prepare_operational_recovery_replay().unwrap();
-        for manifest in &manifests {
-            reopened
-                .stage_archive_batch_for_recovery(manifest.batch_id())
-                .unwrap();
-        }
-        reopened.finish_operational_recovery_replay().unwrap();
-
-        assert!(
-            reopened.archive_fingerprints.is_empty(),
-            "recovery repopulated retained accepted fingerprint state"
-        );
-        assert_eq!(reopened.next_acceptance_sequence, accepted_before);
-
-        drop(reopened);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 
     /// Author `batches` accepted batches of `pages_per_batch` pages, each with
@@ -44717,6 +38288,110 @@ mod validation_tests {
         }
     }
 
+    /// Isolates the constructor plus its explicit re-importing oracle. The
+    /// production activation builder does not pay the oracle readback; this
+    /// ignored receipt remains available when changing the checkpoint format.
+    ///
+    /// Run with:
+    /// `cargo test --release -p tine-core lazy_genesis_direct_checkpoint_cost_receipt -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual lazy-genesis checkpoint construction receipt"]
+    fn lazy_genesis_direct_checkpoint_cost_receipt() {
+        let pages = std::env::var("TINE_LAZY_GENESIS_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(13_000);
+        let blocks_per_page = std::env::var("TINE_LAZY_GENESIS_BLOCKS_PER_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x7500));
+        let mut builder = LazyGenesisCheckpointBuilder::new_verifying(catalog).unwrap();
+        let started = std::time::Instant::now();
+        let mut checkpoint_bytes = 0_u64;
+        for page_ordinal in 0..pages {
+            let home = DocumentId::from_uuid(Uuid::from_u128(
+                0x7600_u128.saturating_add(page_ordinal as u128),
+            ));
+            let page_id = PageId::from_uuid(Uuid::from_u128(
+                0x1_0000_0000_u128.saturating_add(page_ordinal as u128),
+            ));
+            let path = format!("pages/receipt-{page_ordinal:08}.md");
+            let page = LazyGenesisPageInput {
+                source_leaf: *ContentDigest::of(path.as_bytes()).as_bytes(),
+                exact_source_bytes: vec![
+                    b'x';
+                    blocks_per_page.saturating_mul(96)
+                ],
+                page_id,
+                home_document_id: home,
+                name: format!("Receipt {page_ordinal:08}"),
+                path: ManagedPath::parse(path).unwrap(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                blocks: (0..blocks_per_page)
+                    .map(|block_ordinal| LazyGenesisBlockInput {
+                        block_id: BlockId::from_uuid(Uuid::from_u128(
+                            0x2_0000_0000_u128
+                                .saturating_add((page_ordinal * blocks_per_page) as u128)
+                                .saturating_add(block_ordinal as u128),
+                        )),
+                        home_document_id: home,
+                        parent: None,
+                        order: format!("{block_ordinal:08}"),
+                        content: format!(
+                            "receipt page {page_ordinal:08} block {block_ordinal:04} with representative content"
+                        ),
+                        external_uuid_claims: Vec::new(),
+                    })
+                    .collect(),
+                document_checkpoint: Vec::new(),
+                document_dependencies: None,
+            };
+            let (checkpoint, _) = builder.push_page(&page, &BTreeMap::new()).unwrap();
+            checkpoint_bytes = checkpoint_bytes.saturating_add(checkpoint.len() as u64);
+        }
+        let page_elapsed = started.elapsed();
+        let (catalog_checkpoint, _) = builder.finish().unwrap();
+        let total_elapsed = started.elapsed();
+        eprintln!(
+            "lazy_genesis_checkpoint_receipt pages={pages} blocks={} page_ms={} total_ms={} page_checkpoint_bytes={checkpoint_bytes} catalog_checkpoint_bytes={}",
+            pages.saturating_mul(blocks_per_page),
+            page_elapsed.as_millis(),
+            total_elapsed.as_millis(),
+            catalog_checkpoint.len(),
+        );
+    }
+
+    #[test]
+    fn lazy_genesis_checkpoint_builder_is_terminal_state_not_import_history() {
+        let source = include_str!("hot_engine.rs");
+        let builder = source
+            .split_once("impl LazyGenesisCheckpointBuilder")
+            .and_then(|(_, tail)| tail.split_once("fn verify_lazy_genesis_page_checkpoint"))
+            .map(|(body, _)| body)
+            .expect("lazy-genesis checkpoint builder must remain identifiable");
+        for forbidden in [
+            "SemanticOperation",
+            "OperationTransaction",
+            "prepare_bootstrap_transaction",
+            "AcceptedBatchEvidence",
+            "ProjectionReceipt",
+        ] {
+            assert!(
+                !builder.contains(forbidden),
+                "lazy-genesis checkpoint construction reintroduced {forbidden}"
+            );
+        }
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("deterministic CRDT checkpoint constructed directly"));
+        assert!(contract.contains("authors no `SemanticOperation`"));
+        assert!(contract.contains("remain unopened in the lazy pack"));
+        assert!(source.contains("#[cfg(test)]\nfn verify_lazy_genesis_page_checkpoint"));
+        assert!(source.contains("verify_checkpoints: false"));
+        assert!(source.contains("new_verifying(catalog_document_id"));
+    }
+
     /// The exact 25-batch / 400-page / 100-block shape of the release 1M-block
     /// replay fixture, measured on its own because authoring it costs tens of
     /// minutes and several gigabytes of scratch.
@@ -44927,7 +38602,7 @@ mod replay_benchmark {
             let validation_started = Instant::now();
             assert!(matches!(
                 replay
-                    .stage_ready_internal(batch, true, None, None)
+                    .stage_ready_internal(batch, true, None, None, None)
                     .disposition(),
                 BatchDisposition::Accepted { .. }
             ));
@@ -44959,12 +38634,6 @@ mod replay_benchmark {
             reference_evidence_parse_calls(),
             0,
             "syntax-free replay fixture reparsed one or more block bodies"
-        );
-        let reference_catalog_stats = replay.reference_catalog.store_stats();
-        assert!(
-            reference_catalog_stats.writes <= pages * 24,
-            "one-million replay published transient catalog Patricia nodes: {} writes for {pages} sources",
-            reference_catalog_stats.writes,
         );
         let replay_timing = replay.replay_timing.get();
         let batch_count = pages.div_ceil(PAGES_PER_BATCH);
@@ -45003,7 +38672,7 @@ mod replay_benchmark {
             .saturating_add(replay_timing.checkpoint_blob_append_nanos)
             .saturating_add(replay_timing.checkpoint_whole_digest_nanos);
         eprintln!(
-            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_index_reads={} claim_index_writes={} claim_index_syncs={} claim_hot_entries={} reference_catalog_node_reads={} reference_catalog_node_writes={} owned_semantic_snapshot_entries={}",
+            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_index_reads={} claim_index_writes={} claim_index_syncs={} claim_hot_entries={} owned_semantic_snapshot_entries={}",
             replay.status().accepted_batch_ids().unwrap().len(),
             elapsed.as_secs_f64() * 1_000.0,
             inspection_elapsed.as_secs_f64() * 1_000.0,
@@ -45017,8 +38686,6 @@ mod replay_benchmark {
             instrumentation.store.block_claim_index_writes,
             instrumentation.store.block_claim_index_syncs,
             instrumentation.block_claim_hot_entries,
-            reference_catalog_stats.reads,
-            reference_catalog_stats.writes,
             owned_semantic_snapshot_entries(),
         );
         eprintln!(
@@ -45146,7 +38813,7 @@ mod replay_benchmark {
     }
 
     #[test]
-    fn history_rejects_first_reference_delta_with_post_authority_as_prior_root() {
+    fn history_rejects_first_accepted_record_with_nonempty_prior_frontier() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(969_000));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(969_001));
         let page = PageId::from_uuid(Uuid::from_u128(969_002));
@@ -45159,7 +38826,7 @@ mod replay_benchmark {
         let writer = ObjectStore::open(&root, workspace).unwrap();
         let mut engine = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&root, workspace).unwrap(),
-            LineageDigest::of(b"reference-catalog-initial-root"),
+            LineageDigest::of(b"accepted-frontier-initial-root"),
             catalog,
         );
         let prepared = engine
@@ -45191,578 +38858,15 @@ mod replay_benchmark {
 
         let mut tampered = engine.cold_history_record(batch_id).unwrap().unwrap();
         tampered.generation = 1;
-        let arbitrary_prior = ReferenceCatalogRootV2::empty(
-            &tampered.reference_catalog_policy,
-            &tampered.page_names.ownership_root,
-            tampered.logseq_claim_root.digest(),
-        )
-        .unwrap();
         let ArchiveStatus::Accepted { evidence, .. } = &mut tampered.status else {
             panic!("first history record was accepted");
         };
-        assert_ne!(
-            evidence.reference_catalog_delta.prior_root(),
-            &arbitrary_prior,
-            "the first batch must change page-name authority for this regression"
-        );
-        evidence
-            .reference_catalog_delta
-            .replace_prior_root_for_test(arbitrary_prior.clone());
-        evidence.prior_frontier_root = empty_accepted_frontier_root_with_catalog(arbitrary_prior);
+        evidence.prior_frontier_root = evidence.post_frontier_root.clone();
         assert!(validate_accepted_evidence(evidence).is_err());
         let bytes = encode_history_record(&tampered).unwrap();
         assert!(decode_history_record(batch_id, &bytes).is_err());
-        let error = validate_history_catalog(&[tampered], 1).unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                EngineError::Archive(message)
-                    if message.contains("initial engine history reference-catalog root")
-            ),
-            "unexpected initial-root validation error: {error:?}"
-        );
         drop(engine);
         drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn divergent_current_reference_source_retains_bounded_authenticated_fallback() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(969_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(969_001));
-        let page_id = PageId::from_uuid(Uuid::from_u128(969_002));
-        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(969_003));
-        let block_id = BlockId::from_uuid(Uuid::from_u128(969_004));
-        let lineage = LineageDigest::of(b"divergent-reference-source-fallback");
-        let root = std::env::temp_dir().join(format!(
-            "tine-divergent-reference-source-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let writer = ObjectStore::open(&root, workspace).unwrap();
-        let author = |batch: u128, peer: u64| AuthorBatch {
-            batch_id: BatchId::from_uuid(Uuid::from_u128(batch)),
-            author_device_id: DeviceId::from_uuid(Uuid::from_u128(batch + 1_000)),
-            author_session_id: SessionId::from_uuid(Uuid::from_u128(batch + 2_000)),
-            crdt_peer_id: CrdtPeerId::from_u64(peer),
-        };
-        let mut left_author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&root, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        let base = left_author
-            .prepare_bootstrap_transaction(
-                author(969_010, 969_010),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id,
-                        home_document_id,
-                        name: LogicalPageName::parse("Divergent Source").unwrap(),
-                        path: ManagedPath::parse("pages/divergent-source.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id,
-                            home_document_id,
-                        },
-                        page_id,
-                        parent: None,
-                        order: "a".into(),
-                        content: "base".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        let base_id = base.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
-        assert!(matches!(
-            left_author
-                .stage_archive_batch(base_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-
-        let mut right_author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&root, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            right_author
-                .stage_archive_batch(base_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let left = left_author
-            .prepare_bootstrap_transaction(
-                author(969_020, 969_020),
-                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                    block: BlockLocation {
-                        block_id,
-                        home_document_id,
-                    },
-                    content: "[[Left Reference]]".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let right = right_author
-            .prepare_bootstrap_transaction(
-                author(969_030, 969_030),
-                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                    block: BlockLocation {
-                        block_id,
-                        home_document_id,
-                    },
-                    content: "[[Right Reference]]".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let left_id = left.manifest().batch_id();
-        let right_id = right.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
-
-        let mut receiver = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&root, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            receiver.stage_archive_batch(base_id).unwrap().disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        receiver
-            .reference_source_observations
-            .set(ReferenceSourceObservationStats::default());
-        assert!(matches!(
-            receiver.stage_archive_batch(left_id).unwrap().disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let exact_sources = receiver.reference_source_observations.get();
-        assert_eq!(exact_sources.fallback_document_reconstructions, 0);
-        assert_eq!(exact_sources.authenticated_page_identity_lookups, 2);
-        assert!(exact_sources.carried_shards >= 1);
-        assert!(exact_sources.carried_after_snapshots >= 1);
-
-        receiver
-            .reference_source_observations
-            .set(ReferenceSourceObservationStats::default());
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(right_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let divergent_sources = receiver.reference_source_observations.get();
-        assert_eq!(
-            divergent_sources.fallback_document_reconstructions, 1,
-            "only the divergent replacement must reconstruct a document"
-        );
-        assert_eq!(divergent_sources.authenticated_page_identity_lookups, 2);
-        assert_eq!(
-            divergent_sources.carried_shards, 0,
-            "a divergent-current shard must not reuse its exact-after snapshot"
-        );
-        assert!(receiver
-            .reference_source_posting(page_id)
-            .unwrap()
-            .is_some());
-
-        drop(receiver);
-        drop(right_author);
-        drop(left_author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn authenticated_reference_catalog_tracks_dangling_recreation_move_and_source_delete() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(970_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(970_001));
-        let source_page = PageId::from_uuid(Uuid::from_u128(970_002));
-        let source_home = DocumentId::from_uuid(Uuid::from_u128(970_003));
-        let target_page = PageId::from_uuid(Uuid::from_u128(970_004));
-        let target_home = DocumentId::from_uuid(Uuid::from_u128(970_005));
-        let recreated_target = PageId::from_uuid(Uuid::from_u128(970_006));
-        let recreated_home = DocumentId::from_uuid(Uuid::from_u128(970_007));
-        let source_block = BlockId::from_uuid(Uuid::from_u128(970_008));
-        let raw_uuid = "6a55b643-1234-5678-9abc-def012345678";
-        let root = std::env::temp_dir().join(format!(
-            "tine-reference-catalog-lifecycle-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let writer = ObjectStore::open(&root, workspace).unwrap();
-        let store = ObjectStore::open(&root, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
-            store,
-            LineageDigest::of(b"reference-catalog-lifecycle"),
-            catalog,
-        );
-        let author = |batch: u128| AuthorBatch {
-            batch_id: BatchId::from_uuid(Uuid::from_u128(batch)),
-            author_device_id: DeviceId::from_uuid(Uuid::from_u128(970_100)),
-            author_session_id: SessionId::from_uuid(Uuid::from_u128(batch + 1_000)),
-            crdt_peer_id: CrdtPeerId::from_u64(970_010),
-        };
-
-        let create = engine
-            .prepare_bootstrap_transaction(
-                author(970_010),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: source_page,
-                        home_document_id: source_home,
-                        name: LogicalPageName::parse("Source").unwrap(),
-                        path: ManagedPath::parse("pages/Source.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreatePage {
-                        page_id: target_page,
-                        home_document_id: target_home,
-                        name: LogicalPageName::parse("Target").unwrap(),
-                        path: ManagedPath::parse("pages/Target.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id: source_block,
-                            home_document_id: source_home,
-                        },
-                        page_id: source_page,
-                        parent: None,
-                        order: "a".into(),
-                        content: format!("[[Target]] (({raw_uuid}))"),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        let create_id = create.manifest().batch_id();
-        writer.publish_bootstrap_prepared_for_test(&create).unwrap();
-        engine
-            .reference_source_observations
-            .set(ReferenceSourceObservationStats::default());
-        let create_outcome = engine.stage_archive_batch(create_id).unwrap();
-        assert!(
-            matches!(
-                create_outcome.disposition(),
-                BatchDisposition::Accepted { .. }
-            ),
-            "{create_outcome:?}"
-        );
-        let create_sources = engine.reference_source_observations.get();
-        assert_eq!(
-            create_sources.fallback_document_reconstructions, 0,
-            "validated catalog and new-shard observations must avoid source reconstruction"
-        );
-        assert!(create_sources.carried_catalog_pages >= 2);
-        assert!(create_sources.carried_shards >= 2);
-        let first_root = engine.reference_catalog_root().unwrap().clone();
-        let mut direct_replay = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&root, workspace).unwrap(),
-            LineageDigest::of(b"reference-catalog-lifecycle"),
-            catalog,
-        );
-        direct_replay
-            .reference_source_observations
-            .set(ReferenceSourceObservationStats::default());
-        assert!(matches!(
-            direct_replay
-                .stage_archive_batch(create_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let replay_sources = direct_replay.reference_source_observations.get();
-        assert_eq!(replay_sources.fallback_document_reconstructions, 0);
-        assert!(replay_sources.carried_catalog_pages >= 2);
-        assert!(replay_sources.carried_shards >= 2);
-        assert!(replay_sources.carried_new_shards >= 2);
-        assert_eq!(direct_replay.reference_catalog_root().unwrap(), &first_root);
-        drop(direct_replay);
-        assert_eq!(first_root.source_count(), 2);
-        assert_eq!(engine.reference_catalog.hot_entry_count(), 0);
-        let posting = engine
-            .reference_source_posting(source_page)
-            .unwrap()
-            .unwrap();
-        let target_fact = posting
-            .facts()
-            .iter()
-            .find_map(|fact| match fact {
-                super::super::ReferenceFactV1::PageName(fact) if fact.raw_target == "Target" => {
-                    Some(fact.clone())
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            engine.resolve_reference_page_name(&target_fact).unwrap(),
-            Some(target_page)
-        );
-        assert!(posting.facts().iter().any(|fact| matches!(
-            fact,
-            super::super::ReferenceFactV1::Block(fact)
-                if fact.raw_claim == raw_uuid
-        )));
-        let evidence = engine.accepted_batch_evidence(create_id).unwrap();
-        assert_eq!(
-            evidence.reference_catalog_delta().post_root(),
-            engine.reference_catalog_root().unwrap()
-        );
-        let mut tampered_evidence = evidence.clone();
-        tampered_evidence.post_frontier_root.reference_catalog_root = tampered_evidence
-            .prior_frontier_root
-            .reference_catalog_root
-            .clone();
-        assert!(matches!(
-            tampered_evidence.validate(),
-            Err(EngineError::Archive(_))
-        ));
-        let record = engine.cold_history_record(create_id).unwrap().unwrap();
-        let assert_record_rejected = |label: &str, record: ColdHistoryRecord| {
-            let bytes = encode_history_record(&record).unwrap();
-            assert!(
-                decode_history_record(create_id, &bytes).is_err(),
-                "{label} tamper was accepted"
-            );
-        };
-
-        let mut tampered = record.clone();
-        let ArchiveStatus::Accepted {
-            evidence: status_evidence,
-            ..
-        } = &mut tampered.status
-        else {
-            panic!("created reference batch was accepted");
-        };
-        status_evidence.batch_id = BatchId::from_uuid(Uuid::from_u128(970_099));
-        assert_record_rejected("batch ID", tampered);
-
-        let mut tampered = record.clone();
-        let ArchiveStatus::Accepted {
-            evidence: status_evidence,
-            ..
-        } = &mut tampered.status
-        else {
-            panic!("created reference batch was accepted");
-        };
-        status_evidence.manifest_fingerprint = ContentDigest::of(b"wrong fingerprint");
-        assert_record_rejected("fingerprint", tampered);
-
-        let mut tampered = record.clone();
-        tampered.reference_catalog_root = evidence
-            .prior_frontier_root()
-            .reference_catalog_root()
-            .clone();
-        assert_record_rejected("catalog root", tampered);
-
-        let mut tampered = record.clone();
-        let mut policy_config = crate::config::Config::default();
-        policy_config.property_pages_enabled = !policy_config.property_pages_enabled;
-        tampered.reference_catalog_policy = ReferenceCatalogPolicyV1::from_config(&policy_config);
-        assert_record_rejected("policy", tampered);
-
-        let mut tampered = record.clone();
-        tampered.page_names.ownership_root = PageNameOwnershipRootV1::empty();
-        assert_record_rejected("page-name root", tampered);
-
-        let mut tampered = record;
-        tampered.logseq_claim_root =
-            LogseqClaimIndexRoot::from_digest(ContentDigest::of(b"wrong UUID root"));
-        assert_record_rejected("UUID root", tampered);
-
-        let delete_target = engine
-            .prepare_bootstrap_transaction(
-                author(970_020),
-                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
-                    page_id: target_page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let delete_target_id = delete_target.manifest().batch_id();
-        writer
-            .publish_bootstrap_prepared_for_test(&delete_target)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(delete_target_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let dangling = engine
-            .reference_source_posting(source_page)
-            .unwrap()
-            .unwrap()
-            .facts()
-            .iter()
-            .find_map(|fact| match fact {
-                super::super::ReferenceFactV1::PageName(fact) if fact.raw_target == "Target" => {
-                    Some(fact.clone())
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(engine.resolve_reference_page_name(&dangling).unwrap(), None);
-        assert_ne!(engine.reference_catalog_root().unwrap(), &first_root);
-
-        let recreate = engine
-            .prepare_bootstrap_transaction(
-                author(970_030),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: recreated_target,
-                    home_document_id: recreated_home,
-                    name: LogicalPageName::parse("Target").unwrap(),
-                    path: ManagedPath::parse("pages/Target.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let recreate_id = recreate.manifest().batch_id();
-        writer
-            .publish_bootstrap_prepared_for_test(&recreate)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(recreate_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let rebound = engine
-            .reference_source_posting(source_page)
-            .unwrap()
-            .unwrap()
-            .facts()
-            .iter()
-            .find_map(|fact| match fact {
-                super::super::ReferenceFactV1::PageName(fact) if fact.raw_target == "Target" => {
-                    Some(fact.clone())
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            engine.resolve_reference_page_name(&rebound).unwrap(),
-            Some(recreated_target)
-        );
-
-        let move_block = engine
-            .prepare_bootstrap_transaction(
-                author(970_040),
-                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
-                    root: BlockLocation {
-                        block_id: source_block,
-                        home_document_id: source_home,
-                    },
-                    from_page_id: source_page,
-                    to_page_id: recreated_target,
-                    parent: None,
-                    order: "b".into(),
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let move_id = move_block.manifest().batch_id();
-        writer
-            .publish_bootstrap_prepared_for_test(&move_block)
-            .unwrap();
-        engine
-            .reference_source_observations
-            .set(ReferenceSourceObservationStats::default());
-        assert!(matches!(
-            engine.stage_archive_batch(move_id).unwrap().disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let move_sources = engine.reference_source_observations.get();
-        assert_eq!(
-            move_sources.fallback_document_reconstructions, 0,
-            "authenticated page-identity point reads must avoid full document reconstruction"
-        );
-        assert!(
-            (2..=4).contains(&move_sources.authenticated_page_identity_lookups),
-            "the two affected page identities must use bounded authenticated point reads"
-        );
-        assert!(
-            move_sources.carried_shards >= 2,
-            "the updated membership shard must also carry its cross-home block source"
-        );
-        assert!(move_sources.carried_after_snapshots >= 2);
-        assert!(engine
-            .reference_source_posting(source_page)
-            .unwrap()
-            .unwrap()
-            .facts()
-            .is_empty());
-        assert!(!engine
-            .reference_source_posting(recreated_target)
-            .unwrap()
-            .unwrap()
-            .facts()
-            .is_empty());
-
-        let delete_source = engine
-            .prepare_bootstrap_transaction(
-                author(970_050),
-                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
-                    page_id: source_page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let delete_source_id = delete_source.manifest().batch_id();
-        writer
-            .publish_bootstrap_prepared_for_test(&delete_source)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(delete_source_id)
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(engine
-            .reference_source_posting(source_page)
-            .unwrap()
-            .is_none());
-        assert_eq!(engine.reference_catalog_root().unwrap().source_count(), 1);
-        let final_root = engine.reference_catalog_root().unwrap().clone();
-        drop(engine);
-
-        let replay_store = ObjectStore::open(&root, workspace).unwrap();
-        let mut replay = ShardedHotEngine::with_archive_store(
-            replay_store,
-            LineageDigest::of(b"reference-catalog-lifecycle"),
-            catalog,
-        );
-        for batch_id in [
-            delete_source_id,
-            move_id,
-            recreate_id,
-            delete_target_id,
-            create_id,
-        ] {
-            replay.stage_archive_batch(batch_id).unwrap();
-        }
-        assert_eq!(replay.reference_catalog_root().unwrap(), &final_root);
-        assert_eq!(replay.reference_catalog.hot_entry_count(), 0);
-        let duplicate_root = replay.reference_catalog_root().unwrap().clone();
-        replay.stage_archive_batch(delete_source_id).unwrap();
-        assert_eq!(replay.reference_catalog_root().unwrap(), &duplicate_root);
-        assert_eq!(replay.reference_catalog.hot_entry_count(), 0);
-        drop(replay);
         crate::test_support::remove_dir_all(root);
     }
 

@@ -19,12 +19,14 @@ import {
   codeLanguageItems,
   fuzzyScore,
   propertyKeyFold,
+  propertyValueKeyAfterBoundary,
   type Trigger,
 } from "../editor/autocomplete";
 import { pluginManager } from "../plugins/manager";
 import { bindPluginBlockSnapshot, isPluginGraphOwnerCurrent } from "../plugins/ownership";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
+import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
@@ -32,6 +34,7 @@ import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "
 import {
   doc,
   pageByName,
+  pageWritable,
   setRaw,
   setBlockProperty,
   makeOwnNumberedList,
@@ -125,7 +128,9 @@ import {
   type SelectionAction,
 } from "../editor/selectionActions";
 import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/block";
-import { effectiveHeadingLevel, facetsOf } from "../render/facets";
+import { effectiveHeadingLevel, facetsOf, EMPTY_FACETS, type Facets } from "../render/facets";
+import type { Format } from "../render/ast";
+import type { Node as StoreNode } from "../store";
 import { AstBody, loadHljs, highlightFencedForOverlay } from "../render/body";
 import { codeHlEnabled } from "../codeHighlightSettings";
 import { InlineText, CopyButton } from "../render/inline";
@@ -149,7 +154,7 @@ import { openInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
-import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
+import { cycleMarkerSmart, markerLabelClickable, toggleMarkerLabel, toggleTaskDone } from "../editor/repeat";
 import { setMarker } from "../editor/marker";
 import { registerTransientLayer } from "../transientLayers";
 
@@ -233,7 +238,7 @@ function bodyContainsQueryMacro(raw: string): boolean {
 
 // Pointer-based drag reorder (HTML5 DnD is unreliable in WebKitGTK).
 const [dragId, setDragId] = createSignal<string | null>(null);
-const [dropInd, setDropInd] = createSignal<{ id: string; before: boolean } | null>(null);
+const [dropInd, setDropInd] = createSignal<{ id: string; position: BlockDropPosition } | null>(null);
 let dragMoved = false;
 
 function beginDrag(id: string, e: MouseEvent) {
@@ -256,7 +261,10 @@ function beginDrag(id: string, e: MouseEvent) {
     const tid = el?.dataset.blockId;
     if (tid) {
       const main = el!.querySelector(".block-main")!.getBoundingClientRect();
-      setDropInd({ id: tid, before: ev.clientY < main.top + main.height / 2 });
+      setDropInd({
+        id: tid,
+        position: blockDropPosition(ev.clientX, ev.clientY, el!.getBoundingClientRect(), main),
+      });
     } else {
       setDropInd(null);
     }
@@ -266,7 +274,7 @@ function beginDrag(id: string, e: MouseEvent) {
     document.removeEventListener("mouseup", onUp);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
-      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.before ? "before" : "after");
+      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
     }
     setDragId(null);
     setDropInd(null);
@@ -310,8 +318,78 @@ export interface CollapseSurfaceApi {
 // Keep this surface-local contract explicit when changing collapse parity.
 export const CollapseSurfaceContext = createContext<CollapseSurfaceApi | null>(null);
 
+interface ThreadLineDecoration {
+  enabled: boolean;
+  active: boolean;
+  standard: boolean;
+}
+const NO_THREAD_LINES: ThreadLineDecoration = { enabled: false, active: false, standard: false };
+
+/** The `.ls-block` row's class list. Taking the decoration as ONE argument keeps
+ *  `threadLineDecoration()` evaluated once per class-list update (so a decoration
+ *  host still queries the plugin manager exactly once per change) without paying
+ *  a per-block memo to get that. */
+function rowClassList(
+  collapsed: boolean,
+  embedHost: boolean,
+  threadLines: ThreadLineDecoration,
+): Record<string, boolean> {
+  return {
+    collapsed,
+    "block-embed-host": embedHost,
+    "plugin-thread-lines": threadLines.enabled,
+    "plugin-thread-lines-active": threadLines.active,
+    "plugin-thread-lines-standard": threadLines.standard,
+  };
+}
+
+/** The children container's "collapse/expand every descendant" left border.
+ *  Its two derivations (the descendant list and whether any of them is folded)
+ *  live HERE rather than in `Block` so a leaf — the overwhelming majority of
+ *  blocks on a large page — never allocates them, and so the subtree walk stays
+ *  memoized for the containers that actually render this control. */
+function CollapseAllBorder(props: { id: string; readOnly: boolean }): JSX.Element {
+  const collapseSurface = useContext(CollapseSurfaceContext);
+  const collapsibleDescendants = createMemo(() => collapsibleDescendantIds(props.id));
+  const hasCollapsedDescendant = createMemo(() =>
+    collapsibleDescendants().some((id) => {
+      const descendant = doc.byId[id];
+      return descendant
+        ? collapseSurface?.collapsed(id, descendant.collapsed) ?? descendant.collapsed
+        : false;
+    })
+  );
+  const toggleCollapsedDescendants = () => {
+    const ids = collapsibleDescendants();
+    if (!ids.length || (props.readOnly && !collapseSurface)) return;
+    // OG semantics: any folded descendant means “expand all”; only a completely
+    // open subtree means “collapse all”. The guide parent itself stays open.
+    const next = !hasCollapsedDescendant();
+    if (collapseSurface) collapseSurface.setMany(ids, next);
+    else setCollapsedDescendants(props.id, next);
+  };
+  return (
+    <button
+      type="button"
+      class="block-children-left-border"
+      aria-label={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
+      aria-expanded={!hasCollapsedDescendant()}
+      disabled={collapsibleDescendants().length === 0 || (props.readOnly && !collapseSurface)}
+      title={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
+      onClick={(event) => {
+        event.stopPropagation();
+        toggleCollapsedDescendants();
+      }}
+    />
+  );
+}
+
 export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
-  const node = () => doc.byId[props.id];
+  // ONE store read per block for the node itself. Every derivation below reads
+  // `node()` several times over, and each raw `doc.byId[id]` costs two Solid
+  // store proxy traps (plus a wrap); on a 2000-block page that proxy `get` was
+  // the single largest app-attributable cost in the bigLoad CPU profile.
+  const node = createMemo(() => doc.byId[props.id]);
   // Unique per rendered instance, so when one block uuid appears in several
   // surfaces only the instance that was clicked mounts the editor (the rest stay
   // rendered and reflect edits live). null owner = unscoped (keyboard nav).
@@ -340,28 +418,10 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   };
   const hasChildren = () => node().children.length > 0;
   const collapsed = () => collapseSurface?.collapsed(props.id, node().collapsed) ?? node().collapsed;
-  const collapsibleDescendants = createMemo(() => collapsibleDescendantIds(props.id));
-  const hasCollapsedDescendant = createMemo(() =>
-    collapsibleDescendants().some((id) => {
-      const descendant = doc.byId[id];
-      return descendant
-        ? collapseSurface?.collapsed(id, descendant.collapsed) ?? descendant.collapsed
-        : false;
-    })
-  );
-  const toggleCollapsedDescendants = () => {
-    const ids = collapsibleDescendants();
-    if (!ids.length || (readOnly() && !collapseSurface)) return;
-    // OG semantics: any folded descendant means “expand all”; only a completely
-    // open subtree means “collapse all”. The guide parent itself stays open.
-    const next = !hasCollapsedDescendant();
-    if (collapseSurface) collapseSurface.setMany(ids, next);
-    else setCollapsedDescendants(props.id, next);
-  };
-  const fmt = () => pageByName(node().page)?.format ?? "md";
-  const blockFacets = createMemo(() => {
+  const fmt = createMemo(() => pageByName(node().page)?.format ?? "md");
+  const blockFacets = createMemo<Facets>(() => {
     const n = node();
-    return n ? facetsOf(n.raw, fmt()) : null;
+    return n ? facetsOf(n.raw, fmt()) : EMPTY_FACETS;
   });
   // A table/board view on a block whose body CONTAINS a {{query}} macro belongs
   // to the query results (the macro path renders it, rowSource: query) — the
@@ -370,7 +430,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // {{query}} + tine.view:: board in ONE block, which the exact-body
   // detectMacro misses. Grid stays children-source even on a query block.
   const sheet = createMemo(() => {
-    const cfg = sheetConfig(blockFacets()?.properties ?? []);
+    const cfg = sheetConfig(blockFacets().properties);
     if ((cfg.view === "table" || cfg.view === "board") && bodyContainsQueryMacro(node().raw)) {
       return { ...cfg, view: null };
     }
@@ -382,27 +442,32 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // the plugin CSS to affect. Deliberately keep collapsed parents eligible so
   // their normal decoration state is already current when they expand.
   const hasThreadLineHost = () => hasChildren() && sheet().view === null;
-  const threadLineDecoration = createMemo(() => {
-    if (!hasThreadLineHost()) return { enabled: false, active: false, standard: false };
+  // Plain function, not a memo: a leaf pays nothing but a shared constant, and a
+  // large flat page is predominantly leaves. A memo here allocated a reactive
+  // node per block to answer "false" 2000 times.
+  const threadLineDecoration = (): ThreadLineDecoration => {
+    if (!hasThreadLineHost()) return NO_THREAD_LINES;
     return {
       enabled: pluginManager.hasDeclarativeDecoration("thread-lines"),
       active: pluginManager.declarativeDecorationSetting("thread-lines", "display") === "active",
       standard: pluginManager.declarativeDecorationSetting("thread-lines", "intensity") === "standard",
     };
-  });
+  };
   // Heading level of THIS block's first line, so the bullet column can match the
-  // (taller) heading line box and the bullet stays centered on it.
-  const headingLevel = createMemo(() => {
-    const facets = blockFacets();
-    return facets ? effectiveHeadingLevel(facets, depthOf(props.id)) : null;
-  });
-  const editorVisibleValue = createMemo(() => {
+  // (taller) heading line box and the bullet stays centered on it. Shared with
+  // `Rendered` (which applies the same level to the content), so the underlying
+  // `depthOf` parent walk happens once per block instead of twice.
+  const headingLevel = createMemo(() => effectiveHeadingLevel(blockFacets(), depthOf(props.id)));
+  // Editor-only derivations: read solely while THIS block is being edited (the
+  // heading-offset rule below short-circuits on `!editing()`). Keeping them lazy
+  // means a page-load never runs `splitProps` over every block's raw text.
+  const editorVisibleValue = () => {
     const n = node();
     if (!n) return "";
-    const fmt = pageByName(n.page)?.format === "org" ? "org" : "md";
-    return splitProps(n.raw, isBuiltinHidden, fmt).visible;
-  });
-  const editorIsUniline = createMemo(() => !editorVisibleValue().includes("\n"));
+    const format = pageByName(n.page)?.format === "org" ? "org" : "md";
+    return splitProps(n.raw, isBuiltinHidden, format).visible;
+  };
+  const editorIsUniline = () => !editorVisibleValue().includes("\n");
   // Block-level "linked references" panel toggled by the reference-count badge.
   const [showRefs, setShowRefs] = createSignal(false);
   createEffect(() => {
@@ -414,7 +479,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   const orderMarker = () => orderedListMarker(props.id);
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
-  const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  const readOnly = () => !pageWritable(node().page);
   // Bullet threading: this block's role in the active-path thread (elbow at a path
   // node, or a spine segment on a preceding sibling). Reads threadRoles only while
   // threading is on, so it stays zero-cost when the feature is off. The per-depth
@@ -431,24 +496,25 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // outline. Showing both this storage block's controls and the referenced root's
   // controls produces two consecutive bullets. Keep the referenced root controls
   // (they own collapse/zoom/sidebar behavior) and suppress only the macro host.
-  const blockEmbedHost = createMemo(() => {
-    const m = detectMacro(node().raw);
+  // ONE macro detection per block, shared with `Rendered` (which dispatches
+  // query/embed hosts off the same result) — it used to run `detectMacro` over
+  // the same raw text twice per block.
+  const macro = createMemo(() => detectMacro(node().raw));
+  const blockEmbedHost = () => {
+    const m = macro();
     return m?.kind === "embed" && /^embed\s*\(\([^)]+\)\)\s*$/i.test(m.inner);
-  });
+  };
 
   return (
     <div
       class="ls-block"
       classList={{
-        collapsed: collapsed(),
+        ...rowClassList(collapsed(), blockEmbedHost(), threadLineDecoration()),
+        // FORK: bullet threading draws its own SVG elbow/spine. `rowClassList`
+        // above carries upstream's plugin-thread-lines decoration path, which is
+        // active only when an actual plugin declares it — so these never both apply.
         "thread-elbow": threadRole()?.elbow !== undefined,
         "thread-spine": threadRole()?.spine !== undefined,
-        "block-embed-host": blockEmbedHost(),
-        // Upstream plugin decoration path — active only when an actual plugin
-        // declares it; the fork toggle draws its own SVG so these never both apply.
-        "plugin-thread-lines": threadLineDecoration().enabled,
-        "plugin-thread-lines-active": threadLineDecoration().active,
-        "plugin-thread-lines-standard": threadLineDecoration().standard,
       }}
       style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
       data-block-id={props.id}
@@ -479,8 +545,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           // editing, apply the same offset only when the hidden-props-stripped editor
           // value is still a single line; multi-line heading blocks edit at body size.
           [`bullet-h${headingLevel()}`]: headingLevel() != null && (!editing() || editorIsUniline()),
-          "drop-before": dropInd()?.id === props.id && dropInd()?.before === true,
-          "drop-after": dropInd()?.id === props.id && dropInd()?.before === false,
+          "drop-before": dropInd()?.id === props.id && dropInd()?.position === "before",
+          "drop-after": dropInd()?.id === props.id && dropInd()?.position === "after",
+          "drop-child": dropInd()?.id === props.id && dropInd()?.position === "child",
           dragging: dragId() === props.id,
           selected: isSelected(props.id),
           // Marks the row being edited; drives dim-mode's active-block spotlight.
@@ -561,6 +628,11 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
             fallback={
               <Rendered
                 id={props.id}
+                node={node}
+                fmt={fmt}
+                facets={blockFacets}
+                headingLevel={headingLevel}
+                macro={macro}
                 owner={instanceId}
                 outlineScope={outlineScope}
                 trailing={
@@ -616,18 +688,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           </Match>
           <Match when={true}>
             <div class="block-children-container">
-              <button
-                type="button"
-                class="block-children-left-border"
-                aria-label={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
-                aria-expanded={!hasCollapsedDescendant()}
-                disabled={collapsibleDescendants().length === 0 || (readOnly() && !collapseSurface)}
-                title={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  toggleCollapsedDescendants();
-                }}
-              />
+              <CollapseAllBorder id={props.id} readOnly={readOnly()} />
               <div class="block-children">
                 <For each={node().children}>{(cid) => <Block id={cid} />}</For>
               </div>
@@ -723,35 +784,44 @@ function beginEditGesture(
   document.addEventListener("mouseup", onUp, true);
 }
 
+// `Rendered` is `Block`'s non-editing face. Its node/format/facets/heading-level
+// /macro derivations are IDENTICAL to the ones `Block` already keeps, so they
+// arrive as accessors instead of being recomputed here: one parent walk, one
+// facet lookup and one macro detection per block instead of two.
 function Rendered(props: {
   id: string;
+  node: () => StoreNode;
+  fmt: () => Format;
+  facets: () => Facets;
+  headingLevel: () => number | null;
+  macro: () => { kind: "query" | "embed"; inner: string } | null;
   owner?: string;
   trailing?: JSX.Element;
   outlineScope?: OutlineScope | null;
 }): JSX.Element {
-  const node = () => doc.byId[props.id];
-  const fmt = () => pageByName(node().page)?.format ?? "md";
+  const node = props.node;
+  const fmt = props.fmt;
   // Header facets (marker/priority/heading/scheduled/deadline/properties) off the
   // ONE lsdoc parse — read from the cache the store seeded from the backend DTO (no
   // parse on load), recomputed from a single wasm parse only for the edited block.
-  const facets = createMemo(() => facetsOf(node().raw, fmt()));
-  const headingLevel = createMemo(() => effectiveHeadingLevel(facets(), depthOf(props.id)));
-  const clock = createMemo((): LogbookInfo | null => {
+  const facets = props.facets;
+  const headingLevel = props.headingLevel;
+  const clock = (): LogbookInfo | null => {
     if (!timetrackingEnabled()) return null;
     const marker = facets().marker;
     if (marker !== "DONE" && marker !== "TODO" && marker !== "LATER") return null;
     const info = logbookInfo(node().raw);
     return info.seconds > 0 ? info : null;
-  });
-  const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  };
+  const readOnly = () => !pageWritable(node().page);
 
-  const macro = createMemo(() => detectMacro(node().raw));
+  const macro = props.macro;
 
   // PDF highlight (annotation) blocks render a colored, clickable swatch
   // (AnnotationBody) that opens the PDF at the highlight's page; notes go in
   // child blocks. The detection + rendering live in editor/annotation +
   // components/AnnotationBody.
-  const annotation = createMemo(() => annotationInfo(facets().properties));
+  const annotation = () => annotationInfo(facets().properties);
   // The highlight text shown in the annotation swatch = the first visible (non-
   // property) line of the block (cheap; the shared line recognizer).
   const annotationLine = () => node().raw.split("\n").find((l) => !isPropertyLine(l) && l.trim() !== "") ?? "";
@@ -834,6 +904,11 @@ function Rendered(props: {
       style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
     >
+      {/* One gate for the whole header-chip group. Every chip below needs a
+          marker or a priority, so an ordinary prose block — the overwhelming
+          majority on a large page — evaluates ONE condition instead of three,
+          and allocates no reactive node for the chips it will never show. */}
+      <Show when={facets().marker || facets().priority}>
       <Show when={taskCheckboxState(facets().marker) !== null}>
         <span
           class="block-task-checkbox"
@@ -853,9 +928,10 @@ function Rendered(props: {
       <Show when={facets().marker}>
         <span
           class={`block-marker marker-${facets().marker?.toLowerCase()}`}
+          classList={{ "marker-clickable": markerLabelClickable(facets().marker) }}
           onClick={(e) => {
             e.stopPropagation();
-            cycleBlockMarker(props.id);
+            toggleBlockMarkerLabel(props.id);
           }}
         >
           {facets().marker}
@@ -864,10 +940,15 @@ function Rendered(props: {
       <Show when={facets().priority}>
         <span class={`block-priority priority-${facets().priority}`}>[#{facets().priority}]</span>{" "}
       </Show>
+      </Show>
       {/* Heading size is applied inside AstBody to ONLY the heading's first line
           (see renderBlocks headingLevel), so a `> quote`/table/etc. continuation in
           the same block renders at normal size — matching OG. */}
       {body}
+      {/* Same gate for the trailing chips. `clock()` can only be non-null for a
+          DONE/TODO/LATER block, so keying the group on the marker also keeps
+          `logbookInfo` off every ordinary block's raw text. */}
+      <Show when={facets().marker || facets().scheduled || facets().deadline || displayProps().length > 0}>
       <Show when={clock()}>
         {(info) => <ClockBadge info={info()} />}
       </Show>
@@ -910,19 +991,22 @@ function Rendered(props: {
           </For>
         </span>
       </Show>
+      </Show>
       {props.trailing}
     </div>
     </Show>
   );
 }
 
-// Cycle the task marker on a block (OG order), used by the marker chip click.
-function cycleBlockMarker(id: string) {
-  const { raw } = cycleMarkerSmart(doc.byId[id].raw, workflow(), {
+// Marker-label clicks follow OG's separate two-state toggle. Keyboard marker
+// cycling remains cycleMarkerSmart and may still reach DONE / no marker.
+function toggleBlockMarkerLabel(id: string) {
+  const raw = toggleMarkerLabel(doc.byId[id].raw, {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
+  if (raw === null) return;
   setRaw(id, raw, { timetracking: false });
 }
 
@@ -1111,6 +1195,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // returning to Tine resumes editing exactly where you left off.
   let savedSel: { start: number; end: number } | null = null;
   const node = () => doc.byId[props.id];
+  const readOnly = () => !node() || !pageWritable(node().page);
   const sheetInitialRaw = sheetCell ? node()?.raw ?? "" : null;
   // Page format drives in-block list markers (`-` is an org bullet, not md).
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
@@ -1294,17 +1379,19 @@ export function Editor(props: { id: string }): JSX.Element {
     left.query === right.query &&
     left.start === right.start &&
     left.end === right.end &&
-    left.property === right.property;
+    left.property === right.property &&
+    (left.propertyValues ?? []).join("\0") === (right.propertyValues ?? []).join("\0");
   const detectEditorTrigger = (value = ref.value, caret = ref.selectionStart): Trigger | null =>
     isCalc() || isAnnot() || !!sheetCell
       ? null
       : detectTrigger(value, caret, propertyValueKey());
-  const propertyValueItems = (key: string, query: string): AcItem[] => {
+  const propertyValueItems = (key: string, query: string, used: readonly string[] = []): AcItem[] => {
     const values = propertyFacets.find(([candidate]) => candidate === key)?.[1] ?? [];
     const q = query.trim();
+    const excluded = new Set(used.map((value) => value.toLocaleLowerCase()));
     const ranked = values
       .map((value, index) => ({ value, index, score: q ? fuzzyScore(q, value) : 1 }))
-      .filter(({ score }) => score > 0)
+      .filter(({ value, score }) => score > 0 && !excluded.has(value.toLocaleLowerCase()))
       .sort((left, right) => right.score - left.score || left.index - right.index)
       .slice(0, 100)
       .map(({ value }) => ({ label: value, propertyValue: value }));
@@ -1335,7 +1422,16 @@ export function Editor(props: { id: string }): JSX.Element {
     setAc(t);
     setAcIndex(0);
     if (t.kind === "property-name") {
-      const facets = await autocompleteFacets();
+      let facets: [string, string[]][];
+      try {
+        facets = await autocompleteFacets();
+      } catch (error) {
+        // Completion is an optional aid. A transient facet-query failure must
+        // never reject the editor input event or pile up global error toasts.
+        console.warn("Property autocomplete unavailable", error);
+        if (sameAcTrigger(ac(), t)) setAcItems([]);
+        return;
+      }
       const cur = ac();
       if (!sameAcTrigger(cur, t)) return;
       propertyFacets = facets;
@@ -1348,13 +1444,13 @@ export function Editor(props: { id: string }): JSX.Element {
         .map(({ key }) => ({ label: key, propertyName: key }));
       const created = propertyKeyFold(t.query);
       if (created && !facets.some(([key]) => key === created)) {
-        ranked.push({ label: `Create "${created}"`, propertyName: created });
+        ranked.unshift({ label: `Create "${created}"`, propertyName: created });
       }
       setAcItems(ranked);
       return;
     }
     if (t.kind === "property-value") {
-      setAcItems(propertyValueItems(t.property!, t.query));
+      setAcItems(propertyValueItems(t.property!, t.query, t.propertyValues));
       return;
     }
     if (t.kind === "code-language") {
@@ -2398,6 +2494,10 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   let acTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => {
+    clearTimeout(acTimer);
+    acTimer = undefined;
+  });
   const refreshAutocompleteAfterInput = () => {
     // Close the popup synchronously when the trigger ends (instant), but debounce
     // the page/template IPC fetch so holding down a key doesn't fire a backend
@@ -2427,7 +2527,9 @@ export function Editor(props: { id: string }): JSX.Element {
       setAcItems([]);
     }
     clearTimeout(acTimer);
-    acTimer = setTimeout(() => void updateAutocomplete(), 90);
+    acTimer = setTimeout(() => {
+      if (editorMounted && node()) void updateAutocomplete();
+    }, 90);
   };
   const applyFullWidthRefReplace = () => {
     const paired = fullWidthRefReplace(ref.value, ref.selectionStart);
@@ -2484,6 +2586,17 @@ export function Editor(props: { id: string }): JSX.Element {
     if (e.inputType === "insertText" && e.data && e.data.length === 1 && !e.isComposing) {
       const ch = e.data;
       let handled = false;
+      // OG parity: typing `::` at the beginning of a property line places the
+      // caret before the delimiter. Subsequent property-name characters are
+      // authored as `name|::`, not the malformed `::name` that caused GH #306.
+      if (ch === ":" && ref.selectionStart >= 2) {
+        const caret = ref.selectionStart;
+        const lineStart = ref.value.lastIndexOf("\n", caret - 3) + 1;
+        if (caret - lineStart === 2 && ref.value.slice(lineStart, caret) === "::") {
+          ref.setSelectionRange(lineStart, lineStart);
+          handled = true;
+        }
+      }
       if (ch === "【") {
         handled = applyFullWidthRefReplace();
       }
@@ -2514,6 +2627,8 @@ export function Editor(props: { id: string }): JSX.Element {
           ref.setSelectionRange(r.caret, r.caret);
         }
       }
+      const valueKey = propertyValueKeyAfterBoundary(ref.value, ref.selectionStart, ch);
+      if (valueKey) setPropertyValueKey(valueKey);
       // OG's typing trigger is exact: only the complete visible editor value
       // `1. ` becomes own numbered-list state, then the trigger text disappears
       // (`src/main/frontend/handler/editor.cljs:1888-1892`, 6e7afa8eb).
@@ -3384,7 +3499,12 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     const start = ref.selectionStart;
-    const syntaxSensitive = sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start);
+    const syntaxSensitive =
+      sheetCell ||
+      isCalc() ||
+      caretInFence(ref.value, start) ||
+      caretOnOpeningFence(ref.value, start) ||
+      caretInDisplayMath(ref.value, start);
     const slot = peekClipboardSlot();
     if (!syntaxSensitive) {
       if (slot && text !== "" && normalize(text) === normalize(slot.text)) {
@@ -3570,6 +3690,7 @@ export function Editor(props: { id: string }): JSX.Element {
         onSelect={updateSel}
         onMouseUp={updateSel}
         rows={1}
+        disabled={readOnly()}
       />
       <Show when={isCalc()}>
         <div class="calc-results">
