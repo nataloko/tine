@@ -848,6 +848,13 @@ textarea {
   flex: 1;
   min-width: 0; /* shrink horizontally when the right sidebar/PDF pane is open */
   overflow-y: auto;
+  /* Column flex context so the end-of-page slack (the ::after below) sizes
+     itself against THIS pane's height. GH #369: the slack used to live on the
+     inner column as padding-bottom: 40vh — 40% of the WINDOW — so a split
+     pane a fraction of the window tall overflowed on slack alone and showed a
+     useless scrollbar even when its content fit. */
+  display: flex;
+  flex-direction: column;
 }
 
 /* The pane scroller is tabindex="-1" purely as a programmatic focus target
@@ -859,6 +866,23 @@ textarea {
    cue live on other elements/rules and are unaffected. */
 .main-content:focus {
   outline: none;
+}
+
+/* End-of-page slack (GH #369): an idle dashboard pane gets only its actual free
+   space, so ANY naturally fitting page ends flush without acquiring a scroll
+   range. The released first correction used a non-shrinking 40% basis here;
+   that still forced a bar whenever content occupied 60–100% of the pane. */
+.main-content::after {
+  content: "";
+  flex: 1 1 0;
+}
+
+/* The breathing room is an editing affordance. Restore its non-shrinking 40%
+   pane-relative basis only while this pane owns a mounted editor: long-page
+   tails can still move comfortably above the bottom edge, while read-only
+   dashboards never scroll through blank space. */
+.main-content:has(.block-editor)::after {
+  flex: 1 0 40%;
 }
 
 /* Solo-pane shell: a non-scrolling, positioned wrapper so the pane-select
@@ -1133,9 +1157,12 @@ textarea {
 }
 
 .main-content-inner {
+  /* Flex item of the pane scroller: keep the page column at natural height so
+     only real content overflow (never a compressed column) drives scrolling. */
+  flex: 0 0 auto;
   max-width: var(--ls-main-content-max-width);
   margin: 0 auto;
-  padding: 12px 48px 40vh;
+  padding: 12px 48px 0;
 }
 
 /* Wide mode: drop the reading-width cap. */
@@ -1423,6 +1450,106 @@ textarea {
 .nav-toggle-caret.open {
   transform: rotate(90deg);
 }
+/* Favorites group labels. A label is not a page: it is text the user types, so
+   it is an input rather than a link. It is otherwise an ordinary `.nav-page`
+   row — same height, same drag, same indent — because in the arrangement tree a
+   label and a favorite are the same kind of thing at different depths. */
+.nav-fav-group {
+  gap: 2px;
+  cursor: grab;
+}
+.nav-fav-group-toggle,
+.nav-fav-group-delete {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.6;
+  padding: 0 4px;
+  font: inherit;
+  line-height: 1;
+}
+.nav-fav-group-toggle:hover,
+.nav-fav-group-delete:hover {
+  opacity: 1;
+}
+.nav-fav-group-delete {
+  visibility: hidden;
+}
+.nav-fav-group:hover .nav-fav-group-delete {
+  visibility: visible;
+}
+.nav-fav-group-name {
+  /* Deliberately not `flex: 1`. The row is draggable, and an input stretched
+     across it would leave the user nothing to grab a group by. */
+  flex: 0 1 auto;
+  min-width: 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.75;
+  padding: 1px 4px;
+}
+.nav-fav-group-name:hover {
+  border-color: var(--border, rgba(127, 127, 127, 0.35));
+}
+.nav-fav-group-name:focus {
+  outline: none;
+  border-color: var(--accent, #4c8bf5);
+  opacity: 1;
+}
+/* Keeps a favorite's star aligned with the caret column of a label at the same
+   depth, so a level reads as a level. */
+.nav-fav-spacer {
+  flex: 0 0 14px;
+}
+#sidebar-favorites-list .nav-page {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  gap: 4px;
+}
+/* The insertion line starts where the row WOULD land, so a drop that nests is
+   visibly different from one that does not before the pointer is released. A
+   gradient rather than the flat `inset` box-shadow the right sidebar uses,
+   because only this list has a depth to show. */
+#sidebar-favorites-list .nav-page.row-drop-before,
+#sidebar-favorites-list .nav-page.row-drop-after {
+  box-shadow: none;
+  background-image: linear-gradient(
+    to right,
+    transparent 0 var(--fav-drop-indent, 0px),
+    var(--link-color) var(--fav-drop-indent, 0px)
+  );
+  background-size: 100% 2px;
+  background-repeat: no-repeat;
+}
+#sidebar-favorites-list .nav-page.row-drop-before {
+  background-position: top left;
+}
+#sidebar-favorites-list .nav-page.row-drop-after {
+  background-position: bottom left;
+}
+.nav-fav-add-group {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  opacity: 0.5;
+  padding: 3px 10px;
+  text-align: left;
+  width: 100%;
+}
+.nav-fav-add-group:hover {
+  opacity: 0.9;
+}
+
 .nav-section-count {
   margin-left: auto;
   opacity: 0.7;
@@ -1582,6 +1709,8 @@ textarea {
   font: inherit;
   font-size: 20px;
   line-height: 1;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-title-row:hover .page-actions-trigger,
 .page-actions-trigger:focus-visible,
@@ -1609,6 +1738,8 @@ textarea {
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.1s, background 0.1s, color 0.1s;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-title-row:hover .tag-table-toggle,
 .tag-table-toggle.active {
@@ -1627,6 +1758,8 @@ textarea {
   color: var(--text-secondary);
   font-size: 12px;
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .guide-copy-btn:hover {
   background: var(--bg-tertiary);
@@ -1843,6 +1976,122 @@ textarea {
 }
 .export-btn-primary:hover {
   filter: brightness(1.05);
+}
+
+/* Reference batch export: header affordance (GH #348), mirrored on the
+   filter toggle. */
+.reference-export-toggle {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  padding: 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.reference-export-toggle svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+.reference-export-toggle:hover,
+.reference-export-toggle:focus-visible {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
+
+.reference-export-toggle:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.reference-export-toggle:disabled:hover {
+  color: var(--text-muted);
+  background: transparent;
+}
+
+/* Reference batch-export chooser (GH #348). Chrome reuses the Copy / export
+   modal; only the entry list is new. */
+.ref-export-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.ref-export-actions button {
+  padding: 3px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.ref-export-actions button:hover {
+  background: var(--bg-tertiary);
+}
+
+.ref-export-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ref-export-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.03));
+}
+
+.ref-export-group + .ref-export-group {
+  margin-top: 8px;
+}
+
+.ref-export-group-name {
+  margin-bottom: 2px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.ref-export-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.ref-export-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.ref-export-row input {
+  margin: 0;
+  flex: none;
+}
+
+.ref-export-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-export-empty {
+  padding: 8px;
+  font-size: 12.5px;
+  color: var(--text-muted);
 }
 
 /* PDF export dialog: a note between the options and the buttons explaining the
@@ -2778,6 +3027,10 @@ textarea {
 .sync-merge-row {
   display: flex;
   align-items: center;
+  /* The merged strip and the expanded bodies are full-width children of the
+     row. Nothing else in a row can wrap — every column already has
+     `min-width: 0` — so a row without them keeps its exact one-line layout. */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 4px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 55%, transparent);
@@ -2847,6 +3100,79 @@ textarea {
   font-size: 11px;
   color: var(--link-color);
 }
+
+/* --- The fourth outcome (a suggested merged body) and the per-row expander. ---
+
+   The proposal is a full-width strip UNDER the two columns, never a third
+   column: three columns do not survive a phone. Collapsed rows stay one line
+   per column, so the panel's mobile footprint is unchanged until the user
+   expands a row. */
+.sync-merge-cell.merged {
+  flex: 0 0 100%;
+}
+.sync-merge-mergedtag {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-right: 6px;
+}
+/* Marks a preview that starts below line 0. Deliberately its own element: the
+   marker is never part of the previewed text. */
+.sync-merge-elided {
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+.sync-merge-expand {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  background: none;
+  color: var(--text-muted);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sync-merge-expand:hover {
+  color: var(--text-primary);
+}
+.sync-merge-expanded {
+  flex: 0 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 4px;
+}
+.sync-merge-fulltext-label {
+  margin-bottom: 2px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+/* Capped and independently scrollable: an expanded logbook must not push the
+   Apply button off the screen. */
+.sync-merge-fulltext-body {
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 6px 8px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+.sync-merge-fulltext-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 1.35em;
+}
+.sync-merge-fulltext-line.differs {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--link-color) 14%, transparent);
+  color: var(--text-primary);
+}
 /* --- Concord L3/L4: the calm queue badge and the in-page resolver. --- */
 
 /* The badge waits in the sidebar footer. Deliberately quiet: no red, no count
@@ -2884,6 +3210,183 @@ textarea {
   border-left: 3px solid #b45309;
   border-radius: 6px;
   background: var(--bg-secondary);
+  /* Narrow layout is driven by the PANEL's own width (container query), not
+     the viewport: a phone and a skinny desktop split-pane need the same fix. */
+  container: conflict / inline-size;
+}
+/* Side dots: tie a control to its side's hue where there is no room for the
+   side's name (the legend maps hue → name once). Hidden in row segments at
+   comfortable widths; the narrow rules below reveal them. */
+.sync-merge-seg-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.sync-merge-seg-dot[data-side="mine"] {
+  background: #2e7d32;
+}
+.sync-merge-seg-dot[data-side="theirs"] {
+  background: #1565c0;
+}
+.sync-merge-seg .sync-merge-seg-dot {
+  display: none;
+  margin-right: 5px;
+}
+/* On the active segment's filled background the bare hue almost vanishes;
+   a thin light ring keeps the side color legible. */
+.sync-merge-seg.active .sync-merge-seg-dot {
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85);
+}
+.sync-merge-seg-short {
+  display: none;
+}
+.conflict-narrow {
+  display: none;
+}
+/* Narrow panel (phone sheet, skinny pane): the two-column row starved the
+   TEXT — the one thing the user must read to decide — because the per-row
+   segments carry side labels and don't shrink. Stack the cells full-width and
+   turn the segments into one compact equal-width strip: dot + short word. */
+@container conflict (max-width: 560px) {
+  .conflict-wide {
+    display: none;
+  }
+  .conflict-narrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .page-conflict-legend {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  /* Two-COLUMN headers make no sense over stacked cells; the color edges +
+     the legend carry side identity instead. */
+  .page-conflict .sync-merge-collabels {
+    display: none;
+  }
+  .page-conflict .sync-merge-cols {
+    flex: 1 1 100%;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .page-conflict .sync-merge-cell {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .page-conflict .sync-merge-controls {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .page-conflict .sync-merge-controls .sync-merge-seg {
+    flex: 1 1 0;
+    text-align: center;
+    padding: 4px 4px;
+    white-space: nowrap;
+  }
+  .page-conflict .sync-merge-controls .sync-merge-suggested-tag,
+  .page-conflict .sync-merge-controls .sync-merge-unchanged-tag,
+  .page-conflict .sync-merge-controls .sync-merge-expand {
+    flex: none;
+    align-self: center;
+  }
+  .sync-merge-seg .sync-merge-seg-dot {
+    display: inline-block;
+  }
+  .sync-merge-seg-long {
+    display: none;
+  }
+  .sync-merge-seg-short {
+    display: inline;
+  }
+}
+/* Concord dock (spec: tine-agents/specs/concord-conflict-dock.md): when the
+   panel is scrolled entirely out of view, a slim bar pins to the top of this
+   pane's scroller; tapping it unrolls the SAME panel node as a pinned sheet.
+   position: fixed, not sticky — WebKitGTK has no scroll anchoring, so an
+   in-flow height swap would visibly jump the content below. */
+.page-conflict-sentinel {
+  height: 0;
+}
+.page-conflict-dock {
+  position: fixed;
+  z-index: 250;
+  display: flex;
+  flex-direction: column;
+  max-height: 78vh;
+  padding: 0 8px;
+  box-sizing: border-box;
+  /* the bar and sheet re-enable their own hits; the gutters stay clickable */
+  pointer-events: none;
+}
+.page-conflict-dockbar {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.page-conflict-dockbar-icon {
+  flex: none;
+  color: #b45309;
+}
+.page-conflict-dockbar-title {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.page-conflict-dockbar-count {
+  flex: none;
+  font-weight: 600;
+  color: #b45309;
+}
+.page-conflict-dockbar-chevron {
+  flex: none;
+  margin-left: auto;
+  opacity: 0.7;
+}
+.page-conflict-sheet {
+  pointer-events: auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.page-conflict-sheet .page-conflict {
+  margin: 0;
+}
+@media (max-width: 640px) {
+  .page-conflict-dock {
+    padding: 0 4px;
+  }
+  .page-conflict-dockbar {
+    font-size: 12px;
+    padding: 6px 8px;
+  }
+  .page-conflict-sheet {
+    padding: 6px;
+  }
 }
 .page-conflict-head {
   display: flex;
@@ -2942,6 +3445,20 @@ textarea {
 .page-conflict .sync-merge-cell.theirs {
   border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
 }
+/* The merged proposal is neither side, so it gets its own hue rather than
+   borrowing one of theirs. */
+.page-conflict .sync-merge-cell.merged {
+  border-left: 3px solid color-mix(in srgb, #6f42c1 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="mine"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #2e7d32 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="theirs"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="merged"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #6f42c1 55%, transparent);
+}
 .page-conflict-rows {
   padding: 2px 14px 8px;
   max-height: 420px;
@@ -2986,6 +3503,8 @@ textarea {
   gap: 8px;
   flex-wrap: wrap;
   margin-left: auto;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .carry-btn {
   background: none;
@@ -3010,7 +3529,7 @@ textarea {
 }
 @media (max-width: 640px) {
   .main-content-inner {
-    padding: 8px 12px 40vh;
+    padding: 8px 12px 0;
   }
   .page-title-row {
     gap: 6px;
@@ -3899,6 +4418,29 @@ textarea {
 
 .page-loading {
   height: 50vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.page-loading-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: page-loading-spin 0.8s linear infinite;
+}
+
+@keyframes page-loading-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-loading-spinner { animation: none; }
 }
 
 .conflict-stack {
@@ -4536,6 +5078,29 @@ textarea {
   background: var(--bg-primary);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
 }
+
+/* GH #375: Android/iOS already own the selection-adjacent region with their
+   native Cut/Copy/Paste ActionMode. Tine's separate formatting actions form a
+   second row immediately above the existing mobile keyboard toolbar instead of
+   competing for that region. MobileKeyboardToolbar publishes the measured lift
+   from the layout viewport, including the visible keyboard and safe-area. */
+.sel-toolbar-mobile {
+  position: fixed;
+  top: auto;
+  bottom: var(--mobile-kb-toolbar-lift, calc(64px + env(safe-area-inset-bottom)));
+  left: max(6px, env(safe-area-inset-left));
+  right: max(6px, env(safe-area-inset-right));
+  z-index: 81;
+  justify-content: center;
+}
+
+/* The dock is already above the keyboard, so its narrow-layout overflow opens
+   farther upward rather than covering the keyboard toolbar below. */
+.sel-toolbar-mobile .sel-toolbar-overflow {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
 @container editor (max-width: 260px) {
   .sel-toolbar-secondary {
     display: none;
@@ -8641,6 +9206,16 @@ img.emoji {
 .nav-page.row-drop-before {
   box-shadow: inset 0 2px 0 var(--link-color);
 }
+/* A row reorder drag is not a text gesture: while one is armed nothing on the
+   page is selectable, so dragging a favorite no longer smears its title blue
+   (GH #211 follow-up, Martin 2026-08-25). Transient — the class is only present
+   between the drag threshold and the drop. */
+html.row-reorder-dragging,
+html.row-reorder-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 .rs-item.row-drop-after,
 .nav-page.row-drop-after {
   box-shadow: inset 0 -2px 0 var(--link-color);
@@ -9271,6 +9846,21 @@ img.emoji {
 .pdf-hl-remove:hover {
   color: #e44;
   border-color: #e44;
+}
+
+/* Touch annotation actions share the desktop command set, but need a bounded
+   full-width target instead of a pointer-sized popup that can overflow a phone. */
+.pdf-pane-mobile .pdf-color-menu {
+  left: 12px !important;
+  right: 12px;
+  max-width: calc(100vw - 24px);
+}
+.pdf-pane-mobile .pdf-color-menu :is(.pdf-color-swatch, .pdf-hl-remove) {
+  width: 36px;
+  height: 36px;
+}
+.pdf-pane-mobile .pdf-hl-action {
+  min-height: 36px;
 }
 
 /* ── Onboarding Welcome screen ────────────────────────────────────────────
@@ -9971,4 +10561,36 @@ img.emoji {
     grid-template-columns: 1fr;
     gap: 2px;
   }
+}
+.diagnostics-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1rem 0;
+}
+
+.diagnostics-preview {
+  display: grid;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+}
+
+.diagnostics-preview textarea {
+  width: 100%;
+  min-height: 20rem;
+  resize: vertical;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.diagnostics-verification {
+  border-top: 1px solid var(--border-color);
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+}
+
+.diagnostics-comparison ul {
+  max-height: 12rem;
+  overflow: auto;
 }

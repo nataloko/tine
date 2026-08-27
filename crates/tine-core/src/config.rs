@@ -52,8 +52,18 @@ pub struct Config {
     /// `:default-templates {:journals "Name"}` — template applied to a new,
     /// empty journal page.
     pub default_journal_template: Option<String>,
+    /// `:default-home {:page "Name"}` — graph-portable startup page. Other
+    /// keys in the map belong to Logseq and are preserved by the writer.
+    pub default_home: Option<String>,
     /// `:favorites ["Page" …]` — favorited page names (on-disk, graph-portable).
     pub favorites: Vec<String>,
+    /// `:tine/favorites-page "Name"` — the page holding Tine's Favorites
+    /// arrangement (groups and order). Tine-only; Logseq ignores unknown keys.
+    /// Identity lives here rather than in a reserved page NAME so that a user's
+    /// own page called "Favorites" is never silently treated as Tine's, and
+    /// rather than in a page property so that resolving it costs nothing on the
+    /// reference path (see `refs::ReferenceSourceExclusions`).
+    pub favorites_page: Option<String>,
     /// `:journal/file-name-format` — Logseq's journal FILENAME format (cljs-time /
     /// Joda tokens). `None` = the default `"yyyy_MM_dd"`. Tine only synthesizes
     /// the default format, so a non-default value here means Tine must NOT create
@@ -147,7 +157,9 @@ impl Default for Config {
             property_pages_enabled: true,
             property_pages_excludelist: Vec::new(),
             default_journal_template: None,
+            default_home: None,
             favorites: Vec::new(),
+            favorites_page: None,
             journal_file_name_format: None,
             journal_page_title_format: None,
             preferred_format: crate::model::Format::Md,
@@ -208,7 +220,11 @@ impl Config {
         cfg.property_pages_excludelist = parse_keyword_set(edn, ":property-pages/excludelist");
         cfg.default_journal_template =
             nested_string(edn, ":default-templates", ":journals").filter(|s| !s.is_empty());
+        cfg.default_home = nested_string_in_balanced_map(edn, ":default-home", ":page")
+            .filter(|s| !s.trim().is_empty());
         cfg.favorites = parse_string_vector(edn, ":favorites");
+        cfg.favorites_page =
+            string_value(edn, ":tine/favorites-page").filter(|s| !s.trim().is_empty());
         cfg.journal_file_name_format =
             string_value(edn, ":journal/file-name-format").filter(|s| !s.is_empty());
         cfg.journal_page_title_format =
@@ -267,7 +283,7 @@ impl Config {
 /// Serializes ALL config.edn writers so two concurrent setting changes (or one
 /// racing a read-modify-write) can't clobber each other (audit M2). Process-global:
 /// config writes are rare and there's one config per running app. Every writer below
-/// goes through `crate::model::atomic_update(&path, &CONFIG_LOCK, …)`, which also
+/// goes through `self.write_config(&path, …)`, which also
 /// makes the read NFS-safe (NotFound→`{}`, other errors abort — audit H2) and the
 /// commit atomic.
 static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -279,11 +295,61 @@ fn config_path_for_write(graph: &Graph) -> io::Result<std::path::PathBuf> {
 }
 
 impl Graph {
+    /// Record which page holds the Favorites arrangement, as
+    /// `:tine/favorites-page "Name"`. Logseq ignores unknown keys, so this is
+    /// invisible to it; `:favorites` remains the shared membership list.
+    ///
+    /// Surgical and key-local like `set_favorites`: unknown keys, comments and
+    /// formatting elsewhere in the file survive untouched. The existing value is
+    /// located with the comment/string-aware `find_keyword` and replaced only
+    /// when it really is a string, so a stray non-string value is appended
+    /// beside rather than mis-scanned.
+    /// Publish one configuration edit.
+    ///
+    /// Every setter goes through here rather than calling `atomic_update`
+    /// directly, so a self-write is always recorded. Without that record the
+    /// configuration watcher cannot tell Tine's own settings write from an
+    /// outside one, and every star toggled in the sidebar would cost a
+    /// whole-graph reopen — which discards every cache the graph has built.
+    fn write_config(
+        &self,
+        path: &std::path::Path,
+        edit: impl Fn(&str) -> io::Result<String>,
+    ) -> io::Result<()> {
+        crate::model::atomic_update(path, &CONFIG_LOCK, edit)?;
+        self.note_config_write();
+        Ok(())
+    }
+
+    pub fn set_favorites_page(&self, name: &str) -> io::Result<()> {
+        let path = config_path_for_write(self)?;
+        let quoted = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+        self.write_config(&path, |content| {
+            let mut content = content.to_string();
+            const KEY: &str = ":tine/favorites-page";
+            if let Some(start) = find_top_level_keyword(&content, KEY) {
+                let after = start + KEY.len();
+                let j = skip_blank(&content, after);
+                if content.as_bytes().get(j) == Some(&b'"') {
+                    let end = edn_str_end(&content, j);
+                    content.replace_range(start..end, &format!("{KEY} {quoted}"));
+                } else {
+                    content.insert_str(after, &format!(" {quoted}"));
+                }
+            } else if let Some(brace) = content.find('{') {
+                content.insert_str(brace + 1, &format!("\n {KEY} {quoted}\n"));
+            } else {
+                content = format!("{{{KEY} {quoted}}}\n");
+            }
+            Ok(content)
+        })
+    }
+
     /// Persist the favorites list to `:favorites [...]`, replacing the existing
     /// vector or inserting one, preserving the rest of the file.
     pub fn set_favorites(&self, names: &[String]) -> io::Result<()> {
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
             let vec_str = format!(
                 "[{}]",
@@ -293,7 +359,7 @@ impl Graph {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            if let Some(start) = find_keyword(&content, ":favorites") {
+            if let Some(start) = find_top_level_keyword(&content, ":favorites") {
                 // Replace the existing `:favorites [...]` vector. Require its value to
                 // be a vector and find the matching `]` with an EDN-aware scan so a
                 // favorite NAME containing `]` (or a comment in the vector) can't
@@ -322,10 +388,10 @@ impl Graph {
         let kw = if wf == "todo" { ":todo" } else { ":now" };
         let key = ":preferred-workflow";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 let vstart = skip_blank(&content, after); // comment-aware
                 if content[vstart..].starts_with(':') {
@@ -349,53 +415,13 @@ impl Graph {
     /// Persist `:feature/enable-timetracking?`. OG treats an absent key as ON,
     /// but writing the explicit boolean keeps the Settings toggle reversible.
     pub fn set_timetracking_enabled(&self, enabled: bool) -> io::Result<()> {
-        let key = ":feature/enable-timetracking?";
-        let val = if enabled { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":feature/enable-timetracking?", enabled)
     }
 
     /// Persist `:ui/show-brackets?`. OG treats an absent key as ON, but writing
     /// the explicit boolean keeps the Settings toggle reversible.
     pub fn set_show_brackets(&self, enabled: bool) -> io::Result<()> {
-        let key = ":ui/show-brackets?";
-        let val = if enabled { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":ui/show-brackets?", enabled)
     }
 
     /// Persist the document-mode escape hatch. OG declares the equivalent key in
@@ -415,10 +441,10 @@ impl Graph {
     fn set_config_bool(&self, key: &str, enabled: bool) -> io::Result<()> {
         let val = if enabled { "true" } else { "false" };
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 match next_value_span(&content, after, content.len()) {
                     Some((vstart, vend, _)) if vend > vstart => {
@@ -437,27 +463,7 @@ impl Graph {
 
     /// Persist the one-time in-app Guide announcement flag, graph-locally.
     pub fn set_guide_announced(&self, announced: bool) -> io::Result<()> {
-        let key = ":tine/guide-announced?";
-        let val = if announced { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":tine/guide-announced?", announced)
     }
 
     /// Persist the preferred format for new pages/journals as
@@ -471,10 +477,10 @@ impl Graph {
         };
         let key = ":preferred-format";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 // Replace the FULL existing value span — whether it's a string
                 // (`"Markdown"`) or a keyword (`:org`) — so a keyword value isn't left
@@ -505,10 +511,10 @@ impl Graph {
         let val = format!("\"{escaped}\"");
         let key = ":journal/page-title-format";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 match next_value_span(&content, after, content.len()) {
                     Some((vstart, vend, _)) if vend > vstart => {
@@ -531,11 +537,11 @@ impl Graph {
     /// preserved.
     pub fn set_default_journal_template(&self, name: Option<&str>) -> io::Result<()> {
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             // Locate a real `:default-templates` whose value is a map literal `{ … }`.
-            let dt = find_keyword(&content, ":default-templates").and_then(|start| {
+            let dt = find_top_level_keyword(&content, ":default-templates").and_then(|start| {
                 let after = start + ":default-templates".len();
                 let j = skip_blank(&content, after); // comment-aware
                 if content.as_bytes().get(j) != Some(&b'{') {
@@ -603,6 +609,101 @@ impl Graph {
         })
     }
 
+    /// Persist the graph's startup page in Logseq's `:default-home {:page
+    /// "Name"}` map. Sibling keys (notably OG's `:sidebar`) and the rest of the
+    /// file remain byte-for-byte untouched. A malformed/non-map `:default-home`
+    /// is refused rather than replaced, so an automatic legacy migration can
+    /// never destroy graph-owned configuration it does not understand.
+    pub fn set_default_home_page(&self, name: Option<&str>) -> io::Result<()> {
+        let path = config_path_for_write(self)?;
+        self.write_config(&path, |content| {
+            let mut content = content.to_string();
+            let (root_open, root_close) = root_map_bounds(&content).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "config.edn is not a balanced root map",
+                )
+            })?;
+            let existing =
+                find_keyword_at_map_level(&content[root_open + 1..root_close], ":default-home")
+                    .map(|relative| {
+                        let start = root_open + 1 + relative;
+                        let after = start + ":default-home".len();
+                        let open = skip_blank(&content, after);
+                        if content.as_bytes().get(open) != Some(&b'{') {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                ":default-home exists but is not a map",
+                            ));
+                        }
+                        let close = match_close_brace(&content, open);
+                        if close >= content.len() || content.as_bytes().get(close) != Some(&b'}') {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                ":default-home map is not balanced",
+                            ));
+                        }
+                        Ok((open, close))
+                    });
+            let existing = match existing {
+                Some(result) => Some(result?),
+                None => None,
+            };
+
+            match name.map(str::trim).filter(|name| !name.is_empty()) {
+                Some(name) => {
+                    let value = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+                    match existing {
+                        Some((open, close)) => {
+                            if let Some(relative) =
+                                find_keyword_at_map_level(&content[open + 1..close], ":page")
+                            {
+                                let after = open + 1 + relative + ":page".len();
+                                match next_value_span(&content, after, close) {
+                                    Some((value_start, value_end, _)) => {
+                                        content.replace_range(value_start..value_end, &value)
+                                    }
+                                    None => content.insert_str(after, &format!(" {value}")),
+                                }
+                            } else {
+                                let separator = if content[open + 1..close].trim().is_empty() {
+                                    ""
+                                } else {
+                                    " "
+                                };
+                                content.insert_str(open + 1, &format!(":page {value}{separator}"));
+                            }
+                        }
+                        None => {
+                            let entry = format!("\n :default-home {{:page {value}}}\n");
+                            content.insert_str(root_open + 1, &entry);
+                        }
+                    }
+                }
+                None => {
+                    if let Some((open, close)) = existing {
+                        if let Some(relative) =
+                            find_keyword_at_map_level(&content[open + 1..close], ":page")
+                        {
+                            let start = open + 1 + relative;
+                            let after = start + ":page".len();
+                            let end = next_value_span(&content, after, close)
+                                .map(|(_, value_end, _)| value_end)
+                                .unwrap_or(after);
+                            let tail: usize = content[end..close]
+                                .chars()
+                                .take_while(|c| c.is_whitespace() || *c == ',')
+                                .map(char::len_utf8)
+                                .sum();
+                            content.replace_range(start..end + tail, "");
+                        }
+                    }
+                }
+            }
+            Ok(content)
+        })
+    }
+
     /// Persist the first day of week to `:start-of-week N` (Logseq convention:
     /// 0=Monday … 6=Sunday), replacing the numeric value or inserting the key.
     /// `find_keyword` is comment/string-aware, so a commented `:start-of-week` is
@@ -611,10 +712,10 @@ impl Graph {
         let n = n.min(6);
         let key = ":start-of-week";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 let vstart = skip_blank(&content, after); // comment-aware
                 let digits = content[vstart..]
@@ -745,6 +846,83 @@ fn find_keyword(s: &str, key: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Find a keyword only among the direct entries of an already-sliced map body.
+/// Nested maps/vectors/lists may legally contain the same keyword and are not
+/// the setting being read or edited.
+fn find_keyword_at_map_level(s: &str, key: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = edn_str_end(s, index);
+                continue;
+            }
+            b';' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && s[index..].starts_with(key) => {
+                let after = index + key.len();
+                let boundary = after >= bytes.len()
+                    || matches!(
+                        bytes[after],
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b'('
+                            | b')'
+                            | b'#'
+                            | b','
+                    );
+                if boundary {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Bounds of the root EDN map. Config writers may create entries in the empty
+/// `{}` supplied for a missing file, but must not replace non-map or unbalanced
+/// bytes that may belong to a newer/partially-written configuration shape.
+fn root_map_bounds(s: &str) -> Option<(usize, usize)> {
+    let open = skip_blank(s, 0);
+    if s.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let close = match_close_brace(s, open);
+    (close < s.len() && s.as_bytes().get(close) == Some(&b'}')).then_some((open, close))
+}
+
+/// Locate `key` among the DIRECT entries of the root config map (byte index
+/// into the full string), never inside a nested map/vector/list. The
+/// depth-blind `find_keyword` returns the FIRST occurrence anywhere — so a
+/// `:favorites` nested inside `:default-templates` shadowed the real top-level
+/// entry, and a setter splicing its replacement over the nested hit corrupted
+/// config.edn (DUP-3, 2026-08-25 duplication audit). Every top-level SETTER
+/// must locate its key through this helper; `None` (absent at top level, or no
+/// balanced root map yet) sends callers to their ordinary insert/create path,
+/// which inserts at the root map's opening brace — BEFORE any nested shadow in
+/// byte order, so the depth-blind readers still see the top-level entry first.
+fn find_top_level_keyword(s: &str, key: &str) -> Option<usize> {
+    let (open, close) = root_map_bounds(s)?;
+    find_keyword_at_map_level(&s[open + 1..close], key).map(|relative| open + 1 + relative)
 }
 
 /// Span `[start, end)` of the value token following byte `from` (skipping leading
@@ -1301,6 +1479,26 @@ fn nested_string(edn: &str, outer: &str, inner: &str) -> Option<String> {
     (edn.as_bytes().get(vfrom) == Some(&b'"')).then(|| read_string_at(edn, vfrom))
 }
 
+/// Like `nested_string`, but rejects an unbalanced outer map. Preferences may
+/// fall back when malformed; a graph-owner migration must not mistake a partial
+/// form for authority and then rewrite it.
+fn nested_string_in_balanced_map(edn: &str, outer: &str, inner: &str) -> Option<String> {
+    let (root_open, root_close) = root_map_bounds(edn)?;
+    let relative = find_keyword_at_map_level(&edn[root_open + 1..root_close], outer)?;
+    let start = root_open + 1 + relative;
+    let from = skip_blank(edn, start + outer.len());
+    if edn.as_bytes().get(from) != Some(&b'{') {
+        return None;
+    }
+    let close = match_close_brace(edn, from);
+    if close >= edn.len() || edn.as_bytes().get(close) != Some(&b'}') {
+        return None;
+    }
+    let inner_relative = find_keyword_at_map_level(&edn[from + 1..close], inner)?;
+    let value_start = skip_blank(edn, from + 1 + inner_relative + inner.len());
+    (edn.as_bytes().get(value_start) == Some(&b'"')).then(|| read_string_at(edn, value_start))
+}
+
 /// Boolean value for `inner` inside the map following `outer`, e.g.
 /// `:logbook/settings {:with-second-support? false}`.
 fn nested_bool(edn: &str, outer: &str, inner: &str) -> Option<bool> {
@@ -1449,7 +1647,341 @@ fn parse_macros(edn: &str) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// DUP-3 (2026-08-25 duplication audit): setters located their key with the
+    /// depth-blind `find_keyword`, which returns the FIRST occurrence anywhere.
+    /// With a `:favorites` nested inside `:default-templates` ahead of the real
+    /// top-level entry, `set_favorites` spliced its vector over the NESTED one,
+    /// corrupting the map. Setters must edit only direct root-map entries.
+    #[test]
+    fn setters_edit_the_top_level_key_never_a_nested_shadow() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-nested-shadow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        let path = dir.join("logseq").join("config.edn");
+        std::fs::write(
+            &path,
+            "{:default-templates {:journals \"J\" :favorites [\"nested\"]}\n :favorites [\"real\"]}\n",
+        )
+        .unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites(&["Replaced".to_owned()]).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(":default-templates {:journals \"J\" :favorites [\"nested\"]}"),
+            "the nested shadow must survive byte-for-byte, got: {after}"
+        );
+        assert!(
+            after.contains(":favorites [\"Replaced\"]"),
+            "the real top-level entry must be the one replaced, got: {after}"
+        );
+        assert!(
+            !after.contains("[\"real\"]"),
+            "old top-level value gone, got: {after}"
+        );
+
+        // A key that exists ONLY nested gets a NEW top-level entry; the nested
+        // copy is not the setting and must not be edited.
+        std::fs::write(&path, "{:default-queries {:preferred-format :org}}\n").unwrap();
+        let g = crate::model::Graph::open(&dir);
+        g.set_preferred_format(crate::model::Format::Md).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(":default-queries {:preferred-format :org}"),
+            "nested copy untouched, got: {after}"
+        );
+        assert!(
+            after.contains(":preferred-format \"Markdown\""),
+            "new top-level entry inserted, got: {after}"
+        );
+    }
+
+    // :tine/favorites-page identifies the page holding the Favorites
+    // arrangement. Logseq ignores unknown keys, so the round trip must leave
+    // every other key, comment and bit of formatting exactly as it found it —
+    // a malformed favorites value once invalidated Logseq's whole config parse,
+    // and this writer runs on the user's real config.edn.
+    /// The watcher's whole economy rests on this: it may only pay for a
+    /// whole-graph reopen when the configuration on disk differs from the bytes
+    /// the running `Graph` was opened with. A settings write Tine performed
+    /// itself already refreshed the graph, so it must read as unchanged.
+    #[test]
+    fn a_graph_reports_whether_config_edn_moved_since_it_was_opened() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-witness-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\"]}\n",
+        )
+        .unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(
+            g.open_config_description(),
+            crate::model::config_file_description(&dir),
+            "nothing has touched the file"
+        );
+
+        // An outside write — Logseq, an editor, Syncthing delivering a peer's.
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\" \"Beta\"]}\n",
+        )
+        .unwrap();
+        assert_ne!(
+            g.open_config_description(),
+            crate::model::config_file_description(&dir),
+            "the running graph is now serving stale configuration"
+        );
+
+        // Reopening is what the watcher does about it, and settles it.
+        let reopened = crate::model::Graph::open(&dir);
+        assert_eq!(
+            reopened.open_config_description(),
+            crate::model::config_file_description(&dir)
+        );
+
+        // A graph with no configuration file at all agrees with the absence,
+        // rather than reporting a change on every single cycle.
+        let bare = std::env::temp_dir().join(format!(
+            "tine-config-witness-bare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let empty = crate::model::Graph::open(&bare);
+        assert_eq!(empty.open_config_description(), None);
+        assert_eq!(crate::model::config_file_description(&bare), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The other half of the watcher's economy. A settings write leaves the
+    /// running graph's parsed view stale (it always has), so the byte gate
+    /// alone would read every star toggled in the sidebar as an outside change
+    /// and reopen the whole graph — discarding every cache it has built.
+    #[test]
+    fn a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-selfwrite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(dir.join("logseq").join("config.edn"), "{}\n").unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(g.recent_config_write(), None, "nothing published yet");
+
+        g.set_favorites(&["Alpha".to_owned()]).unwrap();
+        let disk = crate::model::config_file_description(&dir);
+
+        assert_ne!(
+            g.open_config_description(),
+            disk,
+            "the parsed view is stale after a write, as it has always been"
+        );
+        assert_eq!(
+            g.recent_config_write(),
+            disk,
+            "but the bytes on disk are the ones this instance published"
+        );
+
+        // An outside edit after our own write is still an outside edit.
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n",
+        )
+        .unwrap();
+        let disk = crate::model::config_file_description(&dir);
+        assert_ne!(g.open_config_description(), disk);
+        assert_ne!(g.recent_config_write(), disk);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_graph_s_own_config_edn_is_recognized_as_configuration() {
+        use crate::model::is_config_file_path;
+        let root = std::path::Path::new("/graph");
+        assert!(is_config_file_path(
+            root,
+            std::path::Path::new("/graph/logseq/config.edn")
+        ));
+        // A case-folding filesystem may hand back either spelling; the open
+        // path resolves it case-insensitively, so this must too.
+        assert!(is_config_file_path(
+            root,
+            std::path::Path::new("/graph/Logseq/Config.edn")
+        ));
+        for other in [
+            "/graph/config.edn",
+            "/graph/logseq/custom.css",
+            "/graph/logseq/pages-metadata.edn",
+            "/graph/pages/logseq/config.edn",
+            "/elsewhere/logseq/config.edn",
+            "/graph",
+        ] {
+            assert!(
+                !is_config_file_path(root, std::path::Path::new(other)),
+                "{other} is not this graph's configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn favorites_page_key_round_trips_and_preserves_the_rest_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("tine-favpage-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        let original =
+            "{;; a leading comment\n :favorites [\"Alpha\"]\n :journals-directory \"journals\"}\n";
+        std::fs::write(dir.join("logseq").join("config.edn"), original).unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(g.config.favorites_page, None);
+        g.set_favorites_page("Favorites").unwrap();
+
+        let written = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert!(written.contains(";; a leading comment"), "{written}");
+        assert!(written.contains(":favorites [\"Alpha\"]"), "{written}");
+        assert!(
+            written.contains(":journals-directory \"journals\""),
+            "{written}"
+        );
+        assert_eq!(
+            Config::parse(&written).favorites_page.as_deref(),
+            Some("Favorites")
+        );
+
+        // Rewriting replaces the value in place rather than accumulating keys.
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites_page("My Favourites").unwrap();
+        let rewritten = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert_eq!(
+            rewritten.matches(":tine/favorites-page").count(),
+            1,
+            "{rewritten}"
+        );
+        assert_eq!(
+            Config::parse(&rewritten).favorites_page.as_deref(),
+            Some("My Favourites")
+        );
+        assert!(rewritten.contains(":favorites [\"Alpha\"]"), "{rewritten}");
+
+        // A quoted name containing a quote survives the round trip.
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites_page("od\"d").unwrap();
+        let odd = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert_eq!(Config::parse(&odd).favorites_page.as_deref(), Some("od\"d"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
+
+    #[test]
+    fn default_home_reads_only_the_page_inside_the_logseq_map() {
+        assert_eq!(
+            Config::parse(r#"{:default-home {:page "Directory" :sidebar ["Contents"]}}"#)
+                .default_home
+                .as_deref(),
+            Some("Directory")
+        );
+        assert_eq!(
+            Config::parse(r#"{:default-home "Wrong shape"}"#).default_home,
+            None
+        );
+        assert_eq!(Config::parse("{}").default_home, None);
+        assert_eq!(
+            Config::parse(r#"{:nested {:default-home {:page "Not home"}}}"#).default_home,
+            None
+        );
+        assert_eq!(
+            Config::parse(r#"{:default-home {:sidebar {:page "Not home"} :page "Actual home"}}"#)
+                .default_home
+                .as_deref(),
+            Some("Actual home")
+        );
+    }
+
+    #[test]
+    fn default_home_writer_preserves_siblings_clears_only_page_and_refuses_malformed_owner() {
+        use crate::model::Graph;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-default-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        let path = dir.join("logseq/config.edn");
+        fs::write(
+            &path,
+            "{:default-home {:sidebar [\"Contents\"] :page \"Old\"}\n ;; keep me\n :start-of-week 2}\n",
+        )
+        .unwrap();
+
+        Graph::open(&dir)
+            .set_default_home_page(Some("New \"Home\""))
+            .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains(":page \"New \\\"Home\\\"\""), "{written}");
+        assert!(written.contains(":sidebar [\"Contents\"]"), "{written}");
+        assert!(written.contains(";; keep me"), "{written}");
+        assert!(written.contains(":start-of-week 2"), "{written}");
+        assert_eq!(
+            Graph::open(&dir).config.default_home.as_deref(),
+            Some("New \"Home\"")
+        );
+
+        Graph::open(&dir).set_default_home_page(None).unwrap();
+        let cleared = fs::read_to_string(&path).unwrap();
+        assert!(!cleared.contains(":page \"New"), "{cleared}");
+        assert!(cleared.contains(":sidebar [\"Contents\"]"), "{cleared}");
+        assert_eq!(Graph::open(&dir).config.default_home, None);
+
+        fs::write(&path, "{:start-of-week 2}\n").unwrap();
+        Graph::open(&dir)
+            .set_default_home_page(Some("Inserted"))
+            .unwrap();
+        let inserted = fs::read_to_string(&path).unwrap();
+        assert!(
+            inserted.contains(":default-home {:page \"Inserted\"}"),
+            "{inserted}"
+        );
+        assert!(inserted.contains(":start-of-week 2"), "{inserted}");
+
+        let malformed = "{:default-home \"do not replace\" :start-of-week 2}\n";
+        fs::write(&path, malformed).unwrap();
+        let error = Graph::open(&dir)
+            .set_default_home_page(Some("Migration"))
+            .expect_err("a non-map owner must be left untouched");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+
+        fs::write(&path, "[:not-a-config-map]\n").unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = Graph::open(&dir)
+            .set_default_home_page(Some("Never replace the file"))
+            .expect_err("a non-map config must be left untouched");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_macros_map() {

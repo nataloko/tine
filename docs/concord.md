@@ -239,9 +239,16 @@ page**, above the outline, block by block:
 - The two sides are named by whatever produced them — a git ref like `HEAD` and
   the incoming branch, or the Syncthing device/timestamp tag — and coloured
   consistently in the legend, the columns, and the buttons.
-- Each differing block gets its own choice: keep one side, keep the other, or
-  **keep both**.
+- Each differing block gets its own choice: keep one side, keep the other,
+  **keep both** — or, when both sides edited provably different parts of the
+  block's text, accept a **merged** version that combines the two edits.
 - `N conflicts` with ↑ / ↓ walks between the blocks that need a decision.
+
+The review lives at the top of the page, but it cannot scroll out of sight:
+once it leaves the view, a slim one-line notice stays pinned to the top of
+the pane — ignorable, never invisible. Tapping it unrolls the same review in
+place, without losing your reading position or any choices already made;
+tapping again (or Escape, or scrolling back up) folds it away.
 
 **A suggested resolution is pre-selected.** Where a common ancestor is known
 (the base ledger, or the ancestor a `diff3`/Fossil marker block carries with it),
@@ -250,9 +257,24 @@ a block only one side changed arrives with that side already chosen and labeled
 hunt-and-compare. **Apply all suggested** re-applies that opening position after
 you have experimented.
 
-Where no ancestor answers the question — both sides changed the block, or no
-common version is known — the pre-selection is **keep both**, which loses
-nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
+A block **both** sides changed can still arrive with a suggestion: when the
+two edits touch provably different parts of the text against the known
+ancestor — one device fixed the start of a sentence while the other appended
+to its end — Tine offers the combined text as a pre-selected **Merged** row.
+It is a suggestion like any other: shown, labeled, and applied only when you
+confirm. Edits that overlap (or whose combination Tine cannot vouch for) get
+no merged offer.
+
+Where the edits overlap but the merge tool wrote its own `####### SUGGESTED
+CONFLICT RESOLUTION` sections (Fossil), that text is offered in the same
+Merged slot instead, labeled **Merged (tool)**. Because it is the tool's text
+rather than something Tine computed, **Apply all suggested** leaves such rows
+at your current choice — the pre-selection stands until you touch it, but
+only your per-row click (or the initial confirmation) accepts the tool's
+wording.
+
+Where no ancestor answers the question, or the edits genuinely collide, the
+pre-selection is **keep both**, which loses nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
 ordinary outline Markdown that every other tool can read. Tine never invents a
 marker or a property to record that a block was contested.
 
@@ -271,6 +293,9 @@ Nothing is applied until you click **Apply resolution**.
   lifts by itself, because there is no longer anything to quarantine. This is
   the only circumstance in which Tine ever rewrites a file carrying merge
   markers, and only as the direct result of the resolution you just confirmed.
+  A byte-exact copy of the pre-resolution file (markers and all) goes to the
+  recoverable trash first, so the sides you did not choose stay recoverable
+  in Settings → Backups & recovery.
 - For a **retained live draft**: the merged result is revision-guarded against
   the exact disk version shown in the review and written through the ordinary
   Direct Files writer. A newer unseen disk edit refuses the apply and refreshes
@@ -342,8 +367,9 @@ When you review a conflict, Tine uses that ancestor when it has one:
 - A block only **you** changed arrives with *your* version pre-selected.
 - A block only the **other device** changed arrives with *its* version
   pre-selected.
-- A block **both** sides changed is a real conflict — no pre-selection; you
-  decide.
+- A block **both** sides changed is a real conflict. If the two edits touch
+  provably different parts of the text, a combined **Merged** version is
+  offered pre-selected; otherwise there is no pre-selection and you decide.
 
 Pre-selected rows are labeled *suggested*, and the toolbar says when
 suggestions are in play. Nothing is ever merged automatically — you review the

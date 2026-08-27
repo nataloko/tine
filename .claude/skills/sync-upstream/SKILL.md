@@ -137,7 +137,7 @@ sides: `grep -E '"version"|createUpdaterArtifacts|nataloko/tine' src-tauri/tauri
 > nix-shell -p patchelf glibc gcc --run \
 >   'patchelf --set-interpreter $(cat $NIX_CC/nix-support/dynamic-linker) ~/cargo-nextest'
 > ```
-> Expected result at v0.6.95: `1945 tests run: 1945 passed, 133 skipped`.
+> Expected result at v0.6.97: `2128 tests run: 2128 passed, 86 skipped`.
 >
 > Known upstream slip: a patch release sometimes bumps `version` in `tauri.conf.json` but forgets the
 > Android `bundle.android.versionCode`, so `src/version-code.test.ts` fails (versionCode must equal

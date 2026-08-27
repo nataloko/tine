@@ -21,6 +21,7 @@ import {
   sweepReplaceable,
 } from "./store";
 import { backend } from "./backend";
+import { favoritesPageChanged } from "./favoritesStore";
 import { onGraphRebound } from "./modeHooks";
 import {
   markConflict,
@@ -631,6 +632,13 @@ function conflictObservationEpoch(error: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/** Whether a save failed because the page revision changed underneath it.
+ * Consumers outside the persistence loop use this bounded contract instead of
+ * searching arbitrary backend prose for words such as "conflict" or "exists". */
+export function isSaveConflictFailure(error: unknown): boolean {
+  return conflictObservationEpoch(error) !== null || saveFailureCode(error) === "managed.conflict";
+}
+
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (reopenRequired) return;
   if (!isRetryableSaveFailure(error)) {
@@ -1018,6 +1026,11 @@ async function doSave(
       if (baseline === null) bumpPageInventoryRev();
       savedSinceDrain.add(name); // record for the git commit-message composer (read-only)
     }
+    // The favorites arrangement lives in an ordinary page, so editing it in
+    // Tine's own editor is how a keyboard user reorders favorites. The sidebar
+    // has to follow that edit, and this is the one place every in-app page save
+    // passes through.
+    void favoritesPageChanged([name]);
     clearTransientRetry(name);
     conflictObservation.delete(name);
     // The bytes landed, so any banner still up is answered. Only a re-observation

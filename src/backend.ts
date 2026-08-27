@@ -16,6 +16,7 @@ import type {
   AssetInfo,
   EditorActivationHandle,
   SavePageResult,
+  RenameOutcome,
   PageKind,
   GraphMeta,
   GuideCopyResult,
@@ -345,7 +346,7 @@ export interface Backend {
   getBlockReferrers(uuid: string): Promise<RefGroup[]>;
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string): Promise<void>;
   /** Rename a page and update all [[refs]]/#tags across the graph. */
-  renamePage(old: string, next: string, expectedPath?: string): Promise<void>;
+  renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
@@ -355,7 +356,9 @@ export interface Backend {
   /** Resolve all Copy / Export query macros under one cumulative native budget. */
   exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch>;
   /** Advanced (datalog-subset) query: maps the supported clauses onto the engine
-   *  and reports what ran vs was ignored. `currentPage` resolves `:current-page`. */
+   *  and reports what ran vs was ignored. `currentPage` resolves the typed
+   *  `:current-page` input; callers without that input may use it as query-owner
+   *  context for compatibility. */
   runAdvancedQuery(query: string, currentPage?: string): Promise<AdvancedQueryResult>;
   /** Property keys (each with their distinct values) for query-builder
    *  autocomplete. */
@@ -368,6 +371,10 @@ export interface Backend {
   existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
+  /** Record which page owns the Favorites arrangement (`:tine/favorites-page`). */
+  setFavoritesPage(name: string): Promise<void>;
+  /** Persist (or clear) config.edn `:default-home {:page "..."}`. */
+  setDefaultHome(name: string | null): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
   setPreferredWorkflow(workflow: "now" | "todo"): Promise<void>;
   /** Persist `:feature/enable-timetracking?` (default on when absent). */
@@ -417,6 +424,15 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
+  duplicateJournalDiff(canonical: string, stray: string): Promise<SyncConflictDiff | null>;
+  resolveDuplicateJournalDay(
+    canonical: string,
+    stray: string,
+    decisions: Record<string, string>,
+    baseRev: string,
+    strayRev: string,
+    preChoice?: string,
+  ): Promise<PageDto>;
   /** Request one watcher full pass. The returned sequence is completed by a
    *  later `graph-rescan-complete` event, after ordinary change events emit. */
   rescanGraphNow(): Promise<number>;
@@ -529,15 +545,18 @@ export interface Backend {
     preChoice?: "mine" | "theirs" | "union"
   ): Promise<void>;
   /** Merge a conflict copy into its winner per the user's per-row decisions
-   *  (row id → mine/theirs/both), via the normal save path, then trash the copy.
-   *  `baseRev` guards against the winner changing under the merge (throws
-   *  "conflict" if it did). `preChoice`: "mine" | "theirs" | "union". */
+   *  (row id → mine/theirs/both/merged), via the normal save path, then trash
+   *  the copy. `baseRev` guards against the winner changing under the merge
+   *  (throws "conflict" if it did); `mergeBaseRev` echoes the diff's
+   *  `merge_base_rev` so a repinned merge base refuses the same way.
+   *  `preChoice`: "mine" | "theirs" | "union". */
   resolveSyncConflict(
     winner: string,
     conflict: string,
     decisions: Record<string, MergeDecision>,
     baseRev: string,
     conflictRev: string,
+    mergeBaseRev?: string | null,
     preChoice?: "mine" | "theirs" | "union"
   ): Promise<PageDto>;
   /** Discard a conflict copy without merging (move it to the recoverable trash). */
@@ -640,6 +659,10 @@ export interface Backend {
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
+  /** Subscribe to `logseq/config.edn` being re-read after an outside change.
+   *  Carries the fresh GraphMeta; a graph whose settings did not move emits
+   *  nothing. */
+  onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
   /** Subscribe to an admitted aggregate managed-storage change. */
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
@@ -737,6 +760,14 @@ export interface Backend {
    *  tracked-file edits so the working tree matches the remote. Destructive;
    *  callers must confirm first. The reset reloads through the watcher path. */
   gitForcePull(): Promise<GitResult>;
+  diagnosticReport(buildCommit: string, buildTime: string): Promise<DiagnosticReport>;
+  saveDiagnosticReport(buildCommit: string, buildTime: string): Promise<boolean>;
+  clearDiagnostics(): Promise<void>;
+  createGraphVerification(operationId: string): Promise<GraphVerificationReport>;
+  cancelGraphVerification(operationId: string): Promise<void>;
+  saveGraphVerificationReport(text: string): Promise<boolean>;
+  onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
+  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number): Promise<void>;
 }
 
 /** Repo status for the git integration's status line / topbar badge. */
@@ -761,6 +792,28 @@ export interface GitResult {
 export interface DebugInfo {
   enabled: boolean;
   path: string;
+  recorderActive: boolean;
+  previousExitUnclean: boolean;
+}
+
+export interface DiagnosticReport {
+  text: string;
+  suggestedFileName: string;
+}
+
+export interface GraphVerificationReport {
+  text: string;
+  suggestedFileName: string;
+  totalFiles: number;
+  totalBytes: number;
+  aggregateDigest?: string;
+  complete: boolean;
+}
+
+export interface GraphVerificationProgress {
+  operationId: string;
+  processed: number;
+  total: number;
 }
 
 /** Backend-visible rendering-environment facts (Linux-relevant; all false on
@@ -809,6 +862,7 @@ export function isTauri(): boolean {
  * graph without adding it here reintroduces the round-15 blockers.
  */
 const REBINDING_COMMANDS = new Set([
+  "set_default_home",
   "set_journal_title_format",
   "set_preferred_format",
   "set_timetracking_enabled",
@@ -818,6 +872,17 @@ const REBINDING_COMMANDS = new Set([
   "set_guide_announced",
   "restore_backup",
 ]);
+
+const DIAGNOSTIC_COMMANDS = new Set([
+  "debug_info",
+  "debug_log",
+  "diagnostic_ipc_event",
+  "diagnostic_frontend_event",
+  "diagnostic_report",
+  "save_diagnostic_report",
+  "clear_diagnostics",
+]);
+const SLOW_IPC_MS = 500;
 
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -841,7 +906,33 @@ class TauriBackend implements Backend {
     const leasedArgs = bindingGeneration
       ? { ...(args ?? {}), bindingGeneration }
       : args;
-    const result = await this.invoke<T>(cmd, leasedArgs);
+    const started = performance.now();
+    let slow = false;
+    let slowTimer: ReturnType<typeof setTimeout> | undefined;
+    const reportPhase = (phase: "slow" | "completed" | "failed", elapsedMs: number) => {
+      if (DIAGNOSTIC_COMMANDS.has(cmd)) return;
+      void this.invoke<void>("diagnostic_ipc_event", {
+        command: cmd,
+        phase,
+        elapsedMs: Math.max(0, Math.round(elapsedMs)),
+      }).catch(() => {});
+    };
+    if (!DIAGNOSTIC_COMMANDS.has(cmd)) {
+      slowTimer = setTimeout(() => {
+        slow = true;
+        reportPhase("slow", performance.now() - started);
+      }, SLOW_IPC_MS);
+    }
+    let result: T;
+    try {
+      result = await this.invoke<T>(cmd, leasedArgs);
+    } catch (error) {
+      if (slowTimer !== undefined) clearTimeout(slowTimer);
+      reportPhase("failed", performance.now() - started);
+      throw error;
+    }
+    if (slowTimer !== undefined) clearTimeout(slowTimer);
+    if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh
     // `Graph`, with a fresh (empty) editor-activation registry — must announce
     // it, or this side keeps tokens naming editors the core has never heard of
@@ -1119,7 +1210,7 @@ class TauriBackend implements Backend {
     return this.call<void>("delete_page", { name, kind, expectedPath });
   }
   renamePage(old: string, next: string, expectedPath?: string) {
-    return this.call<void>("rename_page", { old, new: next, expectedPath });
+    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath });
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");
@@ -1153,6 +1244,15 @@ class TauriBackend implements Backend {
   }
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });
+  }
+  /** Record which page holds the Favorites arrangement (`:tine/favorites-page`).
+   *  Membership stays in `:favorites`; this names the page that owns groups and
+   *  order, and is what keeps that page out of everyone's Linked References. */
+  setFavoritesPage(name: string) {
+    return this.call<void>("set_favorites_page", { name });
+  }
+  setDefaultHome(name: string | null) {
+    return this.call<void>("set_default_home", { name });
   }
   setPreferredWorkflow(workflow: "now" | "todo") {
     return this.call<void>("set_preferred_workflow", { workflow });
@@ -1273,6 +1373,21 @@ class TauriBackend implements Backend {
   }
   listJournalConflicts() {
     return this.call<JournalConflict[]>("list_journal_conflicts");
+  }
+  duplicateJournalDiff(canonical: string, stray: string) {
+    return this.call<SyncConflictDiff | null>("duplicate_journal_diff", { canonical, stray });
+  }
+  resolveDuplicateJournalDay(
+    canonical: string,
+    stray: string,
+    decisions: Record<string, string>,
+    baseRev: string,
+    strayRev: string,
+    preChoice?: string,
+  ) {
+    return this.call<PageDto>("resolve_duplicate_journal_day", {
+      canonical, stray, decisions, baseRev, strayRev, preChoice,
+    });
   }
   rescanGraphNow() {
     return this.call<number>("rescan_graph_now");
@@ -1422,6 +1537,7 @@ class TauriBackend implements Backend {
     decisions: Record<string, MergeDecision>,
     baseRev: string,
     conflictRev: string,
+    mergeBaseRev?: string | null,
     preChoice?: "mine" | "theirs" | "union"
   ) {
     return this.call<PageDto>("resolve_sync_conflict", {
@@ -1430,6 +1546,7 @@ class TauriBackend implements Backend {
       decisions,
       baseRev,
       conflictRev,
+      mergeBaseRev: mergeBaseRev ?? null,
       preChoice: preChoice ?? "union",
     });
   }
@@ -1555,6 +1672,10 @@ class TauriBackend implements Backend {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
+  async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+  }
   async onSparseV2Changed(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen("sparse-v2-changed", () => cb());
@@ -1644,6 +1765,31 @@ class TauriBackend implements Backend {
   }
   gitForcePull() {
     return this.call<GitResult>("git_force_pull");
+  }
+  diagnosticReport(buildCommit: string, buildTime: string) {
+    return this.call<DiagnosticReport>("diagnostic_report", { buildCommit, buildTime });
+  }
+  saveDiagnosticReport(buildCommit: string, buildTime: string) {
+    return this.call<boolean>("save_diagnostic_report", { buildCommit, buildTime });
+  }
+  clearDiagnostics() {
+    return this.call<void>("clear_diagnostics");
+  }
+  createGraphVerification(operationId: string) {
+    return this.call<GraphVerificationReport>("create_graph_verification", { operationId });
+  }
+  cancelGraphVerification(operationId: string) {
+    return this.call<void>("cancel_graph_verification", { operationId });
+  }
+  saveGraphVerificationReport(text: string) {
+    return this.call<boolean>("save_graph_verification_report", { text });
+  }
+  async onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
+  }
+  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number) {
+    return this.call<void>("diagnostic_frontend_event", { kind, line, column, delayMs });
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

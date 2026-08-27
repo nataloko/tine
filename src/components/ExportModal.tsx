@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta } from "../ui";
+import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta, type ExportRequest } from "../ui";
 import { exportNodesFor, formatForPage } from "../store";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
@@ -45,9 +45,13 @@ function saveOptions(o: ExportOptions): void {
   }
 }
 
+// The two content choices must name the OUTPUT the user gets, not the internal
+// mode: GH #352 showed "Rendered"/"Source" left the preserve-Markdown option
+// undiscoverable on the reporter's screen. The option values stay
+// "rendered"/"source" so persisted settings keep working.
 const CONTENT_STYLES: { value: ExportContent; label: string; hint: string }[] = [
-  { value: "rendered", label: "Rendered", hint: "the text as displayed — glyphs (→ –), no markup markers" },
-  { value: "source", label: "Source", hint: "the raw Markdown/Org text" },
+  { value: "rendered", label: "Plain text", hint: "cleaned — the text as displayed, without markup markers (bold, highlighting, links)" },
+  { value: "source", label: "Markdown", hint: "preserved — original source syntax (bold, highlighting, links, properties)" },
 ];
 
 const FORMAT_STYLES: { value: ExportFormat; label: string }[] = [
@@ -142,7 +146,7 @@ function pageRefTarget(s: string): string | null {
   return /^\[\[([^\]]+)\]\]$/.exec(s.trim())?.[1] ?? null;
 }
 
-function blockDtosToExportNodes(blocks: BlockDto[], format: Format): ExportNode[] {
+export function blockDtosToExportNodes(blocks: BlockDto[], format: Format): ExportNode[] {
   return blocks.map((b) => ({ raw: b.raw, format, children: blockDtosToExportNodes(b.children, format) }));
 }
 
@@ -362,12 +366,12 @@ export async function warmExportResolutions(nodes: ExportNode[], warmed: Map<str
 export function ExportModal(): JSX.Element {
   return (
     <Show when={exportModal()}>
-      {(m) => <Modal ids={m().ids} />}
+      {(m) => <Modal request={m()} />}
     </Show>
   );
 }
 
-function Modal(props: { ids: string[] }): JSX.Element {
+function Modal(props: { request: ExportRequest }): JSX.Element {
   let root: HTMLDivElement | undefined;
   createEffect(() => {
     const unregister = registerTransientLayer({ id: "copy-export", root: () => root ?? null, dismiss: () => { closeExportModal(); return true; } });
@@ -387,7 +391,16 @@ function Modal(props: { ids: string[] }): JSX.Element {
   // Build the node forest once (the selection is fixed while the modal is open);
   // the preview recomputes from it as options change. Rendered mode applies the
   // typographic glyphs exactly when the app displays them (not persisted).
-  const nodes = exportNodesFor(props.ids);
+  const nodes = "ids" in props.request ? exportNodesFor(props.request.ids) : props.request.nodes;
+  // Name the preserved syntax after the selection's actual format: a Markdown
+  // forest offers "Markdown", an Org forest "Org", a mix "Markdown/Org" — so
+  // the preserve choice says what it preserves (GH #352).
+  const sourceLabel = () => {
+    const formats = new Set(nodes.map((n) => n.format ?? "md"));
+    if (formats.size === 1 && formats.has("org")) return "Org";
+    if (formats.size === 1) return "Markdown";
+    return "Markdown/Org";
+  };
   const resolveMacro = (name: string, args: string[]) => {
     const warmed = warmedMacros.get(macroKey(name, args));
     if (warmed?.kind === "text") return { raw: "", format: "md" as const, text: warmed.text };
@@ -452,12 +465,12 @@ function Modal(props: { ids: string[] }): JSX.Element {
     format() === "text"
       && ((t.sourceOnly && opts().content === "rendered") || (t.renderedOnly && opts().content !== "rendered"));
   const toggleTitle = (t: ExportToggle) => {
-    if (format() === "text" && t.sourceOnly && opts().content === "rendered") return "Rendered text has no markup markers";
-    if (format() === "text" && t.renderedOnly && opts().content !== "rendered") return "Only applies to rendered text";
+    if (format() === "text" && t.sourceOnly && opts().content === "rendered") return "Plain text output has no markup markers to remove";
+    if (format() === "text" && t.renderedOnly && opts().content !== "rendered") return "Only applies to plain text output";
     return undefined;
   };
 
-  const blockCount = props.ids.length;
+  const blockCount = "ids" in props.request ? props.request.ids.length : props.request.count;
   return (
     <div class="modal-overlay" onClick={closeExportModal}>
       <div ref={root} class="export-modal" onClick={(e) => e.stopPropagation()}>
@@ -497,7 +510,7 @@ function Modal(props: { ids: string[] }): JSX.Element {
                     title={s.hint}
                     onClick={() => update({ content: s.value })}
                   >
-                    {s.label}
+                    {s.value === "source" ? sourceLabel() : s.label}
                   </button>
                 )}
               </For>

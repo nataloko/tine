@@ -237,6 +237,14 @@ fn bad_path() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid file path")
 }
 
+/// A confirmed `"merged"` row decision the resolve could not re-derive from the
+/// same base (see [`crate::sync_diff::MergeRefused`]). Refusing the whole
+/// resolve is the point: no side is silently substituted for the merged body
+/// the user approved, and nothing has been written when this is returned.
+fn merge_refused(refusal: crate::sync_diff::MergeRefused) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, refusal.to_string())
+}
+
 /// Capability-issued evidence that one exact projection target was durably
 /// published or recovered at one exact graph-relative path.
 #[derive(Debug)]
@@ -493,6 +501,10 @@ enum EditorPublicationAuthority {
 enum GraphTextPublicationValidation {
     /// Standalone callers have not established graph-wide collision evidence.
     CompleteIndex,
+    /// One exact source/destination transition proves portable aliases,
+    /// retained parent ownership, the source's single-link identity, and the
+    /// destination's absence directly. No document contents are relevant.
+    PathLocal,
     /// A surrounding transaction owns graph-text identity authority and has
     /// already completed a bounded no-follow inventory. Publication still
     /// repeats exact target, single-link, portable-path, and no-clobber checks.
@@ -654,6 +666,15 @@ pub struct PageEntry {
     pub rel_path: String,
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+/// Digest of one exact user-visible Markdown/Org source file.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphTextSourceDigest {
+    pub path: String,
+    pub length: u64,
+    pub digest: String,
 }
 
 /// One parser-owned interpretation of a present external graph-text document.
@@ -1057,6 +1078,19 @@ pub struct SyncConflict {
     pub tag: String,
     /// One-line content preview of the conflict copy.
     pub preview: String,
+}
+
+/// What a rename deliberately left undone.
+///
+/// A rename cascades reference rewrites through every referring page. Files
+/// under VCS-marker quarantine are skipped rather than rewritten (see
+/// [`Graph::rename_page_reporting`]), so the caller needs to know which ones
+/// still point at the old name — otherwise the skip is invisible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOutcome {
+    /// Paths of quarantined referrers left byte-identical, old refs intact.
+    pub skipped_conflicted_referrers: Vec<String>,
 }
 
 /// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
@@ -2537,6 +2571,12 @@ pub struct Graph {
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
     reconciliation_scan_open_config_utf8: bool,
+    /// Digest of the configuration bytes THIS instance last published.
+    ///
+    /// The watcher cannot otherwise tell Tine's own settings write from an
+    /// outside one, and would reopen the whole graph — discarding every cache
+    /// it has built — every time the user toggles a star.
+    recent_config_write: RwLock<Option<BlobDescription>>,
     /// Private, process-local graph-text completeness capability. This state is
     /// neither serialized nor consulted by durable import/projection paths in
     /// this packet.
@@ -2626,6 +2666,17 @@ pub struct Graph {
     /// bytes we wrote and suppress that false positive (the parse-cache comparison
     /// alone races that window). See `write_page` / `sync_file_content`.
     recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    /// Recent exact Direct Files states which the native watcher may still echo.
+    /// Unlike `recent_writes`, the first receipt is minted only after Tine's
+    /// final no-follow reread proved both the published bytes and physical file
+    /// identity. Successful debounced reconciliation replaces it with the exact
+    /// accepted final state, so delayed duplicate callbacks remain no-ops while
+    /// an old state can never regain authority after a newer state was admitted.
+    /// The raw callback reopens only candidate paths under the same page lock and
+    /// may omit the external-change frontier only when both identity and revision
+    /// still match.
+    recent_graph_text_states:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ExactGraphTextStateReceipt>>,
     /// Concord base ledger (ADR 0056): the per-page last text Tine agreed on
     /// with the disk, updated best-effort after successful saves and external-
     /// change admissions. A disposable cache stored OUTSIDE the sync tree;
@@ -2699,6 +2750,12 @@ static NEXT_EXTERNAL_OBSERVATION_INSTANCE: std::sync::atomic::AtomicU64 =
 pub struct GraphTextExternalObservationTicket {
     instance: u64,
     epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExactGraphTextStateReceipt {
+    revision: String,
+    resource_identity: ContentDigest,
 }
 
 impl GraphTextExternalObservationTicket {
@@ -4034,6 +4091,7 @@ thread_local! {
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static CONFLICT_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
     static GRAPH_TEXT_ADMISSION_TEST_COUNTERS: std::cell::Cell<GraphTextAdmissionTestCounters> = const { std::cell::Cell::new(GraphTextAdmissionTestCounters { builder_enumerations: 0, direct_creation_censuses: 0, direct_creation_files_hashed: 0, point_query_attempts: 0, parser_invocations: 0, index_map_insertions: 0, event_map_key_reads: 0, event_map_key_writes: 0, event_reverse_members: 0, persistent_node_allocations: 0, persistent_rotations: 0, persistent_payload_members: 0 }) };
@@ -5027,6 +5085,18 @@ fn editor_commit_before_final_reread_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+fn exact_graph_text_event_after_candidate_hook() {
+    EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn exact_graph_text_event_after_candidate_hook() {}
+
+#[cfg(test)]
 fn conflict_observation_hook() -> io::Result<()> {
     CONFLICT_OBSERVATION.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -5044,7 +5114,10 @@ fn rename_source_remove_failpoint() -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `PartialEq` is load-bearing, not a convenience: the config watcher refreshes
+// a graph and then compares the meta it produced against the meta the frontend
+// already has, so a rewrite that changes no setting emits nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphMeta {
     pub root: String,
     pub journals_dir: String,
@@ -5058,8 +5131,16 @@ pub struct GraphMeta {
     pub block_hidden_properties: Vec<String>,
     /// Template name applied to a new, empty journal page (if configured).
     pub default_journal_template: Option<String>,
+    /// Graph-portable startup page from `:default-home {:page "..."}`.
+    #[serde(default)]
+    pub default_home: Option<String>,
     /// Favorited page names (read from config.edn `:favorites`).
     pub favorites: Vec<String>,
+    /// The page holding Tine's Favorites arrangement (`:tine/favorites-page`),
+    /// when this graph has one. `:favorites` above stays the flat, Logseq-
+    /// readable membership list; this page owns groups and order.
+    #[serde(default)]
+    pub favorites_page: Option<String>,
     /// Effective journal title format (`:journal/page-title-format`, default
     /// `MMM do, yyyy`) — so the frontend formats "today" to match the backend.
     pub journal_page_title_format: String,
@@ -5090,6 +5171,43 @@ pub struct GraphMeta {
     /// Tine-owned graph-local flag: whether this graph has already seen the
     /// one-time in-app Guide announcement.
     pub guide_announced: bool,
+}
+
+/// The graph-relative location of the configuration file, as `Graph::open`
+/// reads it and as the exact-feed classifier names it. One constant, so moving
+/// it can never land in one of those and miss the other.
+pub const CONFIG_RELATIVE_PATH: &str = "logseq/config.edn";
+
+/// Re-exported so a caller outside the crate can name what
+/// [`config_file_description`] and [`Graph::open_config_description`] return.
+pub use crate::oplog::BlobDescription as ConfigDescription;
+
+/// Digest `logseq/config.edn` as it stands on disk right now, resolving the
+/// path exactly as `Graph::open` does.
+///
+/// `None` means "no readable configuration file", which is precisely what
+/// `open` would have parsed as an empty `Config` -- so a `None` here and a
+/// `None` from [`Graph::open_config_description`] agree that nothing changed.
+pub fn config_file_description(root: &Path) -> Option<BlobDescription> {
+    fs::read(reconciliation_scan_config_path_at_open(root))
+        .ok()
+        .map(|bytes| BlobDescription::of(&bytes))
+}
+
+/// Is `path` the configuration file of the graph rooted at `root`?
+///
+/// Case-insensitive, like the open path and the classifier: a graph delivered
+/// by a case-folding filesystem may spell it `Logseq/Config.edn`.
+pub fn is_config_file_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(relative) = relative.to_str() else {
+        return false;
+    };
+    relative
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .eq_ignore_ascii_case(CONFIG_RELATIVE_PATH)
 }
 
 fn reconciliation_scan_config_path_at_open(root: &Path) -> PathBuf {
@@ -5194,7 +5312,209 @@ impl Graph {
             validate_managed_dir(&graph.root, "assets", "assets")?;
             graph.assets_root = graph.root.join("assets");
         }
+        graph.recover_interrupted_publishes();
         Ok(graph)
+    }
+
+    /// Restore any small file or Direct editor publication left mid-publish by
+    /// a crash.
+    ///
+    /// [`atomic_replace_expected`] vacates the target name for the length of one
+    /// rename, so a crash in that window leaves the content under a `.retired`
+    /// sibling and the file itself missing. Small-file recovery scans only its
+    /// registered directories. Editor recovery performs one bounded no-follow
+    /// graph-scope name walk and never reads unrelated document contents.
+    pub fn recover_interrupted_publishes(&self) -> usize {
+        restore_retired_files(&self.root, &[self.root.join("logseq")])
+            .saturating_add(self.recover_interrupted_editor_publications())
+    }
+
+    /// Reconcile exact files stranded by a crash inside the Direct Files
+    /// retire/publish window. A sole claim for a missing live name is restored
+    /// with no-replace. When a live name exists, every recognized artifact is
+    /// moved intact to typed recovery trash. Multiple claims for one missing
+    /// target stay untouched because choosing one would discard information.
+    fn recover_interrupted_editor_publications(&self) -> usize {
+        let Ok(write) = self.admit_managed_text_writer() else {
+            return 0;
+        };
+        let Ok(claims) = self.editor_publication_recovery_claims(&write) else {
+            return 0;
+        };
+        let mut by_target = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+        for (artifact, target) in claims {
+            by_target.entry(target).or_default().push(artifact);
+        }
+
+        let mut reconciled = 0_usize;
+        for (target, artifacts) in by_target {
+            let target_present = match self.managed_exists(&write, &target) {
+                Ok(present) => present,
+                Err(_) => continue,
+            };
+            if !target_present {
+                if artifacts.len() != 1 {
+                    continue;
+                }
+                let artifact = &artifacts[0];
+                let Ok(identity) =
+                    self.managed_move_editor_recovery_noreplace(&write, artifact, &target)
+                else {
+                    continue;
+                };
+                if self
+                    .managed_optional_file_identity(&write, &target)
+                    .ok()
+                    .flatten()
+                    == Some(identity)
+                {
+                    reconciled = reconciled.saturating_add(1);
+                }
+                continue;
+            }
+
+            let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+            if self.managed_create_dir_all(&write, &trash).is_err() {
+                continue;
+            }
+            for artifact in artifacts {
+                let Some(filename) = artifact.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(target_name) = editor_recovery_target_name(filename) else {
+                    continue;
+                };
+                let Some(extension) = text_extension_from_path(Path::new(target_name)) else {
+                    continue;
+                };
+                let destination = trash.join(format!(
+                    "{}__editor-publication__{}.{}",
+                    trash_stamp(),
+                    filename.trim_start_matches('.'),
+                    extension
+                ));
+                let Ok(identity) =
+                    self.managed_move_editor_recovery_noreplace(&write, &artifact, &destination)
+                else {
+                    continue;
+                };
+                if self
+                    .managed_optional_file_identity(&write, &destination)
+                    .ok()
+                    .flatten()
+                    == Some(identity)
+                {
+                    reconciled = reconciled.saturating_add(1);
+                }
+            }
+        }
+        reconciled
+    }
+
+    /// Discover only names emitted by `managed_atomic_replace_bound`, through
+    /// the retained no-follow graph capability. This is not a suffix glob: the
+    /// parser requires the complete producer shape, and the claimed target must
+    /// be an eligible graph-text file in the same retained directory.
+    fn editor_publication_recovery_claims(
+        &self,
+        permit: &ManagedTextWritePermit,
+    ) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        let limits = managed_text_inventory_limits();
+        let mut pending = vec![PendingDirectory {
+            directory: self.managed_permit_root(permit)?.try_clone()?,
+            relative: String::new(),
+            depth: 0,
+        }];
+        let mut claims = Vec::new();
+        let mut all_entries = 0_usize;
+        let mut directories = 1_usize;
+        let mut path_bytes = 0_u64;
+
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let child_relative = if relative.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                path_bytes = path_bytes
+                    .checked_add(usize_to_u64(child_relative.len())?)
+                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !self.graph_text_scope.should_descend(&child_relative) {
+                        continue;
+                    }
+                    let child_depth = depth.checked_add(1).ok_or_else(|| {
+                        managed_text_inventory_limit_error("managed directory depth")
+                    })?;
+                    if child_depth > limits.directory_depth {
+                        return Err(managed_text_inventory_limit_error(
+                            "managed directory depth",
+                        ));
+                    }
+                    directories = directories
+                        .checked_add(1)
+                        .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                    if directories > limits.directories {
+                        return Err(managed_text_inventory_limit_error("directory count"));
+                    }
+                    projection_real_directory(&directory, &name)?;
+                    pending.push(PendingDirectory {
+                        directory: open_projection_dir_nofollow(&directory, &name)?,
+                        relative: child_relative,
+                        depth: child_depth,
+                    });
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(target_name) = editor_recovery_target_name(&name) else {
+                    continue;
+                };
+                let target_relative = if relative.is_empty() {
+                    target_name.to_owned()
+                } else {
+                    format!("{relative}/{target_name}")
+                };
+                if !self.graph_text_scope.is_eligible(&target_relative) {
+                    continue;
+                }
+                claims.push((
+                    self.root.join(&child_relative),
+                    self.root.join(target_relative),
+                ));
+            }
+        }
+        Ok(claims)
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
@@ -5347,6 +5667,7 @@ impl Graph {
                 .as_deref()
                 .map(BlobDescription::of),
             reconciliation_scan_open_config_utf8: config_bytes.is_none() || config_text.is_some(),
+            recent_config_write: RwLock::new(None),
             graph_text_admission: Arc::new(GraphTextAdmissionControl {
                 state: RwLock::new(GraphTextAdmissionState::Unbuilt),
             }),
@@ -5374,6 +5695,7 @@ impl Graph {
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recent_graph_text_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             concord_ledger: std::sync::OnceLock::new(),
             marker_resolutions: std::sync::Mutex::new(std::collections::HashSet::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
@@ -5527,7 +5849,13 @@ impl Graph {
             .map(Arc::clone)?;
         let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
         let result = projection.sparse_task_query(
-            &self.root, generation, &pages, query_src, max_rows, max_bytes,
+            &self.root,
+            &self.journal_format,
+            generation,
+            &pages,
+            query_src,
+            max_rows,
+            max_bytes,
         )?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
@@ -6087,6 +6415,90 @@ impl Graph {
 
     fn graph_text_entries(&self, permit: &ManagedTextWritePermit) -> io::Result<Vec<PageEntry>> {
         Ok(self.graph_text_inventory(permit)?.0)
+    }
+
+    /// Enumerate every user-visible Markdown/Org source file using the same
+    /// scope and nested-layout rules as Tine's ordinary graph inventory.
+    pub fn graph_text_source_paths(&self) -> io::Result<Vec<String>> {
+        let permit = self.admit_retained_managed_text_writer()?;
+        self.graph_text_entries(&permit)
+            .map(|entries| entries.into_iter().map(|entry| entry.rel_path).collect())
+    }
+
+    /// Hash the actual bytes of one path returned by
+    /// [`Graph::graph_text_source_paths`]. The file is opened without following
+    /// links, streamed through SHA-256, then rechecked through its path. Any
+    /// observed replacement or metadata change is an incomplete verification,
+    /// never a digest result.
+    pub fn digest_graph_text_source(
+        &self,
+        relative: &str,
+        cancelled: &AtomicBool,
+    ) -> io::Result<GraphTextSourceDigest> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "graph verification cancelled",
+            ));
+        }
+        let managed = ManagedPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
+        let absolute = self.root.join(managed.as_str());
+        let Some(entry) = self.graph_inventory_entry(&absolute)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not an admitted graph-text source",
+            ));
+        };
+        if entry.rel_path != managed.as_str() {
+            return Err(bad_path());
+        }
+
+        let permit = self.admit_retained_managed_text_writer()?;
+        let target = self.managed_target(&permit, &absolute, false)?;
+        projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let mut file = open_projection_file_nofollow(target.parent(), &target.filename)?;
+        let before = file.metadata()?;
+        let before_modified = before.modified()?;
+        let before_identity = canonical_projection_file_resource_id(&file)?;
+        let mut hasher = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "graph verification cancelled",
+                ));
+            }
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(allocation_overflow)?;
+        }
+        let after = file.metadata()?;
+        let rebound = open_projection_file_nofollow(target.parent(), &target.filename)?;
+        let rebound_metadata = rebound.metadata()?;
+        let stable = length == before.len()
+            && after.len() == before.len()
+            && after.modified()? == before_modified
+            && rebound_metadata.len() == before.len()
+            && rebound_metadata.modified()? == before_modified
+            && canonical_projection_file_resource_id(&rebound)? == before_identity;
+        if !stable {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "graph source changed while it was being verified",
+            ));
+        }
+        Ok(GraphTextSourceDigest {
+            path: managed.to_string(),
+            length,
+            digest: format!("{:x}", hasher.finalize()),
+        })
     }
 
     /// Check historical page filenames through the retained graph capability.
@@ -8801,7 +9213,8 @@ impl Graph {
                     self.managed_optional_file_identity(permit, path)?,
                 )
                 .map(|_| ()),
-            GraphTextPublicationValidation::TransactionInventory => (|| {
+            GraphTextPublicationValidation::PathLocal
+            | GraphTextPublicationValidation::TransactionInventory => (|| {
                 self.validate_graph_text_portable_aliases_path_local(
                     permit,
                     &managed_path,
@@ -9138,7 +9551,7 @@ impl Graph {
             permit,
             source,
             destination,
-            GraphTextPublicationValidation::CompleteIndex,
+            GraphTextPublicationValidation::PathLocal,
         )
     }
 
@@ -9154,6 +9567,71 @@ impl Graph {
             destination,
             GraphTextPublicationValidation::TransactionInventory,
         )
+    }
+
+    /// Move one exact hidden file produced by the editor publication protocol.
+    /// The retained source is validated directly rather than through
+    /// `ManagedPath`: hidden publication artifacts are not ordinary documents,
+    /// and recovery must not treat them as such. Note that `ManagedPath` itself
+    /// does NOT reject a leading-dot name — `is_managed_path` only requires a
+    /// non-empty stem and a graph-text extension — so this validation is the
+    /// boundary, not a redundant second check.
+    /// `managed_path_accepts_leading_dot_name` in `oplog::receipt` keeps that
+    /// statement honest.
+    fn managed_move_editor_recovery_noreplace(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source_path: &Path,
+        destination_path: &Path,
+    ) -> io::Result<ContentDigest> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        let destination_managed =
+            ManagedPath::parse(self.rel_path(destination_path)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("editor recovery destination is not portable: {error}"),
+                )
+            })?;
+        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+
+        let source = self.managed_target(permit, source_path, false)?;
+        projection_optional_regular_metadata(source.parent(), &source.filename)?;
+        let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
+        let source_identity = canonical_projection_file_resource_id(&source_file)?;
+        validate_graph_text_single_link(&source_file, &self.rel_path(source_path))?;
+        drop(source_file);
+
+        let destination = self.managed_target(permit, destination_path, true)?;
+        match destination.parent().symlink_metadata(&destination.filename) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            Err(error) => return Err(error),
+        }
+        managed_write_before_mutation_hook()?;
+        let rebound = open_projection_file_nofollow(source.parent(), &source.filename)?;
+        if canonical_projection_file_resource_id(&rebound)? != source_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "editor recovery artifact changed before reconciliation",
+            ));
+        }
+        validate_graph_text_single_link(&rebound, &self.rel_path(source_path))?;
+        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+        match destination.parent().symlink_metadata(&destination.filename) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            Err(error) => return Err(error),
+        }
+        rename_managed_noreplace(
+            source.parent(),
+            &source.filename,
+            destination.parent(),
+            &destination.filename,
+        )?;
+        sync_projection_chain_required(&source.chain)?;
+        sync_projection_chain_required(&destination.chain)?;
+        self.finish_tine_owned_graph_text_identity_paths(std::iter::once(destination_path))?;
+        Ok(source_identity)
     }
 
     fn managed_move_noreplace_validated(
@@ -9182,7 +9660,7 @@ impl Graph {
                     format!("guarded graph-text destination is not portable: {error}"),
                 )
             })?;
-        if validation == GraphTextPublicationValidation::TransactionInventory {
+        if validation != GraphTextPublicationValidation::CompleteIndex {
             self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
@@ -9199,7 +9677,7 @@ impl Graph {
             Err(error) => return Err(error),
         }
         managed_write_before_mutation_hook()?;
-        if validation == GraphTextPublicationValidation::TransactionInventory {
+        if validation != GraphTextPublicationValidation::CompleteIndex {
             self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
             self.validate_existing_graph_text_target_exact(&source, &source_managed, None)?;
             self.validate_graph_text_portable_aliases_path_local(
@@ -9258,6 +9736,43 @@ impl Graph {
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         read_projection_optional(parent.final_dir(), &target.filename)
+    }
+
+    /// Capture the exact managed page bytes and refresh the same file-identity
+    /// guard as an ordinary exact page load, without parsing the page yet.
+    /// Managed application hydration uses this so a cache hit can skip parsing
+    /// without weakening the next guarded save.
+    pub(crate) fn read_application_projection_input(
+        &self,
+        path: &ManagedPath,
+    ) -> io::Result<Option<Vec<u8>>> {
+        require_projection_platform()?;
+        let target = self.projection_page_target(path.as_str())?;
+        let lock = self.page_lock(&target.absolute_path);
+        let _guard = lock.lock().unwrap();
+        let Some(parent) = self.projection_parent_optional(&target)? else {
+            return Ok(None);
+        };
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        let (file, bytes) =
+            match open_and_read_projection_regular(parent.final_dir(), &target.filename) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        let content = std::str::from_utf8(&bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph text is not UTF-8: {path}"),
+            )
+        })?;
+        let file_identity = canonical_projection_file_resource_id(&file)?;
+        self.loaded_file_identities
+            .write()
+            .unwrap()
+            .insert(target.absolute_path, (content_rev(content), file_identity));
+        Ok(Some(bytes))
     }
 
     /// Preserve the actor's exact current managed projection in user-visible,
@@ -9930,7 +10445,7 @@ impl Graph {
         relative: &str,
     ) -> io::Result<GraphTextExactFeedPathClass> {
         validate_graph_text_exact_feed_relative(relative)?;
-        if relative.eq_ignore_ascii_case("logseq/config.edn") {
+        if relative.eq_ignore_ascii_case(CONFIG_RELATIVE_PATH) {
             return Ok(GraphTextExactFeedPathClass::Configuration);
         }
         let mut parent = String::new();
@@ -10674,6 +11189,32 @@ impl Graph {
             .clone()
     }
 
+    /// The `logseq/config.edn` bytes this instance was opened with, digested.
+    /// `None` when there was no readable file.
+    ///
+    /// Compare against [`config_file_description`] to learn whether an external
+    /// write actually changed the configuration this instance is serving. The
+    /// watcher does exactly that before paying for a whole-graph reopen, which
+    /// drops every cache the graph has built.
+    pub fn open_config_description(&self) -> Option<BlobDescription> {
+        self.reconciliation_scan_open_config_description
+    }
+
+    /// Digest of the configuration bytes this instance last wrote, if any.
+    ///
+    /// `None` on an instance that has published nothing — including every
+    /// short-lived managed capability, whose refresh is cheap enough not to
+    /// need the distinction.
+    pub fn recent_config_write(&self) -> Option<BlobDescription> {
+        *self.recent_config_write.read().unwrap()
+    }
+
+    /// Record what a configuration write just published. Called by the one
+    /// funnel every setter goes through (`Graph::write_config`).
+    pub(crate) fn note_config_write(&self) {
+        *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
+    }
+
     pub fn meta(&self) -> GraphMeta {
         GraphMeta {
             root: self.root.display().to_string(),
@@ -10687,7 +11228,9 @@ impl Graph {
             start_of_week: self.config.start_of_week,
             block_hidden_properties: self.config.block_hidden_properties.clone(),
             default_journal_template: self.config.default_journal_template.clone(),
+            default_home: self.config.default_home.clone(),
             favorites: self.config.favorites.clone(),
+            favorites_page: self.config.favorites_page.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),
             preferred_format: self.config.preferred_format.ext().to_string(),
@@ -11237,6 +11780,56 @@ impl Graph {
         entries
     }
 
+    /// Publish the exact physical/effective page inventory already represented by
+    /// the warm parsed cache. This is used only after a successful scoped cache
+    /// mutation; watcher parse failures deliberately leave the memo absent so a
+    /// later listing revalidates the failed path from disk.
+    fn publish_warm_page_inventory(&self, generation: u64) {
+        let entries = {
+            let guard = self.cache.read().unwrap();
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+                return;
+            }
+            let Some(pages) = guard.as_ref() else {
+                return;
+            };
+            pages.iter().map(|(entry, _)| entry.clone()).collect()
+        };
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+            *self.page_list_cache.write().unwrap() = Some((generation, entries));
+        }
+    }
+
+    /// Capture a current list memo before a transaction that must discard the
+    /// parsed cache. The transaction may update this in memory from bytes it
+    /// already owns, avoiding a second whole-graph read/parse after commit.
+    fn current_page_inventory_snapshot(&self) -> Option<(Vec<PageEntry>, Vec<String>)> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let entries = self
+            .page_list_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(memo_generation, _)| *memo_generation == generation)
+            .map(|(_, entries)| entries.clone())?;
+        let failures = self.page_index_failures.read().unwrap().clone();
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
+            .then_some((entries, failures))
+    }
+
+    fn publish_page_inventory_snapshot(
+        &self,
+        mut entries: Vec<PageEntry>,
+        mut failures: Vec<String>,
+    ) {
+        entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        failures.sort();
+        failures.dedup();
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        *self.page_index_failures.write().unwrap() = failures;
+        *self.page_list_cache.write().unwrap() = Some((generation, entries));
+    }
+
     /// Page names referenced anywhere in the graph — inline `[[link]]`/`#tag`/
     /// `#[[..]]` plus `tags::`/`alias::` property values (block- and page-level) —
     /// display case preserved, deduped case-insensitively. These are the pages
@@ -11781,6 +12374,47 @@ impl Graph {
                 markers: marked.markers.clone(),
             });
         }
+        for day in self.journal_conflicts() {
+            // `journal_conflicts` sorts canonical-first, so files[0] is the
+            // keeper whether or not any file carries the canonical date stem.
+            let mut files = day.files.iter();
+            let Some(keeper) = files.next() else { continue };
+            let strays: Vec<_> = files.collect();
+            if strays.is_empty() {
+                continue;
+            }
+            let mut sides = vec![ConflictSide {
+                role: SideRole::Mine,
+                label: keeper.name.clone(),
+                path: Some(keeper.path.clone()),
+            }];
+            for stray in &strays {
+                sides.push(ConflictSide {
+                    role: SideRole::Theirs,
+                    label: stray.name.clone(),
+                    path: Some(stray.path.clone()),
+                });
+            }
+            // A day with three or more files is resolved pairwise: the row
+            // decisions belong to the keeper against the FIRST stray, and once
+            // that stray is folded in the queue re-derives with one file fewer.
+            let diff = self
+                .duplicate_journal_diff(&keeper.path, &strays[0].path)
+                .ok()
+                .flatten();
+            out.push(ConflictObject {
+                id: format!("journal:{}", keeper.path),
+                source: ConflictSource::DuplicateJournal,
+                page_name: day.title.clone(),
+                page_path: keeper.path.clone(),
+                kind: PageKind::Journal,
+                sides,
+                // `None` where the pair cannot be merged at all (cross-format):
+                // the file rows still work, but no row-by-row choice is offered.
+                block_conflicts: diff.as_ref().map(|d| decidable_row_count(&d.rows)),
+                markers: Vec::new(),
+            });
+        }
         out.sort_by(|a, b| a.page_name.cmp(&b.page_name).then_with(|| a.id.cmp(&b.id)));
         out
     }
@@ -11790,6 +12424,12 @@ impl Graph {
     /// texts (`concord_queue::parse_vcs_marker_sides`) and run through the very
     /// same `sync_diff` machinery the conflict-copy path uses, so the in-page
     /// resolution UI is one renderer, not two.
+    ///
+    /// When the markers also carried the merge tool's own `#######` SUGGESTED
+    /// CONFLICT RESOLUTION sections, that fourth reconstruction rides along as
+    /// the diff's ARTIFACT: rows the disjoint-edit merge declines may offer the
+    /// tool's body instead (`MergedSource::Artifact`). It is still only a
+    /// proposal — the resolve re-derives it from the same guarded bytes.
     ///
     /// Read-only. Both staleness tokens are the rev of the whole marker file, so
     /// [`Graph::resolve_vcs_marker_conflict`]'s guard rejects decisions made
@@ -11809,7 +12449,28 @@ impl Graph {
         };
         let org = matches!(Format::from_path(&self.root.join(rel)), Format::Org);
         let mut diff = match sides.base.as_deref() {
-            Some(base) => crate::sync_diff::diff3_texts(base, &sides.mine, &sides.theirs, org),
+            Some(base) => {
+                let full = self.root.join(rel);
+                let base_doc = parse_doc(&full, base);
+                let mine_doc = parse_doc(&full, &sides.mine);
+                let theirs_doc = parse_doc(&full, &sides.theirs);
+                // The merge tool's own proposed resolution, when EVERY region
+                // supplied one. It is not a side and never changes a verdict —
+                // it can only fill a `BothChanged` row the disjoint-edit merge
+                // declined, and the user still has to confirm it.
+                let art_doc = sides
+                    .suggested
+                    .as_deref()
+                    .map(|suggested| parse_doc(&full, suggested));
+                crate::sync_diff::diff3_docs_with_artifact(
+                    &base_doc,
+                    &mine_doc,
+                    &theirs_doc,
+                    art_doc.as_ref(),
+                )
+            }
+            // No ancestor → no `BothChanged` verdict → no proposal of either
+            // source; a suggestion region without a base never surfaces.
             None => crate::sync_diff::diff_texts(&sides.mine, &sides.theirs, org),
         };
         // Both revs address the ONE file the decisions will be applied to.
@@ -11875,8 +12536,26 @@ impl Graph {
         }
         let mine_doc = parse_doc(&path, &sides.mine);
         let theirs_doc = parse_doc(&path, &sides.theirs);
-        let merged_roots =
-            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        // Same ancestor the marker diff used: the reconstructed base side, which
+        // `parse_vcs_marker_sides` supplies only when EVERY region carried one.
+        // The `base_rev` guard above pins the whole marker file, so mine, theirs
+        // and this base are all still the exact bytes the UI decided against.
+        let base_doc = sides.base.as_deref().map(|base| parse_doc(&path, base));
+        // Likewise the merge tool's proposal: re-derived from the very bytes the
+        // `base_rev` guard pinned, never taken from the frontend, so a confirmed
+        // artifact row applies exactly the body the diff offered.
+        let art_doc = sides
+            .suggested
+            .as_deref()
+            .map(|suggested| parse_doc(&path, suggested));
+        let merged_roots = crate::sync_diff::merge_blocks3(
+            base_doc.as_ref().map(|doc| doc.roots.as_slice()),
+            &mine_doc.roots,
+            &theirs_doc.roots,
+            art_doc.as_ref().map(|doc| doc.roots.as_slice()),
+            decisions,
+        )
+        .map_err(merge_refused)?;
         let pre_block = match pre_choice {
             "theirs" => theirs_doc.pre_block.clone(),
             "mine" => mine_doc.pre_block.clone(),
@@ -11893,6 +12572,18 @@ impl Graph {
         assign_doc_runtime_ids(&mut merged.roots, &entry.rel_path);
         let dto = page_dto_checked(&entry, &merged)?;
         let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        // Keep the pre-resolution marker bytes recoverable (ADR 0007), the way
+        // the sync-copy resolve already trashes its conflict copy. The marker
+        // file is rewritten IN PLACE, so a byte-exact copy staged here is the
+        // only place the not-chosen side survives once the clean merge lands —
+        // which is also what makes defaulting a missing row decision to Mine
+        // at apply time recoverable rather than lossy.
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_trash_write_target(&trash)?;
+        fs::create_dir_all(&trash)?;
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+        let staged = trash.join(format!("{}__markers__{file_name}", trash_stamp()));
+        atomic_write_new(&staged, content.as_bytes())?;
         let authorized = self.authorize_marker_resolution(&path);
         let result = self.write_page(
             &write,
@@ -11906,6 +12597,11 @@ impl Graph {
             cacheable,
         );
         drop(authorized);
+        if result.is_err() {
+            // The write refused or failed — the file still carries its
+            // markers, so the staged recovery copy is redundant; withdraw it.
+            let _ = fs::remove_file(&staged);
+        }
         result.map(|_| ())
     }
 
@@ -12064,7 +12760,8 @@ impl Graph {
             page,
             Document {
                 pre_block,
-                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions)
+                    .map_err(merge_refused)?,
             },
         )?;
         let cacheable = self.managed_path_is_cacheable(&write, &path)?;
@@ -12116,7 +12813,8 @@ impl Graph {
             page,
             Document {
                 pre_block,
-                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions)
+                    .map_err(merge_refused)?,
             },
         )?;
         let rev = self.force_save_page_at_revision(&resolved, base_rev, presented)?;
@@ -12159,16 +12857,134 @@ impl Graph {
             .get()
             .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
             .filter(|base| base != &win_c);
-        let mut diff = match base_c {
+        let mut diff = match &base_c {
             Some(base_c) => {
-                let base = parse_doc(&win, &base_c);
+                let base = parse_doc(&win, base_c);
                 crate::sync_diff::diff3_docs(&base, &mine, &theirs)
             }
             None => crate::sync_diff::diff_docs(&mine, &theirs),
         };
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
+        // Identity of the pinned base itself. `base_rev`/`conflict_rev` pin
+        // mine and theirs, but the pin is MUTABLE state — the resolve echoes
+        // this token back so a repin between diff and apply is a refusal, not
+        // a silent substitution of the third input to a `"merged"` body.
+        diff.merge_base_rev = base_c.as_deref().map(content_rev);
         Ok(Some(diff))
+    }
+
+    /// Two-way diff of a duplicate journal day's canonical file against one of
+    /// its strays.
+    ///
+    /// Unlike a sync-conflict copy, the two files here have **no common
+    /// ancestor**: they were never one document that diverged, they are two
+    /// files that ended up claiming the same day (usually a journal date-format
+    /// change, which never clobbers). So there is no ledger pin to look up and
+    /// the diff is always 2-way — which the queue already handles, since it
+    /// only offers a Base side when the diff reports `three_way`.
+    ///
+    /// Where the two files hold disjoint content every row is one-sided and
+    /// "keep both" reproduces what Settings' Merge does by concatenation; where
+    /// they overlap, the row-by-row choice can drop the duplication instead of
+    /// doubling it.
+    pub fn duplicate_journal_diff(
+        &self,
+        canonical_rel: &str,
+        stray_rel: &str,
+    ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
+        let canonical = ManagedPath::parse(canonical_rel.to_owned()).map_err(|_| bad_path())?;
+        let stray = ManagedPath::parse(stray_rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(canonical_bytes) = self.read_projection_input(&canonical)? else {
+            return Ok(None);
+        };
+        let Some(stray_bytes) = self.read_projection_input(&stray)? else {
+            return Ok(None);
+        };
+        let canonical_path = self.root.join(canonical_rel);
+        let stray_path = self.root.join(stray_rel);
+        // A cross-format pair (.md against .org) cannot be merged: `merge_pages`
+        // and `resolve_sync_conflict` both refuse it, and offering a row-by-row
+        // choice we cannot apply would be a dead end. Surfaced as a
+        // no-decidable-rows object instead, so the file rows still work.
+        if Format::from_path(&canonical_path) != Format::from_path(&stray_path) {
+            return Ok(None);
+        }
+        let canonical_content = String::from_utf8(canonical_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal file is not UTF-8"))?;
+        let stray_content = String::from_utf8(stray_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal file is not UTF-8"))?;
+        let mine = parse_doc(&canonical_path, &canonical_content);
+        let theirs = parse_doc(&stray_path, &stray_content);
+        let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
+        diff.base_rev = content_rev(&canonical_content);
+        diff.conflict_rev = content_rev(&stray_content);
+        diff.merge_base_rev = None;
+        Ok(Some(diff))
+    }
+
+    /// Fold one stray of a duplicate journal day into that day's canonical file,
+    /// applying the user's per-row decisions, and move the stray to recoverable
+    /// trash.
+    ///
+    /// Guarded so this can never be pointed at two unrelated pages: both paths
+    /// must belong to the SAME duplicate day as `journal_conflicts` reports it,
+    /// and the stray must not be the canonical file. Beyond those guards the
+    /// merge is exactly the two-file reconciliation the sync-copy path already
+    /// performs (same row decisions, same org round-trip firewall, same
+    /// stage-before-commit ordering, same recoverable trash), so it shares that
+    /// implementation rather than growing a second one that could drift.
+    pub fn resolve_duplicate_journal_day(
+        &self,
+        canonical_rel: &str,
+        stray_rel: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        base_rev: &str,
+        stray_rev: &str,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        if canonical_rel == stray_rel {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "canonical and stray are the same file",
+            ));
+        }
+        let day = self
+            .journal_conflicts()
+            .into_iter()
+            .find(|day| day.files.iter().any(|file| file.path == canonical_rel))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "not a file of a duplicate journal day",
+                )
+            })?;
+        if !day.files.iter().any(|file| file.path == stray_rel) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the two files are not the same journal day",
+            ));
+        }
+        // `journal_conflicts` sorts canonical-first, so the keeper is files[0]
+        // whether or not any file carries the canonical date stem.
+        let keeper = day.files.first().ok_or_else(bad_path)?;
+        if keeper.path != canonical_rel {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "that file is not the day's canonical file",
+            ));
+        }
+        // No ledger pin exists for a duplicate day, so the base token is None
+        // and the shared path resolves 2-way.
+        self.resolve_sync_conflict(
+            canonical_rel,
+            stray_rel,
+            decisions,
+            base_rev,
+            stray_rev,
+            None,
+            pre_choice,
+        )
     }
 
     /// Read one explicitly recognized provider conflict copy through the same
@@ -12258,9 +13074,10 @@ impl Graph {
     }
 
     /// Resolve a sync-conflict copy: build the merged winner from the user's
-    /// per-row `decisions` (row id → `"mine"`/`"theirs"`/`"both"`, see
-    /// [`crate::sync_diff::merge_blocks`]), write it through the NORMAL round-
-    /// tripping save path, and move the conflict copy to the recoverable trash.
+    /// per-row `decisions` (row id → `"mine"`/`"theirs"`/`"both"`/`"merged"`,
+    /// see [`crate::sync_diff::merge_blocks3`]), write it through the NORMAL
+    /// round-tripping save path, and move the conflict copy to the recoverable
+    /// trash.
     ///
     /// Data-safety invariants (ADR 0012 one-writer + ADR 0007 never-silently-
     /// overwrite), mirroring [`merge_pages`]:
@@ -12286,6 +13103,7 @@ impl Graph {
         decisions: &std::collections::HashMap<String, String>,
         base_rev: &str,
         conflict_rev: &str,
+        merge_base_rev: Option<&str>,
         pre_choice: &str,
     ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
@@ -12331,8 +13149,42 @@ impl Graph {
         }
         let mine_doc = parse_doc(&win, &win_content);
         let theirs_doc = parse_doc(&conf, &conf_content);
-        let merged_roots =
-            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        // Re-derive the SAME base `sync_conflict_diff` published suggestions
+        // against — ledger pin included, and the same "a base identical to the
+        // winner is the admission artifact" filter. The `base_rev`/
+        // `conflict_rev` guards pin mine and theirs; `merge_base_rev` pins the
+        // THIRD input: the ledger pin is mutable state, so the diff stamped
+        // the pinned base's own rev and this apply refuses if it no longer
+        // matches — a `"merged"` body is only ever computed from the exact
+        // three texts the user saw. A `None` token (the UI reviewed a 2-way
+        // diff) resolves without a base: mine/theirs/both decisions don't
+        // need one and `"merged"` then refuses in `merge_blocks3`.
+        let pinned_base = self
+            .concord_ledger
+            .get()
+            .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
+            .filter(|base| base != &win_content);
+        let base_doc = match (merge_base_rev, pinned_base) {
+            (None, _) => None,
+            (Some(rev), Some(base_content)) if content_rev(&base_content) == rev => {
+                Some(parse_doc(&win, &base_content))
+            }
+            (Some(_), _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the pinned merge base changed since the diff",
+                ));
+            }
+        };
+        let merged_roots = crate::sync_diff::merge_blocks3(
+            base_doc.as_ref().map(|doc| doc.roots.as_slice()),
+            &mine_doc.roots,
+            &theirs_doc.roots,
+            // A conflict copy carries no merge tool's suggestion: computed-only.
+            None,
+            decisions,
+        )
+        .map_err(merge_refused)?;
         let pre_block = match pre_choice {
             "theirs" => theirs_doc.pre_block.clone(),
             "mine" => mine_doc.pre_block.clone(),
@@ -12606,6 +13458,7 @@ impl Graph {
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
+        let page_inventory_snapshot = self.current_page_inventory_snapshot();
         let src = self
             .resolve_managed_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
@@ -12662,13 +13515,37 @@ impl Graph {
             }
         }
         self.managed_create_dir_all(&write, &dir)?;
-        self.managed_move_noreplace(&write, &src, &dir.join(format!("{enc}.{ext}")))?;
-        // The page SET changed — drop the list memo so the new page (and the stray's
-        // disappearance from journals/) show up immediately, and discard the
-        // parsed snapshot so its page/index set is rebuilt coherently on next use.
-        *self.page_list_cache.write().unwrap() = None;
+        let dst = dir.join(format!("{enc}.{ext}"));
+        self.managed_move_noreplace(&write, &src, &dst)?;
+        // Reopen only the committed destination, not the graph: this binds the
+        // inventory entry to the exact bytes that now own the new name even if an
+        // external editor changed the retained source inode during the move.
+        let updated_page_inventory =
+            page_inventory_snapshot.and_then(|(mut inventory, mut failures)| {
+                let content = self.managed_read_to_string(&write, &dst).ok()?;
+                let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
+                let effective = parse_exact_page(self, &provisional, &content)
+                    .ok()
+                    .map(|(entry, _, _)| entry);
+                let src_rel = self.rel_path(&src);
+                let dst_rel = self.rel_path(&dst);
+                inventory.retain(|entry| entry.path != src);
+                failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
+                if let Some(entry) = effective {
+                    inventory.push(entry);
+                } else {
+                    failures.push(dst_rel);
+                }
+                Some((inventory, failures))
+            });
+        // The parsed snapshot is invalidated because this rescue changes the
+        // physical kind/path. Preserve the separately updated list memo when its
+        // pre-transaction generation was current.
         *self.find_entry_cache.write().unwrap() = None;
         self.invalidate_cache_after_tine_mutation();
+        if let Some((inventory, failures)) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory, failures);
+        }
         Ok(())
     }
 
@@ -13803,6 +14680,7 @@ impl Graph {
                 resulting_failures.clone(),
             );
         }
+        let page_inventory_complete = resulting_failures.is_empty();
         *failures_guard = resulting_failures;
         drop(failures_guard);
         drop(guard);
@@ -13833,6 +14711,7 @@ impl Graph {
         // stamping it as current republishes that staleness permanently —
         // `list_pages` is keyed on generation equality, so it never rebuilds and
         // the missing page becomes unloadable.
+        let mut page_list_advanced = false;
         if cache_built && !failures_changed {
             if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
@@ -13845,8 +14724,16 @@ impl Graph {
                         entries.push(evict_entry.clone());
                     }
                     *generation = newgen;
+                    page_list_advanced = true;
                 }
             }
+        }
+        // Creation paths and watcher reconciliation may intentionally have no
+        // prior list memo to retag. The warm parsed cache already contains the
+        // exact newly parsed entry and every survivor, so rebuild the in-memory
+        // inventory from it rather than reopening and reparsing the graph.
+        if cache_built && !page_list_advanced && page_inventory_complete {
+            self.publish_warm_page_inventory(newgen);
         }
         // Scoped query/backlink invalidation (#52): a content edit to one page
         // can't change a derived result the page doesn't participate in, so keep
@@ -14117,6 +15004,21 @@ impl Graph {
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
+        let mut page_list_advanced = false;
+        if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
+            if *generation + 1 == newgen {
+                entries.retain(|entry| {
+                    !removed_entries
+                        .iter()
+                        .any(|removed| removed.path == entry.path)
+                });
+                *generation = newgen;
+                page_list_advanced = true;
+            }
+        }
+        if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
+            self.publish_warm_page_inventory(newgen);
+        }
         for entry in removed_entries {
             self.direct_projection_enqueue_delete(newgen, entry);
         }
@@ -14159,6 +15061,17 @@ impl Graph {
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
+        let mut page_list_advanced = false;
+        if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
+            if *generation + 1 == newgen {
+                entries.retain(|candidate| candidate.path != entry.path);
+                *generation = newgen;
+                page_list_advanced = true;
+            }
+        }
+        if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
+            self.publish_warm_page_inventory(newgen);
+        }
         self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
@@ -14567,6 +15480,20 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<()> {
+        self.rename_page_reporting(old, new, expected_path)
+            .map(|_| ())
+    }
+
+    /// `rename_page_expected`, plus what the rename deliberately did NOT do.
+    ///
+    /// Callers that can surface it to the user should prefer this: a silently
+    /// skipped referrer looks identical to a completed rename otherwise.
+    pub fn rename_page_reporting(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+    ) -> io::Result<RenameOutcome> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
@@ -14576,11 +15503,12 @@ impl Graph {
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
             self.finish_successful_rename_editor_lifecycle();
-            return Ok(()); // nothing to do (case-only rename is intentionally a no-op)
+            return Ok(RenameOutcome::default()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
         let mut content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let entries = self.managed_text_entries_with_budget(&write, false, &content_budget)?;
+        let page_inventory_snapshot = self.current_page_inventory_snapshot();
         self.validate_page_mutation_target(&write, &entries, old, PageKind::Page, expected_path)?;
         // M1: refuse to rename an ambiguous page (same-stem .md/.markdown/.org on
         // disk) — which twin moves, and which content is authoritative, is
@@ -14786,6 +15714,7 @@ impl Graph {
             .map(|(o, n)| (crate::refs::normalize(o), n.clone()))
             .collect();
         let mut edits: Vec<Edit> = Vec::new();
+        let mut skipped_conflicted_referrers: Vec<String> = Vec::new();
         let mut edits_charge =
             RetainedHeapCharge::new(Some(&content_budget), "managed rename edit vector")?;
         for entry in entries.iter() {
@@ -14827,6 +15756,21 @@ impl Graph {
             // file. Abort the whole rename (all-or-nothing) so the user resolves it
             // in Logseq first. A pure file move with no content change (updated ==
             // content) is still allowed — it preserves bytes exactly.
+            // A referrer carrying column-0 VCS conflict markers is quarantined: the
+            // user (or their merge tool) still owes it a resolution, and its bytes
+            // are not ours to touch. Threat: an external-editor / sync-service merge
+            // left the file mid-conflict; rewriting refs inside it edits one or both
+            // sides of a conflict the user has not adjudicated, behind their back.
+            // Leave it byte-identical and report it instead of refusing the whole
+            // rename, which would be harsher than the problem.
+            let quarantined =
+                updated != *content && !crate::doc::vcs_conflict_markers(&content).is_empty();
+            let updated = if quarantined {
+                skipped_conflicted_referrers.push(entry.path.display().to_string());
+                content.to_string()
+            } else {
+                updated
+            };
             let changed = updated != *content;
             if is_org && changed && !crate::org::org_editable(&content) {
                 return Err(io::Error::new(
@@ -14902,7 +15846,7 @@ impl Graph {
         }
         if edits.is_empty() {
             self.finish_successful_rename_editor_lifecycle();
-            return Ok(()); // page doesn't exist / nothing references it
+            return Ok(RenameOutcome::default()); // page doesn't exist / nothing references it
         }
 
         // Phase 1 — lock every touched path (src + move dst), sorted + deduped
@@ -15061,9 +16005,43 @@ impl Graph {
             self.invalidate_cache_after_tine_mutation();
             return Err(err);
         }
+        // The rename transaction already retains every changed document's final
+        // bytes. Update a current page-list memo from those bytes before dropping
+        // the parsed cache: unchanged entries preserve their exact physical and
+        // effective identity, while only the edited subset is reparsed. A cold or
+        // already-stale memo remains cold and retains the ordinary disk rebuild.
+        let updated_page_inventory =
+            page_inventory_snapshot.map(|(mut inventory, mut failures)| {
+                for edit in &edits {
+                    inventory.retain(|entry| entry.path != edit.src);
+                    let src_rel = self.rel_path(&edit.src);
+                    let dst_rel = self.rel_path(&edit.dst);
+                    failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
+                    let parsed = self
+                        .graph_inventory_entry(&edit.dst)
+                        .ok()
+                        .flatten()
+                        .and_then(|entry| {
+                            parse_exact_page(self, &entry, &edit.new_content)
+                                .ok()
+                                .map(|(effective, _, _)| effective)
+                        });
+                    if let Some(entry) = parsed {
+                        inventory.push(entry);
+                    } else {
+                        failures.push(dst_rel);
+                    }
+                }
+                (inventory, failures)
+            });
         self.invalidate_cache_after_tine_mutation();
+        if let Some((inventory, failures)) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory, failures);
+        }
         self.finish_successful_rename_editor_lifecycle();
-        Ok(())
+        Ok(RenameOutcome {
+            skipped_conflicted_referrers,
+        })
     }
 
     /// An ordinary rename resets the frontend's entire working set because the
@@ -16314,6 +17292,25 @@ impl Graph {
         let existing_raw = page_baseline
             .clone()
             .or_else(|| legacy_page_baseline.clone());
+        // VCS merge-conflict quarantine (Concord invariant 3) — the same
+        // refusal the ordinary save path enforces in `serialize_page_dto_for_path`.
+        // This path used to bypass it: one added highlight rewrote a
+        // conflicted `hls__` page, re-indented the markers off column 0, and
+        // thereby silently LIFTED the quarantine while the VCS still
+        // considered the merge unresolved. Refuse before the sidecar commit so
+        // the pair stays untouched.
+        if let Some(existing) = existing_raw.as_deref() {
+            let markers = doc::vcs_conflict_markers(existing);
+            if !markers.is_empty() {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "highlight page contains unresolved VCS merge conflict markers ({}) — resolve the merge first; Tine never rewrites a conflicted file",
+                        markers.join(", ")
+                    ),
+                ));
+            }
+        }
         // The sidecar and annotation page are one logical update. Reject a
         // non-round-trippable Org page before publishing the sidecar so a failed
         // page serialization cannot leave the pair half-updated.
@@ -16538,6 +17535,102 @@ impl Graph {
         if recent.get(path).is_some_and(|r| r == rev) {
             recent.remove(path);
         }
+    }
+
+    fn remember_exact_graph_text_state(
+        &self,
+        path: &Path,
+        revision: String,
+        resource_identity: ContentDigest,
+    ) {
+        let mut recent = self.recent_graph_text_states.lock().unwrap();
+        if recent.len() >= 1024 && !recent.contains_key(path) {
+            // This is only an optimization receipt. Losing it makes the next
+            // callback take the ordinary fail-closed external frontier; it can
+            // never authorize a write or weaken a collision check.
+            recent.clear();
+        }
+        recent.insert(
+            path.to_path_buf(),
+            ExactGraphTextStateReceipt {
+                revision,
+                resource_identity,
+            },
+        );
+    }
+
+    fn retire_exact_graph_text_state(&self, path: &Path) {
+        self.recent_graph_text_states.lock().unwrap().remove(path);
+    }
+
+    /// Return true only when an exact native-watcher path is still the physical
+    /// file and byte state Tine just published, or the identical state already
+    /// admitted into the cache. The callback calls this before raising the
+    /// graph-wide external-observation frontier.
+    ///
+    /// The writer permit, graph-text identity authority and per-path lock use
+    /// the same order as `save_page`. A callback delivered during atomic
+    /// publication therefore waits until the writer has completed its final
+    /// no-follow reread and cache publication. Two coherent snapshots then bind
+    /// the proof to the exact path, content revision and file identity. A sync
+    /// service or second Tine which replaced the path, even with identical
+    /// bytes, has a different identity and takes the ordinary external lane.
+    pub fn exact_graph_text_event_matches_tine_state(&self, path: &Path) -> bool {
+        if !self.recent_writes.lock().unwrap().contains_key(path)
+            && !self
+                .recent_graph_text_states
+                .lock()
+                .unwrap()
+                .contains_key(path)
+        {
+            return false;
+        }
+        exact_graph_text_event_after_candidate_hook();
+        let Ok(write) = self.admit_managed_text_writer() else {
+            return false;
+        };
+        let Ok(_identity) = self.lock_graph_text_identity_mutation() else {
+            return false;
+        };
+        let lock = self.page_lock(path);
+        let Ok(_guard) = lock.lock() else {
+            return false;
+        };
+        let first = match self.managed_read_optional_text_with_identity(&write, path) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return false,
+        };
+        let second = match self.managed_read_optional_text_with_identity(&write, path) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return false,
+        };
+        if first != second {
+            return false;
+        }
+        let revision = content_rev(&second.0);
+        let publication_matches = self
+            .recent_graph_text_states
+            .lock()
+            .unwrap()
+            .get(path)
+            .is_some_and(|receipt| {
+                receipt.revision == revision && receipt.resource_identity == second.1
+            });
+        let accepted_matches = self
+            .disk_revs
+            .read()
+            .unwrap()
+            .get(path)
+            .is_some_and(|accepted| accepted == &revision)
+            && self
+                .loaded_file_identities
+                .read()
+                .unwrap()
+                .get(path)
+                .is_some_and(|(accepted_revision, accepted_identity)| {
+                    accepted_revision == &revision && *accepted_identity == second.1
+                });
+        publication_matches || accepted_matches
     }
 
     /// Oplog entry into the singular page serializer and commit boundary.
@@ -18576,13 +19669,24 @@ impl Graph {
         creation_proof: Option<DirectCreationProof>,
         publication_authority: EditorPublicationAuthority,
     ) -> io::Result<String> {
+        // The Direct existing-file replacement already performs the late
+        // baseline proof at the stronger boundary: it atomically retires the
+        // exact expected inode, reads that detached inode, and restores it on a
+        // byte mismatch before reporting the conflict. Reading the live name in
+        // `commit_write` immediately beforehand duplicated a full-file read
+        // without closing an additional race. Keep that earlier recheck for
+        // creates, unpinned auxiliary writes, and reconstructible managed
+        // projections; this cut is deliberately Direct Files only.
+        let commit_recheck = recheck
+            && !(publication_authority == EditorPublicationAuthority::DirectFile
+                && expected_identity.is_some());
         let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
             write,
             path,
             content,
             baseline,
-            recheck,
+            commit_recheck,
             create_parent,
             editor_episode,
             || match (expected_identity, creation_proof) {
@@ -18656,6 +19760,9 @@ impl Graph {
             .write()
             .unwrap()
             .insert(path.to_path_buf(), (rev.clone(), identity));
+        if publication_authority == EditorPublicationAuthority::DirectFile {
+            self.remember_exact_graph_text_state(path, rev.clone(), identity);
+        }
         Ok(rev)
     }
 
@@ -18739,6 +19846,7 @@ impl Graph {
                 "managed text watcher snapshot changed before reconciliation",
             ));
         }
+        self.remember_exact_graph_text_state(path, content_rev(&content), identity);
         self.repin_retained_identity_at_equal_bytes(path, &content, identity);
         // The watcher consumes the self-write marker (one-shot) so the map stays
         // bounded to in-flight writes.
@@ -18903,6 +20011,7 @@ impl Graph {
     /// Drop a file deleted on disk from the cache; returns the entry if it was
     /// cached (so the UI can react).
     pub fn forget_file(&self, path: &Path) -> Option<PageEntry> {
+        self.retire_exact_graph_text_state(path);
         self.loaded_file_identities.write().unwrap().remove(path);
         self.revoke_conflict_authority(path);
         let entry = self.entry_for_path(path)?;
@@ -21751,25 +22860,58 @@ pub fn block_to_dto(b: &DocBlock) -> io::Result<BlockDto> {
 /// and are hydrated once per page by live consumers. Keeping this constructor
 /// separate makes it difficult to accidentally reintroduce overlapping subtree
 /// amplification in queries, references, search, or batched resolution.
-pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+/// The ONE parser-backed `DocBlock` → shallow `BlockDto` facet projection
+/// (DUP-6/B9, 2026-08-25 duplication audit): both DTO constructors delegate
+/// here, so a new `BlockDto` facet is a one-site decision on this path. `id`
+/// validation stays with the callers — their polite-error vs assert difference
+/// is deliberate.
+fn doc_block_facets_dto(block: &DocBlock, id: String) -> BlockDto {
     BlockDto {
-        id: block_runtime_id(b),
-        raw: b.raw.clone(),
-        collapsed: b.collapsed(),
+        id,
+        raw: block.raw.clone(),
+        collapsed: block.collapsed(),
         children: Vec::new(),
         breadcrumb: Vec::new(),
         page_property: false,
-        marker: b.marker().map(str::to_string),
-        priority: b.priority().map(str::to_string),
-        heading_level: b.heading_level(),
-        scheduled: b.scheduled().map(str::to_string),
-        deadline: b.deadline().map(str::to_string),
-        tags: b.tags(),
-        properties: b.properties(),
+        marker: block.marker().map(str::to_string),
+        priority: block.priority().map(str::to_string),
+        heading_level: block.heading_level(),
+        scheduled: block.scheduled().map(str::to_string),
+        deadline: block.deadline().map(str::to_string),
+        tags: block.tags(),
+        properties: block.properties(),
     }
 }
 
-fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Vec<DocBlock>> {
+pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+    doc_block_facets_dto(b, block_runtime_id(b))
+}
+
+/// The ONE `BlockDto` → `DocBlock` field mapping (2026-08-25 duplication
+/// audit, DUP-application-query-twin). Every managed path that rehydrates a
+/// parseable block from its wire DTO goes through this constructor, so a new
+/// `DocBlock` field is initialized in exactly one place. The tree walkers
+/// around it deliberately differ — [`dto_blocks_to_doc_checked`] is iterative,
+/// depth-bounded, and allocation-guarded because it validates untrusted managed
+/// page loads, while the query/projection walkers recurse over block trees that
+/// are already inside the trusted process — but the per-block field mapping
+/// must not diverge. A source guard in this module's tests pins the invariant.
+pub(crate) fn dto_block_to_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
+    DocBlock {
+        raw: block.raw.clone(),
+        children: Vec::new(),
+        uuid: block.id.clone(),
+        is_org,
+        proj: std::sync::OnceLock::new(),
+    }
+}
+
+/// Bounded tree walker over [`dto_block_to_doc_block`] for untrusted managed
+/// page loads: iterative (no recursion), depth-limited, allocation-guarded.
+pub(crate) fn dto_blocks_to_doc_checked(
+    blocks: &[BlockDto],
+    is_org: bool,
+) -> io::Result<Vec<DocBlock>> {
     struct Frame<'a> {
         source: &'a [BlockDto],
         next: usize,
@@ -21806,13 +22948,7 @@ fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Ve
         }
         let block = &frame.source[frame.next];
         frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        frame.output.push(DocBlock {
-            raw: block.raw.clone(),
-            children: Vec::new(),
-            uuid: block.id.clone(),
-            is_org,
-            proj: std::sync::OnceLock::new(),
-        });
+        frame.output.push(dto_block_to_doc_block(block, is_org));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(
@@ -21881,21 +23017,9 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
                 "block has no assigned runtime identity",
             ));
         }
-        frame.output.push(BlockDto {
-            id: block.uuid.clone(),
-            raw: block.raw.clone(),
-            collapsed: block.collapsed(),
-            children: Vec::new(),
-            breadcrumb: Vec::new(),
-            page_property: false,
-            marker: block.marker().map(str::to_string),
-            priority: block.priority().map(str::to_string),
-            heading_level: block.heading_level(),
-            scheduled: block.scheduled().map(str::to_string),
-            deadline: block.deadline().map(str::to_string),
-            tags: block.tags(),
-            properties: block.properties(),
-        });
+        frame
+            .output
+            .push(doc_block_facets_dto(block, block.uuid.clone()));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(
@@ -22592,28 +23716,241 @@ pub(crate) fn move_file_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 /// appeared after the caller's collision check. The payload is fsynced in a
 /// same-directory temp, then atomically renamed into the final name only if absent.
 pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_publish(path, bytes, PublishMode::NoReplace)
+}
+
+/// Suffix marking a file retired by [`atomic_replace_expected`] mid-publish.
+pub(crate) const RETIRED_SUFFIX: &str = ".retired";
+
+/// True for dir-fsync errors that mean "this filesystem does not offer it",
+/// as opposed to a real durability failure.
+///
+/// Directory fsync is genuinely unavailable in several places: Windows has no
+/// handle you can open this way, and some network filesystems reject it. Those
+/// must stay non-fatal — that is why the call was best-effort to begin with.
+/// A real `EIO`/`ENOSPC`, though, means the rename may not survive a crash, and
+/// reporting durable success there is a false ack.
+fn dir_fsync_is_unsupported(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotFound
+    ) {
+        return true;
+    }
+    // EBADF / EACCES / EISDIR / EINVAL from an fsync on a directory handle: the
+    // filesystem (several NFS and FUSE implementations) is telling us the
+    // operation does not apply, not that data was lost.
+    const UNSUPPORTED_ERRNOS: [i32; 4] = [9, 13, 21, 22];
+    error
+        .raw_os_error()
+        .is_some_and(|errno| UNSUPPORTED_ERRNOS.contains(&errno))
+}
+
+/// App-layer face of [`sync_dir`]: fsync `dir` so a rename into it survives a
+/// crash. For src-tauri writers (settings registry, backup restore, window
+/// identity) that previously discarded this result with `let _ = …` — a false
+/// ack under the in-scope crash/power-loss threat (DUP-5).
+pub fn sync_dir_for_rename(dir: &Path) -> io::Result<()> {
+    sync_dir(dir)
+}
+
+/// App-layer face of [`dir_fsync_is_unsupported`], for writers that hold their
+/// own directory handle (the cap-std restore path) and must apply the same
+/// tolerate-unsupported / report-real policy.
+pub fn dir_fsync_error_is_unsupported(error: &io::Error) -> bool {
+    dir_fsync_is_unsupported(error)
+}
+
+/// fsync a directory so a rename into it survives a crash.
+///
+/// Errors that mean "unsupported here" are swallowed; everything else is
+/// propagated, because a caller told the durability succeeded when it did not
+/// will happily report a save as committed.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match fs::File::open(dir).and_then(|handle| handle.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error) if dir_fsync_is_unsupported(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Outcome of a conditional publish.
+#[derive(Debug)]
+pub(crate) enum AtomicReplaceOutcome {
+    /// `next` is now the file's content.
+    Published,
+    /// Someone else wrote the file first; nothing was published. Carries the
+    /// bytes actually found, so the caller can retry, refuse, or preserve them.
+    ExternalChanged(Vec<u8>),
+}
+
+/// Publish `next` to `path` ONLY if `path` still holds `expected`.
+///
+/// A plain temp+rename publish silently clobbers whatever arrived after the
+/// caller's last read: Syncthing delivering a peer's `config.edn`, Logseq
+/// writing the same file, an external editor saving a sidecar. Those bytes
+/// vanish with no conflict copy and no refusal, which is exactly the class
+/// ADR 0007 forbids for pages.
+///
+/// Checking the file and then renaming over it cannot fix that — the check and
+/// the rename are two operations and the writer lands between them. So the
+/// capture IS the rename: `path` is renamed aside to a unique sibling first,
+/// which atomically takes whatever was current, and the comparison happens on
+/// a name nobody else is writing.
+///
+/// The threat model is honest concurrent writers (crash/power loss, sync
+/// delivery, external editors, a second instance), not an attacker forging
+/// bytes with local write access — see the 2026-08-07 trust decision.
+pub(crate) fn atomic_replace_expected(
+    path: &Path,
+    expected: &[u8],
+    next: &[u8],
+) -> io::Result<AtomicReplaceOutcome> {
+    atomic_replace_expected_with_hooks(path, expected, next, || Ok(()))
+}
+
+fn atomic_replace_expected_with_hooks(
+    path: &Path,
+    expected: &[u8],
+    next: &[u8],
+    after_retire: impl Fn() -> io::Result<()>,
+) -> io::Result<AtomicReplaceOutcome> {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{}.new.tmp", std::process::id(), seq));
-    let res = (|| {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{fname}.{pid}.{seq}.publish.tmp"));
+    let retired = dir.join(format!(".{fname}.{pid}.{seq}{RETIRED_SUFFIX}"));
+
+    let staged = (|| -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        file.write_all(bytes)?;
+        file.write_all(next)?;
         file.sync_all()?;
-        drop(file);
-        move_file_noreplace(&tmp, path)?;
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
         Ok(())
     })();
-    if res.is_err() {
+    if let Err(error) = staged {
         let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    res
+
+    // RETIRE: atomically capture whatever `path` currently holds. A no-replace
+    // rename would be wrong here - we intend to vacate the slot.
+    if let Err(error) = fs::rename(path, &retired) {
+        let _ = fs::remove_file(&tmp);
+        if error.kind() == io::ErrorKind::NotFound {
+            // The file we meant to update is gone: an external delete. Not ours
+            // to recreate silently.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(Vec::new()));
+        }
+        return Err(error);
+    }
+
+    // A crash between here and the publish leaves the content in `retired`;
+    // `restore_retired_files` puts it back on next open.
+    if let Err(error) = after_retire() {
+        let _ = move_file_noreplace(&retired, path);
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+
+    let found = match fs::read(&retired) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = move_file_noreplace(&retired, path);
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    if found != expected {
+        // Someone wrote between the caller's read and now. Put their bytes back
+        // and publish nothing.
+        let restored = move_file_noreplace(&retired, path);
+        let _ = fs::remove_file(&tmp);
+        if restored.is_err() {
+            // An even newer external CREATE took the name. Leave `retired` for
+            // the recovery sweep rather than deleting anyone's data.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(found));
+        }
+        return Ok(AtomicReplaceOutcome::ExternalChanged(found));
+    }
+
+    // PUBLISH into the slot we vacated. No-replace: an AlreadyExists here means
+    // an external CREATE won the window, and its bytes are not ours to replace.
+    if let Err(error) = move_file_noreplace(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            let current = fs::read(path).unwrap_or_default();
+            // Our retired bytes stay on disk for the sweep to triage.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(current));
+        }
+        let _ = move_file_noreplace(&retired, path);
+        return Err(error);
+    }
+
+    sync_dir(dir)?;
+    let _ = fs::remove_file(&retired);
+    Ok(AtomicReplaceOutcome::Published)
+}
+
+/// Recover files stranded mid-publish by a crash.
+///
+/// [`atomic_replace_expected`] briefly leaves `path` non-existent while its
+/// content sits under a `.retired` sibling. A crash in that window would
+/// otherwise look like a deleted file. Restores the content when the target is
+/// missing; otherwise the publish completed (or an external writer recreated
+/// the file), so the retired copy goes to recoverable trash rather than being
+/// deleted outright.
+///
+/// Registered directories only - never a whole-graph walk.
+pub(crate) fn restore_retired_files(root: &Path, dirs: &[PathBuf]) -> usize {
+    let mut recovered = 0usize;
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let retired = entry.path();
+            let Some(name) = retired.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(target_name) = retired_target_name(name) else {
+                continue;
+            };
+            let target = dir.join(target_name);
+            if target.exists() {
+                // The publish completed, or an external writer recreated the
+                // file. Either way the retired copy is superseded - keep it
+                // recoverable instead of deleting it.
+                let trash = typed_trash_dir(root, TrashEntryKind::Conflict);
+                if fs::create_dir_all(&trash).is_ok() {
+                    let _ = move_file_noreplace(&retired, &trash.join(name));
+                }
+                continue;
+            }
+            if move_file_noreplace(&retired, &target).is_ok() {
+                recovered += 1;
+            }
+        }
+    }
+    recovered
+}
+
+/// `.config.edn.1234.7.retired` -> `config.edn`.
+fn retired_target_name(retired: &str) -> Option<&str> {
+    let rest = retired.strip_prefix('.')?;
+    let rest = rest.strip_suffix(RETIRED_SUFFIX)?;
+    let (rest, _seq) = rest.rsplit_once('.')?;
+    let (name, _pid) = rest.rsplit_once('.')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Atomic write: write to a temp file in the same directory, then rename. The
@@ -22621,13 +23958,39 @@ pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// the same path (e.g. an autosave and a highlight/rename rewrite) can't truncate
 /// each other's temp; the rename is still atomic. The temp is removed if the
 /// write fails, so a unique name never leaks an orphan behind.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// How [`atomic_publish`] lands the temp on its final name.
+enum PublishMode {
+    /// `fs::rename` — replaces an existing file (the ordinary save shape).
+    Replace,
+    /// `move_file_noreplace` — create-only; never clobbers a concurrent creator.
+    NoReplace,
+}
+
+/// THE temp+fsync+rename publish implementation, shared by [`atomic_write`]
+/// and [`atomic_write_new`] (DUP-5, 2026-08-25 duplication audit: the family
+/// had drifted into copies with different failure policies; the rationale
+/// lives here once).
+///
+/// - The temp name is unique per write (pid + per-process sequence) so two
+///   concurrent writers to the same path can't truncate each other's temp.
+/// - The temp is hidden (`.`-prefixed) and ends in `.tmp` — the shape the
+///   watcher's `is_tine_atomic_page_temp_path` and the wire-side recognizer
+///   understand; change it only together with both recognizers.
+/// - Directory-fsync errors that mean "unsupported here" are tolerated; a real
+///   `EIO`/`ENOSPC` is REPORTED, because a caller told this succeeded will
+///   report the save as durably committed (in-scope threat: crash/power loss
+///   right after the rename).
+fn atomic_publish(path: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{seq}.tmp", std::process::id()));
+    let infix = match mode {
+        PublishMode::Replace => "",
+        PublishMode::NoReplace => ".new",
+    };
+    let tmp = dir.join(format!(".{fname}.{}.{seq}{infix}.tmp", std::process::id()));
     let res = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -22636,17 +23999,20 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)
+        match mode {
+            PublishMode::Replace => fs::rename(&tmp, path),
+            PublishMode::NoReplace => move_file_noreplace(&tmp, path),
+        }
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp); // never leave a temp behind on failure
-    } else {
-        // Persist the rename itself: fsync the directory so a crash right after the
-        // write can't lose the new directory entry (the rename) on some
-        // filesystems. Best-effort — not all platforms allow fsync on a dir.
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+        return res;
     }
-    res
+    sync_dir(dir)
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_publish(path, bytes, PublishMode::Replace)
 }
 
 fn managed_root_components(root: &str) -> Option<Vec<&str>> {
@@ -22668,6 +24034,7 @@ fn projection_component_is_portable(component: &str) -> bool {
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
+    target_os = "ios",
     windows
 ))]
 fn require_projection_platform() -> io::Result<()> {
@@ -22678,6 +24045,7 @@ fn require_projection_platform() -> io::Result<()> {
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
+    target_os = "ios",
     windows
 )))]
 fn require_projection_platform() -> io::Result<()> {
@@ -29354,6 +30722,28 @@ fn create_editor_staged_recovery(dir: &Dir, filename: &str, bytes: &[u8]) -> io:
     create_projection_staging_file(dir, filename, bytes, "editor-staged-recovery")
 }
 
+/// Parse only the complete filenames emitted by the editor publication
+/// protocol. The two numeric fields are part of the authority: a user file
+/// that merely ends in `editor-recovery` is not a cleanup candidate.
+fn editor_recovery_target_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('.')?;
+    let rest = rest
+        .strip_suffix(".editor-staged-recovery")
+        .or_else(|| rest.strip_suffix(".editor-recovery"))?;
+    let (rest, sequence) = rest.rsplit_once('.')?;
+    let (target, process) = rest.rsplit_once('.')?;
+    if target.is_empty()
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || sequence.is_empty()
+        || !process.bytes().all(|byte| byte.is_ascii_digit())
+        || process.is_empty()
+        || text_extension_from_path(Path::new(target)).is_none()
+    {
+        return None;
+    }
+    Some(target)
+}
+
 fn create_projection_staging_file(
     dir: &Dir,
     filename: &str,
@@ -29660,7 +31050,7 @@ fn preflight_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
 const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
     "renameat2(RENAME_NOREPLACE) publishing the projection";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
     "renameatx_np(RENAME_EXCL) publishing the projection";
 
@@ -29671,6 +31061,7 @@ const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -29708,7 +31099,7 @@ fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::
         .ok_or_else(io::Error::last_os_error)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
@@ -29843,6 +31234,7 @@ fn rename_projection_between_noreplace(
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -30298,7 +31690,7 @@ fn rename_managed_noreplace(
         .ok_or_else(io::Error::last_os_error)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_managed_noreplace(
     source_dir: &Dir,
     source: &str,
@@ -30352,6 +31744,7 @@ fn rename_managed_noreplace(
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -30767,10 +32160,9 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
-    } else {
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+        return res;
     }
-    res
+    sync_dir(dir)
 }
 
 /// Copy into a newly-created destination without replacing a path that appeared
@@ -30798,8 +32190,7 @@ pub fn atomic_copy_new(src: &Path, dst: &Path) -> io::Result<()> {
         output.sync_all()?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        Ok(())
+        sync_dir(dir)
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -30838,8 +32229,7 @@ pub fn atomic_copy_file_new(input: &mut fs::File, dst: &Path, max_bytes: u64) ->
         output.sync_all()?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
-        let _ = fs::File::open(dir).and_then(|directory| directory.sync_all());
-        Ok(())
+        sync_dir(dir)
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -30897,17 +32287,22 @@ fn atomic_update_with_hooks(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let published = if baseline.is_none() {
-            atomic_write_new(path, next.as_bytes())
-        } else {
-            atomic_write(path, next.as_bytes())
-        };
-        match published {
-            Ok(()) => return Ok(()),
-            Err(error) if baseline.is_none() && error.kind() == io::ErrorKind::AlreadyExists => {
-                continue;
+        match baseline.as_deref() {
+            // Creation is already no-clobber: `create_new` + no-replace rename.
+            None => match atomic_write_new(path, next.as_bytes()) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            },
+            // Update: the recheck above narrows the race but cannot close it -
+            // an external writer can still land between it and the rename. Make
+            // the publish itself conditional so their bytes cannot be lost.
+            Some(current) => {
+                match atomic_replace_expected(path, current.as_bytes(), next.as_bytes())? {
+                    AtomicReplaceOutcome::Published => return Ok(()),
+                    AtomicReplaceOutcome::ExternalChanged(_) => continue,
+                }
             }
-            Err(error) => return Err(error),
         }
     }
     Err(io::Error::new(
@@ -30920,6 +32315,156 @@ fn atomic_update_with_hooks(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // DUP mapping semantics (2026-08-25 duplication audit): both tree walkers
+    // delegate every block to the one shared field mapping, so identical DTO
+    // input must produce identical parseable trees (identity, format flag,
+    // fresh lazy projection included).
+    #[test]
+    fn blockdto_walkers_agree_on_the_shared_field_mapping() {
+        let leaf = BlockDto {
+            id: "u-leaf".into(),
+            raw: "TODO leaf\nkey:: value".into(),
+            ..Default::default()
+        };
+        let root = BlockDto {
+            id: "u-root".into(),
+            raw: "DONE [#B] root".into(),
+            children: vec![leaf],
+            ..Default::default()
+        };
+
+        fn shape(
+            blocks: &[DocBlock],
+        ) -> Vec<(String, String, bool, Vec<(String, String, bool, usize)>)> {
+            blocks
+                .iter()
+                .map(|b| {
+                    (
+                        b.raw.clone(),
+                        b.uuid.clone(),
+                        b.is_org,
+                        b.children
+                            .iter()
+                            .map(|c| (c.raw.clone(), c.uuid.clone(), c.is_org, c.children.len()))
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+
+        for is_org in [false, true] {
+            let via_query_walk = crate::query::application_query_doc_block(&root, is_org);
+            let via_checked_walk = dto_blocks_to_doc_checked(std::slice::from_ref(&root), is_org)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                shape(std::slice::from_ref(&via_query_walk)),
+                shape(std::slice::from_ref(&via_checked_walk)),
+                "is_org={is_org}: every walker must run the same per-block mapping"
+            );
+            // The mapping hands out a fresh projection memo: the first access
+            // parses `raw` (facets visible), it is not inherited from anywhere.
+            assert_eq!(
+                via_checked_walk.projection().marker.as_deref(),
+                Some("DONE")
+            );
+            assert_eq!(
+                via_checked_walk.children[0].projection().marker.as_deref(),
+                Some("TODO")
+            );
+            if !is_org {
+                // Org takes properties from a :PROPERTIES: drawer, not `key::`.
+                assert_eq!(
+                    via_checked_walk.children[0].projection().properties,
+                    vec![("key".to_string(), "value".to_string())]
+                );
+            }
+            assert_eq!(via_checked_walk.projection().priority.as_deref(), Some("B"));
+        }
+    }
+
+    // DUP-7 (2026-08-25 duplication audit): the block-level property recognizer
+    // (`doc::parse_property_line`, an lsdoc transcription) and this page-HEADER
+    // recognizer are deliberately different grammars — the header must never
+    // promote a property-looking prose line into page metadata, so its keys sit
+    // at column zero and its values stay verbatim; the block rule follows lsdoc
+    // (leading parser spaces skipped, `::` must be followed by a space or end,
+    // value trimmed). Do not unify them; pin the distinction.
+    #[test]
+    fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
+        // Column zero: the block rule (like lsdoc) tolerates indent; the header
+        // does not — an indented property-looking line is content, not metadata.
+        assert_eq!(
+            crate::doc::parse_property_line(" key:: v"),
+            Some(("key", "v"))
+        );
+        assert_eq!(page_header_property_line(" key:: v"), None);
+        // Separator spacing: lsdoc requires a space after `::` (or line end);
+        // the header rule keeps verbatim values so `title::x` still rewrites.
+        assert_eq!(crate::doc::parse_property_line("key::value"), None);
+        assert_eq!(
+            page_header_property_line("key::value"),
+            Some(("key", "value"))
+        );
+        // Verbatim vs trimmed value.
+        assert_eq!(
+            page_header_property_line("title:: Name"),
+            Some(("title", " Name"))
+        );
+        // Both take Unicode and dotted keys; neither takes a space in the key.
+        for line in ["kéy:: v", "logseq.order-list-type:: number"] {
+            assert!(crate::doc::parse_property_line(line).is_some(), "{line}");
+            assert!(page_header_property_line(line).is_some(), "{line}");
+        }
+        assert_eq!(crate::doc::parse_property_line("a b:: v"), None);
+        assert_eq!(page_header_property_line("a b:: v"), None);
+    }
+
+    // DUP guard (2026-08-25 duplication audit): the `BlockDto` → `DocBlock`
+    // field mapping existed as TWO inline copies (here in
+    // `dto_blocks_to_doc_checked` and in `query.rs::application_query_doc_block`)
+    // that had to be kept in agreement manually. The mapping is the contract —
+    // which DTO fields carry into the parseable tree (and that the lazy
+    // projection starts empty) — so it is one function and this source guard
+    // forbids a second spelling.
+    #[test]
+    fn only_one_blockdto_to_docblock_field_mapping_exists() {
+        let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut spellings = Vec::new();
+        let mut stack = vec![crate_src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Only production code counts: the trailing `mod tests` pins and
+                // documents the rule (inline cfg(test) items above it are rare
+                // and contain no DTO conversion).
+                let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+                if production.contains("uuid: block.id.clone()") {
+                    spellings.push(
+                        path.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        spellings.sort();
+        assert_eq!(
+            spellings,
+            vec!["src/model.rs"],
+            "the BlockDto -> DocBlock field mapping must stay in exactly one function"
+        );
+    }
 
     // Direct Files performance audit 2026-08-09, finding F7. The digest exists to
     // let the frontend skip transporting several thousand names it already has,
@@ -34691,6 +36236,198 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn duplicate_day_graph(name: &str) -> PathBuf {
+        let dir = scratch(name);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("journals").join("2026_06_26.md"),
+            "- shared line\n- only in canonical\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.md"),
+            "- shared line\n- only in stray\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn conflict_queue_offers_duplicate_journal_days_as_resolvable_objects() {
+        // The whole point of item 5: a duplicate day used to reach the user only
+        // through a startup toast, because it was not a queue object at all. As
+        // an object it inherits the badge, the count, the dock and the walk.
+        let dir = duplicate_day_graph("queue-duplicate-journal");
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let queue = graph.conflict_queue();
+        let day = queue
+            .iter()
+            .find(|object| object.source == crate::concord_queue::ConflictSource::DuplicateJournal)
+            .expect("the duplicate day is a queue object");
+
+        assert_eq!(day.page_name, "Friday, 26-06-2026");
+        assert_eq!(day.page_path, "journals/2026_06_26.md");
+        assert_eq!(day.kind, PageKind::Journal);
+        assert_eq!(day.sides.len(), 2, "canonical + one stray");
+        assert_eq!(day.sides[0].label, "2026_06_26.md");
+        assert_eq!(day.sides[1].label, "Friday, 26-06-2026.md");
+        assert!(day.markers.is_empty());
+        // Merge is implicit: real rows, so the panel can offer keep-mine /
+        // keep-theirs / keep-both rather than a bare file list.
+        assert!(
+            day.block_conflicts.is_some_and(|rows| rows > 0),
+            "expected decidable rows, got {:?}",
+            day.block_conflicts
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_journal_ids_are_stable_across_a_restart() {
+        let dir = duplicate_day_graph("queue-duplicate-journal-stable");
+        let first = Graph::open(&dir).conflict_queue();
+        let second = Graph::open(&dir).conflict_queue();
+        let ids = |queue: &[crate::concord_queue::ConflictObject]| {
+            queue.iter().map(|o| o.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&second));
+        assert!(first
+            .iter()
+            .any(|o| o.id == "journal:journals/2026_06_26.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_a_duplicate_day_folds_the_stray_in_and_leaves_the_queue() {
+        let dir = duplicate_day_graph("queue-duplicate-journal-resolve");
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let diff = graph
+            .duplicate_journal_diff("journals/2026_06_26.md", "journals/Friday, 26-06-2026.md")
+            .unwrap()
+            .expect("a same-format pair diffs");
+        // Keep both sides of every decidable row - the case that must reproduce
+        // what Settings' Merge does by concatenation.
+        fn keep_both(
+            rows: &[crate::sync_diff::DiffRow],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            for row in rows {
+                if row.kind != crate::sync_diff::RowKind::Unchanged {
+                    out.insert(row.id.clone(), "both".to_string());
+                }
+                keep_both(&row.children, out);
+            }
+        }
+        let mut decisions = std::collections::HashMap::new();
+        keep_both(&diff.rows, &mut decisions);
+
+        graph
+            .resolve_duplicate_journal_day(
+                "journals/2026_06_26.md",
+                "journals/Friday, 26-06-2026.md",
+                &decisions,
+                &diff.base_rev,
+                &diff.conflict_rev,
+                "union",
+            )
+            .unwrap();
+
+        let kept = fs::read_to_string(dir.join("journals").join("2026_06_26.md")).unwrap();
+        assert!(
+            kept.contains("only in canonical"),
+            "canonical kept: {kept:?}"
+        );
+        assert!(kept.contains("only in stray"), "stray folded in: {kept:?}");
+        assert!(
+            !dir.join("journals").join("Friday, 26-06-2026.md").exists(),
+            "the stray is gone from the graph"
+        );
+        // Recoverable, never deleted (ADR 0007).
+        let trash = typed_trash_dir(&dir, TrashEntryKind::Conflict);
+        assert!(
+            fs::read_dir(&trash)
+                .map(|entries| entries.flatten().count() > 0)
+                .unwrap_or(false),
+            "the stray must be recoverable in typed trash"
+        );
+        let after = Graph::open(&dir).conflict_queue();
+        assert!(
+            !after
+                .iter()
+                .any(|o| o.source == crate::concord_queue::ConflictSource::DuplicateJournal),
+            "the resolved day leaves the queue: {after:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_a_duplicate_day_refuses_files_from_different_days() {
+        // The guard that keeps this from becoming a merge-any-two-pages command.
+        let dir = duplicate_day_graph("queue-duplicate-journal-guard");
+        fs::write(dir.join("journals").join("2026_06_24.md"), "- other day\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let error = graph
+            .resolve_duplicate_journal_day(
+                "journals/2026_06_26.md",
+                "journals/2026_06_24.md",
+                &std::collections::HashMap::new(),
+                "whatever",
+                "whatever",
+                "union",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            fs::read_to_string(dir.join("journals").join("2026_06_24.md"))
+                .unwrap()
+                .contains("other day"),
+            "the unrelated day is untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_format_duplicate_day_offers_no_rows_but_still_lists_its_files() {
+        // `merge_pages` and the sync-copy resolve both refuse a .md/.org pair, so
+        // offering row choices we could never apply would be a dead end.
+        let dir = scratch("queue-duplicate-journal-cross-format");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals").join("2026_06_26.md"), "- markdown\n").unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.org"),
+            "* org\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let queue = graph.conflict_queue();
+        let day = queue
+            .iter()
+            .find(|o| o.source == crate::concord_queue::ConflictSource::DuplicateJournal)
+            .expect("still a queue object");
+        assert_eq!(day.sides.len(), 2, "both files are still listed");
+        assert!(
+            day.block_conflicts.is_none(),
+            "no row-by-row choice on a pair that cannot be merged"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn journal_conflicts_reports_duplicate_days() {
         let dir = scratch("journal-conflicts");
@@ -35207,6 +36944,263 @@ mod tests {
         // The quarantine lifts by itself: the file simply has no markers now.
         assert!(Graph::open(&dir).list_vcs_marker_conflicts().is_empty());
         assert!(Graph::open(&dir).conflict_queue().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A marker resolution rewrites the conflicted file IN PLACE, so the sides
+    /// the user did not choose survive nowhere else — the resolve must stage a
+    /// byte-exact copy of the pre-resolution file in the recoverable trash
+    /// (ADR 0007), like the sync-copy resolve trashes its conflict copy.
+    #[test]
+    fn resolving_markers_stages_the_preresolution_file_in_recoverable_trash() {
+        let dir = scratch("concord-marker-resolve-trash");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        // Keep-mine everywhere — the LOSSY choice: "theirs wins" survives only
+        // in the staged recovery copy.
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "mine".to_string()))
+                .collect();
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("resolution writes the merged result");
+        assert!(
+            !fs::read_to_string(&file).unwrap().contains("theirs wins"),
+            "keep-mine drops the other side from the page itself"
+        );
+        let trash = dir.join("logseq").join(".tine-trash").join("conflicts");
+        let staged: Vec<_> = fs::read_dir(&trash)
+            .expect("the resolve staged a recovery copy")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("__markers__Merged.md")
+            })
+            .collect();
+        assert_eq!(staged.len(), 1, "exactly one recovery copy");
+        assert_eq!(
+            fs::read_to_string(staged[0].path()).unwrap(),
+            P4_DIFF3_MARKERS,
+            "the recovery copy is the byte-exact pre-resolution file"
+        );
+        // A stale resolve refuses BEFORE staging anything.
+        let dir2 = scratch("concord-marker-resolve-trash-stale");
+        fs::write(dir2.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph2 = Graph::open(&dir2);
+        let diff2 = graph2
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        let decisions2: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff2.rows)
+                .into_iter()
+                .map(|id| (id, "mine".to_string()))
+                .collect();
+        graph2
+            .resolve_vcs_marker_conflict(rel, &decisions2, "not-the-current-rev", "union")
+            .expect_err("stale rev refuses");
+        assert!(
+            !dir2.join("logseq").join(".tine-trash").exists(),
+            "a refused resolve must not materialize a trash directory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// The marker resolver's ancestor is the SAME reconstructed base side the
+    /// marker diff used, so a `"merged"` row re-derives the body it offered.
+    #[test]
+    fn resolving_markers_can_apply_a_confirmed_merged_body() {
+        const DISJOINT: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< HEAD\n- the shared desktop machine label\n",
+            "||||||| merged common ancestors\n- the shared desktop machine label 5\n",
+            "=======\n- the shared desktop machine label 5 kk\n",
+            ">>>>>>> feature\n",
+        );
+        let dir = scratch("concord-marker-merged");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, DISJOINT).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        let row = diff
+            .rows
+            .iter()
+            .find(|row| row.merged.is_some())
+            .expect("a merged proposal");
+        assert_eq!(row.suggestion.as_deref(), Some("merged"));
+        assert_eq!(
+            row.merged.as_ref().unwrap().text,
+            "the shared desktop machine label kk"
+        );
+
+        let decisions = std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the confirmed merged body applies");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(doc::vcs_conflict_markers(&after).is_empty(), "{after:?}");
+        assert_eq!(
+            doc::parse(&after)
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "the shared desktop machine label kk"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fossil's own `####### SUGGESTED CONFLICT RESOLUTION` is the second
+    /// source for the fourth outcome: the two edits here OVERLAP, so the
+    /// disjoint-edit merge declines and the artifact is what fills the row.
+    /// Resolving writes exactly the suggested body — re-derived from the
+    /// guarded file bytes, never echoed back from the client.
+    #[test]
+    fn resolving_fossil_markers_can_apply_the_suggested_resolution() {
+        const FOSSIL: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<<<<\n",
+            "- the quick brown fox jumped over it\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ##################\n",
+            "- the quick brown fox leapt over it\n",
+            "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+            "- the quick brown fox jumps over it\n",
+            "======= MERGED IN content follows ==============================\n",
+            "- the quick brown fox leaped over it\n",
+            ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n",
+        );
+        let dir = scratch("concord-marker-artifact");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        let row = diff
+            .rows
+            .iter()
+            .find(|row| row.merged.is_some())
+            .expect("an artifact proposal");
+        let proposal = row.merged.as_ref().unwrap();
+        assert_eq!(
+            proposal.source,
+            crate::sync_diff::MergedSource::Artifact,
+            "the edits overlap, so nothing was computed"
+        );
+        assert_eq!(proposal.text, "the quick brown fox leapt over it");
+        assert_eq!(row.suggestion.as_deref(), Some("merged"));
+
+        let decisions = std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the confirmed artifact applies");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(doc::vcs_conflict_markers(&after).is_empty(), "{after:?}");
+        assert_eq!(
+            doc::parse(&after)
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "the quick brown fox leapt over it"]
+        );
+        // The suggestion text itself never leaked into a side.
+        assert!(!after.contains("jumped"), "{after:?}");
+        assert!(!after.contains("leaped"), "{after:?}");
+        // And the stale-rev guard still fires against the ORIGINAL rev.
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let err = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, "not-the-current-rev", "union")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&file).unwrap(), FOSSIL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A suggestion region that merely repeats one side is not a fourth
+    /// outcome, so nothing is offered — and a forged `"merged"` refuses the
+    /// whole resolve, leaving the marker file byte-identical.
+    #[test]
+    fn a_fossil_suggestion_equal_to_a_side_offers_nothing_and_writes_nothing() {
+        const FOSSIL: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<<<<\n",
+            "- the quick brown fox jumped over it\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ##################\n",
+            "- the quick brown fox leaped over it\n",
+            "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+            "- the quick brown fox jumps over it\n",
+            "======= MERGED IN content follows ==============================\n",
+            "- the quick brown fox leaped over it\n",
+            ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n",
+        );
+        let dir = scratch("concord-marker-artifact-refused");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        assert!(
+            diff.rows.iter().all(|row| row.merged.is_none()),
+            "a proposal equal to a side duplicates an existing choice"
+        );
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "merged".to_string()))
+                .collect();
+        let error = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), FOSSIL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without a reconstructed ancestor (a 2-marker conflict) the diff offers
+    /// nothing to merge, and a forged `"merged"` decision refuses the resolve.
+    #[test]
+    fn markers_without_an_ancestor_refuse_a_forged_merged_decision() {
+        const NO_BASE: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< HEAD\n- the shared desktop machine label\n",
+            "=======\n- the shared desktop machine label 5 kk\n",
+            ">>>>>>> feature\n",
+        );
+        let dir = scratch("concord-marker-nobase");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, NO_BASE).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(!diff.three_way);
+        assert!(diff.rows.iter().all(|row| row.merged.is_none()));
+        let decidable = collect_decidable_ids(&diff.rows);
+        let decisions: std::collections::HashMap<String, String> = decidable
+            .iter()
+            .map(|id| (id.clone(), "merged".to_string()))
+            .collect();
+        let error = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), NO_BASE);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -35893,8 +37887,8 @@ mod tests {
         graph.save_page(&exact, exact.rev.as_deref()).unwrap();
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            3,
-            "exact save reads validation, coherent late-recheck, and final receipt snapshots"
+            2,
+            "exact save reads initial validation and the final receipt; the atomic retirement validates the baseline without a pre-retirement reread"
         );
         assert_eq!(
             GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
@@ -35902,6 +37896,119 @@ mod tests {
             "exact-owner validation parses only its captured target"
         );
         assert_eq!(GRAPH_TEXT_VALIDATION_TARGET_READS.with(Cell::get), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_page_inventory_survives_delete_and_watcher_lifecycle_without_graph_reread() {
+        let dir = scratch("warm-page-inventory-lifecycle");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Delete Me.md"), "- delete me\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 25);
+
+        graph.delete_page("Delete Me", PageKind::Page).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_delete = graph.list_pages();
+        assert_eq!(after_delete.len(), 24);
+        assert!(!after_delete.iter().any(|entry| entry.name == "Delete Me"));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+
+        let watched = dir.join("pages/Watched.md");
+        fs::write(&watched, "title:: Watched Identity\n\n- watched\n").unwrap();
+        graph.sync_file_checked(&watched).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_create = graph.list_pages();
+        assert_eq!(after_create.len(), 25);
+        assert!(after_create
+            .iter()
+            .any(|entry| entry.name == "Watched Identity" && entry.path == watched));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+
+        fs::remove_file(&watched).unwrap();
+        graph.sync_deleted_file(&watched).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_remove = graph.list_pages();
+        assert_eq!(after_remove.len(), 24);
+        assert!(!after_remove.iter().any(|entry| entry.path == watched));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_page_inventory_survives_rename_without_graph_reread_or_reparse() {
+        let dir = scratch("warm-page-inventory-rename");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("pages/Original.md"),
+            "title:: Original\n\n- [[Original]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 25);
+
+        graph.rename_page("Original", "Renamed").unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_rename = graph.list_pages();
+        assert_eq!(after_rename.len(), 25);
+        assert!(!after_rename
+            .iter()
+            .any(|entry| entry.rel_path == "pages/Original.md"));
+        assert!(after_rename.iter().any(|entry| {
+            // An explicit title remains the effective identity; the physical
+            // move must not silently reinterpret it from the new filename.
+            entry.name == "Original" && entry.rel_path == "pages/Renamed.md"
+        }));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watcher_parse_failure_cannot_republish_stale_warm_page_inventory() {
+        let dir = scratch("watcher-failure-page-inventory");
+        fs::write(dir.join("pages/Good.md"), "- good\n").unwrap();
+        let failed = dir.join("pages/Failed.md");
+        fs::write(&failed, "- initially valid\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 2);
+
+        fs::write(&failed, [0xff, 0xfe, b'\n']).unwrap();
+        assert!(graph.sync_file_checked(&failed).is_err());
+        let mut good = graph.load_by_path("pages/Good.md").unwrap().unwrap();
+        good.blocks[0].raw = "saved while sibling failed".into();
+        graph.save_page(&good, good.rev.as_deref()).unwrap();
+
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        let inventory = graph.list_pages();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].name, "Good");
+        assert!(
+            GRAPH_TEXT_CONTENT_READS.with(Cell::get) >= 2,
+            "a known watcher parse failure must force exact disk revalidation"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -35948,8 +38055,8 @@ mod tests {
         assert_eq!(GRAPH_TEXT_VALIDATION_TARGET_READS.with(Cell::get), 1);
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            3,
-            "only exact validation, coherent late recheck, and the target receipt may read content"
+            2,
+            "only exact validation and the target receipt may read content; retirement itself validates the baseline"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -37214,6 +39321,105 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// GH #374 native-platform witness. ReadDirectoryChangesW may echo Tine's
+    /// atomic create several times; the exact completed publication and its
+    /// atomic create during its publication-to-final-reread window. The callback
+    /// must wait for the same-path writer rather than treating the not-yet-minted
+    /// completed receipt as an external change.
+    /// Exact completed and reconciled states are safe no-ops, but neither
+    /// matching bytes on a replacement inode nor changed bytes on the original
+    /// inode are ownership proof.
+    #[test]
+    fn windows_direct_publication_event_waits_for_inflight_writer_receipt() {
+        let dir = scratch("windows-direct-publication-inflight-event");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        graph.warm_cache();
+        let path = dir.join("pages/Inflight Publication.md");
+        let page = direct_save_bench_new_page("Inflight Publication");
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_graph = Arc::clone(&graph);
+        let writer = std::thread::spawn(move || {
+            EDITOR_COMMIT_BEFORE_FINAL_REREAD.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    published_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }));
+            });
+            writer_graph.save_page(&page, None)
+        });
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer reached the publication-to-final-reread window");
+
+        let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+        let observer_graph = Arc::clone(&graph);
+        let observer_path = path.clone();
+        let observer = std::thread::spawn(move || {
+            EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || candidate_tx.send(()).unwrap()));
+            });
+            observer_graph.exact_graph_text_event_matches_tine_state(&observer_path)
+        });
+        let reached_candidate = candidate_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        writer.join().unwrap().unwrap();
+        assert!(
+            reached_candidate,
+            "the in-flight self-write marker must make the callback wait for the completed receipt"
+        );
+        assert!(
+            observer.join().unwrap(),
+            "after the writer releases its lock, exact bytes and identity must prove the self echo"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_direct_publication_receipt_requires_revision_and_file_identity() {
+        for same_bytes_new_identity in [false, true] {
+            let dir = scratch(if same_bytes_new_identity {
+                "windows-direct-publication-replaced-identity"
+            } else {
+                "windows-direct-publication-changed-bytes"
+            });
+            fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let page = direct_save_bench_new_page("Owned Publication");
+            graph.save_page(&page, None).unwrap();
+            let path = dir.join("pages/Owned Publication.md");
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&path),
+                "the completed exact publication receipt must match"
+            );
+            graph.sync_file_checked(&path).unwrap();
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&path),
+                "after reconciliation, exact admitted bytes and identity must match"
+            );
+
+            if same_bytes_new_identity {
+                let replacement = dir.join("external-winner.tmp");
+                fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            } else {
+                fs::write(&path, b"- external winner\n").unwrap();
+            }
+            assert!(
+                !graph.exact_graph_text_event_matches_tine_state(&path),
+                "an external byte or physical-identity winner must take the guarded external lane"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
     /// A debounced batch may finish after a newer raw callback has arrived. Its
     /// acknowledgement must not clear that newer callback's creation barrier.
     #[test]
@@ -37897,6 +40103,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Moving one exact Direct Files document to typed trash needs names and
+    /// retained file identities, never the contents of unrelated documents.
+    #[test]
+    fn direct_trash_move_does_not_capture_unrelated_graph_text_bytes() {
+        let dir = scratch("direct-trash-metadata-only");
+        fs::write(dir.join("journals/2026_08_25.md"), b"- discard me\n").unwrap();
+        for index in 0..24 {
+            fs::write(
+                dir.join(format!("pages/Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        let graph = Graph::open(&dir);
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        let before_reads = managed_text_capture_reads();
+        let before_builds = graph.guarded_graph_text_identity_report().complete_builds;
+
+        graph.trash_journal_file("2026_08_25.md").unwrap();
+
+        assert_eq!(managed_text_capture_reads(), before_reads);
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            before_builds
+        );
+        assert!(!dir.join("journals/2026_08_25.md").exists());
+        for index in 0..24 {
+            assert_eq!(
+                fs::read(dir.join(format!("pages/Unrelated {index}.md"))).unwrap(),
+                format!("- unrelated {index}\n").as_bytes()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn import_asset_uses_given_name() {
         let dir = scratch("import-name");
@@ -38047,6 +40290,86 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join("pages").join("Weird.org")).unwrap(),
             ro
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_skips_marker_bearing_referrers_and_reports_them() {
+        // A11: a referrer whose file carries column-0 VCS conflict markers is
+        // quarantined - the user still owes it a merge resolution. The rename
+        // must not rewrite it behind their back; it must leave the bytes exactly
+        // as they are, still complete for every other referrer, and report the
+        // skipped path so the UI can say which pages still point at the old name.
+        let dir = scratch("rename-marker-referrer");
+        fs::write(dir.join("pages").join("Alpha.md"), "- alpha\n").unwrap();
+        let conflicted = "- intro\n<<<<<<< HEAD\n- mine sees [[Alpha]]\n=======\n- theirs sees [[Alpha]]\n>>>>>>> branch\n";
+        fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
+        fs::write(
+            dir.join("pages").join("Clean.md"),
+            "- clean sees [[Alpha]]\n",
+        )
+        .unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let outcome = g.rename_page_reporting("Alpha", "Beta", None).unwrap();
+
+        // The quarantined referrer is byte-identical and still quarantined.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Conflicted.md")).unwrap(),
+            conflicted,
+            "a marker-bearing referrer must not be rewritten"
+        );
+        assert_eq!(
+            g.list_vcs_marker_conflicts().len(),
+            1,
+            "quarantine must survive the rename"
+        );
+        // Everything else completed.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Clean.md")).unwrap(),
+            "- clean sees [[Beta]]\n",
+            "clean referrers must still be rewritten"
+        );
+        assert!(dir.join("pages").join("Beta.md").exists(), "page renamed");
+        assert!(!dir.join("pages").join("Alpha.md").exists());
+        // And the skip is reported, not silent.
+        assert_eq!(outcome.skipped_conflicted_referrers.len(), 1);
+        assert!(
+            outcome.skipped_conflicted_referrers[0].ends_with("Conflicted.md"),
+            "reported path was {:?}",
+            outcome.skipped_conflicted_referrers
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn namespace_rename_also_skips_marker_bearing_referrers() {
+        // The cascade variant: renaming a parent renames its descendants too, so
+        // one quarantined referrer can be hit by several (old, new) pairs in the
+        // same pass. It must still come out byte-identical, and be reported once
+        // rather than once per pair.
+        let dir = scratch("rename-marker-namespace");
+        fs::write(dir.join("pages").join("Parent.md"), "- parent\n").unwrap();
+        fs::write(dir.join("pages").join("Parent%2FChild.md"), "- child\n").unwrap();
+        let conflicted = "- intro\n<<<<<<< HEAD\n- [[Parent]] and [[Parent/Child]]\n=======\n- [[Parent/Child]] only\n>>>>>>> branch\n";
+        fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let outcome = g.rename_page_reporting("Parent", "Ancestor", None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Conflicted.md")).unwrap(),
+            conflicted,
+            "namespace cascade must not rewrite a quarantined referrer either"
+        );
+        assert_eq!(
+            outcome.skipped_conflicted_referrers.len(),
+            1,
+            "reported once per file, not once per rename pair: {:?}",
+            outcome.skipped_conflicted_referrers
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -38987,6 +41310,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Concord invariant 3: a marker-bearing page is quarantined from EVERY
+    /// writer. This path used to bypass the refusal — one added highlight
+    /// rewrote the conflicted `hls__` page, re-indented the markers off column
+    /// 0, and silently LIFTED the quarantine while the VCS still considered
+    /// the merge unresolved.
+    #[test]
+    fn write_highlights_refuses_a_marker_bearing_hls_page() {
+        let dir = scratch("highlights-marker-quarantine");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        // A git merge left column-0 conflict markers in the hls page.
+        let conflicted = format!(
+            "<<<<<<< HEAD\n{}=======\n- the other merge side\n>>>>>>> feature\n",
+            fs::read_to_string(&page_path).unwrap()
+        );
+        fs::write(&page_path, &conflicted).unwrap();
+
+        let reopened = Graph::open(&dir);
+        assert!(
+            reopened
+                .list_vcs_marker_conflicts()
+                .iter()
+                .any(|c| c.path == format!("pages/hls__{key}.md")),
+            "the conflicted hls page is quarantined"
+        );
+        let before = graph_tree_snapshot(&dir);
+        let h2 = mkhl("22222222-2222-2222-2222-222222222222", 4, Some("more"));
+        let err = reopened
+            .write_highlights("paper.pdf", "Paper", &[h, h2], &[])
+            .expect_err("a highlight write to a conflicted page must refuse");
+        assert!(
+            err.to_string().contains("conflict markers"),
+            "the refusal names the markers: {err}"
+        );
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "the refusal leaves every file byte-identical (page AND sidecar)"
+        );
+        assert!(
+            Graph::open(&dir)
+                .list_vcs_marker_conflicts()
+                .iter()
+                .any(|c| c.path == format!("pages/hls__{key}.md")),
+            "the quarantine still stands"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The same invariant when there IS a semantic change: adding a highlight
     /// appends one block and leaves the rest of the file's formatting alone.
     #[test]
@@ -39594,6 +41970,40 @@ mod tests {
         let u = g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None);
         assert!(!u.supported);
         assert!(u.groups.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advanced_current_page_input_filters_real_graph_blocks() {
+        let dir = scratch("advanced-current-page");
+        fs::write(dir.join("pages/Focus A.md"), "- own A\n").unwrap();
+        fs::write(dir.join("pages/Focus B.md"), "- own B\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- TODO pinned [[Focus A]]\n- TODO pinned [[Focus B]]\n- DONE [[Focus A]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let query = r#"[:find (pull ?b [*])
+                        :in $ ?current-page
+                        :where
+                        [?p :block/name ?current-page]
+                        [?b :block/refs ?p]
+                        (task ?b #{"TODO"})]
+                       :inputs [:current-page]"#;
+
+        let result = graph.run_advanced_query(query, Some("Focus A"));
+        assert!(result.supported, "ignored={:?}", result.ignored);
+        assert!(result.ignored.is_empty(), "{:?}", result.ignored);
+        assert_eq!(result.ran, vec!["current-page-ref", "task"]);
+        let raws = result
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(raws, vec!["TODO pinned [[Focus A]]"]);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -42785,6 +45195,46 @@ mod tests {
     }
 
     #[test]
+    fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
+        let dir = scratch("graph-text-byte-verification");
+        fs::create_dir_all(dir.join("pages/nested")).unwrap();
+        fs::create_dir_all(dir.join("archive/deep")).unwrap();
+        fs::write(
+            dir.join("pages/nested/Unicode 題.md"),
+            b"- exact\r\nbytes\n",
+        )
+        .unwrap();
+        fs::write(dir.join("archive/deep/Elsewhere.org"), b"* elsewhere\n").unwrap();
+        fs::write(dir.join("pages/.hidden.md"), b"- private\n").unwrap();
+        fs::write(dir.join("archive/deep/not-graph.txt"), b"ignored\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        let paths = graph.graph_text_source_paths().unwrap();
+        assert!(paths.contains(&"pages/nested/Unicode 題.md".to_owned()));
+        assert!(paths.contains(&"archive/deep/Elsewhere.org".to_owned()));
+        assert!(!paths.iter().any(|path| path.contains(".hidden.md")));
+        assert!(!paths.iter().any(|path| path.ends_with("not-graph.txt")));
+
+        let before = fs::read(dir.join("pages/nested/Unicode 題.md")).unwrap();
+        let result = graph
+            .digest_graph_text_source("pages/nested/Unicode 題.md", &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(result.length, before.len() as u64);
+        assert_eq!(result.digest, format!("{:x}", Sha256::digest(&before)));
+        assert_eq!(fs::read(dir.join(&result.path)).unwrap(), before);
+        assert_eq!(
+            graph
+                .digest_graph_text_source("pages/nested/Unicode 題.md", &AtomicBool::new(true),)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(fs::read(dir.join(&result.path)).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn projection_retry_resumes_after_synced_partial_parent_chain() {
         let dir = scratch("projection-partial-parent-retry");
         let relative = "pages/created/synced/deep/Projection.md";
@@ -44885,6 +47335,281 @@ mod tests {
     }
 
     #[test]
+    fn atomic_update_existing_publish_preserves_a_concurrent_external_write() {
+        // A2: the recheck narrows the clobber window but cannot close it. With a
+        // baseline already on disk, an external writer (Syncthing delivering a
+        // peer's config.edn, Logseq, an editor) landing AFTER the recheck and
+        // before the rename used to be overwritten silently - no conflict copy,
+        // no refusal, no trace. The publish must be conditional.
+        let dir = scratch("atomic-update-existing-race");
+        let path = dir.join("config.edn");
+        fs::write(&path, "{:base 1}\n").unwrap();
+        let lock = std::sync::Mutex::new(());
+        let injected = std::sync::atomic::AtomicBool::new(false);
+        atomic_update_with_hooks(
+            &path,
+            &lock,
+            |content| Ok(content.replace('}', " :mine 3}")),
+            |_| {},
+            |_| {
+                if !injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    fs::write(&path, "{:base 1 :external 2}\n").unwrap();
+                }
+            },
+        )
+        .unwrap();
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content.contains(":external 2"),
+            "external bytes were clobbered: {final_content:?}"
+        );
+        assert!(
+            final_content.contains(":mine 3"),
+            "our edit was dropped: {final_content:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conditional_publish_refuses_when_the_file_changed_underneath() {
+        let dir = scratch("conditional-publish-refuses");
+        let path = dir.join("sidecar.edn");
+        fs::write(&path, b"expected").unwrap();
+        fs::write(&path, b"external").unwrap();
+        let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
+        match outcome {
+            AtomicReplaceOutcome::ExternalChanged(found) => assert_eq!(found, b"external"),
+            AtomicReplaceOutcome::Published => panic!("published over an external write"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"external", "their bytes stand");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conditional_publish_leaves_no_retired_file_behind_on_success() {
+        let dir = scratch("conditional-publish-clean");
+        let path = dir.join("sidecar.edn");
+        fs::write(&path, b"expected").unwrap();
+        let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
+        assert!(matches!(outcome, AtomicReplaceOutcome::Published));
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".retired") || name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left {leftovers:?} behind");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crash_between_retire_and_publish_is_recovered_byte_identical() {
+        // The window the protocol opens deliberately: `path` does not exist and
+        // its content lives under a `.retired` sibling. A crash there must not
+        // look like a deleted file.
+        let dir = scratch("retired-crash-recovery");
+        let path = dir.join("config.edn");
+        fs::write(&path, b"{:base 1}\n").unwrap();
+        let crashed =
+            atomic_replace_expected_with_hooks(&path, b"{:base 1}\n", b"{:next 2}\n", || {
+                Err(io::Error::other("simulated crash after retire"))
+            });
+        assert!(crashed.is_err());
+        // The unwind restores it; simulate the harder case - a real crash, where
+        // nothing runs - by retiring again and abandoning it.
+        let retired = dir.join(".config.edn.999.0.retired");
+        fs::rename(&path, &retired).unwrap();
+        assert!(!path.exists(), "the window is real");
+
+        let recovered = restore_retired_files(&dir, &[dir.clone()]);
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"{:base 1}\n",
+            "content must come back byte-identical"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_keeps_a_superseded_retired_copy_instead_of_deleting_it() {
+        // The publish completed (or an external writer recreated the file), so
+        // the retired copy is superseded - but it is still the only copy of
+        // those bytes, so it goes to recoverable trash, never to /dev/null.
+        let dir = scratch("retired-superseded");
+        let path = dir.join("config.edn");
+        fs::write(&path, b"current").unwrap();
+        fs::write(dir.join(".config.edn.999.0.retired"), b"older").unwrap();
+
+        let recovered = restore_retired_files(&dir, &[dir.clone()]);
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"current",
+            "current file untouched"
+        );
+        let trashed =
+            typed_trash_dir(&dir, TrashEntryKind::Conflict).join(".config.edn.999.0.retired");
+        assert_eq!(
+            fs::read(&trashed).unwrap(),
+            b"older",
+            "the superseded copy must be recoverable"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checked_open_restores_one_stranded_editor_recovery_without_guessing() {
+        let dir = scratch("editor-recovery-single-restore");
+        let recovery = dir.join("pages").join(".Note.md.4242.1.editor-recovery");
+        fs::write(&recovery, b"- exact pre-crash bytes\n").unwrap();
+
+        let graph = Graph::open_checked(&dir).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("pages/Note.md")).unwrap(),
+            b"- exact pre-crash bytes\n"
+        );
+        assert!(!recovery.exists());
+        assert!(graph.list_pages().iter().any(|entry| entry.name == "Note"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_recovery_sweep_preserves_ambiguous_and_superseded_bytes() {
+        // Two distinct claims and no live target are ambiguous. Neither is
+        // selected, renamed, or deleted.
+        let ambiguous = scratch("editor-recovery-ambiguous");
+        let old = ambiguous
+            .join("pages")
+            .join(".Note.md.4242.1.editor-recovery");
+        let edited = ambiguous
+            .join("pages")
+            .join(".Note.md.4242.2.editor-staged-recovery");
+        fs::write(&old, b"- old bytes\n").unwrap();
+        fs::write(&edited, b"- edited bytes\n").unwrap();
+        let _graph = Graph::open_checked(&ambiguous).unwrap();
+        assert!(!ambiguous.join("pages/Note.md").exists());
+        assert_eq!(fs::read(&old).unwrap(), b"- old bytes\n");
+        assert_eq!(fs::read(&edited).unwrap(), b"- edited bytes\n");
+
+        // If a live winner exists, it stays byte-identical and every stranded
+        // artifact moves intact to recoverable conflict trash.
+        let superseded = scratch("editor-recovery-superseded");
+        let live = superseded.join("pages/Note.md");
+        let old = superseded
+            .join("pages")
+            .join(".Note.md.4242.1.editor-recovery");
+        let edited = superseded
+            .join("pages")
+            .join(".Note.md.4242.2.editor-staged-recovery");
+        fs::write(&live, b"- external winner\n").unwrap();
+        fs::write(&old, b"- old bytes\n").unwrap();
+        fs::write(&edited, b"- edited bytes\n").unwrap();
+        let _graph = Graph::open_checked(&superseded).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"- external winner\n");
+        assert!(!old.exists());
+        assert!(!edited.exists());
+        let recovered = fs::read_dir(typed_trash_dir(&superseded, TrashEntryKind::Conflict))
+            .unwrap()
+            .flatten()
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(recovered.contains(&b"- old bytes\n".to_vec()));
+        assert!(recovered.contains(&b"- edited bytes\n".to_vec()));
+
+        let _ = fs::remove_dir_all(&ambiguous);
+        let _ = fs::remove_dir_all(&superseded);
+    }
+
+    #[test]
+    fn editor_recovery_sweep_ignores_lookalikes_and_restores_a_sole_staged_copy() {
+        let dir = scratch("editor-recovery-exact-name");
+        let staged = dir
+            .join("pages")
+            .join(".Note.md.4242.1.editor-staged-recovery");
+        let lookalike = dir
+            .join("pages")
+            .join(".Other.md.not-a-pid.1.editor-recovery");
+        fs::write(&staged, b"- sole staged bytes\n").unwrap();
+        fs::write(&lookalike, b"- ordinary lookalike\n").unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("pages/Note.md")).unwrap(),
+            b"- sole staged bytes\n"
+        );
+        assert_eq!(fs::read(&lookalike).unwrap(), b"- ordinary lookalike\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_recovery_sweep_refuses_a_multi_link_artifact() {
+        let dir = scratch("editor-recovery-hardlink");
+        let artifact = dir.join("pages").join(".Note.md.4242.1.editor-recovery");
+        fs::write(&artifact, b"- linked bytes\n").unwrap();
+        fs::hard_link(&artifact, dir.join("linked-copy")).unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert!(!dir.join("pages/Note.md").exists());
+        assert_eq!(fs::read(&artifact).unwrap(), b"- linked bytes\n");
+        assert_eq!(
+            fs::read(dir.join("linked-copy")).unwrap(),
+            b"- linked bytes\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dir_fsync_that_is_merely_unsupported_is_not_a_durability_failure() {
+        // The best-effort discard existed because dir fsync genuinely does not
+        // exist everywhere. Keep tolerating that, and only that.
+        for kind in [
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+        ] {
+            assert!(
+                dir_fsync_is_unsupported(&io::Error::new(kind, "x")),
+                "{kind:?}"
+            );
+        }
+        for errno in [9, 13, 21, 22] {
+            assert!(dir_fsync_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        // A real durability failure must surface.
+        for errno in [5 /* EIO */, 28 /* ENOSPC */] {
+            assert!(
+                !dir_fsync_is_unsupported(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not be swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_names_round_trip_to_their_target() {
+        assert_eq!(
+            retired_target_name(".config.edn.123.7.retired"),
+            Some("config.edn")
+        );
+        assert_eq!(
+            retired_target_name(".a.b.c.md.1.2.retired"),
+            Some("a.b.c.md")
+        );
+        assert_eq!(retired_target_name("config.edn"), None);
+        assert_eq!(retired_target_name(".config.edn.tmp"), None);
+    }
+
+    #[test]
     fn guide_twin_withdrawal_preserves_a_concurrent_markdown_replacement() {
         let dir = scratch("guide-twin-withdrawal-race");
         let graph = Graph::open(&dir);
@@ -45650,6 +48375,14 @@ mod tests {
 
         // The stray became a normal page, reachable by its new unique name.
         assert!(!dir.join("journals").join("Friday, 26-06-2026.org").exists());
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let inventory = g.list_pages();
+        assert!(inventory.iter().any(|entry| {
+            entry.name == "Old Friday" && entry.rel_path == "pages/Old Friday.org"
+        }));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
         let page = g.load_named("Old Friday", PageKind::Page).unwrap().unwrap();
         assert_eq!(page.blocks[0].raw, "stray body");
         assert_eq!(page.kind, PageKind::Page);
@@ -47160,6 +49893,7 @@ mod tests {
             &Default::default(),
             "",
             "",
+            None,
             "mine",
         ));
         assert_handoff_blocked(graph.merge_pages("pages/a.md", "pages/b.md"));
@@ -48296,7 +51030,7 @@ mod tests {
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         // Preserve the inode while changing its bytes. Revision-only force used
         // to overwrite this unseen second winner.
-        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || {
                 fs::write(path, "- unseen second winner\n")
@@ -48305,7 +51039,7 @@ mod tests {
         let error = graph
             .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
             .unwrap_err();
-        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "- unseen second winner\n"
@@ -48483,8 +51217,22 @@ mod tests {
             title: "Prospective".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "my draft".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -48645,8 +51393,22 @@ mod tests {
             title: "First save".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "created".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -49107,14 +51869,14 @@ mod tests {
     }
 
     #[test]
-    fn gh254_s3_commit_recheck_reads_bytes_and_identity_together() {
+    fn gh254_s3_retired_snapshot_reads_bytes_and_identity_together() {
         let (root, path, graph, page) = gh254_loaded("s3");
-        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s3 winner\n")));
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
-        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         graph
             .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
             .unwrap();
@@ -49202,8 +51964,22 @@ mod tests {
             title: "New".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "mine".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,

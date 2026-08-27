@@ -5,6 +5,10 @@
 pub mod concord_ledger;
 pub mod concord_queue;
 pub mod config;
+/// Test-only: every `Config` field either reaches `GraphMeta` (Rust and TS) or
+/// says why it does not.
+#[cfg(test)]
+mod config_projection_parity;
 pub mod date;
 mod direct_projection;
 pub mod doc;
@@ -34,6 +38,7 @@ pub mod sync_diff;
 pub mod sync_runtime;
 #[cfg(test)]
 mod test_support;
+pub mod text_merge;
 
 /// Re-export the lsdoc parser so the Tauri shell can name its AST types
 /// (`tine_core::lsdoc::ast::Block`) without depending on lsdoc directly.

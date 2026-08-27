@@ -218,6 +218,15 @@ export interface SyncConflict {
   preview: string;
 }
 
+/** What a rename deliberately left undone. A rename cascades reference
+ *  rewrites through every referring page, but files under VCS-marker
+ *  quarantine are skipped rather than rewritten, so they still point at the
+ *  old name and the user has to be told. */
+export interface RenameOutcome {
+  /** Paths of quarantined referrers left byte-identical, old refs intact. */
+  skippedConflictedReferrers: string[];
+}
+
 /** A page whose on-disk bytes carry unresolved VCS merge-conflict markers
  *  (git/Fossil). It stays readable, but saves to it are refused so Tine never
  *  rewrites (and thereby mangles) the markers — the user resolves the merge in
@@ -702,6 +711,18 @@ export interface BlockView {
  *  Only present on 3-way diffs. */
 export type Diff3Verdict = "mine-only" | "theirs-only" | "both-changed";
 
+/** Where a proposed merged body came from: "computed" = composed here from two
+ *  disjoint edits of the base; "artifact" = lifted from the merge tool's own
+ *  suggested-resolution region. Computed always wins when both exist. */
+export type MergedSource = "computed" | "artifact";
+
+/** A merged body offered for a `both-changed` row. Display only — the resolve
+ *  re-derives the text from the same inputs and never trusts this echo. */
+export interface MergedProposal {
+  text: string;
+  source: MergedSource;
+}
+
 /** One aligned position in the two block trees. `id` is a stable path ("2.1")
  *  that the resolve step reproduces, so a decision maps back to the same block. */
 export interface DiffRow {
@@ -712,9 +733,13 @@ export interface DiffRow {
   children: DiffRow[];
   /** 3-way classification against the base (absent on 2-way diffs). */
   verdict?: Diff3Verdict | null;
-  /** Pre-selected decision the base justifies ("mine"/"theirs"); the modal only
-   *  pre-selects it — nothing applies without the user's confirm. */
-  suggestion?: "mine" | "theirs" | null;
+  /** Pre-selected decision the base justifies ("mine"/"theirs"/"merged"); the
+   *  modal only pre-selects it — nothing applies without the user's confirm. */
+  suggestion?: MergeDecision | null;
+  /** Merged body proposed for a `both-changed` row — two disjoint edits
+   *  composed, or the merge tool's own suggestion. Absent on 2-way diffs and
+   *  wherever no proposal may be offered. */
+  merged?: MergedProposal | null;
 }
 
 /** The full block-level diff of a conflict copy against its winner. */
@@ -728,13 +753,17 @@ export interface SyncConflictDiff {
   blocks_identical: boolean;
   /** True when rows carry 3-way verdicts computed against a real base. */
   three_way?: boolean;
+  /** Revision of the pinned merge base this 3-way alignment (and its "merged"
+   *  proposals) were computed from; echoed back on resolve so a repinned base
+   *  refuses instead of substituting a body the user never saw. */
+  merge_base_rev?: string | null;
 }
 
 /** A user's per-row merge decision. */
-export type MergeDecision = "mine" | "theirs" | "both";
+export type MergeDecision = "mine" | "theirs" | "both" | "merged";
 
 /** Where a conflict object came from (Concord L3). */
-export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save";
+export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save" | "duplicate-journal";
 
 export interface LiveSaveConflictSnapshot {
   page: PageDto;
@@ -772,7 +801,7 @@ export interface ConflictSide {
  *  judgement. Entirely DERIVED from what is on disk (no metadata is stored in
  *  the graph), so the queue survives restarts by being recomputed. */
 export interface ConflictObject {
-  /** Stable derived id — `copy:<path>` / `markers:<path>`. */
+  /** Stable derived id — `copy:<path>` / `markers:<path>` / `journal:<path>`. */
   id: string;
   source: ConflictSource;
   page_name: string;
@@ -929,7 +958,13 @@ export interface GraphMeta {
   start_of_week: number; // Logseq :start-of-week, 0=Monday … 6=Sunday (default 6)
   block_hidden_properties: string[];
   default_journal_template: string | null;
+  /** Graph-portable startup page from config.edn `:default-home {:page "..."}`. */
+  default_home?: string | null;
   favorites: string[];
+  /** `:tine/favorites-page` — the page that owns the Favorites arrangement
+   *  (groups and order). `favorites` above stays the flat, Logseq-readable
+   *  membership list. Absent until this graph has one. */
+  favorites_page?: string | null;
   journal_page_title_format: string; // :journal/page-title-format (default "MMM do, yyyy")
   journal_file_name_format: string; // :journal/file-name-format (default "yyyy_MM_dd")
   preferred_format: Format; // :preferred-format — new pages/journals ("md" | "org")

@@ -123,7 +123,11 @@ impl SparseV2ActivationRecord {
 
     fn open_request(&self, app: &tauri::AppHandle) -> Result<SyncRuntimeOpenRequest, String> {
         let private = self.private_root(app)?;
-        Ok(SyncRuntimeOpenRequest {
+        Ok(self.open_request_at(&private))
+    }
+
+    fn open_request_at(&self, private: &Path) -> SyncRuntimeOpenRequest {
+        SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
             clean_identities: Some(SyncLocalActivationIdentities {
                 workspace_id: self.workspace_id,
@@ -142,7 +146,7 @@ impl SparseV2ActivationRecord {
             application_runtime_root: private.join("runtime"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
             provider_journal_root: private.join("provider/device/journal"),
-        })
+        }
     }
 
     fn activation_request(
@@ -150,7 +154,11 @@ impl SparseV2ActivationRecord {
         app: &tauri::AppHandle,
     ) -> Result<SyncLocalActivationRequest, String> {
         let private = self.private_root(app)?;
-        Ok(SyncLocalActivationRequest {
+        Ok(self.activation_request_at(&private))
+    }
+
+    fn activation_request_at(&self, private: &Path) -> SyncLocalActivationRequest {
+        SyncLocalActivationRequest {
             graph_root: PathBuf::from(&self.graph_root),
             archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
@@ -170,7 +178,7 @@ impl SparseV2ActivationRecord {
                 preparation_id: self.preparation_id,
                 session_id: self.activation_session_id,
             },
-        })
+        }
     }
 }
 
@@ -604,6 +612,54 @@ impl SparseV2Binding {
             .as_ref()
             .and_then(|handle| handle.status().ok())
             .is_some_and(|snapshot| runtime_lifecycle_admits_application_pages(&snapshot.lifecycle))
+    }
+
+    /// Explain why this binding cannot be published as the application's page
+    /// authority. Core open returns typed status separately from its optional
+    /// actor handle; collapsing those two facts into a GraphSlot used to hide
+    /// the real OpenRefused/Retryable detail behind SPARSE_V2_NOT_ACTIVE.
+    pub(crate) fn serving_failure_detail(&self) -> Option<String> {
+        if let Some(handle) = &self.handle {
+            return match handle.status() {
+                Ok(snapshot) if runtime_lifecycle_admits_application_pages(&snapshot.lifecycle) => {
+                    None
+                }
+                Ok(snapshot) => Some(snapshot.detail.unwrap_or_else(|| {
+                    format!(
+                        "managed storage runtime is not serving pages (lifecycle: {:?})",
+                        snapshot.lifecycle
+                    )
+                })),
+                Err(error) => Some(format!("managed storage runtime status failed: {error}")),
+            };
+        }
+        Some(match &self.availability {
+            SparseV2Availability::Retryable { detail, .. } => detail.clone(),
+            SparseV2Availability::Blocked {
+                reason_code,
+                scenario_id,
+            } => format!(
+                "managed storage open was blocked (reason code: {reason_code}; scenario: {scenario_id})"
+            ),
+            SparseV2Availability::Refused {
+                reason_code,
+                scenario_id,
+                detail,
+            } => detail.clone().unwrap_or_else(|| {
+                format!(
+                    "managed storage open was refused (reason code: {reason_code}; scenario: {scenario_id})"
+                )
+            }),
+            SparseV2Availability::LegacyDefault => {
+                "managed storage setup is not present for this graph".into()
+            }
+            SparseV2Availability::Joinable { .. } => {
+                "managed storage must be joined before it can serve pages".into()
+            }
+            SparseV2Availability::Active => {
+                "managed storage open reported active without a serving actor".into()
+            }
+        })
     }
 
     /// A managed binding with no live actor, for tests that only need the slot
@@ -1215,19 +1271,32 @@ impl SyncRuntimeFacade {
             }
         }
         let private = sparse_private_root(app, graph_root)?;
-        if std::fs::symlink_metadata(&private).is_ok() {
-            let recovery = sparse_recovery_root(app)?;
-            archive_private_root(&private, &recovery).map_err(|error| {
-                format!(
-                    "Couldn't quarantine prior unpublished managed-storage candidate before fresh activation: {error}"
-                )
-            })?;
-        }
-        Ok(SparseV2ActivationRecord::new(
+        let recovery = sparse_recovery_root(app)?;
+        let record = SparseV2ActivationRecord::new(
             graph_root,
             graph_meta,
             DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
-        ))
+        );
+        prepare_fresh_authority_at_paths(&private, &recovery, record, "fresh activation")
+    }
+
+    pub(crate) fn prepare_shared_binding_record(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+        graph_meta: GraphMeta,
+        descriptor: &SyncSharedEnrollmentDescriptor,
+    ) -> Result<SparseV2ActivationRecord, String> {
+        let private = sparse_private_root(app, graph_root)?;
+        let recovery = sparse_recovery_root(app)?;
+        prepare_shared_binding_record_at_paths(
+            &private,
+            &recovery,
+            graph_root,
+            graph_meta,
+            DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
+            descriptor,
+        )
     }
 
     pub(crate) fn persist_binding_record(
@@ -2289,6 +2358,33 @@ fn archive_private_root(
     Ok(Some(destination))
 }
 
+fn prepare_shared_binding_record_at_paths(
+    private_root: &Path,
+    recovery_root: &Path,
+    graph_root: &Path,
+    graph_meta: GraphMeta,
+    device_id: DeviceId,
+    descriptor: &SyncSharedEnrollmentDescriptor,
+) -> Result<SparseV2ActivationRecord, String> {
+    let record =
+        SparseV2ActivationRecord::from_shared(graph_root, graph_meta, device_id, descriptor);
+    prepare_fresh_authority_at_paths(private_root, recovery_root, record, "shared-graph join")
+}
+
+fn prepare_fresh_authority_at_paths(
+    private_root: &Path,
+    recovery_root: &Path,
+    record: SparseV2ActivationRecord,
+    operation: &str,
+) -> Result<SparseV2ActivationRecord, String> {
+    archive_private_root(private_root, recovery_root).map_err(|error| {
+        format!(
+            "Couldn't quarantine prior unselected managed-storage state before {operation}: {error}"
+        )
+    })?;
+    Ok(record)
+}
+
 #[derive(Debug)]
 enum ProviderNamespaceArchive {
     Absent,
@@ -3292,12 +3388,12 @@ fn prepare_sparse_v2_join(
     let graph_meta = graph.meta();
     let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
-    let record = SparseV2ActivationRecord::from_shared(
+    let record = state.sync_runtime.prepare_shared_binding_record(
+        app,
         &slot.root_key,
         graph_meta.clone(),
-        DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
         &descriptor,
-    );
+    )?;
 
     let activated = activate_record_with_diagnostics(
         &state.sync_runtime,
@@ -4647,6 +4743,21 @@ mod tests {
         let retained_branch = join
             .find("if slot.sparse_binding().is_some()")
             .expect("already-managed join branch");
+        let direct_branch = join
+            .find("let graph = slot.legacy_graph()?;")
+            .expect("Direct Files join branch");
+        let direct = &join[direct_branch..];
+        let archive_predecessor = direct
+            .find("prepare_shared_binding_record(")
+            .expect("Direct Files join must prepare a fresh descriptor-bound private root");
+        let bootstrap = direct
+            .find("activate_record_with_diagnostics(")
+            .expect("Direct Files join bootstrap");
+        assert!(archive_predecessor < bootstrap);
+        assert!(
+            !direct.contains("SparseV2ActivationRecord::from_shared("),
+            "the production join path must not construct shared identities without first archiving unselected private state"
+        );
         let retained = &join[retained_branch..];
         let join_cut = retained.find(".join_shared(").expect("join cut");
         let join_reopen = retained
@@ -5406,6 +5517,20 @@ mod tests {
     }
 
     #[test]
+    fn retryable_open_binding_preserves_its_real_failure_before_page_readiness() {
+        let binding = SparseV2Binding::from_open(SyncRuntimeOpenResult {
+            status: SyncRuntimeOpenStatus::OpenRefused {
+                detail: "clean managed runtime open failed: SQLite checkpoint is stale".into(),
+            },
+            handle: None,
+        });
+        assert_eq!(
+            binding.serving_failure_detail().as_deref(),
+            Some("clean managed runtime open failed: SQLite checkpoint is stale")
+        );
+    }
+
+    #[test]
     fn transition_status_keeps_archive_and_direct_escape_available_with_warnings() {
         let local = RollbackFixture::new(Some("shadow_import"));
         let local_status = sparse_v2_status_for_slot(&local.slot).unwrap();
@@ -6013,7 +6138,9 @@ mod tests {
             start_of_week: 6,
             block_hidden_properties: Vec::new(),
             default_journal_template: None,
+            default_home: None,
             favorites: Vec::new(),
+            favorites_page: None,
             journal_page_title_format: "MMM do, yyyy".into(),
             journal_file_name_format: "yyyy_MM_dd".into(),
             preferred_format: "md".into(),
@@ -6066,6 +6193,162 @@ mod tests {
         publish_direct_selection_at(&direct, &graph, "publication rollback").unwrap();
         assert!(direct_selection_is_active_at(&direct, &graph).unwrap());
         assert!(read_binding_at(&binding, &graph).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Set `TINE_SYNC_JOIN_RETAINED_AUTHORITY_GRAPH` to a read-only graph
+    /// corpus to run this same journey at real graph scale. Both participants
+    /// are copied before activation; the source corpus is never opened for
+    /// writes.
+    #[test]
+    fn direct_join_archives_a_retained_different_authority_before_local_active() {
+        std::thread::Builder::new()
+            .name("tine-direct-join-retained-authority-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(direct_join_archives_a_retained_different_authority_before_local_active_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn direct_join_archives_a_retained_different_authority_before_local_active_inner() {
+        fn settle_initial_feed(handle: &SyncRuntimeHandle) {
+            for _ in 0..128 {
+                let status = handle.status().unwrap();
+                if !status.watcher.pending && status.provider_pending == 0 {
+                    return;
+                }
+                handle.tick().unwrap();
+            }
+            panic!("managed activation did not settle its initial feed");
+        }
+
+        fn copy_tree(source: &Path, destination: &Path) {
+            std::fs::create_dir_all(destination).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "tine-direct-join-retained-authority-{}",
+            Uuid::new_v4()
+        ));
+        let initiator_graph = root.join("initiator-graph");
+        let joiner_graph = root.join("joiner-graph");
+        let initiator_private = root.join("initiator-private");
+        let joiner_private = root.join("joiner-private");
+        let recovery_root = root.join("recovery");
+        let real_graph =
+            std::env::var_os("TINE_SYNC_JOIN_RETAINED_AUTHORITY_GRAPH").map(PathBuf::from);
+        for graph in [&initiator_graph, &joiner_graph] {
+            if let Some(source) = &real_graph {
+                copy_tree(source, graph);
+                let inherited_managed = graph.join(".tine-sync");
+                if inherited_managed.exists() {
+                    std::fs::remove_dir_all(inherited_managed).unwrap();
+                }
+            }
+            std::fs::create_dir_all(graph.join("pages")).unwrap();
+            std::fs::create_dir_all(graph.join("journals")).unwrap();
+            std::fs::write(
+                graph.join("pages/shared.md"),
+                b"- byte-identical shared outline\n",
+            )
+            .unwrap();
+        }
+
+        let initiator_record = SparseV2ActivationRecord::new(
+            &initiator_graph,
+            Graph::open(&initiator_graph).meta(),
+            DeviceId::new(),
+        );
+        let initiator = SyncRuntimeHandle::activate_or_resume_local(
+            initiator_record.activation_request_at(&initiator_private),
+        );
+        assert_eq!(initiator.status, SyncLocalActivationStatus::Active);
+        let initiator = initiator.handle.unwrap();
+        settle_initial_feed(&initiator);
+        let descriptor = initiator.prepare_shared().unwrap();
+
+        let old_record = SparseV2ActivationRecord::new(
+            &joiner_graph,
+            Graph::open(&joiner_graph).meta(),
+            DeviceId::new(),
+        );
+        let old_request = old_record.activation_request_at(&joiner_private);
+        let old = SyncRuntimeHandle::activate_or_resume_local(old_request.clone());
+        assert_eq!(old.status, SyncLocalActivationStatus::Active);
+        let old = old.handle.unwrap();
+        settle_initial_feed(&old);
+        assert!(matches!(
+            old.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(old);
+        persist_binding_at(&joiner_private.join(SPARSE_BINDING_FILE), &old_record).unwrap();
+        std::fs::write(
+            joiner_private.join("retained-diagnostic-bytes"),
+            b"preserve this predecessor exactly",
+        )
+        .unwrap();
+        let predecessor = snapshot_tree(&joiner_private);
+
+        copy_tree(
+            &initiator_graph.join(".tine-sync/v2/shared"),
+            &joiner_graph.join(".tine-sync/v2/shared"),
+        );
+        let joined_record = prepare_shared_binding_record_at_paths(
+            &joiner_private,
+            &recovery_root,
+            &joiner_graph,
+            Graph::open(&joiner_graph).meta(),
+            DeviceId::new(),
+            &descriptor,
+        )
+        .unwrap();
+        let joined_request = joined_record.activation_request_at(&joiner_private);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(joined_request.clone());
+        let activated = SparseV2Binding::from_activation(activated);
+        assert!(
+            matches!(activated.availability(), SparseV2Availability::Active),
+            "a Direct Files join must not try to reopen the retained different catalog authority: {:?}",
+            activated.availability()
+        );
+        let joined = activated.handle().unwrap().clone();
+        settle_initial_feed(&joined);
+        joined.join_shared(descriptor).unwrap();
+        drop(joined);
+
+        let reopened = SyncRuntimeHandle::open(joined_record.open_request_at(&joiner_private));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.unwrap();
+        assert_eq!(
+            reopened.status().unwrap().shared_role,
+            Some(SyncSharedRole::Joiner)
+        );
+        assert!(matches!(
+            reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        assert!(!joiner_private.join("retained-diagnostic-bytes").exists());
+        let archives = std::fs::read_dir(&recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(snapshot_tree(&archives[0]), predecessor);
+        assert_eq!(
+            std::fs::read(joiner_graph.join("pages/shared.md")).unwrap(),
+            b"- byte-identical shared outline\n"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

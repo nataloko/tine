@@ -1,5 +1,8 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::{AppState, GraphSlot, LegacyGraphLease};
+use crate::state::{
+    refresh_graph_for_label, slot_for_window, AppState, GraphSlot, LegacyGraphLease,
+    RefreshLaneWait, RefreshOutcome,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,6 +117,11 @@ struct SparseV2ErrorEvent {
 struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
+    /// Candidate `logseq/config.edn` paths. Configuration is not graph text --
+    /// `incremental_page_paths` discards it a few lines below, which is why an
+    /// external config edit was invisible until the next graph open -- so it
+    /// needs its own queue rather than a place in `paths`.
+    config_paths: HashSet<PathBuf>,
     /// Highest raw-callback frontier admitted into this pending batch for each
     /// Direct graph root. The callback records this while holding the same
     /// mutex used to add its notify event, so a drained batch can never
@@ -147,6 +155,13 @@ impl Pending {
 
     fn add_event(&mut self, event: notify::Event) {
         self.note_event_arrival();
+        for path in event
+            .paths
+            .iter()
+            .filter(|path| path_is_config_file_name(path))
+        {
+            self.config_paths.insert(path.clone());
+        }
         if event.need_rescan() {
             if event.paths.is_empty() {
                 self.need_full = true;
@@ -236,6 +251,21 @@ pub(crate) struct WatcherLatencyReceipt {
     /// Reconcile start → last `graph-changed` emitted (read + parse + emit).
     reconcile_ms: u64,
     /// First notify callback → last emit; the number GH #337 reports as 5–20 s.
+    event_to_emit_ms: Option<u64>,
+}
+
+/// Report form of a watcher receipt. Graph labels are deliberately omitted:
+/// they can contain a user-chosen graph name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WatcherDiagnosticReceipt {
+    mode: &'static str,
+    pages: usize,
+    event_paths: usize,
+    full_diff: bool,
+    errors: usize,
+    event_to_reconcile_ms: Option<u64>,
+    reconcile_ms: u64,
     event_to_emit_ms: Option<u64>,
 }
 
@@ -350,9 +380,39 @@ fn record_latency_receipt(mut receipt: WatcherLatencyReceipt) {
         receipt.reconcile_ms,
         stage(receipt.event_to_emit_ms),
     ));
+    crate::debug::record_watcher_latency(
+        receipt.mode,
+        u64::try_from(receipt.pages).unwrap_or(u64::MAX),
+        u64::try_from(receipt.event_paths).unwrap_or(u64::MAX),
+        receipt.full_diff,
+        u64::try_from(receipt.errors).unwrap_or(u64::MAX),
+        receipt.event_to_reconcile_ms,
+        receipt.reconcile_ms,
+        receipt.event_to_emit_ms,
+    );
     if let Ok(mut ring) = latency_receipts().lock() {
         push_latency_receipt(&mut ring, receipt);
     }
+}
+
+pub(crate) fn diagnostic_latency_snapshot() -> Vec<WatcherDiagnosticReceipt> {
+    latency_receipts()
+        .lock()
+        .map(|ring| {
+            ring.iter()
+                .map(|receipt| WatcherDiagnosticReceipt {
+                    mode: receipt.mode,
+                    pages: receipt.pages,
+                    event_paths: receipt.event_paths,
+                    full_diff: receipt.full_diff,
+                    errors: receipt.errors,
+                    event_to_reconcile_ms: receipt.event_to_reconcile_ms,
+                    reconcile_ms: receipt.reconcile_ms,
+                    event_to_emit_ms: receipt.event_to_emit_ms,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Debug command for bug reports: the last 64 external-change latency receipts,
@@ -461,6 +521,22 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
     let Some(mut stem) = name.strip_suffix(".tmp") else {
         return false;
     };
+    // Backup-restore publishes page files into the live graph through
+    // `.tine-restore-{pid}-{seq}.tmp` temps (`backup.rs::atomic_copy_new_into_live`).
+    // Recognize that shape too, or a rename event pairing such a temp with a
+    // page path is dropped and the restored page never queued — previously
+    // masked only by an unrelated `refresh_graph` call after restore (DUP-5).
+    if let Some(rest) = stem.strip_prefix(".tine-restore-") {
+        if let Some((pid, seq)) = rest.split_once('-') {
+            if !pid.is_empty()
+                && !seq.is_empty()
+                && pid.chars().all(|value| value.is_ascii_digit())
+                && seq.chars().all(|value| value.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
     if let Some(without_projection) = stem.strip_suffix(".projection") {
         stem = without_projection;
     }
@@ -537,6 +613,18 @@ fn watch_event_is_tool_noise(event: &notify::Event, roots: &HashSet<PathBuf>) ->
         .paths
         .iter()
         .all(|path| roots.iter().any(|root| path_is_tool_noise(root, path)))
+}
+
+/// A watch event path that *might* be some graph's `logseq/config.edn`.
+///
+/// Only the filename, deliberately: which graph owns it -- and whether it sits
+/// at the one graph-relative location that counts -- is
+/// `tine_core::model::is_config_file_path`'s decision, made per root when the
+/// batch drains. This is the cheap gate that keeps the pending set small.
+fn path_is_config_file_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("config.edn"))
 }
 
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
@@ -1007,6 +1095,100 @@ fn reconcile_pending(
     }
 }
 
+/// Re-read `logseq/config.edn` for the graphs an event named, and refresh any
+/// whose configuration actually moved.
+///
+/// A separate pass rather than a branch inside the reconcile loops, because
+/// configuration is not graph text: it is the same plain file under both
+/// storage engines -- never in `GraphTextScope`, never in the oplog, never
+/// projected -- so one pass serves Direct and managed alike.
+///
+/// Returns true when a refresh was deferred and wants another cycle.
+fn refresh_changed_configs(
+    app: &tauri::AppHandle,
+    labels_by_root: &[(String, PathBuf)],
+    config_paths: &HashSet<PathBuf>,
+    check_all: bool,
+    recheck: &mut HashSet<String>,
+    seen: &mut HashMap<PathBuf, Option<tine_core::model::ConfigDescription>>,
+) -> bool {
+    let mut deferred = false;
+    let state = app.state::<AppState>();
+    for (label, root) in labels_by_root {
+        let named = check_all
+            || recheck.contains(label)
+            || config_paths
+                .iter()
+                .any(|path| tine_core::model::is_config_file_path(root, path));
+        if !named {
+            continue;
+        }
+        recheck.remove(label);
+        let Ok(slot) = slot_for_window(&state, label) else {
+            continue;
+        };
+        // A Direct graph carries a digest of the exact bytes it was opened
+        // with, so this costs nothing after Tine's own settings write: that
+        // command already refreshed the slot, and the reopened graph matches
+        // disk. Skipping here is what keeps a settings toggle from paying for
+        // a second whole-graph reopen -- which discards every cache the graph
+        // has built.
+        //
+        // A managed slot retains no `Graph` to ask. Its refresh is a meta-only
+        // reopen with no cache to lose, so it re-reads unconditionally and lets
+        // the meta comparison below decide whether anything is worth announcing.
+        let disk = tine_core::model::config_file_description(root);
+        if slot.is_sparse_v2() {
+            // A managed slot retains no `Graph` to interrogate, so the watcher
+            // remembers the configuration it last saw for that root. Without
+            // this, poll mode — which cannot name paths and therefore rechecks
+            // every graph every cycle — would reopen a derived view every three
+            // seconds forever.
+            if seen.get(root).copied() == Some(disk) {
+                continue;
+            }
+            seen.insert(root.clone(), disk);
+        } else {
+            let unchanged = slot.legacy_graph().is_ok_and(|lease| {
+                // Either the graph was opened with these exact bytes, or it
+                // published them itself. The second case is what keeps a star
+                // toggled in the sidebar from reading as an outside change.
+                lease.open_config_description() == disk || lease.recent_config_write() == disk
+            });
+            if unchanged {
+                continue;
+            }
+        }
+        let before = slot.graph_meta();
+        drop(slot);
+        match refresh_graph_for_label(&state, app, label, RefreshLaneWait::TryOnce) {
+            Ok(RefreshOutcome::Deferred) => {
+                recheck.insert(label.clone());
+                deferred = true;
+            }
+            Ok(RefreshOutcome::Refreshed) => {
+                let Ok(slot) = slot_for_window(&state, label) else {
+                    continue;
+                };
+                let after = slot.graph_meta();
+                // A rewrite that changed no setting we surface -- Logseq
+                // touching an unrelated key, Syncthing redelivering identical
+                // bytes with a new mtime -- announces nothing.
+                if after != before {
+                    let _ = app.emit_to(label, "graph-config-changed", after);
+                }
+            }
+            Err(message) => {
+                // Not silent: until this succeeds the window is serving stale
+                // configuration, which is exactly the failure this whole pass
+                // exists to prevent.
+                let _ = app.emit_to(label, "graph-watch-error", &message);
+            }
+        }
+    }
+    deferred
+}
+
 /// Which pending event paths this graph should reconcile incrementally.
 ///
 /// The predicate is the core's graph-wide text scope, not `journals/` +
@@ -1204,29 +1386,38 @@ fn observe_legacy_graph_text_event(
     if !observation.relevant {
         return false;
     }
-    // The raw platform callback is only an admission barrier. Reading and
-    // semantically parsing an exact path here defeated debounce: reconciliation
-    // read/parsed the same final file again 200 ms later, and a burst paid once
-    // per raw event before bulk coalescing even began. A relevant text event
-    // publishes an O(1) pending epoch so name-only creation refuses during the
-    // debounce window. Only genuinely ambiguous events invalidate the retained
-    // identity index; exact events remain eligible for one exact-path update by
-    // the debounced reconciler.
+    // The raw platform callback is normally only an admission barrier. Reading
+    // and semantically parsing arbitrary exact paths here defeated debounce, so
+    // external paths still publish one O(1) pending epoch and are read/parsed by
+    // the debounced reconciler. The one bounded exception is a candidate echo of
+    // a completed Tine publication: core reopens that exact path twice under the
+    // writer's identity + page locks and requires both its content revision and
+    // physical identity to match Tine's publication receipt (or the identical
+    // already-admitted cache state). Windows can emit Create(Any), Modify(Any)
+    // and rename for one atomic publication; none of those self echoes should
+    // strand the next new page. Any mismatch remains an external observation.
+    // Only genuinely ambiguous events invalidate the retained identity index.
     if observation.uncertain {
         graph.note_graph_text_external_observation();
         let _ = graph.observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
     } else if !observation.exact_paths.is_empty() {
-        graph.note_graph_text_external_observation();
+        let all_match_tine = observation
+            .exact_paths
+            .iter()
+            .all(|path| graph.exact_graph_text_event_matches_tine_state(path));
+        if !all_match_tine {
+            graph.note_graph_text_external_observation();
+        }
     }
     true
 }
 
 /// Linearize a platform callback with guarded graph-text writes before the
-/// watcher's debounce/reconciliation delay. The callback performs no content
-/// I/O: it publishes an admission epoch (and invalidates retained identity only
-/// when the event is ambiguous) under the same resource-scoped mutation
-/// authority that `Graph::save_page` uses. Debounced reconciliation captures
-/// each final path once.
+/// watcher's debounce/reconciliation delay. External callbacks publish an
+/// admission epoch (and invalidate retained identity only when ambiguous) under
+/// the same resource-scoped mutation authority that `Graph::save_page` uses.
+/// Exact candidates for a Tine self echo take a bounded two-open identity+bytes
+/// proof; debounced reconciliation still captures each final path once.
 fn observe_legacy_graph_text_callback(
     app: &tauri::AppHandle,
     event: Option<&notify::Event>,
@@ -1557,6 +1748,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
         let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
+        // Windows whose configuration still needs re-reading: named by an event
+        // this cycle could not act on because the storage transition lane was
+        // busy. Carried across cycles so a deferral cannot lose the change.
+        let mut config_recheck: HashSet<String> = HashSet::new();
+        // Last configuration seen per MANAGED root. Direct graphs need no such
+        // memory: their own `Graph` instance is the witness.
+        let mut config_seen: HashMap<PathBuf, Option<tine_core::model::ConfigDescription>> =
+            HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
         // Last surfaced `watch()` failure per graph root, so a root that keeps
@@ -1739,6 +1938,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let (
                 paths,
                 full_paths,
+                config_paths,
                 drained_observation_epochs,
                 event_need_full,
                 notify_error,
@@ -1747,6 +1947,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
+                    let config_paths = std::mem::take(&mut p.config_paths);
                     let observation_epochs = p.take_legacy_observation_epochs();
                     let need_full = p.need_full;
                     let notify_error = p.notify_error;
@@ -1756,6 +1957,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     (
                         paths,
                         full_paths,
+                        config_paths,
                         observation_epochs,
                         need_full,
                         notify_error,
@@ -1763,6 +1965,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     )
                 } else {
                     (
+                        HashSet::new(),
                         HashSet::new(),
                         HashSet::new(),
                         HashMap::new(),
@@ -1773,6 +1976,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
             } else {
                 (
+                    HashSet::new(),
                     HashSet::new(),
                     HashSet::new(),
                     HashMap::new(),
@@ -2096,6 +2300,24 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // finished the requested full pass and all ordinary change events
             // were emitted before this completion marker. The frontend still
             // waits for its asynchronous handlers before admitting edits.
+            // Configuration, for every graph this cycle could have touched. A
+            // kernel rescan or notify error carries no usable paths, and poll
+            // mode has none at all, so both re-check every graph -- one file
+            // read and one digest each, against a stat scan they already pay.
+            if refresh_changed_configs(
+                &app,
+                &labels_by_root,
+                &config_paths,
+                event_need_full || notify_error || !inotify,
+                &mut config_recheck,
+                &mut config_seen,
+            ) {
+                // A deferral means the lane was busy, not that the change went
+                // away. Wake again; the 200 ms coalescing sleep below bounds
+                // how fast this can retry while a transition holds the lane.
+                let _ = tx.send(());
+            }
+
             if let Some(sequence) = explicit_rescan {
                 complete_full_rescan(&app, sequence);
             }
@@ -2380,6 +2602,132 @@ mod tests {
         assert!(graph_dir
             .path("pages/Creation After Windows Event.md")
             .exists());
+    }
+
+    /// GH #374 negative follow-up to #366. Windows reports the atomic
+    /// publication of Tine's own new journal as an exact graph-text event. That
+    /// echo must not raise the external-change admission frontier and strand the
+    /// next new page before the debounced reconciler sees the journal bytes.
+    #[test]
+    fn windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
+
+        let cases = [
+            (
+                "journal-page",
+                new_journal("Aug 25th, 2026"),
+                new_page("20260825100915"),
+            ),
+            ("page-page-unicode", new_page("第一页"), new_page("第二页")),
+            (
+                "page-journal",
+                new_page("Before Journal"),
+                new_journal("Aug 24th, 2026"),
+            ),
+        ];
+        for (case, first, second) in cases {
+            let graph_dir = TempGraph::new(&format!("windows-owned-{case}"));
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
+
+            graph.save_page(&first, None).unwrap();
+            let first_path = graph
+                .find_entry(&first.name, first.kind)
+                .expect("created first entry")
+                .path;
+            let before = graph.graph_text_external_observation_ticket();
+            // ReadDirectoryChangesW can surface several exact shapes for the
+            // one atomic publication before (and occasionally just after) the
+            // debounce pass. Every one must validate the same exact receipt.
+            for kind in [
+                EventKind::Create(CreateKind::Any),
+                EventKind::Modify(ModifyKind::Any),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            ] {
+                let paths = if matches!(&kind, EventKind::Modify(ModifyKind::Name(_))) {
+                    let filename = first_path.file_name().unwrap().to_string_lossy();
+                    vec![
+                        first_path.with_file_name(format!(".{filename}.123.7.projection.tmp")),
+                        first_path.clone(),
+                    ]
+                } else {
+                    vec![first_path.clone()]
+                };
+                assert!(observe_legacy_graph_text_event(
+                    &graph,
+                    &graph_dir.root,
+                    Some(&event(kind, paths)),
+                ));
+                assert_eq!(
+                    graph.graph_text_external_observation_ticket(),
+                    before,
+                    "{case}: Tine's exact publication echo must not become an external frontier"
+                );
+            }
+            graph
+                .sync_file_checked(&first_path)
+                .expect("debounced self-write reconciliation");
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
+            ));
+            assert_eq!(
+                graph.graph_text_external_observation_ticket(),
+                before,
+                "{case}: a delayed duplicate matching the admitted cache state remains a no-op"
+            );
+
+            graph
+                .save_page(&second, None)
+                .unwrap_or_else(|error| panic!("{case}: following creation failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn windows_external_replacement_of_tine_publication_keeps_creation_blocked() {
+        use notify::event::{EventKind, ModifyKind};
+
+        for same_bytes in [false, true] {
+            let graph_dir = TempGraph::new(if same_bytes {
+                "windows-external-same-bytes-new-identity"
+            } else {
+                "windows-external-different-bytes"
+            });
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
+            let first = new_page("First Publication");
+            graph.save_page(&first, None).unwrap();
+            let first_path = graph
+                .find_entry(&first.name, first.kind)
+                .expect("created page entry")
+                .path;
+            if same_bytes {
+                let bytes = std::fs::read(&first_path).unwrap();
+                let replacement = graph_dir.path("external-winner.tmp");
+                std::fs::write(&replacement, bytes).unwrap();
+                std::fs::remove_file(&first_path).unwrap();
+                std::fs::rename(replacement, &first_path).unwrap();
+            } else {
+                std::fs::write(&first_path, "- external winner\n").unwrap();
+            }
+
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
+            ));
+            assert_new_page_waits_for_reconciliation(
+                &graph,
+                if same_bytes {
+                    "Blocked By New Physical Owner"
+                } else {
+                    "Blocked By Different External Bytes"
+                },
+            );
+        }
     }
 
     #[test]
@@ -3382,6 +3730,53 @@ mod tests {
         }
     }
 
+    /// Configuration is deliberately not graph text, so `incremental_page_paths`
+    /// throws it away — which is exactly why an outside edit to `config.edn` was
+    /// invisible until the next graph open. It has to be queued separately, for
+    /// every shape a writer can produce: an in-place write, and the temp+rename
+    /// that Tine, Logseq and Syncthing all actually use.
+    #[test]
+    fn a_config_edn_write_is_queued_even_though_it_is_not_graph_text() {
+        use notify::event::{CreateKind, DataChange, EventKind, ModifyKind, RenameMode};
+        let config = PathBuf::from("/graph/logseq/config.edn");
+
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Create(CreateKind::File),
+        ] {
+            let mut pending = Pending::default();
+            pending.add_event(event(kind, vec![config.clone()]));
+            assert!(
+                pending.paths.is_empty(),
+                "{kind:?}: configuration is not graph text and must not enter the page queue"
+            );
+            assert!(
+                pending.config_paths.contains(&config),
+                "{kind:?}: but it must reach the configuration queue"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_page_write_queues_no_configuration_work() {
+        use notify::event::{DataChange, EventKind, ModifyKind};
+        let mut pending = Pending::default();
+        pending.add_event(event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            vec![PathBuf::from("/graph/pages/Alpha.md")],
+        ));
+        assert!(pending.config_paths.is_empty());
+        // And an unrelated EDN file is not configuration either. The filename
+        // gate is cheap and rough; `is_config_file_path` is the decision.
+        let mut pending = Pending::default();
+        pending.add_event(event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            vec![PathBuf::from("/graph/logseq/pages-metadata.edn")],
+        ));
+        assert!(pending.config_paths.is_empty());
+    }
+
     fn new_page(name: &str) -> PageDto {
         PageDto {
             activation: None,
@@ -3400,6 +3795,12 @@ mod tests {
             path: String::new(),
             guide: false,
         }
+    }
+
+    fn new_journal(name: &str) -> PageDto {
+        let mut page = new_page(name);
+        page.kind = PageKind::Journal;
+        page
     }
 
     /// Warm the parsed page cache and exercise one ordinary Direct save. This
@@ -4565,5 +4966,35 @@ mod tests {
         assert_eq!(full_snap, fresh);
         assert_eq!(inc_conflicts_dirty, full_conflicts_dirty);
         assert_eq!(sorted_changes(inc_changes), sorted_changes(full_changes));
+    }
+
+    /// DUP-5: every temp shape a Tine writer can rename INTO the live graph
+    /// must be recognized here, or the rename event that publishes the real
+    /// page is dropped. The restore shape was invisible until 2026-08-25.
+    #[test]
+    fn recognizes_every_tine_temp_shape_that_lands_in_the_live_graph() {
+        for recognized in [
+            ".Foo.md.1234.7.tmp",
+            ".Foo.md.1234.7.new.tmp",
+            ".Foo.md.1234.7.projection.tmp",
+            ".tine-restore-1234-7.tmp",
+        ] {
+            assert!(
+                is_tine_atomic_page_temp_path(Path::new(recognized)),
+                "{recognized} must be recognized as a Tine atomic temp"
+            );
+        }
+        for foreign in [
+            ".tine-restore-x.tmp",
+            ".tine-restore-12.tmp",
+            "tine-restore-1234-7.tmp",
+            ".Foo.md.restore.tmp",
+            "Foo.md",
+        ] {
+            assert!(
+                !is_tine_atomic_page_temp_path(Path::new(foreign)),
+                "{foreign} must NOT read as a Tine atomic temp"
+            );
+        }
     }
 }

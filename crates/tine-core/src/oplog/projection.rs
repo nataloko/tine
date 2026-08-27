@@ -2039,10 +2039,16 @@ fn execute_manifested_projection_work_located(
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
     if let Some(target) = target {
+        let claim_source = projection_phase!(
+            "uuid_claim_source",
+            projection
+                .materialized_read()
+                .map_err(|error| ProjectionError::Work(error.to_string()))
+        )?;
         let current = projection_phase!(
             "authorize_write",
             engine
-                .authorize_clean_accepted_projection_write(work.page_id())
+                .authorize_clean_accepted_projection_write(work.page_id(), &claim_source)
                 .map_err(ProjectionError::Engine)
         )?;
         let replay = projection_phase!(
@@ -2857,22 +2863,19 @@ impl ValidatedForest {
 
 fn sort_siblings(
     blocks: &[MaterializedBlock],
-    parent: Option<BlockId>,
+    _parent: Option<BlockId>,
     siblings: &mut [usize],
 ) -> Result<(), ProjectionError> {
+    // Concurrent inserts can legitimately choose the same positional order
+    // key before either device has observed the other. Block identity is the
+    // stable CRDT tie-breaker, matching hot-engine materialization. The prior
+    // uniqueness refusal made that valid merged state impossible to project,
+    // which in turn prevented the conflict resolver from authoring the
+    // semantic operation that removes a projection echo.
     siblings.sort_unstable_by(|left, right| {
         (&blocks[*left].order, blocks[*left].block_id)
             .cmp(&(&blocks[*right].order, blocks[*right].block_id))
     });
-    if let Some(pair) = siblings
-        .windows(2)
-        .find(|pair| blocks[pair[0]].order == blocks[pair[1]].order)
-    {
-        return Err(ProjectionError::DuplicateSiblingOrder {
-            parent,
-            order: blocks[pair[0]].order.clone(),
-        });
-    }
     Ok(())
 }
 
@@ -3271,10 +3274,6 @@ pub enum ProjectionError {
     },
     CyclicTree(BlockId),
     EmptyOrder(BlockId),
-    DuplicateSiblingOrder {
-        parent: Option<BlockId>,
-        order: String,
-    },
     DuplicateLogseqClaim(LogseqUuid),
     AmbiguousRawLogseqId(LogseqUuid),
     InconsistentLogseqIdentityOrigin(BlockId),
@@ -3316,9 +3315,6 @@ impl fmt::Display for ProjectionError {
             }
             Self::CyclicTree(block) => write!(f, "materialized hierarchy cycles at {block}"),
             Self::EmptyOrder(block) => write!(f, "block {block} has an empty order key"),
-            Self::DuplicateSiblingOrder { parent, order } => {
-                write!(f, "duplicate sibling order {order:?} below {parent:?}")
-            }
             Self::DuplicateLogseqClaim(uuid) => {
                 write!(f, "duplicate materialized Logseq UUID claim {uuid}")
             }

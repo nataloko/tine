@@ -1521,6 +1521,12 @@ pub struct ConflictPair {
     pub max_author_device: DeviceId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictSiblingRetirement {
+    pub block_id: BlockId,
+    pub expected_content: String,
+}
+
 impl ConflictPair {
     fn from_manifests(left: &OperationBatch, right: &OperationBatch) -> Self {
         let (min, max) = if left.batch_id() <= right.batch_id() {
@@ -1574,6 +1580,155 @@ pub enum ConflictResolutionIntent {
         merged_text: String,
         pair: ConflictPair,
     },
+    /// Two concurrent observations represent one semantic edit, or a later
+    /// operation on one branch reaches the other branch's exact authored
+    /// state. Replace the unauthored CRDT interleave with that one converged
+    /// text; creating a sibling here would turn a projection echo into data.
+    ConvergeText {
+        page_id: PageId,
+        block: BlockLocation,
+        content: String,
+        retire_siblings: Vec<ConflictSiblingRetirement>,
+        pair: ConflictPair,
+    },
+    /// A shared Markdown projection reached this device before the provider
+    /// operation that produced it. The external-import lane therefore gave an
+    /// unstamped new subtree fresh local identities, while the later provider
+    /// batch carried the original identities for the same exact bytes. Retire
+    /// only the externally observed duplicate roots; the ordinary local batch
+    /// remains the one semantic creation.
+    ConvergeProjectionCreate {
+        page_id: PageId,
+        retire_roots: Vec<BlockId>,
+        resolution_author_device: DeviceId,
+        pair: ConflictPair,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectionCreateShape {
+    existing_parent: Option<BlockId>,
+    order: String,
+    content: String,
+    children: Vec<ProjectionCreateShape>,
+}
+
+fn projection_effect_is_pure_create(effect: &SemanticEffect) -> bool {
+    effect.pages().is_empty()
+        && effect.page_preambles().is_empty()
+        && !effect.blocks().is_empty()
+        && effect.blocks().iter().all(|delta| {
+            delta.before.is_none()
+                && delta
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| matches!(after.owner, BlockOwner::Page(_)))
+        })
+        && effect.memberships().len() == effect.blocks().len()
+        && effect
+            .memberships()
+            .iter()
+            .all(|delta| delta.before.is_none() && delta.after.is_some())
+}
+
+fn projection_create_origins_match(x: BatchOrigin, z: BatchOrigin) -> bool {
+    matches!(
+        (x, z),
+        (
+            BatchOrigin::ExternalReconciliation { .. },
+            BatchOrigin::LocalMutation
+        ) | (
+            BatchOrigin::LocalMutation,
+            BatchOrigin::ExternalReconciliation { .. }
+        )
+    )
+}
+
+fn projection_create_forest(
+    effect: &SemanticEffect,
+    page_id: PageId,
+) -> Option<(Vec<ProjectionCreateShape>, Vec<BlockId>)> {
+    let created = effect
+        .blocks()
+        .iter()
+        .filter_map(|delta| match (&delta.before, &delta.after) {
+            (None, Some(after))
+                if after.owner == BlockOwner::Page(page_id)
+                    && after.logseq_uuid.is_none()
+                    && after.logseq_identity_origin.is_none() =>
+            {
+                Some((delta.block_id, after))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    if created.is_empty() {
+        return None;
+    }
+    let memberships = created
+        .keys()
+        .map(|block_id| {
+            let claim = effect
+                .memberships()
+                .iter()
+                .find(|delta| {
+                    delta.page_id == page_id
+                        && delta.block_id == *block_id
+                        && delta.before.is_none()
+                })?
+                .after
+                .as_ref()?;
+            Some((*block_id, claim))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    if memberships.len() != created.len() {
+        return None;
+    }
+
+    fn shape(
+        block_id: BlockId,
+        created: &BTreeMap<BlockId, &BlockState>,
+        memberships: &BTreeMap<BlockId, &MembershipClaim>,
+        visiting: &mut BTreeSet<BlockId>,
+    ) -> Option<ProjectionCreateShape> {
+        if !visiting.insert(block_id) {
+            return None;
+        }
+        let block = created.get(&block_id)?;
+        let claim = memberships.get(&block_id)?;
+        let mut children = memberships
+            .iter()
+            .filter_map(|(candidate, candidate_claim)| {
+                (candidate_claim.parent == Some(block_id)).then_some(*candidate)
+            })
+            .map(|child| shape(child, created, memberships, visiting))
+            .collect::<Option<Vec<_>>>()?;
+        visiting.remove(&block_id);
+        children.sort_unstable();
+        Some(ProjectionCreateShape {
+            existing_parent: claim.parent.filter(|parent| !created.contains_key(parent)),
+            order: claim.order.clone(),
+            content: block.content.clone(),
+            children,
+        })
+    }
+
+    let mut roots = memberships
+        .iter()
+        .filter_map(|(block_id, claim)| {
+            claim
+                .parent
+                .is_none_or(|parent| !created.contains_key(&parent))
+                .then_some(*block_id)
+        })
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+    let mut forest = roots
+        .iter()
+        .map(|root| shape(*root, &created, &memberships, &mut BTreeSet::new()))
+        .collect::<Option<Vec<_>>>()?;
+    forest.sort_unstable();
+    Some((forest, roots))
 }
 
 fn block_delta_edit_page(delta: &BlockDelta) -> Option<PageId> {
@@ -19777,13 +19932,16 @@ impl ShardedHotEngine {
     /// different page, and must not make the earlier record appear to depend
     /// on unaccepted state. The actor is single-owner, so detach only the
     /// disposable overlay for this synchronous accepted-state proof and put it
-    /// back before returning; user-visible reads never observe the gap.
+    /// back before returning; user-visible reads never observe the gap. The
+    /// exact-frontier projection remains the bounded source of baseline UUID
+    /// claimants that the index-free accepted suffix cannot reconstruct alone.
     pub(crate) fn authorize_clean_accepted_projection_write(
         &mut self,
         page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let overlay = std::mem::take(&mut self.local_overlay);
-        let result = self.authorize_projection_write_inner(page_id, None);
+        let result = self.authorize_projection_write_inner(page_id, Some(claim_source));
         self.local_overlay = overlay;
         result
     }
@@ -24367,6 +24525,127 @@ impl ShardedHotEngine {
         Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
     }
 
+    fn accepted_batch_causal_containment(
+        &self,
+        batch: &ValidatedBatch,
+    ) -> Result<AcceptedBatchCausalContainment, EngineError> {
+        self.batch_causal_containment(
+            batch.manifest().batch_id(),
+            batch.manifest().causal_dot(),
+            batch.manifest().causal_dependency_heads(),
+        )
+    }
+
+    fn equivalent_projection_create_intents(
+        &self,
+        x_batch: &ValidatedBatch,
+        x_effect: &SemanticEffect,
+        z_batch: &ValidatedBatch,
+        z_effect: &SemanticEffect,
+        pair: &ConflictPair,
+    ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
+        let (external_batch, external_effect, local_batch, local_effect) =
+            match (x_batch.manifest().origin(), z_batch.manifest().origin()) {
+                (BatchOrigin::ExternalReconciliation { .. }, BatchOrigin::LocalMutation) => {
+                    (x_batch, x_effect, z_batch, z_effect)
+                }
+                (BatchOrigin::LocalMutation, BatchOrigin::ExternalReconciliation { .. }) => {
+                    (z_batch, z_effect, x_batch, x_effect)
+                }
+                _ => return Ok(Vec::new()),
+            };
+        if !projection_effect_is_pure_create(external_effect)
+            || !projection_effect_is_pure_create(local_effect)
+        {
+            return Ok(Vec::new());
+        }
+        let external_intents =
+            self.load_accepted_projection_intents(external_batch.manifest().batch_id())?;
+        let local_intents =
+            self.load_accepted_projection_intents(local_batch.manifest().batch_id())?;
+        let mut resolutions = Vec::new();
+        for external_intent in external_intents {
+            let matching = local_intents
+                .iter()
+                .filter(|local_intent| {
+                    local_intent.page_id() == external_intent.page_id()
+                        && local_intent.path() == external_intent.path()
+                        && local_intent.target().bytes() == external_intent.target().bytes()
+                        && local_intent.target().bytes().is_some()
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                continue;
+            }
+            let page_id = external_intent.page_id();
+            let Some((external_forest, retire_roots)) =
+                projection_create_forest(external_effect, page_id)
+            else {
+                continue;
+            };
+            let Some((local_forest, _)) = projection_create_forest(local_effect, page_id) else {
+                continue;
+            };
+            if external_forest != local_forest {
+                continue;
+            }
+            let mut superseded = false;
+            for block_id in &retire_roots {
+                if self.pair_superseded_by_descendant_touch(*block_id, pair)? {
+                    superseded = true;
+                    break;
+                }
+            }
+            if superseded {
+                continue;
+            }
+            let page = match self.materialize_page(page_id) {
+                Ok(page) => page,
+                Err(EngineError::PageDeleted(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let external_created = external_effect
+                .blocks()
+                .iter()
+                .filter_map(|delta| match (&delta.before, &delta.after) {
+                    (None, Some(after)) if after.owner == BlockOwner::Page(page_id) => {
+                        Some((delta.block_id, after))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            let external_unchanged = external_created.iter().all(|(block_id, expected)| {
+                page.blocks.iter().any(|current| {
+                    current.block_id == *block_id
+                        && current.home_document_id == expected.home_document_id
+                        && current.logseq_uuid == expected.logseq_uuid
+                        && current.logseq_identity_origin == expected.logseq_identity_origin
+                        && current.content == expected.content
+                        && external_effect.memberships().iter().any(|delta| {
+                            delta.page_id == page_id
+                                && delta.block_id == *block_id
+                                && delta.after.as_ref().is_some_and(|claim| {
+                                    current.parent == claim.parent && current.order == claim.order
+                                })
+                        })
+                })
+            });
+            if !external_unchanged {
+                continue;
+            }
+            let intent = ConflictResolutionIntent::ConvergeProjectionCreate {
+                page_id,
+                retire_roots,
+                resolution_author_device: external_batch.manifest().author_device_id(),
+                pair: pair.clone(),
+            };
+            if !resolutions.contains(&intent) {
+                resolutions.push(intent);
+            }
+        }
+        Ok(resolutions)
+    }
+
     /// Derive the deterministic conflict resolutions owed after accepting
     /// `batch_id` (GH #351). Returns work only when the batch raced accepted
     /// concurrent history on the same block: edit-vs-delete and
@@ -24387,16 +24666,18 @@ impl ShardedHotEngine {
         if x_effect.blocks().is_empty() {
             return Ok(Vec::new());
         }
-        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
-        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
+        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
         let accepted = self.status().accepted_batches()?.to_vec();
         let mut intents = Vec::new();
         for candidate in accepted {
             let z_id = candidate.batch_id;
-            if z_id == batch_id || x_ancestry.contains_key(&z_id) {
+            if z_id == batch_id {
                 continue;
             }
             let z_batch = self.load_accepted_validated_batch(z_id)?;
+            if x_containment.contains(z_batch.manifest().causal_dot(), z_id) {
+                continue;
+            }
             let z_effect = self.accepted_semantic_effect(&z_batch)?;
             let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
                 .blocks()
@@ -24412,19 +24693,31 @@ impl ShardedHotEngine {
                         .map(|z_delta| (x_delta, z_delta))
                 })
                 .collect();
-            if shared.is_empty() {
+            let possible_projection_create = projection_create_origins_match(
+                x_batch.manifest().origin(),
+                z_batch.manifest().origin(),
+            ) && projection_effect_is_pure_create(&x_effect)
+                && projection_effect_is_pure_create(&z_effect);
+            if shared.is_empty() && !possible_projection_create {
                 continue;
             }
             // Batches causally after `batch_id` (an already-accepted
             // resolution, a later user action) are not concurrent with it.
-            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
-            if self
-                .collect_batch_ancestry(&z_heads, false)?
-                .contains_key(&batch_id)
-            {
+            // Keep this behind the two cheap overlap classifiers: unrelated
+            // accepted history never needs even a sparse-clock lookup.
+            let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
+            if z_containment.contains(x_batch.manifest().causal_dot(), batch_id) {
                 continue;
             }
             let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
+            if possible_projection_create {
+                intents.extend(self.equivalent_projection_create_intents(
+                    &x_batch, &x_effect, &z_batch, &z_effect, &pair,
+                )?);
+            }
+            if shared.is_empty() {
+                continue;
+            }
             for (x_delta, z_delta) in shared {
                 self.classify_block_race(
                     x_delta,
@@ -24450,6 +24743,8 @@ impl ShardedHotEngine {
         block_id: BlockId,
         pair: &ConflictPair,
     ) -> Result<bool, EngineError> {
+        let min_batch = self.load_accepted_validated_batch(pair.min_batch)?;
+        let max_batch = self.load_accepted_validated_batch(pair.max_batch)?;
         let accepted = self.status().accepted_batches()?.to_vec();
         for candidate in accepted {
             let w_id = candidate.batch_id;
@@ -24465,14 +24760,146 @@ impl ShardedHotEngine {
             {
                 continue;
             }
-            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
-            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
-            if w_ancestry.contains_key(&pair.min_batch) && w_ancestry.contains_key(&pair.max_batch)
+            let containment = self.accepted_batch_causal_containment(&w_batch)?;
+            if containment.contains(min_batch.manifest().causal_dot(), pair.min_batch)
+                && containment.contains(max_batch.manifest().causal_dot(), pair.max_batch)
             {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Find a later one-sided operation which proves that the two racing text
+    /// branches converged. This is the projection-first file-sync shape: the
+    /// projection imports the final text concurrently with an intermediate
+    /// provider operation, then the provider branch's descendant reaches that
+    /// same final state. A descendant of both sides is handled by
+    /// `pair_superseded_by_descendant_touch`; two different crossing results
+    /// remain a genuine conflict.
+    fn converged_text_by_one_sided_descendant(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+        x_after: &BlockState,
+        z_after: &BlockState,
+    ) -> Result<Option<String>, EngineError> {
+        let z_batch_id = if pair.min_batch == x_batch_id {
+            pair.max_batch
+        } else {
+            pair.min_batch
+        };
+        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
+        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
+        let mut converged = BTreeSet::new();
+        for candidate in self.status().accepted_batches()?.to_vec() {
+            let w_id = candidate.batch_id;
+            if w_id == x_batch_id || w_id == z_batch_id {
+                continue;
+            }
+            let w_batch = self.load_accepted_validated_batch(w_id)?;
+            let w_effect = self.accepted_semantic_effect(&w_batch)?;
+            let matches_x = w_effect.blocks().iter().any(|delta| {
+                delta.block_id == block_id
+                    && delta.after.as_ref().is_some_and(|after| {
+                        after.owner == x_after.owner && after.content == x_after.content
+                    })
+            });
+            let matches_z = w_effect.blocks().iter().any(|delta| {
+                delta.block_id == block_id
+                    && delta.after.as_ref().is_some_and(|after| {
+                        after.owner == z_after.owner && after.content == z_after.content
+                    })
+            });
+            if !matches_x && !matches_z {
+                continue;
+            }
+            let containment = self.accepted_batch_causal_containment(&w_batch)?;
+            let descends_x = containment.contains(x_batch.manifest().causal_dot(), x_batch_id);
+            let descends_z = containment.contains(z_batch.manifest().causal_dot(), z_batch_id);
+            if descends_x != descends_z {
+                if descends_x && matches_z {
+                    converged.insert(z_after.content.clone());
+                }
+                if descends_z && matches_x {
+                    converged.insert(x_after.content.clone());
+                }
+            }
+        }
+        if converged.len() == 1 {
+            Ok(converged.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Machine-created keep-both siblings on the branches leading to a
+    /// converged pair. The expected text is part of the retirement proof: the
+    /// runtime removes only an untouched, childless synthetic sibling.
+    fn converged_conflict_sibling_retirements(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+    ) -> Result<Vec<ConflictSiblingRetirement>, EngineError> {
+        let z_batch_id = if pair.min_batch == x_batch_id {
+            pair.max_batch
+        } else {
+            pair.min_batch
+        };
+        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
+        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
+        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
+        let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
+
+        let mut pairs = BTreeSet::from([(pair.min_batch, pair.max_batch)]);
+        for candidate in self.status().accepted_batches()?.to_vec() {
+            let ancestor_id = candidate.batch_id;
+            if ancestor_id == x_batch_id || ancestor_id == z_batch_id {
+                continue;
+            }
+            let ancestor = self.load_accepted_validated_batch(ancestor_id)?;
+            let effect = self.accepted_semantic_effect(&ancestor)?;
+            if !effect
+                .blocks()
+                .iter()
+                .any(|delta| delta.block_id == block_id && delta.after.is_some())
+            {
+                continue;
+            }
+            let in_x = x_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
+            let in_z = z_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
+            if in_x == in_z {
+                continue;
+            }
+            let other = if in_x { z_batch_id } else { x_batch_id };
+            pairs.insert(if ancestor_id < other {
+                (ancestor_id, other)
+            } else {
+                (other, ancestor_id)
+            });
+        }
+
+        let mut retirements = Vec::new();
+        for (min_batch, max_batch) in pairs {
+            let max = self.load_accepted_validated_batch(max_batch)?;
+            let effect = self.accepted_semantic_effect(&max)?;
+            let Some(expected_content) = effect
+                .blocks()
+                .iter()
+                .find(|delta| delta.block_id == block_id)
+                .and_then(|delta| delta.after.as_ref())
+                .map(|after| after.content.clone())
+            else {
+                continue;
+            };
+            retirements.push(ConflictSiblingRetirement {
+                block_id: BlockId::for_conflict_sibling(block_id, min_batch, max_batch),
+                expected_content,
+            });
+        }
+        Ok(retirements)
     }
 
     fn classify_block_race(
@@ -24604,6 +25031,29 @@ impl ShardedHotEngine {
                 let z_before = z_delta.before.as_ref().expect("edit delta has before");
                 let x_after = x_delta.after.as_ref().expect("edit delta has after");
                 let z_after = z_delta.after.as_ref().expect("edit delta has after");
+                let converged_text =
+                    if x_after.owner == z_after.owner && x_after.content == z_after.content {
+                        Some(x_after.content.clone())
+                    } else {
+                        self.converged_text_by_one_sided_descendant(
+                            block_id, pair, x_batch_id, x_after, z_after,
+                        )?
+                    };
+                if let Some(content) = converged_text {
+                    let retire_siblings =
+                        self.converged_conflict_sibling_retirements(block_id, pair, x_batch_id)?;
+                    let intent = ConflictResolutionIntent::ConvergeText {
+                        page_id: current_page,
+                        block,
+                        content,
+                        retire_siblings,
+                        pair: pair.clone(),
+                    };
+                    if !intents.contains(&intent) {
+                        intents.push(intent);
+                    }
+                    return Ok(());
+                }
                 let classification = if x_before.content == z_before.content {
                     super::text_merge::classify_concurrent_edits(
                         &x_before.content,
@@ -38347,8 +38797,8 @@ mod validation_tests {
             .expect("production half remains identifiable");
         assert_eq!(
             production.matches("collect_batch_ancestry(").count(),
-            6,
-            "five full ancestry call sites plus their definition stay confined to conflict/reconstruction paths"
+            3,
+            "two full ancestry call sites plus their definition stay confined to reconstruction paths"
         );
     }
 

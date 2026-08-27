@@ -8,19 +8,23 @@ mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
+/// Test-only: `src/backend.ts` and `tauri::generate_handler!` must name the
+/// same set of commands.
+#[cfg(test)]
+mod backend_command_parity;
 mod backup;
 mod commands;
 mod data_home;
 mod debug;
 mod git;
 mod graph;
+mod graph_verification;
 #[cfg(target_os = "ios")]
 mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
-/// Test-only: the enumeration of what every command can do under Tine-managed
-/// storage. Nothing in the shipped app reads it.
-#[cfg(test)]
+/// Enumeration of what every command can do under Tine-managed storage. The
+/// diagnostics boundary also uses it to reject invented/free-form IPC names.
 mod managed_command_surface;
 mod media_protocol;
 mod migrate_identifier;
@@ -31,6 +35,10 @@ mod settings;
 mod spellcheck;
 mod state;
 mod storage_mode_supervisor;
+/// Test-only: the storage-transition enums and their `src/types.ts` unions are
+/// one wire format written twice.
+#[cfg(test)]
+mod storage_transition_wire_parity;
 mod sync_runtime;
 mod watcher;
 
@@ -39,29 +47,34 @@ use commands::{
     activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
     block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
     close_graph_window, conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
-    durable_live_save_conflict_diff, edit_asset_external, empty_asset_trash, existing_page_names,
-    export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page, get_page_by_path,
-    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
-    journal_content_days, journal_feed_page, list_journal_conflicts,
-    list_journal_filename_migrations, list_orphan_assets, list_pages, list_sync_conflicts,
-    list_templates, list_vcs_marker_conflicts, live_save_conflict_diff, load_workspaces,
-    merge_pages, move_managed_application_subtrees, open_asset, open_page_file, open_pdf,
-    page_aliases, page_icons, page_print_html, preflight_managed_page_mutation, prepare_tine_quit,
-    present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
-    read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
-    recover_managed_application_subtrees, referenced_page_names, rename_file_to_page, rename_page,
-    rescan_graph_now, resolve_block, resolve_blocks, resolve_durable_live_save_conflict,
-    resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
-    retire_editor_activation, run_advanced_query, run_graph_search, run_query, save_asset,
-    save_page, save_pdf_area_image, save_workspaces, search, set_default_journal_template,
-    set_doc_mode_enter_for_new_block, set_favorites, set_guide_announced, set_journal_title_format,
-    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
-    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
-    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
-    write_pdf_view_state,
+    duplicate_journal_diff, durable_live_save_conflict_diff, edit_asset_external,
+    empty_asset_trash, existing_page_names, export_query_subtrees, get_backlink_filter_context,
+    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
+    import_asset, import_native_capture, journal_content_days, journal_feed_page,
+    list_journal_conflicts, list_journal_filename_migrations, list_orphan_assets, list_pages,
+    list_sync_conflicts, list_templates, list_vcs_marker_conflicts, live_save_conflict_diff,
+    load_workspaces, merge_pages, move_managed_application_subtrees, open_asset, open_page_file,
+    open_pdf, page_aliases, page_icons, page_print_html, preflight_managed_page_mutation,
+    prepare_tine_quit, present_conflict_override, preview_block, publish_html, query_facets,
+    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
+    read_local_image, read_text_file, recover_managed_application_subtrees, referenced_page_names,
+    rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
+    resolve_duplicate_journal_day, resolve_durable_live_save_conflict, resolve_live_save_conflict,
+    resolve_sync_conflict, resolve_vcs_marker_conflict, retire_editor_activation,
+    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
+    save_workspaces, search, set_default_home, set_default_journal_template,
+    set_doc_mode_enter_for_new_block, set_favorites, set_favorites_page, set_guide_announced,
+    set_journal_title_format, set_logical_outdenting, set_preferred_format, set_preferred_workflow,
+    set_show_brackets, set_start_of_week, set_timetracking_enabled, stream_asset_path,
+    sync_conflict_diff, text_block_diff, text_block_diff3, tine_open_devtools, tine_quit,
+    trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
+    write_highlights, write_pdf_view_state,
 };
-use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
+use debug::{
+    clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
+    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, flight_init,
+    install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
+};
 use git::{
     git_commit, git_force_pull, git_force_push, git_init, git_pull, git_push, git_status,
 };
@@ -69,6 +82,9 @@ use graph::{
     app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
     default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
     warm_done,
+};
+use graph_verification::{
+    cancel_graph_verification, create_graph_verification, save_graph_verification_report,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use plugins::{
@@ -421,7 +437,6 @@ pub fn run() {
     // milestone — and any panic — is captured to the log file from the very start.
     debug_init();
     install_panic_logger();
-    debug_header();
     diag("main() entered");
 
     // AppImages bundle their own libwayland-client.so; on a Wayland session it can
@@ -501,6 +516,7 @@ pub fn run() {
     data_home::ensure_usable(migrate_identifier::CURRENT_IDENTIFIER);
 
     migrate_identifier::run_early();
+    debug_header();
 
     // Wayland resolves the shell/titlebar icon by matching a window app ID to a
     // desktop-entry basename. Packages ship that identity themselves; the raw
@@ -619,7 +635,7 @@ pub fn run() {
     #[cfg(any(mobile, target_os = "windows"))]
     let builder = builder.plugin(tauri_plugin_opener::init());
 
-    builder
+    let result = builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -666,6 +682,12 @@ pub fn run() {
             next_window: AtomicU64::new(1),
         })
         .setup(|app| {
+            // Resolve through Tauri rather than desktop path conventions: this
+            // is the exact sandbox-private app-data home on Android and iOS too.
+            match app.path().app_data_dir() {
+                Ok(path) => flight_init(path.join("diagnostics")),
+                Err(error) => diag(format!("diagnostic app-data path unavailable: {error}")),
+            }
             diag("setup() begin");
             #[cfg(target_os = "linux")]
             {
@@ -741,6 +763,9 @@ pub fn run() {
             journal_feed_page,
             get_page,
             graph_source_files,
+            create_graph_verification,
+            cancel_graph_verification,
+            save_graph_verification_report,
             save_page,
             move_managed_application_subtrees,
             recover_managed_application_subtrees,
@@ -779,6 +804,8 @@ pub fn run() {
             page_icons,
             existing_page_names,
             set_favorites,
+            set_favorites_page,
+            set_default_home,
             set_preferred_workflow,
             set_timetracking_enabled,
             set_show_brackets,
@@ -803,6 +830,8 @@ pub fn run() {
             empty_asset_trash,
             apply_journal_filename_migrations,
             list_journal_conflicts,
+            duplicate_journal_diff,
+            resolve_duplicate_journal_day,
             list_journal_filename_migrations,
             list_sync_conflicts,
             list_vcs_marker_conflicts,
@@ -894,13 +923,21 @@ pub fn run() {
             git_pull,
             git_force_push,
             git_force_pull,
+            diagnostic_ipc_event,
+            diagnostic_frontend_event,
+            diagnostic_report,
+            save_diagnostic_report,
+            clear_diagnostics,
             prepare_tine_quit,
             tine_quit,
             close_graph_window,
             tine_open_devtools
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .run(context);
+    if result.is_ok() {
+        mark_clean_shutdown();
+    }
+    result.expect("error while running tauri application");
 }
 
 #[cfg(test)]

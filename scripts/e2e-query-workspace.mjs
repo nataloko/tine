@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -92,7 +93,7 @@ async function withApp(index, fn) {
   const driverPort = DRIVER_BASE + index * 2;
   const nativePort = NATIVE_BASE + index * 2;
   const log = fs.openSync(`${TMP}/tauri-driver-${index}.log`, "w");
-  const td = spawn(TD, ["--port", String(driverPort), "--native-port", String(nativePort), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"], {
+  const td = spawn(TD, webdriverServerArgs(driverPort, nativePort, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), {
     env, stdio: ["ignore", log, log], detached: true,
   });
   await sleep(2500);
@@ -101,7 +102,7 @@ async function withApp(index, fn) {
     browser = await remote({
       hostname: "127.0.0.1", port: driverPort, path: "/", logLevel: "error",
       connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-      capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+      capabilities: tauriCapabilities(APP, "query-workspace"),
     });
     await browser.$(".query-workspace, .ls-block, .page-title").waitForExist({ timeout: 20_000 });
     await fn(browser);
@@ -728,11 +729,26 @@ await withApp(2, async (browser) => {
   }
   await showFull.click();
 
+  // This journey does not exercise notifications. Persistent startup/Guide
+  // toasts can cover the bottom-right reference controls even after WebDriver
+  // scrolls them into view, so dismiss them before driving those controls.
+  await browser.execute(() => {
+    document.querySelectorAll(".toast-close").forEach((button) => {
+      if (button instanceof HTMLButtonElement) button.click();
+    });
+  });
+  await browser.waitUntil(async () => (await browser.$$(".toast")).length === 0, {
+    timeout: 5_000,
+    timeoutMsg: "persistent notifications did not dismiss before reference controls",
+  });
+
   const unlinkedBulk = await browser.$$(".unlinked-references .reference-bulk-controls button");
+  await unlinkedBulk[0].scrollIntoView({ block: "center", inline: "center" });
   await unlinkedBulk[0].click();
   await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === 0, {
     timeout: 5_000, timeoutMsg: "Collapse all did not unmount unlinked reference bodies",
   });
+  await unlinkedBulk[1].scrollIntoView({ block: "center", inline: "center" });
   await unlinkedBulk[1].click();
   await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === unlinkedProof.groupCount, {
     timeout: 5_000, timeoutMsg: "Expand all did not restore unlinked reference bodies",

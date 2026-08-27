@@ -32,6 +32,10 @@ const iosTestFlightWorkflow = fs.readFileSync(
   path.join(process.cwd(), ".github/workflows/ios-testflight.yml"),
   "utf8"
 );
+const iosIconVerifier = fs.readFileSync(
+  path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+  "utf8"
+);
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
@@ -43,6 +47,7 @@ const flatpakMetadataWorkflow = fs.readFileSync(
 const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-release-preflight.mjs"), "utf8");
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8");
+const viteConfig = fs.readFileSync(path.join(process.cwd(), "vite.config.ts"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
 const androidManagedRuntimeScript = fs.readFileSync(
@@ -65,6 +70,9 @@ const iosEntitlements = fs.readFileSync(path.join(process.cwd(), "src-tauri/Tine
 const iosPrivacyManifest = fs.readFileSync(
   path.join(process.cwd(), "src-tauri/PrivacyInfo.xcprivacy"),
   "utf8"
+);
+const iosIconFixture = fs.readFileSync(
+  path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-512@2x.png")
 );
 const aboutTab = fs.readFileSync(path.join(process.cwd(), "src/components/AboutTab.tsx"), "utf8");
 const websiteIndex = fs.readFileSync(path.join(process.cwd(), "website/index.html"), "utf8");
@@ -183,8 +191,8 @@ const successfulFullCiRun = {
 };
 const successfulFullCiJobs = REQUIRED_FULL_CI_JOBS.map((name) => ({ name, conclusion: "success" }));
 
-assert.equal(layout.allAssets.length, 23, "release layout must retain its exact 23-asset inventory");
-assert.equal(layout.platformAssets.length, 22, "release layout must retain its exact platform-asset inventory");
+assert.equal(layout.allAssets.length, 26, "release layout must retain its exact 26-asset inventory");
+assert.equal(layout.platformAssets.length, 25, "release layout must retain its exact platform-asset inventory");
 assert.equal(
   Object.keys(layout.updaterPlatforms).length,
   12,
@@ -198,6 +206,40 @@ assert.ok(
   layout.lanes["linux-arm64"].assets.includes(`Tine_${version}_aarch64.AppImage.zsync`),
   "linux-arm64 is missing its AppImage update metadata"
 );
+assert.deepEqual(
+  layout.lanes["windows-x86"],
+  {
+    assets: [
+      `Tine_${version}_x86-setup.exe`,
+      `Tine_${version}_x86-setup.exe.sig`,
+      `Tine_${version}_x86-portable.zip`,
+    ],
+    platforms: {},
+  },
+  "the experimental Windows 32-bit lane must ship installer and portable assets without promising updater support"
+);
+assert.match(
+  releaseWorkflow,
+  /lane: windows-x86[\s\S]*?--target i686-pc-windows-msvc[\s\S]*?rust-targets: "i686-pc-windows-msvc"[\s\S]*?win-arch: x86[\s\S]*?win-exe-dir: target\/i686-pc-windows-msvc\/release/,
+  "release workflow is missing the experimental Windows 32-bit cross-build"
+);
+assert.match(
+  releaseWorkflow,
+  /CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"/,
+  "release builds must retain line-level native symbol information without changing optimization"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Upload exact diagnostic symbols[\s\S]*?diagnostic-symbols-\$\{\{ matrix\.lane \}\}-\$\{\{ github\.sha \}\}/,
+  "release builds must retain exact-SHA native symbols and frontend source maps outside public packages"
+);
+assert.match(
+  viteConfig,
+  /TINE_RETAIN_SOURCE_MAPS[\s\S]*?sourcemap:[\s\S]*?"hidden"/,
+  "Vite must retain hidden release source maps outside dist instead of embedding them in the app"
+);
+assert.match(viteConfig, /target[\\/]diagnostic-symbols[\\/]frontend/);
+assert.match(viteConfig, /await fsp\.unlink\(source\)/, "retained maps must be removed from the shipped dist tree");
 assert.match(
   releaseWorkflow,
   /lane: linux-x64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_amd64\.AppImage\.zsync"[\s\S]*?lane: linux-arm64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_aarch64\.AppImage\.zsync"/,
@@ -290,6 +332,38 @@ assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n
 assert.match(iosTestFlightWorkflow, /name: Upload IPA to TestFlight\n\s+if: inputs\.action == 'upload'/);
 assert.match(
   iosTestFlightWorkflow,
+  /AppIcon60x60@2x\.png[\s\S]*?pngcrush -q -revert-iphone-optimizations[\s\S]*?verify-ios-app-icon\.mjs[\s\S]*?src-tauri\/icons\/ios\/AppIcon-60x60@2x\.png/,
+  "the signed TestFlight IPA is not checked against Tine's tracked primary icon"
+);
+assert.match(
+  iosIconVerifier,
+  /MAX_MEAN_ABSOLUTE_RGB_ERROR[\s\S]*?meanAbsoluteRgbError[\s\S]*?assert\.ok/,
+  "the signed IPA icon verifier must tolerate packaging transforms while enforcing visual identity",
+);
+execFileSync(
+  process.execPath,
+  [
+    path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+    path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+    path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+  ],
+  { stdio: "pipe" }
+);
+assert.throws(
+  () =>
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+        path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+        path.join(process.cwd(), "src-tauri/icons/128x128.png"),
+      ],
+      { stdio: "pipe" }
+    ),
+  "the signed IPA icon verifier must reject different artwork"
+);
+assert.match(
+  iosTestFlightWorkflow,
   /name: Remove Apple signing material\n\s+if: always\(\)[\s\S]*?security delete-keychain[\s\S]*?\.appstoreconnect\/private_keys/,
   "temporary iOS App Store Connect authentication is not cleaned after failures"
 );
@@ -322,9 +396,23 @@ try {
   const fixtureTauri = path.join(iosPrepareFixture, "src-tauri");
   const fixtureApple = path.join(fixtureTauri, "gen", "apple");
   const fixtureTarget = path.join(fixtureApple, "tine_iOS");
+  const fixtureTrackedIcons = path.join(fixtureTauri, "icons", "ios");
+  const fixtureGeneratedIcons = path.join(
+    fixtureApple,
+    "Assets.xcassets",
+    "AppIcon.appiconset"
+  );
   fs.mkdirSync(fixtureTarget, { recursive: true });
+  fs.mkdirSync(fixtureTrackedIcons, { recursive: true });
+  fs.mkdirSync(fixtureGeneratedIcons, { recursive: true });
   fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
   fs.writeFileSync(path.join(fixtureTauri, "PrivacyInfo.xcprivacy"), iosPrivacyManifest);
+  fs.writeFileSync(path.join(fixtureTrackedIcons, "AppIcon-512@2x.png"), iosIconFixture);
+  fs.writeFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png"), "tauri-icon");
+  fs.writeFileSync(
+    path.join(fixtureGeneratedIcons, "Contents.json"),
+    JSON.stringify({ images: [{ filename: "AppIcon-512@2x.png" }] })
+  );
   fs.writeFileSync(
     path.join(fixtureApple, "project.yml"),
     [
@@ -369,6 +457,11 @@ try {
   assert.equal(
     fs.readFileSync(path.join(fixtureApple, "PrivacyInfo.xcprivacy"), "utf8"),
     iosPrivacyManifest,
+  );
+  assert.deepEqual(
+    fs.readFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png")),
+    iosIconFixture,
+    "iOS project preparation must replace Tauri's generated AppIcon with Tine's tracked icon"
   );
 } finally {
   fs.rmSync(iosPrepareFixture, { recursive: true, force: true });

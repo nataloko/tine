@@ -72,6 +72,8 @@ function openReleases(): void {
   void backend().openExternal(RELEASES_PAGE).catch(() => {});
 }
 
+let offeredUpdateToastId: number | null = null;
+
 /** The toast's "Download" action. Win/Linux packaged app → run the Tauri updater
  *  in place and relaunch; everything else (macOS, browser, or any failure) → open
  *  the releases page. Never throws. */
@@ -109,7 +111,8 @@ async function applyUpdateOrOpen(): Promise<void> {
 }
 
 function offerUpdate(version: string, current: string): void {
-  pushToast(
+  if (offeredUpdateToastId !== null) dismissToast(offeredUpdateToastId);
+  offeredUpdateToastId = pushToast(
     `Tine ${version} is available — you're on ${current}.`,
     "info",
     {

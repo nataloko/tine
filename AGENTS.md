@@ -34,10 +34,6 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, and
   `src/sheet/config.ts`.
 - Bullet threading: `src/bulletThreading.ts` and `src/components/Block.tsx`.
-- Page-rename navigation remap: `renamePageInNavigation` in `src/ui.ts` takes a
-  `PageKind` and remaps case-insensitive namespace descendants. Upstream has no
-  such overload, so this file is a silent-interaction surface despite never
-  appearing in a conflict.
 - Git integration: `src-tauri/src/git.rs` and Settings.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
 - Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
@@ -77,6 +73,18 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   reverted to upstream's `white-space: pre`, since it existed only to match the
   fork's wrapping editor. `feat/codeblock-editing` was deleted at that sync
   (tip was `fc0a73c0`; its commits remain ancestors of `mine`).
+- **Page-rename navigation remap** (retired at the v0.6.97 sync). Upstream's
+  DUP-2 favorites work rewrote `renamePageInNavigation` in `src/ui.ts` around a
+  single identity-folded membership key (`favoriteKey`, `pageIdentityKey`) as
+  part of the nested-favorites refactor (`favoritesStore`, `favoritesLayout`).
+  The fork's version was adopted away wholesale rather than combined: upstream's
+  function is now the live path verbatim, so the third `kind: PageKind` overload
+  parameter and the case-insensitive namespace-descendant remapping are both
+  gone. A rename no longer follows the renamed page's namespace children in
+  favorites, recents, or the sidebar. Removed with it: the fork test
+  `"renamePageInNavigation remaps favorites + recents (exact + namespace child,
+  case-insensitive)"` in `src/store.test.ts`, which asserted exactly that
+  behavior. No `feat/*` branch carried this — it only ever lived on `mine`.
 
 ## Build and verification
 
@@ -109,8 +117,8 @@ release ever runs them. Cross-check any failure against that list before calling
 it broken. The curated selection above is also stricter: one process per test, a
 5-minute per-test timeout, no retries. It needs cargo-nextest **exactly 0.9.143**
 (nixpkgs has 0.9.140, and the prebuilt binary needs `patchelf` on NixOS — see the
-`sync-upstream` skill for the one-time fix). At v0.6.95 it reports
-`1945 tests run: 1945 passed, 133 skipped`.
+`sync-upstream` skill for the one-time fix). At v0.6.97 it reports
+`2128 tests run: 2128 passed, 86 skipped`.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.

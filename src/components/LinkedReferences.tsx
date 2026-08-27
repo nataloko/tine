@@ -5,7 +5,7 @@ import { openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 import {
   classifyReferenceLoadError,
@@ -18,34 +18,20 @@ import {
   setCollapsedGroupsFor,
   setSectionOverride,
 } from "../referenceSectionState";
+import { pageIdentityKey } from "../pageIdentity";
+import { mergeReferenceGroups } from "../lib/referenceGroups";
+import { ReferenceExportChooser } from "./ReferenceExportChooser";
 
-const norm = (s: string) => s.trim().toLowerCase();
-const pageIdentity = (s: string) => {
-  const lowered = s.trim().toLowerCase();
-  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
-  const withoutBoundaries = withoutLeading.endsWith("/") ? withoutLeading.slice(0, -1) : withoutLeading;
-  return withoutBoundaries.normalize("NFC");
-};
+// One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
+// old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
+// spellings of one page into separate chips whose filters missed each other,
+// and mismatched the backend, which keys the same request with refs::normalize.
+const norm = (s: string) => pageIdentityKey(s);
 
 type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
   total?: number;
   truncated?: boolean;
 };
-
-function mergeReferenceGroups(groups: RefGroup[]): RefGroup[] {
-  const merged = new Map<string, RefGroup>();
-  for (const group of groups) {
-    const key = pageIdentity(group.page);
-    const existing = merged.get(key);
-    if (existing) {
-      existing.blocks.push(...group.blocks);
-      existing.evidence = [...(existing.evidence ?? []), ...(group.evidence ?? [])];
-    } else {
-      merged.set(key, { ...group, blocks: [...group.blocks], evidence: [...(group.evidence ?? [])] });
-    }
-  }
-  return [...merged.values()];
-}
 
 // Persist the per-page include/exclude reference filter so it survives reload.
 type FilterMap = Record<string, "in" | "out">;
@@ -142,6 +128,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     });
   };
   const [filterOpen, setFilterOpen] = createSignal(false);
+  const [exportChooserOpen, setExportChooserOpen] = createSignal(false);
   const [searchDraft, setSearchDraft] = createSignal("");
   const [searchQuery, setSearchQuery] = createSignal("");
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -199,10 +186,46 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     nativeByRoot().get(filterKey(group.page, group.kind, block.id))
       ?? fallbackByRoot().get(filterKey(group.page, group.kind, block.id))!;
 
+  const parsedSearch = createMemo(() => parseSearchQuery(searchQuery()));
+  const searchError = createMemo(() => {
+    const parsed = parsedSearch();
+    return parsed.kind === "invalid" ? parsed.error : null;
+  });
+
+  /** Filter backlink roots, trim each group's evidence to the survivors, and
+   *  drop groups that lose every root. Shared so the text pass runs ONCE and
+   *  both the facet chips and the reference list read the same result. */
+  const filterGroups = (
+    groups: RefGroup[],
+    keep: (group: RefGroup, block: BlockDto) => boolean
+  ): RefGroup[] =>
+    groups
+      .map((g) => ({ ...g, blocks: g.blocks.filter((b) => keep(g, b)) }))
+      .map((g) => {
+        const ids = new Set(g.blocks.map((block) => block.id));
+        return { ...g, evidence: g.evidence?.filter((item) => ids.has(item.block_id)) };
+      })
+      .filter((g) => g.blocks.length > 0);
+
+  // The text query applied on its own, WITHOUT the facet chips. The chips are
+  // the list the user picks from, so they must follow the typed text (GH #173
+  // follow-up — OG's "Search in linked pages" narrows exactly this) but must
+  // NOT follow the chip selections, or selecting a chip would remove the
+  // controls needed to undo it.
+  const textMatchedGroups = createMemo<RefGroup[]>(() => {
+    const parsed = parsedSearch();
+    const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
+    if (!searching || nativeContext.loading) return mergedGroups();
+    return filterGroups(mergedGroups(), (group, block) => {
+      const entry = rootEntry(group, block);
+      return matcherMatches(parsed, entry.normalizedText, entry.text);
+    });
+  });
+
   // Co-referenced pages/tags and task states in each backlink tree, with counts.
   const coRefs = createMemo(() => {
     const counts = new Map<string, { name: string; count: number }>();
-    for (const g of mergedGroups()) {
+    for (const g of textMatchedGroups()) {
       for (const b of g.blocks) {
         for (const name of rootEntry(g, b).facets) {
           const key = norm(name);
@@ -216,11 +239,17 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   });
 
-  const parsedSearch = createMemo(() => parseSearchQuery(searchQuery()));
-  const searchError = createMemo(() => {
-    const parsed = parsedSearch();
-    return parsed.kind === "invalid" ? parsed.error : null;
+  // An active include/exclude chip whose last backlink the text query filtered
+  // away still has to be reachable, or the user is stranded with an invisible
+  // filter and zero results. These are listed after the matching chips at zero.
+  // Deliberately a SEPARATE memo: folding them into coRefs() would make the
+  // whole chip list depend on filters(), so every click would re-create every
+  // chip node mid-cycle.
+  const orphanFilters = createMemo(() => {
+    const present = new Set(coRefs().map(([name]) => norm(name)));
+    return Object.keys(filters()).filter((name) => !present.has(norm(name)));
   });
+
   const filterState = (name: string): "in" | "out" | undefined => {
     const key = norm(name);
     return Object.entries(filters()).find(([candidate]) => norm(candidate) === key)?.[1];
@@ -233,33 +262,24 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     const parsed = parsedSearch();
     const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
     // Do not flash descendant-only matches away while their on-demand native
-    // index is still in flight. Once it arrives, filtering is synchronous.
+    // index is still in flight: the fallback corpus is a SUBSET of the native
+    // one, so a fallback miss cannot prove a real miss and dropping the root
+    // would hide a genuine match. Once the index arrives filtering is
+    // synchronous. The summary says so rather than reporting a filtered count.
     if ((searching || ins.length || outs.length) && nativeContext.loading) return mergedGroups();
-    if (!searching && !ins.length && !outs.length) return mergedGroups();
-    return mergedGroups()
-      .map((g) => ({
-        ...g,
-        blocks: g.blocks.filter((b) => {
-          const entry = rootEntry(g, b);
-          const facets = new Set(entry.facets.map(norm));
-          const contentMatches = !searching || matcherMatches(parsed, entry.normalizedText, entry.text);
-          // GH #273: positive include chips OR — a backlink stays when ANY
-          // included page/tag is present, and zero positive chips leaves the
-          // facet side unconstrained (today's behavior). Exclude chips stay
-          // cumulative and the text filter stays conjunctive with the facets.
-          return contentMatches
-            && (ins.length === 0 || ins.some((i) => facets.has(i)))
-            && outs.every((o) => !facets.has(o));
-        }),
-      }))
-      .map((g) => {
-        const ids = new Set(g.blocks.map((block) => block.id));
-        return { ...g, evidence: g.evidence?.filter((item) => ids.has(item.block_id)) };
-      })
-      .filter((g) => g.blocks.length > 0);
+    if (!ins.length && !outs.length) return textMatchedGroups();
+    // GH #273: positive include chips OR — a backlink stays when ANY included
+    // page/tag is present, and zero positive chips leaves the facet side
+    // unconstrained. Exclude chips stay cumulative, and because this runs over
+    // textMatchedGroups() the text filter stays conjunctive with the facets.
+    return filterGroups(textMatchedGroups(), (group, block) => {
+      const facets = new Set(rootEntry(group, block).facets.map(norm));
+      return (ins.length === 0 || ins.some((i) => facets.has(i)))
+        && outs.every((o) => !facets.has(o));
+    });
   });
 
-  const groupKey = (group: RefGroup) => pageIdentity(group.page);
+  const groupKey = (group: RefGroup) => pageIdentityKey(group.page);
   const shownByKey = createMemo(() => new Map(shown().map((group) => [groupKey(group), group] as const)));
   const groupCollapsed = (group: RefGroup) => collapsedGroups().has(groupKey(group));
   const setGroupCollapsed = (group: RefGroup, value: boolean) => {
@@ -298,6 +318,15 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     return { shown, total, truncated: total > shown };
   });
   const hasActiveFilter = () => searchDraft().trim() !== "" || Object.keys(filters()).length > 0;
+  /** A filter is asked for but the descendant index it needs has not arrived,
+   *  so the list below is deliberately UNFILTERED. Say that instead of
+   *  reporting "N of N references", which asserts a finished filter. */
+  const filterPending = () => {
+    if (!nativeContext.loading) return false;
+    const parsed = parsedSearch();
+    const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
+    return searching || Object.keys(filters()).length > 0;
+  };
   const updateSearch = (value: string) => {
     setSearchDraft(value);
     if (searchTimer !== undefined) clearTimeout(searchTimer);
@@ -324,6 +353,15 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       }
     >
     <Show when={groups() && mergedGroups().length > 0}>
+      <Show when={exportChooserOpen()}>
+        {/* GH #348: batch export honors the visible (filtered) set, matching
+            what the section actually shows the user right now. */}
+        <ReferenceExportChooser
+          subject="Linked References"
+          groups={shown()}
+          onClose={() => setExportChooserOpen(false)}
+        />
+      </Show>
       <div class="linked-references">
         <div class="references-header" onClick={() => setCollapsedOverride(!collapsed())}>
           <span class="ref-collapse" classList={{ collapsed: collapsed() }}>
@@ -332,6 +370,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             </svg>
           </span>
           Linked References <span class="references-count">{count()}</span>
+          <button
+            type="button"
+            class="reference-export-toggle"
+            aria-label="Copy / export linked references"
+            title="Copy / export selected linked references"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExportChooserOpen(true);
+            }}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
+          </button>
           <button
             type="button"
             class="reference-filter-toggle"
@@ -372,8 +422,17 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                 </button>
               </div>
               <div class="reference-filter-summary">
-                {count()} of {totalCount()} references
-                <Show when={nativeContext.loading}> · indexing…</Show>
+                <Show
+                  when={filterPending()}
+                  fallback={
+                    <>
+                      {count()} of {totalCount()} references
+                      <Show when={nativeContext.loading}> · indexing…</Show>
+                    </>
+                  }
+                >
+                  Indexing {totalCount()} references… the filter applies when this finishes
+                </Show>
               </div>
               <Show when={searchError()}>
                 {(error) => <div class="reference-filter-error">Invalid search: {error()}</div>}
@@ -384,7 +443,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
               <Show when={nativeContext()?.truncated || nativeContext()?.entries.some((entry) => entry.truncated)}>
                 <div class="reference-filter-warning">Some very large reference trees are searched partially.</div>
               </Show>
-              <Show when={coRefs().length > 0}>
+              <Show when={coRefs().length > 0 || orphanFilters().length > 0}>
                 <div class="ref-filter" aria-label="Reference facets">
                   <For each={coRefs()}>
                     {([name, n]) => (
@@ -395,6 +454,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                         onClick={() => cycle(name)}
                       >
                         {name} <span class="ref-filter-count">{n}</span>
+                      </button>
+                    )}
+                  </For>
+                  <For each={orphanFilters()}>
+                    {(name) => (
+                      <button
+                        class="ref-filter-chip"
+                        classList={{ "f-in": filterState(name) === "in", "f-out": filterState(name) === "out" }}
+                        title="No match in the current text search · click to cycle or clear"
+                        onClick={() => cycle(name)}
+                      >
+                        {name} <span class="ref-filter-count">0</span>
                       </button>
                     )}
                   </For>
@@ -426,18 +497,14 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                   <button
                     type="button"
                     class="reference-page"
+                    onMouseDown={internalLinkMouseDown}
                     onClick={(e) => {
                       const dest = internalLinkDest(e);
                       if (dest === "sidebar") openPageInSidebar(group().page, group().kind);
                       else if (dest === "background") openPageInNewTab(group().page, group().kind);
                       else openPage(group().page, group().kind);
                     }}
-                    onAuxClick={(e) => {
-                      if (e.button === 1) {
-                        e.preventDefault();
-                        openPageInNewTab(group().page, group().kind);
-                      }
-                    }}
+                    onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(group().page, group().kind))}
                     onContextMenu={(e) => {
                       if (!shouldOpenTextContextMenu(e.target)) return;
                       e.preventDefault();

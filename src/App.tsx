@@ -36,7 +36,8 @@ import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
-import { loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { applyGraphConfigChange, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
 import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type QueryRoute } from "./router";
@@ -334,6 +335,9 @@ export async function handleGraphChange(c: GraphChange) {
   // below, while unloaded block references re-resolve by UUID from dataRev.
   bumpDataRev();
   if (c.created || c.removed) bumpPageInventoryRev();
+  // The favorites arrangement page is an ordinary page, so an outside edit to
+  // it arrives here like any other — and the sidebar has to follow it.
+  void favoritesPageChanged([c.name]);
   await applyExternalChange(c, binding);
   // A merge finished outside Tine (git resolving the markers, a sync tool
   // removing a copy) must not leave a stale item in the conflict queue.
@@ -465,6 +469,9 @@ export async function handleGraphChangedBulk(bulk: GraphChangedBulk) {
   if (!changes.length) return;
   bumpDataRev();
   if (changes.some((c) => c.created || c.removed)) bumpPageInventoryRev();
+  // Outside the per-page loop below, which deliberately skips pages nothing is
+  // showing: the arrangement page is normally one of those.
+  void favoritesPageChanged(changes.map((c) => c.name));
   const routedNames = new Set<string>();
   for (const paneId of layoutPaneIds()) {
     const route = paneRouter(paneId).route();
@@ -1020,6 +1027,16 @@ export function App(): JSX.Element {
     let unsub = () => {};
     void backend()
       .onGraphChangedBulk((bulk) => trackGraphChangeApplication(handleGraphChangedBulk(bulk)))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // `logseq/config.edn` was rewritten outside Tine (Logseq, an editor, a sync
+  // service) and the backend re-read it. Only settings changes arrive here; a
+  // rewrite that moved nothing we surface emits nothing.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphConfigChanged((meta) => applyGraphConfigChange(meta))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

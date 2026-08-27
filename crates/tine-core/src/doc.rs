@@ -345,6 +345,135 @@ impl DocBlock {
     }
 }
 
+/// How many characters of a block's first visible line a breadcrumb label keeps
+/// before it is elided. One value, because a trail whose segments truncate at
+/// different lengths depending on which code path produced them is a bug the
+/// user sees.
+pub(crate) const CRUMB_MAX_CHARS: usize = 60;
+
+/// A short, single-line label for a block in a breadcrumb trail: the first line
+/// of its visible text, trimmed, elided with `…` past [`CRUMB_MAX_CHARS`].
+///
+/// DUP-8: this used to exist three times -- byte-identical in `query.rs` and
+/// `query_plan.rs`, and a third time in `sync_runtime.rs` over a synthesized
+/// `DocBlock`. Three copies of a truncation rule is three places for the rule
+/// to drift.
+pub(crate) fn crumb_line(block: &DocBlock) -> String {
+    let line = block.visible_text().lines().next().unwrap_or("").trim();
+    if line.chars().count() > CRUMB_MAX_CHARS {
+        format!(
+            "{}…",
+            line.chars().take(CRUMB_MAX_CHARS).collect::<String>()
+        )
+    } else {
+        line.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod crumb_line_tests {
+    use super::*;
+
+    fn block(raw: &str) -> DocBlock {
+        DocBlock {
+            raw: raw.to_owned(),
+            children: Vec::new(),
+            uuid: String::new(),
+            is_org: false,
+            proj: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_limit_is_kept_whole() {
+        let raw = "x".repeat(CRUMB_MAX_CHARS);
+        assert_eq!(crumb_line(&block(&raw)), raw);
+    }
+
+    #[test]
+    fn one_character_past_the_limit_elides() {
+        let raw = "x".repeat(CRUMB_MAX_CHARS + 1);
+        let crumb = crumb_line(&block(&raw));
+        assert_eq!(crumb, format!("{}…", "x".repeat(CRUMB_MAX_CHARS)));
+        assert_eq!(crumb.chars().count(), CRUMB_MAX_CHARS + 1);
+    }
+
+    /// The limit counts CHARACTERS, not bytes -- 60 multi-byte characters are
+    /// still 60 characters.
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        let raw = "é".repeat(CRUMB_MAX_CHARS);
+        assert_eq!(crumb_line(&block(&raw)), raw);
+        assert_eq!(
+            crumb_line(&block(&"é".repeat(CRUMB_MAX_CHARS + 1))),
+            format!("{}…", "é".repeat(CRUMB_MAX_CHARS))
+        );
+    }
+
+    /// Only the FIRST line becomes the label, and it is trimmed.
+    #[test]
+    fn a_multi_line_block_labels_on_its_first_line_only() {
+        assert_eq!(
+            crumb_line(&block("  Parent heading  \nsecond line\nthird line")),
+            "Parent heading"
+        );
+    }
+
+    /// Properties are not visible text, so they never reach a breadcrumb.
+    #[test]
+    fn properties_are_not_part_of_the_label() {
+        assert_eq!(
+            crumb_line(&block("Parent heading\nid:: 6512-abcd\ncollapsed:: true")),
+            "Parent heading"
+        );
+    }
+
+    #[test]
+    fn an_empty_block_has_an_empty_label() {
+        assert_eq!(crumb_line(&block("")), "");
+    }
+
+    /// The three collapsed copies had one rule between them; this pins the rule
+    /// each of them implemented, verbatim, so the collapse cannot have moved
+    /// any output.
+    #[test]
+    fn the_shared_rule_reproduces_what_the_three_copies_did() {
+        fn original(block: &DocBlock) -> String {
+            let line = block
+                .visible_text()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if line.chars().count() > 60 {
+                format!("{}…", line.chars().take(60).collect::<String>())
+            } else {
+                line
+            }
+        }
+        for raw in [
+            "",
+            "   ",
+            "\n\n",
+            "short",
+            "  padded  ",
+            "one\ntwo",
+            &"x".repeat(59),
+            &"x".repeat(60),
+            &"x".repeat(61),
+            &"é".repeat(61),
+            &format!("{}\nsecond", "x".repeat(61)),
+            "TODO [#A] a task with a marker",
+            "Parent heading\nid:: 6512-abcd",
+            "  \tleading tab and a very long tail ---------------------------------------",
+        ] {
+            let b = block(raw);
+            assert_eq!(crumb_line(&b), original(&b), "diverged on {raw:?}");
+        }
+    }
+}
+
 fn push_tag(out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, tag: String) {
     let tag = tag.trim().to_string();
     if tag.is_empty() {
@@ -703,19 +832,78 @@ pub(crate) fn property_key_norm(key: &str) -> String {
     key.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
-pub(crate) fn parse_property_line(line: &str) -> Option<(String, String)> {
-    // `key:: value` — key is letters/digits/_/-/. and at least one char.
-    let idx = line.find("::")?;
-    let key = line[..idx].trim();
+/// lsdoc's parser-space set (`Parsers.is_space`: space, tab, SUB, FF) — the
+/// characters lsdoc skips at the edge of a property line's key.
+fn mldoc_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | 0x1a | 0x0c)
+}
+
+fn skip_mldoc_spaces(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && mldoc_space(bytes[i]) {
+        i += 1;
+    }
+    &s[i..]
+}
+
+/// lsdoc's property-value trim set (`trim_markdown_property_value`: space, tab,
+/// newline, CR, FF — note: NO SUB) on both ends.
+fn trim_property_value(s: &str) -> &str {
+    fn trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+    }
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && trim(bytes[start]) {
+        start += 1;
+    }
+    while end > start && trim(bytes[end - 1]) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+/// The ONE hand-rolled Markdown property-line recognizer (`key:: value`),
+/// transcribed from lsdoc `markdown_property_line` so every non-parser caller
+/// (rename, conflict-strip id lines, template/content probes, logbook insertion,
+/// published title lookup — and, since DUP-7, managed command loading) reads a
+/// property line exactly the way the read path's lsdoc projection does:
+///
+/// - leading lsdoc parser spaces (space/tab/SUB/FF) skipped;
+/// - the key is every byte up to the first `::` — non-empty, and containing
+///   none of `:` space tab SUB FF CR LF (so Unicode keys, leading periods and
+///   `logseq.order-list-type`-style dotted keys parse, but `a b::` does not);
+/// - the separator must be followed by a literal space (or only-spaces remains
+///   — an empty value): `key::value` is NOT a property line, matching lsdoc.
+///
+/// Returns borrowed slices into `line`: no allocation per recognized line.
+/// The page-HEADER recognizer in model.rs (`page_header_property_line`) is a
+/// deliberately narrower grammar (column-zero keys, values kept verbatim) and
+/// must NOT be unified with this one — its test pins the distinction.
+pub fn parse_property_line(line: &str) -> Option<(&str, &str)> {
+    let rest = skip_mldoc_spaces(line);
+    let pos = rest.find("::")?;
+    let key = &rest[..pos];
     if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        || key
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b':' || mldoc_space(b) || b == b'\n' || b == b'\r')
     {
         return None;
     }
-    let value = line[idx + 2..].trim().to_string();
-    Some((key.to_string(), value))
+    let value = &rest[pos + 2..];
+    if let Some(value) = value.strip_prefix(' ') {
+        let value = skip_mldoc_spaces(value);
+        return Some((key, trim_property_value(value)));
+    }
+    value
+        .as_bytes()
+        .iter()
+        .all(|&b| mldoc_space(b))
+        .then_some((key, ""))
 }
 
 /// Original-case page names carried by OG-compatible `tags::`, `alias::`, or

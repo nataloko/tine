@@ -8,6 +8,432 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.97] - 2026-08-26
+
+### Added
+
+- Added a read-only synchronized-graph verifier that compares the actual Markdown and Org file bytes across devices, including nested and nonstandard layouts, without requiring shell or ADB access.
+
+### Changed
+
+- **A fault one core test injects can no longer fail an unrelated test beside
+  it.** The shared-provider "this filesystem has no `renameat2` flags" fault was
+  armed process-wide, so under a threaded `cargo test` the injected errno was
+  visible to every other test renaming a provider file at that moment; the
+  whole-suite failure set differed on every run. The fault is now scoped to the
+  thread under test and handed explicitly to the sync actor for the one request
+  that needs it, so the corpus reports the same result twice in a row (GH #350).
+
+- **Queries and search are much faster on Managed Storage.** Every managed
+  query used to re-read, re-parse, and structurally cross-check every candidate
+  page, every time -- so a page full of `{{query}}` re-parsed the graph on each
+  open, and search re-parsed it on each keystroke. Unchanged pages now reuse
+  their complete parsed application view after their exact file bytes and
+  stored page state are checked; an external edit or accepted actor change is
+  re-read immediately. Searching for a literal phrase also consults the stored
+  text index first instead of reading every page, and a result-limited search
+  now does its work only for the results it keeps.
+
+### Fixed
+
+- **Task markers mean the same thing everywhere.** The editor, carry-forward,
+  the sheet state/priority writers, and the rendered checkbox now share one
+  leading-marker recognizer that is byte-faithful to the parser: a task written
+  as `TODO<tab>x` no longer counts as open for carry-forward while rendering
+  without a checkbox, cycling or setting state on an indented task replaces its
+  marker instead of prepending a second one, and a bare `TODO` followed by
+  continuation lines is no longer treated as a task the renderer cannot see.
+- **`key:: value` property lines are recognized the same way by every tool.**
+  Logbook insertion, managed template/content checks, rename, conflict handling
+  and the read index now share the parser's exact property-line rule, so a
+  dotted key like `logseq.order-list-type:: number` is treated as a block
+  property everywhere (a logbook entry could previously be inserted above it),
+  leading whitespace and Unicode keys behave identically, and `key::value`
+  without a space is (as the parser already said) not a property.
+- **Page-link gestures are the same everywhere.** Middle-click now opens a
+  background tab from every page reference and page title — unlinked-reference
+  page headers, namespace macro and hierarchy links, the zoom breadcrumb,
+  right-sidebar item titles, query search-result rows, and the page title's
+  Ctrl/Cmd+click all behaved differently (plain-click only, or autoscroll on
+  Windows). Shift+click still opens the sidebar and plain click still navigates
+  (GH #207).
+- **A split pane's only tab keeps its close button.** The tab strip hid the ✕
+  whenever a pane held a single tab, so after one split neither pane could be
+  closed without first dragging a tab across. The ✕ now shows whenever closing
+  actually works: any multi-tab strip, or a lone non-feed tab whose pane can
+  close (GH #207).
+- **Search and conflict handling now use one contract across runtimes.** Page
+  and block search agree on Unicode whitespace, bare Unicode tags, and the
+  common linear-time regex subset; query-workspace saves and Direct conflict
+  resolution classify bounded failure codes instead of matching error prose.
+  The browser mock now also announces the graph rebind caused by changing the
+  default home page.
+- **Managed Storage and Direct Files answer the same query the same way.** The
+  two storage modes evaluated block queries through separate copies of the same
+  logic, and the copies had drifted: a byte-budgeted block-referrers panel
+  admitted a different number of rows, and kept a different set of them, on the
+  two modes for identical content. Both now use one evaluator and one
+  result-budget rule.
+- **Journal recency respects the configured title format.** On graphs with a
+  custom `:journal/page-title-format`, `(sort-by modified)` ranked every
+  journal last on three of the four query paths (they parsed titles with the
+  default format only). All producers now share one recency axis that honours
+  the graph's configured formats.
+- **Backlink filter truncation is reported consistently.** A page-property
+  root entry that hit its text/facet budget marked the context truncated on
+  Managed Storage but not on Direct Files; the two now agree.
+- **Managed rename works for every page name.** The managed rename planner
+  keyed its index lookups with a different Unicode fold than the index itself
+  (the two disagree on Greek final sigma), so renaming such a page reported
+  success while doing nothing. Rename lookups now use the index's own fold.
+- **config.edn settings can no longer clobber a nested map.** Every setting
+  writer now edits only the root map's direct entries; a same-named keyword
+  nested inside another map (e.g. under `:default-templates`) survives
+  byte-for-byte instead of being spliced over.
+- **Write-durability errors are reported, not swallowed.** The workspaces
+  registry, backup restore, and Linux window-identity writers follow the save
+  path's directory-fsync policy (tolerate "unsupported here", report real
+  errors), the window-identity writer uses unique create-only temp files, and
+  the file watcher recognizes backup-restore temp files directly.
+
+- **One spelling of a page is one favorite.** Starring a page under one
+  spelling (different case, an alias, NFC/NFD accents, boundary slashes) now
+  fills the star and toggles off under every other spelling instead of
+  appending a duplicate; the sidebar arrangement, membership, page delete, and
+  rename all use the same kind-scoped identity, so deleting a page no longer
+  silently drops a journal favorite that merely shares its name. Backlink
+  filter chips key by the same identity, so two spellings of one co-referenced
+  page no longer produce two chips that miss each other's filters.
+
+### Added
+
+- **Batch copy/export for references** (GH #348). Linked References and
+  Unlinked References each have an explicit export affordance: every entry is
+  pre-selected for copy-all, uncheck for a subset, and the familiar Copy /
+  export modal (Text, OPML, HTML, with the usual content/indent/depth/cleanup
+  options) produces the selected blocks grouped by their source page. The two
+  sections act independently, Linked honors its active filters, and normal page
+  export is unchanged — references are never included unless you ask.
+- **Favorites nest to any depth** (GH #102). A group can hold groups, and a
+  favorite can hold favorites; drag a row to the right to nest it, to the left
+  to lift it out. Depth is measured from where the drag started, so a plain
+  vertical drag never nests by accident, and the insertion line is drawn at the
+  depth the drop will land. Deleting a group still keeps everything it held —
+  now one level up rather than at the top. The arrangement page round-trips
+  every bullet at every depth, so hand-written nesting survives.
+
+- **Editing the Favorites page updates the sidebar** (GH #102). The arrangement
+  lives in an ordinary page, so editing it — in Tine or outside — is now
+  reflected immediately instead of at the next graph open. A page edit is a
+  membership statement: removing a `[[link]]` bullet unfavorites that page and
+  adding one favorites it. This also gives favorites reordering a keyboard
+  route, since the arrangement is a page like any other.
+
+- **`logseq/config.edn` is re-read while Tine runs.** A settings change made in
+  Logseq, in a text editor, or delivered by Syncthing is now picked up during
+  the session rather than being ignored until the next graph open — and
+  therefore no longer computed against a stale copy. Favorites, shortcuts,
+  macros, the home page, journal formats, hidden properties and the rest all
+  follow. Tine only pays for the reload when the file's bytes actually differ
+  from those it is serving, so its own settings writes and repeated identical
+  deliveries cost nothing.
+
+- **Privacy-safe diagnostic reports** (GH #343). Every production build now
+  retains a bounded current-and-previous-run flight recorder of fixed operation
+  names, outcomes, timings and counts. Settings → Diagnostics previews the JSON
+  before the user chooses to copy or save it; nothing is uploaded automatically,
+  and graph content, paths, page titles, queries, URLs and credentials are
+  excluded by the recorder API. Release CI also retains exact-commit native
+  symbols and hidden frontend source maps outside the shipped packages.
+
+- **Experimental 32-bit Windows packages** (GH #275). Releases now produce an
+  `i686-pc-windows-msvc` installer and portable ZIP for older Windows 10 tablets.
+  The pilot is deliberately excluded from automatic updates until it has been
+  exercised on a reporter's real 32-bit device.
+
+- **Favorites can be arranged into named groups.** One level, plain-text group
+  names, collapsible, with drag between groups as well as within one. Deleting a
+  group never unfavorites anything — its pages move back to the ungrouped list.
+  The arrangement lives in an ordinary page in your graph, so it syncs and
+  merges like everything else rather than as an opaque settings blob, and
+  because its entries are real links a page rename follows them automatically.
+  `config.edn :favorites` stays exactly what it was — the flat list Logseq
+  reads — so Logseq keeps working. Nothing is created until you actually make a
+  group: if you never group anything, nothing about Favorites changes (GH #102).
+
+### Changed
+
+- **Typing in the Linked References search box now also narrows the reference
+  chips below it.** The reference list already shrank as you typed; the chips —
+  the pages and tags you pick from — were computed over every backlink, so they
+  and their counts never moved. They now follow what you type, which is what
+  Logseq's equivalent field does and what the list is for. A chip you have
+  already selected stays visible even when your text filters its last backlink
+  away, at count zero, so a filter can never become unreachable (GH #173).
+
+- **A journal day with more than one file is now resolved on the day itself.**
+  These days — usually a leftover of changing the journal date format, which
+  never overwrites the old file — used to reach you only as a sticky notice at
+  startup pointing at Settings. They now join the conflict badge, the dock and
+  the walk like every other conflict, and the day page offers the same
+  side-by-side review: keep a line from either file, or keep both. Keeping both
+  is what "Merge" did in Settings, so nothing was lost by moving it here; the
+  other file goes to the recoverable trash once you apply. Opening, renaming and
+  trashing an individual file are still offered, on the day and in Settings.
+  Two files in different formats (a `.md` and an `.org` for one day) can't be
+  folded together and say so instead of offering a choice that could not be
+  applied. The startup notice is gone.
+
+
+- **Copy / export names its two content choices after what you actually get.**
+  The explicit *Content* option in "Copy / export as…" now reads **Plain text**
+  (cleaned, as displayed) and **Markdown** — or **Org** on an Org page —
+  (preserved source syntax: bold, highlighting, links, properties and
+  structure). The preserve choice was always implemented but shipped under
+  the internal label "Source"; users looking for the Markdown-preserving
+  option could not find it (GH #352).
+
+### Fixed
+
+- **Future iOS/TestFlight builds now use Tine's application icon.** The generated
+  Xcode project previously retained Tauri's template icon even though Tine's
+  complete iOS icon set was tracked in the repository. Project preparation now
+  installs that set before Xcode compiles the asset catalog, and the signed-IPA
+  contract compares the packaged primary icon's pixels with Tine's source. The
+  already-submitted `0.6.95.8` beta is unchanged.
+- **Dragging a favourite in the sidebar no longer selects its title.** The
+  reorder drag is a pointer gesture, not a text gesture, but nothing suppressed
+  selection, so the label smeared under the cursor. Applies to both reorderable
+  sidebar lists.
+- **The Linked References filter no longer claims to have filtered a list it has
+  not.** While the descendant index is still loading the panel deliberately
+  shows every reference — the local text it has is only a subset, so hiding a
+  reference could hide a real match — but the summary still read "N of N
+  references". It now says indexing is in progress and that the filter applies
+  when it finishes (GH #173).
+- **Deleting an open page on Android no longer passes through an unexplained
+  black frame.** Tine still waits for pending edits and the native trash
+  operation to become durable before navigating anywhere, but it now retires
+  the deleted page's pane routes in that same durable continuation, before the
+  loaded page is purged. Debug mode also times confirmation, saving, native
+  deletion, fallback loading and first paint separately so remaining
+  device/storage latency can be diagnosed without logging note names or paths
+  (GH #376).
+
+- **Creating a journal no longer makes the next Direct Files page fail to save
+  on Windows.** Windows may report several `Create`, `Modify`, and rename events
+  for Tine's own atomic page publication. Those exact self echoes now validate
+  the published path, bytes, and physical file identity under the same write
+  lock instead of raising the external-change frontier while the watcher waits
+  to reconcile them. A changed external file, an identical-byte replacement
+  inode from a sync service or second Tine, ambiguous events, and portable
+  case/NFC collisions remain fail-closed (GH #374, follow-up to GH #366).
+
+- **Block zoom keeps pointing at the intended block after siblings are inserted
+  or reordered.** Tine now keeps its deterministic, UUID-shaped runtime
+  locators separate from authored `id::` / Org `:id:` identity, resolves the
+  unique authored claimant first, and refuses ambiguous duplicate authored IDs
+  instead of guessing. Existing graphs are not rewritten (GH #373).
+
+- **Windows self-update now follows the system proxy route and shows one update
+  offer at a time.** The native updater already used the Windows trust store,
+  but its reduced feature set omitted Reqwest's separate Windows system-proxy
+  integration, so it could fail to fetch `latest.json` even while WebView2 and
+  the browser reached GitHub. Startup and manual checks also now replace the
+  same release offer instead of stacking duplicate install prompts (GH #241).
+
+- **Selecting text on Android no longer stacks Tine's formatting controls under
+  the system Cut/Copy/Paste menu.** Tine's Bold, link, code, highlight and other
+  formatting actions now dock above the existing mobile keyboard toolbar, while
+  Android keeps the selection-adjacent region for its native actions and handles.
+  The compact formatting overflow opens upward, away from the keyboard (GH #375).
+
+- **Fitting split panes no longer keep a scrollbar merely for blank editing
+  space.** The first GH #369 correction fixed short panes but still made an
+  otherwise fitting page scroll whenever it occupied 60–100% of its pane. An
+  idle pane now has zero blank scroll range at every fitting height; the 40%
+  pane-relative breathing room returns while a block is actively edited, so a
+  long page's tail remains comfortably reachable.
+
+- **The full Rust core corpus now finishes and the release gate no longer hides
+  passing tests.** Five obsolete shared-join test barriers now pause at current,
+  finite clean-runtime concurrency cuts. An honest unfiltered run completed all
+  2,116 selected-or-ignored tests without a hang or timeout, and 47 stale or
+  passing names were removed from the release exclusion. The remaining 45
+  known-red legacy-oracle tests are listed exactly and classified by behavior
+  family, so a newly passing, renamed, or omitted test fails the contract
+  instead of silently drifting outside the gate (GH #350).
+
+- **Managed Storage can reopen retained edits and moves of blocks carrying a
+  Logseq `id::` UUID.** Projection recovery now consults the same bounded
+  baseline identity candidates as planning and commit validation, instead of
+  refusing the accepted block as unauthorized when the UUID originated in the
+  activation baseline (GH #370).
+
+- **Android startup and page navigation no longer look like an unexplained black
+  or blank screen while work is pending.** The native window now has light and
+  night Tine backing colors before the WebView paints, startup immediately shows
+  a matching readiness surface, and an in-app page load has a small visible
+  indicator. Actual load failures still replace it with their error, and plugin
+  revocation checks still finish before community code can activate (GH #299).
+
+- **Clicking a block bullet no longer reports a false same-name file conflict.**
+  A block zoom now keeps using the exact page already open in Direct Files
+  instead of racing the durable block-ID save with a second read of the page's
+  older bytes. Restored zoom tabs still load missing owners from disk, and
+  genuinely different same-name physical files remain fail-closed (GH #354).
+
+- **Page action control labels no longer join dragged text selections.** The
+  journal carry-over buttons ("Carry unfinished tasks → today" and friends),
+  the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger
+  are page chrome, not content: selecting across the page no longer copies
+  their label text, while the buttons stay fully clickable and keyboard-
+  focusable.
+
+- **Joining a synced graph no longer gets stuck on an older local managed-storage
+  marker.** If Direct Files is active but a previous activation left private
+  managed state behind, Tine now archives that complete predecessor unchanged
+  before bootstrapping the other device's shared identity, instead of trying to
+  open the old marker as the new graph and reporting that it names a different
+  catalog document.
+
+- **A provider deletion can no longer erase a local edit that arrived in the
+  same sync pass.** Managed sync now captures a pending Markdown or Org watcher
+  epoch before applying provider projection, then drains the complete visible
+  provider cut before classifying the resulting race. The local edit therefore
+  enters immutable history and the normal edit-versus-delete rule settles it,
+  even when the filesystem and oplog notifications arrive together.
+
+- **Direct Files delete, rename, trash, and conflict-copy moves no longer read
+  every document in the graph.** These exact no-clobber moves now validate the
+  source and destination through retained metadata and portable path checks;
+  document contents remain untouched and unrelated files are never opened.
+
+- **A crash inside a Direct Files save can no longer leave a page invisible
+  under hidden recovery names.** On the next checked open, one unambiguous
+  stranded copy is restored without clobbering a live file. Ambiguous or
+  superseded copies are retained or moved intact to recoverable conflict trash;
+  lookalikes and files whose physical identity cannot be proved are untouched.
+
+- **Changed Direct Files saves perform one fewer full-file read.** The atomic
+  retirement already detaches and byte-checks the exact expected inode before
+  publishing, so Tine no longer rereads the same live name immediately before
+  that stronger proof. External edits still win or become an explicit conflict,
+  and managed-storage projection behavior is unchanged.
+
+- **Page lists stay fast after Direct Files file lifecycle changes.** With a
+  warm graph, creates, deletes, watcher additions/removals, and renames now
+  update the exact in-memory page inventory instead of making the next page
+  lookup reopen and reparse the whole graph. Rename transactions reparse only
+  documents whose retained final bytes they already changed; explicit titles,
+  parse failures, physical paths, and watcher invalidation remain authoritative.
+
+## [0.6.96] - 2026-08-24
+
+### Added
+
+- **Conflict review can now suggest a combined "Merged" version of a block both
+  sides edited.** When two devices changed provably different parts of the same
+  block's text (against the last version both sides agreed on), the in-page
+  conflict review offers the combination as a fourth, pre-selected choice next
+  to keep-mine/keep-theirs/keep-both — for sync-conflict copies and for
+  `diff3`/Fossil-style merge markers alike. Where the edits overlap but the
+  merge tool wrote its own `####### SUGGESTED CONFLICT RESOLUTION` sections
+  (Fossil), that suggestion is offered in the same place instead, clearly
+  labeled as the tool's proposal. Like every suggestion it is only
+  pre-selected: nothing is applied until you confirm, the applied text is
+  re-derived from the same three versions (never trusted from the UI), and
+  edits that overlap — or whose combination would not survive as a single
+  block — simply get no offer.
+
+- **Conflict rows now preview the first line that actually differs**, not
+  blindly the first line, with an `…` marker when earlier lines agree — and
+  multi-line blocks gain a per-row expander showing the full text of each
+  version with the differing lines highlighted.
+
+- **A conflict can no longer scroll out of sight.** The in-page conflict
+  review lives at the top of the page; once it scrolls out of view a slim
+  one-line notice stays pinned to the top of the pane — especially on a
+  phone, where the review was previously invisible until you scrolled up.
+  Tapping the notice unrolls the same review in place (your reading position
+  and any choices you already made are kept); tapping again, pressing
+  Escape, or scrolling back to the top folds it away.
+
+### Changed
+
+- **The conflict review is now usable on a phone (and in a skinny split
+  pane).** When the panel is narrow, the two versions stack full-width instead
+  of being squeezed into unreadable columns, and the per-row choices become a
+  compact strip — a color dot plus a short word, with the legend mapping each
+  color to the real side name. Sync-copy names like
+  `sync-conflict-20260705-141233-A2B2C3D` now read "Sync copy · Jul 5"
+  everywhere (the exact file tag stays as a tooltip).
+
+- **The startup conflict notices are gone.** The two toasts that appeared on
+  every graph open while conflict copies or merge-marker files existed
+  duplicated what the conflicts badge, the in-page review, and its pinned
+  notice already say — and pointed at Settings instead of the in-page
+  resolver. A toast still appears when a *new* conflict arrives mid-session,
+  and for duplicate journal days (which have no other surface).
+
+- **"Apply all suggested" no longer sweeps up a merge tool's own proposed
+  text.** A Fossil `SUGGESTED CONFLICT RESOLUTION` body (labeled *Merged
+  (tool)*) keeps whatever you set on that row; only your per-row choice (or
+  the initial pre-selection you confirm) accepts text Tine did not compute
+  itself.
+
+### Fixed
+
+- **A settings change can no longer overwrite a `config.edn` that arrived while
+  it was being written.** Tine re-read the file before saving, but an external
+  writer — Syncthing delivering a peer's copy, Logseq, an editor — could still
+  land in the moment between that check and the write, and its changes vanished
+  with no warning. Tine now publishes the file only if it still holds what it
+  read, and otherwise re-applies your change on top of theirs. If a crash
+  interrupts a write, the file is restored on next open rather than left
+  missing.
+
+- **Renaming a page no longer edits pages that are mid-merge.** A page whose
+  file still contains unresolved merge-conflict markers is left exactly as it
+  is instead of having its links rewritten inside both sides of the conflict.
+  The rename still completes everywhere else, and a notice tells you how many
+  conflicted pages still point at the old name.
+
+
+- **Split panes whose content fits no longer show a useless vertical
+  scrollbar** (GH #369 — the reporter's dashboard of short panes like "Lines"
+  and "GRID" each carried a permanent bar). The end-of-page editing slack now
+  measures against each pane's own height (flex spacer in the pane scroller)
+  instead of the window (`40vh`): a pane up to ~60% full shows no bar at all,
+  a near-full pane keeps at most 40%-of-pane of breathing-room range, and a
+  long pane still scrolls independently and its tail can scroll ~40% of the
+  pane up off the bottom edge while editing.
+
+- **Advanced queries using `:inputs [:current-page]` now follow the focused
+  pane** (GH #301). Tine binds Logseq's standard current-page page/ref
+  relationship, reruns it on focused-page navigation, and keeps ordinary date
+  inputs typed and unchanged.
+
+- **A graph's Home page setting now follows the graph between devices** (GH
+  #269). Tine reads and writes Logseq's `:default-home {:page "..."}` entry in
+  `logseq/config.edn`, preserves other keys in that map, and safely migrates an
+  older device-local setting after the graph opens.
+- **Resolving merge markers inside Tine now stages the pre-resolution file in
+  the recoverable trash** (Settings → Backups & recovery), so the sides you
+  did not choose stay recoverable — the same guarantee resolving a sync
+  conflict copy already had.
+- **Adding a highlight no longer rewrites a PDF notes page that carries
+  unresolved VCS merge markers.** The write is refused like any other save to
+  a quarantined page; previously it silently lifted the quarantine while the
+  merge was still unresolved in git/Fossil.
+- **Conflict review no longer freezes on blocks with extremely long single
+  lines.** Comparing candidate rows now caps at the first 512 characters per
+  line (a 64 KB one-line block previously stalled the conflict panel for
+  seconds to minutes), oversized flat pages avoid a slow exact-alignment
+  cliff, and all conflict-review reads moved off the UI's request thread.
+
+- **Managed-storage startup failures now keep their real recovery cause and stop looking active** (GH #370). A core reopen can return a typed retryable/refused result without a serving actor; startup previously wrapped that non-serving result in a managed graph slot and then replaced its useful cause with the generic “managed storage is not ready” page-readiness error. It now refuses before publication with the original redacted diagnostic, keeps the Direct Files escape available, and freezes the elapsed time when the operation reaches its terminal failure instead of counting upward indefinitely.
+
 ## [0.6.95] - 2026-08-23
 
 ### Added
@@ -41,7 +467,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Ctrl/Cmd+click on an internal link now opens a background tab everywhere** (GH #283). One standard pointer contract now covers page links, block refs, references, search results, Favorites, Recent, namespace crumbs and query group headers alike: plain click navigates, Shift+click opens the right sidebar, Ctrl(Win/Linux)/Cmd(macOS)+click opens a background tab — as does middle-click — and right-click keeps the explicit destination menu. (Behavior change note: Ctrl+click on a rendered `[[page]]` or `((block))` link previously opened the other pane; pane opening remains available through context menus and the window/pane gestures.)
 
-- **Block embeds now track their source block's collapse state live** (GH #360). Folding or unfolding a source block updates every visible embedding of it immediately — no page leave/re-open needed. Folding a block inside one embed remains yours alone: it never touches the source block or another embed of it, is never written to `collapsed::`/disk, and resets when that embed remounts or the app reloads; the next collapse change on the source reclaims authority everywhere.
+- **Block embeds now track their source block's collapse state live and keep each occurrence's own fold** (GH #360). Before you change an embed locally it follows source folding immediately. Folding or unfolding that embedded root then stores an explicit `collapsed:: true` or `collapsed:: false` on the block containing the embed, so the choice survives reload independently of the source and other occurrences; the referenced source block is never changed.
+
+- **PDF annotations are usable on mobile** (GH #191). Finishing a native touch text selection now opens the highlight color chooser, and long-pressing an existing text or area highlight opens the same recolor, remove, Copy ref, and Linked references actions as desktop. Touch-sized controls stay inside the phone viewport; desktop mouse and context-menu behavior is unchanged. The earlier mobile Close/Back escape fix remains intact.
 
 - **Queries with `<% current page %>` rerun when you navigate** (GH #301). A query that explicitly carries the `<% current page %>` dyvar now binds it to the page in the focused pane — so a sidebar (or any open) query like "everything on #current page tagged #pin" updates as you move between pages. The authored query text is untouched, queries without the dyvar don't rerun on navigation, and a delayed result from the previous page can never leak into the new page's view. (`:query-page` remains bound to the block owning the query; the EDN `:inputs [:current-page]` advanced form is still outside the engine's entity binding and is documented in the issue thread.)
 

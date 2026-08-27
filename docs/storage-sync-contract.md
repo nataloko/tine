@@ -118,6 +118,13 @@ manifest tail. The pre-0.7 share and join implementations compile only in
 tests. A production decoder may still recognize an old descriptor so it can
 give a bounded migration refusal, but it cannot use that descriptor to reopen
 the retired runtime; the user must Return to Direct Files and share again.
+The descriptor anchors the immutable enrollment baseline; it does not freeze
+the state a later device must already contain. Before comparing or installing,
+a clean join collects every valid descriptor-bound provider head and replays
+the union of their reachable manifest tails. The joining Markdown/Org graph is
+compared with that current reconstructed provider frontier, so an external edit
+published after share setup cannot make an already-synchronized device look
+divergent merely because it no longer matches the enrollment-time baseline.
 Both successful enrollment cuts intentionally retire the actor that entered
 them. Tauri must reopen the durable result, prove ordinary page inventory/load,
 and atomically replace the exact predecessor graph slot before reporting share
@@ -298,6 +305,27 @@ property, tag, and search facts accepted by managed storage's disposable
 projection; it contains no binding, oplog frontier, sync role, or authority
 stamp. Markdown/Org remains the sole Direct Files authority.
 
+Direct editor replacement briefly retains the old live inode as
+`.<target>.<pid>.<sequence>.editor-recovery` and the proposed bytes as the
+matching `editor-staged-recovery` name. Checked Direct Files open reconciles
+only that complete producer shape through retained no-follow capabilities. If
+the live target is absent and exactly one artifact claims it, that exact inode
+is restored with no-replace. Multiple claims for an absent target remain in
+place for explicit recovery; when a live target exists, every artifact is moved
+unchanged to typed conflict trash. Every move rechecks the artifact's physical
+identity and single-link status immediately before publication. A suffix
+lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
+or failed identity recheck is never deleted or selected as authority.
+
+For an existing Direct editor save, the initial exact-file read supplies the
+serialization baseline. The late external-writer proof is the atomic
+retirement itself: after the expected physical owner is detached from the live
+name, Tine reads that retained inode and compares it byte-for-byte with the
+baseline before publishing. A mismatch restores the same inode when possible
+and mints a conflict from the retained snapshot. There is no separate
+pre-retirement full-file reread; creates, unpinned auxiliary writes, and managed
+projections keep their independent recheck rules.
+
 The existing parsed `PageEntry + Arc<Document>` cache feeds one background
 SQLite owner. The database retains each page's exact caller-owned content
 revision together with the Direct fact-extractor version as disposable adapter
@@ -413,13 +441,24 @@ fallback.
    then publishes the one shared descriptor and records the matching local
    phase.
 2. **Direct/explicit join → Joining (joiner).** The joiner reads that exact
-   descriptor, reconstructs the descriptor-bound baseline and causal
+   descriptor. Before bootstrapping the descriptor's authority, it renames any
+   app-private managed root that is not selected by the Direct Files slot into
+   `sparse-v2-recovery`; this includes an interrupted activation candidate and
+   a complete predecessor retained after an explicit Direct Files selection.
+   The move preserves the predecessor whole and prevents its clean activation
+   marker from being reopened under the descriptor's different identities.
+   The joiner then reconstructs the descriptor-bound baseline and causal
    manifest/object closure in a private staging area, and replays it to the
    advertised frontier. Before replacing local managed authority it compares
    the complete disk-expressible page/outline semantics with the currently
    synchronized Markdown/Org graph. A mismatch leaves both authorities
    unchanged; equality installs the provider history without rewriting graph
-   bytes. Local-only endpoint and device identities remain local.
+   bytes. A refusal's shareable first line reports complete page and mismatch
+   category counts. Local diagnostics additionally name at most 32 differing
+   relative paths and whether each is local-only, shared-only, or differs in
+   kind, preamble, outline, or externally supplied block IDs; they never print
+   note content or UUID values. Local-only endpoint and device identities
+   remain local.
 3. **SharePrepared/Joining → SharedActive.** Each device records its role
    (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
    shared identity; local endpoint/device IDs remain local.
@@ -551,9 +590,11 @@ first durable step:
 | This device is itself sharing, joining, or holding an unfinished cut | Adopting would abandon devices joined to this one; finish or return to Direct Files first. |
 | This device is already in Direct Files | There is no managed history to set aside; use the ordinary join. |
 
-Every one of those strings is a single line and carries a diagnostic-class word,
-because the panel keeps only a native message's first line and drops lines with
-no recognised class.
+Every user-facing first line carries a diagnostic-class word, because the panel
+keeps only that first line and drops lines with no recognised class. A refusal
+may append the bounded local-only diagnostic continuation defined in §2.3; it
+is written to the detailed local trace and is not copied into the panel or the
+privacy-safe flight recorder.
 
 ### 2.4 Lazy activation and clean runtime boundary
 
@@ -656,6 +697,30 @@ The clean runtime has no completed-path index: a receiver-local completion that
 belongs to a superseded source batch remains durable historical receipt evidence
 but is not required to replay as the later merged point authority merely to
 perform a nonexistent index update.
+
+File synchronizers deliver the visible Markdown/Org projection and the hidden
+provider history independently. Before classifying concurrent semantic edits,
+the runtime drains every provider operation already visible in the current
+provider observation; an intermediate operation must not be resolved while its
+causal descendant is waiting in the same delivered cut. If a projection-first
+external admission and provider history reach the same authored block text,
+they are one semantic edit and collapse to one block. The same applies when a
+later operation on one branch reaches the other branch's exact authored text.
+Only genuinely different final authored texts use keep-both siblings. Such a
+sibling has deterministic conflict-pair identity so later convergence can
+retire it, but retirement is permitted only while its text is unchanged and it
+has no children; any user-touched sibling remains user data.
+
+Concurrent new blocks may legitimately choose the same sibling-order key.
+Projection orders that temporary merged state by `(order key, block identity)`;
+equal order keys are not corruption and must not block provider recovery. A
+new-block projection echo collapses only when one concurrent batch is an
+external reconciliation, the other is an ordinary local mutation, both carry
+the same complete projected bytes for the same page, and their newly created
+unstamped forests have the same structure and content. The unchanged external
+forest is then retired by an ordinary durable semantic operation. Different
+projected bytes, explicit Logseq identities, or a changed external subtree are
+preserved for ordinary conflict handling.
 
 **An applied provider batch always owes a Markdown projection.** The same rule
 holds on the receiving side, and there it is a durability rule rather than a
@@ -776,9 +841,14 @@ path.
 
 The clean engine does not hydrate those baseline UUID introductions into a
 resident identity map. During ordinary operation the exact-frontier SQLite
-projection supplies bounded baseline candidates, the engine unions them with
-post-baseline introductions from committed manifests, and current CRDT block
-state decides whether a candidate is live and unique. If disposable SQLite is
+projection supplies bounded baseline candidates for planning, authoring,
+commit validation, and every manifested projection drain; the engine unions
+them with post-baseline introductions from committed manifests, and current
+CRDT block state decides whether a candidate is live and unique. This includes
+replaying a retained projection after an interrupted manifest-committed
+UUID-bearing edit or move: derivative Markdown authorization asks the current
+SQLite projection for the baseline claimant rather than treating the
+index-free hot suffix as the whole claim history. If disposable SQLite is
 missing or corrupt, terminal reconstruction derives one rebuild-scoped
 candidate snapshot from the immutable lazy-genesis capsules, including every
 ambiguous claimant, and drops it when SQLite publication finishes. That
@@ -795,7 +865,10 @@ ambiguous baseline claims remain unresolved after reconstruction.
 2. The immutable oplog is the source of truth for managed page/journal content,
    IDs, names/paths, references, and properties. Markdown is a projection when
    managed mode is active. Assets, PDF sidecars, `config.edn`, and app settings
-   retain their separate authorities.
+   retain their separate authorities. Merely opening a PDF reads its asset-side
+   state and does not create an empty semantic `hls__` page; the first
+   annotation write creates or updates that page through the paired sidecar and
+   managed-page publication path.
 3. SQLite, runtime scratch, and transient projection receipts are disposable.
    Deleting or version-mismatching one may cause exactly one bounded rebuild,
    never a second rebuild on the following open. A complete rebuild must be
@@ -1343,16 +1416,20 @@ The ordinary release suite tests the clean baseline-plus-manifest runtime,
 including activation, cold reopen, editor/application saves, external
 reconciliation, cross-page moves, graph/PDF/guide reads, sharing, late join,
 restart, and clean shutdown. Every current and newly added non-ignored
-`tine-core` test is selected automatically. The frozen pre-0.7 actor failure
+`tine-core` test is selected automatically. The known-red legacy actor failure
 corpus remains a regression oracle for the retirement campaign, but retired
 enrollment, Patricia, persistent projection-work, and promoted-runtime
 mechanics are not compiled production alternatives and cannot redefine the
 release contract. The only tests the release gate does not run are enumerated
-by name in `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+by behavior family and exact name in
+`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` in
 `scripts/tine-core-nextest-contract.mjs`; the contract fails both on any other
-omission and on a listed name with no test behind it. Architectural guards that
-bind this document to the code therefore enter the release suite without a
-second hand-maintained allowlist.
+omission and on a listed name with no test behind it. The 2026-08-25 honest
+unfiltered run established the current boundary: 2,071 passing, 45 normally
+failing, 41 ignored, and no hangs or timeouts. A legacy-oracle failure does not
+authorize a production change without an independent current-runtime
+fail-before. Architectural guards that bind this document to the code therefore
+enter the release suite without a second hand-maintained allowlist.
 
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
 20. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,

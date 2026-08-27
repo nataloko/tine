@@ -21,7 +21,7 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "Embedded blocks keep local disclosure, keyboard navigation, deletion, and caret ownership in the visible embed.",
+     "userOutcome": "Embedded blocks persist each occurrence's root disclosure on its host across reload without changing the source, while keyboard navigation, deletion, and caret ownership stay in the visible embed.",
      "blocking": true
     }
    ],
@@ -30,6 +30,23 @@
    ],
    "nonRequirements": [
     "Exact indentation pixels or disclosure-icon artwork."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-compat-home-current-page.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A Logseq-compatible config.edn home page controls startup without losing sibling configuration, and an advanced :inputs [:current-page] query resolves against that focused page through the native query engine.",
+     "blocking": true,
+     "authority": "Logseq config.edn :default-home and advanced query input compatibility contract"
+    }
+   ],
+   "acceptableVariations": [
+    "Settings layout and query-result presentation may evolve while graph-owned home configuration and focused-page binding remain exact."
+   ],
+   "nonRequirements": [
+    "Exact control geometry, startup timing, or query result styling."
    ],
    "stability": "stable"
   },
@@ -95,6 +112,22 @@
    ],
    "nonRequirements": [
     "Any end-user product workflow by itself."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-capabilities.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Shared E2E harness helpers keep one exact capability spelling, one launch-arg shape, one preview-server readiness wait, and one frame-extents parse core across every suite.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Helper signatures and per-suite session names may evolve while the shared spellings stay byte-identical to the platform contracts and the strict/lax frame-extents policy stays an explicit call-site choice."
+   ],
+   "nonRequirements": [
+    "Any product UI journey, a live WebDriver session, or a live window manager by itself."
    ],
    "stability": "stable"
   },
@@ -341,6 +374,12 @@
      "class": "stateful-ux",
      "userOutcome": "A native Linux titlebar close uses Tine's safe persistence path and closes the real window.",
      "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "The production app creates a schema-v1 diagnostic report without the fixture graph path or content and without automatic upload.",
+     "blocking": true,
+     "authority": "ADR 0058 and docs/diagnostics-contract.md"
     }
    ],
    "acceptableVariations": [
@@ -914,7 +953,7 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after managed-storage activation and after returning to Direct Files.",
+     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
      "blocking": true
     }
    ],

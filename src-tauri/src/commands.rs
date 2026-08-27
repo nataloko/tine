@@ -1262,6 +1262,21 @@ fn report_direct_save_diagnostics(
         Some(error) => tine_core::model::direct_save_failure_code(error),
         None => "ok",
     };
+    crate::debug::record_direct_save(
+        outcome,
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        u64::try_from(report.complete_builds).unwrap_or(u64::MAX),
+        u64::try_from(report.exact_updates).unwrap_or(u64::MAX),
+        report.invalidated,
+        report
+            .last_build
+            .as_ref()
+            .map(|build| u64::try_from(build.captured_entries).unwrap_or(u64::MAX)),
+        report
+            .last_build
+            .as_ref()
+            .map(|build| u64::try_from(build.captured_bytes).unwrap_or(u64::MAX)),
+    );
     let build = report.last_build.map_or_else(
         || " last_build=none".to_string(),
         |build| {
@@ -1724,22 +1739,26 @@ pub(crate) async fn rename_page(
     new: String,
     expected_path: Option<String>,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<tine_core::model::RenameOutcome, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         match sparse_application_handle(&slot)? {
+            // Managed storage has no VCS-marker quarantine (markers are an
+            // on-disk Direct Files concept), so it never skips a referrer and
+            // the empty report is accurate rather than a stand-in.
             Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
                 SyncApplicationGraphMutationRequest::RenamePage {
                     old,
                     new,
                     expected_path,
                 },
-            )),
+            ))
+            .map(|()| tine_core::model::RenameOutcome::default()),
             None => slot
                 .legacy_graph()?
-                .rename_page_expected(&old, &new, expected_path.as_deref())
+                .rename_page_reporting(&old, &new, expected_path.as_deref())
                 .map_err(|e| e.to_string()),
         }
     })
@@ -2343,6 +2362,27 @@ pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Resu
 }
 
 #[tauri::command]
+pub(crate) fn set_favorites_page(name: String, state: GraphContext<'_>) -> Result<(), String> {
+    with_config_graph(&state, |g| {
+        g.set_favorites_page(&name).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn set_default_home(
+    name: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    with_config_graph(&state, |graph| {
+        graph
+            .set_default_home_page(name.as_deref())
+            .map_err(|error| error.to_string())
+    })?;
+    refresh_graph(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,
@@ -2675,15 +2715,12 @@ pub(crate) async fn list_templates(
     .map_err(|error| error.to_string())?
 }
 
+/// Managed command loading recognizes `key:: value` lines through the one
+/// shared recognizer (tine-core `doc::parse_property_line`, transcribed from
+/// lsdoc) instead of a local copy — the two had drifted on leading whitespace,
+/// Unicode keys and dotted keys (DUP-7).
 fn application_property_line(line: &str) -> bool {
-    let Some(separator) = line.find("::") else {
-        return false;
-    };
-    let key = line[..separator].trim();
-    !key.is_empty()
-        && key.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
-        })
+    tine_core::doc::parse_property_line(line).is_some()
 }
 
 fn application_blocks_have_content(blocks: &[BlockDto]) -> bool {
@@ -3846,24 +3883,40 @@ pub(crate) fn list_vcs_marker_conflicts(
 /// that needs the user's judgement — conflict copies AND marker-bearing pages —
 /// behind the calm badge and the in-page resolver. Derived on every call from
 /// what is on disk, so it survives restarts without storing anything.
+///
+/// Async + `spawn_blocking`: deriving the queue block-diffs every conflicted
+/// page, so a pathological page must stall a worker thread, never the main
+/// IPC thread (audit 2026-08-24, finding A3).
 #[tauri::command]
-pub(crate) fn conflict_queue(
+pub(crate) async fn conflict_queue(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::concord_queue::ConflictObject>, String> {
-    with_filesystem_graph(&state, |g| Ok(g.conflict_queue()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| Ok(g.conflict_queue()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Block-level diff of a marker-bearing page's own sides (Concord L5): the
 /// marker sections are parsed into complete page texts and run through the SAME
 /// block diff the conflict-copy path uses. Read-only.
 #[tauri::command]
-pub(crate) fn vcs_marker_conflict_diff(
+pub(crate) async fn vcs_marker_conflict_diff(
     path: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::concord_queue::MarkerConflictDiff>, String> {
-    with_filesystem_graph(&state, |g| {
-        g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string()))
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Apply the user's per-row decisions to a marker-bearing page, writing the
@@ -3891,13 +3944,7 @@ pub(crate) async fn resolve_vcs_marker_conflict(
                 &base_rev,
                 pre_choice.as_deref().unwrap_or("union"),
             )
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "conflict".to_string()
-                } else {
-                    error.to_string()
-                }
-            })
+            .map_err(direct_save_error_message)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3906,15 +3953,78 @@ pub(crate) async fn resolve_vcs_marker_conflict(
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
 /// relative paths) — the data behind the two-column merge UI. Read-only.
 #[tauri::command]
-pub(crate) fn sync_conflict_diff(
+pub(crate) async fn sync_conflict_diff(
     winner: String,
     conflict: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
-    with_filesystem_graph(&state, |g| {
-        g.sync_conflict_diff(&winner, &conflict)
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| {
+            g.sync_conflict_diff(&winner, &conflict)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Two-way diff of a duplicate journal day's canonical file against one of its
+/// strays — the data behind the same two-column merge UI the sync-copy path
+/// uses. `Ok(None)` when the pair cannot be merged at all (a cross-format
+/// `.md`/`.org` twin), which the UI renders as file rows without row choices.
+/// Read-only.
+#[tauri::command]
+pub(crate) async fn duplicate_journal_diff(
+    canonical: String,
+    stray: String,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| {
+            g.duplicate_journal_diff(&canonical, &stray)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Fold one stray of a duplicate journal day into that day's canonical file with
+/// the user's per-row decisions, moving the stray to recoverable trash. Guarded
+/// so it can only ever touch two files of the SAME duplicate day.
+#[tauri::command]
+pub(crate) async fn resolve_duplicate_journal_day(
+    canonical: String,
+    stray: String,
+    decisions: std::collections::HashMap<String, String>,
+    base_rev: String,
+    stray_rev: String,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.legacy_graph()?
+            .resolve_duplicate_journal_day(
+                &canonical,
+                &stray,
+                &decisions,
+                &base_rev,
+                &stray_rev,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
             .map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Block-level diff of two raw page texts — a pure function of its inputs,
@@ -3923,80 +4033,109 @@ pub(crate) fn sync_conflict_diff(
 /// anything else means markdown. Revs are `content_rev` of the exact inputs,
 /// the same staleness tokens `Graph::sync_conflict_diff` issues.
 #[tauri::command]
-pub(crate) fn text_block_diff(
+pub(crate) async fn text_block_diff(
     mine: String,
     theirs: String,
     format: Option<String>,
-) -> tine_core::sync_diff::SyncConflictDiff {
-    tine_core::sync_diff::diff_texts(&mine, &theirs, format.as_deref() == Some("org"))
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        tine_core::sync_diff::diff_texts(&mine, &theirs, format.as_deref() == Some("org"))
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// 3-way variant of [`text_block_diff`]: classifies each aligned row against
 /// `base` (the last-agreed text) and carries per-row suggestions the UI may
 /// pre-select — never auto-apply. See ADR 0056.
 #[tauri::command]
-pub(crate) fn text_block_diff3(
+pub(crate) async fn text_block_diff3(
     base: String,
     mine: String,
     theirs: String,
     format: Option<String>,
-) -> tine_core::sync_diff::SyncConflictDiff {
-    tine_core::sync_diff::diff3_texts(&base, &mine, &theirs, format.as_deref() == Some("org"))
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        tine_core::sync_diff::diff3_texts(&base, &mine, &theirs, format.as_deref() == Some("org"))
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Diff a retained live Direct Files draft against the exact disk observation
 /// that refused its save. The authority is inspected, never consumed.
 #[tauri::command]
-pub(crate) fn live_save_conflict_diff(
+pub(crate) async fn live_save_conflict_diff(
     page: PageDto,
     base_rev: Option<String>,
     conflict_epoch: u64,
     state: GraphContext<'_>,
 ) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
-    with_filesystem_graph(&state, |graph| {
-        graph
-            .live_save_conflict_diff(
-                &page,
-                base_rev.as_deref(),
-                tine_core::ConflictOverride {
-                    observation_epoch: conflict_epoch,
-                },
-            )
-            .map_err(|error| error.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|graph| {
+            graph
+                .live_save_conflict_diff(
+                    &page,
+                    base_rev.as_deref(),
+                    tine_core::ConflictOverride {
+                        observation_epoch: conflict_epoch,
+                    },
+                )
+                .map_err(|error| error.to_string())
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn capture_live_save_conflict(
+pub(crate) async fn capture_live_save_conflict(
     page: PageDto,
     base_rev: Option<String>,
     conflict_epoch: u64,
     state: GraphContext<'_>,
 ) -> Result<tine_core::LiveSaveConflictCapture, String> {
-    with_filesystem_graph(&state, |graph| {
-        graph
-            .capture_live_save_conflict(
-                &page,
-                base_rev.as_deref(),
-                tine_core::ConflictOverride {
-                    observation_epoch: conflict_epoch,
-                },
-            )
-            .map_err(|error| error.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|graph| {
+            graph
+                .capture_live_save_conflict(
+                    &page,
+                    base_rev.as_deref(),
+                    tine_core::ConflictOverride {
+                        observation_epoch: conflict_epoch,
+                    },
+                )
+                .map_err(|error| error.to_string())
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn durable_live_save_conflict_diff(
+pub(crate) async fn durable_live_save_conflict_diff(
     page: PageDto,
     base_text: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
-    with_filesystem_graph(&state, |graph| {
-        graph
-            .durable_live_save_conflict_diff(&page, base_text.as_deref())
-            .map_err(|error| error.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|graph| {
+            graph
+                .durable_live_save_conflict_diff(&page, base_text.as_deref())
+                .map_err(|error| error.to_string())
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -4058,7 +4197,7 @@ pub(crate) async fn resolve_live_save_conflict(
 }
 
 /// Resolve a sync-conflict copy: merge it into its winner per the user's per-row
-/// `decisions` (row id → "mine"/"theirs"/"both") via the normal save path, then
+/// `decisions` (row id → "mine"/"theirs"/"both"/"merged") via the normal save path, then
 /// trash the conflict copy. `base_rev` guards against the winner changing under
 /// the merge; returns "conflict" if it did. `pre_choice`: "mine"/"theirs"/"union".
 #[tauri::command]
@@ -4068,6 +4207,7 @@ pub(crate) async fn resolve_sync_conflict(
     decisions: std::collections::HashMap<String, String>,
     base_rev: String,
     conflict_rev: String,
+    merge_base_rev: Option<String>,
     pre_choice: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<PageDto, String> {
@@ -4106,15 +4246,10 @@ pub(crate) async fn resolve_sync_conflict(
                     &decisions,
                     &base_rev,
                     &conflict_rev,
+                    merge_base_rev.as_deref(),
                     pre_choice.as_deref().unwrap_or("union"),
                 )
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        "conflict".to_string()
-                    } else {
-                        error.to_string()
-                    }
-                }),
+                .map_err(direct_save_error_message),
         }
     })
     .await

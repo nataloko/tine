@@ -1,5 +1,5 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
-import { createSignal, useContext } from "solid-js";
+import { createMemo, createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
 import type {
   ConflictObject,
@@ -12,6 +12,9 @@ import type {
 } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
+import { pageIdentityKey } from "./pageIdentity";
+import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
+import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
 import { route, focusBlock, openPageTarget, scheduleSessionSave, type PageTarget } from "./router";
 import { PaneContext } from "./paneContext";
@@ -20,6 +23,7 @@ import { setJournalTitleFormat, isJournalTitle } from "./journal";
 import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawerFocus, type DrawerSide } from "./mobileDrawers";
 import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
+import type { ExportNode } from "./editor/exportText";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -318,7 +322,7 @@ export function changeJournalTitleFormat(fmt: string) {
       // rebind and not just a repaint: anything still in flight against the old
       // binding is now aimed at paths that may not exist.
       notifyGraphRebound();
-      void refreshJournalConflicts(true); // surface any days the migration couldn't merge
+      void refreshJournalConflicts(); // the queue surfaces any day the migration couldn't merge
     })
     .catch(() => {});
 }
@@ -328,18 +332,18 @@ export function changeJournalTitleFormat(fmt: string) {
 // the user to reconcile; we surface them rather than letting a day silently show
 // twice in the feed. ---
 export const [journalConflicts, setJournalConflicts] = createSignal<JournalConflict[]>([]);
-/** Re-fetch the duplicate-journal-day list; with `notify`, toast if any exist. */
-export async function refreshJournalConflicts(notify = false): Promise<void> {
+/** Re-fetch the duplicate-journal-day list.
+ *
+ *  No longer toasts. Duplicate days became conflict-queue objects, so they
+ *  reach the user the same calm way every other standing conflict does — the
+ *  badge, the dock, and the in-page panel on the day itself — instead of a
+ *  sticky startup toast that could only point at Settings. Same reasoning as
+ *  the sync-conflict startup toast removed on 2026-08-24 (`ed550670`); it was
+ *  kept here only until this day had a surface of its own. The Settings list
+ *  stays as the fallback, exactly as Backups does for sync copies. */
+export async function refreshJournalConflicts(): Promise<void> {
   try {
-    const c = await backend().listJournalConflicts();
-    setJournalConflicts(c);
-    if (notify && c.length) {
-      pushToast(
-        `${c.length} journal day${c.length === 1 ? "" : "s"} have duplicate files in different formats — reconcile them in Settings → Backups & recovery`,
-        "info",
-        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
-      );
-    }
+    setJournalConflicts(await backend().listJournalConflicts());
   } catch {
     /* best-effort */
   }
@@ -512,18 +516,12 @@ export function conflictObjectFor(
 // Where the badge left off, so repeated clicks WALK the queue instead of parking
 // on its first item. Transient session state: the queue itself is derived.
 let conflictCursor = 0;
-let syncConflictInventoryToast: number | undefined;
-let vcsConflictInventoryToast: number | undefined;
 const artifactArrivalToasts = new Map<number, Set<string>>();
 // Inventory calls include several awaited filesystem walks. Only the newest
 // refresh episode may publish: a conflicts-changed scan begun before Apply can
 // otherwise finish after the guarded native resolution and resurrect the exact
 // conflict object the user just settled.
 let artifactConflictRefreshGeneration = 0;
-
-function retireToast(id: number | undefined): void {
-  if (id !== undefined) dismissToast(id);
-}
 
 /** Sticky conflict notices describe live derived objects, not history. Retire
  * them when the objects disappear so a successful resolution cannot leave a
@@ -548,18 +546,21 @@ export function settleArtifactConflict(id: string): void {
   ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
   resetConflictCursor();
-  if (settled.source === "sync-copy") {
-    const copy = settled.sides.find((side) => side.role === "theirs")?.path;
-    if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
-    if (!syncConflicts().length) {
-      retireToast(syncConflictInventoryToast);
-      syncConflictInventoryToast = undefined;
+  switch (settled.source) {
+    case "sync-copy": {
+      const copy = settled.sides.find((side) => side.role === "theirs")?.path;
+      if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
+      break;
     }
-  } else if (settled.source === "vcs-markers") {
-    setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
-    if (!vcsMarkerConflicts().length) {
-      retireToast(vcsConflictInventoryToast);
-      vcsConflictInventoryToast = undefined;
+    case "vcs-markers":
+      setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+      break;
+    case "live-save":
+    case "duplicate-journal":
+      break;
+    default: {
+      const unhandled: never = settled.source;
+      throw new Error(`unsupported conflict source: ${String(unhandled)}`);
     }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
@@ -596,30 +597,21 @@ export async function refreshConflictQueueIfTouched(
   if (touched) await refreshSyncConflicts();
 }
 
-/** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
-export async function refreshSyncConflicts(notify: boolean | "new" = false): Promise<void> {
+/** Re-fetch the sync-conflict + VCS-marker lists (and the Concord queue below).
+ *
+ *  With `notify === "new"`, toast for conflict copies that newly ARRIVED
+ *  mid-session — the one moment nothing else announces (the badge just ticks,
+ *  and on a phone the sidebar is hidden). There is deliberately no toast for
+ *  the standing inventory: the calm badge, the in-page panel, its pinned dock
+ *  bar, and the marker banner already carry it, and the pre-Concord startup
+ *  toasts routed to the Settings FALLBACK surface while demanding a dismissal
+ *  on every graph open (removed 2026-08-24, Martin's call). */
+export async function refreshSyncConflicts(notify: "new" | false = false): Promise<void> {
   const generation = ++artifactConflictRefreshGeneration;
   try {
     const c = await backend().listSyncConflicts();
     if (generation !== artifactConflictRefreshGeneration) return;
     setSyncConflicts(c);
-    if (!c.length) {
-      retireToast(syncConflictInventoryToast);
-      syncConflictInventoryToast = undefined;
-    } else if (notify === true && syncConflictInventoryToast === undefined) {
-      const id = pushToast(
-        `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
-        "info",
-        {
-          sticky: true,
-          action: { label: "Open", run: () => openSettings("backups") },
-          onDismiss: () => {
-            if (syncConflictInventoryToast === id) syncConflictInventoryToast = undefined;
-          },
-        }
-      );
-      syncConflictInventoryToast = id;
-    }
   } catch {
     /* best-effort */
   }
@@ -627,23 +619,6 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
     const m = await backend().listVcsMarkerConflicts();
     if (generation !== artifactConflictRefreshGeneration) return;
     setVcsMarkerConflicts(m);
-    if (!m.length) {
-      retireToast(vcsConflictInventoryToast);
-      vcsConflictInventoryToast = undefined;
-    } else if (notify === true && vcsConflictInventoryToast === undefined) {
-      const id = pushToast(
-        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; open the page to resolve the merge block by block`,
-        "info",
-        {
-          sticky: true,
-          action: { label: "Open", run: () => openSettings("backups") },
-          onDismiss: () => {
-            if (vcsConflictInventoryToast === id) vcsConflictInventoryToast = undefined;
-          },
-        }
-      );
-      vcsConflictInventoryToast = id;
-    }
   } catch {
     /* best-effort */
   }
@@ -870,9 +845,15 @@ export function closePageProps() {
 
 // "Copy / export as" modal — a live-preview text export of a block subtree or a
 // multi-block selection, with indent-style + remove options (mirrors OG Logseq).
-export const [exportModal, setExportModal] = createSignal<{ ids: string[] } | null>(null);
+// Two sources: store block ids (page/block gestures) or a prebuilt node forest
+// (GH #348 reference batch export, whose blocks are backend DTOs, not store ids).
+export type ExportRequest = { ids: string[] } | { nodes: ExportNode[]; count: number };
+export const [exportModal, setExportModal] = createSignal<ExportRequest | null>(null);
 export function openExportModal(ids: string[]) {
   if (ids.length) setExportModal({ ids });
+}
+export function openExportNodesModal(nodes: ExportNode[], count: number) {
+  if (nodes.length) setExportModal({ nodes, count });
 }
 export function closeExportModal() {
   setExportModal(null);
@@ -1120,22 +1101,46 @@ export interface FavItem {
   kind: PageKind;
 }
 export const [favorites, setFavorites] = createSignal<FavItem[]>([]);
+/** THE membership key for favorites: alias-resolve pages, then fold with
+ *  `pageIdentityKey`, kind-scoped. Every membership decision (star button,
+ *  toggle, delete, rename dedupe) and the sidebar arrangement
+ *  (`favoritesLayout.keyOf`) must agree on this one key — they used to carry
+ *  four different predicates (exact-match, kind-blind, weak lowercase), so a
+ *  page starred as `[[foo]]` showed an unfilled star on `Foo` and clicking
+ *  appended a duplicate (DUP-2, 2026-08-25 duplication audit). */
+export function favoriteKey(name: string, kind: PageKind): string {
+  const canonical = kind === "page" ? resolveAlias(name) : name;
+  return `${kind}\0${pageIdentityKey(canonical)}`;
+}
 export function isFavorite(name: string): boolean {
-  const target = resolveAlias(name);
-  return favorites().some((f) =>
-    f.kind === "page" ? resolveAlias(f.name) === target : f.name === name
-  );
+  return favorites().some((f) => favoriteKey(f.name, f.kind) === favoriteKey(name, f.kind));
 }
 function persistFavorites(next: FavItem[]) {
   // Persist to config.edn :favorites so favorites travel with the graph and stay
   // scoped to it. config.edn stores names only; kind is re-derived on seed.
-  void backend().setFavorites(next.map((f) => f.name)).catch(() => {});
+  const names = next.map((f) => f.name);
+  void backend().setFavorites(names).catch(() => {});
+  // Keep the arrangement (groups and order) in step. On a graph that has never
+  // grouped anything this only updates the in-memory layout — no page is
+  // created, and behaviour is exactly what it was before groups existed.
+  membershipChanged(names);
 }
+// Arrangement changes (reorder, move between groups) project their display
+// order back into the flat list every other consumer reads.
+setMembershipSink((names) =>
+  setFavorites(names.map((name): FavItem => ({ name, kind: isJournalTitle(name) ? "journal" : "page" })))
+);
+/** The arrangement AS RENDERED: the stored groups reconciled against live
+ *  membership on every read. Deriving it rather than storing it is what makes
+ *  it impossible for the sidebar to show a favorite that is no longer favorited,
+ *  or to miss one that is. */
+export const favoritesLayout = createMemo(() =>
+  reconcileLayout(storedFavoritesLayout(), favorites().map((f) => f.name))
+);
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
   const f = favorites();
-  const target = kind === "page" ? resolveAlias(name) : name;
-  const matches = (item: FavItem) => item.kind === kind &&
-    (kind === "page" ? resolveAlias(item.name) === target : item.name === name);
+  const target = favoriteKey(name, kind);
+  const matches = (item: FavItem) => favoriteKey(item.name, item.kind) === target;
   const next = f.some(matches)
     ? f.filter((x) => !matches(x))
     : [...f, { name, kind }];
@@ -1161,7 +1166,10 @@ export function removeDeletedPageFromNavigation(targetOrName: PageTarget | strin
     : targetOrName;
   const name = target.name;
   kind = target.pageKind;
-  const nextFavs = favorites().filter((f) => f.name !== name);
+  // Kind-scoped, identity-folded: deleting a page must not drop a journal
+  // favorite that merely shares the name (was kind-blind exact match, DUP-2).
+  const removed = favoriteKey(name, kind);
+  const nextFavs = favorites().filter((f) => favoriteKey(f.name, f.kind) !== removed);
   if (nextFavs.length !== favorites().length) {
     setFavorites(nextFavs);
     persistFavorites(nextFavs);
@@ -1187,75 +1195,49 @@ export function removeDeletedPageFromNavigation(targetOrName: PageTarget | strin
  * PageTarget calls affect one physical owner; string calls represent a logical
  * rename and also remap case-insensitive namespace descendants. */
 export function renamePageInNavigation(from: PageTarget, to: PageTarget): void;
-export function renamePageInNavigation(from: string, to: string, kind?: PageKind): void;
-export function renamePageInNavigation(
-  fromOrName: PageTarget | string,
-  toOrName: PageTarget | string,
-  kind: PageKind = "page",
-) {
-  const exactTarget = typeof fromOrName !== "string";
+export function renamePageInNavigation(from: string, to: string): void;
+export function renamePageInNavigation(fromOrName: PageTarget | string, toOrName: PageTarget | string) {
   const from: PageTarget = typeof fromOrName === "string"
-    ? { name: fromOrName.trim(), pageKind: kind }
+    ? { name: fromOrName, pageKind: "page" }
     : fromOrName;
   const to: PageTarget = typeof toOrName === "string"
-    ? { name: toOrName.trim(), pageKind: from.pageKind }
+    ? { name: toOrName, pageKind: from.pageKind }
     : toOrName;
-  if (!from.name || !to.name) return;
-  const fromKey = from.name.toLowerCase();
-  const namespacePrefix = `${fromKey}/`;
-
-  const remapName = (
-    name: string,
-    itemKind: PageKind,
-    path: string | undefined,
-    pathAware: boolean,
-  ): string | null => {
-    if (itemKind !== from.pageKind) return null;
-    if (exactTarget) {
-      if (name !== from.name) return null;
-      if (pathAware && from.path !== undefined && path !== from.path) return null;
-      return to.name;
+  const dedupe = (items: FavItem[]): FavItem[] => {
+    const seen = new Set<string>();
+    const out: FavItem[] = [];
+    // Identity-folded on both the rename match and the dedupe key, so a
+    // favorite stored under a different spelling of the renamed page is
+    // re-keyed too, and spelling twins collapse (DUP-2).
+    const renamed = `${from.pageKind}\0${pageIdentityKey(from.name)}`;
+    for (const item of items) {
+      const next = `${item.kind}\0${pageIdentityKey(item.name)}` === renamed
+        ? { ...item, name: to.name }
+        : item;
+      const key = `${next.kind}\0${pageIdentityKey(next.name)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(next);
     }
-    const key = name.toLowerCase();
-    if (key === fromKey) return to.name;
-    if (key.startsWith(namespacePrefix)) return to.name + name.slice(from.name.length);
-    return null;
+    return out;
   };
 
-  const nextFavorites: FavItem[] = [];
-  let favoritesChanged = false;
-  for (const item of favorites()) {
-    const mapped = remapName(item.name, item.kind, undefined, false);
-    const nextItem = mapped === null ? item : { ...item, name: mapped };
-    if (mapped !== null) favoritesChanged = true;
-    const key = `${nextItem.kind}\0${nextItem.name}`;
-    if (nextFavorites.some((seen) => `${seen.kind}\0${seen.name}` === key)) {
-      favoritesChanged = true;
-      continue;
-    }
-    nextFavorites.push(nextItem);
-  }
-  if (favoritesChanged) {
+  const nextFavorites = dedupe(favorites());
+  if (nextFavorites.some((item, i) => item !== favorites()[i]) || nextFavorites.length !== favorites().length) {
     setFavorites(nextFavorites);
     persistFavorites(nextFavorites);
   }
 
-  const nextRecents: RecentItem[] = [];
-  let recentsChanged = false;
-  for (const item of recentPages()) {
-    const mapped = remapName(item.name, item.kind, item.path, true);
-    const nextItem: RecentItem = mapped === null
-      ? item
-      : { name: mapped, kind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
-    if (mapped !== null) recentsChanged = true;
-    const key = `${nextItem.kind}\0${nextItem.name}`;
-    if (nextRecents.some((seen) => `${seen.kind}\0${seen.name}` === key)) {
-      recentsChanged = true;
-      continue;
-    }
-    nextRecents.push(nextItem);
-  }
-  if (recentsChanged) {
+  const nextRecents = recentPages().reduce<RecentItem[]>((out, item) => {
+    const matches = item.kind === from.pageKind && item.name === from.name
+      && (from.path === undefined || item.path === from.path);
+    const next = matches
+      ? { name: to.name, kind: to.pageKind, ...(to.path ? { path: to.path } : {}) }
+      : item;
+    if (!out.some((seen) => seen.kind === next.kind && seen.name === next.name)) out.push(next);
+    return out;
+  }, []);
+  if (nextRecents.some((item, i) => item !== recentPages()[i]) || nextRecents.length !== recentPages().length) {
     setRecentPages(nextRecents);
     scheduleSessionSave();
   }
@@ -1263,22 +1245,16 @@ export function renamePageInNavigation(
   const seenSidebar = new Set<string>();
   const nextSidebar: SidebarItem[] = [];
   for (const item of rightSidebar()) {
-    const name = item.kind === "page" ? item.name : item.page;
-    const mapped = remapName(name, item.pageKind, item.path, true);
-    let nextItem: SidebarItem = item;
-    if (mapped !== null) {
-      if (item.kind === "page") {
-        const { path: _path, ...rest } = item;
-        nextItem = { ...rest, name: mapped, pageKind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
-      } else {
-        const { path: _path, ...rest } = item;
-        nextItem = { ...rest, page: mapped, pageKind: to.pageKind, ...(exactTarget && to.path ? { path: to.path } : {}) };
-      }
-    }
-    const key = sidebarItemKey(nextItem);
+    const matches = item.kind === "page"
+      ? item.name === from.name && item.pageKind === from.pageKind && (from.path === undefined || item.path === from.path)
+      : item.page === from.name && item.pageKind === from.pageKind && (from.path === undefined || item.path === from.path);
+    const next: SidebarItem = !matches ? item : item.kind === "page"
+      ? { ...item, name: to.name, pageKind: to.pageKind, path: to.path }
+      : { ...item, page: to.name, pageKind: to.pageKind, path: to.path };
+    const key = sidebarItemKey(next);
     if (seenSidebar.has(key)) continue;
     seenSidebar.add(key);
-    nextSidebar.push(nextItem);
+    nextSidebar.push(next);
   }
   if (nextSidebar.some((item, i) => item !== rightSidebar()[i]) || nextSidebar.length !== rightSidebar().length) {
     setRightSidebar(nextSidebar);
@@ -1291,6 +1267,10 @@ export function renamePageInNavigation(
  *  stores names only; kind is re-derived so a favorited journal still routes as a
  *  journal (not a would-be-empty page). */
 export function seedFavorites(names: string[]) {
+  // A seeded membership list always implies a fresh arrangement: an
+  // arrangement built for one graph must never outlive it and re-order
+  // another's favorites. `loadFavoritesLayout` re-populates it right after.
+  resetFavoritesLayout();
   setFavorites(
     names.map((name): FavItem => ({ name, kind: isJournalTitle(name) ? "journal" : "page" }))
   );
@@ -1926,7 +1906,7 @@ export function requestBlockReferences(id: string) {
   setBlockReferencesRequest({ id, token: ++blockReferencesRequestToken });
 }
 
-export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "plugins" | "improve" | "shortcuts" | "about";
+export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "extras" | "plugins" | "improve" | "shortcuts" | "diagnostics" | "about";
 
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 
@@ -2002,16 +1982,9 @@ export const [audioPlayer, setAudioPlayer] =
 
 // Page aliases (alias:: → canonical), keyed by normalized alias; loaded per graph.
 export const [aliasMap, setAliasMap] = createSignal<Record<string, string>>({});
-/** Mirror core `refs::page_key`: trim, Unicode lowercase, remove one boundary
- *  slash at each side, then NFC. Lowercasing is contextual (`ΟΣ` → `ος`). */
-export function pageIdentityKey(name: string): string {
-  const lowered = name.trim().toLowerCase();
-  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
-  const withoutBoundaries = withoutLeading.endsWith("/")
-    ? withoutLeading.slice(0, -1)
-    : withoutLeading;
-  return withoutBoundaries.normalize("NFC");
-}
+// The page-identity fold lives in the dependency-free leaf `pageIdentity.ts`
+// (DUP-2/DUP-8); re-exported here so existing importers keep working.
+export { pageIdentityKey };
 /** Resolve a page name through `alias::` to its canonical page (else unchanged). */
 export function resolveAlias(name: string): string {
   return aliasMap()[pageIdentityKey(name)] ?? name;

@@ -1,13 +1,14 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
-import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, type PaneRouter } from "../router";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
+import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
   isFavorite, toggleFavorite,
-  graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
+  graphEpoch, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
   vcsMarkerConflictFor, conflictObjectFor,
 } from "../ui";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
 import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
@@ -31,6 +32,7 @@ import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
 import { graphBinding } from "../persistence";
+import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -262,6 +264,18 @@ export function PageView(): JSX.Element {
     const r = currentRoute();
     const epoch = graphEpoch(); // reload when the open graph changes
     const binding = graphBinding();
+    const deleteFallbackTrace = markPageDeleteFallbackFetch(pane.paneId, r.kind);
+    const publishReady = (outcome: "ready" | "error") => {
+      setLoadedRoute(r);
+      setReady(true);
+      if (deleteFallbackTrace === null) return;
+      const afterPaint = () => {
+        if (!surfaceAlive || !sameRoute(currentRoute(), r)) return;
+        markPageDeleteFallbackFirstPaint(deleteFallbackTrace, outcome);
+      };
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(afterPaint);
+      else queueMicrotask(afterPaint);
+    };
     setReady(false);
     setLoadError(null);
     // Surface keys are STATIC per pane (matching PaneLeaf's frozen provider
@@ -279,8 +293,7 @@ export function PageView(): JSX.Element {
         if (r.kind === "query") {
           // Query workspaces are rendered by PaneLeaf, not PageView. Keep this
           // guard so the page loader never interprets a virtual route as a file.
-          setLoadedRoute(r);
-          setReady(true);
+          publishReady("ready");
           return;
         } else if (r.kind === "journals") {
           // restartJournalFeed synchronously reads the working set safety gate.
@@ -292,51 +305,60 @@ export function PageView(): JSX.Element {
           if (isGuidePageName(r.name)) {
             await ensureGuidePagesLoaded(true);
             if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-            setLoadedRoute(r);
-            setReady(true);
+            publishReady("ready");
             router.restoreScrollFor(r);
             return;
           }
-          // A path-pinned route (#21) loads that SPECIFIC file — the way to reach a
-          // duplicate-day stray that shares a (kind,name) with the canonical day;
-          // everything else resolves by name as before.
-          const dto = r.path
-            ? await backend().getPageByPath(r.path)
-            : await backend().getPage(r.name, r.pageKind);
-          if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-          if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
-            throw new Error("The selected physical page is no longer available at that path.");
-          }
-          // Core page identity is Unicode-case-insensitive while display names
-          // preserve their original spelling. Alias-map warmup normally
-          // canonicalizes before navigation; this adoption also covers an early
-          // click or restored route that raced that map. Re-route once so the
-          // exact-keyed working set, tab history, Recent, and editor all own the
-          // backend's canonical display name instead of a phantom case variant.
-          if (dto && !r.path && r.pageKind === "page" && dto.name !== r.name) {
-            renamePageInNavigation(r.name, dto.name);
-            router.replaceActiveRoute({ ...r, name: dto.name });
-            return;
-          }
-          // null = page doesn't exist yet → start a fresh empty page. A failed
-          // read throws and is caught below, so we never overwrite a page whose
-          // load errored with empty content.
-          await loadRoutedPage(
-            dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind),
-            binding,
+          const target = pageTargetFromRoute(r)!;
+          // A bullet zoom is navigation WITHIN the exact loaded owner. Re-reading
+          // it races the durable-id save started by persistentBlockRef: stale
+          // pre-save bytes then look like a competing page instance and trigger
+          // the unsaved-changes replacement refusal (GH #354). A restored zoom
+          // has no owner to reuse and still follows the ordinary disk load below;
+          // a path-pinned duplicate only reuses the matching physical file.
+          const reuseLoadedZoomOwner = !!r.block && untrack(() =>
+            pageTargetMatchesLoaded(target, pageByName(r.name))
           );
+          if (!reuseLoadedZoomOwner) {
+            // A path-pinned route (#21) loads that SPECIFIC file — the way to reach a
+            // duplicate-day stray that shares a (kind,name) with the canonical day;
+            // everything else resolves by name as before.
+            const dto = r.path
+              ? await backend().getPageByPath(r.path)
+              : await backend().getPage(r.name, r.pageKind);
+            if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
+            if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
+              throw new Error("The selected physical page is no longer available at that path.");
+            }
+            // Core page identity is Unicode-case-insensitive while display names
+            // preserve their original spelling. Alias-map warmup normally
+            // canonicalizes before navigation; this adoption also covers an early
+            // click or restored route that raced that map. Re-route once so the
+            // exact-keyed working set, tab history, Recent, and editor all own the
+            // backend's canonical display name instead of a phantom case variant.
+            if (dto && !r.path && r.pageKind === "page" && dto.name !== r.name) {
+              renamePageInNavigation(r.name, dto.name);
+              router.replaceActiveRoute({ ...r, name: dto.name });
+              return;
+            }
+            // null = page doesn't exist yet → start a fresh empty page. A failed
+            // read throws and is caught below, so we never overwrite a page whose
+            // load errored with empty content.
+            await loadRoutedPage(
+              dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind),
+              binding,
+            );
+          }
         }
         if (!sameRoute(currentRoute(), r)) return;
-        setLoadedRoute(r);
-        setReady(true);
+        publishReady("ready");
         // Put the scroll back where it was when we last left this entry (back/
         // forward, or returning to this tab). A new page has no saved offset → top.
         router.restoreScrollFor(r);
       } catch (e) {
         if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-        setLoadedRoute(r);
         setLoadError(String(e));
-        setReady(true);
+        publishReady("error");
       }
     })();
   });
@@ -494,7 +516,12 @@ export function PageView(): JSX.Element {
         </div>
       </div>
     }>
-    <Show when={contentReady()} fallback={<div class="page-loading" />}>
+    <Show when={contentReady()} fallback={
+      <div class="page-loading" role="status" aria-live="polite">
+        <span class="page-loading-spinner" aria-hidden="true" />
+        <span>Loading page…</span>
+      </div>
+    }>
       <Show when={zoomValid()} fallback={
         <div class="page">
           <For each={pagesToRender()}>
@@ -588,7 +615,14 @@ function ZoomedView(props: { id: string }): JSX.Element {
       <div class="zoom-breadcrumb">
         <a
           class="crumb crumb-page"
-          onClick={() => router.openPageTarget(pageTarget())}
+          onMouseDown={internalLinkMouseDown}
+          onClick={(e) => {
+            const dest = internalLinkDest(e);
+            if (dest === "sidebar") openPageInSidebar(pageTarget());
+            else if (dest === "background") openPageTargetInNewTab(pageTarget());
+            else router.openPageTarget(pageTarget());
+          }}
+          onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
         >
           {pageName()}
         </a>
@@ -596,7 +630,24 @@ function ZoomedView(props: { id: string }): JSX.Element {
           {(aid) => (
             <>
               <span class="crumb-sep">›</span>
-              <a class="crumb" onClick={() => router.focusBlock(aid)}>
+              <a
+                class="crumb"
+                onMouseDown={internalLinkMouseDown}
+                onClick={(e) => {
+                  const dest = internalLinkDest(e);
+                  if (dest === "default") {
+                    router.focusBlock(aid);
+                    return;
+                  }
+                  const ref = blockRef(aid);
+                  if (dest === "sidebar") openBlockInSidebar(ref);
+                  else openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+                }}
+                onAuxClick={(e) => internalLinkAuxClick(e, () => {
+                  const ref = blockRef(aid);
+                  openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+                })}
+              >
                 <InlineText text={crumb(aid)} format={formatForBlock(aid)} />
               </a>
             </>
@@ -796,16 +847,13 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             classList={{ "journal-title": props.page.kind === "journal" }}
             title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
             onClick={(e) => {
-              if (e.shiftKey && !props.page.guide) openPageInSidebar(pageTarget());
+              const dest = internalLinkDest(e);
+              if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
+              else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
               else router.openPageTarget(pageTarget());
             }}
-            onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
-            onAuxClick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault(); // middle-click → background tab, like a body link
-                openPageTargetInNewTab(pageTarget());
-              }
-            }}
+            onMouseDown={internalLinkMouseDown}
+            onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
             onDblClick={startRename}
             onContextMenu={(e) => {
               if (props.page.guide) return;

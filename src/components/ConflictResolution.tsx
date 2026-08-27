@@ -20,15 +20,20 @@ import {
   createResource,
   createSignal,
   onCleanup,
+  onMount,
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
+import { openFile } from "../router";
+import { ConflictFileRow } from "./Settings";
 import {
   clearConflict,
   conflictQueue,
   pushToast,
   refreshLiveSaveConflictDraft,
   refreshSyncConflicts,
+  refreshJournalConflicts,
+  journalConflicts,
   settleArtifactConflict,
   updateLiveSaveConflictDiskRev,
 } from "../ui";
@@ -49,8 +54,18 @@ import {
   pageInstanceGeneration,
   reloadPage,
 } from "../store";
-import { DiffRowView, collectRows, seedSuggestedOrNoLoss } from "./DiffRows";
+import {
+  DiffRowView,
+  collectRows,
+  humanizeSideLabel,
+  seedSuggestedExceptArtifact,
+  seedSuggestedOrNoLoss,
+} from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
+
+function unsupportedConflictSource(source: never): never {
+  throw new Error(`unsupported conflict source: ${String(source)}`);
+}
 
 /** The side labels the artifact itself supplied, shortened for a row segment. */
 function segLabel(text: string, fallback: string): string {
@@ -59,13 +74,24 @@ function segLabel(text: string, fallback: string): string {
   return trimmed.length > 18 ? `${trimmed.slice(0, 17)}…` : trimmed;
 }
 
-/** What the two sides of this conflict are called, from the queue object. */
-function sideLabels(conflict: ConflictObject): { mine: string; theirs: string; base?: string } {
+/** What the two sides of this conflict are called, from the queue object.
+ *  A sync tool's raw copy tag is humanized for display ("Sync copy · Jul 5");
+ *  the exact tag survives as `theirsTitle` for the legend's tooltip. */
+function sideLabels(conflict: ConflictObject): {
+  mine: string;
+  theirs: string;
+  theirsTitle?: string;
+  base?: string;
+} {
   const of = (role: "mine" | "theirs" | "base") =>
     conflict.sides.find((s) => s.role === role)?.label ?? "";
+  const theirs = humanizeSideLabel(
+    of("theirs") || (conflict.source === "vcs-markers" ? "Merged-in side" : "Conflict copy")
+  );
   return {
     mine: of("mine") || (conflict.source === "vcs-markers" ? "Local side" : "This device"),
-    theirs: of("theirs") || (conflict.source === "vcs-markers" ? "Merged-in side" : "Conflict copy"),
+    theirs: theirs.text,
+    theirsTitle: theirs.title,
     base: of("base") || undefined,
   };
 }
@@ -91,32 +117,157 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   const [cursor, setCursor] = createSignal(0);
   let root: HTMLDivElement | undefined;
 
+  // --- Dock: slim pinned bar + unroll-in-place sheet ---------------------
+  // (Design + argued decisions: tine-agents/specs/concord-conflict-dock.md.)
+  // The panel lives at the top of the page and scrolls away with it; on a
+  // phone that made a conflict invisible until the user happened to scroll
+  // up. When the panel is ENTIRELY above the viewport, a slim bar pins to
+  // the top of this pane's scroller; tapping it unrolls the SAME panel node
+  // (physically reparented, so decisions/diff/DOM state survive) as a pinned
+  // sheet. Fixed positioning, not sticky: WebKitGTK has no scroll anchoring,
+  // so an in-flow height swap would visibly jump the content.
+  const [docked, setDocked] = createSignal(false);
+  const [expanded, setExpanded] = createSignal(false);
+  const [dockRect, setDockRect] = createSignal<{
+    left: number;
+    top: number;
+    width: number;
+  } | null>(null);
+  let inlineSlot: HTMLDivElement | undefined;
+  let sentinel: HTMLDivElement | undefined;
+  let sheetEl: HTMLDivElement | undefined;
+
+  const paneScroller = () => inlineSlot?.closest(".main-content") ?? null;
+  const measureDock = () => {
+    const scroller = paneScroller();
+    if (!scroller) {
+      setDockRect(null);
+      return;
+    }
+    const r = scroller.getBoundingClientRect();
+    setDockRect({ left: r.left, top: r.top, width: r.width });
+  };
+
+  onMount(() => {
+    // The sentinel sits directly BELOW the inline panel: dock only when it is
+    // entirely above the viewport (a tall, half-visible panel must not dock;
+    // neither must a sentinel still below the fold on a short window).
+    if (!sentinel || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      const above = !entry.isIntersecting && entry.boundingClientRect.top < 0;
+      setDocked(above);
+      if (!above) setExpanded(false); // panel back in view: the bar yields
+    });
+    io.observe(sentinel);
+    onCleanup(() => io.disconnect());
+  });
+
+  // Keep the fixed dock aligned with THIS pane's scroller (split panes each
+  // dock over their own content column).
+  createEffect(() => {
+    if (!docked()) return;
+    measureDock();
+    const onResize = () => measureDock();
+    window.addEventListener("resize", onResize);
+    let ro: ResizeObserver | undefined;
+    const scroller = paneScroller();
+    if (typeof ResizeObserver !== "undefined" && scroller) {
+      ro = new ResizeObserver(onResize);
+      ro.observe(scroller);
+    }
+    onCleanup(() => {
+      window.removeEventListener("resize", onResize);
+      ro?.disconnect();
+    });
+  });
+
+  // ONE panel node, moved — never a second render of the rows. While the
+  // panel is in the sheet, its inline slot keeps the vacated height so the
+  // content below does not jump (same no-anchoring reason as above).
+  createEffect(() => {
+    const panel = root;
+    if (!panel || !inlineSlot) return;
+    if (docked() && expanded() && sheetEl) {
+      inlineSlot.style.minHeight = `${panel.offsetHeight}px`;
+      sheetEl.appendChild(panel);
+    } else if (panel.parentElement !== inlineSlot) {
+      inlineSlot.appendChild(panel);
+      inlineSlot.style.minHeight = "";
+    }
+  });
+
+  const conflictTitle = () =>
+    conflict().source === "vcs-markers"
+      ? "Unresolved merge from your version-control tool"
+      : conflict().source === "live-save"
+        ? "Your draft and the current file both changed"
+        : conflict().source === "duplicate-journal"
+          ? "This day has more than one file"
+          : "Two versions of this page arrived";
+
+  // The day's files, for the direct per-file actions. Read from the inventory
+  // the graph already refreshes rather than re-scanning here.
+  const duplicateDayFiles = () =>
+    conflict().source === "duplicate-journal"
+      ? journalConflicts().find((day) => day.title === conflict().page_name)?.files ?? []
+      : [];
+  const reconcileFile = async (op: () => Promise<unknown>, ok: string) => {
+    try {
+      await op();
+      pushToast(ok, "success");
+      await refreshJournalConflicts();
+    } catch (e) {
+      pushToast(`Couldn’t do that: ${String(e)}`, "error");
+    }
+  };
+  const trashDayFile = async (name: string) => {
+    const confirmed = await backend().confirm(
+      `Move the journal file “${name}” to the trash?\n\n` +
+        `It's a duplicate of another file for the same day. It moves to logseq/.tine-trash (recoverable).`
+    );
+    if (!confirmed) return;
+    await reconcileFile(() => backend().trashJournalFile(name), `Moved ${name} to trash`);
+  };
+
   // Load the diff from whichever source this object came from. Both return the
   // same `SyncConflictDiff`, so everything downstream is source-agnostic.
   const [diff, { refetch }] = createResource<SyncConflictDiff | null, string>(
     () => `${conflict().id}:${conflict().live?.draft_version ?? 0}`,
     async () => {
       const c = conflict();
-      if (c.source === "live-save") {
-        const live = c.live;
-        if (!live) return null;
-        const result = live.disk_rev !== undefined
-          ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
-          : await backend().liveSaveConflictDiff(
-              live.page,
-              live.base_rev,
-              live.conflict_epoch,
-            );
-        updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
-        return result;
+      switch (c.source) {
+        case "live-save": {
+          const live = c.live;
+          if (!live) return null;
+          const result = live.disk_rev !== undefined
+            ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
+            : await backend().liveSaveConflictDiff(
+                live.page,
+                live.base_rev,
+                live.conflict_epoch,
+              );
+          updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
+          return result;
+        }
+        case "vcs-markers": {
+          const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
+          return parsed?.diff ?? null;
+        }
+        case "duplicate-journal": {
+          const copy = c.sides.find((s) => s.role === "theirs")?.path;
+          if (!copy) return null;
+          return await backend().duplicateJournalDiff(c.page_path, copy);
+        }
+        case "sync-copy": {
+          const copy = c.sides.find((s) => s.role === "theirs")?.path;
+          if (!copy) return null;
+          return await backend().syncConflictDiff(c.page_path, copy);
+        }
+        default:
+          return unsupportedConflictSource(c.source);
       }
-      if (c.source === "vcs-markers") {
-        const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
-        return parsed?.diff ?? null;
-      }
-      const copy = c.sides.find((s) => s.role === "theirs")?.path;
-      if (!copy) return null;
-      return await backend().syncConflictDiff(c.page_path, copy);
     }
   );
 
@@ -149,7 +300,12 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   };
   const applyAllSuggested = () => {
     const current = diff();
-    if (current) setDecisions(seedSuggestedOrNoLoss(current.rows));
+    if (!current) return;
+    // The sweep re-applies Tine's OWN suggestions. A merge tool's proposed
+    // text (an artifact-source merged row) keeps whatever the user set —
+    // Tine vouches for nothing about that text, so accepting it stays a
+    // per-row act (the initial pre-selection still stands until touched).
+    setDecisions((prev) => seedSuggestedExceptArtifact(current.rows, { ...prev }));
   };
 
   /** Move the highlight to the previous/next region that needs a decision. */
@@ -330,14 +486,29 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           return;
         }
         releasePageSaves = holdManagedMovePages([pageName]);
-        const resolved = await backend().resolveSyncConflict(
-          pagePath,
-          copy,
-          decisions(),
-          current.base_rev,
-          current.conflict_rev,
-          preChoice()
-        );
+        // A duplicate journal day reaches the same two-file reconciliation
+        // through its own guarded command: the guard is what keeps it from
+        // being a merge-any-two-pages surface. Everything around it — the
+        // editor lease, the quiescence flush, the generation checks — applies
+        // identically, because the canonical file is an ordinary open page.
+        const resolved = source === "duplicate-journal"
+          ? await backend().resolveDuplicateJournalDay(
+              pagePath,
+              copy,
+              decisions(),
+              current.base_rev,
+              current.conflict_rev,
+              preChoice()
+            )
+          : await backend().resolveSyncConflict(
+              pagePath,
+              copy,
+              decisions(),
+              current.base_rev,
+              current.conflict_rev,
+              current.merge_base_rev ?? null,
+              preChoice()
+            );
         if (
           pageInstanceGeneration(pageName) !== instance
           || editGeneration(pageName) !== edit
@@ -352,13 +523,21 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           throw new Error("the resolved file was committed, but its exact page could not replace the old editor; reopen the page");
         }
         settleArtifactConflict(conflictId);
-        pushToast(`Merged into “${pageName}”`, "success");
+        pushToast(
+          source === "duplicate-journal"
+            ? `Folded into “${pageName}”`
+            : `Merged into “${pageName}”`,
+          "success"
+        );
       }
       // A successful sync-copy commit has already retired its exact object
       // locally. Reconcile unrelated artifacts without keeping Apply blocked on
       // graph-wide directory walks (noticeable on Android document trees).
       if (source === "sync-copy") void refreshSyncConflicts();
       else await refreshSyncConflicts();
+      // The duplicate-day inventory is a separate scan; a day with three files
+      // still has one left to reconcile after this fold.
+      if (source === "duplicate-journal") void refreshJournalConflicts();
     } catch (e) {
       if (String(e).includes("conflict")) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");
@@ -389,15 +568,11 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   });
 
   return (
+    <>
+    <div class="page-conflict-slot" ref={inlineSlot}>
     <div class="page-conflict" ref={root}>
       <div class="page-conflict-head">
-        <span class="page-conflict-title">
-          {conflict().source === "vcs-markers"
-            ? "Unresolved merge from your version-control tool"
-            : conflict().source === "live-save"
-              ? "Your draft and the current file both changed"
-            : "Two versions of this page arrived"}
-        </span>
+        <span class="page-conflict-title">{conflictTitle()}</span>
         <span class="page-conflict-nav">
           <Show when={pending().length}>
             <span class="page-conflict-count">
@@ -414,16 +589,42 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       </div>
       <div class="page-conflict-legend">
         <span class="page-conflict-side mine">{labels().mine}</span>
-        <span class="page-conflict-side theirs">{labels().theirs}</span>
+        <span class="page-conflict-side theirs" title={labels().theirsTitle}>
+          {labels().theirs}
+        </span>
         <Show when={labels().base}>
           {(base) => <span class="page-conflict-side base">{base()} (used for the suggestions)</span>}
         </Show>
       </div>
+      <Show when={conflict().source === "duplicate-journal"}>
+        <div class="settings-hint page-conflict-files">
+          This day has more than one file. Choosing below folds the other file in
+          and moves it to the trash (recoverable). Or act on a file directly:
+        </div>
+        <For each={duplicateDayFiles()}>
+          {(file) => (
+            <ConflictFileRow
+              file={file}
+              parentLayerId="page-conflict"
+              onOpen={() => openFile(file.path, conflict().page_name, "journal")}
+              onRename={(name) => void reconcileFile(
+                () => backend().renameFileToPage(file.path, name),
+                `Renamed ${file.name} → ${name}`
+              )}
+              onTrash={() => void trashDayFile(file.name)}
+            />
+          )}
+        </For>
+      </Show>
       <Show
         when={diff()}
         fallback={
           <div class="page-conflict-empty">
-            {diff.loading ? "Reading both versions…" : "Couldn’t read this conflict."}
+            {diff.loading
+              ? "Reading both versions…"
+              : conflict().source === "duplicate-journal"
+                ? "These two files can’t be folded together — they’re in different formats. Use the actions above."
+                : "Couldn’t read this conflict."}
           </div>
         }
       >
@@ -452,17 +653,39 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                 </Show>
               </span>
               <span class="sync-merge-toolbar-actions">
-                <button class="settings-btn" onClick={applyAllSuggested}>
-                  Apply all suggested
+                <button
+                  class="settings-btn"
+                  onClick={applyAllSuggested}
+                  title="Re-applies Tine's own suggestions. A merge tool's proposed text (Merged (tool)) keeps your current choice."
+                >
+                  <span class="conflict-wide">Apply all suggested</span>
+                  <span class="conflict-narrow">All suggested</span>
                 </button>
                 <button class="settings-btn" onClick={() => setAll("both")}>
-                  Keep both everywhere
+                  <span class="conflict-wide">Keep both everywhere</span>
+                  <span class="conflict-narrow">All both</span>
                 </button>
-                <button class="settings-btn" onClick={() => setAll("mine")}>
-                  Keep {segLabel(labels().mine, "mine")}
+                <button
+                  class="settings-btn"
+                  onClick={() => setAll("mine")}
+                  title={labels().mine}
+                >
+                  <span class="conflict-wide">Keep {segLabel(labels().mine, "mine")}</span>
+                  <span class="conflict-narrow">
+                    <span class="sync-merge-seg-dot" data-side="mine" aria-hidden="true" />
+                    All mine
+                  </span>
                 </button>
-                <button class="settings-btn" onClick={() => setAll("theirs")}>
-                  Keep {segLabel(labels().theirs, "theirs")}
+                <button
+                  class="settings-btn"
+                  onClick={() => setAll("theirs")}
+                  title={labels().theirsTitle ?? labels().theirs}
+                >
+                  <span class="conflict-wide">Keep {segLabel(labels().theirs, "theirs")}</span>
+                  <span class="conflict-narrow">
+                    <span class="sync-merge-seg-dot" data-side="theirs" aria-hidden="true" />
+                    All theirs
+                  </span>
                 </button>
                 <label class="sync-merge-showunchanged">
                   <input
@@ -521,7 +744,9 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                   fallback={
                     conflict().source === "live-save"
                       ? <>The resolved page is saved through the same guarded Direct Files path.</>
-                      : <>The copy moves to the recoverable trash once this is applied.</>
+                      : conflict().source === "duplicate-journal"
+                        ? <>The other file moves to the recoverable trash once this is applied, leaving the day one file.</>
+                        : <>The copy moves to the recoverable trash once this is applied.</>
                   }
                 >
                   Applying writes the merged page without any markers — the file becomes ordinary
@@ -540,5 +765,49 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         )}
       </Show>
     </div>
+    </div>
+    <div class="page-conflict-sentinel" ref={sentinel} aria-hidden="true" />
+    <Show when={docked()}>
+      <div
+        class="page-conflict-dock"
+        classList={{ expanded: expanded() }}
+        style={
+          dockRect()
+            ? {
+                left: `${dockRect()!.left}px`,
+                top: `${dockRect()!.top}px`,
+                width: `${dockRect()!.width}px`,
+              }
+            : undefined
+        }
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && expanded()) {
+            e.stopPropagation();
+            setExpanded(false);
+          }
+        }}
+      >
+        <button
+          class="page-conflict-dockbar"
+          aria-expanded={expanded()}
+          onClick={() => setExpanded(!expanded())}
+        >
+          <span class="page-conflict-dockbar-icon" aria-hidden="true">⚠</span>
+          <span class="page-conflict-dockbar-title">{conflictTitle()}</span>
+          <Show when={pending().length}>
+            <span class="page-conflict-dockbar-count">
+              {pending().length} to review
+            </span>
+          </Show>
+          <span class="page-conflict-dockbar-chevron" aria-hidden="true">
+            {expanded() ? "▴" : "▾"}
+          </span>
+        </button>
+        <Show when={expanded()}>
+          <div class="page-conflict-sheet" ref={(el) => (sheetEl = el)} />
+        </Show>
+      </div>
+    </Show>
+    </>
   );
 }

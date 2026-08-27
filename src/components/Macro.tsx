@@ -1,11 +1,11 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { focusedRouter } from "../panes";
-import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
-import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
+import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
@@ -38,6 +38,76 @@ import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDe
 import { blockDtoExternalId } from "../blockIdentity";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
+
+// Recognize the typed Logseq input without treating an example in a string or
+// `;;` comment as live. Only a direct token in the :inputs vector makes query
+// execution depend on focused-pane navigation.
+function declaresCurrentPageInput(source: string): boolean {
+  const boundary = (ch: string | undefined) =>
+    ch === undefined || /[\s,\[\](){}]/.test(ch);
+  let i = 0;
+  while (i < source.length) {
+    if (source[i] === '"') {
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") i += 2;
+        else if (source[i] === '"') {
+          i += 1;
+          break;
+        } else i += 1;
+      }
+      continue;
+    }
+    if (source[i] === ";") {
+      while (i < source.length && source[i] !== "\n") i += 1;
+      continue;
+    }
+    if (
+      source.startsWith(":inputs", i) &&
+      boundary(source[i - 1]) &&
+      boundary(source[i + ":inputs".length])
+    ) {
+      let cursor = i + ":inputs".length;
+      while (cursor < source.length && /[\s,]/.test(source[cursor])) cursor += 1;
+      if (source[cursor] !== "[") return false;
+      let depth = 1;
+      cursor += 1;
+      while (cursor < source.length && depth > 0) {
+        if (source[cursor] === '"') {
+          cursor += 1;
+          while (cursor < source.length) {
+            if (source[cursor] === "\\") cursor += 2;
+            else if (source[cursor] === '"') {
+              cursor += 1;
+              break;
+            } else cursor += 1;
+          }
+          continue;
+        }
+        if (source[cursor] === ";") {
+          while (cursor < source.length && source[cursor] !== "\n") cursor += 1;
+          continue;
+        }
+        if ("[({".includes(source[cursor])) depth += 1;
+        else if ("])}".includes(source[cursor])) depth -= 1;
+        else if (
+          depth === 1 &&
+          source.slice(cursor, cursor + ":current-page".length).toLowerCase() ===
+            ":current-page" &&
+          boundary(source[cursor - 1]) &&
+          boundary(source[cursor + ":current-page".length])
+        ) {
+          return true;
+        }
+        cursor += 1;
+      }
+      return false;
+    }
+    i += 1;
+  }
+  return false;
+}
+
 type QueryView = "search" | "list" | "table" | "board";
 const QUERY_VIEWS: QueryView[] = ["search", "list", "table", "board"];
 const QUERY_VIEW_LABEL: Record<QueryView, string> = {
@@ -219,6 +289,9 @@ export function QueryMacro(props: {
   };
 
   const isAdvanced = () => ADVANCED_RE.test(arg());
+  const currentPageInput = createMemo(() =>
+    isAdvanced() && declaresCurrentPageInput(form())
+  );
   const simpleBackDsl = createMemo<string | null>(() => {
     const blockId = props.blockId;
     if (!blockId || !isAdvanced()) return null;
@@ -285,7 +358,7 @@ export function QueryMacro(props: {
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
   const queryRequestKey = () =>
-    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
+    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
   const [groups] = createResource(
     queryRequestKey,
     async (requestKey) => {
@@ -320,7 +393,9 @@ export function QueryMacro(props: {
       // Advanced (datalog) queries take a separate path that maps the supported
       // clause subset onto the engine and reports what ran vs was ignored.
       if (isAdvanced()) {
-        const page = currentPage();
+        // `:inputs [:current-page]` is a focused-pane binding. Advanced forms
+        // without it retain the owner page for :query-page compatibility.
+        const page = currentPageInput() ? focusedQueryPage() : currentPage();
         const r = await sharedQueryResult(
           scope,
           `advanced\0${page ?? ""}\0${requestKey}`,
@@ -649,11 +724,23 @@ export function QueryMacro(props: {
                                   <button
                                     type="button"
                                     class="query-search-page"
-                                    onClick={() => openPageTarget({
+                                    onMouseDown={internalLinkMouseDown}
+                                    onClick={(e) => {
+                                      const target = {
+                                        name: hit.page.name,
+                                        pageKind: hit.page.kind,
+                                        ...(hit.page.path ? { path: hit.page.path } : {}),
+                                      };
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") openPageInSidebar(target);
+                                      else if (dest === "background") openPageTargetInNewTab(target);
+                                      else openPageTarget(target);
+                                    }}
+                                    onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab({
                                       name: hit.page.name,
                                       pageKind: hit.page.kind,
                                       ...(hit.page.path ? { path: hit.page.path } : {}),
-                                    })}
+                                    }))}
                                   >
                                     <span class="switcher-kind">{hit.page.kind}</span>
                                     <span>{hit.display_text}</span>
@@ -664,11 +751,27 @@ export function QueryMacro(props: {
                                   <button
                                     type="button"
                                     class="query-search-hit switcher-row block-result"
-                                    onClick={() => openPageAtBlock({
-                                      name: blockHit().page,
-                                      pageKind: blockHit().kind,
-                                      block: blockDtoExternalId(blockHit().block),
-                                      ...(blockHit().path ? { path: blockHit().path } : {}),
+                                    onMouseDown={internalLinkMouseDown}
+                                    onClick={(e) => {
+                                      const bh = blockHit();
+                                      const uuid = blockDtoExternalId(bh.block);
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") {
+                                        openBlockInSidebar({ uuid, page: bh.page, pageKind: bh.kind, ...(bh.path ? { path: bh.path } : {}) });
+                                      } else if (dest === "background") {
+                                        openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
+                                      } else {
+                                        openPageAtBlock({
+                                          name: bh.page,
+                                          pageKind: bh.kind,
+                                          block: uuid,
+                                          ...(bh.path ? { path: bh.path } : {}),
+                                        });
+                                      }
+                                    }}
+                                    onAuxClick={(e) => internalLinkAuxClick(e, () => {
+                                      const bh = blockHit();
+                                      openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: blockDtoExternalId(bh.block), ...(bh.path ? { path: bh.path } : {}) });
                                     })}
                                   >
                                     <SearchResultRow
@@ -769,6 +872,7 @@ export function QueryMacro(props: {
                                   </td>
                                   <td
                                     class="qt-page"
+                                    onMouseDown={internalLinkMouseDown}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
@@ -778,11 +882,9 @@ export function QueryMacro(props: {
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => {
-                                      if (e.button === 1) {
-                                        e.preventDefault();
-                                        e.stopPropagation();
-                                        openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) });
-                                      }
+                                      if (internalLinkAuxClick(e, () =>
+                                        openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) })
+                                      )) e.stopPropagation();
                                     }}
                                     onContextMenu={(e) => {
                                       if (!shouldOpenTextContextMenu(e.target)) return;
@@ -846,6 +948,7 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
         <div class="query-group" classList={{ "query-group-flat": props.flat }}>
           <div
             class={props.flat ? "query-crumb" : "query-page"}
+            onMouseDown={internalLinkMouseDown}
             onClick={(e) => {
               e.stopPropagation();
               const dest = internalLinkDest(e);
@@ -854,11 +957,7 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
               else openPageTarget(target());
             }}
             onAuxClick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault();
-                e.stopPropagation();
-                openPageTargetInNewTab(target());
-              }
+              if (internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))) e.stopPropagation();
             }}
             onContextMenu={(e) => {
               if (!shouldOpenTextContextMenu(e.target)) return;
@@ -1167,7 +1266,14 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
     <div class="embed-block">
       <Show when={!selfPageEmbed()}>
         <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
-          <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
+          <LiveRefGroup
+            page={data()!.page}
+            kind={data()!.kind}
+            blocks={data()!.blocks}
+            embedId={data()!.embedId}
+            hostBlockId={props.blockId}
+            surface="embed"
+          />
         </Show>
       </Show>
     </div>

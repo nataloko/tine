@@ -2,8 +2,9 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, crea
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
+import { DiagnosticsTab } from "./DiagnosticsTab";
 import { writeClipboardTextResilient } from "../clipboard";
-import { safeManagedErrorDetail } from "../managedDiagnostics";
+import { managedJoinErrorDetail, safeManagedErrorDetail } from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -216,6 +217,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "plugins", label: "Plugins" },
   { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
+  { id: "diagnostics", label: "Diagnostics" },
   { id: "about", label: "About" },
 ];
 
@@ -227,6 +229,7 @@ type SettingSearchEntry = {
   level?: "advanced" | "experimental";
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
+  { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
   { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
@@ -524,6 +527,9 @@ export function Settings(): JSX.Element {
                   onRecord={(id) => setRecording(recording() === id ? null : id)}
                   onReset={resetShortcutOverride}
                 />
+              </Show>
+              <Show when={tab() === "diagnostics"}>
+                <DiagnosticsTab />
               </Show>
               <Show when={tab() === "about"}>
                 <AboutTab />
@@ -2274,10 +2280,9 @@ function JournalsTab(props: { search: string }): JSX.Element {
   );
 }
 
-// Optional graph home page (GH #245): opened automatically in the primary tab
-// whenever this graph is opened. The value lives in the per-graph app-settings
-// string (see homePage.ts); picking only offers existing pages and a stale
-// value is surfaced with an explicit Clear.
+// Optional graph home page (GH #245/#269): opened automatically in the primary
+// tab whenever this graph is opened. Logseq-compatible config.edn owns it;
+// picking only offers existing pages and a stale value has an explicit Clear.
 function HomePageField(): JSX.Element {
   const root = () => graphMeta()?.root ?? "";
   const [value, setValue] = createSignal<string | null>(null);
@@ -2335,7 +2340,7 @@ function HomePageField(): JSX.Element {
   const commit = async (name: string) => {
     const r = root();
     if (!r) return;
-    await setHomePageSetting(r, name);
+    if (!(await setHomePageSetting(r, name))) return;
     setValue(name.trim());
     setPicking(false);
     setQ("");
@@ -2344,7 +2349,7 @@ function HomePageField(): JSX.Element {
   const clear = async () => {
     const r = root();
     if (!r) return;
-    await setHomePageSetting(r, null);
+    if (!(await setHomePageSetting(r, null))) return;
     setValue("");
     setQ("");
     setDq("");
@@ -2586,14 +2591,20 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     return null;
   };
 
-  const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
+  const reportManagedFailure = (
+    summary: string,
+    detail: string,
+    remedy?: string | null,
+    copyDetail = detail,
+  ) => {
     const message = `${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`;
+    const copyMessage = `${summary}: ${copyDetail}${remedy ? `\n\n${remedy}` : ""}`;
     pushToast(message, "error", {
       sticky: true,
       action: {
         label: "Copy details",
         run: () => {
-          void writeClipboardTextResilient(message)
+          void writeClipboardTextResilient(copyMessage)
             .then(() => pushToast("Managed storage details copied.", "success"))
             .catch((error) => pushToast(
               `Couldn't copy managed storage details: ${safeManagedErrorDetail(error)}`,
@@ -2980,7 +2991,12 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    * a descriptor naming another managed graph is exactly the two-independent-
    * activations case, and adoption is the operation for it.
    */
-  const reportJoinRefusal = async (summary: string, detail: string, redacted: string) => {
+  const reportJoinRefusal = async (
+    summary: string,
+    detail: string,
+    visible: string,
+    copy = visible,
+  ) => {
     if (detail.includes("names another managed graph")) {
       try {
         if (await offerAdoption()) return;
@@ -2989,7 +3005,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         return;
       }
     }
-    reportManagedFailure(summary, redacted, joinFailureRemedy(detail));
+    reportManagedFailure(summary, visible, joinFailureRemedy(detail), copy);
   };
 
   const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
@@ -3012,11 +3028,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       }
     } catch (error) {
       // The refusal that matters most here is raw native text. Read the remedy
-      // off the untruncated message, then report the redacted one.
+      // off the untruncated message. A clean-join mismatch additionally carries
+      // bounded affected paths which the user needs in order to reconcile it.
+      const joinDetail = managedJoinErrorDetail(error);
       await reportJoinRefusal(
         "Couldn't join the synced graph",
         String(error),
-        safeManagedErrorDetail(error)
+        joinDetail.visible,
+        joinDetail.copy,
       );
     } finally {
       endStorageTransition();
@@ -3491,12 +3510,19 @@ export function SettingsConflictPanels(): JSX.Element {
 // navigates to THIS specific file (editable, saves back to itself), Merge folds a
 // stray into the canonical day, Rename rescues it as a normal page, Trash removes
 // the redundant one (recoverable).
-function ConflictFileRow(props: {
+/** One file of a duplicate journal day, with its reconcile actions.
+ *
+ *  Exported because the in-page conflict panel renders the same rows: one
+ *  renderer, not two that drift apart. `parentLayerId` exists only so the
+ *  transient layers (the content preview, the rename box) attach to whichever
+ *  surface is hosting the row. */
+export function ConflictFileRow(props: {
   file: JournalFile;
   onOpen: () => void;
   onMerge?: () => void;
   onRename: (newName: string) => void;
   onTrash: () => void;
+  parentLayerId?: string;
 }): JSX.Element {
   const rowLayerId = `journal-conflict-${props.file.path}`;
   let renameRoot: HTMLDivElement | undefined;
@@ -3518,7 +3544,7 @@ function ConflictFileRow(props: {
     if (!open()) return;
     const unregister = registerTransientLayer({
       id: `${rowLayerId}-content`,
-      parentId: "settings",
+      parentId: props.parentLayerId ?? "settings",
       root: () => contentRoot ?? null,
       dismiss: () => { setOpen(false); return true; },
     });
@@ -3528,7 +3554,7 @@ function ConflictFileRow(props: {
     if (!renaming()) return;
     const unregister = registerTransientLayer({
       id: `${rowLayerId}-rename`,
-      parentId: "settings",
+      parentId: props.parentLayerId ?? "settings",
       root: () => renameRoot ?? null,
       dismiss: () => { setRenaming(false); setNewName(""); return true; },
     });
@@ -3596,7 +3622,7 @@ function JournalConflictsPanel(): JSX.Element {
     try {
       await op();
       pushToast(ok, "success");
-      await refreshJournalConflicts(true);
+      await refreshJournalConflicts();
     } catch (e) {
       pushToast(`Couldn’t do that: ${String(e)}`, "error");
     }

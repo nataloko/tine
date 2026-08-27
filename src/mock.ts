@@ -3,11 +3,11 @@
 // backend's shape so the UI behaves identically.
 
 import { notifyGraphRebound } from "./modeHooks";
-import type { Backend, GpuEnv, DebugInfo, GitStatus, GitResult, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GitStatus, GitResult, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
-import { MARKER_RE } from "./markers";
+import { leadingMarker } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
 import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
 import { parseJournalWith } from "./journal";
@@ -48,10 +48,8 @@ function blockRefIds(raw: string): string[] {
   while ((m = bare.exec(rest))) push(m[1]);
   return out;
 }
-function leadingMarker(raw: string): string | null {
-  const m = MARKER_RE.exec(raw);
-  return m ? m[1] : null;
-}
+// Marker recognition comes from the one shared recognizer (imported below), so
+// the demo graph facet synthesis agrees with the real (lsdoc) one.
 function priorityOf(raw: string): string | undefined {
   const m = /(?:^|\s)\[#([ABC])\]/.exec(raw.split("\n", 1)[0] ?? "");
   return m?.[1];
@@ -377,6 +375,27 @@ const NAMED: PageDto[] = [
   },
   // Namespace + page-icon demo: {{namespace}} renders the nested descendant tree,
   // each page showing its `icon::`.
+  {
+    // The page the mock's sync-conflict copy belongs to (the conflict queue
+    // points here); its body matches the diff's "mine" side so the in-page
+    // resolver reads coherently in demos/screenshots.
+    name: "Project Plan",
+    kind: "page",
+    title: "Project Plan",
+    pre_block: "title:: Project Plan\ntags:: launch",
+    blocks: [
+      b("Milestones for the launch"),
+      b("TODO ship the beta by Friday"),
+      b("write the release notes"),
+      b("DOING draft the announcement\ncollapsed:: false\nowner:: me"),
+      // Filler so the page actually SCROLLS: the conflict dock (slim pinned
+      // bar once the panel scrolls out of view) needs a long page to be
+      // demonstrable in demos and the screenshot harness.
+      ...Array.from({ length: 60 }, (_, i) =>
+        b(`launch checklist item ${i + 1} — status notes and follow-ups`),
+      ),
+    ],
+  },
   {
     name: "Formula1",
     kind: "page",
@@ -1212,11 +1231,15 @@ export function mockBackend(): Backend {
       // No exclude → same-page referrers included (matches the backend).
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
+    async setDefaultHome(): Promise<void> {
+      notifyGraphRebound();
+    },
     async deletePage(): Promise<void> {
       // no-op in mock
     },
-    async renamePage(): Promise<void> {
-      // no-op in mock
+    async renamePage(): Promise<RenameOutcome> {
+      // no-op in mock; nothing is ever quarantined here
+      return { skippedConflictedReferrers: [] };
     },
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
@@ -1361,6 +1384,9 @@ export function mockBackend(): Backend {
         all.some((p) => p.name.toLowerCase() === name.toLowerCase()));
     },
     async setFavorites(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async setFavoritesPage(): Promise<void> {
       // no-op in the browser mock
     },
     async setPreferredWorkflow(): Promise<void> {
@@ -1657,6 +1683,34 @@ export function mockBackend(): Backend {
     async emptyAssetTrash(): Promise<number> {
       return 3;
     },
+    async duplicateJournalDiff(): Promise<SyncConflictDiff | null> {
+      // The mock day's two files hold disjoint content, so every row is
+      // one-sided — the shape that makes "keep both" reproduce a plain fold.
+      return {
+        rows: [
+          {
+            id: "dup-1",
+            kind: "removed",
+            mine: { id: "m1", text: "Tried out the Org demo graph in Tine today", level: 0 },
+            theirs: null,
+            children: [],
+          },
+          {
+            id: "dup-2",
+            kind: "added",
+            mine: null,
+            theirs: { id: "t1", text: "Evening notes written on the phone", level: 0 },
+            children: [],
+          },
+        ],
+        base_rev: "mock-canonical-rev",
+        conflict_rev: "mock-stray-rev",
+        three_way: false,
+      } as unknown as SyncConflictDiff;
+    },
+    async resolveDuplicateJournalDay(): Promise<PageDto> {
+      throw new Error("resolveDuplicateJournalDay is not wired in the mock backend");
+    },
     async listJournalConflicts() {
       // Default demo state is clean: no sticky "duplicate journal day" toast and no
       // reconcile banner cluttering the marketing screenshots. The reconcile flow is
@@ -1792,6 +1846,20 @@ export function mockBackend(): Backend {
           { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
           { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
           { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+          // Row 4 is the fourth outcome: both sides edited ONE block, but in
+          // different places, so a merged body is offered (suggestion only).
+          // Its bodies are multi-line and agree on line 0, which is also what
+          // exercises the differing-line preview and the expander.
+          {
+            id: "4",
+            kind: "modified" as const,
+            mine: v("DOING draft the announcement\ncollapsed:: false\nowner:: me"),
+            theirs: v("DOING draft the announcement\ncollapsed:: false\ndue:: Friday"),
+            children: [],
+            verdict: "both-changed" as const,
+            suggestion: "merged" as const,
+            merged: { text: "DOING draft the announcement\ncollapsed:: false\nowner:: me\ndue:: Friday", source: "computed" as const },
+          },
         ],
         // The page's OWN properties differ too, so the resolver shows its
         // pre-block choice — the one thing the retired Settings modal used to
@@ -1880,7 +1948,7 @@ export function mockBackend(): Backend {
             },
             { role: "base" as const, label: "Last agreed version" },
           ],
-          block_conflicts: 3,
+          block_conflicts: 4,
         },
         {
           id: "markers:pages/Tine.md",
@@ -1894,6 +1962,22 @@ export function mockBackend(): Backend {
           ],
           block_conflicts: 1,
           markers: ["<<<<<<<", "=======", ">>>>>>>"],
+        },
+        {
+          id: "journal:journals/2026_06_26.org",
+          source: "duplicate-journal" as const,
+          page_name: "Friday, 26-06-2026",
+          page_path: "journals/2026_06_26.org",
+          kind: "journal" as const,
+          sides: [
+            { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
+            {
+              role: "theirs" as const,
+              label: "Friday, 26-06-2026.org",
+              path: "journals/Friday, 26-06-2026.org",
+            },
+          ],
+          block_conflicts: 2,
         },
       ];
     },
@@ -2001,6 +2085,9 @@ export function mockBackend(): Backend {
     async onGraphChangedBulk(): Promise<() => void> {
       return () => {};
     },
+    async onGraphConfigChanged(): Promise<() => void> {
+      return () => {};
+    },
     async onSparseV2Changed(): Promise<() => void> {
       return () => {};
     },
@@ -2100,7 +2187,7 @@ export function mockBackend(): Backend {
       return ["cs_CZ", "de_DE", "en_GB", "en_US", "fr_FR", "sk_SK"];
     },
     async debugInfo(): Promise<DebugInfo> {
-      return { enabled: false, path: "" };
+      return { enabled: false, path: "", recorderActive: false, previousExitUnclean: false };
     },
     async debugLog(_line: string): Promise<void> {
       // no-op in the browser mock
@@ -2144,6 +2231,50 @@ export function mockBackend(): Backend {
       mockGit.dirty = 0;
       mockGit.ahead = 0;
       return { op: "pull", ok: true, detail: "Reset to remote — local changes discarded." };
+    },
+    async diagnosticReport(): Promise<DiagnosticReport> {
+      return {
+        text: JSON.stringify({ schemaVersion: 1, mock: true }, null, 2),
+        suggestedFileName: "tine-diagnostics-mock.json",
+      };
+    },
+    async saveDiagnosticReport(): Promise<boolean> {
+      return false;
+    },
+    async clearDiagnostics(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async createGraphVerification(): Promise<GraphVerificationReport> {
+      const text = JSON.stringify({
+        schemaVersion: 1,
+        tool: "tine-graph-bytes",
+        algorithm: "sha256",
+        complete: true,
+        generatedAtUnixMs: Date.now(),
+        files: [],
+        aggregateDigest: "0".repeat(64),
+        errors: [],
+      }, null, 2);
+      return {
+        text,
+        suggestedFileName: "tine-graph-verification-mock.json",
+        totalFiles: 0,
+        totalBytes: 0,
+        aggregateDigest: "0".repeat(64),
+        complete: true,
+      };
+    },
+    async cancelGraphVerification(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async saveGraphVerificationReport(): Promise<boolean> {
+      return false;
+    },
+    async onGraphVerificationProgress(): Promise<() => void> {
+      return () => {};
+    },
+    async diagnosticFrontendEvent(): Promise<void> {
+      // no-op in the browser mock
     },
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];

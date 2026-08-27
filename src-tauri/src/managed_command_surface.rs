@@ -19,6 +19,7 @@
 //! and then refused inside `tine-core`, because appending a capture to today's
 //! journal is a graph-text write the oplog owns.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 /// How one command reaches a graph, and therefore what a **managed** binding
@@ -48,12 +49,17 @@ use ManagedRouting::{ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraph
 /// folder-picker and system-bar commands are deliberately outside this list;
 /// `no_graph_routing_hides_in_the_unscanned_sources` proves they hold no graph
 /// routing rather than taking it on trust.
+#[cfg(test)]
 const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("backup.rs", include_str!("backup.rs")),
     ("commands.rs", include_str!("commands.rs")),
     ("data_home.rs", include_str!("data_home.rs")),
     ("debug.rs", include_str!("debug.rs")),
     ("graph.rs", include_str!("graph.rs")),
+    (
+        "graph_verification.rs",
+        include_str!("graph_verification.rs"),
+    ),
     ("lib.rs", include_str!("lib.rs")),
     (
         "migrate_identifier.rs",
@@ -67,6 +73,7 @@ const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("watcher.rs", include_str!("watcher.rs")),
 ];
 
+#[cfg(test)]
 const UNSCANNED_SOURCES: &[(&str, &str)] = &[
     (
         "android_folder_picker.rs",
@@ -96,6 +103,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("asset_trash_stats", Filesystem),
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
+    ("cancel_graph_verification", NoGraphSlot),
     ("cancel_sparse_v2", NoGraphSlot),
     // Emergency recovery starts without a bound GraphContext. The native
     // supervisor validates the selected root and supersedes stale managed work
@@ -107,17 +115,23 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("capture_quick_switch", NoGraphSlot),
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
+    ("clear_diagnostics", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
     ("conflict_queue", Filesystem),
     ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
+    ("create_graph_verification", Filesystem),
     ("debug_info", NoGraphSlot),
     ("debug_log", NoGraphSlot),
     ("default_graph_parent", NoGraphSlot),
     ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
+    ("diagnostic_frontend_event", NoGraphSlot),
+    ("diagnostic_ipc_event", NoGraphSlot),
+    ("diagnostic_report", NoGraphSlot),
     ("durable_live_save_conflict_diff", Filesystem),
+    ("duplicate_journal_diff", Filesystem),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
@@ -196,6 +210,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("rescan_graph_now", NoGraphSlot),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
+    ("resolve_duplicate_journal_day", LegacyOnly),
     ("resolve_durable_live_save_conflict", LegacyOnly),
     ("resolve_live_save_conflict", LegacyOnly),
     ("resolve_sync_conflict", ManagedRouted),
@@ -206,6 +221,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
     ("save_asset", Filesystem),
+    ("save_diagnostic_report", NoGraphSlot),
+    ("save_graph_verification_report", NoGraphSlot),
     ("save_page", ManagedRouted),
     ("save_pdf_area_image", Filesystem),
     ("save_session", NoGraphSlot),
@@ -215,9 +232,11 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("set_app_string", NoGraphSlot),
     ("set_backup_keep", LegacyOnly),
     ("set_capture_enter_files", NoGraphSlot),
+    ("set_default_home", ConfigWrite),
     ("set_default_journal_template", ConfigWrite),
     ("set_doc_mode_enter_for_new_block", ConfigWrite),
     ("set_favorites", ConfigWrite),
+    ("set_favorites_page", ConfigWrite),
     ("set_guide_announced", ConfigWrite),
     ("set_journal_title_format", ConfigWrite),
     ("set_link_first_match", NoGraphSlot),
@@ -259,11 +278,21 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("write_pdf_view_state", ManagedRouted),
 ];
 
+/// The flight recorder accepts only names from the shipped IPC surface. This
+/// prevents a caller from smuggling graph text or paths into a diagnostic
+/// event through the nominally structured `command` field.
+pub(crate) fn is_known_command(command: &str) -> bool {
+    MANAGED_COMMAND_SURFACE
+        .iter()
+        .any(|(known, _)| *known == command)
+}
+
 /// Every command that a managed binding refuses outright, with the reason it
 /// is still refused. Derived from the table above by the tests, and asserted
 /// against this list so shrinking it is a deliberate edit.
 ///
 /// Each entry says what the command needs before it can come back.
+#[cfg(test)]
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "apply_journal_filename_migrations",
@@ -277,6 +306,12 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "present_conflict_override",
         "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
+        "resolve_duplicate_journal_day",
+        "a day resolving to two FILES is a Direct Files phenomenon: managed \
+         storage addresses journals by document identity, so a filename-format \
+         change cannot leave it a second file for the same day",
     ),
     (
         "resolve_durable_live_save_conflict",
@@ -308,6 +343,7 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
 /// The routing helpers a command body can use, most specific first. A body that
 /// dispatches on `sparse_application_handle` has a managed implementation even
 /// though its other arm takes the legacy graph, so that marker wins.
+#[cfg(test)]
 const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("sparse_application_handle", ManagedRouted),
     ("legacy_graph(", LegacyOnly),
@@ -317,6 +353,7 @@ const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("with_filesystem_graph(", Filesystem),
 ];
 
+#[cfg(test)]
 const MARKER_PRECEDENCE: &[ManagedRouting] = &[
     ManagedRouted,
     LegacyOnly,
@@ -327,6 +364,7 @@ const MARKER_PRECEDENCE: &[ManagedRouting] = &[
 
 /// Read every `#[tauri::command]` out of one source and classify it by the
 /// routing helper its body uses.
+#[cfg(test)]
 fn commands_in(source: &str) -> Vec<(String, ManagedRouting)> {
     let lines: Vec<&str> = source.lines().collect();
     let mut found = Vec::new();
@@ -369,6 +407,7 @@ fn commands_in(source: &str) -> Vec<(String, ManagedRouting)> {
 }
 
 /// `fn name(`, `pub(crate) async fn name<R: Runtime>(` and everything between.
+#[cfg(test)]
 fn fn_name(line: &str) -> Option<String> {
     let after = line
         .split_once(" fn ")
@@ -385,6 +424,7 @@ fn fn_name(line: &str) -> Option<String> {
     Some(name)
 }
 
+#[cfg(test)]
 fn scanned_surface() -> BTreeMap<String, ManagedRouting> {
     let mut surface = BTreeMap::new();
     for (file, source) in SCANNED_SOURCES {
@@ -494,6 +534,7 @@ mod tests {
         let scanned = scanned_surface();
         for command in [
             "set_favorites",
+            "set_favorites_page",
             "set_preferred_workflow",
             "set_preferred_format",
             "set_journal_title_format",
@@ -503,6 +544,7 @@ mod tests {
             "set_doc_mode_enter_for_new_block",
             "set_timetracking_enabled",
             "set_default_journal_template",
+            "set_default_home",
             "set_guide_announced",
         ] {
             assert_eq!(

@@ -1,12 +1,21 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
-import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, moveFavorite, conflictQueue, advanceConflictCursor } from "../ui";
+import {
+  addGroup,
+  deleteGroup,
+  moveFavoriteRow,
+  persistFavoritesLayout,
+  renameGroup,
+  setGroupCollapsed,
+} from "../favoritesStore";
+import { itemKind, resolveDrop, visibleRows, type FavRow } from "../favoritesLayout";
+import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
 import { backend } from "../backend";
 import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { NamespaceTree } from "./Namespace";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
@@ -38,11 +47,82 @@ const sidebarPageOpenDeps: SidebarPageOpenDeps = {
 // Live drop target while a favorites reorder drag is in progress (GH #211).
 // Module scope: Sidebar renders once per window.
 const [favDropTarget, setFavDropTarget] = createSignal<RowDropTarget | null>(null);
+/** Nesting step, in px. Also the width of one pointer "step" to the right when
+ *  choosing a drop depth, so the gesture reads the same as the result looks. */
+const FAV_INDENT_PX = 16;
+/** The depth the live drop would land at — drawn as the indent of the insertion
+ *  line, so the user sees WHERE a nested drop goes before releasing. */
+const [favDropDepth, setFavDropDepth] = createSignal(0);
+
+/** The depth the pointer is asking for: the dragged row's own depth, plus one
+ *  level per indent step it has been dragged to the right (or left). */
+function requestedDepth(rows: FavRow[], from: number, dx: number): number {
+  const origin = rows[from];
+  if (!origin) return 0;
+  return origin.depth + Math.round(dx / FAV_INDENT_PX);
+}
+
 /** Pointerdown on a favorites row starts a reorder drag — never from an
  *  interactive child. */
 function startFavoriteDrag(index: number, event: PointerEvent) {
   if ((event.target as HTMLElement | null)?.closest("button, a, input, [contenteditable=\"true\"]")) return;
-  beginRowReorderDrag(event, index, "#sidebar-favorites-list .nav-page", setFavDropTarget, moveFavorite);
+  const rows = visibleRows(favoritesLayout());
+  beginRowReorderDrag(
+    event,
+    index,
+    "#sidebar-favorites-list .nav-page",
+    (target) => {
+      if (target) {
+        const slot = target.index + (target.before ? 0 : 1);
+        setFavDropDepth(
+          resolveDropFor(rows, index, slot, requestedDepth(rows, index, target.dx)).depth
+        );
+      }
+      setFavDropTarget(target);
+    },
+    (from, _to, target) => {
+      const slot = target.index + (target.before ? 0 : 1);
+      const { parent, index: at } = resolveDropFor(
+        rows,
+        from,
+        slot,
+        requestedDepth(rows, from, target.dx)
+      );
+      const origin = rows[from];
+      if (!origin) return;
+      void persistFavoritesLayout(moveFavoriteRow(favoritesLayout(), origin.path, parent, at));
+    },
+    // A drop at the same slot but a different depth re-parents the row, so the
+    // flat helper's "nothing moved" shortcut must not swallow it.
+    { commitUnchanged: true },
+  );
+}
+
+/** Resolve a drop, ignoring the rows the dragged subtree itself occupies — a
+ *  node may not become its own descendant, and its own rows must not be counted
+ *  when working out which parent the slot belongs to. */
+function resolveDropFor(
+  rows: FavRow[],
+  from: number,
+  slot: number,
+  depth: number,
+): { parent: number[]; index: number; depth: number } {
+  const origin = rows[from];
+  if (!origin) return { parent: [], index: 0, depth: 0 };
+  const dragged = new Set<number>();
+  rows.forEach((row, i) => {
+    if (row.path.length >= origin.path.length && origin.path.every((v, k) => row.path[k] === v)) {
+      dragged.add(i);
+    }
+  });
+  const rest = rows.filter((_, i) => !dragged.has(i));
+  const restSlot = rows.slice(0, slot).filter((_, i) => !dragged.has(i)).length;
+  const resolved = resolveDrop(rest, restSlot, depth);
+  const parentRow = resolved.parent.length
+    ? rest.find((row) => row.path.length === resolved.parent.length
+        && resolved.parent.every((v, k) => row.path[k] === v))
+    : null;
+  return { ...resolved, depth: parentRow ? parentRow.depth + 1 : 0 };
 }
 
 export function openSidebarPageTarget(
@@ -111,12 +191,11 @@ export function Sidebar(props: {
     path ? openFile(path, name, "page") : openPage(name, "page");
     props.onActiveNavigationComplete?.();
   };
-  // Shift+click on a sidebar page row opens it in the right sidebar (mirrors the
-  // center-pane page-link behavior; GH #63). The onMouseDown guard suppresses the
-  // browser's native shift-range text-selection (same fix as inline links, GH #42).
-  const shiftGuard = (e: MouseEvent) => {
-    if (e.shiftKey) e.preventDefault();
-  };
+  // Sidebar page rows follow the shared internal-link gesture contract (GH #63,
+  // GH #283): the shared mousedown guard suppresses native shift-range
+  // text-selection AND middle-click autoscroll up front (GH #207 — the old
+  // shift-only guard let the middle gesture leak to the browser here).
+  const shiftGuard = internalLinkMouseDown;
   const openRowMenu = (e: MouseEvent, name: string, kind: PageKind) => {
     e.preventDefault();
     openPageContextMenu(e.clientX, e.clientY, name, kind);
@@ -136,13 +215,9 @@ export function Sidebar(props: {
         <div
           class="nav-item"
           classList={{ active: route().kind === "journals" }}
+          onMouseDown={internalLinkMouseDown}
           onClick={() => { openJournals(); props.onActiveNavigationComplete?.(); }}
-          onAuxClick={(e) => {
-            if (e.button === 1) {
-              e.preventDefault();
-              openInNewTab({ kind: "journals" });
-            }
-          }}
+          onAuxClick={(e) => internalLinkAuxClick(e, () => openInNewTab({ kind: "journals" }))}
         >
           <Icon name="journals" />
           <span>Journals</span>
@@ -164,40 +239,119 @@ export function Sidebar(props: {
             </button>
             <Show when={favoritesSectionExpanded()}>
               <div id="sidebar-favorites-list">
-                <For each={favorites()}>
-                  {(fav, i) => {
-                    const target = () => sidebarPageTarget(fav.name, fav.kind);
+                {/* One flat run of rows, pre-order, indented by depth — not
+                    nested markup. The visible index IS `data-row-index`, so the
+                    drop target found by elementFromPoint needs no translation,
+                    and a label row and a favorite row are draggable on exactly
+                    the same terms. */}
+                <For each={visibleRows(favoritesLayout())}>
+                  {(row, i) => {
+                    const indent = () => ({ "padding-left": `${6 + row.depth * FAV_INDENT_PX}px` });
+                    const dropping = () => favDropTarget()?.index === i();
+                    const rowClasses = () => ({
+                      "row-drop-before": dropping() && favDropTarget()!.before,
+                      "row-drop-after": dropping() && !favDropTarget()!.before,
+                    });
+                    const dropIndent = () =>
+                      dropping() ? { "--fav-drop-indent": `${6 + favDropDepth() * FAV_INDENT_PX}px` } : {};
+                    const toggle = (
+                      <Show when={row.node.children.length > 0} fallback={<span class="nav-fav-spacer" />}>
+                        <button
+                          type="button"
+                          class="nav-fav-group-toggle"
+                          aria-expanded={!row.node.collapsed}
+                          aria-label={row.node.collapsed ? "Expand" : "Collapse"}
+                          onClick={() =>
+                            void persistFavoritesLayout(
+                              setGroupCollapsed(favoritesLayout(), row.path, !row.node.collapsed)
+                            )
+                          }
+                        >
+                          <span class="nav-toggle-caret" classList={{ open: !row.node.collapsed }}>▸</span>
+                        </button>
+                      </Show>
+                    );
+                    if (row.node.target === null) {
+                      return (
+                        <div
+                          class="nav-page nav-fav-group"
+                          data-row-index={i()}
+                          classList={rowClasses()}
+                          style={{ ...indent(), ...dropIndent() }}
+                          onPointerDown={(e) => startFavoriteDrag(i(), e)}
+                        >
+                          {toggle}
+                          {/* Sized to its text, not stretched: a label row is
+                              draggable like any other, and an input filling the
+                              row would leave nowhere to grab it. */}
+                          <input
+                            class="nav-fav-group-name"
+                            size={Math.max(row.node.raw.length, 4)}
+                            value={row.node.raw}
+                            aria-label={`Rename group ${row.node.raw}`}
+                            onChange={(event) =>
+                              void persistFavoritesLayout(
+                                renameGroup(favoritesLayout(), row.path, event.currentTarget.value)
+                              )
+                            }
+                          />
+                          <button
+                            type="button"
+                            class="nav-fav-group-delete"
+                            /* Deleting a group keeps its favorites — they move up
+                               to where it stood — so this needs no confirmation,
+                               which is just as well: WebKitGTK's confirm() is a
+                               no-op (#confirm). */
+                            title="Delete this group (what it holds moves up a level)"
+                            aria-label={`Delete group ${row.node.raw}`}
+                            onClick={() =>
+                              void persistFavoritesLayout(deleteGroup(favoritesLayout(), row.path))
+                            }
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    }
+                    const name = row.node.target;
+                    const target = () => sidebarPageTarget(name, itemKind(name));
                     return (
                       <div
                         class="nav-page"
                         data-row-index={i()}
-                        classList={{ active: isActive(target().name), "row-drop-before": favDropTarget()?.index === i() && favDropTarget()!.before, "row-drop-after": favDropTarget()?.index === i() && !favDropTarget()!.before }}
+                        classList={{ active: isActive(target().name), ...rowClasses() }}
+                        style={{ ...indent(), ...dropIndent() }}
                         onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
                           if (rowReorderClickSuppressed()) return;
                           const dest = internalLinkDest(e);
-                          openSidebarPageTarget(fav.name, fav.kind, dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                          openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
-                        onAuxClick={(e) => {
-                          if (e.button === 1) {
-                            e.preventDefault();
-                            openSidebarPageTarget(fav.name, fav.kind, "new-tab");
-                          }
-                        }}
+                        onAuxClick={(e) =>
+                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"))
+                        }
                         onContextMenu={(e) => {
                           e.preventDefault();
-                          openSidebarPageTarget(fav.name, fav.kind, "context", { x: e.clientX, y: e.clientY });
+                          openSidebarPageTarget(name, itemKind(name), "context", { x: e.clientX, y: e.clientY });
                         }}
                       >
+                        {toggle}
                         {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
                             crashes painting a raw color-emoji glyph on hardened
                             libstdc++ (#29); Twemoji <img> never touches the font. */}
-                        <EmojiText text={`⭐ ${fav.name}`} />
+                        <EmojiText text={`⭐ ${name}`} />
                       </div>
                     );
                   }}
                 </For>
+                <button
+                  type="button"
+                  class="nav-fav-add-group"
+                  onClick={() => void persistFavoritesLayout(addGroup(favoritesLayout()))}
+                >
+                  + New group
+                </button>
               </div>
             </Show>
           </div>
@@ -233,12 +387,7 @@ export function Sidebar(props: {
                           else if (dest === "background") openPageTargetInNewTab(target());
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
-                        onAuxClick={(e) => {
-                          if (e.button === 1) {
-                            e.preventDefault();
-                            openPageTargetInNewTab(target());
-                          }
-                        }}
+                        onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openPageContextMenu(e.clientX, e.clientY, target());
@@ -280,14 +429,12 @@ export function Sidebar(props: {
                       : openPageInNewTab(p.name, "page");
                     else openEntry(p.path, p.name);
                   }}
-                  onAuxClick={(e) => {
-                    if (e.button === 1) {
-                      e.preventDefault();
+                  onAuxClick={(e) =>
+                    internalLinkAuxClick(e, () =>
                       p.path
                         ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
-                        : openPageInNewTab(p.name, "page");
-                    }
-                  }}
+                        : openPageInNewTab(p.name, "page"))
+                  }
                   onContextMenu={(e) => {
                     e.preventDefault();
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });

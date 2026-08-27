@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { frameExtents as sharedFrameExtents, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -104,16 +105,10 @@ const geometry = (id) => {
     HEIGHT: read("Height"),
   };
 };
-const frameExtents = (id) => {
-  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], { encoding: "utf8", env });
-  const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
-  // An undecorated window commonly has no property at all; that is equivalent
-  // to zero extents and is the expected pre-toggle state.
-  if (!values && /not found/i.test(raw)) return { left: 0, right: 0, top: 0, bottom: 0 };
-  if (!values) throw new Error(`window manager exposed malformed frame extents: ${raw.trim()}`);
-  const [left, right, top, bottom] = values;
-  return { left, right, top, bottom };
-};
+// An undecorated window commonly has no frame-extents property at all; the
+// shared parser (e2e-capabilities.mjs) treats that as zero extents unless the
+// caller asks for strictness — exactly this suite's old behavior.
+const frameExtents = (id) => sharedFrameExtents(id, env);
 
 const wmLog = fs.openSync(path.join(ARTIFACTS, "window-manager.log"), "w");
 const wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
@@ -123,7 +118,7 @@ await sleep(600);
 if (wm.exitCode != null) throw new Error(`window manager exited early: ${fs.readFileSync(path.join(ARTIFACTS, "window-manager.log"), "utf8")}`);
 
 const driverLog = fs.openSync(path.join(ARTIFACTS, "tauri-driver.log"), "w");
-const td = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
   env, stdio: ["ignore", driverLog, driverLog], detached: true,
 });
 await sleep(2500);
@@ -133,11 +128,7 @@ try {
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/", logLevel: "error",
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "native-titlebar"),
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   const desktopEntry = `${TMP}/xdg/data/applications/page.tine.Tine.desktop`;
@@ -164,6 +155,28 @@ try {
   if ((await toggle.getAttribute("aria-checked")) !== "true") {
     throw new Error("Settings did not reflect the native frame applied at startup");
   }
+
+  // The same real production binary must expose its safe report through native
+  // IPC. This catches command-registration, app-data, report-schema and Settings
+  // wiring failures that a browser render test cannot see.
+  await browser.$("button=Diagnostics").click();
+  const createReport = await browser.$("button=Create diagnostic report");
+  await createReport.waitForExist({ timeout: 5_000 });
+  await createReport.click();
+  const reportPreview = await browser.$(".diagnostics-preview textarea");
+  await reportPreview.waitForExist({ timeout: 5_000 });
+  const reportText = await reportPreview.getValue();
+  const report = JSON.parse(reportText);
+  if (report.schemaVersion !== 1 || report.privacy?.automaticUpload !== false) {
+    throw new Error(`diagnostic report has the wrong safety schema: ${reportText}`);
+  }
+  if (report.privacy?.containsGraphContent !== false || report.runtime?.recorderActive !== true) {
+    throw new Error(`diagnostic report did not preserve its privacy/runtime contract: ${reportText}`);
+  }
+  if (reportText.includes(GRAPH) || reportText.includes("native titlebar fixture")) {
+    throw new Error("diagnostic report exposed the fixture graph path or content");
+  }
+  await browser.saveScreenshot(path.join(ARTIFACTS, "diagnostics-report.png"));
 
   // Allow the close-request handler to be installed before driving the actual
   // window-manager widget rather than synthesizing WM_DELETE_WINDOW directly.
@@ -202,7 +215,7 @@ try {
   }
   await waitFor(() => windowIds().length === 0, 12_000,
     `native close control did not close Tine; geometry=${JSON.stringify(g)} extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY} state=${JSON.stringify(clickState)}`);
-  console.log(`PASS: Linux native close control closed Tine safely; extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY}`);
+  console.log(`PASS: privacy-safe diagnostics and Linux native close control; extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY}`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}
