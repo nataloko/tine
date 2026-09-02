@@ -1091,6 +1091,9 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/debug.rs", "fs.remove_file", 5),
         ("src-tauri/src/debug.rs", "fs.rename", 3),
         ("src-tauri/src/debug.rs", "open.create", 1),
+        // FORK: git integration — `git_init` seeds a default .gitignore at the
+        // graph root, once, only when none exists. Not a projection producer.
+        ("src-tauri/src/git.rs", "fs.write", 1),
         ("src-tauri/src/graph.rs", "fs.create_dir", 1),
         ("src-tauri/src/graph.rs", "fs.create_dir_all", 1),
         (
@@ -1651,6 +1654,11 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
     );
     let expected_launch_roots = [
         ("src-tauri/src/commands.rs", "process.opener", 3),
+        // FORK: git integration — graph-derived by design: `git_base` builds the
+        // one `git` invocation every fork git command runs, `current_dir`-rooted
+        // at the graph directory, collected via `.output()` (no .spawn/.status,
+        // so no PC-18 row). It mutates the repo, never Tine's projections.
+        ("src-tauri/src/git.rs", "process.command.imported", 1),
         ("src-tauri/src/lib.rs", "process.command.imported", 1),
         ("src-tauri/src/lib.rs", "process.command.std", 1),
         ("src-tauri/src/platform.rs", "process.command.imported", 2),
