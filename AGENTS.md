@@ -34,7 +34,12 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, and
   `src/sheet/config.ts`.
 - Bullet threading: `src/bulletThreading.ts` and `src/components/Block.tsx`.
-- Git integration: `src-tauri/src/git.rs` and Settings.
+- Git integration: `src-tauri/src/git.rs` and Settings. Since v0.6.981,
+  upstream's producer census (`crates/tine-core/src/projection_producer_census.rs`)
+  pins every `src-tauri` mutation primitive and process construction site, so it
+  carries two `FORK:`-commented rows for `git.rs` (one `fs.write`, one
+  `Command::new`); any change to what `git.rs` writes or spawns must update those
+  pins.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
 - Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
   `src/components/AboutTab.tsx`. One behavior drives all of it — `updateMode()`
@@ -48,7 +53,10 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   - The About tab reports "available upstream … Merge it into your fork."
   - `update.test.ts` asserts the updater is never called and retargets both
     action-label assertions. It conflicts whenever upstream edits its own
-    GH #241 test.
+    GH #241 test. Since v0.6.981 it also drops (with a `FORK:` comment)
+    upstream's end-to-end "sanitizes the opt-in error chain" test, which drives
+    the self-update failure path this build can't reach; upstream's pure
+    `classifyUpdaterFailure` table test is kept.
 
   Upstream's doc comments in `update.ts` still name the old `"Download"` label
   and the `"Install update"` action; they are deliberately left unedited, since
@@ -117,8 +125,8 @@ release ever runs them. Cross-check any failure against that list before calling
 it broken. The curated selection above is also stricter: one process per test, a
 5-minute per-test timeout, no retries. It needs cargo-nextest **exactly 0.9.143**
 (nixpkgs has 0.9.140, and the prebuilt binary needs `patchelf` on NixOS — see the
-`sync-upstream` skill for the one-time fix). At v0.6.97 it reports
-`2128 tests run: 2128 passed, 86 skipped`.
+`sync-upstream` skill for the one-time fix). At v0.6.981 it reports
+`1936 tests run: 1936 passed, 113 skipped`.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.
