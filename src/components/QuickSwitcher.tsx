@@ -1,6 +1,6 @@
 import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar } from "../ui";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
@@ -14,6 +14,9 @@ import { dismissTopTransient, registerTransientLayer } from "../transientLayers"
 import { persistBlockRefTarget } from "../store";
 import type { QueryPageScope } from "../types";
 import { blockDtoExternalId } from "../blockIdentity";
+import { createLongPress } from "../render/longPress";
+import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
+import { managedStorageRuntime } from "../managedStorageRuntime";
 
 // One selectable result row.
 type Item =
@@ -418,8 +421,16 @@ export function QuickSwitcher(): JSX.Element {
       e.preventDefault();
       const it = flat()[sel()];
       if (it) {
+        // GH #463: the keyboard half of the same ladder the pointer already
+        // implements below. Ctrl/Cmd+Enter was the one rung missing, so it fell
+        // through to plain navigation and the modifier did nothing — while
+        // Ctrl/Cmd+click on the very same row opened a background tab. Like the
+        // click, it leaves the switcher open, so several results can be fanned
+        // out without searching again.
         const shiftOnly = e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+        const cmdCtrlOnly = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
         if (shiftOnly && !switcherEmbryo() && (it.t === "page" || it.t === "block")) chooseSidebar(it);
+        else if (cmdCtrlOnly && (it.t === "page" || it.t === "block")) openInBackground(it);
         else if (e.altKey && !switcherEmbryo()) void chooseOther(it);
         else choose(it);
       }
@@ -487,6 +498,11 @@ export function QuickSwitcher(): JSX.Element {
             }}
           />
           <div id="switcher-results" class="switcher-results" role="listbox" ref={resultsRef}>
+            <Show when={query().trim() && managedStorageRuntime.snapshot().status?.runtime?.search_index_building}>
+              <div class="switcher-empty" data-search-index-building>
+                Search index building… Results remain complete but may be slower for a moment.
+              </div>
+            </Show>
             <For each={sections()}>
               {(section, sIdx) => (
                 <div class="switcher-section" role="group" aria-labelledby={`switcher-group-${sIdx()}`}>
@@ -497,8 +513,12 @@ export function QuickSwitcher(): JSX.Element {
                   <For each={section.items}>
                     {(it, iIdx) => {
                       const idx = () => flatIndex(sIdx(), iIdx());
+                      let rowElement: HTMLDivElement | undefined;
+                      const longPress = createLongPress(() => rowElement);
+                      onCleanup(longPress.dispose);
                       return (
                         <div
+                          ref={rowElement}
                           class="switcher-row"
                           classList={{ active: idx() === sel(), "block-result": it.t === "block" }}
                           id={`switcher-option-${idx()}`}
@@ -506,6 +526,11 @@ export function QuickSwitcher(): JSX.Element {
                           aria-selected={idx() === sel()}
                           onMouseMove={() => setSel(idx())}
                           onMouseDown={(e) => {
+                            if (longPress.consumeClick()) {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              return;
+                            }
                             // preventDefault keeps input focus (and kills the
                             // middle-click autoscroll). Left opens + closes;
                             // middle opens a background tab, switcher stays open.
@@ -534,6 +559,20 @@ export function QuickSwitcher(): JSX.Element {
                                 choose(it);
                               }
                             }
+                          }}
+                          onPointerDown={(e) => { if (it.t === "page") longPress.onPointerDown(e); }}
+                          onPointerMove={(e) => { if (it.t === "page") longPress.onPointerMove(e); }}
+                          onPointerUp={(e) => { if (it.t === "page") longPress.onPointerUp(e); }}
+                          onPointerCancel={(e) => { if (it.t === "page") longPress.onPointerCancel(e); }}
+                          onContextMenu={(e) => {
+                            if (it.t !== "page" || !shouldOpenTextContextMenu(e)) return;
+                            e.preventDefault();
+                            e.stopPropagation();
+                            openPageContextMenu(e.clientX, e.clientY, {
+                              name: it.name,
+                              pageKind: it.pageKind,
+                              ...(it.path ? { path: it.path } : {}),
+                            });
                           }}
                         >
                           <Row item={it} />

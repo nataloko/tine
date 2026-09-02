@@ -6,28 +6,26 @@
 //! archive, accepted-history, tail/SQLite, projection-receipt, authorship, and
 //! provider derivatives of that exact record.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use tine_storage::LocalJournalFrame;
+use tine_storage::{LocalJournalError, LocalJournalFrame};
 use uuid::Uuid;
 
 use crate::model::Graph;
-use crate::oplog::batch::ObjectKind;
 use crate::oplog::hot_engine::AcceptedFrontierRoot;
 use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBoundary};
 use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
-    ManifestObjectRef, ObjectStore, PageId, ProjectionEndpointBinding, ProjectionReceiptStore,
-    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
-    TailOverlay, WorkspaceId,
+    ManifestProjectionTarget, ObjectStore, PageId, ProjectionReceiptStore, ProjectionTurn,
+    ProjectionTurnError, ProjectionTurnPayloadKind, SequenceDomain, ShardedHotEngine,
+    SqliteFrontier, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget, WorkspaceId,
+    PROJECTION_TURN_DERIVATION_SCHEME_V1, PROJECTION_TURN_SCHEMA_VERSION,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
-const ENGINE_STAGE_WORK_PER_RESUME: usize = 8;
-const SQLITE_BATCHES_PER_RESUME: usize = 1;
 
 /// Exact point answer derived from the already decoded pending local journal.
 /// The index is rebuildable acceleration state; the journal and hot-prefix
@@ -242,10 +240,6 @@ impl ManagedLocalDrainCheckpoint {
         self.lineage_digest
     }
 
-    pub(crate) const fn commitment(&self) -> ContentDigest {
-        self.commitment
-    }
-
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         postcard::to_allocvec(self).map_err(|error| error.to_string())
     }
@@ -284,9 +278,7 @@ pub(crate) struct ManagedLocalDerivativeAuthority {
 pub(crate) enum ManagedLocalPublicationState {
     Complete,
     Pending(String),
-    Blocked(String),
     Conflict(String),
-    RecoveryRequired(String),
 }
 
 /// Adapter implemented by the runtime owner of local-authorship receipts and
@@ -452,40 +444,6 @@ fn publication_conflict(error: &StoreError) -> bool {
     )
 }
 
-fn exact_work(
-    record: &ManagedLocalRecord,
-    projection: &super::ManagedLocalProjection,
-    endpoint: ProjectionEndpointBinding,
-) -> Result<ProjectionWork, String> {
-    let batch = record.prepared_batch();
-    let intent = projection.intent();
-    let descriptor = batch
-        .manifest()
-        .required_objects()
-        .iter()
-        .find(|descriptor| {
-            descriptor.kind() == ObjectKind::ProjectionIntent
-                && descriptor.document_id() == intent.descriptor_document_id()
-        })
-        .ok_or_else(|| "journal projection descriptor is absent".to_owned())?;
-    let target = intent
-        .target()
-        .description()
-        .map_or(ProjectionWorkTarget::Absent, ProjectionWorkTarget::Present);
-    Ok(ProjectionWork::new(
-        batch.manifest().workspace_id(),
-        endpoint.endpoint_id(),
-        endpoint.graph_resource_id(),
-        batch.manifest().batch_id(),
-        intent.page_id(),
-        intent.path().clone(),
-        intent.portable_path_index_root(),
-        ManifestObjectRef::from_descriptor(descriptor),
-        intent.post_frontier().clone(),
-        target,
-    ))
-}
-
 fn checkpoint_advance(
     checkpoint: &ManagedLocalDrainCheckpoint,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
@@ -516,36 +474,6 @@ fn checkpoint_advance(
         commitment: ContentDigest::of(&bytes),
         accepted_frontier_digest,
     })
-}
-
-/// The same boundary with explicit promoted parts, retained for deterministic
-/// semantic/failure tests. Production callers use the session facade above.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain_with_parts(
-    admission: &LocalRuntimeAdmission<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &mut ShardedHotEngine,
-    database: &mut SqliteFrontier,
-    tail: &mut TailOverlay,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
-        admission,
-        graph,
-        receipts,
-        engine,
-        database,
-        ManagedLocalSqliteMode::Tail(tail),
-        frame,
-        None,
-        checkpoint,
-        continuation,
-        publisher,
-    )
 }
 
 /// Resume one foreground-journal record through the clean runtime's direct
@@ -580,8 +508,7 @@ pub(crate) fn resume_clean_managed_local_journal_drain(
     )
 }
 
-enum ManagedLocalSqliteMode<'a> {
-    Tail(&'a mut TailOverlay),
+enum ManagedLocalSqliteMode {
     Direct,
 }
 
@@ -592,7 +519,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
-    sqlite_mode: ManagedLocalSqliteMode<'_>,
+    sqlite_mode: ManagedLocalSqliteMode,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
@@ -686,10 +613,30 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             "journal projection authority differs from the enrolled graph/receipt endpoint",
         );
     }
-    let mut projection_superseded = BTreeMap::new();
+    let mut projection_superseded = BTreeSet::new();
     for projection in record.projections() {
         let intent = projection.intent();
         let exact_target = intent.target().bytes();
+        let completed_creation =
+            if exact_target.is_some() && projection.precondition_base().is_none() {
+                let intent_id = match projection
+                    .completion_intent()
+                    .and_then(|intent| intent.id())
+                {
+                    Ok(intent_id) => intent_id,
+                    Err(error) => {
+                        return conflict(ManagedLocalDrainStage::Authenticate, error.to_string())
+                    }
+                };
+                match engine.local_projection_completed(intent_id) {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        return recovery(ManagedLocalDrainStage::Authenticate, error.to_string())
+                    }
+                }
+            } else {
+                false
+            };
         let superseded = match graph.read_projection_input(intent.path()) {
             Ok(Some(current)) => {
                 let current_matches_target = exact_target.is_some_and(|target| current == target);
@@ -729,16 +676,29 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     );
                 }
             }
-            Ok(None) if exact_target.is_none() || projection.precondition_base().is_none() => false,
-            Ok(None) => {
+            Ok(None) if exact_target.is_none() => false,
+            Ok(None) if graph.has_interrupted_publication_claimant(intent.path()) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
-                    "graph target is not the exact journal-authorized bytes",
+                    "an unresolved publication artifact still claims the absent journal target",
                 )
             }
+            // A creation-shaped foreground projection has no captured base.
+            // Only the exact intent's completed local-half entry can prove it
+            // ran before the file disappeared; otherwise this is its first
+            // projection and must create as before.
+            Ok(None) if projection.precondition_base().is_none() => completed_creation,
+            // W4 has already reconciled publication artifacts before any
+            // journal replay. A claimant-free absence is therefore a real
+            // external deletion, not a torn W1 window. Accept this older batch
+            // first, suppress its obsolete projection, and let the ordinary
+            // clean watcher/full-scan import the deletion as the next batch.
+            Ok(None) => true,
             Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
         };
-        projection_superseded.insert(intent.path().as_str().to_owned(), superseded);
+        if superseded {
+            projection_superseded.insert(intent.path().clone());
+        }
     }
 
     let archive = match engine
@@ -758,7 +718,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         stage_started = std::time::Instant::now();
     }
 
-    let direct_clean_runtime = matches!(&sqlite_mode, ManagedLocalSqliteMode::Direct);
     match exact_archive_batch(&record, &archive) {
         Ok(true) => {}
         Ok(false) => {
@@ -773,7 +732,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     error.to_string(),
                 );
             }
-            if let Err(error) = archive.publish_prepared(record.prepared_batch()) {
+            if let Err(error) = archive.publish_turn_covered_prepared(record.prepared_batch()) {
                 if publication_conflict(&error) {
                     return conflict(
                         ManagedLocalDrainStage::ArchivePublication,
@@ -817,38 +776,22 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         {
             return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string());
         }
-        let (disposition, has_more, stage_work) = if direct_clean_runtime {
-            let claim_source = match database.materialized_read() {
-                Ok(source) => source,
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
-            };
-            match engine.accept_clean_prepared_below_managed_local_overlay(
-                record.prepared_batch(),
-                &claim_source,
-            ) {
-                Ok(staged) => (staged.disposition().clone(), false, 1),
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
-            }
-        } else {
-            match engine.stage_archive_batch_bounded_below_managed_local_overlay(
-                batch_id,
-                ENGINE_STAGE_WORK_PER_RESUME,
-            ) {
-                Ok(staged) => (
-                    staged.outcome().disposition().clone(),
-                    staged.has_more(),
-                    staged.work(),
-                ),
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
+        let claim_source = match database.materialized_read() {
+            Ok(source) => source,
+            Err(error) => {
+                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
             }
         };
-        work_done.engine_stage_work = stage_work;
+        let disposition = match engine.accept_clean_prepared_below_managed_local_overlay(
+            record.prepared_batch(),
+            &claim_source,
+        ) {
+            Ok(staged) => staged.disposition().clone(),
+            Err(error) => {
+                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+            }
+        };
+        work_done.engine_stage_work = 1;
         match disposition {
             BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => {}
             BatchDisposition::IncompleteStaged {
@@ -873,9 +816,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     "accepted-history staging quarantined the journal batch",
                 )
             }
-        }
-        if has_more {
-            return pending(ManagedLocalDrainStage::EngineAcceptance, frame, &record);
         }
         if drain_fault!(AfterEngineAcceptance) {
             return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
@@ -910,45 +850,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     }
     work_done.accepted_events = 1;
     match sqlite_mode {
-        ManagedLocalSqliteMode::Tail(tail) => {
-            if let Err(error) = tail.try_enqueue(database, engine, &event) {
-                return pending_with_detail(
-                    ManagedLocalDrainStage::TailAndSqlite,
-                    frame,
-                    &record,
-                    error.to_string(),
-                );
-            }
-            if drain_fault!(AfterTailAdmission) {
-                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-            }
-            if let Err(error) =
-                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
-            {
-                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
-            }
-            let source = match RebuildSource::new(engine, &archive) {
-                Ok(source) => source,
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
-                }
-            };
-            if drain_fault!(BeforeSqliteCommit) {
-                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-            }
-            work_done.sqlite_batches =
-                match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME) {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        return pending_with_detail(
-                            ManagedLocalDrainStage::TailAndSqlite,
-                            frame,
-                            &record,
-                            error.to_string(),
-                        )
-                    }
-                };
-        }
         ManagedLocalSqliteMode::Direct => {
             if drain_fault!(AfterTailAdmission) {
                 return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
@@ -1035,43 +936,52 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             error.to_string(),
         );
     }
-    for projection in record.projections() {
-        let intent = projection.intent();
-        let exact_target = intent.target().bytes();
-        let expected_work = match exact_work(&record, projection, endpoint) {
-            Ok(work) => work,
-            Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
+    let mut turn = match projection_turn_from_managed_local_record(
+        frame.device_id(),
+        checkpoint.lineage_digest(),
+        &record,
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            return conflict(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                error.to_string(),
+            )
+        }
+    };
+    // A later authenticated foreground frame for this path is itself queued
+    // and will replay as its own turn. The older record must not validate its
+    // stale receipt precondition against the newer editor publication.
+    turn.pages
+        .retain(|page| !projection_superseded.contains(&page.path));
+    if let Err(error) = crate::oplog::projection::replay_projection_turn(
+        graph, receipts, engine, database, &turn, None,
+    ) {
+        let conflicts = record.projections().iter().any(|projection| {
+            let intent = projection.intent();
+            let exact_target = intent.target().bytes();
+            matches!(
+                graph.read_projection_input(intent.path()),
+                Ok(Some(bytes))
+                    if exact_target.is_none_or(|target| bytes != target)
+                        && projection
+                            .precondition_base()
+                            .is_none_or(|base| bytes != base.bytes())
+            )
+        });
+        return if conflicts {
+            conflict(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                error.to_string(),
+            )
+        } else {
+            pending_with_detail(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                frame,
+                &record,
+                error.to_string(),
+            )
         };
-        if projection_superseded
-            .get(intent.path().as_str())
-            .copied()
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Err(error) = crate::oplog::projection::execute_clean_manifested_projection_work(
-            graph,
-            receipts,
-            database,
-            engine,
-            &expected_work,
-        ) {
-            let current = graph.read_projection_input(intent.path());
-            let conflicts = matches!(current, Ok(Some(bytes)) if exact_target.is_none_or(|target| bytes != target) && projection.precondition_base().is_none_or(|base| bytes != base.bytes()));
-            return if conflicts {
-                conflict(
-                    ManagedLocalDrainStage::ProjectionAdoption,
-                    error.to_string(),
-                )
-            } else {
-                pending_with_detail(
-                    ManagedLocalDrainStage::ProjectionAdoption,
-                    frame,
-                    &record,
-                    error.to_string(),
-                )
-            };
-        }
     }
     work_done.projection_work_point_reads = record.projections().len();
     if drain_fault!(AfterProjectionAdoption) {
@@ -1105,18 +1015,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         ManagedLocalPublicationState::Pending(_) => {
             return pending(ManagedLocalDrainStage::AuthorshipReceipt, frame, &record)
         }
-        ManagedLocalPublicationState::Blocked(detail) => {
-            return ManagedLocalDrainOutcome::Blocked(ManagedLocalDrainBlock {
-                stage: ManagedLocalDrainStage::AuthorshipReceipt,
-                missing_dependencies: Vec::new(),
-                detail,
-            })
-        }
         ManagedLocalPublicationState::Conflict(detail) => {
             return conflict(ManagedLocalDrainStage::AuthorshipReceipt, detail)
-        }
-        ManagedLocalPublicationState::RecoveryRequired(detail) => {
-            return recovery(ManagedLocalDrainStage::AuthorshipReceipt, detail)
         }
     }
     if drain_fault!(AfterAuthorship) {
@@ -1138,18 +1038,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         ManagedLocalPublicationState::Pending(_) => {
             return pending(ManagedLocalDrainStage::ProviderPublication, frame, &record)
         }
-        ManagedLocalPublicationState::Blocked(detail) => {
-            return ManagedLocalDrainOutcome::Blocked(ManagedLocalDrainBlock {
-                stage: ManagedLocalDrainStage::ProviderPublication,
-                missing_dependencies: Vec::new(),
-                detail,
-            })
-        }
         ManagedLocalPublicationState::Conflict(detail) => {
             return conflict(ManagedLocalDrainStage::ProviderPublication, detail)
-        }
-        ManagedLocalPublicationState::RecoveryRequired(detail) => {
-            return recovery(ManagedLocalDrainStage::ProviderPublication, detail)
         }
     }
     if drain_fault!(AfterProvider) {
@@ -1181,4 +1071,242 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         timings.total = drain_started.elapsed();
     });
     outcome
+}
+
+// ---------------------------------------------------------------------------
+// Torn versus corrupt: the WAL rule (journal-universal durability design §3.4).
+//
+// The discriminator is NOT invented here. `LocalJournalSegmentV2` maintains a
+// durable frontier: append file-flushes the frame and durably publishes the
+// successor frontier before returning, open validates every byte inside the
+// committed frontier and truncates only bytes beyond it. So:
+//
+// * bytes BEYOND the durable frontier -- the append never returned. By the
+//   turn-before-mutation invariant, no graph mutation for those bytes can have
+//   started. The segment truncates them; nothing is owed; there is no residue
+//   probe because none is needed.
+// * any invalid frame AT OR BELOW the frontier, tail or interior -- a disk or
+//   media error damaged an authoritative record whose effects may exist.
+//   Refuse activation, retain the segment bytes as evidence, report the
+//   component. Never truncate, never skip.
+//
+// The first case never reaches this module: the segment handles it silently and
+// reports it as `discarded_tail_bytes`. The second arrives as an open error,
+// and mapping every open error to one code would be wrong -- `open_selected`
+// also reports an honest concurrent instance and an unsafe filesystem, whose
+// in-scope scenarios are different and whose refusals already exist. The
+// mapping below is therefore per-variant, and each arm names its scenario.
+// ---------------------------------------------------------------------------
+
+/// A local-journal segment that could not be opened, classified by the in-scope
+/// failure it actually names (the refusal-scenario rule).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalJournalOpenRefusal {
+    /// `MS-REF-DISK-CORRUPT`. In-scope scenario: a disk/media error damaged an
+    /// authoritative record inside the durable frontier, whose graph effects
+    /// may already exist. Retain the segment bytes as evidence; never truncate.
+    DiskCorrupt(String),
+    /// In-scope scenario: an honest second Tine instance holds the segment.
+    /// The existing concurrent-instance refusal applies; nothing is corrupt.
+    ConcurrentInstance(String),
+    /// In-scope scenario: the journal namespace contains an entry this
+    /// platform cannot safely open (symlink, non-regular file, unsafe name).
+    UnsafeFilesystem(String),
+    /// In-scope scenario: a transient I/O or capability failure. Retryable;
+    /// asserts nothing about the record's integrity.
+    Unavailable(String),
+}
+
+impl LocalJournalOpenRefusal {
+    /// The contract refusal code this classification maps to, or `None` where
+    /// the existing (non-corruption) refusal owns the message.
+    #[cfg(test)]
+    pub(crate) const fn refusal_code(&self) -> Option<&'static str> {
+        match self {
+            Self::DiskCorrupt(_) => Some("MS-REF-DISK-CORRUPT"),
+            Self::ConcurrentInstance(_) | Self::UnsafeFilesystem(_) | Self::Unavailable(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn retains_evidence(&self) -> bool {
+        matches!(self, Self::DiskCorrupt(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::DiskCorrupt(detail)
+            | Self::ConcurrentInstance(detail)
+            | Self::UnsafeFilesystem(detail)
+            | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for LocalJournalOpenRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiskCorrupt(detail) => write!(
+                formatter,
+                "MS-REF-DISK-CORRUPT: an authoritative journal record inside the durable \
+                 frontier is damaged and its bytes are retained as evidence: {detail}"
+            ),
+            Self::ConcurrentInstance(detail) => write!(
+                formatter,
+                "another Tine instance already holds this local journal segment: {detail}"
+            ),
+            Self::UnsafeFilesystem(detail) => write!(
+                formatter,
+                "the local journal namespace contains an entry that cannot be safely opened: \
+                 {detail}"
+            ),
+            Self::Unavailable(detail) => {
+                write!(formatter, "the local journal is unavailable: {detail}")
+            }
+        }
+    }
+}
+
+/// Per-variant mapping of a `LocalJournalSegmentV2::open_selected` failure.
+///
+/// This deliberately does not collapse to "any open error is corruption": a
+/// check with the wrong scenario is a future availability bug, not hardening.
+pub(crate) fn classify_local_journal_open_error(
+    error: &LocalJournalError,
+) -> LocalJournalOpenRefusal {
+    let detail = error.to_string();
+    match error {
+        // Every one of these is reported by the committed-prefix scan, i.e.
+        // strictly at or below the durable frontier. Bytes beyond the frontier
+        // are truncated by the segment and never surface as an error at all.
+        LocalJournalError::CorruptSegment { .. }
+        | LocalJournalError::SegmentDeviceMismatch { .. }
+        | LocalJournalError::SegmentSequenceGap { .. }
+        | LocalJournalError::ChecksumMismatch
+        | LocalJournalError::PayloadDigestMismatch
+        | LocalJournalError::InvalidFrameMagic
+        | LocalJournalError::NonCanonicalFrameHeader
+        | LocalJournalError::TruncatedFrame
+        | LocalJournalError::FrameLengthMismatch { .. }
+        | LocalJournalError::LengthOverflow
+        | LocalJournalError::FrameTooLarge(_)
+        | LocalJournalError::FrameHeaderTooLarge(_)
+        | LocalJournalError::SegmentTooLarge(_)
+        | LocalJournalError::UnknownFrameSchemaVersion { .. }
+        | LocalJournalError::Decode(_)
+        | LocalJournalError::SequenceExhausted => LocalJournalOpenRefusal::DiskCorrupt(detail),
+        LocalJournalError::SegmentAlreadyOpen(_) | LocalJournalError::PreparedArtifactExists(_) => {
+            LocalJournalOpenRefusal::ConcurrentInstance(detail)
+        }
+        LocalJournalError::UnsafeSegmentName(_)
+        | LocalJournalError::UnsupportedDurableReplacement => {
+            LocalJournalOpenRefusal::UnsafeFilesystem(detail)
+        }
+        LocalJournalError::Io(_)
+        | LocalJournalError::Encode(_)
+        | LocalJournalError::SegmentPoisoned => LocalJournalOpenRefusal::Unavailable(detail),
+    }
+}
+
+/// Decode a projection-turn frame.
+///
+/// One of the two producers of the single [`ProjectionTurn`] view; the sibling
+/// below reads a managed-local frame. Recovery therefore has one record shape
+/// to reason about regardless of which physical segment carried it.
+pub(crate) fn decode_projection_turn_frame(
+    frame: &LocalJournalFrame<ProjectionTurnPayloadKind>,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    if frame.payload_kind() != ProjectionTurnPayloadKind::TurnV1 {
+        return Err(ProjectionTurnError::CorruptPayload(
+            "unknown projection turn payload kind".into(),
+        ));
+    }
+    ProjectionTurn::decode(frame.payload(), frame.device_id(), frame.sequence())
+}
+
+/// Project one already-authenticated managed-local frame into the same
+/// [`ProjectionTurn`] view.
+///
+/// For A1/A2 this is a re-shape of material the frame already carries
+/// (`ManagedLocalProjection::precondition_base`/`render_base`), not a size
+/// increase, and it is why the foreground journal needs no second record kind.
+/// `lineage_digest` is a binding input for the same reason the drain
+/// checkpoint takes one: the frame does not carry it.
+#[cfg(test)]
+pub(crate) fn projection_turn_from_managed_local_frame(
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    lineage_digest: LineageDigest,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    let record = decode_managed_local_record(frame)
+        .map_err(|error| ProjectionTurnError::CorruptPayload(error.to_string()))?;
+    projection_turn_from_managed_local_record(frame.device_id(), lineage_digest, &record)
+}
+
+pub(crate) fn projection_turn_from_managed_local_record(
+    device_id: Uuid,
+    lineage_digest: LineageDigest,
+    record: &ManagedLocalRecord,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    let first = record.projections().first().ok_or_else(|| {
+        ProjectionTurnError::CorruptPayload(
+            "a managed-local record retains at least one projection".into(),
+        )
+    })?;
+    let workspace_id = first.intent().workspace_id();
+    let endpoint_id = first.intent().source_endpoint_id();
+    let mut pages = Vec::with_capacity(record.projections().len());
+    for projection in record.projections() {
+        let intent = projection.intent();
+        if intent.workspace_id() != workspace_id || intent.source_endpoint_id() != endpoint_id {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "one managed-local record spans two workspaces or endpoints".into(),
+            ));
+        }
+        let precondition = match projection.precondition_base() {
+            None => TurnPrecondition::Absent,
+            Some(base) => TurnPrecondition::Base {
+                description: base.description(),
+                bytes: Some(base.bytes().to_vec()),
+                annotations: base.annotations().to_vec(),
+            },
+        };
+        let target = match intent.target() {
+            ManifestProjectionTarget::Absent => TurnTarget::Absent,
+            ManifestProjectionTarget::Present {
+                description,
+                bytes,
+                annotations,
+            } => TurnTarget::Present {
+                description: *description,
+                bytes: Some(bytes.clone()),
+                annotations: annotations.clone(),
+            },
+        };
+        pages.push(TurnPage {
+            page_id: intent.page_id(),
+            path: intent.path().clone(),
+            precondition,
+            target,
+            frontier: intent.post_frontier().clone(),
+            claim_evidence: intent.claim_evidence().to_vec(),
+        });
+    }
+    let turn = ProjectionTurn {
+        schema_version: PROJECTION_TURN_SCHEMA_VERSION,
+        derivation_scheme: PROJECTION_TURN_DERIVATION_SCHEME_V1,
+        workspace_id,
+        lineage_digest,
+        device_id,
+        endpoint_id,
+        sequence: record.sequence(),
+        domain: SequenceDomain::ManagedLocal,
+        origin: TurnOrigin::LocalBatch {
+            batch_id: record.prepared_batch().manifest().batch_id(),
+        },
+        pages,
+    };
+    // Encoding revalidates every structural invariant of the record.
+    turn.encode()?;
+    Ok(turn)
 }

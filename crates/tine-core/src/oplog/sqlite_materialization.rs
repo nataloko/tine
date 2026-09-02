@@ -383,14 +383,6 @@ impl MaterializationChange {
         &self.deletions
     }
 
-    pub(crate) fn page_name_identity_records(&self) -> &[MaterializedIdentityRecord] {
-        &self.page_name_identity_records
-    }
-
-    pub(crate) fn portable_path_identity_records(&self) -> &[MaterializedIdentityRecord] {
-        &self.portable_path_identity_records
-    }
-
     pub(crate) fn with_derived_graph_facts(
         mut self,
         mut reference_postings: Vec<MaterializedReferencePosting>,
@@ -1016,21 +1008,6 @@ fn validate_page_name_pair(
     if crate::refs::page_key(raw_name) != normalized_name {
         return Err(MaterializationError::InvalidInput(format!(
             "{description} normalized name does not match refs::page_key"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_normalized_page_name(
-    description: &str,
-    normalized_name: &str,
-) -> Result<(), MaterializationError> {
-    if normalized_name.is_empty()
-        || normalized_name.len() > MAX_MATERIALIZATION_FIELD_BYTES
-        || crate::refs::page_key(normalized_name) != normalized_name
-    {
-        return Err(MaterializationError::InvalidInput(format!(
-            "{description} is not a canonical page key"
         )));
     }
     Ok(())
@@ -3016,6 +2993,9 @@ pub enum MaterializationError {
         materialized: u64,
         frontier: u64,
     },
+    SearchIndexBuilding {
+        horizon_sequence: u64,
+    },
     DuplicateCollision(BatchId),
     InvalidQuery(String),
 }
@@ -3058,6 +3038,9 @@ impl fmt::Display for MaterializationError {
                     "materialization for batch {batch_id} has different canonical bytes"
                 )
             }
+            Self::SearchIndexBuilding { horizon_sequence } => {
+                write!(f, "search index building from projection frontier {horizon_sequence}")
+            }
             Self::InvalidQuery(error) => write!(f, "invalid materialization query: {error}"),
         }
     }
@@ -3073,6 +3056,9 @@ impl From<rusqlite::Error> for MaterializationError {
 
 impl From<storage::MaterializationError> for MaterializationError {
     fn from(error: storage::MaterializationError) -> Self {
+        if let Some(horizon_sequence) = error.search_index_building_horizon() {
+            return Self::SearchIndexBuilding { horizon_sequence };
+        }
         match error {
             storage::MaterializationError::Sqlite(error) => Self::Sqlite(error),
             storage::MaterializationError::Schema(error) => Self::Schema(error),
@@ -3512,6 +3498,7 @@ mod tests {
                         home_document_id: page.home_document_id,
                         kind: page.kind,
                     }),
+                    lifecycle: super::super::PageDeltaLifecycle::Ordinary,
                 })
                 .collect(),
             Vec::new(),

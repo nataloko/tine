@@ -18,6 +18,9 @@ describe("stable desktop startup reveal (GH #132)", () => {
     expect(index).toContain('id="tine-startup-style"');
     expect(index).toContain('localStorage.getItem("logseq-claude.theme")');
     expect(index).toContain('matchMedia("(prefers-color-scheme: dark)")');
+    expect(index).toContain("background: var(--bg-primary, #ffffff);");
+    expect(index).toContain("background: var(--bg-primary, #1a1b1e);");
+    expect(index).toContain("color: var(--text-primary, #d1d5db);");
     expect(shell).toBeGreaterThanOrEqual(0);
     expect(module).toBeGreaterThan(shell);
     expect(main).toContain("root.replaceChildren();");
@@ -32,6 +35,16 @@ describe("stable desktop startup reveal (GH #132)", () => {
     expect(startup).toBeGreaterThanOrEqual(0);
     expect(readinessGate).toBeGreaterThan(startup);
     expect(mount).toBeGreaterThan(readinessGate);
+  });
+
+  it("keeps the complete Settings implementation out of the initial page bundle", () => {
+    expect(app).not.toContain('import { Settings } from "./components/Settings"');
+    expect(app).toContain('import("./components/Settings")');
+    expect(app).toContain("<Show when={settingsOpen()}>");
+
+    const conflict = fs.readFileSync(path.join(root, "src/components/ConflictResolution.tsx"), "utf8");
+    expect(conflict).toContain('from "./JournalConflictFileRow"');
+    expect(conflict).not.toContain('from "./Settings"');
   });
 
   it("starts the main window hidden and reveals it after a stable themed frame", () => {

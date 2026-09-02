@@ -2931,8 +2931,8 @@ dependencies = [
 
 [[package]]
 name = "lsdoc"
-version = "0.5.5"
-source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.5#c79cb059da5b4360ebde2e5fd953fa1f43ddabc3"
+version = "0.5.7"
+source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.7#ab054c3fd2cd52c5599564fb0433116c47b0b782"
 dependencies = [
  "memchr",
  "phf 0.11.3",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.97"
+version = "0.6.981"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -5660,7 +5660,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.97"
+version = "0.6.981"
 dependencies = [
  "ahash",
  "ammonia",
@@ -5676,6 +5676,7 @@ dependencies = [
  "lsdoc",
  "postcard",
  "pretty_assertions",
+ "proc-macro2",
  "regex",
  "ring",
  "rusqlite",
@@ -5685,6 +5686,7 @@ dependencies = [
  "sha2",
  "slotmap",
  "smallvec",
+ "syn 2.0.117",
  "tine-storage",
  "unicode-normalization",
  "unicode-segmentation",
@@ -5694,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "tine-ios-folder-picker-native"
-version = "0.6.97"
+version = "0.6.981"
 dependencies = [
  "tauri",
  "tauri-plugin",
@@ -5710,8 +5712,8 @@ dependencies = [
 
 [[package]]
 name = "tine-storage"
-version = "0.8.9"
-source = "git+https://github.com/martinkoutecky/tine-storage?tag=v0.8.9#5a7b1e40d4eea3d99a3277e67223631693839926"
+version = "0.11.0"
+source = "git+https://github.com/martinkoutecky/tine-storage?tag=v0.11.0#136ac0d70801cb6551bf6f5b6356e0ac622ecabe"
 dependencies = [
  "cap-fs-ext",
  "cap-std",

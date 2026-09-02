@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { InlineText } from "./inline";
 import { initParser } from "./parse";
 import { backend } from "../backend";
+import { setToasts, toasts } from "../ui";
 
 // GH #367: a labeled link into `assets/` (`[image](./assets/quick-capture.png)`)
 // is not an external URL — clicking it must reach the OS opener for that asset
@@ -119,6 +120,151 @@ describe("asset link opens through the OS opener", () => {
       click(host);
       expect(openAsset).not.toHaveBeenCalled();
     } finally {
+      dispose();
+    }
+  });
+});
+
+describe("remote PDF URLs are external links, not the PDF viewer (GH #442)", () => {
+  const expectExternalPdf = (host: HTMLElement, url: string) => {
+    const openExternal = vi.spyOn(backend(), "openExternal").mockResolvedValue(undefined);
+    const a = host.querySelector("a.external-link");
+    expect(a, "expected a rendered external link").not.toBeNull();
+    expect(a!.classList.contains("pdf-link"), "a remote PDF URL must not render as the in-app viewer chip").toBe(false);
+    click(host);
+    expect(openExternal).toHaveBeenCalledWith(url);
+  };
+
+  it("a labeled https PDF link opens in the browser, exactly like other remote links", () => {
+    const url = "https://aclanthology.org/2025.acl-long.879.pdf";
+    const { host, dispose } = mountLink(`[a paper](${url})`);
+    try {
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("a bare https PDF URL stays an external URL too", () => {
+    const url = "https://example.org/papers/summary.pdf";
+    const { host, dispose } = mountLink(url);
+    try {
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("an image-syntax remote PDF is also an external link, not an image or the viewer", () => {
+    const url = "https://example.org/papers/figure.pdf";
+    const { host, dispose } = mountLink(`![figure](${url})`);
+    try {
+      expect(host.querySelector("img.inline-image"), "a remote .pdf URL is not an embeddable image").toBeNull();
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("an Org remote PDF link follows the same external route", () => {
+    const url = "https://example.org/2026.pdf";
+    const { host, dispose } = mountLink(`[[${url}][paper]]`, "org");
+    try {
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("a plain http (not https) PDF URL is just as remote", () => {
+    const url = "http://example.org/old/paper.pdf";
+    const { host, dispose } = mountLink(`[paper](${url})`);
+    try {
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("an uppercase .PDF suffix on a remote URL is still external", () => {
+    const url = "https://example.org/REPORT.PDF";
+    const { host, dispose } = mountLink(`[report](${url})`);
+    try {
+      expectExternalPdf(host, url);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("graph asset PDFs keep entering the in-app viewer (unchanged local routing)", () => {
+    const openExternal = vi.spyOn(backend(), "openExternal").mockResolvedValue(undefined);
+    const openAsset = vi.spyOn(backend(), "openAsset").mockResolvedValue(undefined);
+    const { host, dispose } = mountLink("[paper](../assets/paper.pdf)");
+    try {
+      const a = host.querySelector("a.external-link.pdf-link");
+      expect(a, "a local asset PDF must keep its in-app viewer chip").not.toBeNull();
+      a!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(openAsset).not.toHaveBeenCalled();
+    } finally {
+      dispose();
+    }
+  });
+});
+
+// GH #444: `file:` links written by Logseq (`file://D:\test.txt`) and Obsidian
+// (`<file:///D:\test.txt>`) rendered as links but did nothing at all when
+// clicked — the backend refused every scheme but http/https/mailto, and the
+// frontend discarded the rejection. Both halves are covered here: the link must
+// reach `openExternal` with the destination as written, and a refusal must
+// become a visible message instead of silence.
+describe("local file: links (GH #444)", () => {
+  const expectOpensExternally = (raw: string) => {
+    const openExternal = vi.spyOn(backend(), "openExternal").mockResolvedValue(undefined);
+    const openAsset = vi.spyOn(backend(), "openAsset").mockResolvedValue(undefined);
+    const { host, dispose } = mountLink(raw);
+    try {
+      click(host);
+      expect(openAsset).not.toHaveBeenCalled();
+      expect(openExternal).toHaveBeenCalledTimes(1);
+      return String(openExternal.mock.calls[0][0]);
+    } finally {
+      dispose();
+    }
+  };
+
+  it("the Logseq shape the reporter used reaches the opener, backslashes intact", () => {
+    expect(expectOpensExternally("[Test](file://D:\\test.txt)")).toBe("file://D:\\test.txt");
+  });
+
+  it("the Obsidian angle-bracket shape reaches the opener too", () => {
+    expect(expectOpensExternally("[Test](<file:///D:\\test.txt>)")).toBe("file:///D:\\test.txt");
+  });
+
+  it("a POSIX path and a directory are the same route", () => {
+    expect(expectOpensExternally("[notes](file:///home/user/notes.txt)")).toBe("file:///home/user/notes.txt");
+    expect(expectOpensExternally("[folder](file:///home/user/notes/)")).toBe("file:///home/user/notes/");
+  });
+
+  it("a percent-escaped filename is handed over untouched, for the backend to decode", () => {
+    expect(expectOpensExternally("[spaced](file:///home/user/a%20b.txt)")).toBe("file:///home/user/a%20b.txt");
+  });
+
+  it("a file: link is never mistaken for a graph asset", () => {
+    expect(expectOpensExternally("[x](file:///graph/assets/a.png)")).toBe("file:///graph/assets/a.png");
+  });
+
+  it("says so when the link cannot be opened, instead of doing nothing visible", async () => {
+    setToasts([]);
+    vi.spyOn(backend(), "openExternal").mockRejectedValue("that file link does not name a local file");
+    const { host, dispose } = mountLink("[broken](file://not-a-path)");
+    try {
+      click(host);
+      await vi.waitFor(() => expect(toasts()).toHaveLength(1));
+      expect(toasts()[0].kind).toBe("error");
+      expect(toasts()[0].message).toContain("file://not-a-path");
+    } finally {
+      setToasts([]);
       dispose();
     }
   });

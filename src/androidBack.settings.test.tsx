@@ -30,6 +30,10 @@ const { isMobilePlatform } = await import("./nativeChrome");
 const { closeSettings, dismissMobileDrawer, openSettings, settingsOpen } = await import("./ui");
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const waitForSettingsModal = (host: HTMLElement) => vi.waitFor(
+  () => expect(host.querySelector(".settings-modal")).not.toBeNull(),
+  { timeout: 5_000 },
+);
 
 let dispose = () => {};
 
@@ -90,7 +94,7 @@ describe("Android Back and the Settings modal", () => {
   it("peels recording, then the search query, then closes — three presses, never the history rung", async () => {
     const host = await mountApp();
     openSettings("shortcuts");
-    await vi.waitFor(() => expect(host.querySelector(".settings-modal")).not.toBeNull());
+    await waitForSettingsModal(host);
 
     const keycap = () => [...host.querySelectorAll<HTMLElement>(".help-shortcut-row")]
       .find((row) => row.querySelector(".help-shortcut-id")?.textContent === "go/find-in-page")
@@ -109,14 +113,16 @@ describe("Android Back and the Settings modal", () => {
 
     // Rung 2: a non-empty settings search query.
     const search = host.querySelector<HTMLInputElement>(".settings-search-input")!;
-    search.value = "journal";
+    search.value = "Find in page";
     search.dispatchEvent(new Event("input", { bubbles: true }));
     await tick();
-    expect(host.querySelector(".settings-search-results")).not.toBeNull();
+    expect(host.querySelector(".settings-search-results")).toBeNull();
+    expect([...host.querySelectorAll<HTMLElement>(".help-shortcut-id")].map((id) => id.textContent))
+      .toEqual(["go/find-in-page"]);
     const queryPress = pressBack();
     await tick();
     expect(queryPress).toEqual({ disposition: "transient", fallbacks: [] });
-    expect(host.querySelector(".settings-search-results")).toBeNull();
+    expect(host.querySelectorAll(".help-shortcut-id").length).toBeGreaterThan(1);
     expect(settingsOpen()).toBe(true);
 
     // Rung 3: the modal itself.
@@ -159,7 +165,7 @@ describe("Android Back and the Settings modal", () => {
     expect(activeDrawer()).toBe("left");
 
     openSettings();
-    await vi.waitFor(() => expect(host.querySelector(".settings-modal")).not.toBeNull());
+    await waitForSettingsModal(host);
 
     const press = pressBack();
     await tick();

@@ -92,11 +92,15 @@ const UNSCANNED_SOURCES: &[(&str, &str)] = &[
 /// Sorted by name. Keep it that way; the tests compare sorted sets and the
 /// diff is the point.
 const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
+    // Confirms the frontend has applied a managed subtree move so the actor can
+    // retire the pending application record.
+    ("acknowledge_managed_application_move", ManagedRouted),
     ("activate_absent_editor", ManagedRouted),
     ("activate_editor", ManagedRouted),
     ("activate_sparse_v2", NoGraphSlot),
     ("adopt_sparse_v2_shared", NoGraphSlot),
     ("app_platform", NoGraphSlot),
+    ("app_architecture", NoGraphSlot),
     ("apply_journal_filename_migrations", LegacyOnly),
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
@@ -130,6 +134,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("diagnostic_frontend_event", NoGraphSlot),
     ("diagnostic_ipc_event", NoGraphSlot),
     ("diagnostic_report", NoGraphSlot),
+    ("diagnostic_session_active", NoGraphSlot),
     ("durable_live_save_conflict_diff", Filesystem),
     ("duplicate_journal_diff", Filesystem),
     ("edit_asset_external", Filesystem),
@@ -159,6 +164,14 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("join_sparse_v2_shared", NoGraphSlot),
     ("journal_content_days", ManagedRouted),
     ("journal_feed_page", ManagedRouted),
+    // The four absence-sweep commands reach the sparse actor through
+    // `active_handle` + `ActorRequest`, not `sparse_application_handle`, so the
+    // source scanner cannot see the route and each carries an explicit
+    // `managed-command-routing: managed` marker. Absence sweeps exist only under
+    // managed storage; restore and reapply change graph content, so NoGraphSlot
+    // would be false.
+    ("keep_absence_sweep_deletion", ManagedRouted),
+    ("list_absence_sweeps", ManagedRouted),
     ("list_backups", LegacyOnly),
     ("list_installed_plugins", NoGraphSlot),
     ("list_journal_conflicts", Filesystem),
@@ -203,6 +216,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("read_local_image", NoGraphSlot),
     ("read_plugin_entry", NoGraphSlot),
     ("read_text_file", NoGraphSlot),
+    ("reapply_absence_sweep", ManagedRouted),
     ("recover_managed_application_subtrees", NoGraphSlot),
     ("referenced_page_names", ManagedRouted),
     ("rename_file_to_page", ManagedRouted),
@@ -215,8 +229,10 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("resolve_live_save_conflict", LegacyOnly),
     ("resolve_sync_conflict", ManagedRouted),
     ("resolve_vcs_marker_conflict", LegacyOnly),
+    ("restore_absence_sweep", ManagedRouted),
     ("restore_backup", LegacyOnly),
     ("retire_editor_activation", LegacyOnly),
+    ("reveal_known_graph", NoGraphSlot),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
@@ -346,6 +362,9 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
 #[cfg(test)]
 const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("sparse_application_handle", ManagedRouted),
+    // Extracted wrappers may declare the same route explicitly rather than
+    // duplicating sparse/legacy dispatch solely for this source-level proof.
+    ("managed-command-routing: managed", ManagedRouted),
     ("legacy_graph(", LegacyOnly),
     ("legacy_graph_cloned(", LegacyOnly),
     ("with_config_graph(", ConfigWrite),

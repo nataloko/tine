@@ -17,14 +17,15 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import path from "node:path";
 
 const PORT = Number(process.env.TINE_PANE_SLACK_PORT ?? 5299);
 const OUT_BOARD = "/tmp/shot-pane-slack.png";
 const OUT_SCROLLED = "/tmp/shot-pane-slack-long-scrolled.png";
 
 const server = spawn(
-  "npx",
-  ["vite", "preview", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
+  process.execPath,
+  [path.resolve("node_modules/vite/bin/vite.js"), "preview", "--host", "127.0.0.1", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
   { stdio: "ignore" },
 );
 
@@ -136,8 +137,22 @@ async function measureEndSlack(page, leafRect) {
   }, leafRect);
 }
 
+async function measureFocusedPageWidth(page) {
+  return page.evaluate(() => {
+    const scroller = document.querySelector(".pane-leaf.pane-focused .main-content") ??
+      document.querySelector(".main-content");
+    const inner = scroller?.querySelector(".main-content-inner");
+    if (!scroller || !inner) return null;
+    return {
+      scroller: scroller.getBoundingClientRect().width,
+      inner: inner.getBoundingClientRect().width,
+      maxWidth: getComputedStyle(inner).maxWidth,
+    };
+  });
+}
+
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForServer(`http://127.0.0.1:${PORT}/`);
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });
@@ -151,7 +166,7 @@ try {
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(String(e)));
 
-  await page.goto(`http://localhost:${PORT}/`);
+  await page.goto(`http://127.0.0.1:${PORT}/`);
   // NOTE on evidence substitution: on the reporter's platform (Windows) and on
   // WebKitGTK (Tauri's Linux engine) scrollbars are classic — they are painted
   // whenever the scrollable range is non-zero. This sandbox's headless
@@ -168,6 +183,34 @@ try {
     () => document.querySelector(".main-content .page-title")?.textContent?.trim() === "Dashboard Solo",
     { timeout: 5000 },
   );
+
+  // GH #382: the page column itself must not shrink-wrap to whichever child is
+  // currently widest. The reporter showed both edit entry and expanding
+  // Unlinked References changing the whole page width. Exercise the intrinsic
+  // width boundary directly before building the separate GH #369 pane board.
+  const widthStates = [];
+  widthStates.push({ state: "short-read", ...(await measureFocusedPageWidth(page)) });
+  const widthEditor = page.locator(".main-content .ls-block").first();
+  await widthEditor.click();
+  const widthTextarea = page.locator(".main-content .block-editor").first();
+  await widthTextarea.waitFor({ timeout: 4000 });
+  await widthTextarea.fill("x");
+  await sleep(100);
+  widthStates.push({ state: "short-edit", ...(await measureFocusedPageWidth(page)) });
+  await widthTextarea.fill("a long line ".repeat(80));
+  await sleep(100);
+  widthStates.push({ state: "long-edit", ...(await measureFocusedPageWidth(page)) });
+  await page.keyboard.press("Escape");
+  await sleep(100);
+  widthStates.push({ state: "long-read", ...(await measureFocusedPageWidth(page)) });
+  const measuredWidths = widthStates.map((state) => state.inner).filter(Number.isFinite);
+  console.log("page width through read/edit content changes:", widthStates);
+  if (measuredWidths.length !== widthStates.length) {
+    failures.push(`could not measure every GH #382 width state: ${JSON.stringify(widthStates)}`);
+  } else if (Math.max(...measuredWidths) - Math.min(...measuredWidths) > 1) {
+    failures.push(`page column changes width with its contents: ${JSON.stringify(widthStates)}`);
+  }
+
   await makeFocusedPageReporterHeight(page, 20);
   const solo = await page.evaluate(() => {
     const scroller = document.querySelector(".main-content");
@@ -279,7 +322,7 @@ try {
     );
     // Idle dashboard contract: if the natural page column fits at all, its
     // range is exactly zero. Editing slack is tested separately below.
-    const expectedIdle = Math.max(0, p.contentH - P);
+    const expectedIdle = Math.max(0, p.contentH - P) + (p.contentH > P ? 0.4 * P : 0);
     if (fitsExactly && (p.range > 0 || p.scrollbarW > 0)) {
       failures.push(
         `${p.title}: fitting idle column (${p.contentH}px <= ${P}px) still scrolls ` +
@@ -320,6 +363,33 @@ try {
       longPane.rect,
       { timeout: 4000 },
     );
+
+    // GH #390: entering/leaving edit on an already-overflowing long page must
+    // not manufacture or remove a pane-relative spacer. Measure the literal
+    // scroll range around the transition; this catches the released `:has`
+    // rule that grew every long page by 40% on click and shrank it on Escape.
+    const editStability = [];
+    const measureFocusedScrollHeight = () => page.evaluate(() => {
+      const scroller = document.querySelector(".pane-leaf.pane-focused .main-content") ??
+        document.querySelector(".main-content");
+      return scroller?.scrollHeight ?? null;
+    });
+    editStability.push({ state: "read", height: await measureFocusedScrollHeight() });
+    const stableTarget = page.locator(".pane-leaf.pane-focused .ls-block").nth(8);
+    await stableTarget.scrollIntoViewIfNeeded();
+    await stableTarget.locator(".block-content").first().click();
+    await page.locator(".pane-leaf.pane-focused .block-editor").waitFor({ timeout: 4000 });
+    await sleep(100);
+    editStability.push({ state: "edit", height: await measureFocusedScrollHeight() });
+    await page.keyboard.press("Escape");
+    await sleep(100);
+    editStability.push({ state: "read-again", height: await measureFocusedScrollHeight() });
+    const stableHeights = editStability.map((entry) => entry.height).filter(Number.isFinite);
+    console.log("long-page height through read/edit transitions:", editStability);
+    if (stableHeights.length !== editStability.length || Math.max(...stableHeights) - Math.min(...stableHeights) > 1) {
+      failures.push(`long page changes height when a block enters/leaves edit: ${JSON.stringify(editStability)}`);
+    }
+
     await page.locator(".pane-leaf.pane-focused .ls-block").last().click();
     await page.locator(".pane-leaf.pane-focused .block-editor").waitFor({ timeout: 4000 });
     await sleep(150);
@@ -356,10 +426,10 @@ try {
   await browser.close();
   server.kill("SIGKILL");
   if (failures.length) {
-    console.error("GH #369 defect REPRODUCED:\n - " + failures.join("\n - "));
+    console.error("Pane geometry defect REPRODUCED (GH #369 / GH #382):\n - " + failures.join("\n - "));
     process.exit(1);
   }
-  console.log("OK: short panes have no useless scrollbar, long pane scrolls with pane-proportional end slack");
+  console.log("OK: page width is content-independent; short panes have no useless scrollbar; long pane keeps pane-relative end slack");
   process.exit(errors.length ? 1 : 0);
 } catch (e) {
   console.error(String(e));

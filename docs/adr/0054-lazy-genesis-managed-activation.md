@@ -59,6 +59,23 @@ explicit integrity audit retain independent validators. Activation performs
 one final byte-exact live-tree scan without reparsing, accounts for watcher
 events crossing that scan, and publishes one small authority marker last.
 
+This process-only publication receipt is distinct from the optional bounded
+SQLite semantic verification receipt added to page-capsule v5. The latter is a
+durable cache of parser output, bound to the capsule's exact-source digest and
+checked before use solely to avoid reparsing during disposable SQLite rebuild.
+Receiptless v4 capsules and any absent, stale, or invalid v5 receipt retain the
+independent exact-source parser-and-compare validator.
+
+The foreground editor lane may retain a thread-local, three-entry exact-source
+parser cache for the accepted base, requested target, and clean render base.
+Entries are byte-and-format keyed, limited to 2 MiB sources, and parser failures
+are never cached. Parser-owned unbulleted-heading event facts are carried out of
+that same whole-document parse instead of invoking the outline parser once per
+block during layout retention. The non-parser marker-placement check mirrors
+lsdoc's leading-space, hash-run, and boundary rules, including its extended ATX
+forms. These are bounded computation shortcuts, not durable state or
+independent authority.
+
 Fresh activation writes only the new format. Before 0.7, experimental older
 managed state may be rebuilt from a verified complete Markdown projection. If
 that cannot be proved, Tine preserves the old bytes for an explicit offline

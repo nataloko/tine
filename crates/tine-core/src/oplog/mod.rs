@@ -4,68 +4,53 @@
 //! materialization, and shared-provider synchronization are composed by
 //! `crate::sync_runtime`. Direct Files does not enter this module tree: the
 //! application selects that mutually exclusive runtime before opening a graph.
-//! Immutable operation/object bytes are authoritative; SQLite, scratch, and
+//! Immutable operation/object bytes are authoritative; SQLite and
 //! projection-work state are disposable derived data.
 
-pub mod batch;
-#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
-pub(crate) mod bootstrap_import;
-pub(crate) mod causal_index;
-pub(crate) mod content_patricia;
-pub(crate) mod dependency_queue;
-#[allow(dead_code)] // mixed live/runtime and diagnostic surface
+pub(crate) mod absence_decision;
+pub(crate) mod absence_sweep;
+pub(crate) mod batch;
+pub(crate) mod checkpoint_generation;
 pub(crate) mod discovery;
-pub(crate) mod document_state;
-#[allow(dead_code)] // mixed live/runtime and retained compatibility surface
 pub(crate) mod enrollment;
-// The only keyed enrollment compatibility code.  Current enrollment state is
-// integrity-checked, while immutable v1/v5 history remains verifiable.
-pub(crate) mod enrollment_legacy_hmac;
-pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
-pub(crate) mod evidence_index;
 pub(crate) mod external_import;
-pub mod hot_engine;
+pub(crate) mod hot_engine;
 #[cfg(test)]
 mod hot_engine_integration_tests;
-pub mod identity;
-pub mod import;
+pub(crate) mod identity;
+pub(crate) mod import;
 #[cfg(test)]
 mod import_integration_tests;
 pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
+pub(crate) mod local_completion_index;
 pub(crate) mod local_journal_drain;
-#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
-pub(crate) mod loro_store;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
-#[allow(dead_code)] // mixed live/runtime and test-construction surface
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
-pub mod projection;
+pub(crate) mod projection;
 #[cfg(test)]
 mod projection_integration_tests;
-pub mod projection_manifest;
-pub mod projection_store;
-pub mod projection_work;
-pub mod receipt;
-pub mod reference_catalog;
-pub mod refusal;
-#[allow(dead_code)] // retained recovery format plus test construction surface
-pub(crate) mod resume_point;
-pub(crate) mod scratch_store;
-pub mod semantic;
-pub mod sqlite;
+pub(crate) mod projection_manifest;
+pub(crate) mod projection_store;
+pub(crate) mod projection_turn_journal;
+pub(crate) mod projection_work;
+pub(crate) mod receipt;
+pub(crate) mod receiver_absence_summary;
+pub(crate) mod reference_catalog;
+pub(crate) mod refusal;
+pub(crate) mod semantic;
+pub(crate) mod sqlite;
 mod sqlite_identity;
-pub mod sqlite_materialization;
+pub(crate) mod sqlite_materialization;
 pub mod sync_layout;
 /// The character-level three-way machinery now lives at the crate root
 /// (`crate::text_merge`) because Direct Files' conflict resolver shares it;
 /// this re-export keeps `oplog::text_merge::…` naming its managed-storage
 /// classifier.
 pub use crate::text_merge;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
 pub(crate) mod wire;
@@ -102,9 +87,14 @@ pub use batch::{
     OPLOG_PROTOCOL_VERSION,
 };
 pub(crate) use hot_engine::{
-    append_managed_local_record, CleanTombstoneAuthorization, CleanTombstoneDeferral,
-    CleanTombstoneSupersession, ManagedLocalAppendError, ManagedLocalAppendProof,
-    ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
+    append_managed_local_record, projection_turn_attempt_id, projection_turn_recovery_filename,
+    projection_turn_staged_filename, projection_turn_withdrawn_filename,
+    CleanTombstoneAuthorization, CleanTombstoneDeferral, CleanTombstoneSupersession,
+    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalJournalAppend,
+    ProjectionTombstoneAuthorization, ProjectionTurn, ProjectionTurnError,
+    ProjectionTurnPayloadKind, SequenceDomain, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget,
+    LIVE_PROJECTION_TURN_DERIVATION_SCHEMES, PROJECTION_TURN_DERIVATION_SCHEME_V1,
+    PROJECTION_TURN_SCHEMA_VERSION,
 };
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
@@ -139,7 +129,7 @@ pub use import::{
 pub(crate) use local_journal_v2_anchor::{
     classify_managed_local_anchor, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, ManagedLocalAnchorEncoding, ManagedLocalGenerationAnchorV2,
-    ManagedLocalJournal, ManagedLocalJournalProtocol, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    ManagedLocalJournal, MANAGED_LOCAL_ANCHOR_V2_BYTES,
 };
 pub use object_store::{BatchInspection, ObjectStore, ObjectStoreStats, StoreError};
 pub use page_name_index::{
@@ -155,8 +145,7 @@ pub use portable_path_index::{
 };
 pub use projection::{
     derive_receiver_local_projection, plan_projection, recover_incomplete_projections,
-    write_projection_exact, PolicyGeneratedAnchor, ProjectionError, ProjectionPlan,
-    ProjectionWrite,
+    PolicyGeneratedAnchor, ProjectionError, ProjectionPlan, ProjectionWrite,
 };
 pub use projection_manifest::{
     annotated_base_document_id, projection_intent_document_id, AnnotatedProjectionBase,
@@ -177,10 +166,11 @@ pub use receipt::{
     DocumentDependencies, FrontierV2, ImportInventoryEntry, ImportInventoryState, ImportLocator,
     LogicalCompletionId, ManagedPath, ManagedTextKind, PortablePathKey, PortablePathKeyDigest,
     ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion, ProjectionIntent,
-    ProjectionIntentId, ProjectionPrecondition, ReceiptError, StructuralLocator, StructuralSpan,
-    DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION,
-    PORTABLE_PATH_KEY_VERSION, PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,
-    PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
+    ProjectionIntentId, ProjectionPrecondition, ProjectionTargetKind, ReceiptError,
+    StructuralLocator, StructuralSpan, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION,
+    PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION, PORTABLE_PATH_KEY_VERSION,
+    PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION, PROJECTION_POLICY_VERSION,
+    PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
 };
 pub use reference_catalog::{
     BlockReferenceFactV1, BlockReferenceKindV1, PageNameReferenceFactV1, PageReferenceKindV1,
@@ -192,10 +182,11 @@ pub use refusal::ManagedStorageRefusalScenario;
 pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
     BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
-    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageNameKeyDigest,
-    PagePreambleDelta, PagePreambleState, PageState, PolicyGeneratedAnchorReason, SemanticEffect,
-    SemanticError, VisibleMembership, CATALOG_PAGE_STATE_SCHEMA_VERSION,
-    MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
+    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageDeltaLifecycle,
+    PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
+    PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
+    CATALOG_PAGE_STATE_SCHEMA_VERSION, MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION,
+    SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
 pub use sqlite::{
     AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence,
@@ -218,3 +209,61 @@ pub use sqlite_materialization::{
     MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
 };
 pub use wire::SHARED_PROVIDER_TREE_NAMESPACES;
+
+#[cfg(test)]
+mod external_surface_tests {
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn oplog_external_module_surface_is_exactly_the_named_consumers() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]\nmod external_surface_tests")
+            .next()
+            .unwrap();
+        let public_modules = production
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub mod "))
+            .map(|line| line.trim_end_matches(';'))
+            .collect::<Vec<_>>();
+        assert_eq!(public_modules, ["object_store", "sync_layout"]);
+
+        let mut public_uses = Vec::new();
+        let mut declaration = None::<String>;
+        for line in production.lines() {
+            let trimmed = line.trim();
+            if declaration.is_none() && trimmed.starts_with("pub use ") {
+                declaration = Some(trimmed.to_owned());
+            } else if let Some(current) = declaration.as_mut() {
+                current.push_str(trimmed);
+            }
+            if trimmed.ends_with(';') {
+                if let Some(current) = declaration.take() {
+                    public_uses.push(
+                        current
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+        assert_eq!(public_uses.len(), 20);
+        let digest = Sha256::digest(public_uses.join("\n").as_bytes());
+        assert_eq!(
+            format!("{digest:x}"),
+            "b6d132b2ba20e79948f703faacb02dc67713dc47d88ea8b1fc7d3d6bbdad889e",
+            "the exact public oplog re-export surface changed"
+        );
+
+        let unexpected_direct_public_items = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub "))
+            .filter(|line| !line.starts_with("pub mod ") && !line.starts_with("pub use "))
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected_direct_public_items.is_empty(),
+            "unexpected direct public oplog items: {unexpected_direct_public_items:?}"
+        );
+    }
+}

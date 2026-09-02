@@ -133,7 +133,7 @@ import type { Format } from "../render/ast";
 import type { Node as StoreNode } from "../store";
 import { AstBody } from "../render/body";
 import { InlineText, CopyButton } from "../render/inline";
-import { editorOffsetFromRenderedRange } from "../render/spans";
+import { clickBeyondRenderedEnd, editorOffsetFromRenderedRange } from "../render/spans";
 import {
   assetMarkdown,
   assetFileName,
@@ -144,13 +144,16 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
+import { dropSelection, setDragSelectionSuppressed } from "../dragSelectionGuard";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
-import { codeFenceOnly } from "../editor/codeFence";
+import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
-import { openInNewTab } from "../router";
+import { openInNewTab, type Route } from "../router";
+import { openRouteInOtherPane } from "../panes";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
@@ -165,8 +168,9 @@ import {
   caretAtLastRow,
   caretColumnOnVisualRow,
   caretOffsetOnLastRow,
+  textareaCaretPoints,
 } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, type PropFormat } from "../editor/properties";
 import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
@@ -254,7 +258,14 @@ function beginDrag(id: string, e: MouseEvent) {
       capturedIds = selected.length ? [...selected] : [id];
       setDragId(id);
       endEdit("drag-start");
+      // Moving a block is not a text gesture. WebKit otherwise runs its own
+      // selection drag from the bullet and paints every block the pointer
+      // crosses blue (GH #424, macOS; Chromium does not do this, which is why
+      // the same build looked clean on Windows).
+      setDragSelectionSuppressed(true);
     }
+    // WebKit can re-anchor a selection mid-drag; the class alone is not enough.
+    dropSelection();
     const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(
       ".ls-block"
     ) as HTMLElement | null;
@@ -272,6 +283,7 @@ function beginDrag(id: string, e: MouseEvent) {
   const onUp = () => {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
+    setDragSelectionSuppressed(false);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
       void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
@@ -307,6 +319,12 @@ export const CaptureCtx = createContext<CaptureApi | null>(null);
 // surfaces at once (see startEditing's surface stamping).
 export const SurfaceContext = createContext<string>("main");
 export const OutlineScopeContext = createContext<OutlineScope | null>(null);
+// GH #415: a block embed renders the target outline as a surface-local group
+// (GH #341). Up from the first visual row of the embed ROOT has no in-surface
+// destination; LiveRefGroup carries the embed's host block here so the caret
+// can exit to the host page (to the block preceding the embed there), the way
+// OG leaves the embed upward instead of trapping the caret.
+export const EmbedNavExitContext = createContext<{ hostBlockId: string } | null>(null);
 export interface CollapseSurfaceApi {
   collapsed: (id: string, stored: boolean) => boolean;
   toggle: (id: string, current: boolean) => void;
@@ -478,6 +496,20 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
   // not its children); null for a normal bullet.
   const orderMarker = () => orderedListMarker(props.id);
+  // "This block, zoomed" as a route, for every bullet destination that is not
+  // the in-place zoom. Taking a persistent ref writes `id::` so the tab or pane
+  // still resolves after a restart — which is why this is a function and not a
+  // memo: it must not run until a modified click actually asks for it.
+  const openZoomRoute = (open: (route: Route) => unknown): void => {
+    const ref = persistentBlockRef(props.id);
+    open({
+      kind: "page",
+      name: ref.page,
+      pageKind: ref.pageKind,
+      block: ref.uuid,
+      ...(ref.path ? { path: ref.path } : {}),
+    });
+  };
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => !pageWritable(node().page);
@@ -581,28 +613,33 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           <span
             class="bullet-container"
             classList={{ "bullet-closed": collapsed() && hasChildren(), ordered: !!orderMarker() }}
-            title="Click to zoom; shift-click → sidebar; middle-click → new tab; drag to move"
+            title="Click to zoom; shift-click → sidebar; ctrl/cmd-click or middle-click → new tab; alt-click → other pane; drag to move"
             onMouseDown={(e) => {
+              // The other half of the shared contract (GH #207): suppress the
+              // shift-range selection and the middle-button autoscroll /
+              // PRIMARY-paste that these destinations replace. The bullet ran
+              // its own onMouseDown and skipped it.
+              internalLinkMouseDown(e);
               if (e.button === 0 && !readOnly()) beginDrag(props.id, e);
             }}
             onClick={(e) => {
               e.stopPropagation();
               if (dragMoved) return; // was a drag, not a click
-              if (e.shiftKey) openBlockInSidebar(persistentBlockRef(props.id));
-              else zoomInto(props.id);
+              // GH #456: the bullet used to read only Shift, so Ctrl/Cmd+click
+              // fell through to the plain zoom and the modifier did nothing.
+              // It now goes through the same one decision every other internal
+              // link uses (GH #283), which is why Alt lands here too rather
+              // than growing a second, slightly different ladder.
+              switch (internalLinkDest(e)) {
+                case "sidebar": openBlockInSidebar(persistentBlockRef(props.id)); break;
+                case "background": openZoomRoute(openInNewTab); break;
+                case "pane": openZoomRoute(openRouteInOtherPane); break;
+                default: zoomInto(props.id);
+              }
             }}
             onAuxClick={(e) => {
-              if (e.button !== 1) return; // middle-click → open the zoom in a new tab
-              e.preventDefault();
+              if (!internalLinkAuxClick(e, () => openZoomRoute(openInNewTab))) return;
               e.stopPropagation();
-              const ref = persistentBlockRef(props.id); // writes id:: so the tab survives a restart
-              openInNewTab({
-                kind: "page",
-                name: ref.page,
-                pageKind: ref.pageKind,
-                block: ref.uuid,
-                ...(ref.path ? { path: ref.path } : {}),
-              });
             }}
           >
             <Show when={orderMarker()} fallback={<span class="bullet" />}>
@@ -636,7 +673,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
                 macro={macro}
                 owner={instanceId}
                 outlineScope={outlineScope}
-                trailing={
+                refCountBadge={
                   // OG's per-block reference-count badge: shown only when the block
                   // is referenced. Plain click toggles the referrers panel below;
                   // shift-click opens the block in the sidebar (matching OG and the
@@ -701,19 +738,13 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   );
 }
 
-// --- Click / drag gesture on rendered block content -------------------------
+// --- OG-compatible edit / drag gesture on rendered block content ------------
 //
-// The caret offset is captured at MOUSEDOWN (before the previously-edited
-// block's blur reflows the layout — the coordinates are only valid then), but
-// editing starts at MOUSEUP and only for a CLICK (pointer moved < threshold).
-// A drag instead selects: within the origin block it is the browser's native
-// text selection of the RENDERED text (copy gives the glyphs you see); the
-// moment it crosses into another block it escalates to Tine's block selection
-// (muscle memory from OG — but deterministic: the escalation rule is purely
-// "did the pointer enter a different block", never timing).
-//
-// Deliberately NOT OG's mousedown-instant-edit: that races the native
-// selection against the DOM swap (the inconsistency Martin observed in OG).
+// OG enters edit mode from block-content-on-mouse-down (after a tiny deferred
+// turn), not from mouseup.  That timing is perceptible: a held click must show
+// the caret immediately instead of making Tine feel one click behind.  Keep the
+// document-level drag escalation so crossing another block still becomes block
+// selection; only the edit transition moves earlier.
 const DRAG_THRESHOLD_PX = 4;
 const SHEET_CELL_BLOCKED_EDITOR_COMMANDS = new Set([
   "editor/indent",
@@ -735,6 +766,7 @@ interface EditGesture {
   startY: number;
   escalated: boolean;
   outlineScope: OutlineScope | null;
+  caretPoints: Array<{ x: number; y: number }> | null | undefined;
 }
 
 function blockIdAtPoint(x: number, y: number): string | null {
@@ -743,8 +775,10 @@ function blockIdAtPoint(x: number, y: number): string | null {
   return row?.getAttribute("data-block-id") ?? null;
 }
 
-/** Arm a click-or-drag gesture from a rendered-content mousedown. Document-level
- *  listeners resolve it, so post-blur layout shifts can't misroute the mouseup. */
+/** Begin a click-or-drag gesture from rendered content. Editing starts on
+ *  mousedown (matching OG); document-level listeners then preserve raw-text
+ *  selection within the editor or escalate a cross-block drag to block
+ *  selection, even if the synchronous editor mount changes layout. */
 function beginEditGesture(
   e: MouseEvent,
   blockId: string,
@@ -753,7 +787,21 @@ function beginEditGesture(
   outlineScope: OutlineScope | null,
 ): void {
   clearSelection(); // a plain gesture replaces any active block selection (shift-click returns before this)
-  const g: EditGesture = { blockId, offset, owner, startX: e.clientX, startY: e.clientY, escalated: false, outlineScope };
+  const g: EditGesture = {
+    blockId,
+    offset,
+    owner,
+    startX: e.clientX,
+    startY: e.clientY,
+    escalated: false,
+    outlineScope,
+    caretPoints: undefined,
+  };
+  // The old rendered target is replaced synchronously. Prevent its native
+  // focus default from blurring the newly mounted textarea back out, then enter
+  // edit before mouseup exactly like OG's mousedown path.
+  e.preventDefault();
+  startEditing(g.blockId, g.offset, g.owner);
   const onMove = (ev: MouseEvent) => {
     const moved =
       Math.abs(ev.clientX - g.startX) > DRAG_THRESHOLD_PX || Math.abs(ev.clientY - g.startY) > DRAG_THRESHOLD_PX;
@@ -763,10 +811,41 @@ function beginEditGesture(
       if (over) extendSelectionTo(over, g.outlineScope);
       return;
     }
+    if (over === g.blockId) {
+      const active = document.activeElement;
+      if (active instanceof HTMLTextAreaElement && active.classList.contains("block-editor")) {
+        if (g.caretPoints === undefined) g.caretPoints = textareaCaretPoints(active);
+        const points = g.caretPoints;
+        if (points?.length) {
+          const rect = active.getBoundingClientRect();
+          const x = ev.clientX - rect.left + active.scrollLeft;
+          const y = ev.clientY - rect.top + active.scrollTop;
+          const lineHeight = parseFloat(getComputedStyle(active).lineHeight) || 26;
+          let best = 0;
+          let bestScore = Infinity;
+          for (let i = 0; i < points.length; i++) {
+            // Prefer the correct visual row overwhelmingly, then the nearest
+            // horizontal caret stop on that row.
+            const score = Math.abs(points[i].y + lineHeight / 2 - y) * 10_000 + Math.abs(points[i].x - x);
+            if (score < bestScore) {
+              best = i;
+              bestScore = score;
+            }
+          }
+          active.setSelectionRange(
+            Math.min(g.offset, best),
+            Math.max(g.offset, best),
+            best < g.offset ? "backward" : "forward",
+          );
+        }
+      }
+      return;
+    }
     if (over && over !== g.blockId) {
       // Crossed into another block: escalate to block selection for the rest of
       // the gesture (never de-escalate — flipping modes mid-drag is jarring).
       g.escalated = true;
+      endEdit("select-block");
       window.getSelection()?.removeAllRanges();
       selectBlock(g.blockId, g.outlineScope);
       extendSelectionTo(over, g.outlineScope);
@@ -776,10 +855,6 @@ function beginEditGesture(
     document.removeEventListener("mousemove", onMove, true);
     document.removeEventListener("mouseup", onUp, true);
     if (g.escalated) return; // block selection stands
-    const moved =
-      Math.abs(ev.clientX - g.startX) > DRAG_THRESHOLD_PX || Math.abs(ev.clientY - g.startY) > DRAG_THRESHOLD_PX;
-    if (moved) return; // an in-block text selection (or a stray drag) — not a click
-    startEditing(g.blockId, g.offset, g.owner);
   };
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("mouseup", onUp, true);
@@ -797,7 +872,11 @@ function Rendered(props: {
   headingLevel: () => number | null;
   macro: () => { kind: "query" | "embed"; inner: string } | null;
   owner?: string;
-  trailing?: JSX.Element;
+  // The reference-count badge. It is a RIGHT FLOAT and must therefore be the
+  // FIRST child of `.block-content`: a float attaches to the line box that is
+  // current when the browser reaches it, so emitting it last parked it on the
+  // block's LAST line once the text wrapped (GH #454).
+  refCountBadge?: JSX.Element;
   outlineScope?: OutlineScope | null;
 }): JSX.Element {
   const node = props.node;
@@ -832,22 +911,31 @@ function Rendered(props: {
   // Anything without trustworthy span data (chips, macro hosts, parser fallback)
   // keeps the old end-of-block behavior.
   let contentRef: HTMLDivElement | undefined;
+  const pageFormat = (): PropFormat => (pageByName(node().page)?.format === "org" ? "org" : "md");
+  // The end of what the textarea will actually hold — NOT `raw.length`, which
+  // counts hidden property lines the editor never shows.
+  const editableEnd = (): number => splitProps(node().raw, isBuiltinHidden, pageFormat()).visible.length;
   const clickOffset = (e: MouseEvent): number | null => {
     if (!contentRef) return null;
+    // GH #465: a click in the empty run-out past the last glyph means "the end",
+    // whatever the block ends with. Answered from the click's position before
+    // consulting the span map, because a trailing construct with an invisible
+    // closing delimiter (`*italic*`) maps that click to a legitimate-looking
+    // interior offset just before the delimiter, so nothing downstream can tell
+    // it apart from a deliberate click there.
+    if (clickBeyondRenderedEnd(contentRef, e.clientX, e.clientY)) return editableEnd();
     const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
     const range = d.caretRangeFromPoint?.(e.clientX, e.clientY);
     if (!range) return null;
-    const fmt = pageByName(node().page)?.format === "org" ? "org" : "md";
-    return editorOffsetFromRenderedRange(contentRef, range, node().raw, isBuiltinHidden, fmt);
+    return editorOffsetFromRenderedRange(contentRef, range, node().raw, isBuiltinHidden, pageFormat());
   };
   // For annotation blocks the editor shows only the highlight text (metadata
   // stays hidden); the colored prefix still jumps to the PDF.
   //
   // The caret offset must be computed at MOUSEDOWN — before the previously-
-  // focused editor blurs and reflows the layout (on click the coordinates are
-  // stale; the mouseup can even land on a different element so no block receives
-  // the click at all). Whether it becomes an EDIT (click) or a SELECTION (drag)
-  // is decided at mouseup — see beginEditGesture.
+  // focused editor blurs and reflows the layout. Editing starts immediately;
+  // continuing the gesture within the block selects editor text, while crossing
+  // into another block escalates to outline selection (see beginEditGesture).
   const onMouseDown = (e: MouseEvent) => {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
     if (readOnly()) return; // read-only org page — never enter the editor
@@ -856,7 +944,7 @@ function Rendered(props: {
     beginEditGesture(
       e,
       props.id,
-      clickOffset(e) ?? node().raw.length,
+      clickOffset(e) ?? editableEnd(),
       props.owner ?? null,
       props.outlineScope ?? null,
     );
@@ -905,6 +993,12 @@ function Rendered(props: {
       style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
     >
+      {/* First, before any text: the badge floats right, and a float rides the
+          line box that is current where it appears in the flow. Emitted last it
+          sat on the block's final line, so a wrapped block dropped it a full
+          line below the rest of its header chips (GH #454). Emitted first it
+          rides the block's first line and the text flows around it. */}
+      {props.refCountBadge}
       {/* One gate for the whole header-chip group. Every chip below needs a
           marker or a priority, so an ordinary prose block — the overwhelming
           majority on a large page — evaluates ONE condition instead of three,
@@ -993,7 +1087,6 @@ function Rendered(props: {
         </span>
       </Show>
       </Show>
-      {props.trailing}
     </div>
     </Show>
   );
@@ -1178,6 +1271,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
+  const embedNavExit = useContext(EmbedNavExitContext);
   // Ref/query arrow navigation stays in the rendered result surface (GH #341),
   // while structural edits still target the source outline: a split/merge
   // destination need not remain a query or backlink result. Embeds are true
@@ -1223,9 +1317,9 @@ export function Editor(props: { id: string }): JSX.Element {
   // GH #357: the rendered face of a whole-block code fence is a mono, no-wrap,
   // padded card (.code-block). The editor was the ordinary proportional wrapped
   // textarea, so clicking a code block re-laid every line — the visible "jump".
-  // While the buffer IS code-shaped, present the editor as the same card
-  // (honest raw text, fences included). Mixed content / ```calc keep their own
-  // modes. Re-derived per keystroke so typing a fence in or out flips live.
+  // While the buffer IS code-shaped, present the editor as the same card.
+  // Mixed content / ```calc keep their own modes. Re-derived per keystroke so
+  // typing a fence in or out flips live.
   const codeEditing = createMemo(() => codeFenceOnly(editorValue(), pageFmt()) !== null);
   const editorHeadingLevel = createMemo(() => {
     const visible = editorValue();
@@ -1273,8 +1367,11 @@ export function Editor(props: { id: string }): JSX.Element {
     // unchanged, don't rewrite. Needed for org, where reattaching the hidden
     // drawer canonicalizes its position — so `next === raw` alone wouldn't catch
     // a block whose drawer wasn't already canonical, and would churn the file.
-    if (!commitAsCalc && text === editorValue()) return;
-    const visible = commitAsCalc ? serializeCalcExitCommit(text) : text;
+    if (!commitAsCalc && !codeShown() && text === editorValue()) return;
+    // For calc, `text` is the bare expressions the user sees — re-fence it.
+    // For a code wrapper it is the payload body — re-attach the exact wrapper
+    // bytes (GH #412/#413: the body-only projection is reversible).
+    const visible = commitAsCalc ? serializeCalcExitCommit(text) : codeWrapCommit(text) ?? text;
     const next = joinProps(visible, splitProps(node().raw, hideFn(), pageFmt()).hidden, pageFmt());
     // No-op commit (text that reconstructs the identical raw): don't mark the page
     // dirty or push undo — avoids churn and can't rewrite the block's bytes.
@@ -1315,6 +1412,25 @@ export function Editor(props: { id: string }): JSX.Element {
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
   const [acIndex, setAcIndex] = createSignal(0);
+  // GH #412/#413: inside a COMPLETE whole-block code wrapper the editor shows
+  // only the payload between the wrapper lines (fences stay out of the editing
+  // surface, and select-all can only reach the payload); commits re-attach the
+  // exact raw wrapper bytes via the reversible projection. Mixed content,
+  // incomplete/malformed wrappers and ```calc keep their existing modes, which
+  // is why this is derived separately from the code-card presentation above
+  // (the card also covers the still-unclosed fence being typed). The
+  // code-language picker suppresses the swap while it's open: its query lives
+  // on the opening fence line, which the body-only view hides.
+  const codeShown = createMemo(() => {
+    if (ac()?.kind === "code-language") return null;
+    return codeBodyProjection(editorValue(), pageFmt());
+  });
+  // The text the editor surface commits FROM when the code buffer is live:
+  // the view shows `body`, the store keeps the exact wrapper bytes around it.
+  const codeWrapCommit = (text: string): string | null => {
+    const p = codeShown();
+    return p ? codeBodyJoin(p, text) : null;
+  };
   const [propertyValueKey, setPropertyValueKey] = createSignal<string | null>(null);
   let propertyFacets: [string, string[]][] = [];
   let acListRef: HTMLDivElement | undefined;
@@ -1648,13 +1764,18 @@ export function Editor(props: { id: string }): JSX.Element {
     // malformed fence must still commit as calc), but allow this explicit
     // completion transition without requiring blur + re-entry (GH #57).
     const enteredCalc = !editingCalc() ? calcSource(spaced.raw) : null;
+    // A completion that lands a COMPLETE code wrapper (the language pick on
+    // the opening fence line) swaps the editor to the body-only view — map the
+    // caret from raw into body space, the same transition as calc above.
+    const codeWrap = enteredCalc === null ? codeBodyProjection(spaced.raw, pageFmt()) : null;
     commit(spaced.raw);
     if (enteredCalc !== null) setEditingCalc(true);
     closeAc();
     queueMicrotask(() => {
-      const shown = enteredCalc ?? spaced.raw;
-      const openingEnd = enteredCalc !== null ? spaced.raw.indexOf("\n") + 1 : 0;
-      const shownCaret = enteredCalc !== null
+      const shown = enteredCalc ?? codeWrap?.body ?? spaced.raw;
+      const openingEnd =
+        enteredCalc !== null ? spaced.raw.indexOf("\n") + 1 : codeWrap ? codeWrap.open.length : 0;
+      const shownCaret = enteredCalc !== null || codeWrap
         ? Math.max(0, Math.min(shown.length, spaced.caret - openingEnd))
         : spaced.caret;
       ref.value = shown;
@@ -2415,7 +2536,12 @@ export function Editor(props: { id: string }): JSX.Element {
     if (want == null) {
       offset = editorValue().length;
     } else if (typeof want === "number") {
-      offset = want;
+      // Numeric targets arrive in RAW block coordinates (rendered-face click
+      // spans, raw lengths). A body-only code editor maps them through the
+      // wrapper: an opener hit snaps to the body start, a closer/trailing hit
+      // to the body end.
+      const p = codeShown();
+      offset = p ? Math.max(0, Math.min(want - p.open.length, p.body.length)) : want;
     } else {
       // Cross-block navigation: Down targets the first source line; Up targets
       // the bottom visual row. The latter uses the mounted textarea's wrapping;
@@ -2590,6 +2716,31 @@ export function Editor(props: { id: string }): JSX.Element {
       }
       if (ch === "【") {
         handled = applyFullWidthRefReplace();
+      }
+      // GH #413: the third backtick of a whole-block fence trigger is an
+      // EXPLICIT scaffold decision, not a character to pair — insert the
+      // matching closing fence and land the caret between them. This wins over
+      // the generic symmetric-backtick pairing below (which stacked a fourth
+      // backtick and never added the closer). Whole-buffer only: a `` ` `` run
+      // inside prose keeps the ordinary inline behavior. With the scaffold
+      // committed, the editor is in the body-only code view below.
+      if (
+        !handled && ch === "`" && pageFmt() === "md" &&
+        !isCalc() && codeShown() === null &&
+        ref.value === "```" && ref.selectionStart === 3
+      ) {
+        const scaffold = "```\n\n```";
+        ref.value = scaffold;
+        commit(scaffold);
+        queueMicrotask(() => {
+          const body = codeShown()?.body;
+          if (body !== undefined) ref.value = body;
+          ref.setSelectionRange(0, 0);
+          ref.focus();
+          autosize();
+          refreshAutocompleteAfterInput();
+        });
+        return;
       }
       if (!handled && autoPairing()) {
         // Opt-in general auto-pairing (brackets/quotes), which also folds in the
@@ -3195,13 +3346,16 @@ export function Editor(props: { id: string }): JSX.Element {
       // Enter. See caretInDisplayMath — a deliberate divergence from OG.
       const inMath = !isAnnot() && !inFence && caretInDisplayMath(raw, start);
       const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
+      // GH #412/#413: a body-only code editor has no fence lines in view, so
+      // `caretInFence` can't see it — gate on the projection directly.
+      const inCode = !isAnnot() && codeShown() !== null;
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence || inMath || inPageProperties) && start === end) {
-        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : "properties";
-        const trimmed = multilineExitTrim(raw, start, kind);
+      if ((isCalc() || inFence || inMath || inPageProperties || inCode) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : inCode ? "code" : "properties";
+        const trimmed = kind === "code" ? codeBodyExitTrim(raw, start) : multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
           let newId = props.id;
@@ -3228,6 +3382,12 @@ export function Editor(props: { id: string }): JSX.Element {
       // let the textarea insert the newline natively, like OG.
       if (isCalc()) return;
       e.preventDefault();
+      // Inside a body-only code editor, Enter inserts a real newline and stays
+      // in the block (same rule as the raw-fence path below it).
+      if (inCode) {
+        softNewlineCmd();
+        return;
+      }
       // Inside a fenced code block, Enter inserts a real newline and stays in the
       // block instead of splitting into a new bullet (which would break the fence
       // — GH #66). caretInFence treats a still-unterminated fence (being typed) as
@@ -3291,8 +3451,10 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       if (start === 0) {
-        // Never merge a highlight or calc block away (their structure must stay).
-        if (isAnnot() || isCalc()) return;
+        // Never merge a highlight, calc, or body-only code block away (their
+        // structure must stay — the merge would smuggle raw wrapper bytes into
+        // the previous block's text).
+        if (isAnnot() || isCalc() || codeShown()) return;
         // Own-numbered state is a block property, never an in-block `1.` marker.
         // At offset zero OG removes only that property and preserves the text
         // (`src/main/frontend/handler/editor.cljs:2752-2764`, 6e7afa8eb).
@@ -3317,10 +3479,10 @@ export function Editor(props: { id: string }): JSX.Element {
       }
     } else if (e.key === "Delete" && end === start && start === raw.length) {
       // GH #213: forward-delete merges with the NEXT block — the mirror of
-      // Backspace's merge with the previous one. Never merge a highlight or
-      // calc block itself (same rule as Backspace), and never absorb an
-      // annotation/calc block's raw text into this one.
-      if (isAnnot() || isCalc()) return;
+      // Backspace's merge with the previous one. Never merge a highlight,
+      // calc, or body-only code block itself (same rule as Backspace), and
+      // never absorb an annotation/calc block's raw text into this one.
+      if (isAnnot() || isCalc() || codeShown()) return;
       const next = nextVisible(props.id, structuralScope);
       if (next) {
         const nextRaw = doc.byId[next]?.raw ?? "";
@@ -3364,6 +3526,13 @@ export function Editor(props: { id: string }): JSX.Element {
       const before = raw.slice(0, start);
       if (!before.includes("\n") && caretAtFirstRow(ref, start)) {
         let prev = prevVisible(props.id, outlineScope);
+        // GH #415: at the top of an embed ROOT there is no in-surface previous
+        // block. Exit the embed upward to the block that precedes the embed in
+        // the host page (editing the host itself would unmount the embed under
+        // the caret); the destination mounts in the primary surface, not this
+        // embed surface.
+        const exitingEmbed = !prev && embedNavExit !== null;
+        if (exitingEmbed) prev = prevVisible(embedNavExit!.hostBlockId);
         // A canonical page header is not normally an outline node. Materialize
         // its transient ordinary-editor representation only when the primary
         // page/pane caret crosses the first-body boundary; reference, embed and
@@ -3379,7 +3548,12 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, navigationSurface());
+          startEditing(
+            prev,
+            { col: start - (before.lastIndexOf("\n") + 1), edge: "last" },
+            null,
+            exitingEmbed ? null : navigationSurface(),
+          );
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -3513,6 +3687,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const syntaxSensitive =
       sheetCell ||
       isCalc() ||
+      codeShown() !== null ||
       caretInFence(ref.value, start) ||
       caretOnOpeningFence(ref.value, start) ||
       caretInDisplayMath(ref.value, start);
@@ -3610,6 +3785,7 @@ export function Editor(props: { id: string }): JSX.Element {
         isPasteableUrl(url) &&
         !isPasteableUrl(ref.value.slice(start, end)) &&
         !isCalc() &&
+        codeShown() === null &&
         !caretInFence(ref.value, start) &&
         !caretOnOpeningFence(ref.value, start)
       ) {
@@ -3676,7 +3852,7 @@ export function Editor(props: { id: string }): JSX.Element {
         classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-edit": codeEditing() }}
         spellcheck={spellcheckEnabled()}
         wrap={codeEditing() ? "off" : "soft"}
-        value={isCalc() ? (calcLive() ?? "") : editorValue()}
+        value={isCalc() ? (calcLive() ?? "") : (codeShown()?.body ?? editorValue())}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
         onCompositionStart={onCompositionStart}

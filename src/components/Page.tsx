@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
 import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
-import { PaneContext, focusedRouter } from "../panes";
+import { PaneContext, focusedRouter, openRouteInOtherPane } from "../panes";
 import {
   isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
@@ -33,6 +33,8 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
 import { graphBinding } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
+import { selectedThemePresentation } from "../themeGallery";
+import { TodayTaskSummary } from "./TodayTaskSummary";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -85,14 +87,14 @@ function ownerIsLive(owner: JournalsFeedOwner): boolean {
 /** The single start-over owner for route loads, watcher changes and calendar
  * rollover.  It intentionally keeps the old feed/cursor until a response has
  * passed all ownership checks. */
-async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Promise<void> {
+async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Promise<unknown | null> {
   // An already-dead watcher/surface must be entirely inert.  In particular it
   // must not steal the generation from a live request that is about to land.
-  if (!ownerIsLive(owner)) return;
+  if (!ownerIsLive(owner)) return null;
   const generation = ++feedGeneration; // invalidate starts/appends before checking edit safety
   if (feedHasActiveEdit()) {
     pendingFeedRestart = true;
-    return;
+    return null;
   }
   const browserDay = localDayKey();
   loadingGeneration = generation;
@@ -104,13 +106,13 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
       }
       // A stale/disposed owner cannot create deferred work for a later surface.
       if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
     // The page can become owned while the backend request is in flight. Never
     // begin installing a feed response that is already known to be unsafe.
     if (feedHasActiveEdit()) {
       pendingFeedRestart = true;
-      return;
+      return null;
     }
     // Clear the deferred flag before loadFeed synchronously updates doc.feed;
     // otherwise the intentionally reactive pending-retry effect observes the
@@ -125,15 +127,17 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
     // the old feed atomically and replay after ownership releases.
     if (!installed) {
       pendingFeedRestart = true;
-      return;
+      return null;
     }
     journalAsOfDay = response.as_of_day;
     nextBeforeDay = response.next_before_day;
     feedDone = response.done;
-  } catch {
+    return null;
+  } catch (error) {
     // A failed refresh must leave the displayed feed and its cursor usable.
     // Focus, visibility, load-more, or the next calendar check will retry.
     if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
+    return error;
   } finally {
     if (loadingGeneration === generation) loadingGeneration = null;
   }
@@ -144,14 +148,14 @@ let journalRefreshFlight: {
   graphBinding: number;
   day: number;
   owner: JournalsFeedOwner;
-  promise: Promise<void>;
+  promise: Promise<unknown | null>;
 } | null = null;
 
 /** One lifecycle boundary for initial load, graph rebind, timer, focus,
  * visibility/resume, watcher refresh and deferred-edit retry. A configured
  * template is durably ensured before the feed is allowed to observe that day. */
-async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promise<void> {
-  if (!ownerIsLive(owner)) return;
+async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promise<unknown | null> {
+  if (!ownerIsLive(owner)) return null;
   const date = new Date();
   const day = localDayKey(date);
   const current = journalRefreshFlight;
@@ -171,7 +175,7 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
   ++feedGeneration;
   if (feedHasActiveEdit()) {
     pendingFeedRestart = true;
-    return;
+    return null;
   }
 
   const flight = {
@@ -179,24 +183,24 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
     graphBinding: owner.graphBinding,
     day,
     owner,
-    promise: Promise.resolve(),
+    promise: Promise.resolve<unknown | null>(null),
   };
   flight.promise = (async () => {
     const ensured = await ensureJournalTemplateForDay(date, () => !feedHasActiveEdit());
     const liveOwner = flight.owner;
     if (ensured !== "ready") {
       if (ownerIsLive(liveOwner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
     if (!ownerIsLive(liveOwner) || localDayKey() !== day) {
       if (ownerIsLive(liveOwner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
-    await restartJournalFeed(liveOwner);
+    return restartJournalFeed(liveOwner);
   })();
   journalRefreshFlight = flight;
   try {
-    await flight.promise;
+    return await flight.promise;
   } finally {
     if (journalRefreshFlight === flight) journalRefreshFlight = null;
   }
@@ -290,17 +294,22 @@ export function PageView(): JSX.Element {
     );
     void (async () => {
       try {
-        if (r.kind === "query") {
-          // Query workspaces are rendered by PaneLeaf, not PageView. Keep this
-          // guard so the page loader never interprets a virtual route as a file.
+        if (r.kind === "query" || r.kind === "pdf" || r.kind === "invalid") {
+          // Non-page workspaces are rendered by PaneLeaf, not PageView. Keep
+          // this guard so the page loader never interprets a virtual route or
+          // PDF asset as a graph page file.
           publishReady("ready");
           return;
         } else if (r.kind === "journals") {
           // restartJournalFeed synchronously reads the working set safety gate.
           // Keep those reads out of this route/epoch loader's dependency set:
           // loadFeed replaces doc.feed, and subscribing here would self-reload.
-          await untrack(() => refreshJournalFeedForCurrentDay(journalOwner(r, epoch)));
+          const feedError = await untrack(() => refreshJournalFeedForCurrentDay(journalOwner(r, epoch)));
           if (epoch !== graphEpoch()) return; // graph switched mid-load — drop it
+          // A background refresh failure keeps an already rendered feed usable.
+          // On the first load there is no old feed to preserve: report the real
+          // backend error instead of turning it into "No journal entries".
+          if (feedError !== null && doc.feed.length === 0) throw feedError;
         } else {
           if (isGuidePageName(r.name)) {
             await ensureGuidePagesLoaded(true);
@@ -485,7 +494,7 @@ export function PageView(): JSX.Element {
   const pagesToRender = () => {
     const r = loadedRoute() ?? currentRoute();
     if (r.kind === "journals") return mainPages();
-    if (r.kind === "query") return [];
+    if (r.kind !== "page") return [];
     const p = pageByName(r.name);
     const target = pageTargetFromRoute(r);
     return p && target && pageTargetMatchesLoaded(target, p) ? [p] : [];
@@ -620,6 +629,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
             const dest = internalLinkDest(e);
             if (dest === "sidebar") openPageInSidebar(pageTarget());
             else if (dest === "background") openPageTargetInNewTab(pageTarget());
+            else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...pageTarget() });
             else router.openPageTarget(pageTarget());
           }}
           onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
@@ -641,6 +651,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
                   }
                   const ref = blockRef(aid);
                   if (dest === "sidebar") openBlockInSidebar(ref);
+                  else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
                   else openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
                 }}
                 onAuxClick={(e) => internalLinkAuxClick(e, () => {
@@ -679,6 +690,10 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   let renameCancelled = false;
   let pageActionsTrigger: HTMLButtonElement | undefined;
   const pageTarget = () => pageTargetFromFeedPage(props.page);
+  const isTodayJournal = () => props.page.kind === "journal"
+    && props.page.name === journalTitle(localDateFromDayKey(currentDayKey()));
+  const showTodayTaskSummary = () => isTodayJournal()
+    && selectedThemePresentation().todayTaskSummary === "compact";
   const pageActionsOpen = () => {
     const menu = contextMenu();
     return menu?.kind === "page"
@@ -798,7 +813,10 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   return (
     <div
       class="page-section"
-      classList={{ "page-mutation-busy": pageMutationVisiblyBusy(props.page.name) }}
+      classList={{
+        "page-mutation-busy": pageMutationVisiblyBusy(props.page.name),
+        "journal-today": isTodayJournal(),
+      }}
       inert={pageMutationBusy(props.page.name) ? true : undefined}
       aria-busy={pageMutationBusy(props.page.name) ? "true" : undefined}
     >
@@ -821,86 +839,93 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         <NamespaceCrumb name={props.page.name} />
       </Show>
       <div class="page-title-row">
-        <Show
-          when={!renaming()}
-          fallback={
-            <input
-              class="page-title-input"
-              value={newName()}
-              disabled={pageMutationBusy(props.page.name)}
-              ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
-              onInput={(e) => setNewName(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void commitRename();
-                else if (e.key === "Escape") {
-                  renameCancelled = true;
-                  setRenaming(false);
-                  dropTitleLease();
-                }
-              }}
-              onBlur={() => void commitRename()}
-            />
-          }
-        >
-          <h1
-            class="page-title"
-            classList={{ "journal-title": props.page.kind === "journal" }}
-            title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
-            onClick={(e) => {
-              const dest = internalLinkDest(e);
-              if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
-              else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
-              else router.openPageTarget(pageTarget());
-            }}
-            onMouseDown={internalLinkMouseDown}
-            onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
-            onDblClick={startRename}
-            onContextMenu={(e) => {
-              if (props.page.guide) return;
-              if (!shouldOpenTextContextMenu(e.target)) return;
-              e.preventDefault();
-              openPageContextMenu(e.clientX, e.clientY, pageTarget(), true);
-            }}
+        <div class="page-title-main">
+          <Show
+            when={!renaming()}
+            fallback={
+              <input
+                class="page-title-input"
+                value={newName()}
+                disabled={pageMutationBusy(props.page.name)}
+                ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
+                onInput={(e) => setNewName(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void commitRename();
+                  else if (e.key === "Escape") {
+                    renameCancelled = true;
+                    setRenaming(false);
+                    dropTitleLease();
+                  }
+                }}
+                onBlur={() => void commitRename()}
+              />
+            }
           >
-            <Show when={props.page.kind === "journal"}>
-              <svg class="title-cal" viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="4" y="5" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
-                <line x1="4" y1="9.5" x2="20" y2="9.5" stroke="currentColor" stroke-width="1.7" />
-                <line x1="8.5" y1="3" x2="8.5" y2="7" stroke="currentColor" stroke-width="1.7" />
-                <line x1="15.5" y1="3" x2="15.5" y2="7" stroke="currentColor" stroke-width="1.7" />
-              </svg>
-            </Show>
-            <Show
-              when={pageProperties(propertySource(), props.page.format)
-                .find(([k]) => k.toLowerCase() === "icon")?.[1]
-                ?.trim()}
+            <h1
+              class="page-title"
+              classList={{ "journal-title": props.page.kind === "journal" }}
+              title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
+              onClick={(e) => {
+                const dest = internalLinkDest(e);
+                if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
+                else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
+                else if (dest === "pane" && !props.page.guide) openRouteInOtherPane({ kind: "page", ...pageTarget() });
+                else router.openPageTarget(pageTarget());
+              }}
+              onMouseDown={internalLinkMouseDown}
+              onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
+              onDblClick={startRename}
+              onContextMenu={(e) => {
+                if (props.page.guide) return;
+                if (!shouldOpenTextContextMenu(e.target)) return;
+                e.preventDefault();
+                openPageContextMenu(e.clientX, e.clientY, pageTarget(), true);
+              }}
             >
-              {(icon) => (
-                <span
-                  class="page-icon page-title-icon"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    editPageHeader();
-                  }}
-                >
-                  <EmojiText text={icon()} />
-                </span>
-              )}
-            </Show>
-            <EmojiText text={props.page.title} />
-          </h1>
-        </Show>
-        <Show when={!props.page.guide}>
-          <CarryActions page={props.page} />
-          <TagTableToggle page={props.page} />
-        </Show>
-        <Show when={props.page.guide}>
-          <button class="guide-copy-btn" onClick={() => void copyGuideIntoGraph(props.page.name)}>
-            Copy the guide into your graph
-          </button>
-        </Show>
-        <Show when={!props.page.guide}>
+              <Show when={props.page.kind === "journal"}>
+                <svg class="title-cal" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="5" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="4" y1="9.5" x2="20" y2="9.5" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="8.5" y1="3" x2="8.5" y2="7" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="15.5" y1="3" x2="15.5" y2="7" stroke="currentColor" stroke-width="1.7" />
+                </svg>
+              </Show>
+              <Show
+                when={pageProperties(propertySource(), props.page.format)
+                  .find(([k]) => k.toLowerCase() === "icon")?.[1]
+                  ?.trim()}
+              >
+                {(icon) => (
+                  <span
+                    class="page-icon page-title-icon"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      editPageHeader();
+                    }}
+                  >
+                    <EmojiText text={icon()} />
+                  </span>
+                )}
+              </Show>
+              <EmojiText text={props.page.title} />
+            </h1>
+          </Show>
+          <Show when={showTodayTaskSummary()}>
+            <TodayTaskSummary page={props.page} />
+          </Show>
+        </div>
+        <div class="page-title-actions">
+          <Show when={!props.page.guide}>
+            <CarryActions page={props.page} />
+            <TagTableToggle page={props.page} />
+          </Show>
+          <Show when={props.page.guide}>
+            <button class="guide-copy-btn" onClick={() => void copyGuideIntoGraph(props.page.name)}>
+              Copy the guide into your graph
+            </button>
+          </Show>
+          <Show when={!props.page.guide}>
           <button
             ref={pageActionsTrigger}
             type="button"
@@ -939,7 +964,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               />
             </svg>
           </button>
-        </Show>
+          </Show>
+        </div>
       </div>
       <Show when={aliasNames(propertySource(), props.page.format).length}>
         <div class="page-aliases" title="Also known as — other names that link here" onClick={editPageHeader}>

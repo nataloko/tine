@@ -20,10 +20,16 @@ import "./styles/theme.css";
 import "./lsShimInstall";
 import "./styles/app.css";
 import { installEditableEmojiPlatform } from "./editableEmoji";
+import { applyContentWidths } from "./contentWidth";
+import { installSystemInsetOwner } from "./systemInsets";
+import { installPlatformAttribute } from "./nativeChrome";
 
+installPlatformAttribute();
+installSystemInsetOwner();
 installEditableEmojiPlatform();
 applyTheme();
 applyAccent();
+applyContentWidths();
 const communityExtensionsReady = startCommunityExtensions()
   .then(({ pluginInitialization }) => {
     void pluginInitialization.catch((error) =>

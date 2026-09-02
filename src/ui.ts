@@ -21,7 +21,7 @@ import { PaneContext } from "./paneContext";
 import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
 import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawerFocus, type DrawerSide } from "./mobileDrawers";
-import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
+import type { PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 import type { ExportNode } from "./editor/exportText";
 
@@ -662,11 +662,8 @@ export async function refreshSyncConflicts(notify: "new" | false = false): Promi
   }
 }
 
-// --- which content pane is focused. Drives Ctrl+/- zoom routing (notes → whole
-// interface, pdf → the PDF's own scale). Transient session state, not persisted. ---
-export const [activePane, setActivePane] = createSignal<"notes" | "pdf">("notes");
-let paneFocusSetter: ((paneId: string) => void) | undefined;
-export function registerPaneFocusSetter(setter: (paneId: string) => void) {
+let paneFocusSetter: ((paneId: string, rememberLayout?: boolean) => void) | undefined;
+export function registerPaneFocusSetter(setter: (paneId: string, rememberLayout?: boolean) => void) {
   paneFocusSetter = setter;
 }
 /** Track the focused pane from clicks / focus moves. Capture-phase so it sees
@@ -686,8 +683,7 @@ export function installPaneTracker(): () => void {
     // main default.
     if (e.type === "focusin" && !container) return;
     const paneId = container?.getAttribute("data-pane-id") ?? "main";
-    paneFocusSetter?.(paneId);
-    setActivePane(paneId === "pdf" ? "pdf" : "notes");
+    paneFocusSetter?.(paneId, !!container);
   };
   const pointerdown = (e: Event) => {
     // Any click exits pane-select (standard modal behavior); without this the
@@ -1066,25 +1062,6 @@ export const [rightSidebarWidth, setRightSidebarWidth] = createSignal(loadRsWidt
 export function persistRightSidebarWidth() {
   try {
     localStorage.setItem(RS_W_KEY, String(rightSidebarWidth()));
-  } catch {
-    // ignore
-  }
-}
-
-const PDF_W_KEY = "logseq-claude.pdfPaneWidth";
-function loadPdfWidth(): number {
-  try {
-    const v = Number(localStorage.getItem(PDF_W_KEY));
-    if (v >= 320 && v <= 1200) return v;
-  } catch {
-    // ignore
-  }
-  return 560;
-}
-export const [pdfPaneWidth, setPdfPaneWidth] = createSignal(loadPdfWidth());
-export function persistPdfPaneWidth() {
-  try {
-    localStorage.setItem(PDF_W_KEY, String(pdfPaneWidth()));
   } catch {
     // ignore
   }
@@ -1957,8 +1934,17 @@ export const [toasts, setToasts] = createSignal<Toast[]>([]);
 export function pushToast(
   message: string,
   kind: Toast["kind"] = "info",
-  opts: { sticky?: boolean; action?: { label: string; run: () => void }; onDismiss?: () => void } = {}
+  opts: {
+    sticky?: boolean;
+    dedupe?: boolean;
+    action?: { label: string; run: () => void };
+    onDismiss?: () => void;
+  } = {}
 ): number {
+  if (opts.dedupe) {
+    const existing = toasts().find((toast) => toast.kind === kind && toast.message === message);
+    if (existing) return existing.id;
+  }
   const id = ++toastSeq;
   setToasts([...toasts(), { id, message, kind, sticky: opts.sticky, action: opts.action, onDismiss: opts.onDismiss }]);
   if (!opts.sticky) setTimeout(() => dismissToast(id), 3200);
@@ -2044,20 +2030,6 @@ export interface PdfTarget {
   label: string;
   owner: PdfOwnership;
   page?: number;
+  scale?: number;
   highlightId?: string;
-}
-export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
-export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
-  const owner = currentPdfOwnership();
-  if (!owner) return;
-  // Logseq treats re-opening the current PDF resource without a page/highlight
-  // intent as a no-op. Preserve the reader's current location; explicit targets
-  // within the same file still publish a new reactive navigation intent.
-  const current = pdfTarget();
-  if (current?.filename === filename && current.owner.generation === owner.generation &&
-      page == null && highlightId == null) return;
-  setPdfTarget({ filename, label, owner, page, highlightId });
-}
-export function closePdf() {
-  setPdfTarget(null);
 }

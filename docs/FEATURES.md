@@ -88,6 +88,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   clear approval. Tine stores that exact canonical directory, confines asset reads
   and writes to it, and fails closed if the link is later retargeted; pages,
   journals, and configuration never inherit that exception.
+- **Live external-asset refresh** — images replaced by an editor or a
+  whole-graph synchronizer refresh in place in both Direct Files and managed
+  storage. Asset observation is metadata-only and separate from the managed
+  oplog; PDFs, audio, and video already open in Tine are left undisturbed and
+  use the new bytes on their next open.
 - **Drag the corner grip to resize an image *or a video*** — stored as a width % in
   Logseq's `{:width …}` brace, so it round-trips.
 - ⊕ **Audio ⤢ Expand** opens a wide overlay player — a **waveform scrubber** with
@@ -415,8 +420,14 @@ within a column; merged cells are still v2+.
 
 ## PDF annotation
 
-- Open PDFs in a resizable, zoomable pane (instant zoom, HiDPI, per-page
-  virtualization); in-PDF `Ctrl+F` find with a page jump box.
+- Open PDFs as ordinary persisted pane routes and draggable tabs. Desktop opens
+  a companion pane while preserving the source page; the PDF can then move into
+  any pane, split, or quadrant. Mobile opens it in the one-pane history so Back
+  returns to the source. The reader is resizable and zoomable (instant zoom,
+  HiDPI, per-page virtualization), with in-PDF `Ctrl+F` find and a page jump box.
+- **Notes** opens the `hls__` page in the PDF's structural companion pane on
+  desktop, or in the same history on mobile. Saved workspaces restore PDF tabs,
+  histories, page and scale without a separate global PDF pane or width limit.
 - Select text → colored **highlights**, or hold **Shift** while dragging on Linux
   and Windows (**Command** on macOS) and then choose a color to clip an **area
   (image) highlight**. The drag must exceed 10 pixels in both dimensions, and
@@ -554,7 +565,7 @@ within a column; merged cells are still v2+.
   switching. Also openable from the command line: `tine /path/to/graph` or the
   `TINE_GRAPH` env var.
 
-## Plugins & token themes
+## Plugins & declarative themes
 
 - **Experimental Tine-native plugin API 0.2** — small WebAssembly guests receive
   versioned, bounded events and return inert effects that Tine validates. They do not
@@ -576,10 +587,14 @@ within a column; merged cells are still v2+.
   preconditioned focused-block edits only through declared capabilities. Plugin
   settings are device-local scalar values in Tine's own controls. Disable or uninstall
   removes behavior/packages without making graph files unreadable.
-- **Token theme API 0.1** — executable code is not involved: packages contain a
-  strictly validated literal-color vocabulary. Themes install from the signed
+- **Declarative theme API 0.2** — executable code is not involved: packages contain
+  strictly validated literal colors and may select host-owned editorial typography,
+  journal-header, and Today task-summary presets. Presentation style and color scheme
+  are selected independently, so an installed editorial style can use a built-in
+  palette. Themes install from the signed
   catalogue or local files under Settings → Appearance, remain device-local, and sit
-  below graph `logseq/custom.css` in the cascade.
+  below graph `logseq/custom.css` in the cascade. Existing color-only API 0.1 themes
+  remain compatible.
 - **Starter ecosystem and authoring tools** — the first examples cover bullet
   threading, query-filter shortcuts, and a behavioral port of heading shortcuts. A
   Rust SDK/template, deterministic checker, port-gap format, threat model, registry
@@ -635,10 +650,11 @@ within a column; merged cells are still v2+.
   replaced; markup structure kept) and **re-verified to still reproduce the
   divergence** before it's shown. Copied reports include the Tine version used.
   mldoc is loaded only on demand; nothing is uploaded.
-- Light/dark themes, a built-in theme gallery (Default, Nord, Solarized, Gruvbox),
-  accent color, custom CSS, wide mode (`t w`), document mode (`t d`). Gallery
-  themes are app-level and device-local: Tine stores only the selected theme id in
-  its backend settings, applies the theme as a managed `#tine-theme` CSS layer, and
+- Light/dark themes, independently selectable presentation styles and color schemes,
+  a built-in color gallery (Default, Nord, Solarized, Gruvbox), accent color, custom
+  CSS, wide mode (`t w`), document mode (`t d`). Theme choices are app-level and
+  device-local: Tine stores the selected style and color ids in its backend settings,
+  applies colors as a managed `#tine-theme` CSS layer, and
   never writes to your graph. Tine also aliases common Logseq `--ls-*` theme
   variables, so both gallery themes and file-based themes in `logseq/custom.css`
   can recolor backgrounds, text, links, borders, and inline code. The cascade is

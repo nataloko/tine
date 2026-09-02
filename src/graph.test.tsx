@@ -85,7 +85,18 @@ async function loadHarness(
   });
   const retirePdfOwnership = vi.fn(() => { events.push("retire-pdf"); });
   const activatePdfOwnership = vi.fn((root: string) => { events.push(`activate-pdf:${root}`); });
-  const closePdf = vi.fn(() => { events.push("close-pdf"); });
+  const suspendPdfForGraphTransition = vi.fn(() => {
+    events.push("suspend-pdf");
+    return { filename: "assets/paper.pdf", label: "Paper" };
+  });
+  const restorePdfSessionTarget = vi.fn(() => {
+    events.push("restore-pdf");
+    return true;
+  });
+  const restorePendingPdfSessionTarget = vi.fn(() => {
+    events.push("restore-pending-pdf");
+    return true;
+  });
   const pushToast = vi.fn();
 
   vi.doMock("./backend", () => ({ backend: () => api }));
@@ -118,12 +129,21 @@ async function loadHarness(
     resetLeftSidebarSections: vi.fn(),
     graphTransitioning: () => false,
     setGraphTransitioning: vi.fn(),
-    closePdf,
+    suspendPdfForGraphTransition,
+    restorePdfSessionTarget,
+    restorePendingPdfSessionTarget,
   }));
   vi.doMock("./pdfOwnership", () => ({
     drainPdfWork,
     retirePdfOwnership,
     activatePdfOwnership,
+  }));
+  vi.doMock("./managedStorageRuntime", () => ({
+    managedStorageRuntime: {
+      bind: vi.fn(),
+      clear: vi.fn(),
+      refresh: vi.fn(async () => null),
+    },
   }));
   vi.doMock("./store", () => ({ resetStore: vi.fn(), flushAll: vi.fn(async () => true) }));
   vi.doMock("./assetCache", () => ({ clearAssetBlobCache: vi.fn() }));
@@ -158,7 +178,9 @@ async function loadHarness(
   return {
     createNewGraph, ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph,
     api, events, setAliasMap, pushToast,
-    drainPdfWork, retirePdfOwnership, activatePdfOwnership, closePdf,
+    drainPdfWork, retirePdfOwnership, activatePdfOwnership,
+    suspendPdfForGraphTransition, restorePdfSessionTarget,
+    restorePendingPdfSessionTarget,
     applyTemplateVars, prepareTemplateVars,
     setMeta: (next: GraphMeta | null) => { meta = next; },
     bumpEpoch: () => { epoch += 1; },
@@ -179,6 +201,21 @@ describe("mobile graph folder picker", () => {
     await expect(harness.switchGraph()).resolves.toEqual({ kind: "loaded", root: META.root });
     expect(harness.api.pickGraphFolder).toHaveBeenCalledOnce();
     expect(harness.api.prepareGraphFolder).toHaveBeenCalledWith(META.root);
+    expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
+  });
+
+  it("opens the rebased iOS container path after an app update", async () => {
+    const stale = "/var/mobile/Containers/Data/Application/OLD/Documents/template-graph";
+    const harness = await loadHarness(null, undefined, true, true, "ios");
+    harness.api.prepareGraphFolder.mockResolvedValue({
+      status: "ready",
+      location: "local",
+      path: META.root,
+    } as PreparedGraphFolder);
+
+    await expect(harness.loadGraphPath(stale)).resolves.toEqual({ kind: "loaded", root: META.root });
+    expect(harness.api.prepareGraphFolder).toHaveBeenCalledWith(stale);
+    expect(harness.api.inspectGraphAccess).toHaveBeenCalledWith(META.root);
     expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
   });
 
@@ -559,11 +596,10 @@ describe("PDF graph ownership", () => {
     await harness.loadGraphPath(nextMeta.root);
 
     expect(harness.events).toEqual(expect.arrayContaining([
-      "drain-pdf", "retire-pdf", "close-pdf", "load-next",
+      "drain-pdf", "retire-pdf", "load-next",
     ]));
     expect(harness.events.indexOf("drain-pdf")).toBeLessThan(harness.events.indexOf("retire-pdf"));
-    expect(harness.events.indexOf("retire-pdf")).toBeLessThan(harness.events.indexOf("close-pdf"));
-    expect(harness.events.indexOf("close-pdf")).toBeLessThan(harness.events.indexOf("load-next"));
+    expect(harness.events.indexOf("retire-pdf")).toBeLessThan(harness.events.indexOf("load-next"));
     expect(harness.activatePdfOwnership).toHaveBeenLastCalledWith(nextMeta.root);
   });
 
@@ -578,7 +614,7 @@ describe("PDF graph ownership", () => {
     expect(harness.drainPdfWork).toHaveBeenCalledOnce();
     expect(harness.events).toEqual([]);
     expect(harness.retirePdfOwnership).not.toHaveBeenCalled();
-    expect(harness.closePdf).not.toHaveBeenCalled();
+    expect(harness.suspendPdfForGraphTransition).not.toHaveBeenCalled();
     expect(harness.api.loadGraph).toHaveBeenCalledOnce();
   });
 
@@ -601,11 +637,28 @@ describe("PDF graph ownership", () => {
     expect(harness.events.slice(0, 5)).toEqual([
       "drain-pdf",
       "retire-pdf",
-      "close-pdf",
       "load-refresh",
       `activate-pdf:${META.root}`,
+      "bump-epoch",
     ]);
     expect(harness.activatePdfOwnership).toHaveBeenCalledTimes(2);
+    expect(harness.restorePdfSessionTarget).not.toHaveBeenCalled();
+  });
+
+  it("restores fresh old-graph ownership while route state remains installed when rebind fails", async () => {
+    const harness = await loadHarness(null);
+    await harness.loadGraphPath(META.root);
+    harness.events.length = 0;
+    harness.api.loadGraph.mockRejectedValueOnce(new Error("rebind failed"));
+
+    await expect(harness.loadGraphPath("/tmp/other-graph")).rejects.toThrow("rebind failed");
+
+    expect(harness.events).toEqual([
+      "drain-pdf",
+      "retire-pdf",
+      `activate-pdf:${META.root}`,
+    ]);
+    expect(harness.restorePdfSessionTarget).not.toHaveBeenCalled();
   });
 });
 

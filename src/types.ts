@@ -270,6 +270,61 @@ export interface SparseV2ErrorEvent {
   message: string;
 }
 
+export type SyncAbsenceSweepTier = "tier2" | "tier3";
+export type SyncAbsenceSweepActionKind = "restore" | "reapply" | "keep_deletion";
+export type SyncAbsenceSweepActionState = "started" | "progress" | "completed" | "failed";
+
+export interface SyncAbsenceSweepMember {
+  page_id: string;
+  path: string;
+}
+
+export interface SyncAbsenceSweepAction {
+  action_id: string;
+  action: SyncAbsenceSweepActionKind;
+  state: SyncAbsenceSweepActionState;
+  recorded_at_unix_ms: number;
+  authored_batch_ids: string[];
+  chunk_ordinal: number | null;
+  remaining_operation_watermark: number | null;
+  nondecreasing_retries: number | null;
+  failure_reason: string | null;
+}
+
+export interface SyncAbsenceSweepEvent {
+  sweep_id: string;
+  tier: SyncAbsenceSweepTier;
+  absence_count: number;
+  pages_at_open: number;
+  opened_at_unix_ms: number;
+  closed_at_unix_ms: number | null;
+  grace_deadline_unix_ms: number | null;
+  disposed_at_unix_ms: number | null;
+  members: SyncAbsenceSweepMember[];
+  latest_action: SyncAbsenceSweepAction | null;
+}
+
+export interface SyncAbsenceSweepChangedEvent {
+  binding_generation: number;
+  sweep: SyncAbsenceSweepEvent;
+}
+
+export interface SyncAbsenceSweepActionOutcome {
+  sweep_id: string;
+  action_id: string;
+  authored_batch_ids: string[];
+}
+
+export interface SyncAbsenceSweepRestoreFidelity {
+  page_id: string;
+  path: string;
+  grade: "byte_identical" | "semantically_identical";
+}
+
+export interface SyncAbsenceSweepRestoreOutcome extends SyncAbsenceSweepActionOutcome {
+  fidelity: SyncAbsenceSweepRestoreFidelity[];
+}
+
 export interface SparseV2RuntimeStatus {
   lifecycle: "active" | "terminal" | "stopped_safe" | "stopped_crashed";
   recovery: "first_promotion" | "resumed_own_unsafe" | "adopted_safe_handoff" | "took_over_crashed_unsafe" | null;
@@ -283,6 +338,9 @@ export interface SparseV2RuntimeStatus {
    * work a tick can advance. Diagnostic only; `provider_pending` is a broad
    * inventory that legitimately stays non-zero. */
   provider_runnable: boolean;
+  /** Both FTS families are catching up in bounded background turns. Search
+   * remains exact through the non-indexed fallback until this clears. */
+  search_index_building: boolean;
 }
 
 export type SparseV2Availability =
@@ -526,34 +584,8 @@ export type SparseV2ActivationPhase =
   | "retained_runtime_projection_repair"
   | "retained_runtime_actor_open";
 
-export type SparseV2BootstrapPreparationSubphase =
-  | "source_protocol"
-  | "operation_spool"
-  | "partition"
-  | "detached_authoring"
-  | "sealing";
-
-export interface SparseV2BootstrapPreparationSummary {
-  source_files: number;
-  source_bytes: number;
-  parser_nodes: number;
-  operations: number;
-  parts: number;
-  prepared_bytes: number;
-  operation_builder_retained_bytes: number;
-  operation_builder_spilled: boolean;
-  source_protocol_micros: number;
-  operation_spool_micros: number;
-  partition_micros: number;
-  detached_authoring_micros: number;
-  sealing_micros: number;
-}
-
 export type SparseV2ActivationProgress =
   | { kind: "phase"; phase: SparseV2ActivationPhase }
-  | { kind: "bootstrap_preparation_subphase"; subphase: SparseV2BootstrapPreparationSubphase }
-  | { kind: "bootstrap_detached_authoring"; completed: number; total: number }
-  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary }
   | { kind: "readiness_sample"; largest_page_path: string | null };
 
 export interface SparseV2ActivationProgressEvent {
@@ -660,6 +692,7 @@ export type SparseV2QueryReply =
   | { kind: "pages"; value: SparseV2Page[] }
   | { kind: "page_with_blocks"; value: SparseV2PageWithBlocks | null }
   | { kind: "search"; value: SparseV2SearchHit[] }
+  | { kind: "search_building"; value: { horizon_sequence: number } }
   | { kind: "properties"; value: SparseV2Property[] }
   | { kind: "tags"; value: SparseV2Tag[] }
   | { kind: "tasks"; value: SparseV2Task[] }

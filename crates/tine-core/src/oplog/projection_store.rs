@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
 #[cfg(target_os = "android")]
 use std::fs;
 use std::fs::File;
-use std::io::{self, ErrorKind, Read as _, Write as _};
+use std::io::{self, ErrorKind, Read, Write as _};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
@@ -13,7 +13,11 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(test, target_os = "android"))]
+use std::sync::Mutex;
+#[cfg(target_os = "android")]
+use std::sync::OnceLock;
+use std::sync::RwLock;
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -32,7 +36,6 @@ use super::object_store::{
     sync_dir_required, StoreError,
 };
 use super::sync_layout::{
-    INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
     MUTATION_AUTHORITY_LEASE_SUFFIX, MUTATION_AUTHORITY_SUFFIX,
     PROJECTION_ATTEMPTS_DIR as ATTEMPTS_DIR, PROJECTION_BASES_DIR as BASES_DIR,
     PROJECTION_CLEANUP_ROUND_0_DIR, PROJECTION_CLEANUP_ROUND_1_DIR,
@@ -55,17 +58,53 @@ use super::{
 use crate::model::ProjectionRecoveryCleanup;
 use crate::model::{Graph, ProjectionRecoveryEvidence, ProjectionWriteProof};
 
+thread_local! {
+    /// The turn executor records the exact per-page name seed before entering
+    /// the retained receipt-backed writer. The store persists this value; it
+    /// never derives a competing identity from its own resource id (2b soak).
+    static PROJECTION_TURN_ATTEMPT: std::cell::Cell<Option<Uuid>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub(crate) struct ProjectionTurnAttemptScope {
+    previous: Option<Uuid>,
+}
+
+pub(crate) fn enter_projection_turn_attempt(attempt_id: Uuid) -> ProjectionTurnAttemptScope {
+    let previous = PROJECTION_TURN_ATTEMPT.replace(Some(attempt_id));
+    ProjectionTurnAttemptScope { previous }
+}
+
+impl Drop for ProjectionTurnAttemptScope {
+    fn drop(&mut self) {
+        PROJECTION_TURN_ATTEMPT.set(self.previous);
+    }
+}
+
 const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = [
     PROJECTION_CLEANUP_ROUND_0_DIR,
     PROJECTION_CLEANUP_ROUND_1_DIR,
 ];
 
-const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR5\0";
-const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 2] = [b"TINEPR4\0", b"TINEPR3\0"];
+/// The current private receipt-store claim.
+///
+/// Sub-design (c) §1 (v19): the record format now carries an explicit
+/// target-kind discriminant, and the 0.7 blank-slate decision says pre-(c)
+/// stores are refused rather than migrated. The claim version IS that
+/// transition -- there is no dual acceptance, no legacy classification, and no
+/// migration apparatus. A pre-(c) magic falls into the store's existing
+/// recognized-and-refused convention below, carrying the re-activation remedy;
+/// the user's Markdown is untouched.
+const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR6\0";
+const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 3] = [b"TINEPR5\0", b"TINEPR4\0", b"TINEPR3\0"];
 const STORE_INIT_MAGIC: &[u8; 8] = b"TINEPI5\0";
-const STORE_CLAIM_VERSION: u32 = 5;
+const STORE_CLAIM_VERSION: u32 = 6;
 const STORE_CLAIM_BASE_LEN: usize = STORE_CLAIM_MAGIC.len() + 4 + 32 + 16 + 1 + 16 + 16 + 32;
-const STORE_CLAIM_LEN: usize = STORE_CLAIM_BASE_LEN + 5 * 32;
+/// The version-specific claim envelope length. A current-magic claim of any
+/// other length is malformed, never a shorter older format: this is what the
+/// cold-open precheck holds a claim to before anything can mutate the graph.
+pub(crate) const STORE_CLAIM_LEN: usize = STORE_CLAIM_BASE_LEN + 5 * 32;
 const STORE_INIT_LEN: usize = STORE_CLAIM_BASE_LEN;
 pub(crate) const MAX_PROJECTION_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_PROJECTION_CATALOG_BYTES: u64 = 512 * 1024 * 1024;
@@ -78,9 +117,8 @@ const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
 const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
 const PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION: u32 = 1;
-pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
-const INTENT_NAMESPACE_SCHEMA_VERSION: u32 = 1;
+const PENDING_CLEANUP_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
 const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
@@ -203,7 +241,128 @@ fn create_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreE
     open_android_private_directory(path)
 }
 
-fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptDirectoryDurability {
+    /// The store has not yet published the claim enrollment will promote, so
+    /// the namespace is still reconstructible from unchanged Direct Files.
+    PrePromotionBootstrap,
+    /// Enrollment has promoted the store identity. Its receipt names are now
+    /// private durable authority and every directory barrier is strict.
+    PromotedAuthority,
+}
+
+#[cfg(any(test, target_os = "android"))]
+type AndroidReceiptDirectoryIdentity = (u64, u64);
+
+#[cfg(any(test, target_os = "android"))]
+#[derive(Debug, Default)]
+struct AndroidReceiptBarrierState {
+    verified_parents: Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>>,
+}
+
+#[cfg(any(test, target_os = "android"))]
+impl AndroidReceiptBarrierState {
+    fn begin_mutation(&self, identity: AndroidReceiptDirectoryIdentity) {
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&identity);
+    }
+
+    fn finish_mutation_barrier<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        barrier()?;
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        Ok(())
+    }
+
+    fn record_mutation_barrier<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        // A namespace mutation invalidates the process-local proof before the
+        // barrier runs. If the barrier refuses or panics, this process and a
+        // future process both have to verify the parent before accepting an
+        // exact existing name.
+        self.begin_mutation(identity);
+        self.finish_mutation_barrier(identity, barrier)
+    }
+
+    fn verify_existing<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self
+            .verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&identity)
+        {
+            return Ok(());
+        }
+        barrier()?;
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_receipt_barrier_state() -> &'static AndroidReceiptBarrierState {
+    static STATE: OnceLock<AndroidReceiptBarrierState> = OnceLock::new();
+    STATE.get_or_init(AndroidReceiptBarrierState::default)
+}
+
+#[cfg(target_os = "android")]
+fn android_receipt_directory_identity(
+    directory: &Dir,
+) -> Result<AndroidReceiptDirectoryIdentity, StoreError> {
+    let metadata = directory.try_clone()?.into_std_file().metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Invalidate this process's positive parent proof before a namespace mutation.
+/// Identity acquisition therefore cannot fail after the mutation and preserve
+/// stale positive state. See storage-sync-contract.md §2.10c.
+#[cfg(target_os = "android")]
+fn begin_promoted_receipt_directory_mutation(
+    directory: &Dir,
+) -> Result<AndroidReceiptDirectoryIdentity, StoreError> {
+    let identity = android_receipt_directory_identity(directory)?;
+    android_receipt_barrier_state().begin_mutation(identity);
+    Ok(identity)
+}
+
+#[cfg(target_os = "android")]
+fn sync_promoted_receipt_directory(
+    directory: &Dir,
+    identity: AndroidReceiptDirectoryIdentity,
+) -> Result<(), StoreError> {
+    android_receipt_barrier_state()
+        .finish_mutation_barrier(identity, || sync_dir_required(directory))
+}
+
+#[cfg(target_os = "android")]
+fn verify_promoted_receipt_parent(directory: &Dir) -> Result<(), StoreError> {
+    let identity = android_receipt_directory_identity(directory)?;
+    android_receipt_barrier_state().verify_existing(identity, || sync_dir_required(directory))
+}
+
+fn ensure_directory_nofollow_with_durability(
+    root: &Dir,
+    name: &str,
+    durability: ReceiptDirectoryDurability,
+) -> Result<(), ProjectionStoreError> {
     #[cfg(target_os = "android")]
     {
         let component = Path::new(name);
@@ -221,6 +380,12 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
         // directory open below. cap-std's create_dir adds Linux capability
         // preflights which some physical app-private filesystems reject even
         // though mkdirat/openat themselves are permitted.
+        let promoted_parent_identity = match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => None,
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                Some(begin_promoted_receipt_directory_mutation(root)?)
+            }
+        };
         let created =
             unsafe { libc::mkdirat(root.as_fd().as_raw_fd(), component.as_ptr(), libc::S_IRWXU) };
         if created < 0 {
@@ -233,12 +398,41 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
         // one honest Tine writer, so an fstatat-style preflight adds no safety
         // but is rejected by some physical devices even when mkdir/open work.
         open_dir_nofollow(root, name)?;
-        crate::filesystem_durability::sync_reconstructible_directory(root)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(root)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                sync_promoted_receipt_directory(
+                    root,
+                    promoted_parent_identity.expect("promoted parent identity was retained"),
+                )?;
+            }
+        }
         return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
-    super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    {
+        let _ = durability;
+        super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    }
+}
+
+fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PromotedAuthority,
+    )
+}
+
+fn ensure_bootstrap_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PrePromotionBootstrap,
+    )
 }
 
 fn read_optional_regular(
@@ -331,13 +525,48 @@ fn publish_immutable_exact(
     bytes: &[u8],
     kind: &'static str,
 ) -> Result<(), StoreError> {
+    publish_immutable_exact_with_durability(
+        dir,
+        filename,
+        bytes,
+        kind,
+        ReceiptDirectoryDurability::PromotedAuthority,
+    )
+}
+
+fn publish_immutable_exact_with_durability(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+    durability: ReceiptDirectoryDurability,
+) -> Result<(), StoreError> {
     #[cfg(target_os = "android")]
     {
-        return publish_android_private_immutable(dir, filename, bytes, kind);
+        return publish_android_private_immutable(dir, filename, bytes, kind, durability);
     }
 
     #[cfg(not(target_os = "android"))]
-    publish_immutable_exact_strict(dir, filename, bytes, kind)
+    {
+        let _ = durability;
+        crate::durability_counters::note_immutable_publication();
+        publish_immutable_exact_strict(dir, filename, bytes, kind)
+    }
+}
+
+fn publish_bootstrap_immutable_exact(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    publish_immutable_exact_with_durability(
+        dir,
+        filename,
+        bytes,
+        kind,
+        ReceiptDirectoryDurability::PrePromotionBootstrap,
+    )
 }
 
 /// Android's app-private filesystem is single-writer from Tine's point of
@@ -353,6 +582,7 @@ fn publish_android_private_immutable(
     filename: &str,
     bytes: &[u8],
     kind: &'static str,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<(), StoreError> {
     let verify_existing = || -> Result<bool, StoreError> {
         match read_optional_regular(dir, filename, bytes.len() as u64, Some(bytes.len() as u64)) {
@@ -366,7 +596,22 @@ fn publish_android_private_immutable(
         }
     };
 
-    if verify_existing()? {
+    // A failed strict directory barrier may leave the exact final name in the
+    // page cache and namespace even though its insertion is not crash-durable.
+    // The first promoted acceptance for each parent in every process therefore
+    // establishes a barrier before accepting byte-identical publication. That
+    // closes both same-process retry and process-death windows without adding a
+    // barrier to later accepted names under the same unchanged parent.
+    // Bootstrap state remains deliberately reconstructible.
+    let accept_existing = || -> Result<bool, StoreError> {
+        let exists = verify_existing()?;
+        if exists && matches!(durability, ReceiptDirectoryDurability::PromotedAuthority) {
+            verify_promoted_receipt_parent(dir)?;
+        }
+        Ok(exists)
+    };
+
+    if accept_existing()? {
         return Ok(());
     }
 
@@ -378,7 +623,7 @@ fn publish_android_private_immutable(
     // As for receipt directories, use the ordinary Android primitive without
     // the hostile-namespace flags added by the generic capability publisher.
     // The retained file is still create-new, fully synced, and verified byte
-    // for byte before this pre-promotion store is accepted.
+    // for byte before the publication is accepted.
     let temp_fd = unsafe {
         libc::openat(
             dir.as_fd().as_raw_fd(),
@@ -394,13 +639,19 @@ fn publish_android_private_immutable(
     let mut temp = unsafe { File::from_raw_fd(temp_fd) };
     let result = (|| {
         temp.write_all(bytes)?;
-        temp.sync_all()?;
+        crate::durability_counters::sync_file(&temp)?;
         drop(temp);
 
-        if verify_existing()? {
+        if accept_existing()? {
             return Ok(());
         }
 
+        let promoted_parent_identity = match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => None,
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                Some(begin_promoted_receipt_directory_mutation(dir)?)
+            }
+        };
         let renamed = unsafe {
             libc::renameat(
                 dir.as_fd().as_raw_fd(),
@@ -412,7 +663,17 @@ fn publish_android_private_immutable(
         if renamed < 0 {
             return Err(StoreError::Io(io::Error::last_os_error()));
         }
-        crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                sync_promoted_receipt_directory(
+                    dir,
+                    promoted_parent_identity.expect("promoted parent identity was retained"),
+                )?;
+            }
+        }
         if !verify_existing()? {
             return Err(StoreError::Io(io::Error::new(
                 ErrorKind::NotFound,
@@ -461,8 +722,6 @@ thread_local! {
         std::cell::RefCell::new(None);
     static RECEIPT_SCAN_COUNTERS: std::cell::Cell<ProjectionStoreTestCounters> =
         std::cell::Cell::new(ProjectionStoreTestCounters::ZERO);
-    static PROJECTION_CLEANUP_TIME: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
     static FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
@@ -622,14 +881,8 @@ pub(crate) fn reset_projection_store_test_hooks() {
     COMPLETION_PUBLICATION_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_PUBLICATION_ACT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_RETAINED_SLOT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_CLEANUP_TIME.with(|time| time.set(None));
     FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
     FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
-}
-
-#[cfg(test)]
-pub(crate) fn set_projection_cleanup_time_for_test(unix_seconds: Option<u64>) {
-    PROJECTION_CLEANUP_TIME.with(|time| time.set(unix_seconds));
 }
 
 #[cfg(test)]
@@ -708,25 +961,6 @@ impl ReceiptNamespaces {
             self.forensics.identity,
         ]
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IntentNamespaceReservation {
-    schema_version: u32,
-    store_id: ProjectionReceiptStoreId,
-    namespace: String,
-    intent_id: ProjectionIntentId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IntentNamespaceAuthority {
-    schema_version: u32,
-    store_id: ProjectionReceiptStoreId,
-    namespace: String,
-    intent_id: ProjectionIntentId,
-    directory_identity: DirectoryIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -923,26 +1157,6 @@ impl PendingProjectionCleanupMarker {
     }
 }
 
-pub(crate) struct ProjectionCleanupRetirementAuthority {
-    evidence_digest: [u8; 32],
-}
-
-impl ProjectionCleanupRetirementAuthority {
-    pub(crate) fn permits(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<bool, ProjectionStoreError> {
-        Ok(self.evidence_digest == local_forensic_record_digest(record)?)
-    }
-
-    #[cfg(test)]
-    fn for_test(record: &LocalProjectionEvidenceRecord) -> Self {
-        Self {
-            evidence_digest: local_forensic_record_digest(record).unwrap(),
-        }
-    }
-}
-
 /// Disconnected immutable storage for projection bases, intents, and completions.
 ///
 /// Opening this store is never performed by graph startup. Every path operation
@@ -953,9 +1167,9 @@ pub struct ProjectionReceiptStore {
     store_id: ProjectionReceiptStoreId,
     workspace_id: WorkspaceId,
     endpoint: Option<ProjectionEndpointBinding>,
-    cleanup_session_id: Uuid,
     capability: Dir,
     namespaces: ReceiptNamespaces,
+    retired_own_endpoint_intents: RwLock<BTreeSet<ProjectionIntentId>>,
 }
 
 /// Private one-shot authority spanning one exact graph operation and its
@@ -981,6 +1195,34 @@ pub(crate) struct ProjectionMutationAuthority {
     created_durable_record: bool,
     graph_operation_consumed: bool,
     completion_published: bool,
+}
+
+/// One-shot graph mutation evidence derived exclusively from the durable
+/// projection turn currently being replayed. Unlike
+/// [`ProjectionMutationAuthority`], this authors and consults no receipt-store
+/// artifact: the turn supplies the stable attempt id and the local completion
+/// index supplies own-endpoint execution evidence.
+pub(crate) struct ProjectionTurnMutationAuthority {
+    reservation: ProjectionAttemptReservation,
+    graph_operation_consumed: bool,
+}
+
+pub(crate) trait ProjectionMutationEvidence {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T>;
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T>;
 }
 
 pub(crate) struct ProjectionRecoveryEvidencePublisher<'a> {
@@ -1051,6 +1293,83 @@ impl fmt::Debug for ProjectionMutationAuthority {
     }
 }
 
+impl ProjectionTurnMutationAuthority {
+    pub(crate) fn for_current_turn(
+        intent: &ProjectionIntent,
+    ) -> Result<Self, ProjectionStoreError> {
+        let attempt_id = if let Some(attempt_id) = PROJECTION_TURN_ATTEMPT.get() {
+            attempt_id
+        } else {
+            #[cfg(test)]
+            {
+                let mut bytes = [0_u8; 16];
+                bytes.copy_from_slice(&intent.id()?.as_bytes()[..16]);
+                bytes[6] = (bytes[6] & 0x0f) | 0x80;
+                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                Uuid::from_bytes(bytes)
+            }
+            #[cfg(not(test))]
+            {
+                return Err(ProjectionStoreError::MissingTurnAttemptContext);
+            }
+        };
+        Ok(Self {
+            reservation: ProjectionAttemptReservation::new(intent, attempt_id)?,
+            graph_operation_consumed: false,
+        })
+    }
+
+    pub(crate) fn cleanup_records(
+        &self,
+        intent: &ProjectionIntent,
+        proof: &ProjectionWriteProof,
+    ) -> Result<Vec<LocalProjectionEvidenceRecord>, ProjectionStoreError> {
+        if !self.graph_operation_consumed
+            || proof.path() != intent.path().as_str()
+            || proof.digest() != intent.target().sha256()
+            || BlobDescription::of(proof.bytes()) != intent.target()
+        {
+            return Err(ProjectionStoreError::WriteProofMismatch);
+        }
+        proof
+            .recovery_evidence()
+            .iter()
+            .map(|evidence| {
+                if self.reservation.recovery_filename() != evidence.filename() {
+                    return Err(ProjectionStoreError::UnreservedRecoveryEvidence);
+                }
+                Ok(LocalProjectionEvidenceRecord {
+                    schema_version: LOCAL_FORENSIC_SCHEMA_VERSION,
+                    intent_id: intent.id()?,
+                    attempt_id: self.reservation.attempt_id(),
+                    target_path: intent.path().clone(),
+                    recovery_relative_path: evidence.path().to_owned(),
+                    recovery_filename: evidence.filename().to_owned(),
+                    recovery_resource_id: evidence.resource_id(),
+                    observed: BlobDescription::from_parts(*evidence.digest(), evidence.len()),
+                })
+            })
+            .collect()
+    }
+
+    fn consume_graph_operation(&mut self, relative_path: &str) -> io::Result<()> {
+        if self.graph_operation_consumed {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "projection turn mutation authority was already consumed",
+            ));
+        }
+        if self.reservation.target_path().as_str() != relative_path {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "projection turn mutation authority target path mismatch",
+            ));
+        }
+        self.graph_operation_consumed = true;
+        Ok(())
+    }
+}
+
 /// Canonical read-only catalog row used only by the combined import authority.
 ///
 /// Fields stay crate-private so a downstream caller cannot manufacture a
@@ -1067,6 +1386,95 @@ impl ProjectionReceiptStore {
         Self::open_with_binding(root, workspace_id, None)
     }
 
+    /// Refuse an unusable private receipt store BEFORE anything can touch the
+    /// user's graph tree.
+    ///
+    /// Sub-design (c) §1 (R20-C1/R21-C1). The store's full claim validation is
+    /// already the first thing `open` does, and it is kept as defense in depth
+    /// — but on the clean cold-open path it runs *after* `Graph::open_checked`,
+    /// whose publication recovery renames graph files and moves artifacts to
+    /// `.trash/`. A store this build cannot serve must not get that far.
+    ///
+    /// In-scope scenario: an honest pre-(c) private store meets a (c) build
+    /// (Martin's own dev devices). Recovery is re-activation; the Markdown is
+    /// intact and untouched. The torn-claim arm additionally covers an
+    /// interrupted or truncated write of the claim itself: a current-magic
+    /// header on a short body must not pass, or graph recovery runs before the
+    /// in-place length check ever fires.
+    ///
+    /// The precheck is read-only and mutates nothing on any path. It applies
+    /// only to a store the caller has already proven authoritative; a fresh
+    /// store has no claim to check and initializes exactly as today.
+    pub(crate) fn precheck_authoritative_claim(root: &Path) -> Result<(), ProjectionStoreError> {
+        // No private store directory at all: nothing to refuse, and
+        // initialization owns the state.
+        match std::fs::symlink_metadata(root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ProjectionStoreError::from(StoreError::Io(error))
+                    .at("inspect private receipt store for claim precheck"))
+            }
+        }
+        // Android app-private storage cannot take the hostile-replacement open
+        // flags; it uses the same checked opener the rest of this module does.
+        #[cfg(target_os = "android")]
+        let capability = open_android_private_directory(root)?;
+        #[cfg(not(target_os = "android"))]
+        let capability = Dir::open_ambient_dir(root, ambient_authority()).map_err(|error| {
+            ProjectionStoreError::from(StoreError::Io(error))
+                .at("open private receipt store for claim precheck")
+        })?;
+        let metadata = match capability.symlink_metadata(STORE_CLAIM_FILE) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim"))
+            }
+        };
+        let Some(metadata) = metadata else {
+            // A claimless store root. The claim provably predates the
+            // activation authority marker, so on an authoritative store a
+            // populated claimless root is the in-place claimless-nonempty
+            // refusal, reached one step earlier. An empty or absent root is
+            // left to initialization exactly as today.
+            if capability
+                .entries()
+                .map_err(|error| {
+                    ProjectionStoreError::from(StoreError::Io(error))
+                        .at("enumerate private receipt store for claim precheck")
+                })?
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    ProjectionStoreError::from(StoreError::Io(error))
+                        .at("enumerate private receipt store for claim precheck")
+                })?
+                .is_some()
+            {
+                return Err(ProjectionStoreError::ClaimlessNonemptyStore);
+            }
+            return Ok(());
+        };
+        if !metadata.is_file() {
+            return Err(ProjectionStoreError::MalformedStoreClaim);
+        }
+        let mut bytes = vec![0_u8; STORE_CLAIM_LEN + 1];
+        let read = {
+            let mut file = capability.open(STORE_CLAIM_FILE).map_err(|error| {
+                ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim")
+            })?;
+            read_claim_prefix(&mut file, &mut bytes).map_err(|error| {
+                ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim")
+            })?
+        };
+        bytes.truncate(read);
+        classify_precheck_claim(&bytes)
+    }
+
     /// Open a receipt namespace durably enrolled to one endpoint and one exact
     /// graph-root filesystem resource.
     pub fn open_for_endpoint(
@@ -1075,65 +1483,6 @@ impl ProjectionReceiptStore {
         endpoint: ProjectionEndpointBinding,
     ) -> Result<Self, ProjectionStoreError> {
         Self::open_with_binding(root, workspace_id, Some(endpoint))
-    }
-
-    /// Open an enrolled receipt namespace without creating its root, claim, or
-    /// child namespaces.
-    ///
-    /// This is the runtime-host reopen boundary. The expected physical store
-    /// identity comes from the authenticated enrollment, so replacing a
-    /// missing store with a newly initialized directory cannot silently become
-    /// authority.
-    pub(crate) fn open_existing_for_endpoint(
-        root: &Path,
-        workspace_id: WorkspaceId,
-        endpoint: ProjectionEndpointBinding,
-        expected_store_id: ProjectionReceiptStoreId,
-    ) -> Result<Self, ProjectionStoreError> {
-        let name = root
-            .file_name()
-            .ok_or_else(|| ProjectionStoreError::UnsafeEntry("store root has no name".into()))?;
-        if !matches!(root.components().next_back(), Some(Component::Normal(_))) {
-            return Err(ProjectionStoreError::UnsafeEntry(
-                "store root must end in a normal path component".into(),
-            ));
-        }
-        let name = name.to_str().ok_or_else(|| {
-            ProjectionStoreError::UnsafeEntry("store root name is not UTF-8".into())
-        })?;
-        let parent = root.parent().ok_or_else(|| {
-            ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
-        })?;
-        let canonical_parent = std::fs::canonicalize(parent)?;
-        #[cfg(target_os = "android")]
-        let capability = open_android_private_directory(&canonical_parent.join(name))?;
-        #[cfg(not(target_os = "android"))]
-        let capability = {
-            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-            open_dir_nofollow(&parent_capability, name)?
-        };
-        let store_id = canonical_receipt_store_id(&capability)?;
-        if store_id != expected_store_id {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let bytes = read_optional_regular(&capability, STORE_CLAIM_FILE, 512, None)?
-            .ok_or(ProjectionStoreError::MalformedStoreClaim)?;
-        let expected = validate_claim(&bytes, store_id, workspace_id, Some(endpoint))?;
-        let namespaces = open_receipt_namespaces(&capability, store_id)?;
-        if namespaces.identities() != expected {
-            return Err(ProjectionStoreError::NamespaceSubstitution(
-                "top-level receipt namespace".into(),
-            ));
-        }
-        Ok(Self {
-            root_path: canonical_parent.join(name),
-            store_id,
-            workspace_id,
-            endpoint: Some(endpoint),
-            cleanup_session_id: Uuid::new_v4(),
-            capability,
-            namespaces,
-        })
     }
 
     fn open_with_binding(
@@ -1182,9 +1531,9 @@ impl ProjectionReceiptStore {
             store_id,
             workspace_id,
             endpoint,
-            cleanup_session_id: Uuid::new_v4(),
             capability,
             namespaces,
+            retired_own_endpoint_intents: RwLock::new(BTreeSet::new()),
         })
     }
 
@@ -1377,6 +1726,35 @@ impl ProjectionReceiptStore {
         Ok(Some(BaseBlob::from_parts(*description, bytes)?))
     }
 
+    /// Retrieve an exact content-addressed projection base retained for any
+    /// intent. Sweep restoration uses this only after an authenticated prior
+    /// Present intent names the same description; the blob is layout evidence,
+    /// never the semantic restore payload.
+    pub(crate) fn load_retained_base(
+        &self,
+        description: BlobDescription,
+    ) -> Result<Option<BaseBlob>, ProjectionStoreError> {
+        require_evidence_length(
+            "projection base",
+            description.byte_length(),
+            MAX_PROJECTION_EVIDENCE_BYTES,
+        )?;
+        let bases = self.namespace(BASES_DIR)?;
+        let bytes = read_optional_regular(
+            &bases,
+            &base_filename(description),
+            MAX_PROJECTION_EVIDENCE_BYTES,
+            Some(description.byte_length()),
+        )?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        if BlobDescription::of(&bytes) != description {
+            return Err(ProjectionStoreError::BaseEvidenceMismatch(description));
+        }
+        Ok(Some(BaseBlob::from_parts(description, bytes)?))
+    }
+
     /// Durably reserve the exact recovery filename Graph must use before any
     /// live page name can be retired or published.
     pub fn reserve_attempt(
@@ -1394,12 +1772,8 @@ impl ProjectionReceiptStore {
         intent: &ProjectionIntent,
         intent_id: ProjectionIntentId,
     ) -> Result<ProjectionAttemptReservation, ProjectionStoreError> {
-        self.reserve_deterministic_attempt_under_lease(
-            intent,
-            intent_id,
-            deterministic_mutation_uuid(b"tine/projection-attempt/v1\0", self.store_id, intent_id),
-            true,
-        )
+        let attempt_id = self.turn_attempt_id(intent_id)?;
+        self.reserve_deterministic_attempt_under_lease(intent, intent_id, attempt_id, true)
     }
 
     pub(crate) fn reserve_fallback_attempt(
@@ -1409,16 +1783,29 @@ impl ProjectionReceiptStore {
         let intent_id = self.require_published_intent(intent)?;
         let _lease = self.acquire_mutation_lease(intent_id)?;
         mutation_authority_leased_hook();
-        self.reserve_deterministic_attempt_under_lease(
-            intent,
-            intent_id,
-            deterministic_mutation_uuid(
-                b"tine/projection-fallback-attempt/v1\0",
+        let attempt_id = self.turn_attempt_id(intent_id)?;
+        self.reserve_deterministic_attempt_under_lease(intent, intent_id, attempt_id, true)
+    }
+
+    fn turn_attempt_id(&self, intent_id: ProjectionIntentId) -> Result<Uuid, ProjectionStoreError> {
+        if let Some(attempt_id) = PROJECTION_TURN_ATTEMPT.get() {
+            return Ok(attempt_id);
+        }
+        #[cfg(test)]
+        {
+            // Unit tests that exercise the receipt store below the turn
+            // executor retain their historical deterministic fixture seed.
+            return Ok(deterministic_mutation_uuid(
+                b"tine/projection-attempt/v1\0",
                 self.store_id,
                 intent_id,
-            ),
-            false,
-        )
+            ));
+        }
+        #[cfg(not(test))]
+        {
+            let _ = intent_id;
+            Err(ProjectionStoreError::MissingTurnAttemptContext)
+        }
     }
 
     fn reserve_deterministic_attempt_under_lease(
@@ -1775,6 +2162,15 @@ impl ProjectionReceiptStore {
     ) -> Result<Option<ProjectionCompletion>, ProjectionStoreError> {
         #[cfg(test)]
         count_completion_lookup();
+        let candidate_id = intent.id()?;
+        if self
+            .retired_own_endpoint_intents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&candidate_id)
+        {
+            return Ok(None);
+        }
         let intent_id = self.require_published_intent(intent)?;
         let completions = self.namespace(COMPLETIONS_DIR)?;
         let Some(bytes) = read_optional_regular(
@@ -1814,44 +2210,6 @@ impl ProjectionReceiptStore {
             ));
         }
         Ok(intent)
-    }
-
-    /// Load one completed receipt through an authenticated work-index row.
-    /// This performs direct immutable intent/completion reads only; it never
-    /// enumerates a receipt namespace.
-    pub(crate) fn load_completed_receipt(
-        &self,
-        completed: &ProjectionCompletedReceipt,
-    ) -> Result<(ProjectionIntent, ProjectionCompletion), ProjectionStoreError> {
-        crate::fast_commit::note_projection_receipt_load();
-        let intent =
-            self.load_intent_by_id(completed.intent_id())
-                .map_err(|error| match error {
-                    ProjectionStoreError::MissingIntent(_) => {
-                        ProjectionStoreError::MissingPriorCompletion
-                    }
-                    error => error,
-                })?;
-        let target_matches = match completed.target() {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(target) => intent.target() == target,
-        };
-        if intent.page_id() != completed.page_id()
-            || intent.path() != completed.path()
-            || intent.frontier() != completed.frontier()
-            || !target_matches
-        {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let completion = self
-            .load_completion(&intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        if completion.logical_completion_id() != completed.logical_completion_id() {
-            return Err(ProjectionStoreError::PathBindingMismatch(
-                "projection completed-work mapping",
-            ));
-        }
-        Ok((intent, completion))
     }
 
     pub fn local_forensic_evidence(
@@ -1897,6 +2255,7 @@ impl ProjectionReceiptStore {
     pub(crate) fn pending_projection_cleanup(
         &self,
     ) -> Result<Vec<(ProjectionIntent, LocalProjectionEvidenceRecord)>, ProjectionStoreError> {
+        let (_, _, retired_pending_prefixes) = self.retired_own_endpoint_names();
         let queue = open_pending_cleanup_rounds(
             &self.namespaces.pending_cleanup.capability,
             self.store_id,
@@ -1913,6 +2272,12 @@ impl ProjectionReceiptStore {
                         "non-UTF-8 pending projection cleanup entry".into(),
                     )
                 })?;
+                if retired_pending_prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                {
+                    continue;
+                }
                 if is_temp_name(name) {
                     continue;
                 }
@@ -1947,6 +2312,9 @@ impl ProjectionReceiptStore {
     /// new markers are appended to that same inactive round. The active round
     /// flips only after it is empty, so no retained prefix can be revisited
     /// until every marker that shared its round has received a bounded visit.
+    /// The flip is durable, so it is elided when BOTH rounds are empty: there
+    /// is then nothing to make reachable and the write would cost a barrier per
+    /// call on the ordinary save path, where the queue is empty.
     pub(crate) fn pending_projection_cleanup_bounded(
         &self,
         max_entries: usize,
@@ -1954,6 +2322,12 @@ impl ProjectionReceiptStore {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
+        let (_, _, retired_pending_prefixes) = self.retired_own_endpoint_names();
+        let is_retired_own_name = |name: &str| {
+            retired_pending_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        };
         let namespace = &self.namespaces.pending_cleanup.capability;
         let mut queue = open_pending_cleanup_rounds(
             namespace,
@@ -1962,9 +2336,28 @@ impl ProjectionReceiptStore {
         )?;
         let mut active = usize::from(queue.state.active_round);
         let mut entries = queue.rounds[active].entries()?;
-        let mut first = entries.next().transpose()?;
+        let mut first = next_non_retired_pending_entry(&mut entries, &retired_pending_prefixes)?;
         if first.is_none() {
             drop(entries);
+            // An empty active round normally means "flip, then drain whatever
+            // the other round retained". When the inactive round is empty too,
+            // the entire queue is empty: the flip has nothing to make
+            // reachable, yet it still writes the round state durably and
+            // barriers the namespace directory. That is the ordinary case —
+            // every accepted save enters this function twice with nothing
+            // queued — so peek the inactive round first. The peek reads a
+            // directory and writes nothing, and it uses the same entry
+            // semantics as the enumerator below: a round holding only
+            // removable temporary entries is NOT empty here, so it falls
+            // through to the flip and the existing temp-removal path rather
+            // than inventing a second cleanup route.
+            let mut inactive_entries = queue.rounds[1 - active].entries()?;
+            if next_non_retired_pending_entry(&mut inactive_entries, &retired_pending_prefixes)?
+                .is_none()
+            {
+                return Ok(Vec::new());
+            }
+            drop(inactive_entries);
             flip_pending_cleanup_round(namespace, &queue)?;
             queue = open_pending_cleanup_rounds(
                 namespace,
@@ -1973,7 +2366,7 @@ impl ProjectionReceiptStore {
             )?;
             active = usize::from(queue.state.active_round);
             entries = queue.rounds[active].entries()?;
-            first = entries.next().transpose()?;
+            first = next_non_retired_pending_entry(&mut entries, &retired_pending_prefixes)?;
         }
         let Some(first) = first else {
             return Ok(Vec::new());
@@ -1982,7 +2375,8 @@ impl ProjectionReceiptStore {
         let mut pending = Vec::new();
         let mut removed_temporary = false;
         let mut rotated = false;
-        for entry in std::iter::once(Ok(first)).chain(entries).take(max_entries) {
+        let mut visited_live_entries = 0;
+        for entry in std::iter::once(Ok(first)).chain(entries) {
             let entry = entry?;
             #[cfg(test)]
             count_pending_cleanup_entry();
@@ -1992,6 +2386,13 @@ impl ProjectionReceiptStore {
                     "non-UTF-8 pending projection cleanup entry".into(),
                 )
             })?;
+            if is_retired_own_name(name) {
+                continue;
+            }
+            if visited_live_entries == max_entries {
+                break;
+            }
+            visited_live_entries += 1;
             if is_temp_name(name) {
                 require_regular_entry(&entry.file_type()?, name)?;
                 queue.rounds[active].remove_file(name)?;
@@ -2038,87 +2439,6 @@ impl ProjectionReceiptStore {
         Ok(pending)
     }
 
-    /// Persist one exact unchanged-quarantine observation. Retirement is
-    /// authorized only after a different store-open session observes the same
-    /// marker at least one grace interval later. A backward wall-clock step
-    /// starts settlement over from the current session and time.
-    pub(crate) fn projection_cleanup_grace_elapsed(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<Option<ProjectionCleanupRetirementAuthority>, ProjectionStoreError> {
-        if !record.is_cleanup_bound() {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let name = pending_cleanup_filename(record);
-        let (round, current_bytes) = read_pending_cleanup_marker(
-            &self.namespaces.pending_cleanup.capability,
-            self.store_id,
-            self.namespaces.pending_cleanup.identity,
-            &name,
-        )?;
-        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
-        if marker.evidence != *record {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let now = projection_cleanup_unix_seconds()?;
-        let evidence_digest = local_forensic_record_digest(record)?;
-        let restart_and_grace = marker.observation.as_ref().is_some_and(|observation| {
-            observation.evidence_digest == evidence_digest
-                && observation.session_id != self.cleanup_session_id
-                && now >= observation.observed_unix_seconds
-                && now - observation.observed_unix_seconds >= PROJECTION_RECOVERY_GRACE_SECONDS
-        });
-        if restart_and_grace {
-            return Ok(Some(ProjectionCleanupRetirementAuthority {
-                evidence_digest,
-            }));
-        }
-
-        let must_reset = marker.observation.as_ref().is_none_or(|observation| {
-            observation.evidence_digest != evidence_digest
-                || now < observation.observed_unix_seconds
-        });
-        if must_reset {
-            marker.observation = Some(PendingProjectionCleanupObservation {
-                schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
-                evidence_digest,
-                session_id: self.cleanup_session_id,
-                observed_unix_seconds: now,
-            });
-            let replacement = encode_pending_cleanup_marker(&marker)?;
-            replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)?;
-        }
-        Ok(None)
-    }
-
-    pub(crate) fn reset_projection_cleanup_grace(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<(), ProjectionStoreError> {
-        if !record.is_cleanup_bound() {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let name = pending_cleanup_filename(record);
-        let (round, current_bytes) = read_pending_cleanup_marker(
-            &self.namespaces.pending_cleanup.capability,
-            self.store_id,
-            self.namespaces.pending_cleanup.identity,
-            &name,
-        )?;
-        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
-        if marker.evidence != *record {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        marker.observation = Some(PendingProjectionCleanupObservation {
-            schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
-            evidence_digest: local_forensic_record_digest(record)?,
-            session_id: self.cleanup_session_id,
-            observed_unix_seconds: projection_cleanup_unix_seconds()?,
-        });
-        let replacement = encode_pending_cleanup_marker(&marker)?;
-        replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)
-    }
-
     pub(crate) fn retire_pending_projection_cleanup(
         &self,
         record: &LocalProjectionEvidenceRecord,
@@ -2161,6 +2481,7 @@ impl ProjectionReceiptStore {
     pub(crate) fn validated_catalog(
         &self,
     ) -> Result<Vec<ProjectionCatalogEntry>, ProjectionStoreError> {
+        let (retired_intent_names, retired_completion_names, _) = self.retired_own_endpoint_names();
         let intents_dir = self.namespace(INTENTS_DIR)?;
         let mut intents = BTreeMap::new();
         let mut validated_bases = std::collections::BTreeSet::new();
@@ -2178,6 +2499,9 @@ impl ProjectionReceiptStore {
             let name = name.to_str().ok_or_else(|| {
                 ProjectionStoreError::UnsafeEntry("non-UTF-8 projection intent entry".into())
             })?;
+            if retired_intent_names.contains(name) {
+                continue;
+            }
             require_regular_entry(&entry.file_type()?, name)?;
             if is_temp_name(name) {
                 continue;
@@ -2247,6 +2571,9 @@ impl ProjectionReceiptStore {
             let name = name.to_str().ok_or_else(|| {
                 ProjectionStoreError::UnsafeEntry("non-UTF-8 projection completion entry".into())
             })?;
+            if retired_completion_names.contains(name) {
+                continue;
+            }
             require_regular_entry(&entry.file_type()?, name)?;
             if is_temp_name(name) {
                 continue;
@@ -2300,6 +2627,149 @@ impl ProjectionReceiptStore {
             .collect())
     }
 
+    /// Names-only completion snapshot for the disposable absence summary.
+    /// Retired own-endpoint residue is excluded exactly as it is from the full
+    /// validated catalog. No receipt content is opened on this path.
+    pub(crate) fn absence_summary_evidence_names(
+        &self,
+    ) -> Result<BTreeSet<String>, ProjectionStoreError> {
+        let (retired_intent_names, retired_completion_names, _) = self.retired_own_endpoint_names();
+        let mut names = BTreeSet::new();
+        for (namespace, suffix, kind, retired) in [
+            (
+                COMPLETIONS_DIR,
+                ".completion",
+                "projection completion rows",
+                &retired_completion_names,
+            ),
+            (
+                INTENTS_DIR,
+                ".intent",
+                "projection intent rows",
+                &retired_intent_names,
+            ),
+        ] {
+            let directory = self.namespace(namespace)?;
+            let mut directory_entries = 0_usize;
+            let mut namespace_rows = 0_usize;
+            for entry in directory.entries()? {
+                charge_catalog_directory_entry(
+                    &mut directory_entries,
+                    MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES,
+                )?;
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    ProjectionStoreError::UnsafeEntry("non-UTF-8 projection evidence entry".into())
+                })?;
+                if retired.contains(name) {
+                    continue;
+                }
+                require_regular_entry(&entry.file_type()?, name)?;
+                if is_temp_name(name) {
+                    continue;
+                }
+                if namespace_rows == MAX_PROJECTION_CATALOG_ROWS {
+                    return Err(ProjectionStoreError::EvidenceTooLarge {
+                        kind,
+                        declared: namespace_rows.saturating_add(1) as u64,
+                        limit: MAX_PROJECTION_CATALOG_ROWS as u64,
+                    });
+                }
+                require_canonical_evidence_name(name, suffix)?;
+                namespace_rows += 1;
+                if !names.insert(name.to_owned()) {
+                    return Err(ProjectionStoreError::MalformedEvidenceName(name.into()));
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Read exactly the newly published receiver intents (no completion yet)
+    /// not represented by a current summary.
+    pub(crate) fn absence_summary_intent_delta(
+        &self,
+        newly_intended_names: &BTreeSet<String>,
+    ) -> Result<Vec<ProjectionIntent>, ProjectionStoreError> {
+        let intents_dir = self.namespace(INTENTS_DIR)?;
+        let mut intents = Vec::new();
+        for intent_name in newly_intended_names {
+            require_canonical_evidence_name(intent_name, ".intent")?;
+            let bytes = read_optional_regular(
+                &intents_dir,
+                intent_name,
+                MAX_PROJECTION_EVIDENCE_BYTES,
+                None,
+            )?
+            .ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection intent disappeared after names snapshot: {intent_name}"
+                ))
+            })?;
+            let intent = ProjectionIntent::decode(&bytes)?;
+            self.require_workspace(&intent)?;
+            if intent.encode()? != bytes || intent_filename(intent.id()?) != *intent_name {
+                return Err(ProjectionStoreError::PathBindingMismatch(
+                    "projection intent",
+                ));
+            }
+            intents.push(intent);
+        }
+        Ok(intents)
+    }
+
+    /// Read exactly the newly completed receiver rows not represented by a
+    /// current summary. The matching intent filename is derived directly from
+    /// each completion name; no lifetime intent-directory walk occurs.
+    pub(crate) fn absence_summary_catalog_delta(
+        &self,
+        newly_completed_names: &BTreeSet<String>,
+    ) -> Result<Vec<ProjectionCatalogEntry>, ProjectionStoreError> {
+        let intents_dir = self.namespace(INTENTS_DIR)?;
+        let mut rows = Vec::new();
+        for completion_name in newly_completed_names {
+            require_canonical_evidence_name(completion_name, ".completion")?;
+            let intent_name = format!(
+                "{}.intent",
+                completion_name
+                    .strip_suffix(".completion")
+                    .expect("suffix was checked")
+            );
+            let bytes = read_optional_regular(
+                &intents_dir,
+                &intent_name,
+                MAX_PROJECTION_EVIDENCE_BYTES,
+                None,
+            )?
+            .ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection completion has no matching intent: {completion_name}"
+                ))
+            })?;
+            let intent = ProjectionIntent::decode(&bytes)?;
+            self.require_workspace(&intent)?;
+            if intent.encode()? != bytes
+                || intent_filename(intent.id()?) != intent_name
+                || completion_filename(intent.id()?) != *completion_name
+            {
+                return Err(ProjectionStoreError::PathBindingMismatch(
+                    "projection intent",
+                ));
+            }
+            let completion = self.load_completion(&intent)?.ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection completion disappeared after names snapshot: {completion_name}"
+                ))
+            })?;
+            rows.push(ProjectionCatalogEntry {
+                intent,
+                completion: Some(completion),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Reconstruct completion only from an authorized replay and Graph's fresh
     /// capability-bound durable-target proof.
     pub(crate) fn reconstruct_completion(
@@ -2327,7 +2797,11 @@ impl ProjectionReceiptStore {
             .map_err(|error| error.at("read private receipt store claim"))?;
         if let Some(bytes) = existing {
             let expected = validate_claim(&bytes, store_id, workspace_id, endpoint)?;
-            let namespaces = open_receipt_namespaces(capability, store_id)?;
+            let namespaces = open_receipt_namespaces(
+                capability,
+                store_id,
+                ReceiptDirectoryDurability::PromotedAuthority,
+            )?;
             if namespaces.identities() != expected {
                 return Err(ProjectionStoreError::NamespaceSubstitution(
                     "top-level receipt namespace".into(),
@@ -2350,7 +2824,7 @@ impl ProjectionReceiptStore {
                 if capability.entries()?.next().transpose()?.is_some() {
                     return Err(ProjectionStoreError::ClaimlessNonemptyStore);
                 }
-                publish_immutable_exact(
+                publish_bootstrap_immutable_exact(
                     capability,
                     STORE_INIT_FILE,
                     &expected_init,
@@ -2368,15 +2842,19 @@ impl ProjectionReceiptStore {
             ATTEMPTS_DIR,
             FORENSICS_DIR,
         ] {
-            ensure_directory_nofollow(capability, namespace).map_err(|error| {
+            ensure_bootstrap_directory_nofollow(capability, namespace).map_err(|error| {
                 error.at(format!("create private receipt namespace {namespace}"))
             })?;
         }
         require_incomplete_store_is_empty(capability)?;
-        let namespaces = open_receipt_namespaces(capability, store_id)
-            .map_err(|error| error.at("open private receipt namespaces"))?;
+        let namespaces = open_receipt_namespaces(
+            capability,
+            store_id,
+            ReceiptDirectoryDurability::PrePromotionBootstrap,
+        )
+        .map_err(|error| error.at("open private receipt namespaces"))?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
-        publish_immutable_exact(
+        publish_bootstrap_immutable_exact(
             capability,
             STORE_CLAIM_FILE,
             &claim,
@@ -2400,6 +2878,36 @@ impl ProjectionReceiptStore {
         retained.capability.try_clone().map_err(Into::into)
     }
 
+    /// Open this intent's private recovery namespace, creating it if it is
+    /// absent.
+    ///
+    /// **Refusal census 2026-08-26 (P-census).** This used to bind the
+    /// directory with two immutable artifacts per namespace — a reservation
+    /// published before `mkdir` and an authority published after it, recording
+    /// the directory's device/inode identity — and to refuse
+    /// `NamespaceSubstitution` whenever either was absent, non-canonical, or
+    /// disagreed with the live directory. Four artifacts, eight durability
+    /// barriers, per projected page.
+    ///
+    /// The only failure those refusals detected is an actor who can rename or
+    /// replace a directory *inside Tine's app-private receipt store*. That
+    /// actor already has write access as the user and could replace the Tine
+    /// binary, which
+    /// `specs/notes/2026-08-07-trust-model-and-threat-model-decision.md` puts
+    /// explicitly out of scope. No in-scope failure — crash or power loss,
+    /// torn write, disk error, Syncthing/Dropbox delivery, external-editor
+    /// race, honest concurrent instance, honest multi-device divergence,
+    /// malformed imported content — is detected by them: the receipt store is
+    /// app-private, is never synced, is single-writer under the workspace
+    /// runtime lease, and a crash cannot rename a directory. What the refusals
+    /// *did* add was a wedge: a torn 1 KB JSON binding, or a namespace whose
+    /// binding artifact was lost, refused the page's projection permanently.
+    ///
+    /// Per the refusal-scenario rule, the check is therefore gone and absence
+    /// is a **recovery**: recreate the directory and continue. Recreating it is
+    /// safe because everything inside is content- or intent-addressed and is
+    /// republished byte-identically by the drain, which still holds the
+    /// undrained journal frame for the accepted edit.
     fn intent_namespace(
         &self,
         namespace: &str,
@@ -2414,26 +2922,15 @@ impl ProjectionReceiptStore {
             })
     }
 
-    fn existing_intent_namespace(
-        &self,
-        namespace: &str,
-        intent_id: ProjectionIntentId,
-    ) -> Result<Option<Dir>, ProjectionStoreError> {
-        self.open_intent_namespace(namespace, intent_id, false)
-    }
-
+    /// The recovery form of [`Self::intent_namespace`]: a namespace that an
+    /// earlier published intent implies must exist is recreated when it is
+    /// missing instead of refusing the projection forever.
     fn required_intent_namespace(
         &self,
         namespace: &str,
         intent_id: ProjectionIntentId,
     ) -> Result<Dir, ProjectionStoreError> {
-        self.existing_intent_namespace(namespace, intent_id)?
-            .ok_or_else(|| {
-                ProjectionStoreError::NamespaceSubstitution(format!(
-                    "missing established {namespace}/{}",
-                    hex(intent_id.as_bytes())
-                ))
-            })
+        self.intent_namespace(namespace, intent_id)
     }
 
     fn open_intent_namespace(
@@ -2444,109 +2941,37 @@ impl ProjectionReceiptStore {
     ) -> Result<Option<Dir>, ProjectionStoreError> {
         let parent = self.namespace(namespace)?;
         let name = hex(intent_id.as_bytes());
-        let reservation_name = format!("{name}{INTENT_NAMESPACE_RESERVATION_SUFFIX}");
-        let authority_name = format!("{name}{INTENT_NAMESPACE_AUTHORITY_SUFFIX}");
-        let expected_reservation = IntentNamespaceReservation {
-            schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
-            store_id: self.store_id,
-            namespace: namespace.to_owned(),
-            intent_id,
-        };
-        let reservation_bytes = serde_json::to_vec(&expected_reservation)
-            .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
-
-        if let Some(bytes) = read_optional_regular(&parent, &authority_name, 1024, None)? {
-            let authority: IntentNamespaceAuthority = serde_json::from_slice(&bytes)
-                .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
-            if serde_json::to_vec(&authority)
-                .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?
-                != bytes
-                || authority.schema_version != INTENT_NAMESPACE_SCHEMA_VERSION
-                || authority.store_id != self.store_id
-                || authority.namespace != namespace
-                || authority.intent_id != intent_id
-            {
-                return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                    "{namespace}/{name}"
+        match parent.symlink_metadata(&name) {
+            // A non-directory (or a symlink) at a per-intent namespace name is
+            // still refused: `open_dir_nofollow` would refuse it anyway, and
+            // this names the artifact instead of returning a bare ENOTDIR.
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ProjectionStoreError::UnsafeEntry(format!(
+                    "private receipt namespace {namespace}/{name} is not a directory"
                 )));
             }
-            let directory = open_dir_nofollow(&parent, &name).map_err(|error| {
-                ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
-            })?;
-            if canonical_directory_identity(&directory)? != authority.directory_identity {
-                return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                    "{namespace}/{name}"
-                )));
+            Ok(_) => {
+                // On Android a prior strict mkdir barrier can refuse after the
+                // directory entry became visible, then the process can die
+                // before recording that refusal. The first create/recovery use
+                // of this parent in every process therefore establishes one
+                // strict barrier before accepting an existing name. Read-only
+                // inspection does not mutate and pays no barrier. See
+                // storage-sync-contract.md §2.10c.
+                #[cfg(target_os = "android")]
+                if create {
+                    verify_promoted_receipt_parent(&parent)?;
+                }
+                return Ok(Some(open_dir_nofollow(&parent, &name)?));
             }
-            return Ok(Some(directory));
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-
-        match read_optional_regular(&parent, &reservation_name, 1024, None)? {
-            Some(bytes) => {
-                if bytes != reservation_bytes {
-                    return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                        "{namespace}/{name}"
-                    )));
-                }
-                if !create {
-                    return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                        "incomplete established {namespace}/{name}"
-                    )));
-                }
-            }
-            None => {
-                match parent.symlink_metadata(&name) {
-                    Ok(_) => {
-                        return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                            "unbound {namespace}/{name}"
-                        )));
-                    }
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                if !create {
-                    return Ok(None);
-                }
-                publish_immutable_exact(
-                    &parent,
-                    &reservation_name,
-                    &reservation_bytes,
-                    "per-intent namespace reservation",
-                )?;
-            }
+        if !create {
+            return Ok(None);
         }
-
         ensure_directory_nofollow(&parent, &name)?;
-        let directory = open_dir_nofollow(&parent, &name)?;
-        if directory.entries()?.next().transpose()?.is_some() {
-            return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                "unbound nonempty {namespace}/{name}"
-            )));
-        }
-        let authority = IntentNamespaceAuthority {
-            schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
-            store_id: self.store_id,
-            namespace: namespace.to_owned(),
-            intent_id,
-            directory_identity: canonical_directory_identity(&directory)?,
-        };
-        let authority_bytes = serde_json::to_vec(&authority)
-            .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
-        publish_immutable_exact(
-            &parent,
-            &authority_name,
-            &authority_bytes,
-            "per-intent namespace authority",
-        )?;
-        let live = open_dir_nofollow(&parent, &name).map_err(|error| {
-            ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
-        })?;
-        if canonical_directory_identity(&live)? != authority.directory_identity {
-            return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                "{namespace}/{name}"
-            )));
-        }
-        Ok(Some(directory))
+        Ok(Some(open_dir_nofollow(&parent, &name)?))
     }
 
     fn validate_forensic_record(
@@ -2621,6 +3046,110 @@ impl ProjectionReceiptStore {
             return Err(ProjectionStoreError::EndpointBindingMismatch);
         }
         Ok(())
+    }
+
+    /// Best-effort names-only reporting for pre-2c own-endpoint receipt
+    /// residue. The supplied ids come exclusively from the own turn/journal
+    /// and local-completion authorities. This method never decodes a receipt,
+    /// never treats one as recovery evidence, and never deletes or rewrites an
+    /// artifact; receiver rows outside the supplied set remain untouched.
+    pub(crate) fn retired_own_endpoint_artifacts(
+        &self,
+        own_intent_ids: &BTreeSet<ProjectionIntentId>,
+    ) -> Vec<String> {
+        self.retired_own_endpoint_intents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(own_intent_ids.iter().copied());
+        let mut reported = BTreeSet::new();
+        let own_prefixes = own_intent_ids
+            .iter()
+            .map(|intent_id| format!("{}.", hex(intent_id.as_bytes())))
+            .collect::<Vec<_>>();
+        for intent_id in own_intent_ids {
+            let intent_name = intent_filename(*intent_id);
+            if self
+                .namespaces
+                .intents
+                .capability
+                .symlink_metadata(&intent_name)
+                .is_ok()
+            {
+                reported.insert(format!("{INTENTS_DIR}/{intent_name}"));
+            }
+            let completion_name = completion_filename(*intent_id);
+            if self
+                .namespaces
+                .completions
+                .capability
+                .symlink_metadata(&completion_name)
+                .is_ok()
+            {
+                reported.insert(format!("{COMPLETIONS_DIR}/{completion_name}"));
+            }
+            let intent_directory = hex(intent_id.as_bytes());
+            for (namespace, directory) in [
+                (ATTEMPTS_DIR, &self.namespaces.attempts.capability),
+                (FORENSICS_DIR, &self.namespaces.forensics.capability),
+            ] {
+                if directory.symlink_metadata(&intent_directory).is_ok() {
+                    reported.insert(format!("{namespace}/{intent_directory}/"));
+                }
+            }
+            for name in [
+                mutation_authority_filename(*intent_id),
+                mutation_authority_lease_filename(*intent_id),
+            ] {
+                if self.capability.symlink_metadata(&name).is_ok() {
+                    reported.insert(name);
+                }
+            }
+        }
+        // Pending-cleanup marker names begin with the exact intent id. Report
+        // matching names without decoding the marker or opening any evidence
+        // path: residue is diagnostic, never own-endpoint recovery authority.
+        for round_name in PENDING_CLEANUP_ROUND_DIRS {
+            let Ok(round) =
+                open_dir_nofollow(&self.namespaces.pending_cleanup.capability, round_name)
+            else {
+                continue;
+            };
+            let Ok(entries) = round.entries() else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if own_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                    reported.insert(format!(
+                        "{FORENSICS_DIR}/{PENDING_CLEANUP_DIR}/{round_name}/{name}"
+                    ));
+                }
+            }
+        }
+        reported.into_iter().collect()
+    }
+
+    fn retired_own_endpoint_names(&self) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+        let intent_ids = self
+            .retired_own_endpoint_intents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let intents = intent_ids
+            .iter()
+            .map(|intent_id| intent_filename(*intent_id))
+            .collect();
+        let completions = intent_ids
+            .iter()
+            .map(|intent_id| completion_filename(*intent_id))
+            .collect();
+        let pending_prefixes = intent_ids
+            .iter()
+            .map(|intent_id| format!("{}.", hex(intent_id.as_bytes())))
+            .collect();
+        (intents, completions, pending_prefixes)
     }
 
     fn require_write_proof(
@@ -3090,6 +3619,60 @@ impl ProjectionMutationAuthority {
     }
 }
 
+impl ProjectionMutationEvidence for ProjectionMutationAuthority {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        ProjectionMutationAuthority::consume_write_evidence(
+            self,
+            relative_path,
+            |reservation, attempts, publisher| operation(reservation, attempts, Some(publisher)),
+        )
+    }
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        ProjectionMutationAuthority::consume_recovery_evidence(self, relative_path, operation)
+    }
+}
+
+impl ProjectionMutationEvidence for ProjectionTurnMutationAuthority {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.consume_graph_operation(relative_path)?;
+        operation(
+            &self.reservation,
+            std::slice::from_ref(&self.reservation),
+            None,
+        )
+    }
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.consume_graph_operation(relative_path)?;
+        operation(std::slice::from_ref(&self.reservation))
+    }
+}
+
 impl Drop for ProjectionMutationAuthority {
     fn drop(&mut self) {
         mutation_authority_drop_hook();
@@ -3101,35 +3684,25 @@ impl Drop for ProjectionMutationAuthority {
     }
 }
 
+/// Re-check that a per-intent recovery namespace still is the exact directory
+/// this in-flight mutation authority was sealed against.
+///
+/// **Refusal census 2026-08-26 (P-census).** The artifact half of this check —
+/// reading the per-intent `*.namespace-authority` binding — is gone with the
+/// artifact; see [`ProjectionReceiptStore::intent_namespace`]. What remains is
+/// the live device/inode comparison against the identity the durable authority
+/// already recorded, which costs no durability barrier and needs no artifact.
+/// It is retained rather than deleted because it is free, and because a
+/// mismatch is not reachable from any in-scope failure: a crash cannot rename a
+/// directory, and the authority is created and consumed inside one drain turn.
 fn validate_live_intent_namespace(
     parent: &Dir,
     namespace: &str,
-    store_id: ProjectionReceiptStoreId,
+    _store_id: ProjectionReceiptStoreId,
     intent_id: ProjectionIntentId,
     expected_identity: DirectoryIdentity,
 ) -> Result<(), ProjectionStoreError> {
     let name = hex(intent_id.as_bytes());
-    let authority_name = format!("{name}{INTENT_NAMESPACE_AUTHORITY_SUFFIX}");
-    let bytes = read_optional_regular(parent, &authority_name, 1024, None)?.ok_or_else(|| {
-        ProjectionStoreError::NamespaceSubstitution(format!(
-            "missing established {namespace}/{name} authority"
-        ))
-    })?;
-    let authority: IntentNamespaceAuthority = serde_json::from_slice(&bytes)
-        .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
-    if serde_json::to_vec(&authority)
-        .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?
-        != bytes
-        || authority.schema_version != INTENT_NAMESPACE_SCHEMA_VERSION
-        || authority.store_id != store_id
-        || authority.namespace != namespace
-        || authority.intent_id != intent_id
-        || authority.directory_identity != expected_identity
-    {
-        return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-            "{namespace}/{name}"
-        )));
-    }
     let live = open_dir_nofollow(parent, &name).map_err(|error| {
         ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
     })?;
@@ -3184,6 +3757,7 @@ pub enum ProjectionStoreError {
     WriteProofMismatch,
     RecoveryTargetMismatch,
     AttemptBindingMismatch,
+    MissingTurnAttemptContext,
     MutationAuthorityMismatch,
     MutationAuthorityPending,
     MutationAuthorityTooLarge {
@@ -3207,9 +3781,15 @@ impl fmt::Display for ProjectionStoreError {
             Self::UnknownStoreVersion(version) => {
                 write!(f, "unknown projection store version {version}")
             }
+            // This typed refusal is consumed by the outer pre-0.7 blank-slate
+            // lifecycle. The low-level store never migrates or mutates bytes;
+            // Tauri archives the private root and rebuilds automatically.
             Self::UpgradeRequired { found, current } => write!(
                 f,
-                "projection receipt store version {found} requires upgrade to {current}"
+                "projection receipt store version {found} requires upgrade to {current}: \
+                 this pre-0.7 private state must be backed up and rebuilt from the intact \
+                 Markdown/Org tree by the graph-open lifecycle [{}]",
+                crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
             ),
             Self::MalformedStoreClaim => f.write_str("malformed projection store claim"),
             Self::ClaimlessNonemptyStore => {
@@ -3279,6 +3859,9 @@ impl fmt::Display for ProjectionStoreError {
             }
             Self::AttemptBindingMismatch => {
                 f.write_str("local projection attempt is not canonically bound to its intent")
+            }
+            Self::MissingTurnAttemptContext => {
+                f.write_str("managed projection mutation has no turn-derived attempt identity")
             }
             Self::MutationAuthorityMismatch => {
                 f.write_str("projection mutation authority does not match the durable operation")
@@ -3433,6 +4016,93 @@ mod catalog_limit_tests {
     }
 }
 
+/// The current claim magic as the contract spells it (an escaped trailing NUL).
+#[cfg(test)]
+pub(crate) fn store_claim_magic_display() -> String {
+    display_claim_magic(STORE_CLAIM_MAGIC)
+}
+
+#[cfg(test)]
+pub(crate) const fn store_claim_version() -> u32 {
+    STORE_CLAIM_VERSION
+}
+
+#[cfg(test)]
+pub(crate) fn prior_store_claim_magics_display() -> Vec<String> {
+    PRIOR_STORE_CLAIM_MAGICS
+        .iter()
+        .map(|magic| display_claim_magic(magic))
+        .collect()
+}
+
+#[cfg(test)]
+fn display_claim_magic(magic: &[u8; 8]) -> String {
+    let text = std::str::from_utf8(&magic[..7]).expect("claim magic is ASCII");
+    assert_eq!(magic[7], 0, "a claim magic ends in one NUL byte");
+    format!("{text}\\0")
+}
+
+fn read_claim_prefix(file: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// The precheck's decision, split out so it can be exercised on bytes alone.
+///
+/// It deliberately answers only the questions that can be answered without the
+/// store id, workspace or endpoint: magic family, version, and the exact
+/// version-specific envelope length. Everything else stays with `validate_claim`
+/// at the in-place boundary.
+fn classify_precheck_claim(bytes: &[u8]) -> Result<(), ProjectionStoreError> {
+    for magic in PRIOR_STORE_CLAIM_MAGICS {
+        if bytes.len() >= magic.len() + 4 && &bytes[..magic.len()] == magic {
+            let version = u32::from_be_bytes(
+                bytes[magic.len()..magic.len() + 4]
+                    .try_into()
+                    .expect("prior claim version slice"),
+            );
+            return Err(ProjectionStoreError::UpgradeRequired {
+                found: version,
+                current: STORE_CLAIM_VERSION,
+            });
+        }
+    }
+    if bytes.len() < STORE_CLAIM_MAGIC.len() + 4
+        || &bytes[..STORE_CLAIM_MAGIC.len()] != STORE_CLAIM_MAGIC
+    {
+        return Err(ProjectionStoreError::MalformedStoreClaim);
+    }
+    let version = u32::from_be_bytes(
+        bytes[STORE_CLAIM_MAGIC.len()..STORE_CLAIM_MAGIC.len() + 4]
+            .try_into()
+            .expect("claim version slice"),
+    );
+    if version < STORE_CLAIM_VERSION {
+        return Err(ProjectionStoreError::UpgradeRequired {
+            found: version,
+            current: STORE_CLAIM_VERSION,
+        });
+    }
+    if version > STORE_CLAIM_VERSION {
+        return Err(ProjectionStoreError::UnknownStoreVersion(version));
+    }
+    // R21-C1: a current-magic header on a truncated -- or over-long -- body
+    // must not pass. Without this, graph publication recovery runs before the
+    // in-place length check ever fires.
+    if bytes.len() != STORE_CLAIM_LEN {
+        return Err(ProjectionStoreError::MalformedStoreClaim);
+    }
+    Ok(())
+}
+
 fn validate_claim(
     bytes: &[u8],
     expected_store_id: ProjectionReceiptStoreId,
@@ -3510,9 +4180,11 @@ fn validate_claim(
 fn open_receipt_namespaces(
     capability: &Dir,
     store_id: ProjectionReceiptStoreId,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<ReceiptNamespaces, ProjectionStoreError> {
     let forensics = open_bound_namespace(capability, FORENSICS_DIR)?;
-    let pending_cleanup = open_pending_cleanup_namespace(&forensics.capability, store_id)?;
+    let pending_cleanup =
+        open_pending_cleanup_namespace(&forensics.capability, store_id, durability)?;
     Ok(ReceiptNamespaces {
         bases: open_bound_namespace(capability, BASES_DIR)?,
         intents: open_bound_namespace(capability, INTENTS_DIR)?,
@@ -3526,14 +4198,22 @@ fn open_receipt_namespaces(
 fn open_pending_cleanup_namespace(
     forensics: &Dir,
     store_id: ProjectionReceiptStoreId,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<BoundNamespace, ProjectionStoreError> {
     let existing = read_optional_regular(forensics, PENDING_CLEANUP_AUTHORITY, 1024, None)?;
     let initializing = existing.is_none();
     if initializing {
         match open_dir_nofollow(forensics, PENDING_CLEANUP_DIR) {
+            // If a prior create made the name visible before its barrier
+            // refused, the authority publication below synchronizes this same
+            // parent before initialization can succeed.
             Ok(_) => {}
             Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                ensure_directory_nofollow(forensics, PENDING_CLEANUP_DIR)?;
+                ensure_directory_nofollow_with_durability(
+                    forensics,
+                    PENDING_CLEANUP_DIR,
+                    durability,
+                )?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -3541,7 +4221,7 @@ fn open_pending_cleanup_namespace(
     let directory = open_dir_nofollow(forensics, PENDING_CLEANUP_DIR)?;
     let identity = canonical_directory_identity(&directory)?;
     let authority = PendingCleanupNamespaceAuthority {
-        schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
+        schema_version: PENDING_CLEANUP_NAMESPACE_SCHEMA_VERSION,
         store_id,
         directory_identity: identity,
     };
@@ -3556,13 +4236,14 @@ fn open_pending_cleanup_namespace(
         Some(_) => {}
         None => {}
     }
-    initialize_pending_cleanup_rounds(&directory, store_id, identity, initializing)?;
+    initialize_pending_cleanup_rounds(&directory, store_id, identity, initializing, durability)?;
     if initializing {
-        publish_immutable_exact(
+        publish_immutable_exact_with_durability(
             forensics,
             PENDING_CLEANUP_AUTHORITY,
             &expected,
             "pending projection cleanup namespace authority",
+            durability,
         )?;
     }
     Ok(BoundNamespace {
@@ -3576,6 +4257,7 @@ fn initialize_pending_cleanup_rounds(
     store_id: ProjectionReceiptStoreId,
     namespace_identity: DirectoryIdentity,
     allow_initialization: bool,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<(), ProjectionStoreError> {
     let existing = read_optional_mutation_authority_bounded(
         namespace,
@@ -3592,9 +4274,11 @@ fn initialize_pending_cleanup_rounds(
         validate_pending_cleanup_round_root(namespace, false)?;
         for name in PENDING_CLEANUP_ROUND_DIRS {
             match open_dir_nofollow(namespace, name) {
+                // The round-state publication below synchronizes this same
+                // parent, including any existing name left by a refused create.
                 Ok(_) => {}
                 Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                    ensure_directory_nofollow(namespace, name)?;
+                    ensure_directory_nofollow_with_durability(namespace, name, durability)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -3614,11 +4298,12 @@ fn initialize_pending_cleanup_rounds(
             active_round: 0,
         };
         let bytes = encode_pending_cleanup_round_state(&state)?;
-        publish_immutable_exact(
+        publish_immutable_exact_with_durability(
             namespace,
             PENDING_CLEANUP_ROUND_STATE,
             &bytes,
             "pending projection cleanup round state",
+            durability,
         )?;
     }
     let _ = open_pending_cleanup_rounds(namespace, store_id, namespace_identity)?;
@@ -4030,15 +4715,6 @@ fn remove_mutation_authority_if_exact(
     Ok(())
 }
 
-fn replace_mutation_authority_if_exact(
-    directory: &Dir,
-    name: &str,
-    expected: &[u8],
-    replacement: &[u8],
-) -> Result<(), ProjectionStoreError> {
-    replace_mutation_authority_if_exact_inner(directory, name, expected, replacement, true)
-}
-
 fn replace_mutation_authority_if_exact_inner(
     directory: &Dir,
     name: &str,
@@ -4059,7 +4735,7 @@ fn replace_mutation_authority_if_exact_inner(
     let mut temp = directory.open_with(&temp_name, &options)?;
     let result = (|| {
         temp.write_all(replacement)?;
-        temp.sync_all()?;
+        crate::durability_counters::sync_file(&temp)?;
         drop(temp);
         #[cfg(test)]
         if inject_cleanup_marker_failures {
@@ -4186,6 +4862,26 @@ fn pending_cleanup_filename(record: &LocalProjectionEvidenceRecord) -> String {
         record.attempt_id().simple(),
         PENDING_CLEANUP_SUFFIX
     )
+}
+
+fn next_non_retired_pending_entry(
+    entries: &mut cap_std::fs::ReadDir,
+    retired_prefixes: &[String],
+) -> Result<Option<cap_std::fs::DirEntry>, ProjectionStoreError> {
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            ProjectionStoreError::UnsafeEntry("non-UTF-8 pending projection cleanup entry".into())
+        })?;
+        if !retired_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
 }
 
 fn encode_pending_cleanup_round_state(
@@ -4380,22 +5076,6 @@ fn decode_pending_cleanup_marker(
     Ok(marker)
 }
 
-fn projection_cleanup_unix_seconds() -> Result<u64, ProjectionStoreError> {
-    #[cfg(test)]
-    if let Some(seconds) = PROJECTION_CLEANUP_TIME.with(std::cell::Cell::get) {
-        return Ok(seconds);
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|_| {
-            ProjectionStoreError::Io(io::Error::new(
-                ErrorKind::InvalidData,
-                "system clock is before the Unix epoch",
-            ))
-        })
-}
-
 fn valid_local_forensic_version(record: &LocalProjectionEvidenceRecord) -> bool {
     match record.schema_version {
         PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION => record.recovery_resource_id.is_none(),
@@ -4485,17 +5165,96 @@ fn endpoint_binding_bytes(binding: ProjectionEndpointBinding) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::{Read as _, Seek as _, Write as _};
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt as _;
-    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::oplog::{FrontierV2, PageId};
+    use crate::oplog::{
+        DocumentId, FrontierV2, LineageDigest, ObjectStore, PageId, ShardedHotEngine,
+    };
 
     use super::*;
+
+    #[test]
+    fn android_promoted_receipt_revalidates_an_existing_parent_after_process_restart() {
+        let identity = (17, 29);
+        let first_process = AndroidReceiptBarrierState::default();
+        first_process
+            .record_mutation_barrier(identity, || Err::<(), _>(io::Error::other("refused")))
+            .unwrap_err();
+
+        // A new process has no inherited in-memory debt. It must still prove
+        // the parent directory durable before accepting an exact visible name.
+        let next_process = AndroidReceiptBarrierState::default();
+        let barriers = AtomicUsize::new(0);
+        next_process
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 1);
+
+        next_process
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(
+            barriers.load(Ordering::SeqCst),
+            1,
+            "one successful parent barrier covers later exact names in that process"
+        );
+    }
+
+    #[test]
+    fn android_promoted_receipt_refusal_or_panic_never_marks_the_parent_verified() {
+        let identity = (31, 37);
+        let state = AndroidReceiptBarrierState::default();
+        let barriers = AtomicUsize::new(0);
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("refused"))
+            })
+            .unwrap_err();
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 2);
+
+        let panic_result = std::panic::catch_unwind(|| {
+            state
+                .record_mutation_barrier(identity, || -> Result<(), io::Error> {
+                    panic!("cut after namespace mutation and before verification insertion")
+                })
+                .unwrap();
+        });
+        assert!(panic_result.is_err());
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 3);
+
+        // Identity lookup is deliberately completed before a namespace
+        // mutation. Once mutation begins, any later fallible step must leave
+        // the old positive proof invalid even if no barrier can run.
+        state.begin_mutation(identity);
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 4);
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -4547,6 +5306,7 @@ mod tests {
                 base.map_or(ProjectionPrecondition::Absent, |base| {
                     ProjectionPrecondition::Base(BlobDescription::of(base))
                 }),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(&target),
                 Vec::new(),
             )
@@ -4601,6 +5361,26 @@ mod tests {
             let mut pending = vec![self.graph_root.clone()];
             while let Some(path) = pending.pop() {
                 let relative = path.strip_prefix(&self.graph_root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    snapshot.insert(relative, None);
+                    for entry in fs::read_dir(path).unwrap() {
+                        pending.push(entry.unwrap().path());
+                    }
+                } else {
+                    snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+            snapshot
+        }
+
+        fn snapshot_store(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = BTreeMap::new();
+            let mut pending = vec![self.store.root_path().to_path_buf()];
+            while let Some(path) = pending.pop() {
+                let relative = path
+                    .strip_prefix(self.store.root_path())
+                    .unwrap()
+                    .to_path_buf();
                 if path.is_dir() {
                     snapshot.insert(relative, None);
                     for entry in fs::read_dir(path).unwrap() {
@@ -4706,16 +5486,47 @@ mod tests {
         }
     }
 
-    fn retirement_quarantine_path(
-        recovery_path: &Path,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> PathBuf {
-        let resource_id = record.recovery_resource_id().unwrap();
-        recovery_path.parent().unwrap().join(format!(
-            "Tine-recovery-{}-{}.projection-quarantine",
-            record.attempt_id().simple(),
-            hex(resource_id.as_bytes())
-        ))
+    #[test]
+    fn absence_decision_map_steady_open_skips_the_full_receiver_catalog() {
+        let fixture = Fixture::new("absence-summary-map-cost-fail-before");
+        let archive_path = fixture.root.join("operations");
+        let mut rebuild_engine = ShardedHotEngine::new(
+            fixture.store.workspace_id(),
+            LineageDigest::of(b"absence-summary-map-cost"),
+            DocumentId::from_uuid(Uuid::from_u128(0xc6_0001)),
+        );
+        rebuild_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&archive_path, fixture.store.workspace_id()).unwrap(),
+            )
+            .unwrap();
+        rebuild_engine
+            .open_absence_decision_map(&fixture.store)
+            .unwrap();
+
+        let mut engine = ShardedHotEngine::new(
+            fixture.store.workspace_id(),
+            LineageDigest::of(b"absence-summary-map-cost"),
+            DocumentId::from_uuid(Uuid::from_u128(0xc6_0001)),
+        );
+        engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&archive_path, fixture.store.workspace_id()).unwrap(),
+            )
+            .unwrap();
+
+        reset_projection_store_test_counters();
+        engine.open_absence_decision_map(&fixture.store).unwrap();
+        let measured = projection_store_test_counters();
+        assert_eq!(
+            measured.catalog_directory_entries, 0,
+            "a steady absence-map open must not enumerate the lifetime receiver catalog"
+        );
+        let summary = engine
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("managed open records summary cost");
+        assert_eq!(summary.full_catalog_passes, 0);
+        assert_eq!(summary.receipt_content_reads, 0);
     }
 
     #[test]
@@ -5191,7 +6002,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_publication_crashes_reuse_one_second_exact_attempt() {
+    fn fallback_reuses_the_turn_derived_attempt_instead_of_inventing_a_second_name() {
+        let fresh = Fixture::new("fresh-turn-derived-fallback");
+        let derived = Uuid::from_u128(0xf2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2);
+        let _turn = enter_projection_turn_attempt(derived);
+        let fresh_fallback = fresh.store.reserve_fallback_attempt(&fresh.intent).unwrap();
+        assert_eq!(fresh_fallback.attempt_id(), derived);
+
         let fixture = Fixture::new("fallback-attempt-publication-crash");
         let primary = fixture.store.reserve_attempt(&fixture.intent).unwrap();
         let mut recovery = fixture
@@ -5208,24 +6025,14 @@ mod tests {
             )
             .is_err());
         recovery.release_failed_recovery().unwrap();
-        let mut stable = None;
-
         for _ in 0..8 {
-            ATTEMPT_PUBLICATION_HOOK.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| panic!("simulated process crash")));
-            });
-            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = fixture.store.reserve_fallback_attempt(&fixture.intent);
-            }));
-            assert!(crashed.is_err());
+            let fallback = fixture
+                .store
+                .reserve_fallback_attempt(&fixture.intent)
+                .unwrap();
+            assert_eq!(fallback, primary);
             assert_eq!(fixture.authority_stats(), (0, 0));
-            assert_eq!(fixture.attempt_stats(&fixture.intent).0, 2);
-            let snapshot = fixture.attempt_snapshot(&fixture.intent);
-            if let Some(expected) = &stable {
-                assert_eq!(&snapshot, expected);
-            } else {
-                stable = Some(snapshot);
-            }
+            assert_eq!(fixture.attempt_stats(&fixture.intent).0, 1);
         }
     }
 
@@ -5546,6 +6353,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(&second_target),
             Vec::new(),
         )
@@ -5647,6 +6455,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(&second_target),
             Vec::new(),
         )
@@ -5705,6 +6514,46 @@ mod tests {
         assert!(authority_path.exists());
         drop(recovery);
         assert!(!authority_path.exists());
+    }
+
+    #[test]
+    fn a_turn_crashed_under_2a_replays_under_2b_without_refusal() {
+        let fixture = Fixture::new_replacement("legacy-attempt-turn-continuation");
+
+        // Packet 2a reserved from receipt-store identity. There is deliberately
+        // no turn scope around this call, which preserves that old producer in
+        // test builds for compatibility fixtures.
+        let legacy = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let mut interrupted = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&legacy))
+            .unwrap();
+        fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut interrupted,
+            )
+            .unwrap();
+        drop(interrupted);
+        assert!(fixture.authority_path(&fixture.intent).exists());
+
+        // Packet 2b derives a different fresh id from the replay turn. Durable
+        // residue is stronger evidence: it resumes the recorded attempt rather
+        // than refusing or manufacturing a parallel attempt.
+        let derived = Uuid::from_u128(0x2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b);
+        assert_ne!(legacy.attempt_id(), derived);
+        let reopened = fixture.reopen_store();
+        let _turn = enter_projection_turn_attempt(derived);
+        let resumed = reopened.begin_mutation(&fixture.intent, None).unwrap();
+        assert_eq!(
+            resumed.active.as_ref().map(|attempt| attempt.attempt_id()),
+            Some(legacy.attempt_id())
+        );
+        assert_eq!(resumed.reservations.len(), 1);
+        assert_eq!(fixture.attempt_stats(&fixture.intent).0, 1);
     }
 
     #[test]
@@ -5783,6 +6632,37 @@ mod tests {
     }
 
     #[test]
+    fn registered_own_endpoint_residue_is_inert_and_remains_byte_identical() {
+        let fixture = Fixture::new_replacement("registered-own-residue");
+        let (_, _, records) = fixture.complete_replacement();
+        assert_eq!(records.len(), 1);
+        assert_eq!(fixture.store.validated_catalog().unwrap().len(), 1);
+        let before_store = fixture.snapshot_store();
+        let before_graph = fixture.snapshot_graph();
+
+        let own = [fixture.intent.id().unwrap()].into_iter().collect();
+        let reported = fixture.store.retired_own_endpoint_artifacts(&own);
+        assert!(reported.iter().any(|path| path.ends_with(".intent")));
+        assert!(reported.iter().any(|path| path.ends_with(".completion")));
+        assert!(reported
+            .iter()
+            .any(|path| path.ends_with(PENDING_CLEANUP_SUFFIX)));
+        assert!(fixture
+            .store
+            .load_completion(&fixture.intent)
+            .unwrap()
+            .is_none());
+        assert!(fixture.store.validated_catalog().unwrap().is_empty());
+        assert!(fixture
+            .store
+            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fixture.snapshot_store(), before_store);
+        assert_eq!(fixture.snapshot_graph(), before_graph);
+    }
+
+    #[test]
     fn completed_recovery_retirement_preserves_same_byte_replacement() {
         let fixture = Fixture::new_replacement("completed-recovery-retirement-binding");
         let base = b"- base\n";
@@ -5796,7 +6676,7 @@ mod tests {
         let records = reopened.local_forensic_evidence(&fixture.intent).unwrap();
         let conflict = fixture
             .graph
-            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
+            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records)
             .unwrap();
         let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
             panic!("same-byte replacement did not become a recoverable conflict: {conflict:?}");
@@ -5807,6 +6687,345 @@ mod tests {
             base
         );
         assert_eq!(fs::read(&displaced).unwrap(), base);
+    }
+
+    /// §4 row C3: a pre-existing derived staged name is data, not scratch.
+    /// The writer moves it intact to strict conflict trash before recreating
+    /// the exact turn-derived name for its own bytes.
+    #[test]
+    fn a_staged_name_occupied_after_crash_is_quarantined_not_deleted() {
+        let fixture = Fixture::new_replacement("occupied-derived-staged-name");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let staged_name = format!(
+            ".{}.{}.projection.staged",
+            fixture.intent.path().file_name(),
+            reservation.attempt_id().simple()
+        );
+        let staged_path = fixture
+            .graph_root
+            .join(fixture.intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(&staged_name);
+        let unknown = b"- pre-existing staged-name bytes\n";
+        fs::write(&staged_path, unknown).unwrap();
+
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let proof = fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .unwrap();
+        fixture
+            .store
+            .publish_completion(authority, &fixture.intent, &proof)
+            .unwrap();
+
+        assert!(!staged_path.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(fixture.intent.path().as_str())).unwrap(),
+            fixture.target
+        );
+        let quarantined = fixture
+            .snapshot_graph()
+            .into_iter()
+            .filter_map(|(path, bytes)| bytes.map(|bytes| (path, bytes)))
+            .find(|(path, bytes)| {
+                path.to_string_lossy().contains("projection-residue") && bytes == unknown
+            });
+        assert!(
+            quarantined.is_some(),
+            "the occupied derived name must survive byte-identically in conflict trash"
+        );
+    }
+
+    #[test]
+    fn turn_replay_after_publication_retires_the_displaced_pre_image() {
+        let fixture = Fixture::new_replacement("in-turn-exact-recovery-retirement");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records,)
+                .unwrap(),
+            ProjectionRecoveryCleanup::Retired
+        );
+        assert!(!recovery_path.exists());
+    }
+
+    #[test]
+    fn a_post_crash_recovery_file_is_trashed_not_unlinked() {
+        let fixture = Fixture::new_replacement("post-crash-recovery-retention");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+        let records_for_restart = records.clone();
+
+        // A new thread has no process-local in-turn unlink authority, which is
+        // the exact capability loss a process crash creates.
+        let cleanup = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records_for_restart)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = cleanup else {
+            panic!("post-crash cleanup discarded retained bytes: {cleanup:?}");
+        };
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            b"- base\n"
+        );
+    }
+
+    #[test]
+    fn an_externally_substituted_recovery_inode_is_retained() {
+        let fixture = Fixture::new_replacement("externally-substituted-recovery");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let original = recovery_path.with_extension("original-provider-inode");
+        fs::rename(&recovery_path, &original).unwrap();
+        let substituted = b"- external substitute\n";
+        fs::write(&recovery_path, substituted).unwrap();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+
+        let cleanup = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = cleanup else {
+            panic!("substituted recovery was not retained: {cleanup:?}");
+        };
+        assert_eq!(fs::read(original).unwrap(), b"- base\n");
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            substituted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_crash_hardlinked_recovery_refuses_and_keeps_durable_residue() {
+        let fixture = Fixture::new_replacement("post-crash-hardlinked-recovery");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let extra_link = recovery_path.with_extension("linked-recovery-copy");
+        fs::hard_link(&recovery_path, &extra_link).unwrap();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+        let records_for_restart = records.clone();
+
+        let refusal = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records_for_restart)
+                .unwrap_err()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(refusal.kind(), io::ErrorKind::AlreadyExists, "{refusal}");
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"- base\n");
+        assert_eq!(fs::read(&extra_link).unwrap(), b"- base\n");
+        assert_eq!(
+            fixture.store.pending_projection_cleanup().unwrap().len(),
+            1,
+            "the durable receipt remains the residue record for a refused quarantine"
+        );
+    }
+
+    /// §4.6 / §4.2 row C4: the W2 displacement fault point produces
+    /// "displaced, not yet published" — the live name gone, the derived
+    /// recovery name holding the exact precondition, and nothing staged.
+    ///
+    /// This cut did not exist before packet 1:
+    /// `projection_recovery_after_bound_capture_hook` fires BEFORE the
+    /// displacement rename, so it cannot reach this state at all.
+    #[test]
+    fn turn_replay_after_displacement_republishes_and_retires() {
+        let fixture = Fixture::new_replacement("projection-after-displacement-hook");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
+        let parent = target_path.parent().unwrap().to_path_buf();
+        let recovery_path = parent.join(reservation.recovery_filename());
+        let staged_path = parent.join(format!(
+            ".{}.{}.projection.staged",
+            fixture.intent.path().file_name(),
+            reservation.attempt_id().simple()
+        ));
+
+        type Observation = (bool, bool, Vec<u8>, bool, Vec<u8>);
+        let observed: std::sync::Arc<std::sync::Mutex<Option<Observation>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = std::sync::Arc::clone(&observed);
+        let observed_target = target_path.clone();
+        let observed_recovery = recovery_path.clone();
+        let observed_staged = staged_path.clone();
+        crate::model::set_projection_after_displacement_hook_for_test(
+            target_path.clone(),
+            move || {
+                *recorder.lock().unwrap() = Some((
+                    observed_target.exists(),
+                    observed_recovery.exists(),
+                    fs::read(&observed_recovery).unwrap_or_default(),
+                    observed_staged.exists(),
+                    fs::read(&observed_staged).unwrap_or_default(),
+                ));
+                panic!("simulated process crash after displacement")
+            },
+        );
+
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fixture.graph.write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            );
+        }));
+        assert!(crashed.is_err());
+        drop(authority);
+
+        let (target_present, recovery_present, recovery_bytes, staged_present, staged_bytes) =
+            observed
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the projection displacement hook must fire");
+        assert!(
+            !target_present,
+            "the live name must already be gone at the displacement cut"
+        );
+        assert!(recovery_present, "the displaced pre-image must be retained");
+        assert_eq!(recovery_bytes, b"- base\n".to_vec());
+        assert!(
+            staged_present,
+            "the turn-derived staged name must survive the cut"
+        );
+        assert_eq!(staged_bytes, fixture.target);
+
+        let graph_root = fixture.graph_root.clone();
+        let receipt_root = fixture.store.root_path().to_path_buf();
+        let workspace_id = fixture.store.workspace_id();
+        let intent = fixture.intent.clone();
+        let target = fixture.target.clone();
+        std::thread::spawn(move || {
+            let graph = Graph::open(&graph_root);
+            let store = ProjectionReceiptStore::open(&receipt_root, workspace_id).unwrap();
+            let mut resumed = store.begin_mutation(&intent, None).unwrap();
+            let proof = graph
+                .write_page_projection(
+                    intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &target,
+                    &mut resumed,
+                )
+                .unwrap();
+            store.publish_completion(resumed, &intent, &proof).unwrap();
+            let records = store.local_forensic_evidence(&intent).unwrap();
+            assert_eq!(
+                records.len(),
+                1,
+                "resumed retirement must publish bound evidence"
+            );
+            assert!(matches!(
+                graph
+                    .retire_completed_projection_recovery(intent.path().as_str(), &records)
+                    .unwrap(),
+                ProjectionRecoveryCleanup::ConflictRetained { .. }
+            ));
+            store
+                .retire_pending_projection_cleanup(&records[0])
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(fs::read(&target_path).unwrap(), fixture.target);
+        assert!(!recovery_path.exists());
+        assert!(!staged_path.exists());
+        assert!(fixture
+            .reopen_store()
+            .pending_projection_cleanup()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_resumed_retirement_still_retires_its_recovery_file() {
+        turn_replay_after_displacement_republishes_and_retires();
+    }
+
+    #[test]
+    fn a_lost_directory_entry_after_the_single_barrier_converges() {
+        let fixture = Fixture::new_replacement("lost-single-turn-barrier");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let recovery_path = fixture
+            .graph_root
+            .join(fixture.intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(reservation.recovery_filename());
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let turn = crate::model::ProjectionTurnBarrierScope::begin().unwrap();
+        let proof = fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .unwrap();
+        fixture
+            .store
+            .publish_completion(authority, &fixture.intent, &proof)
+            .unwrap();
+        super::super::projection::retire_pending_projection_recovery(
+            &fixture.graph,
+            &fixture.store,
+            None,
+        )
+        .unwrap();
+        crate::model::fail_next_projection_directory_sync_for_test();
+        assert!(
+            turn.finish().is_err(),
+            "the simulated final barrier must fail"
+        );
+
+        let replay = crate::model::ProjectionTurnBarrierScope::begin().unwrap();
+        fixture
+            .graph
+            .rebarrier_page_projection(fixture.intent.path(), Some(fixture.target.as_slice()))
+            .unwrap();
+        replay.finish().unwrap();
+
+        assert_eq!(
+            fs::read(fixture.graph_root.join(fixture.intent.path().as_str())).unwrap(),
+            fixture.target
+        );
+        assert!(!recovery_path.exists());
+        assert!(fixture
+            .snapshot_graph()
+            .keys()
+            .all(|path| !path.to_string_lossy().ends_with(".projection.staged")));
     }
 
     #[test]
@@ -5852,7 +7071,6 @@ mod tests {
             fixture.graph.retire_completed_projection_recovery(
                 fixture.intent.path().as_str(),
                 std::slice::from_ref(&marker),
-                None,
             ),
             Ok(ProjectionRecoveryCleanup::ConflictRetained { .. })
         ));
@@ -6099,146 +7317,72 @@ mod tests {
         assert_eq!(fs::read(unknown).unwrap(), b"not a canonical marker");
     }
 
+    /// The durable round flip is real work when the inactive round retains
+    /// markers, and pure cost when it does not. Every accepted save enters
+    /// this function twice with an entirely empty queue, so the both-empty
+    /// case must write nothing and take no barrier — while the
+    /// inactive-non-empty case must still flip and drain.
     #[test]
-    fn pending_cleanup_index_visits_only_live_attempts_after_historical_completions() {
-        let fixture = Fixture::new("bounded-pending-cleanup-index");
-        for index in 0_u128..33 {
-            let path = ManagedPath::parse(format!("pages/history-{index}.md")).unwrap();
-            let absolute = fixture.graph_root.join(path.as_str());
-            fs::write(&absolute, b"- base\n").unwrap();
-            let target = format!("- target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(10_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                BlobDescription::of(&target),
-                Vec::new(),
+    fn an_empty_pending_cleanup_queue_elides_the_durable_round_flip() {
+        let fixture = Fixture::new("pending-cleanup-empty-queue-elides-flip");
+        let read_state = |store: &ProjectionReceiptStore| {
+            let namespace = &store.namespaces.pending_cleanup;
+            let queue = open_pending_cleanup_rounds(
+                &namespace.capability,
+                store.store_id,
+                namespace.identity,
             )
             .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            let proof = fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            fixture
-                .store
-                .publish_completion(authority, &intent, &proof)
-                .unwrap();
-            if index != 32 {
-                let (_, record) = fixture
-                    .store
-                    .pending_projection_cleanup()
-                    .unwrap()
-                    .into_iter()
-                    .find(|(candidate, _)| candidate == &intent)
-                    .unwrap();
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            None,
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Quarantined
-                );
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Retired
-                );
-                fixture
-                    .store
-                    .retire_pending_projection_cleanup(&record)
-                    .unwrap();
-            }
-        }
+            (queue.state.active_round, queue.state_bytes)
+        };
 
-        reset_projection_store_test_counters();
-        let pending = fixture.store.pending_projection_cleanup().unwrap();
-        let counters = projection_store_test_counters();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(counters.pending_cleanup_entries, 1);
-        assert_eq!(counters.catalog_directory_entries, 0);
-        assert_eq!(counters.completion_lookups, 0);
-    }
+        let before = read_state(&fixture.store);
+        let session = crate::durability_counters::BarrierSession::begin();
+        assert!(fixture
+            .store
+            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+            .unwrap()
+            .is_empty());
+        let counts = session.counts();
+        crate::durability_counters::BarrierSession::detach_current_thread();
+        assert_eq!(
+            counts.total(),
+            0,
+            "an entirely empty cleanup queue took durability barriers: {}",
+            counts.report()
+        );
+        assert_eq!(
+            read_state(&fixture.store),
+            before,
+            "an entirely empty cleanup queue rewrote the durable round state"
+        );
 
-    #[cfg(unix)]
-    #[test]
-    fn graph_local_retirement_succeeds_when_receipts_are_on_another_filesystem() {
-        let shared_memory = Path::new("/dev/shm");
-        if !shared_memory.is_dir() {
-            return;
-        }
-        let graph_parent =
-            std::env::temp_dir().join(format!("tine-exdev-graph-{}", Uuid::new_v4()));
-        let receipt_parent = shared_memory.join(format!("tine-exdev-receipts-{}", Uuid::new_v4()));
-        fs::create_dir(&graph_parent).unwrap();
-        if fs::create_dir(&receipt_parent).is_err() {
-            let _ = fs::remove_dir(&graph_parent);
-            return;
-        }
-        if fs::metadata(&graph_parent).unwrap().dev()
-            == fs::metadata(&receipt_parent).unwrap().dev()
-        {
-            let _ = fs::remove_dir(&graph_parent);
-            let _ = fs::remove_dir(&receipt_parent);
-            return;
-        }
-        set_projection_cleanup_time_for_test(Some(50_000));
-        let graph_root = graph_parent.join("graph");
-        fs::create_dir(&graph_root).unwrap();
-        fs::create_dir(graph_root.join("pages")).unwrap();
-        let path = ManagedPath::parse("pages/external-volume.md").unwrap();
-        fs::write(graph_root.join(path.as_str()), b"- base\n").unwrap();
-        let graph = Graph::open(&graph_root);
-        let store = ProjectionReceiptStore::open(
-            &receipt_parent.join("receipts"),
-            WorkspaceId::from_uuid(Uuid::from_u128(1)),
-        )
-        .unwrap();
+        let path = ManagedPath::parse("pages/elision.md").unwrap();
+        fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
         let target = b"- target\n";
         let intent = ProjectionIntent::new(
-            store.workspace_id(),
-            PageId::from_uuid(Uuid::from_u128(2)),
+            fixture.store.workspace_id(),
+            PageId::from_uuid(Uuid::from_u128(70_001)),
             path,
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(target),
             Vec::new(),
         )
         .unwrap();
-        store.publish_intent(&intent, Some(b"- base\n")).unwrap();
-        let reservation = store.reserve_attempt(&intent).unwrap();
-        let recovery_path = graph_root
-            .join("pages")
-            .join(reservation.recovery_filename());
-        let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-        let proof = graph
+        fixture
+            .store
+            .publish_intent(&intent, Some(b"- base\n"))
+            .unwrap();
+        let reservation = fixture.store.reserve_attempt(&intent).unwrap();
+        let mut authority = fixture
+            .store
+            .begin_mutation(&intent, Some(&reservation))
+            .unwrap();
+        let proof = fixture
+            .graph
             .write_page_projection(
                 intent.path().as_str(),
                 Some(b"- base\n"),
@@ -6246,912 +7390,28 @@ mod tests {
                 &mut authority,
             )
             .unwrap();
-        store
+        fixture
+            .store
             .publish_completion(authority, &intent, &proof)
             .unwrap();
-        let (_, record) = store
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+
+        // `publish_pending_cleanup_marker` appends to the INACTIVE round, so
+        // the active round is still empty and the flip is now doing the work
+        // it exists for: making that marker reachable. It must still happen,
+        // and the entry must drain in the same pass.
         assert_eq!(
-            graph
-                .retire_completed_projection_recovery(
-                    intent.path().as_str(),
-                    std::slice::from_ref(&record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
+            fixture
+                .store
+                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+                .unwrap()
+                .len(),
+            1,
+            "a non-empty inactive round did not become reachable and drain"
         );
-        assert!(store
-            .projection_cleanup_grace_elapsed(&record)
-            .unwrap()
-            .is_none());
-        set_projection_cleanup_time_for_test(Some(50_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened =
-            ProjectionReceiptStore::open(store.root_path(), store.workspace_id()).unwrap();
-        let retirement = reopened
-            .projection_cleanup_grace_elapsed(&record)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            graph
-                .retire_completed_projection_recovery(
-                    intent.path().as_str(),
-                    std::slice::from_ref(&record),
-                    Some(&retirement),
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Retired
-        );
-        reopened.retire_pending_projection_cleanup(&record).unwrap();
-        assert!(!recovery_path.exists());
-        assert!(store.pending_projection_cleanup().unwrap().is_empty());
-        drop(store);
-        drop(reopened);
-        drop(graph);
-        crate::test_support::remove_dir_all(&graph_parent);
-        crate::test_support::remove_dir_all(&receipt_parent);
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn completed_recovery_retirement_quarantines_final_race_winner() {
-        let fixture = Fixture::new_replacement("completed-recovery-retirement-final-race");
-        let base = b"- base\n";
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let displaced = recovery_path.with_extension("provider-retained");
-        let raced_recovery = recovery_path.clone();
-        let raced_displaced = displaced.clone();
-        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
-            fs::rename(&raced_recovery, &raced_displaced)?;
-            fs::write(&raced_recovery, base)
-        });
-
-        let conflict = fixture
-            .graph
-            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
-            panic!("final race did not become a recoverable conflict: {conflict:?}");
-        };
-        assert!(!recovery_path.exists());
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
-            base
-        );
-        assert_eq!(fs::read(&displaced).unwrap(), base);
-    }
-
-    #[test]
-    fn completed_recovery_retirement_retains_stale_handle_write_at_final_boundary() {
-        let fixture = Fixture::new_replacement("completed-recovery-stale-handle");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let mut stale = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&recovery_path)
-            .unwrap();
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &fixture.store,
-            &fixture.intent,
-            &records[0],
-        )
-        .unwrap();
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
-            stale.seek(io::SeekFrom::Start(0))?;
-            stale.write_all(b"- stale writer changed this inode\n")?;
-            stale.set_len(b"- stale writer changed this inode\n".len() as u64)?;
-            stale.sync_all()
-        });
-
-        let conflict = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                &records,
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
-            panic!("stale handle change did not become a recoverable conflict: {conflict:?}");
-        };
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
-            b"- stale writer changed this inode\n"
-        );
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn settled_stale_descriptor_write_after_final_reread_documents_handoff_residual() {
-        set_projection_cleanup_time_for_test(Some(10_000));
-        let fixture = Fixture::new_replacement("settled-stale-descriptor-after-final-reread");
-        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
-        let stale = Rc::new(RefCell::new(
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&target_path)
-                .unwrap(),
-        ));
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &fixture.store,
-            &fixture.intent,
-            record,
-        )
-        .unwrap();
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        // Necessity gate: the prior immediate-delete construction fails here
-        // because it removed the recovery name before any durable observation.
-        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
-
-        let name = pending_cleanup_filename(record);
-        let (_, marker_bytes) = read_pending_cleanup_marker(
-            &fixture.store.namespaces.pending_cleanup.capability,
-            fixture.store.store_id,
-            fixture.store.namespaces.pending_cleanup.identity,
-            &name,
-        )
-        .unwrap();
-        let marker = decode_pending_cleanup_marker(&marker_bytes).unwrap();
-        let observation = marker
-            .observation
-            .expect("first pass must durably observe the quarantine");
-        assert_eq!(observation.session_id, fixture.store.cleanup_session_id);
-        assert_eq!(observation.observed_unix_seconds, 10_000);
-
-        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened = fixture.reopen_store();
         assert_ne!(
-            reopened.cleanup_session_id,
-            fixture.store.cleanup_session_id
-        );
-        assert!(
-            reopened
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_some(),
-            "settled retirement requires a different session and elapsed grace"
-        );
-
-        let changed = b"- autosaved after Tine's final settled reread\n";
-        let hook_stale = Rc::clone(&stale);
-        crate::model::set_projection_recovery_after_final_reread_hook_for_test(move || {
-            let mut stale = hook_stale.borrow_mut();
-            stale.seek(io::SeekFrom::Start(0))?;
-            stale.write_all(changed)?;
-            stale.set_len(changed.len() as u64)?;
-            stale.sync_all()
-        });
-
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &reopened,
-            &fixture.intent,
-            record,
-        )
-        .unwrap();
-        assert!(!quarantine.exists());
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-
-        // Portable filesystems cannot revoke a writable descriptor held across
-        // restart plus the full grace interval. At the exact post-reread cut,
-        // cleanup therefore accepts the clean-handoff contract and unlinks the
-        // name. The retained descriptor proves the finite-grace residual rather
-        // than claiming that these out-of-contract bytes remain recoverable.
-        let mut anonymous = stale.borrow_mut();
-        anonymous.seek(io::SeekFrom::Start(0)).unwrap();
-        let mut observed = Vec::new();
-        anonymous.read_to_end(&mut observed).unwrap();
-        assert_eq!(
-            observed, changed,
-            "the exact accepted residual must remain observable through the held descriptor"
-        );
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn unchanged_quarantine_requires_restart_and_meaningful_grace() {
-        set_projection_cleanup_time_for_test(Some(10_000));
-        let fixture = Fixture::new_replacement("cleanup-restart-and-grace");
-        let (_, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        assert!(
-            fixture
-                .store
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "elapsed wall time in the creating session authorized retirement"
-        );
-        let reopened = fixture.reopen_store();
-        let retirement = reopened
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    Some(&retirement),
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Retired
-        );
-        reopened.retire_pending_projection_cleanup(record).unwrap();
-        assert!(!recovery_path.exists());
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn restart_before_grace_retains_quarantine_and_clock_rollback_restarts_settlement() {
-        set_projection_cleanup_time_for_test(Some(20_000));
-        let fixture = Fixture::new_replacement("cleanup-clock-rollback");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(20_000 + PROJECTION_RECOVERY_GRACE_SECONDS - 1));
-        let pre_grace = fixture.reopen_store();
-        assert!(pre_grace
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(19_000));
-        let rollback = fixture.reopen_store();
-        assert!(rollback
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-        set_projection_cleanup_time_for_test(Some(19_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        assert!(
-            rollback
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "rollback-reset observation retired in the same session"
-        );
-        let settled = fixture.reopen_store();
-        assert!(settled
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_some());
-
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn cleanup_observation_crash_cuts_retain_or_publish_conservative_state() {
-        set_projection_cleanup_time_for_test(Some(25_000));
-        let fixture = Fixture::new_replacement("cleanup-observation-crash-cuts");
-        let (_, _, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-
-        fail_before_projection_cleanup_marker_swap_for_test();
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .is_err());
-        let reopened = fixture.reopen_store();
-        assert!(
-            reopened
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "pre-swap crash lost the pending marker or invented settlement"
-        );
-
-        set_projection_cleanup_time_for_test(Some(24_000));
-        fail_after_projection_cleanup_marker_swap_for_test();
-        assert!(reopened.projection_cleanup_grace_elapsed(record).is_err());
-        set_projection_cleanup_time_for_test(Some(24_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let after_crash = fixture.reopen_store();
-        assert!(
-            after_crash
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_some(),
-            "post-swap crash did not preserve the conservative rollback-reset observation"
-        );
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn changed_quarantine_becomes_visible_conflict_without_blocking_cleanup_queue() {
-        set_projection_cleanup_time_for_test(Some(30_000));
-        let fixture = Fixture::new_replacement("changed-quarantine-conflict");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        let changed = b"- external editor's newer recoverable bytes\n";
-        fs::write(&quarantine, changed).unwrap();
-
-        let outcome = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(record),
-                None,
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
-            panic!("changed quarantine was not surfaced as a conflict: {outcome:?}");
-        };
-        assert!(!quarantine.exists());
-        let conflict = fixture.graph_root.join(relative_path);
-        assert!(
-            !conflict
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with('.'),
-            "recoverable conflict remained hidden"
-        );
-        assert_eq!(fs::read(conflict).unwrap(), changed);
-        fixture
-            .store
-            .retire_pending_projection_cleanup(record)
-            .unwrap();
-        assert!(fixture
-            .store
-            .pending_projection_cleanup()
-            .unwrap()
-            .is_empty());
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn oversized_changed_quarantine_is_renamed_visible_without_loading_it() {
-        let fixture = Fixture::new_replacement("oversized-changed-quarantine");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&quarantine)
-            .unwrap()
-            .set_len(MAX_PROJECTION_EVIDENCE_BYTES + 1)
-            .unwrap();
-        let outcome = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(record),
-                None,
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
-            panic!("oversized changed quarantine was not retained visibly: {outcome:?}");
-        };
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::metadata(fixture.graph_root.join(relative_path))
-                .unwrap()
-                .len(),
-            MAX_PROJECTION_EVIDENCE_BYTES + 1
-        );
-    }
-
-    #[test]
-    fn settled_cleanup_queue_drains_in_bounded_passes_without_history_growth() {
-        set_projection_cleanup_time_for_test(Some(40_000));
-        let fixture = Fixture::new("bounded-settled-cleanup");
-        for index in 0_u128..70 {
-            let path = ManagedPath::parse(format!("pages/settled-{index}.md")).unwrap();
-            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
-            let target = format!("- target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(50_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                BlobDescription::of(&target),
-                Vec::new(),
-            )
-            .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            let proof = fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            fixture
-                .store
-                .publish_completion(authority, &intent, &proof)
-                .unwrap();
-        }
-
-        reset_projection_store_test_counters();
-        let first_pass = fixture
-            .store
-            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-            .unwrap();
-        assert_eq!(first_pass.len(), MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
-        assert_eq!(
-            projection_store_test_counters().pending_cleanup_entries,
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-
-        for (intent, record) in fixture.store.pending_projection_cleanup().unwrap() {
-            assert_eq!(
-                fixture
-                    .graph
-                    .retire_completed_projection_recovery(
-                        intent.path().as_str(),
-                        std::slice::from_ref(&record),
-                        None,
-                    )
-                    .unwrap(),
-                ProjectionRecoveryCleanup::Quarantined
-            );
-            assert!(fixture
-                .store
-                .projection_cleanup_grace_elapsed(&record)
-                .unwrap()
-                .is_none());
-        }
-
-        set_projection_cleanup_time_for_test(Some(40_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened = fixture.reopen_store();
-        let mut pass_sizes = Vec::new();
-        loop {
-            let pass = reopened
-                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-                .unwrap();
-            if pass.is_empty() {
-                break;
-            }
-            pass_sizes.push(pass.len());
-            for (intent, record) in pass {
-                let retirement = reopened
-                    .projection_cleanup_grace_elapsed(&record)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            Some(&retirement),
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Retired
-                );
-                reopened.retire_pending_projection_cleanup(&record).unwrap();
-            }
-        }
-        assert_eq!(pass_sizes.iter().sum::<usize>(), 70);
-        assert_eq!(pass_sizes.len(), 2);
-        assert!(pass_sizes
-            .iter()
-            .all(|size| *size <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS));
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-        assert!(fs::read_dir(fixture.graph_root.join("pages"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                !name.ends_with(".projection.recovery") && !name.ends_with(".projection-quarantine")
-            }));
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn blocked_cleanup_round_cannot_starve_later_changed_sidecar() {
-        let fixture = Fixture::new("fair-cleanup-blocked-prefix");
-        for index in 0_u128..MAX_PENDING_PROJECTION_CLEANUP_PER_PASS as u128 {
-            let path = ManagedPath::parse(format!("pages/incomplete-{index}.md")).unwrap();
-            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
-            let target = format!("- incomplete target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(80_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                BlobDescription::of(&target),
-                Vec::new(),
-            )
-            .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            drop(authority);
-        }
-
-        // Rotate the 64 incomplete markers into round 0, then durably finish
-        // the empty-round transition without visiting round 0. This is the
-        // exact crash/restart state in which a later insertion belongs to the
-        // inactive round behind a full retained prefix.
-        assert_eq!(
-            fixture
-                .store
-                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-                .unwrap()
-                .len(),
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-        let namespace = &fixture.store.namespaces.pending_cleanup;
-        let queue = open_pending_cleanup_rounds(
-            &namespace.capability,
-            fixture.store.store_id,
-            namespace.identity,
-        )
-        .unwrap();
-        assert_eq!(queue.state.active_round, 1);
-        assert!(queue.rounds[1].entries().unwrap().next().is_none());
-        flip_pending_cleanup_round(&namespace.capability, &queue).unwrap();
-        let restarted = fixture.reopen_store();
-
-        let later_path = ManagedPath::parse("pages/later-changed.md").unwrap();
-        fs::write(
-            fixture.graph_root.join(later_path.as_str()),
-            b"- later base\n",
-        )
-        .unwrap();
-        let later_target = b"- later target\n";
-        let later_intent = ProjectionIntent::new(
-            restarted.workspace_id(),
-            PageId::from_uuid(Uuid::from_u128(90_000)),
-            later_path,
-            FrontierV2::default(),
-            Vec::new(),
-            ProjectionPrecondition::Base(BlobDescription::of(b"- later base\n")),
-            BlobDescription::of(later_target),
-            Vec::new(),
-        )
-        .unwrap();
-        restarted
-            .publish_intent(&later_intent, Some(b"- later base\n"))
-            .unwrap();
-        let reservation = restarted.reserve_attempt(&later_intent).unwrap();
-        let recovery_path = fixture
-            .graph_root
-            .join(later_intent.path().as_str())
-            .parent()
-            .unwrap()
-            .join(reservation.recovery_filename());
-        let mut authority = restarted
-            .begin_mutation(&later_intent, Some(&reservation))
-            .unwrap();
-        let proof = fixture
-            .graph
-            .write_page_projection(
-                later_intent.path().as_str(),
-                Some(b"- later base\n"),
-                later_target,
-                &mut authority,
-            )
-            .unwrap();
-        restarted
-            .publish_completion(authority, &later_intent, &proof)
-            .unwrap();
-        let changed = b"- provider changed the later retained sidecar\n";
-        fs::write(&recovery_path, changed).unwrap();
-
-        reset_projection_store_test_counters();
-        super::super::projection::retire_pending_projection_recovery(&fixture.graph, &restarted)
-            .unwrap();
-        assert_eq!(
-            projection_store_test_counters().pending_cleanup_entries,
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-        assert_eq!(fs::read(&recovery_path).unwrap(), changed);
-
-        // The next active round contains the same 64 retained markers plus the
-        // later insertion. Since every visit rotates a marker away, two more
-        // capped passes are a hard upper bound independent of directory order.
-        let mut later_pass_visits = Vec::new();
-        for _ in 0..2 {
-            reset_projection_store_test_counters();
-            super::super::projection::retire_pending_projection_recovery(
-                &fixture.graph,
-                &restarted,
-            )
-            .unwrap();
-            let visits = projection_store_test_counters().pending_cleanup_entries;
-            assert!(visits <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
-            later_pass_visits.push(visits);
-            if !recovery_path.exists() {
-                break;
-            }
-        }
-        assert!(
-            !recovery_path.exists(),
-            "a full retained prefix starved the later changed sidecar"
-        );
-        assert!(later_pass_visits.len() <= 2);
-        let conflicts = fs::read_dir(fixture.graph_root.join("pages"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("Tine-recovered-") && name.ends_with(".projection-conflict")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(fs::read(conflicts[0].path()).unwrap(), changed);
-    }
-
-    #[test]
-    fn final_quarantine_same_byte_rebind_preserves_both_resources() {
-        let fixture = Fixture::new_replacement("final-quarantine-same-byte-rebind");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        let retained = quarantine.with_extension("retained-provider-inode");
-        let raced_quarantine = quarantine.clone();
-        let raced_retained = retained.clone();
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
-            fs::rename(&raced_quarantine, &raced_retained)?;
-            fs::write(&raced_quarantine, b"- base\n")
-        });
-
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
-        assert_eq!(fs::read(retained).unwrap(), b"- base\n");
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn cleanup_crash_cuts_resume_quarantine_and_marker_retirement_idempotently() {
-        let fixture = Fixture::new_replacement("cleanup-crash-cuts");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "crash after graph-local quarantine",
-            ))
-        });
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Interrupted
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!recovery_path.exists());
-        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-
-        let reopened = fixture.reopen_store();
-        let (_, record) = reopened
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(&record),
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-            )
-            .unwrap();
-        assert!(!quarantine.exists());
-        // Crash before retiring the durable marker. The next reopen observes
-        // exact absence and retires only that one still-pending attempt.
-        let reopened = fixture.reopen_store();
-        let (_, record) = reopened
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(&record),
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-            )
-            .unwrap();
-        reopened.retire_pending_projection_cleanup(&record).unwrap();
-        assert!(fixture
-            .reopen_store()
-            .pending_projection_cleanup()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn completed_recovery_retirement_preserves_parent_rebind_and_original_quarantine() {
-        let fixture = Fixture::new_at_with_base(
-            "completed-recovery-retirement-parent-rebind",
-            "pages/深い/authority ☕.md",
-            Some(b"- base\n"),
-        );
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let parent = recovery_path.parent().unwrap().to_path_buf();
-        let moved_parent = parent.with_file_name("深い-retained");
-        let retained_parent = moved_parent.clone();
-        let replacement_path = recovery_path.clone();
-        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
-            fs::rename(&parent, &moved_parent)?;
-            fs::create_dir(&parent)?;
-            fs::write(&replacement_path, b"- base\n")
-        });
-
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(&recovery_path).unwrap(), b"- base\n");
-        let quarantine_name = retirement_quarantine_path(&recovery_path, &records[0])
-            .file_name()
-            .unwrap()
-            .to_owned();
-        assert_eq!(
-            fs::read(retained_parent.join(quarantine_name)).unwrap(),
-            b"- base\n"
+            read_state(&fixture.store).0,
+            before.0,
+            "the durable flip was elided while the inactive round held a marker"
         );
     }
 

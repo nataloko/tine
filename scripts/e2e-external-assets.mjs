@@ -1,7 +1,8 @@
-// Linux real-app proof for GH #127. The graph's `assets` entry is a symlink to
-// an external directory, with the exact canonical graph/target pair pre-approved
-// in disposable device settings. This exercises the real Tauri open, media read,
-// and asset write paths without weakening the first-use consent component test.
+// Linux real-app proof for GH #127 + MS-03 asset observation. The graph's
+// `assets` entry is a symlink to an external directory, with the exact canonical
+// graph/target pair pre-approved in disposable device settings. This exercises
+// the real Tauri open, media read/write and external replacement/deletion paths
+// without weakening the first-use consent component test.
 import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -22,6 +23,7 @@ const TMP = "/tmp/tine-external-assets-e2e";
 const GRAPH = `${TMP}/graph`;
 const EXTERNAL = `${TMP}/external-assets`;
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lO1O0QAAAABJRU5ErkJggg==";
+const ASSET_OBSERVATION_TIMEOUT_MS = 30_000;
 
 fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq"]) fs.mkdirSync(`${GRAPH}/${dir}`, { recursive: true });
@@ -68,7 +70,12 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "external-assets"),
   });
-  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
+  try {
+    await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
+  } catch (error) {
+    const source = await browser.getPageSource().catch(() => "<page source unavailable>");
+    throw new Error(`${error.message}\nPage source:\n${source.slice(0, 8_000)}`);
+  }
   for (const selector of ["a.page-ref=External assets", "span.page-ref=External assets", "*=External assets"]) {
     const link = await browser.$(selector);
     if (await link.isExisting()) { await link.click(); break; }
@@ -80,6 +87,26 @@ try {
   await image.waitForExist({ timeout: 20_000 });
   await browser.waitUntil(async () => (await image.getProperty("complete")) === true, {
     timeout: 10_000, timeoutMsg: "external asset image did not finish loading",
+  });
+  const firstSrc = await image.getAttribute("src");
+
+  // Replace the approved external file exactly as a filesystem synchronizer
+  // does (temp + rename). The native asset-observation lane must invalidate the
+  // image cache without importing the bytes into graph text or managed state.
+  fs.writeFileSync(`${EXTERNAL}/pixel.replacement`, Buffer.from(PNG, "base64"));
+  fs.renameSync(`${EXTERNAL}/pixel.replacement`, `${EXTERNAL}/pixel.png`);
+  await browser.waitUntil(async () => {
+    const current = await browser.$("img.inline-image");
+    return (await current.isExisting()) && (await current.getAttribute("src")) !== firstSrc;
+  }, {
+    timeout: ASSET_OBSERVATION_TIMEOUT_MS,
+    timeoutMsg: "externally replaced asset did not receive a fresh blob URL",
+  });
+
+  fs.unlinkSync(`${EXTERNAL}/pixel.png`);
+  await browser.$(".inline-image-missing").waitForExist({
+    timeout: ASSET_OBSERVATION_TIMEOUT_MS,
+    timeoutMsg: "externally deleted asset did not render the missing placeholder",
   });
 
   const write = await browser.executeAsync((graph, done) => {
@@ -104,7 +131,7 @@ try {
   if (!fs.lstatSync(`${GRAPH}/assets`).isSymbolicLink()) {
     throw new Error("graph assets link was unexpectedly replaced");
   }
-  console.log("PASS: approved external assets opened, rendered, and accepted a native write");
+  console.log("PASS: approved external assets opened, refreshed, showed deletion, and accepted a native write");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

@@ -12,11 +12,15 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State, WebviewWindow};
 use tine_core::date::JournalDate;
+use tine_core::journal_feed::{
+    collect_journal_feed_page, journal_feed_candidate_in_window, journal_feed_inventory,
+};
 use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
 };
 use tine_core::sync_runtime::{
     SyncApplicationGraphMutationRequest, SyncApplicationGuideCopyOutcome,
+    SyncApplicationJournalFeedOutcome, SyncApplicationJournalFeedRequest,
     SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
@@ -148,6 +152,7 @@ mod managed_application_move_wire_tests {
                     "shared_phase": null,
                     "provider_pending": 0,
                     "provider_runnable": false,
+                    "search_index_building": false,
                     "managed_local_pending": 0,
                     "managed_local_checkpointed_sequence": 0,
                     "managed_local_next_sequence": 0,
@@ -813,98 +818,15 @@ pub(crate) struct JournalFeedPage {
     as_of_day: i64,
 }
 
-fn collect_journal_feed_page<F>(
-    entries: Vec<PageEntry>,
-    limit: usize,
-    before_day: Option<i64>,
-    as_of_day: i64,
-    mut load: F,
-) -> Result<JournalFeedPage, String>
-where
-    F: FnMut(&PageEntry) -> Result<PageDto, std::io::Error>,
-{
-    // A zero limit is authoritative: do not scan/load the feed merely to
-    // discover that the caller requested no rows. No cursor advances because
-    // no day was examined.
-    if limit == 0 {
-        let done = !entries
-            .iter()
-            .any(|entry| before_day.is_none_or(|before| entry.date_key.unwrap_or(0) < before));
-        return Ok(JournalFeedPage {
-            pages: Vec::new(),
-            next_before_day: None,
-            done,
-            as_of_day,
-        });
-    }
-    let mut out = Vec::new();
-    let mut last_examined = None;
-    let mut candidates = entries
-        .into_iter()
-        .filter(|e| before_day.is_none_or(|before| e.date_key.unwrap_or(0) < before))
-        .peekable();
-    while let Some(e) = candidates.next() {
-        let day = e
-            .date_key
-            .expect("feed inventory only contains dated journals");
-        last_examined = Some(day);
-        match load(&e) {
-            Ok(dto) => out.push(dto),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.to_string()),
-        }
-        if out.len() == limit {
-            break;
-        }
-    }
-    let done = candidates.peek().is_none();
-    Ok(JournalFeedPage {
-        pages: out,
-        next_before_day: if done { None } else { last_examined },
-        done,
-        as_of_day,
-    })
-}
-
-fn canonical_journal_entry(entry: &PageEntry) -> bool {
-    let relative = std::path::Path::new(&entry.rel_path);
-    let path = if entry.rel_path.is_empty() {
-        entry.path.as_path()
-    } else {
-        relative
-    };
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| JournalDate::from_file_stem(stem).is_some())
-}
-
-fn journal_feed_inventory(mut entries: Vec<PageEntry>, as_of_day: i64) -> Vec<PageEntry> {
-    entries.retain(|entry| {
-        entry.kind == PageKind::Journal && entry.date_key.is_some_and(|day| day <= as_of_day)
-    });
-    let mut positions = std::collections::HashMap::new();
-    let mut deduplicated: Vec<PageEntry> = Vec::new();
-    for entry in entries {
-        let day = entry
-            .date_key
-            .expect("feed inventory only contains dated journals");
-        if let Some(&position) = positions.get(&day) {
-            if canonical_journal_entry(&entry) && !canonical_journal_entry(&deduplicated[position])
-            {
-                deduplicated[position] = entry;
-            }
-        } else {
-            positions.insert(day, deduplicated.len());
-            deduplicated.push(entry);
-        }
-    }
-    deduplicated.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap_or(0)));
-    deduplicated
-}
-
-/// Feed-only pagination. `before_day` is an ordinal-day cursor rather than a
-/// mutable vector offset, so a file disappearing after inventory cannot make a
-/// later day duplicate or disappear from the next request.
+/// The Journals feed.
+///
+/// Managed storage answers the whole request in ONE actor turn: the runtime
+/// keeps the graph's journal days indexed per accepted frontier, so a feed
+/// open costs a window lookup plus `limit` page loads instead of the complete
+/// page inventory it used to walk on every open and every scroll step
+/// (managed-storage cost-model audit 2026-08-26, D6). Direct Files selects the
+/// same window from its warmed page cache through the same
+/// `tine_core::journal_feed` rules.
 #[tauri::command]
 pub(crate) async fn journal_feed_page(
     limit: usize,
@@ -918,179 +840,58 @@ pub(crate) async fn journal_feed_page(
         let as_of_day = JournalDate::today().ordinal_key();
         match sparse_application_handle(&slot)? {
             Some(handle) => {
-                let entries = journal_feed_inventory(sparse_page_inventory(handle)?, as_of_day);
-                collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
-                    match load_sparse_page(
-                        handle,
-                        SyncApplicationPageSelector::ExactPath {
-                            path: entry.rel_path.clone(),
-                        },
-                    ) {
-                        Ok(Some(page)) => Ok(page),
-                        Ok(None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-                        Err(error) => Err(std::io::Error::other(error)),
-                    }
-                })
+                match handle
+                    .journal_feed_page(SyncApplicationJournalFeedRequest {
+                        limit,
+                        before_day,
+                        as_of_day,
+                    })
+                    .map_err(|error| error.to_string())?
+                {
+                    SyncApplicationJournalFeedOutcome::Loaded {
+                        pages,
+                        next_before_day,
+                        done,
+                    } => Ok(JournalFeedPage {
+                        pages,
+                        next_before_day,
+                        done,
+                        as_of_day,
+                    }),
+                    SyncApplicationJournalFeedOutcome::Ambiguous => Err(
+                        "Tine-managed storage could not identify this page. Reload it and resolve any conflicts."
+                            .into(),
+                    ),
+                    SyncApplicationJournalFeedOutcome::Deferred { state: _ } => Err(
+                        "Tine-managed storage is updating the page list. Try again when it finishes."
+                            .into(),
+                    ),
+                }
             }
             None => {
                 let graph = slot.legacy_graph()?;
                 let entries =
                     graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
-                collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
-                    // A journal deleted from disk between inventory and load is skipped,
-                    // but its day still advances the cursor in the helper above.
-                    graph.load_page(entry)
+                let selection = collect_journal_feed_page(
+                    entries.into_iter().filter(|entry| {
+                        journal_feed_candidate_in_window(entry, as_of_day, before_day)
+                    }),
+                    limit,
+                    // A journal deleted from disk between selection and load is
+                    // skipped, but its day still advances the cursor.
+                    |entry| graph.load_page(entry),
+                )?;
+                Ok(JournalFeedPage {
+                    pages: selection.pages,
+                    next_before_day: selection.next_before_day,
+                    done: selection.done,
+                    as_of_day,
                 })
             }
         }
     })
     .await
     .map_err(|error| error.to_string())?
-}
-
-#[cfg(test)]
-mod journal_feed_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn entry(day: i64) -> PageEntry {
-        PageEntry {
-            name: day.to_string(),
-            kind: PageKind::Journal,
-            date_key: Some(day),
-            rel_path: String::new(),
-            path: PathBuf::new(),
-        }
-    }
-    fn dto(entry: &PageEntry) -> PageDto {
-        serde_json::from_value(serde_json::json!({
-            "name": entry.name, "kind": "journal", "title": entry.name,
-            "pre_block": null, "blocks": []
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn deletion_stable_day_cursor_fills_then_continues_without_duplicates() {
-        let entries = [5, 4, 3, 2, 1].into_iter().map(entry).collect();
-        let first = collect_journal_feed_page(entries, 3, None, 5, |e| {
-            if e.date_key == Some(5) {
-                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-            } else {
-                Ok(dto(e))
-            }
-        })
-        .unwrap();
-        assert_eq!(
-            first
-                .pages
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>(),
-            ["4", "3", "2"]
-        );
-        assert_eq!(first.next_before_day, Some(2));
-        assert!(!first.done);
-        let entries = [5, 4, 3, 2, 1].into_iter().map(entry).collect();
-        let second =
-            collect_journal_feed_page(entries, 3, first.next_before_day, 5, |e| Ok(dto(e)))
-                .unwrap();
-        assert_eq!(
-            second
-                .pages
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>(),
-            ["1"]
-        );
-        assert!(second.done);
-        assert_eq!(second.next_before_day, None);
-    }
-
-    #[test]
-    fn cursor_handles_second_page_loss_empty_suffix_exact_limit_zero_and_hard_errors() {
-        let first = collect_journal_feed_page(
-            [5, 4, 3, 2, 1].into_iter().map(entry).collect(),
-            3,
-            None,
-            5,
-            |e| Ok(dto(e)),
-        )
-        .unwrap();
-        assert_eq!(first.next_before_day, Some(3));
-        let second = collect_journal_feed_page(
-            [5, 4, 3, 2, 1].into_iter().map(entry).collect(),
-            3,
-            first.next_before_day,
-            5,
-            |e| {
-                if e.date_key == Some(2) {
-                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-                } else {
-                    Ok(dto(e))
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            second
-                .pages
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>(),
-            ["1"]
-        );
-        assert!(
-            second.done,
-            "a missing second-page row still exhausts the suffix"
-        );
-
-        let empty = collect_journal_feed_page(
-            [5, 4].into_iter().map(entry).collect(),
-            3,
-            Some(4),
-            5,
-            |e| Ok(dto(e)),
-        )
-        .unwrap();
-        assert!(empty.pages.is_empty());
-        assert!(empty.done);
-
-        let exact = collect_journal_feed_page(
-            [3, 2, 1].into_iter().map(entry).collect(),
-            3,
-            None,
-            3,
-            |e| Ok(dto(e)),
-        )
-        .unwrap();
-        assert!(exact.done, "an exactly-full final page is done");
-        assert_eq!(exact.next_before_day, None);
-
-        let mut loads = 0;
-        let zero = collect_journal_feed_page(
-            [3, 2, 1].into_iter().map(entry).collect(),
-            0,
-            None,
-            3,
-            |_e| {
-                loads += 1;
-                Ok(dto(&entry(0)))
-            },
-        )
-        .unwrap();
-        assert_eq!(loads, 0, "zero limit loads no entries");
-        assert!(!zero.done);
-
-        let hard =
-            collect_journal_feed_page([3].into_iter().map(entry).collect(), 1, None, 3, |_e| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "denied",
-                ))
-            });
-        assert!(matches!(hard, Err(err) if err.contains("denied")));
-    }
 }
 
 #[tauri::command]
@@ -1445,6 +1246,40 @@ pub(crate) async fn move_managed_application_subtrees(
     .map_err(|error| error.to_string())?
 }
 
+/// Retire one committed move's private response-replay evidence after the
+/// frontend has installed the authoritative source and destination DTOs.
+#[tauri::command]
+pub(crate) async fn acknowledge_managed_application_move(
+    binding_generation: u64,
+    episode_id: String,
+    batch_id: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err(
+            "managed cross-page move acknowledgement belongs to a stale graph binding".into(),
+        );
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let handle = sparse_application_handle(&slot)?.ok_or_else(|| {
+            "managed cross-page move acknowledgement requires managed storage".to_owned()
+        })?;
+        let result = handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .map_err(|error| error.to_string());
+        // Acknowledgement schedules actor-owned bounded cleanup. Wake the
+        // watcher on both success and retryable failure so the cleanup lane is
+        // not stranded on an otherwise quiet graph.
+        crate::state::poke_watcher(&state);
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// X1.5 recovery handoff for one exact, already-issued managed move episode.
 /// The helper owns graph lifecycle serialization and may replace only an
 /// already-stopped retained actor with one recovered successor.
@@ -1475,32 +1310,42 @@ pub(crate) fn guide_pages() -> Result<Vec<tine_core::onboarding::GuidePage>, Str
     tine_core::onboarding::bundled_guide_pages().map_err(|error| error.to_string())
 }
 
+pub(crate) fn copy_guide_into_bound_graph(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    title: String,
+) -> Result<tine_core::onboarding::GuideCopyResult, String> {
+    let state = app.state::<AppState>();
+    let slot = slot_for_bound_window(&state, label, Some(binding_generation))?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => match handle
+            .copy_application_guide(title)
+            .map_err(|error| error.to_string())?
+        {
+            SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
+            SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
+                "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
+                    .into(),
+            ),
+        },
+        None => {
+            let graph = slot.legacy_graph()?;
+            tine_core::onboarding::copy_guide_into_graph(&graph, &title)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn copy_guide_into_graph(
     title: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::onboarding::GuideCopyResult, String> {
+    // managed-command-routing: managed
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        match sparse_application_handle(&slot)? {
-            Some(handle) => match handle
-                .copy_application_guide(title)
-                .map_err(|error| error.to_string())?
-            {
-                SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
-                SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
-                    "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
-                        .into(),
-                ),
-            },
-            None => {
-                let graph = slot.legacy_graph()?;
-                tine_core::onboarding::copy_guide_into_graph(&graph, &title)
-                    .map_err(|error| error.to_string())
-            }
-        }
+        copy_guide_into_bound_graph(&app, &label, binding_generation, title)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1811,6 +1656,27 @@ mod graph_wide_command_boundary_tests {
 
 #[cfg(test)]
 mod managed_actor_command_boundary_tests {
+    #[test]
+    fn move_acknowledgement_wakes_actor_cleanup_after_every_attempt() {
+        let source = include_str!("commands.rs");
+        let signature = "pub(crate) async fn acknowledge_managed_application_move(";
+        let start = source
+            .find(signature)
+            .expect("acknowledgement command remains");
+        let tail = &source[start..];
+        let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+        let command = &tail[..end];
+        assert!(command.contains("tauri::async_runtime::spawn_blocking(move ||"));
+        assert!(command.contains("slot_for_bound_window"));
+        assert!(command.contains("Some(binding_generation)"));
+        assert!(command.contains("crate::state::poke_watcher(&state);"));
+        assert!(
+            command.find("let result = handle").unwrap()
+                < command.find("crate::state::poke_watcher(&state);").unwrap(),
+            "the watcher wake must happen after the actor attempt and before its result returns"
+        );
+    }
+
     #[test]
     fn every_ordinary_managed_actor_command_re_resolves_off_the_async_command_thread() {
         let source = include_str!("commands.rs");
@@ -2897,15 +2763,20 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_filesystem_graph(&state, |g| {
-        max_bytes
+    let window_label = state.window.label().to_string();
+    let (bytes, path) = with_filesystem_graph(&state, |g| {
+        let path = g.asset_file_for_read(&name).map_err(|e| e.to_string())?;
+        let bytes = max_bytes
             .map_or_else(
                 || g.read_asset(&name),
                 |limit| g.read_asset_limited(&name, limit),
             )
-            .map(tauri::ipc::Response::new)
-            .map_err(|e| e.to_string())
-    })
+            .map_err(|e| e.to_string())?;
+        Ok((bytes, path))
+    })?;
+    crate::watcher::note_asset_read(&window_label, &path);
+    crate::state::poke_watcher(&state.state);
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Validate one graph media file and return its top-level asset name for the
@@ -3196,9 +3067,13 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.import_asset(std::path::Path::new(&path), name.as_deref())
-            .map_err(|e| e.to_string())
+        let stored = g
+            .import_asset(std::path::Path::new(&path), name.as_deref())
+            .map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 
@@ -3270,10 +3145,13 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
+    let window_label = state.window.label().to_string();
     let stored = with_filesystem_graph(&state, |graph| {
-        graph
+        let stored = graph
             .import_asset_file(&mut capture, &name, max_bytes)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &graph.assets_path().join(&stored));
+        Ok(stored)
     })?;
     // The graph asset is authoritative now. Cleanup failure is harmless cache
     // litter and must not make the frontend omit the already-durable reference.
@@ -3785,7 +3663,13 @@ pub(crate) async fn list_orphan_assets(
 /// Move an orphaned asset to the recoverable trash.
 #[tauri::command]
 pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_trash_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
+    let window_label = state.window.label().to_string();
+    with_trash_graph(&state, |g| {
+        let path = g.assets_path().join(&name);
+        g.trash_asset(&name).map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &path);
+        Ok(())
+    })
 }
 
 /// Count + total bytes in the recoverable asset trash.
@@ -4728,7 +4612,7 @@ mod application_page_authority_tests {
             ["journals/2026_07_29.md", "journals/2026_07_28.md"]
         );
         let loads = Cell::new(0);
-        let feed = collect_journal_feed_page(inventory, 1, None, 20260729, |entry| {
+        let feed = collect_journal_feed_page(inventory.into_iter(), 1, |entry| {
             loads.set(loads.get() + 1);
             Ok(page(
                 &entry.name,
@@ -4888,8 +4772,11 @@ pub(crate) fn save_asset(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.save_asset(&name, &bytes).map_err(|e| e.to_string())
+        let stored = g.save_asset(&name, &bytes).map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 
@@ -5007,9 +4894,13 @@ pub(crate) fn save_pdf_area_image(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
-            .map_err(|e| e.to_string())
+        let stored = g
+            .write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
+            .map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 

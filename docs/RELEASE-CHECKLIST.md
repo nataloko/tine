@@ -16,9 +16,14 @@ may tag, publish, comment, and close issues.
    `tine-storage` tag/commit to the checked-in upstream certification receipt
    and persistent-format manifest, with no path, patch, branch, or rev override.
 2. Generate `docs/releases/vX.Y.Z-impact.json` from every Added, Changed, and
-   Fixed changelog bullet. For each item record regression coverage and its
-   Guide/docs, website, and blog disposition (`update`, `current`,
-   `not-applicable`, or `consult`). `consult` blocks the release.
+   Fixed changelog bullet. For each item record regression coverage and four
+   separate dispositions: user-facing **Guide**, engineering docs/contracts,
+   website, and blog (`update`, `current`, `not-applicable`, or `consult`). A
+   contract or changelog is not Guide coverage: Guide `update`/`current` must
+   cite canonical files under `crates/tine-core/src/templates/`. Every
+   user-visible Added item needs Guide coverage; a user-visible Changed item
+   may opt out only as explicitly performance-only, packaging-only, or
+   internal-only. `consult` blocks the release.
 3. For every accepted bug, require an entry in the indexed regression catalogs
    before the production fix begins (UI/native in the UI inventory; other bugs
    in the non-UI inventory). Public Fixed entries reference their GitHub issue;
@@ -108,10 +113,21 @@ may tag, publish, comment, and close issues.
    PR or focused CI is not release evidence. Any source/rebase/version change
    creates a new SHA and requires a new full run. See `docs/CI.md`.
 10. Manually dispatch `release.yml` on that same frozen ref. Its preflight must
-    verify the exact-SHA CI evidence before packaging begins. Tag only after the
+    use `mode=build`, `publish=false` and verify the exact-SHA CI evidence before
+    packaging begins. Record the successful source run ID. Tag only after the
     exact commit's platform builds, Linux E2E, Android, real offline Flatpak job,
-    and candidate assembly pass. The tag-triggered workflow enforces the same
-    CI evidence before it rebuilds/publishes release artifacts.
+    and candidate assembly pass. Candidate and exact Linux/Windows proof inputs
+    expire after three days.
+    A tag push does not publish. On the exact candidate tag, manually dispatch
+    `release.yml` with `mode=promote`, the recorded `source_run_id`, and
+    `publish=true`; this verifies the immutable candidate and publishes it
+    without rebuilding platforms. If an intervening descendant changes only an
+    exact path registered in `scripts/release-proof-only.json`, first rehearse
+    `mode=promote`, `publish=false` on that target, require every blocking
+    affected proof against the retained source binary to pass, then tag and run
+    the publishing promotion. Any unclassified, ambiguous, added/deleted/renamed,
+    non-descendant, or product-identity change requires fresh full CI and a new
+    `mode=build` candidate.
 11. After publication, inventory the real assets and prepare issue-specific
    reporter follow-ups. Comment/closure authority remains in the canonical
    agent agreement.
@@ -154,9 +170,16 @@ may tag, publish, comment, and close issues.
 ## Fail-closed rules
 
 - Missing or stale evidence is a failure, never a successful skip.
-- No release packaging or tag-triggered build may begin without a completed
-  manual full-CI run whose four required jobs succeeded on the exact candidate
-  SHA. A green PR/focused run or a green run for a parent commit is insufficient.
+- No release build may begin without a completed manual full-CI run whose nine
+  required jobs succeeded on the exact candidate SHA. A green PR/focused run or
+  a green run for a parent commit is insufficient. Promotion may reuse only a
+  successful no-publication candidate run through the machine-checked
+  same-commit or registered proof-only path; it cannot substitute arbitrary
+  parent evidence.
+- Tag pushes never publish by themselves. Publication requires an explicit
+  manual `mode=promote`, `publish=true` dispatch on the tag and a verified
+  promotion receipt naming the actor, source/target commits, retained artifacts,
+  product digest, and proof results.
 - A scenario that does not reach its intended assertions fails.
 - Retries may diagnose a flake but never erase the original failure.
 - If documentation or website impact needs a product decision, stop with a

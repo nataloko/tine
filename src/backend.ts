@@ -47,6 +47,10 @@ import type {
   SparseV2RuntimeStatusEvent,
   SparseV2TickEvent,
   SparseV2ErrorEvent,
+  SyncAbsenceSweepEvent,
+  SyncAbsenceSweepChangedEvent,
+  SyncAbsenceSweepActionOutcome,
+  SyncAbsenceSweepRestoreOutcome,
   SparseV2QueryRequest,
   SparseV2QueryReply,
   SparseV2EditorLoadRequest,
@@ -62,6 +66,7 @@ import type {
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
+import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 // Encode asset bytes as one base64 string for the save_*/copy_image IPC. The old
 // `Array.from(bytes)` produced a JSON number[] — ~4-5x the payload + a multi-MB
@@ -134,7 +139,7 @@ export type GraphFolderPickResult =
   | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
 
 export type PreparedGraphFolder =
-  | { status: "ready"; location: "local" | "icloud" }
+  | { status: "ready"; location: "local" | "icloud"; path?: string }
   | { status: "refused"; location?: undefined };
 
 export interface ClipboardAssetFile {
@@ -229,7 +234,12 @@ export interface Backend {
   bindCaptureGraph(): Promise<void>;
   listKnownGraphs(): Promise<KnownGraph[]>;
   forgetKnownGraph(path: string): Promise<void>;
+  /** Show a known graph's root folder in the OS file manager (desktop only). */
+  revealKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
+  /** Compile-time process architecture. Used to avoid offering updater targets
+   * that the signed release manifest deliberately does not publish. */
+  appArchitecture(): Promise<string>;
   /** Immutable, app-local plugin packages. Installation stores bytes but never
    * executes them; enabling is an explicit second step after host validation. */
   listInstalledPlugins(): Promise<InstalledPluginRecord[]>;
@@ -295,6 +305,12 @@ export interface Backend {
     bindingGeneration: number,
     request: ManagedApplicationMoveSubtreesRequest,
   ): Promise<ManagedApplicationMoveSubtreesResult>;
+  /** Retire response-replay evidence after the committed page pair is installed. */
+  acknowledgeManagedApplicationMove(
+    bindingGeneration: number,
+    episodeId: string,
+    batchId: string,
+  ): Promise<void>;
   /** Resolve one exact deferred move episode without routing a new gesture. */
   recoverManagedApplicationSubtrees(
     bindingGeneration: number,
@@ -326,6 +342,14 @@ export interface Backend {
   sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
   sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
   sparseV2Tick(): Promise<SparseV2Tick>;
+  listAbsenceSweeps(): Promise<SyncAbsenceSweepEvent[]>;
+  onAbsenceSweepChanged(
+    bindingGeneration: number,
+    cb: (sweep: SyncAbsenceSweepEvent) => void,
+  ): Promise<() => void>;
+  reapplyAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepActionOutcome>;
+  restoreAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepRestoreOutcome>;
+  keepAbsenceSweepDeletion(sweepId: string): Promise<void>;
   sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
@@ -659,6 +683,9 @@ export interface Backend {
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
+  /** Subscribe to externally changed graph assets. This is cache observation,
+   *  not managed-storage or oplog admission. */
+  onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void>;
   /** Subscribe to `logseq/config.edn` being re-read after an outside change.
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
@@ -767,7 +794,18 @@ export interface Backend {
   cancelGraphVerification(operationId: string): Promise<void>;
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
-  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number): Promise<void>;
+  diagnosticFrontendEvent(
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    line?: number,
+    column?: number,
+    delayMs?: number,
+    updaterStage?: string,
+    updaterCause?: string,
+  ): Promise<void>;
+  /** Whether the recorded session counts as live from now on. Mobile only: the
+   *  OS reaps a backgrounded app without notice, and that is not a crash
+   *  (GH #426). The backend ignores it on desktop. */
+  diagnosticSessionActive(active: boolean): Promise<void>;
 }
 
 /** Repo status for the git integration's status line / topbar badge. */
@@ -848,6 +886,13 @@ export interface GraphChangedBulk {
   changes: GraphChange[];
 }
 
+/** One coalesced watcher epoch for ordinary files under the approved assets
+ * capability. Paths are relative to assets/; absolute device paths never cross
+ * the bridge. */
+export interface AssetChangedBatch {
+  paths: string[];
+}
+
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -878,6 +923,7 @@ const DIAGNOSTIC_COMMANDS = new Set([
   "debug_log",
   "diagnostic_ipc_event",
   "diagnostic_frontend_event",
+  "diagnostic_session_active",
   "diagnostic_report",
   "save_diagnostic_report",
   "clear_diagnostics",
@@ -928,10 +974,12 @@ class TauriBackend implements Backend {
       result = await this.invoke<T>(cmd, leasedArgs);
     } catch (error) {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
+      recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
       throw error;
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
+    recordGraphOpenCommand(cmd, started, "completed");
     if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh
     // `Graph`, with a fresh (empty) editor-activation registry — must announce
@@ -981,8 +1029,14 @@ class TauriBackend implements Backend {
   forgetKnownGraph(path: string) {
     return this.call<void>("forget_known_graph", { path });
   }
+  revealKnownGraph(path: string) {
+    return this.call<void>("reveal_known_graph", { path });
+  }
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
+  }
+  appArchitecture() {
+    return this.call<string>("app_architecture");
   }
   listInstalledPlugins() {
     return this.call<InstalledPluginRecord[]>("list_installed_plugins");
@@ -1087,6 +1141,17 @@ class TauriBackend implements Backend {
       request,
     });
   }
+  acknowledgeManagedApplicationMove(
+    bindingGeneration: number,
+    episodeId: string,
+    batchId: string,
+  ) {
+    return this.call<void>("acknowledge_managed_application_move", {
+      bindingGeneration,
+      episodeId,
+      batchId,
+    });
+  }
   recoverManagedApplicationSubtrees(
     bindingGeneration: number,
     request: ManagedApplicationMoveSubtreesRequest,
@@ -1175,6 +1240,27 @@ class TauriBackend implements Backend {
   }
   sparseV2Tick() {
     return this.call<SparseV2Tick>("sparse_v2_tick");
+  }
+  listAbsenceSweeps() {
+    return this.call<SyncAbsenceSweepEvent[]>("list_absence_sweeps");
+  }
+  async onAbsenceSweepChanged(
+    bindingGeneration: number,
+    cb: (sweep: SyncAbsenceSweepEvent) => void,
+  ): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SyncAbsenceSweepChangedEvent>("absence-sweep-changed", (event) => {
+      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.sweep);
+    });
+  }
+  reapplyAbsenceSweep(sweepId: string) {
+    return this.call<SyncAbsenceSweepActionOutcome>("reapply_absence_sweep", { sweepId });
+  }
+  restoreAbsenceSweep(sweepId: string) {
+    return this.call<SyncAbsenceSweepRestoreOutcome>("restore_absence_sweep", { sweepId });
+  }
+  keepAbsenceSweepDeletion(sweepId: string) {
+    return this.call<void>("keep_absence_sweep_deletion", { sweepId });
   }
   sparseV2CleanShutdown() {
     return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");
@@ -1672,6 +1758,10 @@ class TauriBackend implements Backend {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
+  async onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
+  }
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
@@ -1788,8 +1878,25 @@ class TauriBackend implements Backend {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
-  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number) {
-    return this.call<void>("diagnostic_frontend_event", { kind, line, column, delayMs });
+  diagnosticFrontendEvent(
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    line?: number,
+    column?: number,
+    delayMs?: number,
+    updaterStage?: string,
+    updaterCause?: string,
+  ) {
+    return this.call<void>("diagnostic_frontend_event", {
+      kind,
+      line,
+      column,
+      delayMs,
+      updaterStage,
+      updaterCause,
+    });
+  }
+  diagnosticSessionActive(active: boolean) {
+    return this.call<void>("diagnostic_session_active", { active });
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

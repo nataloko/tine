@@ -120,10 +120,12 @@ impl ExternalImportObservationEntry {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> ManagedTextKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) const fn portable_path_key_digest(&self) -> PortablePathKeyDigest {
         self.portable_path_key_digest
     }
@@ -169,7 +171,6 @@ pub(crate) struct ExternalImportObservationMaterial {
 
 // Packet 4B deliberately leaves the draft/finalize adapter for the following
 // packet, so these crate-internal handoff methods have no production caller yet.
-#[allow(dead_code)]
 impl ExternalImportObservationMaterial {
     pub(crate) fn new(
         workspace_id: WorkspaceId,
@@ -208,6 +209,7 @@ impl ExternalImportObservationMaterial {
         &self.entries
     }
 
+    #[cfg(test)]
     pub(crate) fn into_operation_object(
         self,
         prospective_portable_path_root: PortablePathIndexRoot,
@@ -246,7 +248,6 @@ impl ExternalImportObservationMaterial {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalImportObservationMaterialError {
     Observation(ExternalImportObservationError),
@@ -355,10 +356,12 @@ impl ExternalImportObservation {
         self.import_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn portable_path_key_version(&self) -> u32 {
         self.portable_path_key_version
     }
 
+    #[cfg(test)]
     pub(crate) const fn prospective_portable_path_root(&self) -> PortablePathIndexRoot {
         self.prospective_portable_path_root
     }
@@ -754,7 +757,6 @@ mod tests {
         entries: Vec<()>,
     }
 
-    #[allow(dead_code)]
     #[derive(Deserialize)]
     struct BoundedAnnotationsProbe(
         #[serde(deserialize_with = "deserialize_annotations")] Vec<AnnotatedIdentity>,

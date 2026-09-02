@@ -16,9 +16,11 @@ pub mod edn;
 pub mod fast_commit;
 mod filesystem_durability;
 
+pub mod durability_counters;
 pub mod graph_name_folding;
 pub mod graph_text_scope;
 pub mod html_sanitize;
+pub mod journal_feed;
 pub mod logbook;
 pub mod managed_storage_journey;
 pub mod model;
@@ -27,6 +29,9 @@ pub mod oplog;
 pub mod org;
 mod outline;
 pub mod pdf;
+#[cfg(test)]
+mod projection_producer_census;
+mod property_line;
 pub mod publish;
 pub mod query;
 pub mod query_plan;

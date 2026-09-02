@@ -15,11 +15,12 @@ icon:: 📱
   - **An editing toolbar docks above the on-screen keyboard** with the actions a keyboard lacks: Outdent / Indent, Move block up / down, Soft newline, TODO, **Camera**, **Voice memo**, Date picker, `[[ ]]` and `(( ))`, the Slash menu, Undo/Redo, and a pinned hide-keyboard button.
   - **Camera and Voice memo** capture a photo (or an existing image) or an `.m4a` recording straight into the graph's `assets/` folder and insert the link at the caret — permission-prompted on first use.
   - **Hardware Back navigates within Tine** — dismissing a drawer or dialog first and stepping back through page history, exiting to the system only at the root.
+  - **PDFs use that same one-pane history.** Open a PDF link in place, press **Notes** to visit its highlights page, and use Hardware Back to return first to the PDF and then to the source page. Desktop-style PDF tabs and companion splits stay disabled on Android.
   - **Plugins and themes follow the same lifecycle as desktop** — browse, install (always disabled at first), review its capabilities, enable, settings, disable, uninstall — and a package that did not declare Android shows **Unavailable** on it. The hands-on path is [[Workflows/Extend Tine]].
   - The whole interface scales through **Interface size** (saved per device) and the native status/navigation icons follow your selected theme.
 - ## What stays different on Android
   - **Global quick capture is desktop-only** — the `tine --capture` desktop shortcut and its always-on-top capture window have no Android counterpart. Its setup lives on [[Features/Quick capture]].
-  - **One page at a time** — no tab strip, no split panes, no second windows; the desktop multi-window model does not exist here.
+  - **One route at a time** — pages and PDF readers share one history, with no tab strip, split panes, or second windows; the desktop multi-window model does not exist here.
   - **Context menus open from the bullet affordance** rather than a right-click anywhere; long-press on text stays with the system, so text selection works natively.
   - In the PDF reader, highlight recolor and remove work, but the highlight menu's **Copy ref** and **Linked references** entries appear only on desktop.
   - **Updates come from you.** The in-app update checker and installer are off on mobile; take each new release-signed APK from the GitHub releases page and sideload it. Distribution today is a sideloaded, release-signed APK attached to each GitHub release; Play Store and F-Droid are planned, and the F-Droid build will omit the network plugin/theme catalogue while keeping local sideloading.
@@ -27,6 +28,7 @@ icon:: 📱
   - Everything the phone skips is here: tabs with pin, reorder, and reopen, split panes, saved workspaces, multiple windows, the modifier-click gestures, and global quick capture.
   - **In-app updates** run on Windows and Linux — the app checks once per launch and Settings → **About** → **Check for updates** downloads, installs, and relaunches in place. On macOS the same notice opens the releases page instead, because today's unsigned app bundle cannot safely replace itself.
   - Any folder on your disk can be a graph — choose it with the ordinary folder picker; there is no sandboxed document picker.
+  - Releases also include an **experimental 32-bit Windows** installer and portable ZIP for older Windows 10 tablets. It is a manual-download pilot, not offered by automatic updates; ordinary Windows users should keep using the x64 package.
 - ## iOS today
   - There is **no public iOS app** — public releases ship the desktop apps and the Android APK, and iOS is being scoped.
   - Some iOS words already exist in the source so a future app is prepared for — the folder-picker handling and the plugin manifest's `ios` platform value — but that is checked-in scaffolding and developer vocabulary, not an installable app. A plugin declaring only `ios` has no host to run on today.

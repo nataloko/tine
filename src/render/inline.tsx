@@ -6,9 +6,11 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, onCl
 import { Dynamic } from "solid-js/web";
 import { extOf, mediaKind } from "../media";
 import { openPage, openPageInNewTab, openPageAtBlock, openInNewTab, focusBlock } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { refClickZoom } from "../copySettings";
 import { isJournalTitle } from "../journal";
-import { openPdf, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openBlockRefContextMenu, setLightbox, setAudioPlayer, dataRev, graphEpoch, graphMeta, pushToast, showBrackets } from "../ui";
+import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, openBlockRefContextMenu, setLightbox, setAudioPlayer, dataRev, graphEpoch, graphMeta, pushToast, showBrackets } from "../ui";
+import { openPdf } from "../panes";
 import { copyImageFromSrc } from "../copyImage";
 import { parseBlock, parserReady } from "./parse";
 import type { Inline, Url, MacroInline, TimestampInline, EmailValue, Block as AstBlock, Format } from "./ast";
@@ -323,6 +325,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     const dest = internalLinkDest(e);
     if (dest === "sidebar" && !isGuidePageName(targetName())) openPageInSidebar(targetName(), kind());
     else if (dest === "background") openPageInNewTab(targetName(), kind());
+    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: targetName(), pageKind: kind() });
     else openPage(targetName(), kind());
   };
 
@@ -366,7 +369,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
           if (internalLinkAuxClick(e, () => openPageInNewTab(targetName(), kind()))) e.stopPropagation();
         }}
         onContextMenu={(e) => {
-          if (!shouldOpenTextContextMenu(e.target)) return;
+          if (!shouldOpenTextContextMenu(e)) return;
           e.preventDefault();
           e.stopPropagation();
           if (!isGuidePageName(targetName())) openPageContextMenu(e.clientX, e.clientY, targetName());
@@ -449,16 +452,23 @@ function renderLink(
     return <BlockRefView id={url.v} label={label} spanAttrs={spanAttrs} />;
   }
   const dest = urlDest(url);
+  // GH #442: a remote http(s) URL ending in `.pdf` is an external web link —
+  // it opens in the browser like every other remote URL. Only graph/local
+  // asset PDF references enter Tine's PDF viewer.
+  const remotePdf = /^https?:\/\//i.test(dest) && /\.pdf$/i.test(dest);
   if (s.image) {
     const { width, height } = parseImageMetaBrace(s.metadata);
     const alt = s.label && s.label.length ? astText(s.label) : "";
-    if (/\.pdf$/i.test(dest)) return <PdfAssetLink dest={dest} label={alt} spanAttrs={spanAttrs} />;
+    if (!remotePdf && /\.pdf$/i.test(dest)) return <PdfAssetLink dest={dest} label={alt} spanAttrs={spanAttrs} />;
     const k = mediaKind(dest);
     if (k === "video" || k === "audio")
       return <MediaEmbed url={dest} kind={k} alt={alt} width={width} blockId={blockId} spanAttrs={spanAttrs} />;
-    return <AssetImage url={dest} alt={alt} width={width} height={height} blockId={blockId} spanAttrs={spanAttrs} />;
+    // A remote .pdf image falls through: <img> cannot display a PDF anyway, so
+    // it renders as the ordinary external link below — its click then opens
+    // the browser, exactly like every other remote URL (GH #442).
+    if (!remotePdf) return <AssetImage url={dest} alt={alt} width={width} height={height} blockId={blockId} spanAttrs={spanAttrs} />;
   }
-  if (/\.pdf$/i.test(dest)) {
+  if (!remotePdf && /\.pdf$/i.test(dest)) {
     const labelStr = s.label && s.label.length ? astText(s.label) : pdfFilenameFromDest(dest);
     return <PdfAssetLink dest={dest} label={labelStr} spanAttrs={spanAttrs} />;
   }
@@ -483,8 +493,8 @@ function renderLink(
           e.preventDefault();
           e.stopPropagation();
           const rel = assetLinkRel(dest);
-          if (rel !== null) void backend().openAsset(rel);
-          else void backend().openExternal(dest);
+          if (rel !== null) void backend().openAsset(rel).catch((error) => reportLinkOpenFailure(dest, error));
+          else void backend().openExternal(dest).catch((error) => reportLinkOpenFailure(dest, error));
         }}
       >
         <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode, macroExpansion, format)}</Show>
@@ -492,6 +502,15 @@ function renderLink(
       <CopyButton text={dest} title="Copy link" class="copy-inline" />
     </span>
   );
+}
+
+/** GH #444: a link that cannot be opened has to say so. Every one of these
+ *  paths used to discard the backend's rejection, so a refused scheme, a
+ *  missing file and a platform with no file manager all looked identical to a
+ *  dead link — which is exactly how the reported `file://` failure stayed
+ *  invisible for as long as it did. */
+export function reportLinkOpenFailure(dest: string, error: unknown): void {
+  pushToast(`Couldn't open ${dest}. (${String(error)})`, "error");
 }
 
 function pdfFilenameFromDest(dest: string): string {
@@ -983,8 +1002,8 @@ function MediaEmbed(props: {
   const open = (e: MouseEvent) => {
     e.stopPropagation();
     const r = rel();
-    if (r && !external) void backend().openAsset(r);
-    else void backend().openExternal(props.url);
+    if (r && !external) void backend().openAsset(r).catch((error) => reportLinkOpenFailure(props.url, error));
+    else void backend().openExternal(props.url).catch((error) => reportLinkOpenFailure(props.url, error));
   };
   let tryingBlobFallback = false;
   let blobLease: MediaBlobLease | null = null;
@@ -1317,10 +1336,13 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           // Tine scrolls + flashes the block in context (default); the OG behavior —
           // zoom into the block as its own page — is opt-in (Settings → ref-click-zoom).
           // GH #283: Ctrl/Cmd+click opens a BACKGROUND tab, matching every other
-          // internal-link surface.
+          // internal-link surface. GH #438: Alt+click opens the referenced block
+          // in the OTHER pane, matching Search / the Quick Switcher.
           if (dest === "sidebar") openBlockInSidebar(ref);
           else if (dest === "background")
             openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+          else if (dest === "pane")
+            openRouteInOtherPane({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
           else if (refClickZoom()) focusBlock(props.id);
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}

@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import {
   addGroup,
   deleteGroup,
@@ -9,10 +10,12 @@ import {
   setGroupCollapsed,
 } from "../favoritesStore";
 import { itemKind, resolveDrop, visibleRows, type FavRow } from "../favoritesLayout";
-import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor } from "../ui";
+import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor, openActionContextMenu, type ContextMenuAction } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
-import { backend } from "../backend";
+import { backend, type KnownGraph } from "../backend";
+import { writeClipboardText } from "../clipboard";
+import { isMobilePlatform } from "../nativeChrome";
 import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
@@ -196,6 +199,16 @@ export function Sidebar(props: {
   // text-selection AND middle-click autoscroll up front (GH #207 — the old
   // shift-only guard let the middle gesture leak to the browser here).
   const shiftGuard = internalLinkMouseDown;
+  // GH #464: the link is the page TITLE, not the row. A row stretches the full
+  // width of the sidebar, so most of it was blank space that still opened a
+  // page — the hand cursor followed the pointer out over nothing, and a reorder
+  // drag that fell short of the 4px threshold navigated instead of moving the
+  // row. The remainder of the row is grab space now. `closest` rather than
+  // `===`, so the ⭐ prefix and an emoji <img> inside the title still count as
+  // the title. The context menu deliberately stays on the whole row: it is not
+  // navigation, it cannot be confused with a drag, and right-clicking anywhere
+  // on a row to get that page's menu is worth keeping.
+  const onLabel = (e: Event) => !!(e.target as HTMLElement | null)?.closest(".nav-page-label");
   const openRowMenu = (e: MouseEvent, name: string, kind: PageKind) => {
     e.preventDefault();
     openPageContextMenu(e.clientX, e.clientY, name, kind);
@@ -324,13 +337,20 @@ export function Sidebar(props: {
                         onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
-                          if (rowReorderClickSuppressed()) return;
+                          if (rowReorderClickSuppressed() || !onLabel(e)) return;
                           const dest = internalLinkDest(e);
-                          openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                          if (dest === "pane") {
+                            // Alt+click (GH #438): the same other-pane route the
+                            // page refs and search results use; alias-resolved
+                            // like every other favorite-row destination.
+                            const t = target();
+                            openRouteInOtherPane({ kind: "page", name: t.name, pageKind: t.kind });
+                          } else openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
-                        onAuxClick={(e) =>
-                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"))
-                        }
+                        onAuxClick={(e) => {
+                          if (!onLabel(e)) return;
+                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"));
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openSidebarPageTarget(name, itemKind(name), "context", { x: e.clientX, y: e.clientY });
@@ -339,8 +359,10 @@ export function Sidebar(props: {
                         {toggle}
                         {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
                             crashes painting a raw color-emoji glyph on hardened
-                            libstdc++ (#29); Twemoji <img> never touches the font. */}
-                        <EmojiText text={`⭐ ${name}`} />
+                            libstdc++ (#29); Twemoji <img> never touches the font.
+                            Wrapped in .nav-page-label: that span IS the link, and
+                            everything beside it is grab space (GH #464). */}
+                        <span class="nav-page-label"><EmojiText text={`⭐ ${name}`} /></span>
                       </div>
                     );
                   }}
@@ -382,18 +404,23 @@ export function Sidebar(props: {
                         classList={{ active: isActive(target().name, target().path) }}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
+                          if (!onLabel(e)) return;
                           const dest = internalLinkDest(e);
                           if (dest === "sidebar") openPageInSidebar(target());
                           else if (dest === "background") openPageTargetInNewTab(target());
+                          else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target() });
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
-                        onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))}
+                        onAuxClick={(e) => {
+                          if (!onLabel(e)) return;
+                          internalLinkAuxClick(e, () => openPageTargetInNewTab(target()));
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openPageContextMenu(e.clientX, e.clientY, target());
                         }}
                       >
-                        <EmojiText text={r.name.startsWith("hls__") ? r.name.slice(5) : r.name} />
+                        <span class="nav-page-label"><EmojiText text={r.name.startsWith("hls__") ? r.name.slice(5) : r.name} /></span>
                       </div>
                     );
                   }}
@@ -422,25 +449,28 @@ export function Sidebar(props: {
                   classList={{ active: isActive(p.name, p.path) }}
                   onMouseDown={shiftGuard}
                   onClick={(e) => {
+                    if (!onLabel(e)) return;
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar({ name: p.name, pageKind: "page", path: p.path });
                     else if (dest === "background") p.path
                       ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
                       : openPageInNewTab(p.name, "page");
+                    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: p.name, pageKind: "page", ...(p.path ? { path: p.path } : {}) });
                     else openEntry(p.path, p.name);
                   }}
-                  onAuxClick={(e) =>
+                  onAuxClick={(e) => {
+                    if (!onLabel(e)) return;
                     internalLinkAuxClick(e, () =>
                       p.path
                         ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
-                        : openPageInNewTab(p.name, "page"))
-                  }
+                        : openPageInNewTab(p.name, "page"));
+                  }}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });
                   }}
                 >
-                  <EmojiText text={pageLabel()(p)} />
+                  <span class="nav-page-label"><EmojiText text={pageLabel()(p)} /></span>
                 </div>
               )}
             </For>
@@ -512,6 +542,73 @@ function graphDisplayName(): string {
 export interface KnownGraphOpenDeps {
   switchInPlace(path: string): Promise<LoadGraphPathOutcome>;
   openNewWindow(path: string): Promise<LoadGraphPathOutcome>;
+}
+
+export interface GraphRowMenuDeps {
+  openKnown(path: string, newWindow: boolean): Promise<LoadGraphPathOutcome>;
+  reveal(path: string): Promise<void>;
+  copyPath(text: string): Promise<void>;
+  forget(path: string): Promise<void>;
+  /** Peer windows and a file manager both exist only on desktop. */
+  desktop: boolean;
+  isCurrent: boolean;
+}
+
+/** Per-row actions for the graph switcher's right-click menu.
+ *
+ *  Built as a plain array so the menu's contents are testable without a DOM:
+ *  which items a row offers depends on the platform and on whether the row is
+ *  the graph this window already has open, and those are exactly the parts that
+ *  regress silently. Items that cannot act are kept visible and disabled with
+ *  the reason in the label (the `SheetTable` field-header menu does the same) —
+ *  hiding them would make the menu change shape row to row, and discoverability
+ *  is the entire point of this menu.
+ */
+export function graphRowMenuActions(
+  graph: KnownGraph,
+  deps: GraphRowMenuDeps,
+): ContextMenuAction[] {
+  const items: ContextMenuAction[] = [];
+  // Same self-retrying shape as the row's left click: a failed open puts a
+  // sticky Retry toast up that re-runs this exact target, not the last one.
+  const open = (newWindow: boolean) => {
+    const attempt = () => void deps.openKnown(graph.path, newWindow)
+      .catch((error) => reportGraphOpenFailure(error, attempt));
+    attempt();
+  };
+  if (deps.desktop) {
+    items.push({
+      label: deps.isCurrent
+        ? "Open in a new window (already open here)"
+        : "Open in a new window",
+      disabled: deps.isCurrent,
+      run: () => open(true),
+    });
+  }
+  items.push({
+    label: deps.isCurrent ? "Open here (current graph)" : "Open here",
+    disabled: deps.isCurrent,
+    run: () => open(false),
+  });
+  if (deps.desktop) {
+    items.push({
+      label: "Show in folder",
+      run: () => void deps.reveal(graph.path).catch((error) =>
+        pushToast(`Couldn't show the graph folder. (${String(error)})`, "error")),
+    });
+  }
+  items.push({
+    label: "Copy path",
+    run: () => void deps.copyPath(graph.path).catch((error) =>
+      pushToast(`Couldn't copy the path. (${String(error)})`, "error")),
+  });
+  items.push({
+    label: "Remove from this list",
+    danger: true,
+    run: () => void deps.forget(graph.path).catch((error) =>
+      pushToast(`Couldn't remove graph. (${String(error)})`, "error")),
+  });
+  return items;
 }
 
 export function openKnownGraph(
@@ -588,6 +685,22 @@ export function GraphSwitcher(props: {
                 class="ctx-item graph-switch-row"
                 classList={{ active: graph.path === graphMeta()?.root }}
                 title={graph.path}
+                onContextMenu={(event) => {
+                  // Local suppression: nothing disables WebKit's own menu
+                  // globally, so without this the native menu appears next to
+                  // ours. stopPropagation keeps the switcher's backdrop handler
+                  // (which closes the switcher) from firing underneath.
+                  event.preventDefault();
+                  event.stopPropagation();
+                  openActionContextMenu(event.clientX, event.clientY, graphRowMenuActions(graph, {
+                    openKnown: props.actions.openKnown,
+                    reveal: (path) => backend().revealKnownGraph(path),
+                    copyPath: writeClipboardText,
+                    forget: (path) => backend().forgetKnownGraph(path).then(() => { void refetch(); }),
+                    desktop: !isMobilePlatform,
+                    isCurrent: graph.path === graphMeta()?.root,
+                  }));
+                }}
                 onClick={(event) => {
                   const newWindow = event.shiftKey;
                   close();

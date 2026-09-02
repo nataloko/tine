@@ -4,8 +4,6 @@
 //! The managed runtime owns this crate-private coordinator and invokes it for
 //! admitted local edits, provider ingress, recovery, and derived-state drains.
 
-#![allow(dead_code)] // mixed production coordinator and fault-injection surface
-
 use std::fmt;
 #[cfg(test)]
 use std::time::{Duration, Instant};
@@ -13,8 +11,9 @@ use std::time::{Duration, Instant};
 use crate::model::{HandoffSafeGuard, PublishedHandoffLatch};
 use crate::Graph;
 
+use super::absence_sweep::{SweepError, SweepRecorder};
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
-use super::hot_engine::{EngineError, LocalAuthorCapture, ReconciliationNeeded};
+use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
 use super::import::plan_clean_affected_import;
 use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, RuntimePromotionError, RuntimeRevocation,
@@ -22,38 +21,14 @@ use super::local_active::{
 };
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
-    ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, LineageDigest, ObjectStore,
-    OperationTransaction, PageId, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
-    ProjectionReceiptStore, ProjectionWork, RebuildSource, SessionId, ShardedHotEngine,
-    SqliteFrontier, TailOverlay, TailReservation,
+    ContentDigest, CrdtPeerId, ImportPlanStatus, OperationTransaction, PageId, PreparedBatch,
+    ProjectionEndpointBinding, ProjectionReceiptStore, SessionId, ShardedHotEngine, SqliteFrontier,
 };
+#[cfg(test)]
+use super::{ObjectStore, RebuildSource, TailOverlay};
+use crate::oplog::projection_turn_journal::ProjectionTurnJournalState;
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
-const RESUME_OPERATION_BUDGET: usize = 256;
-
-#[cfg(test)]
-thread_local! {
-    static TEST_RESUME_OPERATION_BUDGET: std::cell::Cell<Option<usize>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-#[cfg(test)]
-struct TestResumeOperationBudgetGuard(Option<usize>);
-
-#[cfg(test)]
-impl Drop for TestResumeOperationBudgetGuard {
-    fn drop(&mut self) {
-        TEST_RESUME_OPERATION_BUDGET.set(self.0);
-    }
-}
-
-#[cfg(test)]
-fn test_resume_operation_budget(value: usize) -> TestResumeOperationBudgetGuard {
-    let prior = TEST_RESUME_OPERATION_BUDGET.replace(Some(value));
-    TestResumeOperationBudgetGuard(prior)
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TrustedLocalPreparationStageTimings {
@@ -100,63 +75,6 @@ pub(crate) fn last_trusted_local_preparation_stage_timings() -> TrustedLocalPrep
     LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS.get()
 }
 
-struct ResumeBudget {
-    remaining: usize,
-}
-
-impl ResumeBudget {
-    fn new() -> Self {
-        Self {
-            remaining: Self::budget(),
-        }
-    }
-
-    /// The per-slice operation budget. The former value of 16 made fixed
-    /// reauthentication/reopen overhead dominate: a 300-file import needed 168
-    /// ~277 ms slices, and one legitimate 20,000-block page needed thousands.
-    /// 256 retains bounded yields while amortizing that fixed work; the large
-    /// page regression completes within 64 actor turns instead of remaining in
-    /// Recovering until an unrelated memory bound eventually fired (#311).
-    /// `TINE_RESUME_BUDGET` remains available for measured trade-off probes.
-    fn budget() -> usize {
-        #[cfg(test)]
-        if let Some(value) = TEST_RESUME_OPERATION_BUDGET.get() {
-            return value;
-        }
-        std::env::var("TINE_RESUME_BUDGET")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(RESUME_OPERATION_BUDGET)
-    }
-
-    /// Charge `count` units to the phase that actually performed the work.
-    ///
-    /// The phase is supplied by the call site rather than assumed, so an
-    /// exhaustion failure always names the drain that overran and phase
-    /// assertions in regressions stay meaningful.
-    fn consume(
-        &mut self,
-        count: usize,
-        phase: OperationalPhase,
-    ) -> Result<(), OperationalCoordinatorError> {
-        if count > self.remaining {
-            return Err(OperationalCoordinatorError::new(
-                phase,
-                "coordinator resume operation budget was exceeded",
-            ));
-        }
-        // The budget is charged per phase, so this is the only place that knows
-        // which phase consumes an import's work. ~36 s of a 300-file import is
-        // irreducible work (F42) and it has never been attributed to a phase.
-        if super::phase_trace_enabled() {
-            eprintln!("PHASE CHARGE {phase:?} {count}");
-        }
-        self.remaining -= count;
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationalPhase {
     Bindings,
@@ -164,10 +82,8 @@ pub(crate) enum OperationalPhase {
     Draft,
     Capture,
     Finalize,
-    TailReservation,
     Publication,
     ArchiveStage,
-    TailAdmission,
     SqliteDrain,
     ProjectionDrain,
 }
@@ -176,11 +92,8 @@ pub(crate) enum OperationalPhase {
 /// cannot turn into progress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RetainedBlockReason {
-    Rejected(super::EngineError),
-    Quarantined,
     PublishedAuthentication,
     StableBinding,
-    GuardedProjectionConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +122,7 @@ impl OperationalCoordinatorError {
 
     /// A bounded slice completed its portion and must be resumed. Distinct from
     /// a failure so the caller can continue instead of retrying.
+    #[cfg(test)]
     fn continuation_required(phase: OperationalPhase, detail: impl Into<String>) -> Self {
         Self {
             phase,
@@ -255,10 +169,12 @@ impl OperationalCoordinatorError {
     ///
     /// This is diagnosis only. The live admission remains the sole authority,
     /// and the runtime's own latch independently refuses every later boundary.
+    #[cfg(test)]
     pub(crate) const fn revocation(&self) -> Option<&RuntimeRevocation> {
         self.revocation.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn retained_block_reason(&self) -> Option<&RetainedBlockReason> {
         self.retained_block.as_ref()
     }
@@ -483,6 +399,7 @@ fn execute_clean_local_inner(
     transaction: &OperationTransaction,
     batch_id: Option<BatchId>,
     persist_fingerprint: Option<&mut dyn FnMut(ContentDigest) -> Result<(), String>>,
+    projection_turns: &mut ProjectionTurnJournalState,
 ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
     let (admission, engine, database) = session.parts().map_err(|refusal| {
         OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
@@ -587,7 +504,15 @@ fn execute_clean_local_inner(
         continuation.failure = error;
         return Ok(CleanLocalMutationState::DurablePending(continuation));
     }
-    match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+    match resume_clean_published(
+        &admission,
+        graph,
+        receipts,
+        engine,
+        database,
+        &continuation,
+        projection_turns,
+    ) {
         Ok(()) => {
             continuation.guard.complete();
             Ok(CleanLocalMutationState::Complete(batch_id))
@@ -611,14 +536,24 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
-        execute_clean_local_inner(session, graph, receipts, transaction, None, None)
+        execute_clean_local_inner(
+            session,
+            graph,
+            receipts,
+            transaction,
+            None,
+            None,
+            projection_turns,
+        )
     }
 
     /// Execute one clean local mutation with a stable application-owned batch
     /// identity. The immutable episode record is published before the manifest
     /// commit, so a crash can distinguish a retry of the same move from an
     /// unrelated batch collision without creating a second semantic edit.
+    #[cfg(test)]
     pub(crate) fn execute_clean_local_correlated(
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
@@ -626,6 +561,7 @@ impl OperationalCoordinator {
         batch_id: BatchId,
         transaction: &OperationTransaction,
         mut persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
         execute_clean_local_inner(
             session,
@@ -634,14 +570,16 @@ impl OperationalCoordinator {
             transaction,
             Some(batch_id),
             Some(&mut persist_fingerprint),
+            projection_turns,
         )
     }
 
-    pub(crate) fn retry_clean_local(
+    pub(crate) fn retry_clean_local_with_turns(
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         mut continuation: CleanPublishedContinuation,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> CleanLocalMutationState {
         let (admission, engine, database) = match session.parts() {
             Ok(parts) => parts,
@@ -651,7 +589,15 @@ impl OperationalCoordinator {
                 return CleanLocalMutationState::DurablePending(continuation);
             }
         };
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            projection_turns,
+        ) {
             Ok(()) => {
                 let batch_id = continuation.batch_id;
                 continuation.guard.complete();
@@ -672,6 +618,7 @@ impl OperationalCoordinator {
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
@@ -761,7 +708,15 @@ impl OperationalCoordinator {
             continuation.failure = error;
             return Ok(CleanLocalMutationState::DurablePending(continuation));
         }
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            projection_turns,
+        ) {
             Ok(()) => {
                 continuation.guard.complete();
                 Ok(CleanLocalMutationState::Complete(batch_id))
@@ -783,6 +738,8 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         requested_paths: &[&str],
+        sweep_recorder: &mut dyn SweepRecorder,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanExternalMutationState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
             OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
@@ -898,6 +855,45 @@ impl OperationalCoordinator {
                 format!("clean SQLite identity candidates are unavailable: {error}"),
             )
         })?;
+        let mut page_count_at_open = || {
+            let mut count = 0_usize;
+            let mut cursor = None;
+            loop {
+                let pages = commit_claim_source
+                    .page_inventory_after(
+                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                        None,
+                        512,
+                    )
+                    .map_err(|error| SweepError::Invalid(error.to_string()))?;
+                if pages.is_empty() {
+                    break;
+                }
+                count = count.saturating_add(pages.len());
+                let last = pages.last().expect("nonempty page inventory batch");
+                cursor = Some((last.path.clone(), last.page_id));
+                if pages.len() < 512 {
+                    break;
+                }
+            }
+            Ok(count)
+        };
+        if let Err(error) = sweep_recorder.record_prepared_absence_batch(
+            engine,
+            &prepared,
+            &commit_claim_source,
+            &mut page_count_at_open,
+        ) {
+            published.cancel_prepublication();
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                format!("durable sweep membership append failed before deletion commit: {error}"),
+            ));
+        }
+        if let Err(error) = fault(OperationalFaultPoint::AfterSweepRecord) {
+            published.cancel_prepublication();
+            return Err(error);
+        }
         let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -939,7 +935,15 @@ impl OperationalCoordinator {
             continuation.failure = error;
             return Ok(CleanExternalMutationState::DurablePending(continuation));
         }
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            projection_turns,
+        ) {
             Ok(()) => {
                 continuation.guard.complete();
                 Ok(CleanExternalMutationState::Complete(batch_id))
@@ -1000,10 +1004,6 @@ pub(crate) struct PreparedLocalMutation {
 }
 
 impl PreparedLocalMutation {
-    pub(crate) const fn batch_id(&self) -> BatchId {
-        self.batch_id
-    }
-
     pub(crate) const fn prepared_batch(&self) -> &PreparedBatch {
         &self.prepared
     }
@@ -1204,6 +1204,7 @@ fn resume_clean_published(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     continuation: &CleanPublishedContinuation,
+    projection_turns: &mut ProjectionTurnJournalState,
 ) -> Result<(), OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
     let event = AcceptedBatchEvent::from_accepted(
@@ -1254,131 +1255,131 @@ fn resume_clean_published(
         ));
     }
 
-    for work in engine
-        .clean_projection_work_for_batch(continuation.batch_id)
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?
     {
-        reprove_workspace_authority(
-            admission,
-            WorkspaceAuthorityBoundary::ProjectionDrain,
-            OperationalPhase::ProjectionDrain,
-        )?;
-        fault(OperationalFaultPoint::BeforeProjection)?;
-        super::projection::execute_clean_manifested_projection_work_under_handoff(
-            graph,
-            receipts,
-            database,
-            engine,
-            &work,
-            &continuation.guard,
-        )
-        .map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
-        })?;
-        fault(OperationalFaultPoint::AfterProjection)?;
-    }
-
-    // Projection intents authored by another endpoint describe accepted
-    // semantic state, not bytes that this receiver may copy verbatim.  Once
-    // SQLite has advanced to the accepted frontier, render each foreign
-    // intent again against this endpoint's exact local base and record the
-    // result in its private receipt store.  Keeping this in the resumable
-    // published continuation makes provider ingress crash-safe: a retry may
-    // observe the manifest and SQLite transition already complete, but it
-    // must still finish the receiver-local Markdown projection.
-    let receiver_endpoint = engine
-        .projection_endpoint_binding()
-        .ok_or_else(|| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::ProjectionDrain,
-                "clean provider receiver has no enrolled projection endpoint",
-            )
-        })?
-        .endpoint_id();
-    let batch = match engine
-        .archive_store()
-        .ok_or_else(|| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ArchiveStage,
-                "clean committed operation has no retained archive",
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?
-        .inspect_batch(continuation.batch_id)
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })? {
-        BatchInspection::Ready(batch) => batch,
-        BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                "clean accepted batch became partial before receiver-local projection",
-                RetainedBlockReason::PublishedAuthentication,
-            ));
-        }
-    };
-    let projection = super::projection_manifest::validate_projection_object_set(
-        batch.manifest(),
-        batch.objects(),
-    )
-    .map_err(|error| {
-        OperationalCoordinatorError::retained_block(
-            OperationalPhase::ProjectionDrain,
-            error.to_string(),
-            RetainedBlockReason::PublishedAuthentication,
-        )
-    })?;
-    for source in projection
-        .intents()
-        .iter()
-        .filter(|source| source.source_endpoint_id() != receiver_endpoint)
-    {
-        reprove_workspace_authority(
-            admission,
-            WorkspaceAuthorityBoundary::ProjectionDrain,
-            OperationalPhase::ProjectionDrain,
-        )?;
-        let completed = super::projection::execute_receiver_local_projection_under_handoff(
-            graph,
-            receipts,
-            engine,
-            Some(database),
-            source,
-            &continuation.guard,
-            true,
-        )
-        .map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
-        })?;
-        if completed.is_none() {
-            // Name the artifact and the operation. This detail is what
-            // `clean_shutdown` reports when it refuses `Safe`, so an
-            // unapplied delivered deletion is never silent.
-            let operation = if matches!(source.target(), super::ManifestProjectionTarget::Absent) {
-                "deletion"
-            } else {
-                "projection"
+        let turns = projection_turns;
+        let work = engine
+            .clean_projection_work_for_batch(continuation.batch_id)
+            .map_err(|error| {
+                OperationalCoordinatorError::retained_block(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                    RetainedBlockReason::PublishedAuthentication,
+                )
+            })?;
+        if !turns.retains_batch(continuation.batch_id) {
+            let receiver = engine
+                .projection_endpoint_binding()
+                .ok_or_else(|| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        "clean provider receiver has no enrolled projection endpoint",
+                    )
+                })?
+                .endpoint_id();
+            let archive = engine.archive_store().ok_or_else(|| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    "clean provider continuation has no accepted archive",
+                )
+            })?;
+            let batch = match archive
+                .inspect_batch(continuation.batch_id)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                    )
+                })? {
+                BatchInspection::Ready(batch) => batch,
+                BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                    return Err(OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        "clean provider continuation batch is incomplete",
+                    ));
+                }
             };
-            return Err(OperationalCoordinatorError::continuation_required(
-                OperationalPhase::ProjectionDrain,
-                format!(
-                    "clean receiver-local {operation} of {:?} requires a continuation",
-                    source.path().as_str()
-                ),
-            ));
+            let projection = super::projection_manifest::validate_projection_object_set(
+                batch.manifest(),
+                batch.objects(),
+            )
+            .map_err(|error| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                )
+            })?;
+            let foreign = projection
+                .intents()
+                .iter()
+                .filter(|source| source.source_endpoint_id() != receiver)
+                .cloned()
+                .collect::<Vec<_>>();
+            let (origin, pages) = if let Some(source) = foreign.first() {
+                (
+                    super::TurnOrigin::IngressForeign {
+                        batch_id: continuation.batch_id,
+                        source_endpoint_id: source.source_endpoint_id(),
+                    },
+                    super::projection::projection_turn_pages_for_foreign_sources(engine, &foreign)
+                        .map_err(|error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::ProjectionDrain,
+                                error.to_string(),
+                            )
+                        })?,
+                )
+            } else {
+                (
+                    super::TurnOrigin::IngressLocal {
+                        batch_id: continuation.batch_id,
+                    },
+                    super::projection::projection_turn_pages_for_work(engine, &work).map_err(
+                        |error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::ProjectionDrain,
+                                error.to_string(),
+                            )
+                        },
+                    )?,
+                )
+            };
+            if !pages.is_empty() {
+                turns.append(origin, pages).map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                    )
+                })?;
+            }
         }
+        while let Some(turn) = turns.front().cloned() {
+            reprove_workspace_authority(
+                admission,
+                WorkspaceAuthorityBoundary::ProjectionDrain,
+                OperationalPhase::ProjectionDrain,
+            )?;
+            fault(OperationalFaultPoint::BeforeProjection)?;
+            super::projection::replay_projection_turn(
+                graph,
+                receipts,
+                engine,
+                database,
+                &turn,
+                Some(&continuation.guard),
+            )
+            .map_err(|error| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                )
+            })?;
+            turns.checkpoint_front().map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error)
+            })?;
+            fault(OperationalFaultPoint::AfterProjection)?;
+        }
+        return Ok(());
     }
-    Ok(())
 }
 
 fn draft_with_bounded_peer_candidates(
@@ -1457,11 +1458,8 @@ pub(crate) enum OperationalFaultPoint {
     AfterDraft,
     AfterCapture,
     AfterFinalize,
-    AfterReservation,
+    AfterSweepRecord,
     AfterManifest,
-    AfterStage,
-    BeforeTailAdmission,
-    AfterTailAdmission,
     AfterSqliteApply,
     BeforeProjection,
     AfterProjection,
@@ -1492,6 +1490,7 @@ fn terminal_pipeline_origins() -> Vec<BatchOrigin> {
     TERMINAL_PIPELINE_ORIGINS.with(|origins| origins.borrow().clone())
 }
 
+#[cfg(test)]
 pub(crate) fn fail_once_at(point: OperationalFaultPoint) {
     OPERATIONAL_FAULT.set(Some(point));
 }
@@ -1500,12 +1499,6 @@ pub(crate) fn fail_once_at(point: OperationalFaultPoint) {
 pub(crate) fn fail_repeatedly_at(point: OperationalFaultPoint, failures: u8) {
     assert!(failures > 0, "a repeated operational fault needs work");
     OPERATIONAL_REPEATED_FAULT.set(Some((point, failures)));
-}
-
-pub(crate) fn act_once_at(point: OperationalFaultPoint, action: impl FnOnce() + 'static) {
-    OPERATIONAL_ACTION.with(|slot| {
-        *slot.borrow_mut() = Some((point, Box::new(action)));
-    });
 }
 
 fn fault(point: OperationalFaultPoint) -> Result<(), OperationalCoordinatorError> {
@@ -1551,11 +1544,8 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
             OperationalFaultPoint::AfterDraft => OperationalPhase::Draft,
             OperationalFaultPoint::AfterCapture => OperationalPhase::Capture,
             OperationalFaultPoint::AfterFinalize => OperationalPhase::Finalize,
-            OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
+            OperationalFaultPoint::AfterSweepRecord => OperationalPhase::Publication,
             OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
-            OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
-            OperationalFaultPoint::BeforeTailAdmission => OperationalPhase::TailAdmission,
-            OperationalFaultPoint::AfterTailAdmission => OperationalPhase::TailAdmission,
             OperationalFaultPoint::AfterSqliteApply => OperationalPhase::SqliteDrain,
             OperationalFaultPoint::BeforeProjection | OperationalFaultPoint::AfterProjection => {
                 OperationalPhase::ProjectionDrain
@@ -1578,17 +1568,14 @@ mod tests {
         commit_clean_activation, open_clean_activation, prepare_clean_activation,
     };
     use crate::oplog::local_active::CleanLocalRuntime;
-    use crate::oplog::object_store::{
-        fail_next_engine_history_head_swap, fail_next_publish_after_objects,
-    };
-    use crate::oplog::projection::fail_next_formatting_adoption_after_intent_for_harness;
+    use crate::oplog::object_store::fail_next_publish_after_objects;
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
-        recover_incomplete_projections, write_projection_exact, AnnotatedProjectionBase,
-        ApplicationRuntimeRoot, BlockId, BlockLocation, DeviceId, DocumentId, LineageDigest,
-        LogicalPageName, ManagedPath, ManagedTextKind, ManifestProjectionPrecondition,
-        ManifestedProjectionIntent, ObjectKind, OperationTransaction, PageId, ProjectionClaim,
-        ProjectionEndpointId, SemanticOperation, TAIL_MAX_BYTES,
+        recover_incomplete_projections, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,
+        BlockLocation, DeviceId, DocumentId, LineageDigest, LogicalPageName, ManagedPath,
+        ManagedTextKind, ManifestProjectionPrecondition, ManifestedProjectionIntent, ObjectKind,
+        OperationTransaction, PageId, ProjectionClaim, ProjectionEndpointId, SemanticOperation,
+        TAIL_MAX_BYTES,
     };
 
     struct TestRoot(PathBuf);
@@ -1628,6 +1615,7 @@ mod tests {
         receipts: ProjectionReceiptStore,
         archive: ObjectStore,
         runtime: CleanLocalRuntime,
+        projection_turns: crate::oplog::projection_turn_journal::ProjectionTurnJournalState,
         lineage: LineageDigest,
         catalog: DocumentId,
         page_id: PageId,
@@ -1779,6 +1767,10 @@ mod tests {
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
             Self {
+                projection_turns:
+                    crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                        runtime.engine(),
+                    ),
                 _root: root,
                 graph_root,
                 archive_root,
@@ -1839,6 +1831,7 @@ mod tests {
                 &self.graph,
                 &self.receipts,
                 transaction,
+                &mut self.projection_turns,
             )
         }
 
@@ -1855,6 +1848,7 @@ mod tests {
                 batch_id,
                 transaction,
                 |_| Ok(()),
+                &mut self.projection_turns,
             )
         }
 
@@ -1876,6 +1870,8 @@ mod tests {
                 &self.graph,
                 &self.receipts,
                 paths,
+                &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                &mut self.projection_turns,
             )
         }
 
@@ -1887,11 +1883,12 @@ mod tests {
                 .runtime
                 .admit_clean_derived_recovery(&self.graph)
                 .unwrap();
-            OperationalCoordinator::retry_clean_local(
+            OperationalCoordinator::retry_clean_local_with_turns(
                 &mut session,
                 &self.graph,
                 &self.receipts,
                 continuation,
+                &mut self.projection_turns,
             )
         }
 
@@ -1914,6 +1911,7 @@ mod tests {
                 enrollment_root,
                 database_path,
                 graph,
+                projection_turns,
                 receipts,
                 archive,
                 runtime,
@@ -2008,6 +2006,7 @@ mod tests {
                 enrollment_root,
                 database_path,
                 graph,
+                projection_turns,
                 receipts,
                 archive,
                 runtime,
@@ -2215,6 +2214,7 @@ mod tests {
             &fixture.graph,
             &foreign_receipts,
             &transaction,
+            &mut fixture.projection_turns,
         ) {
             Err(error) => error,
             Ok(_) => panic!("a stale clean local binding must be typed before publication"),
@@ -2557,12 +2557,14 @@ mod tests {
             .admit_clean_derived_recovery(&fixture.graph)
             .unwrap();
 
-        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
-            &mut session,
-            &foreign_graph,
-            &fixture.receipts,
-            pending,
-        ));
+        let pending =
+            expect_clean_local_pending(OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                &foreign_graph,
+                &fixture.receipts,
+                pending,
+                &mut fixture.projection_turns,
+            ));
         assert_eq!(pending.batch_id(), batch_id);
         assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
         assert!(fixture.graph.probe_managed_text_writer().is_err());
@@ -3016,6 +3018,7 @@ mod tests {
                 &fixture.graph,
                 &foreign,
                 &transaction,
+                &mut fixture.projection_turns,
             ),
             Err(OperationalCoordinatorError {
                 phase: OperationalPhase::Bindings,
@@ -3043,12 +3046,14 @@ mod tests {
             .runtime
             .admit_clean_derived_recovery(&fixture.graph)
             .unwrap();
-        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
-            &mut session,
-            &foreign_graph,
-            &fixture.receipts,
-            pending,
-        ));
+        let pending =
+            expect_clean_local_pending(OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                &foreign_graph,
+                &fixture.receipts,
+                pending,
+                &mut fixture.projection_turns,
+            ));
         assert_eq!(pending.batch_id(), batch_id);
         assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
         assert!(fixture.graph.probe_managed_text_writer().is_err());

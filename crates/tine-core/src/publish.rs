@@ -4142,7 +4142,7 @@ fn write_publish_stage_file(stage: &PublishStage, name: &str, bytes: &[u8]) -> i
     options.write(true).create_new(true);
     let mut file = stage.dir.open_with(relative, &options)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    crate::durability_counters::sync_file(&file)
 }
 
 #[cfg(test)]
@@ -4239,7 +4239,7 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
     // cap-std may represent a directory capability with an O_PATH descriptor on
     // Linux, which cannot itself be fsynced. Every generated file is fsynced;
     // directory durability remains best-effort, matching the other atomic paths.
-    let _ = stage.dir.try_clone()?.into_std_file().sync_all();
+    let _ = crate::durability_counters::sync_directory(&stage.dir.try_clone()?.into_std_file());
     let PublishStage {
         path,
         root,

@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
@@ -127,7 +127,14 @@ import {
 import { MEDIA_EDITORS } from "../mediaEditors";
 import { mediaEditorCommand, setMediaEditorCommand } from "../mediaEditorSettings";
 import { formatAssetName } from "../media";
-import { galleryThemes, selectedGalleryTheme, applyTheme as applyGalleryTheme } from "../themeGallery";
+import {
+  applyThemeColors,
+  applyThemeStyle,
+  clearThemeSelection,
+  galleryThemes,
+  selectedThemeColors,
+  selectedThemeStyle,
+} from "../themeGallery";
 import type { GalleryTheme } from "../styles/themes";
 import { platformKind } from "../platform";
 import {
@@ -140,12 +147,14 @@ import { openPage, openFile, openPageTarget } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
+import { settingsMaximized, setSettingsMaximized } from "../settingsLayout";
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
+import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -168,6 +177,18 @@ import {
   setLauncherRankingEnabled,
 } from "../launcherRanking";
 import { registerTransientLayer } from "../transientLayers";
+import {
+  DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH,
+  DEFAULT_STANDARD_CONTENT_WIDTH,
+  CONTENT_WIDTH_SLIDER_MAX,
+  MAX_CONTENT_WIDTH,
+  MIN_CONTENT_WIDTH,
+  changeStandardContentWidth,
+  changeWideContentWidth,
+  resetStandardContentWidth,
+  standardContentWidth,
+  wideContentWidth,
+} from "../contentWidth";
 
 // Journal display-title formats offered in the date-format dropdown — OG's
 // `journal-title-formatters` set (frontend/date.cljs). Display-only; the on-disk
@@ -230,10 +251,14 @@ type SettingSearchEntry = {
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
-  { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
+  { tab: "appearance", label: "Theme mode", description: "light dark system" },
+  { tab: "appearance", label: "Style", description: "typography journal headings presentation notnote" },
+  { tab: "appearance", label: "Color scheme", description: "default nord solarized gruvbox theme package colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
+  { tab: "appearance", label: "Standard page width", description: "reading column pixels cap reset", aliases: ["narrow width"], level: "advanced" },
+  { tab: "appearance", label: "Wide page width", description: "fill pane custom pixels cap", aliases: ["wide mode width"], level: "advanced" },
   { tab: "appearance", label: "Document mode", description: "hide bullets prose" },
   { tab: "appearance", label: "Document-mode Enter creates a new block", description: "Enter Shift Enter internal newline config" },
   { tab: "appearance", label: "Show brackets", description: "page references config shortcut" },
@@ -364,14 +389,13 @@ export function Settings(): JSX.Element {
   // Settings owns its semantic Escape rungs.  Registering here (rather than in
   // App) keeps shortcut recording/search/disclosures from being skipped by a
   // blanket modal close and ensures disposal follows this component lifetime.
-  // Transient maximize (GH #287): a pure geometry toggle on the dialog, so the
-  // selected page and scroll position ride through untouched, and closing the
-  // modal always restores the default size for the next open.
-  const [maximized, setMaximized] = createSignal(false);
-  createEffect(() => {
-    if (settingsOpen()) return;
-    setMaximized(false);
-  });
+  // Maximize (GH #287): a pure geometry toggle on the dialog, so the selected
+  // page and scroll position ride through untouched. GH #427 made it stick —
+  // the state lives in settingsLayout.ts and is remembered across a reopen and
+  // a restart, because this dialog unmounts on close and someone who wants the
+  // wide size wants it every time, not once per open.
+  const maximized = settingsMaximized;
+  const setMaximized = setSettingsMaximized;
 
   createEffect(() => {
     if (!settingsOpen()) return;
@@ -436,8 +460,8 @@ export function Settings(): JSX.Element {
               <input
                 class="settings-search-input"
                 type="search"
-                placeholder="Search settings…"
-                aria-label="Search settings"
+                placeholder={tab() === "shortcuts" ? "Search shortcuts..." : "Search settings…"}
+                aria-label={tab() === "shortcuts" ? "Search shortcuts" : "Search settings"}
                 value={settingsQuery()}
                 onInput={(event) => setSettingsQuery(event.currentTarget.value)}
                 onKeyDown={(event) => {
@@ -476,7 +500,18 @@ export function Settings(): JSX.Element {
               </button>
             </div>
             <div class="settings-pane-body">
-              <Show when={settingsQuery().trim()}>
+              {/* GH #409: Settings is mounted under a fallback-less <Suspense>
+                  in App.tsx (it is lazy()), so a panel that starts loading a
+                  resource when it mounts suspended the WHOLE dialog — the user
+                  saw Settings vanish and come back on every switch to Journals,
+                  Backups and Graph, the three sections whose panels do exactly
+                  that (the template list, the journal-filename inventory, the
+                  home-page picker). Sections with nothing to load never
+                  flickered, which is why the report names only those three.
+                  This boundary keeps the suspension inside the pane, so the
+                  dialog, its list of sections and the search box stay put. */}
+              <Suspense fallback={<div class="settings-pane-pending" aria-hidden="true" />}>
+              <Show when={settingsQuery().trim() && tab() !== "shortcuts"}>
                 <div class="settings-search-results" aria-live="polite">
                   <Show when={matches().length} fallback={<div class="settings-search-empty">No matching settings</div>}>
                     <For each={matches()}>
@@ -523,6 +558,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "shortcuts"}>
                 <ShortcutsSettingsPane
                   shortcuts={shortcuts()}
+                  search={settingsQuery()}
                   recording={recording()}
                   onRecord={(id) => setRecording(recording() === id ? null : id)}
                   onReset={resetShortcutOverride}
@@ -534,6 +570,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "about"}>
                 <AboutTab />
               </Show>
+              </Suspense>
             </div>
           </div>
         </div>
@@ -1218,7 +1255,7 @@ function ThemeGalleryCard(props: {
       class="theme-gallery-card"
       classList={{ selected: props.selected }}
       aria-pressed={props.selected}
-      onClick={() => applyGalleryTheme(props.id)}
+      onClick={() => applyThemeColors(props.id)}
     >
       <span class="theme-gallery-thumb">
         <img src={props.thumbnail} alt="" loading="lazy" />
@@ -1263,7 +1300,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
     if (!confirmed) return;
     setThemePackageBusy(key);
     try {
-      if (selectedGalleryTheme() === key) applyGalleryTheme("");
+      clearThemeSelection(key);
       await uninstallThemePackage(key);
       pushToast(`${name} was uninstalled.`, "info");
     } catch (error) {
@@ -1302,7 +1339,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
   return (
     <>
       <div class="settings-row">
-        <span class="settings-label">Theme</span>
+        <span class="settings-label">Mode</span>
         <div
           class="theme-switch theme-switch3"
           classList={{ "is-light": appearancePreference() === "light", "is-system": appearancePreference() === "system", "is-dark": appearancePreference() === "dark" }}
@@ -1344,6 +1381,28 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       </div>
 
       <div class="settings-section">Themes</div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">Style</div>
+          <div class="settings-hint">Typography, journal headings, and other presentation choices.</div>
+        </div>
+        <select
+          class="settings-select"
+          aria-label="Theme style"
+          value={selectedThemeStyle()}
+          onChange={(event) => applyThemeStyle(event.currentTarget.value)}
+        >
+          <option value="">Default</option>
+          <For each={installedThemes().filter((installed) =>
+            !themeVersionIsRevoked(installed.key)
+            && Object.keys(installed.manifest.presentation ?? {}).length > 0
+          )}>
+            {(installed) => <option value={installed.key}>{installed.manifest.name}</option>}
+          </For>
+        </select>
+      </div>
+
+      <div class="settings-section">Color scheme</div>
       <div class="theme-gallery-grid">
         <ThemeGalleryCard
           id=""
@@ -1351,7 +1410,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
           author="Tine"
           badge="Stock"
           thumbnail="/theme-thumbnails/default.png"
-          selected={selectedGalleryTheme() === ""}
+          selected={selectedThemeColors() === ""}
         />
         <For each={galleryThemes}>
           {(theme) => (
@@ -1361,13 +1420,13 @@ function AppearanceTab(props: { search: string }): JSX.Element {
               author={theme.author}
               badge={galleryBadge(theme)}
               thumbnail={theme.thumbnail}
-              selected={selectedGalleryTheme() === theme.id}
+              selected={selectedThemeColors() === theme.id}
             />
           )}
         </For>
       </div>
       <div class="settings-hint theme-gallery-hint">
-        Themes recolor Tine using Logseq's <code>--ls-*</code> variables. If you keep your own <code>logseq/custom.css</code>, it still takes priority.
+        Style and colors are independent. Theme packages use validated colors and Tine-owned presentation styles; your <code>logseq/custom.css</code> still takes priority.
       </div>
 
       <Show when={COMMUNITY_REGISTRY_ENABLED}>
@@ -1409,7 +1468,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       <div class="settings-row">
         <div>
           <div class="settings-label">Install a token theme</div>
-          <div class="settings-hint">Theme packages contain only whitelisted color tokens and metadata—no scripts, selectors, imports, or remote assets.</div>
+          <div class="settings-hint">Theme packages contain whitelisted colors, metadata, and optional Tine-owned presentation presets—no scripts, selectors, imports, or remote assets.</div>
         </div>
         <div>
           <input
@@ -1450,11 +1509,20 @@ function AppearanceTab(props: { search: string }): JSX.Element {
                     <div class="settings-field-control">
                       <button
                         class="settings-btn"
-                        disabled={revoked() || selectedGalleryTheme() === installed.key}
-                        onClick={() => applyGalleryTheme(installed.key)}
+                        disabled={revoked() || selectedThemeColors() === installed.key}
+                        onClick={() => applyThemeColors(installed.key)}
                       >
-                        {revoked() ? "Revoked" : selectedGalleryTheme() === installed.key ? "Selected" : "Use theme"}
+                        {revoked() ? "Revoked" : selectedThemeColors() === installed.key ? "Colors selected" : "Use colors"}
                       </button>
+                      <Show when={Object.keys(installed.manifest.presentation ?? {}).length > 0}>
+                        <button
+                          class="settings-btn"
+                          disabled={revoked() || selectedThemeStyle() === installed.key}
+                          onClick={() => applyThemeStyle(installed.key)}
+                        >
+                          {revoked() ? "Revoked" : selectedThemeStyle() === installed.key ? "Style selected" : "Use style"}
+                        </button>
+                      </Show>
                       <button class="settings-link" onClick={() => void backend().openExternal(installed.manifest.source)}>Details</button>
                       <button
                         class="settings-btn settings-btn-danger"
@@ -1585,6 +1653,84 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       </Field>
 
       <AdvancedSection tab="appearance" forceOpen={advancedMatch("appearance", props.search)}>
+        <Field
+          label="Standard page width"
+          hint="Maximum reading-column width on this device. Reset uses the active theme's default (810 px in Tine's built-in themes)."
+        >
+          <div class="settings-width-control">
+            <input
+              class="settings-width-range"
+              aria-label="Standard page width"
+              type="range"
+              min={MIN_CONTENT_WIDTH}
+              max={CONTENT_WIDTH_SLIDER_MAX}
+              step="10"
+              value={standardContentWidth() ?? DEFAULT_STANDARD_CONTENT_WIDTH}
+              onInput={(event) => changeStandardContentWidth(event.currentTarget.valueAsNumber)}
+            />
+            <input
+              class="settings-num settings-width-number"
+              aria-label="Standard page width in pixels"
+              type="number"
+              min={MIN_CONTENT_WIDTH}
+              max={MAX_CONTENT_WIDTH}
+              step="10"
+              value={standardContentWidth() ?? DEFAULT_STANDARD_CONTENT_WIDTH}
+              onChange={(event) => changeStandardContentWidth(event.currentTarget.valueAsNumber)}
+            />
+            <span class="settings-width-unit">px</span>
+            <Show when={standardContentWidth() !== null}>
+              <button class="settings-btn" onClick={resetStandardContentWidth}>Reset</button>
+            </Show>
+          </div>
+        </Field>
+
+        <Field
+          label="Wide page width"
+          hint="Wide mode can fill the available pane or stop at a custom maximum. Saved on this device."
+        >
+          <div class="settings-width-control">
+            <select
+              class="settings-select"
+              aria-label="Wide page width mode"
+              value={wideContentWidth() === null ? "fill" : "custom"}
+              onChange={(event) =>
+                changeWideContentWidth(
+                  event.currentTarget.value === "fill"
+                    ? null
+                    : (wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH),
+                )
+              }
+            >
+              <option value="fill">Fill pane</option>
+              <option value="custom">Custom maximum</option>
+            </select>
+            <Show when={wideContentWidth() !== null}>
+              <input
+                class="settings-width-range"
+                aria-label="Wide page width"
+                type="range"
+                min={MIN_CONTENT_WIDTH}
+                max={CONTENT_WIDTH_SLIDER_MAX}
+                step="10"
+                value={wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH}
+                onInput={(event) => changeWideContentWidth(event.currentTarget.valueAsNumber)}
+              />
+              <input
+                class="settings-num settings-width-number"
+                aria-label="Wide page width in pixels"
+                type="number"
+                min={MIN_CONTENT_WIDTH}
+                max={MAX_CONTENT_WIDTH}
+                step="10"
+                value={wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH}
+                onChange={(event) => changeWideContentWidth(event.currentTarget.valueAsNumber)}
+              />
+              <span class="settings-width-unit">px</span>
+            </Show>
+          </div>
+        </Field>
+
         <Field
           label="Smooth scrolling (experimental)"
           hint="Animate the journal feed's scrolling to smooth out WebKitGTK's stepped mouse-wheel jumps. Off by default; this is a feel experiment — turn it off if it gets in the way."
@@ -2500,12 +2646,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     const value = status();
     return value?.state === "refused" ? value : null;
   };
-  const activationPartProgress = () => {
-    const progress = activationProgress();
-    return progress?.kind === "bootstrap_detached_authoring" && progress.total > 0
-      ? progress
-      : null;
-  };
   const activationProgressLabel = () => {
     const progress = activationProgress();
     if (!progress) {
@@ -2513,21 +2653,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       return transition
         ? `${transition.phase.replaceAll("_", " ")}…`
         : "Preparing Tine-managed storage…";
-    }
-    if (progress.kind === "bootstrap_detached_authoring") {
-      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
-    }
-    if (progress.kind === "bootstrap_preparation_subphase") {
-      return {
-        source_protocol: "Preparing source inventory…",
-        operation_spool: "Planning graph operations…",
-        partition: "Dividing setup work into parts…",
-        detached_authoring: "Building operation history…",
-        sealing: "Sealing prepared history…",
-      }[progress.subphase];
-    }
-    if (progress.kind === "bootstrap_preparation_summary") {
-      return "Prepared graph operation history…";
     }
     if (progress.kind === "readiness_sample") {
       return "Selecting representative pages for the readiness proof…";
@@ -3166,18 +3291,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={enabling()}>
                     <div class="settings-activation-progress" role="status" aria-live="polite">
                       <div class="settings-hint">{activationProgressLabel()}</div>
-                      <Show
-                        when={activationPartProgress()}
-                        fallback={<progress aria-label={activationProgressLabel()} />}
-                      >
-                        {(part) => (
-                          <progress
-                            aria-label={activationProgressLabel()}
-                            value={part().completed}
-                            max={part().total}
-                          />
-                        )}
-                      </Show>
+                      <progress aria-label={activationProgressLabel()} />
                     </div>
                   </Show>
                   <Show when={current().state === "active"}>
@@ -3510,108 +3624,6 @@ export function SettingsConflictPanels(): JSX.Element {
 // navigates to THIS specific file (editable, saves back to itself), Merge folds a
 // stray into the canonical day, Rename rescues it as a normal page, Trash removes
 // the redundant one (recoverable).
-/** One file of a duplicate journal day, with its reconcile actions.
- *
- *  Exported because the in-page conflict panel renders the same rows: one
- *  renderer, not two that drift apart. `parentLayerId` exists only so the
- *  transient layers (the content preview, the rename box) attach to whichever
- *  surface is hosting the row. */
-export function ConflictFileRow(props: {
-  file: JournalFile;
-  onOpen: () => void;
-  onMerge?: () => void;
-  onRename: (newName: string) => void;
-  onTrash: () => void;
-  parentLayerId?: string;
-}): JSX.Element {
-  const rowLayerId = `journal-conflict-${props.file.path}`;
-  let renameRoot: HTMLDivElement | undefined;
-  let contentRoot: HTMLPreElement | undefined;
-  const [open, setOpen] = createSignal(false);
-  const [renaming, setRenaming] = createSignal(false);
-  const [newName, setNewName] = createSignal("");
-  const [content] = createResource(
-    () => (open() ? props.file.name : null),
-    async (name) => (name ? backend().readJournalFile(name).catch((e) => `(couldn’t read: ${String(e)})`) : "")
-  );
-  const submitRename = () => {
-    const n = newName().trim();
-    if (n) props.onRename(n);
-    setRenaming(false);
-    setNewName("");
-  };
-  createEffect(() => {
-    if (!open()) return;
-    const unregister = registerTransientLayer({
-      id: `${rowLayerId}-content`,
-      parentId: props.parentLayerId ?? "settings",
-      root: () => contentRoot ?? null,
-      dismiss: () => { setOpen(false); return true; },
-    });
-    onCleanup(unregister);
-  });
-  createEffect(() => {
-    if (!renaming()) return;
-    const unregister = registerTransientLayer({
-      id: `${rowLayerId}-rename`,
-      parentId: props.parentLayerId ?? "settings",
-      root: () => renameRoot ?? null,
-      dismiss: () => { setRenaming(false); setNewName(""); return true; },
-    });
-    onCleanup(unregister);
-  });
-  return (
-    <>
-      <div class="journal-conflict-row" data-journal-conflict={props.file.path}>
-        <button class="settings-asset-name mono" title="Show this file's contents" onClick={() => setOpen(!open())}>
-          {open() ? "▾ " : "▸ "}
-          {props.file.name}
-          <Show when={props.file.canonical}>
-            <span class="journal-conflict-keep"> · canonical</span>
-          </Show>
-        </button>
-        <span class="journal-conflict-actions">
-          <button class="settings-btn" title="Open this exact file (editable)" onClick={props.onOpen}>
-            Open
-          </button>
-          <Show when={props.onMerge}>
-            <button class="settings-btn" title="Append this file's blocks to the canonical day, then trash it" onClick={props.onMerge}>
-              Merge
-            </button>
-          </Show>
-          <button class="settings-btn" title="Move this file to a uniquely-named page" onClick={() => { setRenaming(true); setNewName(""); }}>
-            Rename…
-          </button>
-          <button class="settings-btn settings-btn-danger" onClick={props.onTrash}>
-            Trash
-          </button>
-        </span>
-      </div>
-      <div class="journal-conflict-preview">{props.file.preview}</div>
-      <Show when={renaming()}>
-        <div ref={renameRoot} class="journal-conflict-rename">
-          <input
-            class="settings-input"
-            placeholder="New page name"
-            value={newName()}
-            onInput={(e) => setNewName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.isComposing || e.keyCode === 229) return;
-              if (e.key === "Enter") submitRename();
-              else if (e.key === "Escape") setRenaming(false);
-            }}
-          />
-          <button class="settings-btn" onClick={submitRename}>Save</button>
-          <button class="settings-btn" onClick={() => setRenaming(false)}>Cancel</button>
-        </div>
-      </Show>
-      <Show when={open()}>
-        <pre ref={contentRoot} class="journal-conflict-content">{content.loading ? "…" : content() || "(empty file)"}</pre>
-      </Show>
-    </>
-  );
-}
-
 // Duplicate journal days: a date that resolves to >1 file (e.g. a date-stem file
 // plus a title-named one, usually from a date-format change). Tine never
 // auto-merges, so list each file with reconcile actions (Open/Merge/Rename/Trash).

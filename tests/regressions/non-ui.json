@@ -2,6 +2,66 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
+   "title": "Bounded managed block referrers retain the exact Direct Files document-order prefix and result accounting",
+   "family": "managed-query-parity",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime.rs"],
+    "scenario": "managed.block-referrers-bounded-direct-prefix",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: max_rows=1 returned an arbitrary internal-ID-ordered managed subset with total=2 while Direct reported the exact document-order prefix with total=24. Managed discovery now covers the full generation-bound candidate set before the shared path-ordered construction budget selects rows."
+  },
+  {
+   "id": "REG-REPORT-EXPORT-ATOMIC-001",
+   "title": "User-selected diagnostic and graph-verification reports publish atomically instead of truncating destinations in place",
+   "family": "data-safety",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["desktop"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/debug.rs", "src-tauri/src/graph_verification.rs", "crates/tine-core/src/model.rs"],
+    "scenario": "reports.user-selected-atomic-export",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: both savers called std::fs::write directly. They now stage and flush complete bytes, atomically replace the selected name, and flush its parent through the shared small-output publication family."
+  },
+  {
+   "id": "REG-DIRECT-RETURN-PROVIDER-ARCHIVE-DURABILITY-001",
+   "title": "Graceful Direct Files return durably sets aside and can roll back graph-local managed provider state",
+   "family": "managed-storage-data-safety",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs"],
+    "scenario": "managed.direct-return-provider-set-aside-barriers",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: recovery creation, v2 set-aside, and rollback performed zero directory barriers. Creation now flushes .tine-sync, and both cross-directory renames flush destination before source."
+  },
+  {
+   "id": "REG-BACKUP-RESTORE-DIRECTORY-DURABILITY-001",
+   "title": "Capability-bound backup restore never acknowledges recovery reservation retirement or publication before directory entries are durable",
+   "family": "backup-recovery",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/backup.rs"],
+    "scenario": "backup.restore-directory-barrier-crash-safety",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: recovery directory creation and cross-directory live retirement had no directory barriers, and live publication silently skipped a failed parent-handle clone. Injected EIO tests now prove each operation refuses success while retaining only complete old or new bytes; cross-directory barriers are recovery-first."
+  },
+  {
    "id": "REG-CORE-FLAGGED-RENAME-INJECTION-DETERMINISM",
    "title": "A shared-provider flagged-rename fault injected by one test never fails an unrelated test running beside it",
    "family": "release-test-honesty",
@@ -173,13 +233,14 @@
   },
   {
    "id": "REG-PROJECTION-RECOVERY-SIDECAR-GC-001",
-   "title": "Projection recovery sidecars retire fairly only after durable restart-and-grace evidence under clean one-app handoff, with changed bytes retained visibly",
+   "title": "Projection recovery sidecars retain substituted resources and fail closed across crash recovery and cleanup-namespace damage",
    "family": "sync-data-safety",
    "sources": {
     "issues": [],
     "commits": [
      "c12d07840948fffd435eb1b5cd706977a0785610",
-     "380bd9b8c3fa491b0c95fa4fb095d522d3f45d69"
+     "380bd9b8c3fa491b0c95fa4fb095d522d3f45d69",
+     "76154a0f28878782bad515c01d31fd5a067c91ac"
     ]
    },
    "platforms": [
@@ -191,28 +252,14 @@
     "tests": [
      "crates/tine-core/src/oplog/projection_store.rs::tests::same_byte_rebind_after_handle_capture_never_publishes_cleanup_authority",
      "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::graph_local_retirement_succeeds_when_receipts_are_on_another_filesystem",
      "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_same_byte_replacement",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_retains_stale_handle_write_at_final_boundary",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::settled_stale_descriptor_write_after_final_reread_documents_handoff_residual",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::unchanged_quarantine_requires_restart_and_meaningful_grace",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::restart_before_grace_retains_quarantine_and_clock_rollback_restarts_settlement",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::changed_quarantine_becomes_visible_conflict_without_blocking_cleanup_queue",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::oversized_changed_quarantine_is_renamed_visible_without_loading_it",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::settled_cleanup_queue_drains_in_bounded_passes_without_history_growth",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::blocked_cleanup_round_cannot_starve_later_changed_sidecar",
      "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_state_and_identity_fail_closed",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::cleanup_observation_crash_cuts_retain_or_publish_conservative_state",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::final_quarantine_same_byte_rebind_preserves_both_resources",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_parent_rebind_and_original_quarantine",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_index_visits_only_live_attempts_after_historical_completions",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::cleanup_crash_cuts_resume_quarantine_and_marker_retirement_idempotently"
+     "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed"
     ],
     "scenario": "projection.recovery-sidecar-settlement-and-retirement",
     "failBefore": "proven"
    },
-   "notes": "Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Catalog maintenance 2026-08-28: packet 2b deliberately collapsed the restart/grace cleanup protocol and removed its obsolete tests. The remaining coverage names the retained fail-closed resource-substitution, canonical-v1 compatibility, same-byte replacement, and cleanup-namespace integrity contract; deleted retirement-oracle tests are not release evidence."
   },
   {
    "id": "REG-SYNC-PROVIDER-OBSERVATION-ORDERING-001",
@@ -321,6 +368,29 @@
    }
   },
   {
+   "id": "REG-ASSET-OBSERVATION-001",
+   "title": "Externally changed asset images refresh without admitting asset bytes to graph text or managed storage",
+   "family": "external-files",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native-ui",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs",
+     "src/mediaEditors.test.ts",
+     "scripts/e2e-external-assets.mjs"
+    ],
+    "scenario": "filesystem.asset-observation-and-cache-refresh",
+    "failBefore": "proven"
+   }
+  },
+  {
    "id": "REG-ANDROID-BACKUP-RESTORE-EXDEV-001",
    "title": "Backup restore pages journals sidecars and config keep recovery and publication on the live graph filesystem when app data is on another device",
    "family": "backup-recovery",
@@ -425,12 +495,37 @@
    "coverage": {
     "tests": [
      "src/iosAtomicPublicationContract.test.ts",
-     "crates/tine-core/src/onboarding.rs"
+     "crates/tine-core/src/onboarding.rs",
+     ".github/workflows/ios-probe.yml"
     ],
     "scenario": "ios.guide-copy-atomic-publication",
     "failBefore": "proven"
    },
-   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation; the contract test fails if a macOS-only atomic-publication branch returns."
+   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation. The contract test fails if a macOS-only atomic-publication branch returns, while the manual iOS probe invokes the real bound-graph Guide-copy backend inside the Simulator and requires the copied index page to exist."
+  },
+  {
+   "id": "REG-IOS-CONTAINER-PATH-REBASE-001",
+   "title": "An iOS app update reopens a remembered local graph after the sandbox container UUID changes",
+   "family": "platform-compatibility",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "physical TestFlight update report 2026-08-27"
+   },
+   "platforms": [
+    "ios"
+   ],
+   "layer": "ios-native-bridge",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/graph.test.tsx",
+     ".github/workflows/ios-probe.yml"
+    ],
+    "scenario": "ios.remembered-local-graph-rebases-across-container-relocation",
+    "failBefore": "proven"
+   },
+   "notes": "The first TestFlight update retained an absolute Documents path containing the old app-container UUID. The current installation correctly refused that outside-container path, but startup rendered the generic superseded/cancelled recovery screen until all app data was cleared. The iOS bridge now recognizes only the exact local app-container path shape, rebases its Documents-relative suffix onto the current container when that directory exists, and returns the effective path that both Rust and frontend persistence adopt. The simulator launches with a deliberately stale UUID and must open the current graph and copy the bundled Guide into it."
   },
   {
    "id": "REG-IOS-APP-ICON-OPAQUE-001",
@@ -2357,21 +2452,17 @@
     "windows"
    ],
    "layer": "core-native",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
      "crates/tine-core/src/model.rs::inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files",
      "crates/tine-core/src/model.rs::bootstrap_source_regular_file_sync_uses_supported_handle_access",
-     "crates/tine-core/src/oplog/import.rs::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
-     "crates/tine-core/src/oplog/import.rs::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
-     "crates/tine-core/src/oplog/import.rs::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
-     "crates/tine-core/src/oplog/enrollment.rs::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
      "crates/tine-core/src/oplog/sqlite.rs::separate_process_workspace_lease_contends_and_crash_releases"
     ],
     "scenario": "managed-storage.bootstrap-and-lock-windows-semantics",
     "failBefore": "proven"
    },
-   "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED. Instrumented run 30994134161 on cf2ca70f localized the first failure to flush_bootstrap_source_prefix. On non-Linux targets that durability pass recursively opened each regular capture artifact with File::open (GENERIC_READ on Windows) and then called sync_all (FlushFileBuffers on Windows); FlushFileBuffers requires write access and therefore returned ERROR_ACCESS_DENIED on the valid read-only handle. Fixed by e04469c3 using the established shadow-projection and migration-backup pattern: request write access only for the Windows regular-file flush handle, preserve read-only access elsewhere, and propagate every open or flush error. Hosted pass-after run 30995033385 proved capture now completes, then exposed the same legacy portability defect in prepare_inactive_bootstrap_import: its non-Linux preparation-tree flush also used read-only File::open handles for file FlushFileBuffers, while its recursive, post-rename, and retry directory barriers bypassed Tine's explicit Windows directory-sync contract. Fixed by 87a41863: preparation file barriers use Windows write access, and every preparation directory barrier now uses tine-storage ValidatedDirectorySync, which validates a real non-reparse retained capability and explicitly records Windows directory-entry crash durability as unsupported after validation. No PermissionDenied or other open/flush error is ignored. Hosted run 30995785773 proved both production stages pass, then exposed a test-oracle defect: authoritative_world used the generic whole-tree snapshot and filtered .tine-runtime and engine-scratch-v2 only after reading them. The helper process intentionally holds the archive-rooted lease, so Windows correctly rejected reading the locked lease with ERROR_LOCK_VIOLATION while Unix advisory locking had hidden the mistake. Fixed test-only by 8cd3e322 with a path-filtered walker that prunes non-authoritative namespaces before opening contents while continuing to hash every selected durable file. The same caller audit moved volatile SQLite -shm exclusion, lease-namespace exclusion, and immutable batches/objects selection before reads; generic whole-tree snapshots remain unchanged. Hosted run 30996661360 proved the archive-lease pruning worked, then exposed the device-local enrollment lease at sparse-storage/v2/local/<graph>/enrollment/lease: its stable file identity, not its locked empty bytes, is authority and is already bound into every authenticated enrollment record and revalidated separately. Fixed test-only by d9f78a09 by excluding that exact six-component lease path before reads while continuing to hash its authoritative enrollment head and all other durable siblings; snapshot read panics now include root and relative path. A guarded-reader regression proves neither locked lease reaches the reader and authoritative siblings are still hashed. Hosted run 30997515786 then reached the intended same-profile contention operation, but fs2's Windows LockFileEx failure surfaced ERROR_LOCK_VIOLATION (33) with ErrorKind::Uncategorized and enrollment mapped it to generic I/O. Fixed by 0c942015 with one shared narrow nonblocking-lock classifier: WouldBlock everywhere plus exact Windows ERROR_LOCK_VIOLATION. Enrollment, SQLite, and projection mutation leases retain their preexisting explicit PermissionDenied policy; packed-Patricia and object-store transition locks do not gain it. ERROR_SHARING_VIOLATION (32) remains an open/share-mode error, not contention, because fs2 calls LockFileEx only after the file is open. The breadth audit found direct Windows LockFileEx implementations in local-journal, scratch, and simulator already classify exactly code 33; blocking object-store locks need no nonblocking mapping. Focused helpers directly exercise durability and lock contracts; the unchanged full live-runtime witness, capture family, preparation seal/retry, enrollment, SQLite, packed-Patricia, and object-store serialization tests cover the surrounding fail-closed protocol. Linux and Android use syncfs for both prefixes and never enter the recursive per-file FlushFileBuffers paths. 2026-08-17 catalog repair: the family reference crates/tine-core/src/model.rs::inactive_bootstrap_capture named no Rust item, so it now names the bounded-sort member it was standing for, inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files. The upstream tine-storage test filesystem::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit was removed from the coverage list: it lives in the tine-storage repository, not in this one, and no certification receipt names individual tests, so nothing in this checkout could ever have resolved it. It remains real upstream evidence for the 0c942015 classifier and is recorded here rather than claimed as local coverage. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED. Instrumented run 30994134161 on cf2ca70f localized the first failure to flush_bootstrap_source_prefix. On non-Linux targets that durability pass recursively opened each regular capture artifact with File::open (GENERIC_READ on Windows) and then called sync_all (FlushFileBuffers on Windows); FlushFileBuffers requires write access and therefore returned ERROR_ACCESS_DENIED on the valid read-only handle. Fixed by e04469c3 using the established shadow-projection and migration-backup pattern: request write access only for the Windows regular-file flush handle, preserve read-only access elsewhere, and propagate every open or flush error. Hosted pass-after run 30995033385 proved capture now completes, then exposed the same legacy portability defect in prepare_inactive_bootstrap_import: its non-Linux preparation-tree flush also used read-only File::open handles for file FlushFileBuffers, while its recursive, post-rename, and retry directory barriers bypassed Tine's explicit Windows directory-sync contract. Fixed by 87a41863: preparation file barriers use Windows write access, and every preparation directory barrier now uses tine-storage ValidatedDirectorySync, which validates a real non-reparse retained capability and explicitly records Windows directory-entry crash durability as unsupported after validation. No PermissionDenied or other open/flush error is ignored. Hosted run 30995785773 proved both production stages pass, then exposed a test-oracle defect: authoritative_world used the generic whole-tree snapshot and filtered .tine-runtime and engine-scratch-v2 only after reading them. The helper process intentionally holds the archive-rooted lease, so Windows correctly rejected reading the locked lease with ERROR_LOCK_VIOLATION while Unix advisory locking had hidden the mistake. Fixed test-only by 8cd3e322 with a path-filtered walker that prunes non-authoritative namespaces before opening contents while continuing to hash every selected durable file. The same caller audit moved volatile SQLite -shm exclusion, lease-namespace exclusion, and immutable batches/objects selection before reads; generic whole-tree snapshots remain unchanged. Hosted run 30996661360 proved the archive-lease pruning worked, then exposed the device-local enrollment lease at sparse-storage/v2/local/<graph>/enrollment/lease: its stable file identity, not its locked empty bytes, is authority and is already bound into every authenticated enrollment record and revalidated separately. Fixed test-only by d9f78a09 by excluding that exact six-component lease path before reads while continuing to hash its authoritative enrollment head and all other durable siblings; snapshot read panics now include root and relative path. A guarded-reader regression proves neither locked lease reaches the reader and authoritative siblings are still hashed. Hosted run 30997515786 then reached the intended same-profile contention operation, but fs2's Windows LockFileEx failure surfaced ERROR_LOCK_VIOLATION (33) with ErrorKind::Uncategorized and enrollment mapped it to generic I/O. Fixed by 0c942015 with one shared narrow nonblocking-lock classifier: WouldBlock everywhere plus exact Windows ERROR_LOCK_VIOLATION. Enrollment, SQLite, and projection mutation leases retain their preexisting explicit PermissionDenied policy; packed-Patricia and object-store transition locks do not gain it. ERROR_SHARING_VIOLATION (32) remains an open/share-mode error, not contention, because fs2 calls LockFileEx only after the file is open. The breadth audit found direct Windows LockFileEx implementations in local-journal, scratch, and simulator already classify exactly code 33; blocking object-store locks need no nonblocking mapping. Focused helpers directly exercise durability and lock contracts; the unchanged full live-runtime witness, capture family, preparation seal/retry, enrollment, SQLite, packed-Patricia, and object-store serialization tests cover the surrounding fail-closed protocol. Linux and Android use syncfs for both prefixes and never enter the recursive per-file FlushFileBuffers paths. 2026-08-17 catalog repair: the family reference crates/tine-core/src/model.rs::inactive_bootstrap_capture named no Rust item, so it now names the bounded-sort member it was standing for, inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files. The upstream tine-storage test filesystem::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit was removed from the coverage list: it lives in the tine-storage repository, not in this one, and no certification receipt names individual tests, so nothing in this checkout could ever have resolved it. It remains real upstream evidence for the 0c942015 classifier and is recorded here rather than claimed as local coverage. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence. Lost 4 of 7 tests, including every streaming-bootstrap preseal/reseal and platform-durability-handle proof; the Windows handle-lifecycle outcome has no direct coverage left. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-EPOCH-FALSE-CONFLICT-001",
@@ -2419,16 +2510,15 @@
     "android"
    ],
    "layer": "core-native",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point",
      "scripts/run-managed-storage-perf-gates.mjs"
     ],
     "scenario": "managed-storage.crash-reopen-aged-history",
     "failBefore": "proven"
    },
-   "notes": "Martin reported unsafe reopen of his real managed graph spending about 63.6 s in RecoveringPromotedRuntime. The existing managed_crash_reopen_real_graph_manual_benchmark could not see it: it reopens a graph activated seconds earlier, so its oplog holds one generation (195 ms accelerated, 2.5 s forced-full-replay). The missing variable was aged history. managed_crash_reopen_aged_history_manual_benchmark adds it \u2014 N accepted saves across N pages, each fully drained so the local journal crosses its compaction threshold repeatedly, then one pending save and an unsafe drop \u2014 and reproduces 72.2 s on the 1,046-file anonymized graph. Localization by successive splitting, each step measured rather than inferred: the reopen rebuilds the disposable projection (projection_recovery=rebuilt-preserving-evidence, reason 'SQLite projection files differ from their authenticated checkpoint'), but the rebuild's own SQLite work is under 0.5 s and forensic preservation is 0.16 ms; 99.6% is materialize_accepted_event_with_stats, and inside that 83% is validate_external_record_anchor at about 30 ms per document. Cause: anchor validation needs the manifest per document, and every document of one bootstrap batch names the same source batch, but load_observed_manifest was called per document \u2014 cloning a manifest carrying a descriptor per document, or reloading and revalidating the entire retained bootstrap part off disk, once per page. load_archive_document_object then reloaded that same retained part a second time per document and linearly scanned every object in it. Two whole-graph costs per page, so quadratic in graph size. Fixed by memoizing both for the SAME public operation as the existing status/anchor point caches (cleared together in begin_point_operation, bounded at 4 batches, cleared wholesale at the cap because correctness never depends on a hit), plus a document -> CrdtUpdate index built once per memoized part. This memoizes only WHERE a manifest was found, never WHETHER a record matches it: every document still proves its own descriptor content digest and manifest fingerprint. Measured on the same commit pair: 1,046 files 72,229 ms -> 19,751 ms total and 69,911 ms -> 17,390 ms sqlite_open; 350 files 12,230 -> 3,428; 100 files 2,101 -> 874. Anchor validation 31.6 s -> 0.86 s. tine-core release suite 2030 passed with the same 15 pre-existing failures as master (doc::promoted_heading_tests and model::tests::write_highlights_*, all unrelated and failing identically before the change). STILL OPEN, deliberately not claimed fixed here: the remaining cost is superlinear too \u2014 per-document scratch LSM lookups in load_external_exact run without a ScratchLookupSession, unlike the bootstrap bulk materializer which threads one; and the reopen still re-materializes about twice the graph because compacted generations replay whole-graph slices (240/453/220/78 pages for eight single-page edits). Also unaddressed: why the projection is invalidated at all after ordinary drained saves. The regression guard is a 45 s tripwire inside the manual benchmark, which is NOT a CI gate; a counter-based assertion that manifest resolutions are bounded per batch rather than per document would be the durable guard. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Martin reported unsafe reopen of his real managed graph spending about 63.6 s in RecoveringPromotedRuntime. The existing managed_crash_reopen_real_graph_manual_benchmark could not see it: it reopens a graph activated seconds earlier, so its oplog holds one generation (195 ms accelerated, 2.5 s forced-full-replay). The missing variable was aged history. managed_crash_reopen_aged_history_manual_benchmark adds it \u2014 N accepted saves across N pages, each fully drained so the local journal crosses its compaction threshold repeatedly, then one pending save and an unsafe drop \u2014 and reproduces 72.2 s on the 1,046-file anonymized graph. Localization by successive splitting, each step measured rather than inferred: the reopen rebuilds the disposable projection (projection_recovery=rebuilt-preserving-evidence, reason 'SQLite projection files differ from their authenticated checkpoint'), but the rebuild's own SQLite work is under 0.5 s and forensic preservation is 0.16 ms; 99.6% is materialize_accepted_event_with_stats, and inside that 83% is validate_external_record_anchor at about 30 ms per document. Cause: anchor validation needs the manifest per document, and every document of one bootstrap batch names the same source batch, but load_observed_manifest was called per document \u2014 cloning a manifest carrying a descriptor per document, or reloading and revalidating the entire retained bootstrap part off disk, once per page. load_archive_document_object then reloaded that same retained part a second time per document and linearly scanned every object in it. Two whole-graph costs per page, so quadratic in graph size. Fixed by memoizing both for the SAME public operation as the existing status/anchor point caches (cleared together in begin_point_operation, bounded at 4 batches, cleared wholesale at the cap because correctness never depends on a hit), plus a document -> CrdtUpdate index built once per memoized part. This memoizes only WHERE a manifest was found, never WHETHER a record matches it: every document still proves its own descriptor content digest and manifest fingerprint. Measured on the same commit pair: 1,046 files 72,229 ms -> 19,751 ms total and 69,911 ms -> 17,390 ms sqlite_open; 350 files 12,230 -> 3,428; 100 files 2,101 -> 874. Anchor validation 31.6 s -> 0.86 s. tine-core release suite 2030 passed with the same 15 pre-existing failures as master (doc::promoted_heading_tests and model::tests::write_highlights_*, all unrelated and failing identically before the change). STILL OPEN, deliberately not claimed fixed here: the remaining cost is superlinear too \u2014 per-document scratch LSM lookups in load_external_exact run without a ScratchLookupSession, unlike the bootstrap bulk materializer which threads one; and the reopen still re-materializes about twice the graph because compacted generations replay whole-graph slices (240/453/220/78 pages for eight single-page edits). Also unaddressed: why the projection is invalidated at all after ordinary drained saves. The regression guard is a 45 s tripwire inside the manual benchmark, which is NOT a CI gate; a counter-based assertion that manifest resolutions are bounded per batch rather than per document would be the durable guard. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence. Lost its only in-crate proof; the remaining evidence is a manually dispatched perf-gates script. Related: the 2026-09-01 audit measured crash reopen still LINEAR in accepted history (128/663/1467 ms at 50/400/800 batches), which this row's quadratic-only claim does not cover. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-REOPEN-SCRATCH-POINTER-FALSE-REBUILD-001",
@@ -3187,21 +3277,21 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/import.rs::inactive_bootstrap_accepts_non_round_tripping_markdown_as_exact_read_only_source",
      "crates/tine-core/src/model.rs::consumed_external_document_dto_matches_exact_parse_across_formats_and_identity",
      "src/managedDiagnostics.test.ts",
      "scripts/e2e-windows-managed-storage.mjs"
     ]
    },
-   "notes": "The reporter's trace identified the content-specific blocker after source capture: one parseable Markdown file changed block structure under parse/reserialize, and managed import rejected the entire graph even though its error already described the file as byte-preserved and read-only. Tine already admitted the equivalent Org state. Managed import and inactive bootstrap now admit either format as an exact source, while the shared exact-page DTO parser independently recomputes structural editability and marks non-roundtripping Markdown or Org read-only. Existing application/save gates consume that format-neutral flag, so these bytes can be shown but never rewritten. Tests preserve the exact source through both import paths and prove the DTO read-only bit. The UI diagnostic sanitizer now redacts graph-relative source paths while retaining the actual causal reason instead of replacing the whole message with a generic unsafe-detail fallback. The hosted Windows large-graph scenario remains useful platform coverage, but the reporter's demonstrated content cause is now covered deterministically. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "The reporter's trace identified the content-specific blocker after source capture: one parseable Markdown file changed block structure under parse/reserialize, and managed import rejected the entire graph even though its error already described the file as byte-preserved and read-only. Tine already admitted the equivalent Org state. Managed import and inactive bootstrap now admit either format as an exact source, while the shared exact-page DTO parser independently recomputes structural editability and marks non-roundtripping Markdown or Org read-only. Existing application/save gates consume that format-neutral flag, so these bytes can be shown but never rewritten. Tests preserve the exact source through both import paths and prove the DTO read-only bit. The UI diagnostic sanitizer now redacts graph-relative source paths while retaining the actual causal reason instead of replacing the whole message with a generic unsafe-detail fallback. The hosted Windows large-graph scenario remains useful platform coverage, but the reporter's demonstrated content cause is now covered deterministically. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence. Lost one bootstrap admission test; the byte-exact parse/identity proof and the Windows real-app journey still cover the stated outcome. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-ACTIVATION-LATENCY-292",
-   "title": "Managed activation avoids graph-sized intermediate operation I/O and stays within the representative Linux and Windows latency gates",
+   "title": "Managed activation, reopen, and page switching remain responsive at reporter scale",
    "family": "managed-storage-activation",
    "sources": {
     "issues": [
-     292
+     292,
+     396
     ],
     "commits": []
    },
@@ -3210,16 +3300,15 @@
     "linux",
     "android"
    ],
-   "layer": "core-native",
-   "status": "fixing",
+   "layer": "core-native-and-real-app",
+   "status": "reproduced",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/import.rs::in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state",
      "crates/tine-core/src/sync_runtime.rs::activation_scaled_manual_phase_receipt",
      "scripts/e2e-windows-managed-storage.mjs"
     ]
    },
-   "notes": "The reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The approved redesign first reduced successful activation to one live capture plus one final live proof; this packet makes semantic lowering size-adaptive so ordinary graphs retain canonical encoded operations under a measured 128 MiB budget and never write or reread the operation spool, while oversized graphs retain the deterministic bounded spill route. Forced-route differential coverage requires byte-identical aggregate and commit output. Status remains fixing until the 13k Linux gate and same hosted Windows receipt are measured on the exact candidate, followed by the remaining terminal-materialization redesign."
+   "notes": "The original reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The completed activation redesign reduced successful activation to one live capture plus one final live proof, uses size-adaptive semantic lowering to avoid ordinary graph-sized operation spools, publishes the terminal materialization directly, opens the disposable SQLite projection without replaying accepted history, and keeps page queries bounded. The manual 12k receipt records activation, cold actor open, initial-feed settle, total ready time, and paired Direct Files/Managed Storage logical page-open distributions. Hosted Windows run 33349270671 measured exact-candidate activation at 99.36 seconds but then exposed a separate synthetic 119,990-backlink actor stall; run 33350869828 stopped earlier on an exact-page switcher selector defect. The selector and fixture are corrected, but the two-attempt E2E stop-loss is exhausted and the journey is quarantined pending a fresh unchanged-binary Windows burn-in. The current-only journey still binds the activation executable to the exact candidate by canonical path and SHA-256, force-closes and reopens it, alternates repeated real UI page switches between ordinary and nested Unicode pages in both storage modes, records timing summary statistics, and proves byte-exact return to Direct Files when it completes. Windows responsiveness therefore remains reproduced but not yet covered. Lost the in-memory/spilled builder equivalence test; the scaled activation receipt and the Windows journey still cover the stated outcome. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-LARGE-PAGE-ADMISSION-311",
@@ -3366,6 +3455,30 @@
     ]
    },
    "notes": "Direct Files perf audit 2026-08-09, F1, found independently by both the Opus and Codex lanes with agreeing numbers (243 ms vs 263-281 ms). list_pages is memoized on raw cache_gen and its only rebuild path walks the graph text scope, re-reads every file and re-parses each one: ~35 us/file, linear from 506 to 8,006 pages, and find_entry rebuilds straight from it. Every save bumped the generation, so the first navigation or [[ autocomplete after any typing pause stalled ~1/4 s on a real 5,225-file graph. page_list_cache is now re-tagged to the new generation under the same condition the effective-identity index already uses. DELIBERATELY NARROWER than the auditor's recommendation: list_pages parses every file so a title:: edit really does move an entry (hence the !identity_changed gate), and referenced_page_names is genuinely content-derived and is left to rebuild. The test asserts a ratio, not an absolute time, so it survives a loaded shared box."
+  },
+  {
+   "id": "REG-DIRECT-REFERENCE-DELTA-HANDOFF-400",
+   "title": "A reference lookup overlapping an ordinary edit waits for its queued one-page SQLite delta instead of scanning the whole graph",
+   "family": "direct-reference-performance",
+   "sources": {
+    "issues": [
+     400
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "tine-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::reference_lookup_waits_for_an_inflight_one_page_projection_delta",
+     "crates/tine-core/src/direct_projection.rs::tests::reference_wait_is_zero_cost_when_no_projection_work_exists"
+    ],
+    "failBefore": "proven"
+   },
+   "notes": "GH #400 reported Unlinked References taking one to ten seconds. Direct Files already had a disposable SQLite candidate projection, but every one-page cache publication advanced the parser generation and marked SQLite unavailable until its worker applied the queued delta. A reference request in that short interval immediately used the exact but graph-wide parser fallback. The regression pauses that worker boundary and requires the read to remain pending until the bounded delta converges, while unavailable or failed projections retain the parser fallback. The separate conflict.save_baseline_present event in the report remains an intentional no-write guard for bytes that differ from the editor's loaded revision."
   },
   {
    "id": "REG-BACKGROUND-FLUSH-255",
@@ -3924,8 +4037,8 @@
    "notes": "GH #254 increment 3, contract rule 2. ensurePageLoaded replaced the loaded instance whenever the requested path differed from the incumbent's, with no check that the incumbent held unsaved work. Reproduced: the incumbent's nodes are purged, the dirty mark SURVIVES and now belongs to the replacement's content, and a live conflict banner survives describing a file the editor no longer holds. The gate is the existing reloadDisposition predicate AND an empty editor-lease set - enumerating dirty/conflicted/saving kept losing, because IME composition holds text in the textarea until compositionend and the page-title rename holds its draft in component-local signals, so neither is visible to any store predicate. A component holding uncommitted input now declares itself with a lease keyed by a unique per-component handle, released idempotently from the component lifecycle rather than only from commit/cancel - a lease that outlives its component would refuse every later replacement forever. The gate is re-evaluated synchronously at the final replacement boundary because every caller awaits a backend read first and the incumbent can become dirty during that await. Necessity: both behavioural tests fail against the pre-fix code; the lease-hygiene and clean-replacement cases pass both ways by design and are not regression guards for the refusal itself."
   },
   {
-   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-MIGRATION-001",
-   "title": "Enrollment opens byte-exact v1/v5 histories, then lazily appends and audits canonical keyless v6/v3 integrity checkpoints",
+   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-CURRENT-001",
+   "title": "Enrollment accepts one canonical keyless current format and fails closed on altered integrity evidence",
    "family": "sync-data-safety",
    "sources": {
     "issues": [],
@@ -3935,21 +4048,14 @@
     "all"
    ],
    "layer": "core-native",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/enrollment.rs::current_enrollment_claim_record_and_checkpoint_are_keyless_canonical_crc_v2_v6_v3",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_reopens_byte_exactly_then_lazily_appends_v6_without_rewriting_authority",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_mixed_suffix_opens_at_every_boundary_and_full_audit_pages_verify_both_codecs",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_initial_publication_resumes_every_durable_cross_version_cut",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_initial_recovery_rejects_wrong_names_and_invalid_hmac_without_cleanup",
-     "crates/tine-core/src/oplog/enrollment.rs::frozen_legacy_v1_v5_codec_golden_digests_remain_exact",
-     "crates/tine-core/src/oplog/enrollment.rs::enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios"
     ],
-    "scenario": "sync.enrollment-keyless-integrity-with-frozen-legacy-suffix",
+    "scenario": "sync.enrollment-keyless-current-integrity",
     "failBefore": "source-proven"
    },
-   "notes": "Fresh schema-v2 authority claims omit secret material and schema-v6 records use schema-v3 CRC-32/ISO-HDLC checkpoints. The permanent mixed-history fixture constructs exact v1 authority/v5 HMAC bytes using a test-only legacy signer, proves their bytes and OS identity survive reopen, opens every mixed-chain suffix boundary, appends current v6 records without rewriting the claim, and pages a complete audit across both codecs. A cross-version publication matrix additionally resumes byte-exact legacy generation-one state from a full record temp, linked final/temp pair, final record plus HEAD temp, and committed HEAD; the first successor is v6, while fresh v2 authority remains v6-only. Wrong names, ambiguity, invalid legacy HMAC, structural mismatch, noncanonical encodings, illegal record/checkpoint pairs, and altered CRCs refuse before lifecycle admission without cleanup. Frozen v1/v5 golden digests and explicit read-only discovery classification keep the verifier byte-exact. A source guard permits production HMAC only in the frozen verifier module and permits signing only under cfg(test). Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Pre-0.7 policy has no enrollment migration or compatibility route: unrecognized private state is preserved, Direct Files opens, and current managed state is rebuilt from Markdown/Org. Current authority claims omit secret material; current records use canonical CRC integrity checkpoints. Unknown, old, future, altered, and noncanonical records refuse before lifecycle admission. Crash-cut tests prove old-or-new valid authority, page-boundary audit tests authenticate the current chain, and the source guard proves no legacy schema or authenticator remains. The six stale legacy-migration test references were removed during MS-16 structural closure rather than reintroducing the retired compatibility contract. ZERO surviving coverage. All six cited tests were deleted while oplog/enrollment.rs remains 2,884 lines of live production code, reachable from discovery.rs and object_store.rs, now containing no #[test] at all. The integrity contract in this row's title is currently unproven. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-RETAINED-SCRATCH-OPEN-RECOVERY-001",
@@ -3968,15 +4074,15 @@
     "android"
    ],
    "layer": "core-native",
-   "status": "released",
+   "status": "exempt",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::managed_reopen_rebuilds_after_malformed_retained_scratch_blob"
     ],
+    "exemption": "Subject machinery retired: the retained-scratch store was removed by the MS-14b managed-storage retirement (scratch_store.rs is absent from the tree), so no code path remains that could reproduce this behavior. Substitute evidence is the retirement source guard check:retired-managed-v1, which fails if retained-scratch production code returns.",
     "scenario": "managed.retained-scratch-open-recovery",
     "failBefore": "proven"
    },
-   "notes": "A cleanly shut down managed graph selected one retained scratch run through its newest canonical resume point. Deleting only disposable SQLite and corrupting that run's blobs.data reproduced the exact pre-fix terminal result: OpenRefused with 'SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob'. Reopen now recognizes only this typed reconstructible failure, validates the immutable bootstrap authority, preserves the malformed run byte-for-byte, creates a distinct fresh run, fully replays accepted immutable history, and rebuilds SQLite once. The regression proves recovery alone changes neither direct graph bytes nor immutable archive, engine-history, or projection-receipt evidence; then it loads Root.md through the public application API, accepts and reads back a real application save, drains it, proves append-only authority/receipt growth and the updated direct projection, and reaches Safe shutdown. Other malformed or second-attempt errors remain fail-closed."
+   "notes": "A cleanly shut down managed graph selected one retained scratch run through its newest canonical resume point. Deleting only disposable SQLite and corrupting that run's blobs.data reproduced the exact pre-fix terminal result: OpenRefused with 'SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob'. Reopen now recognizes only this typed reconstructible failure, validates the immutable bootstrap authority, preserves the malformed run byte-for-byte, creates a distinct fresh run, fully replays accepted immutable history, and rebuilds SQLite once. The regression proves recovery alone changes neither direct graph bytes nor immutable archive, engine-history, or projection-receipt evidence; then it loads Root.md through the public application API, accepts and reads back a real application save, drains it, proves append-only authority/receipt growth and the updated direct projection, and reaches Safe shutdown. Other malformed or second-attempt errors remain fail-closed. Retired, not regressed: the retained-scratch store was removed with MS-14b (scratch_store.rs absent), so this behavior has no code path left to regress. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-CLIPBOARD-ADMISSION-STALENESS-322",
@@ -4221,7 +4327,6 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations",
      "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_edit_reopens_with_the_same_materialized_identity",
      "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_cross_page_move_reopens_with_the_stable_block",
      "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_replacement_and_removal_reopen_without_stale_claims",
@@ -4231,7 +4336,7 @@
     "scenario": "managed.clean-activation-logseq-uuid-projection-authority",
     "failBefore": "proven"
    },
-   "notes": "The Linux real-app recovery journey activated a 1,046-file anonymized graph successfully, then the first clean watcher scan repeatedly failed before the requested edit: a page containing one ordinary id:: UUID materialized the UUID on one block while the index-free clean engine had no baseline candidate authority. The first repair made exact-frontier SQLite the bounded baseline candidate source for watcher planning, local/external draft preparation, commit validation and cold committed-tail replay; CRDT documents remain semantic proof. GH #370 then supplied the exact v0.6.96 retained-history refusal on Windows: a committed UUID-bearing page could reach projection drain without that same bounded candidate source, yielding `Logseq UUID ... does not uniquely authorize materialized block ...`. The fail-before matrix reproduces that literal refusal for a UUID-bearing external edit and cross-page move; replacement/removal remain valid, a duplicate copy refuses before publication without changing source bytes, and an after-manifest interruption exercises cold replay. A corrupt/missing terminal SQLite rebuild still derives one disposable candidate snapshot from immutable lazy-genesis capsules and drops it after publication rather than restoring a runtime Patricia or handwritten index. Corpus contents and UUID values remain private."
+   "notes": "The Linux real-app recovery journey activated a 1,046-file anonymized graph successfully, then the first clean watcher scan repeatedly failed before the requested edit: a page containing one ordinary id:: UUID materialized the UUID on one block while the index-free clean engine had no baseline candidate authority. The first repair made exact-frontier SQLite the bounded baseline candidate source for watcher planning, local/external draft preparation, commit validation and cold committed-tail replay; CRDT documents remain semantic proof. GH #370 then supplied the exact v0.6.96 retained-history refusal on Windows: a committed UUID-bearing page could reach projection drain without that same bounded candidate source, yielding `Logseq UUID ... does not uniquely authorize materialized block ...`. The fail-before matrix reproduces that literal refusal for a UUID-bearing external edit and cross-page move; replacement/removal remain valid, a duplicate copy refuses before publication without changing source bytes, and an after-manifest interruption exercises cold replay. A corrupt/missing terminal SQLite rebuild still derives one disposable candidate snapshot from immutable lazy-genesis capsules and drops it after publication rather than restoring a runtime Patricia or handwritten index. Corpus contents and UUID values remain private. Lost one activation-preparation test; the five UUID-authority tests stating this row's outcome survive. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-ANDROID-CRASH-REOPEN-001",
@@ -4375,13 +4480,12 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations",
      "crates/tine-core/src/oplog/sqlite_identity.rs::tests::content_only_delta_on_nonowner_duplicate_name_does_not_reacquire_identity"
     ],
     "scenario": "managed.same-name-content-edit-keeps-established-name-owner",
     "failBefore": "field-reproduced"
    },
-   "notes": "A physical Android graph repeatedly failed after activation with clean page-name identity transition refused: Occupied(canonical page-name key is occupied at frontier F). Direct Files legitimately admits multiple physical files with one logical name; file path remains storage identity under ADR 0040. Clean external-import preflight nevertheless consulted the deliberately empty run-local Patricia fallback instead of the frontier-matched SQLite name authority, so a collision could pass before authoring and fail only during final materialization. The finalizer also treated every content-only PageDelta as a fresh name acquisition. Clean reconciliation now asks SQLite for current path and canonical-name ownership, preflights only creation or exact-title changes, and leaves the deterministic existing owner unchanged when another already-admitted physical same-name page changes content or path. A genuinely new or renamed colliding page remains blocked before authoring."
+   "notes": "A physical Android graph repeatedly failed after activation with clean page-name identity transition refused: Occupied(canonical page-name key is occupied at frontier F). Direct Files legitimately admits multiple physical files with one logical name; file path remains storage identity under ADR 0040. Clean external-import preflight nevertheless consulted the deliberately empty run-local Patricia fallback instead of the frontier-matched SQLite name authority, so a collision could pass before authoring and fail only during final materialization. The finalizer also treated every content-only PageDelta as a fresh name acquisition. Clean reconciliation now asks SQLite for current path and canonical-name ownership, preflights only creation or exact-title changes, and leaves the deterministic existing owner unchanged when another already-admitted physical same-name page changes content or path. A genuinely new or renamed colliding page remains blocked before authoring. Lost one activation-preparation test; the surviving identity test is this row's exact outcome. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-SAME-NAME-RECONCILIATION-002",
@@ -4395,18 +4499,15 @@
     "all"
    ],
    "layer": "native-storage",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/import.rs::tests::clean_reconciliation_admits_a_name_twin_activation_deduplicated",
-     "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations",
-     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
-     "src/managedStorageRuntime.test.ts::reports one repeating reconciliation failure once, and again only after real recovery"
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph"
     ],
     "scenario": "managed.duplicate-canonical-page-name-does-not-deny-the-graph",
     "failBefore": "field-reproduced"
    },
-   "notes": "On a physical Android device, managed storage reported that it enabled and then produced an endless stream of identical red toasts reading Failed(\"clean external reconciliation failed during Planning: decoded destination logical page name <name> is already owned by page <uuid>\"). The name carried a non-ASCII character and an inline hashtag. Activation deliberately selects ONE authoritative source per canonical page name and per portable path in exact-path order (bootstrap_authoritative_source_paths, matching OG's retain-the-first/skip-the-later-collision), and retains every other file untouched with no page of its own. Clean external reconciliation then met that retained file as a brand-new page whose decoded name was already owned, and ImportPlanStatus::Blocked became a hard Planning error in execute_clean_external, so EVERY affected path was refused on every tick, permanently, with no user action that could clear it. One title can reach two physical files many ordinary ways: a backup copy, one graph synced between a decomposing and a precomposing filesystem, or the literal '#' an outside editor writes versus the '%23' encode_page_name writes for the same title. Reconciliation now makes activation's own selection: a source with no accepted page identity whose decoded name is already owned acquires no identity, its exact bytes are still observed, and every other path reconciles. An accepted page is never withdrawn this way. A clean requested set likewise selects the first exact path per portable identity instead of refusing the set. The surface was unbounded too: the frontend bridge treated the retry's in-flight 'recovering' tick as recovery, so the next identical error read as news and raised another toast; one condition now reports once and again only after the actor genuinely recovers. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "On a physical Android device, managed storage reported that it enabled and then produced an endless stream of identical red toasts reading Failed(\"clean external reconciliation failed during Planning: decoded destination logical page name <name> is already owned by page <uuid>\"). The name carried a non-ASCII character and an inline hashtag. Activation deliberately selects ONE authoritative source per canonical page name and per portable path in exact-path order (bootstrap_authoritative_source_paths, matching OG's retain-the-first/skip-the-later-collision), and retains every other file untouched with no page of its own. Clean external reconciliation then met that retained file as a brand-new page whose decoded name was already owned, and ImportPlanStatus::Blocked became a hard Planning error in execute_clean_external, so EVERY affected path was refused on every tick, permanently, with no user action that could clear it. One title can reach two physical files many ordinary ways: a backup copy, one graph synced between a decomposing and a precomposing filesystem, or the literal '#' an outside editor writes versus the '%23' encode_page_name writes for the same title. Reconciliation now makes activation's own selection: a source with no accepted page identity whose decoded name is already owned acquires no identity, its exact bytes are still observed, and every other path reconciles. An accepted page is never withdrawn this way. A clean requested set likewise selects the first exact path per portable identity instead of refusing the set. The surface was unbounded too: the frontend bridge treated the retry's in-flight 'recovering' tick as recovery, so the next identical error read as news and raised another toast; one condition now reports once and again only after the actor genuinely recovers. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence. Lost the name-twin deduplication test that WAS this row's outcome; the surviving Android journey test exercises a different path. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-WATCH-MIDEDIT-DEFERRED-RELOAD-337",
@@ -4532,11 +4633,10 @@
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_proves_each_sealed_segment_at_most_once",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_rejects_a_damaged_capsule_after_its_segment_was_proved",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_rejects_a_damaged_segment_on_its_first_read",
-     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_reproves_sealed_segments_after_a_parent_move",
      "crates/tine-core/src/sync_runtime.rs::tests::clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit"
     ]
    },
-   "notes": "Internal report, 2026-08-17: Full CI run 32071490984 shard 3/4 went red because clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit took 34.5 s on the runner and exceeded the production CLEAN_FULL_SCAN_SHUTDOWN_BUDGET (30 s), so clean_shutdown returned ActorRefused instead of Safe; a red full CI run blocks release.yml preflight. Root cause was not the watcher scan, which is already a bounded continuation: LazyGenesisCandidate::page called describe_file on the whole sealed segment pack to re-prove its manifest digest on EVERY page read. Measured with a temporary probe on the 1032-page fixture: 1035 whole-pack proofs of 721,648 bytes at ~15.4 ms each = 15.9 s of the 16.4 s spent inside the scan (clean_observed_projection 16.30 s, SQLite owner lookups 0.075 s, materialized_read 0.023 s). The cost is O(pages x segment bytes), and segments target 32 MiB, so Martin's real 1,045-file graph re-hashes its whole pack per page - the shape behind the reported ~15-second quit/recovery. Fix: prove each sealed segment at most once per opened candidate (SegmentSealMemo), reset on relocate_after_parent_move. The seal check is retained, not deleted, and the per-capsule descriptor-digest check still runs on every read, so damage to the bytes a caller receives is still rejected. Necessity: the guard COUNTS whole-pack proofs rather than timing anything - it reads 64 pages from a one-segment pack and requires exactly 1 proof - and fails (64 proofs) against the pre-fix shape. Drain wall clock 18.375/18.308/18.306 s before, 2.066/1.924/1.914 s after, on the same box, with no budget widened and no fixture shrunk."
+   "notes": "Internal report, 2026-08-17: Full CI run 32071490984 shard 3/4 went red because clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit took 34.5 s on the runner and exceeded the production CLEAN_FULL_SCAN_SHUTDOWN_BUDGET (30 s), so clean_shutdown returned ActorRefused instead of Safe; a red full CI run blocks release.yml preflight. Root cause was not the watcher scan, which is already a bounded continuation: LazyGenesisCandidate::page called describe_file on the whole sealed segment pack to re-prove its manifest digest on EVERY page read. Measured with a temporary probe on the 1032-page fixture: 1035 whole-pack proofs of 721,648 bytes at ~15.4 ms each = 15.9 s of the 16.4 s spent inside the scan (clean_observed_projection 16.30 s, SQLite owner lookups 0.075 s, materialized_read 0.023 s). The cost is O(pages x segment bytes), and segments target 32 MiB, so Martin's real 1,045-file graph re-hashes its whole pack per page - the shape behind the reported ~15-second quit/recovery. Fix: prove each sealed segment at most once per opened candidate (SegmentSealMemo), reset on relocate_after_parent_move. The seal check is retained, not deleted, and the per-capsule descriptor-digest check still runs on every read, so damage to the bytes a caller receives is still rejected. Necessity: the guard COUNTS whole-pack proofs rather than timing anything - it reads 64 pages from a one-segment pack and requires exactly 1 proof - and fails (64 proofs) against the pre-fix shape. Drain wall clock 18.375/18.308/18.306 s before, 2.066/1.924/1.914 s after, on the same box, with no budget widened and no fixture shrunk. Lost the reprove-after-parent-move test; the at-most-once sealed-segment proof stating this row's outcome survives. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-ANDROID-MANAGED-PRIVATE-JOURNAL-PUBLICATION-20260822",
@@ -4629,6 +4729,7 @@
      "src-tauri/src/watcher.rs::tests::windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals",
      "src-tauri/src/watcher.rs::tests::windows_external_replacement_of_tine_publication_keeps_creation_blocked",
      "crates/tine-core/src/model.rs::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
+     "crates/tine-core/src/model.rs::tests::windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation",
      "crates/tine-core/src/model.rs::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
      "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
      "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
@@ -4638,7 +4739,32 @@
     "scenario": "direct.windows-exact-event-and-self-publication-create-reconcile-create",
     "failBefore": "proven"
    },
-   "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE\u7248\u672c\u66f4\u65b0\u63d0\u793a\u8bcd failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. GH #374 on v0.6.96 was a literal negative follow-up and revoked that coverage: Tine's own newly-published journal raised the raw external-observation frontier before debounced reconciliation could recognize the self write, so an immediate second page failed with both `awaiting watcher reconciliation` and `arrived before creation publication`. Deterministic fail-before saves journal then injects its Windows `Create(Any)` echo before the second page and observes epoch 1 instead of 0. The repaired raw boundary waits on the publication's page lock and omits the frontier only after two coherent no-follow reads match Tine's exact completed revision and physical file identity, or the identical already-admitted cache state. It covers journal-to-page, page-to-page, page-to-journal, Unicode, repeated Create/Modify/rename shapes, and a delayed duplicate after reconciliation. Different external bytes and an identical-byte replacement inode both retain the barrier. Ambiguous events, external semantic owners, exact-target races, and case/NFC aliases remain fail-closed."
+   "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE\u7248\u672c\u66f4\u65b0\u63d0\u793a\u8bcd failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. GH #374 on v0.6.96 was a literal negative follow-up and revoked that coverage: Tine's own newly-published journal raised the raw external-observation frontier before debounced reconciliation could recognize the self write, so an immediate second page failed with both `awaiting watcher reconciliation` and `arrived before creation publication`. Deterministic fail-before saves journal then injects its Windows `Create(Any)` echo before the second page and observes epoch 1 instead of 0. The first repair proved exact-path self echoes, but the reporter's v0.6.97 negative follow-up exposed the missing sibling: an ambiguous callback could still publish the graph-wide epoch before waiting for an in-flight writer, making that writer refuse its own creation at the final pre-publication check. The second deterministic interleaving pauses a create at that check and proves the callback frontier waits behind the resource identity authority. The repaired raw boundary omits an exact frontier only after two coherent no-follow reads match Tine's completed revision and physical file identity; ambiguous callbacks still enter ordinary debounced reconciliation, but only after an overlapping Tine publication is complete. Different external bytes and an identical-byte replacement inode both retain the barrier. External semantic owners, exact-target races, and case/NFC aliases remain fail-closed."
+  },
+  {
+   "id": "REG-GUIDE-COPY-DIRECT-WATCHER-391",
+   "title": "Copying the multi-page Guide was interrupted by Tine's own native watcher echo",
+   "family": "direct-files-data-safety-onboarding",
+   "sources": {
+    "issues": [
+     391
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "tine-core-onboarding-native-filesystem-watcher",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/onboarding.rs::tests::copied_guide_pages_are_owned_for_native_watcher_echoes",
+     "scripts/probe-guide.mjs"
+    ],
+    "scenario": "guide.open-read-only-copy-whole-namespace-navigate-copied-pages",
+    "failBefore": "proven"
+   },
+   "notes": "Literal current-master real-app fail-before reproduced the reporter's Windows v0.6.97 outcome on Linux: the first Guide page was published, its native watcher echo raised the external-change frontier, and the next Guide page failed with `external graph-text changes arrived before creation publication`, leaving no copied namespace. Guide creation used the shared atomic Direct Files primitive but bypassed the ordinary editor commit path that records exact final bytes and physical identity for self-echo recognition. Every copied page now records that receipt after a final exact reread. The whole-guide real-app probe is the semantic proof: all pages and assets are copied, links resolve, and navigation reaches the writable copied Guide."
   },
   {
    "id": "REG-MANAGED-FOREGROUND-SETTLES-FINITE-PRIOR-WORK-292",
@@ -5096,6 +5222,452 @@
     "scenario": "managed-sync.pending-local-watcher-epoch-before-provider-delete",
     "failBefore": "proven at 3f4273ad: provider transport preempted the pending watcher epoch and projected the deletion before the local bytes were authored"
    }
+  },
+  {
+   "id": "REG-MANAGED-JOURNAL-FEED-OPEN-GRAPH-SIZED",
+   "title": "Opening or scrolling the Journals feed under managed storage stays proportional to the days shown, not to the size of the graph",
+   "family": "managed-storage-performance",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "managed-storage cost-model audit 2026-08-26, defect D6 (fix packet P-open-feed)"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "tine-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_open_is_not_graph_sized_and_refreshes_after_an_accepted_change",
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_page_matches_the_inventory_walk_across_pagination",
+     "crates/tine-core/src/sync_runtime.rs::tests::inventory_walk_feed_is_graph_sized_per_request",
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_matches_the_inventory_walk_on_a_real_graph_copy",
+     "scripts/e2e-managed-journal-feed.mjs"
+    ],
+    "scenario": "managed-storage.journal-feed-open-shares-one-inventory-scan",
+    "failBefore": "proven at 34e247ac: journal_feed_page assembled the feed in the shell from the complete application_page_inventory, so every open and every scroll step walked every page in the graph. On the 1,045-file anonymized corpus that walk was 5.19 ms p50 of a 6.22 ms feed open (release, this box), and the frontend requests three days at a time. inventory_walk_feed_is_graph_sized_per_request pins that retired shape; disabling the retained index makes the budget assertion fail (2 scans observed, 1 required)."
+   },
+   "notes": "User outcome: the Journals surface is Martin's primary view and its back gesture reloads a feed nothing has changed. Classification: blocking core operation (responsiveness of the primary surface), not an exact-value contract. The budget is stated as inventory scans per accepted frontier, not milliseconds, so a reasonable alternative implementation that answers the feed without enumerating the graph passes. Correctness is guarded separately by a differential against the retired inventory walk over full pagination, on a synthetic fixture whose journal filename format (dd-MM-yyyy) makes path order deliberately differ from date order, and on a real anonymized graph copy behind TINE_MANAGED_NAV_GRAPH_COPY."
+  },
+  {
+   "id": "REG-CORE-MANAGED-SAVE-DURABILITY-BARRIER-CONFETTI",
+   "title": "An ordinary managed edit does not pay a device round trip per archive artifact",
+   "family": "managed-storage-durability",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "android",
+    "windows",
+    "macos"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs",
+     "crates/tine-core/src/durability_counters.rs",
+     "crates/tine-core/src/model.rs::tests::a_projection_operation_flushes_one_directory_whatever_its_depth",
+     "crates/tine-core/src/model.rs::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier",
+     "crates/tine-core/src/model.rs::tests::projection_retry_converges_when_a_created_ancestor_survived_the_crash",
+     "crates/tine-core/src/model.rs::tests::a_cross_directory_move_flushes_one_directory_per_side",
+     "crates/tine-core/src/oplog/object_store.rs::archive_batch_android_fallback_tests::android_group_commit_capability_refusal_flushes_every_exact_staged_file",
+     "crates/tine-core/src/oplog/object_store.rs::archive_batch_android_fallback_tests::android_group_commit_does_not_hide_a_real_io_failure"
+    ],
+    "scenario": "storage.managed-save-and-move-durability-barrier-budget",
+    "failBefore": "proven"
+   },
+   "notes": "Internal report from the 2026-08-26 managed-storage cost-model audit (defect D1), verified by an independent Codex lane and an LD_PRELOAD fsync interposer. User-visible harm: every accepted managed edit blocked on one device round trip per separately durable artifact, so save latency scaled with artifact count rather than edit size - about 20 ms on the audit box's local ext4 and plausibly hundreds of ms on a slow or network filesystem. Classification: blocking stateful UX (latency of the core edit loop), with a data-safety contract attached because the fix changes when bytes become durable. Fail-before on exact base 34e247ac with the new counters: one accepted single-block managed save performed 55 core-initiated durability barriers and one cross-page move 130 (the audit's own broader counter set, which also sees tine-storage-internal barriers, measured 66 and 151 on the 1,045-file anonymized graph). Pass-after: 45 and 109. Two changes: (1) an accepted batch's archive objects and manifest are now staged under temporary names, flushed with ONE syncfs, and only then installed under their final immutable names - ten to sixteen barriers become three; (2) three fsync-before-read helpers on the managed projection paths, which fired three times per save and eight times per move and defended no in-scope failure, are deleted. Crash safety: docs/storage-sync-contract.md section 2.10a-i states the one-durability-point invariant and a crash-point table; clean_batched_archive_publication_leaves_no_torn_immutable_name drives a deterministic cut before the barrier and a second cut mid-install and proves that no immutable name is ever observable with bytes that were never flushed, that the graph still reopens, and that a fresh session completes the same edit. Necessity gate: managed_save_and_move_stay_within_their_barrier_budget fails on the pre-fix code (55 > 45); the mid-install crash test fails against the install-before-flush primitive (tine_storage::ExactImmutablePublicationBatch), which leaves a zero-length immutable object and makes ObjectStore::validate_namespace refuse the whole archive on reopen. Follow-on (P-census, 2026-08-26): the refusal census over the projection receipt store cut the four per-intent namespace binding artifacts - a reservation and an authority for each of attempts/<intent> and forensics/<intent>, four artifacts and eight barriers per projected page - because they detect only a directory renamed or replaced inside Tine's app-private, unsynced, single-writer receipt store, which needs an actor with write access as the user and is out of scope per specs/notes/2026-08-07-trust-model-and-threat-model-decision.md, while a torn or lost 1 KB binding wedged the page's projection permanently. Their refusals became recovery: a missing per-intent recovery namespace is recreated and the drain republishes its byte-identical contents (a_missing_per_intent_recovery_namespace_is_recreated_instead_of_wedging_projection, which fails on the pre-cut code with exactly the removed NamespaceSubstitution refusal). Pass-after: save 37, cross-page move 93, measured identically on the five-file fixture and on a copy of the 1,045-file anonymized graph. Remaining gap to the audit's target of 3/5 is stated in the contract: the projection receipt store's five surviving artifacts per intent, each separated from the next by a read-back and a durable-ordering implication that batching would break (specs/notes/2026-08-26-p-census-receipt.md section 5), and the six projection-directory chain flushes on the user-visible Markdown write path, which neither packet touched. Third packet (P-chain-flush, 2026-08-26, defect D1 continued): the projection directory chain named as the remaining gap above is cut. Every write, rename and preflight on the user-visible Markdown/Org path flushed EVERY directory from the target's parent to the graph root, so a two-deep page paid three device round trips per call and a namespaced page silently cost more than a top-level one. Only the leaf's entry list changes; an ancestor Tine creates is already flushed at creation by create_projection_chain_component, and an ancestor it did not create already has a durable entry in its own parent, which no in-scope scenario can un-durable. Fail-before on exact base d6fd8e03 with the re-pinned budgets: save 37, cross-page move 93, and each of the four new model tests fails on the pre-fix chain walk (for example the depth test observes 15 directory barriers for a three-deep page against 6 for a one-deep one). Pass-after: save 28 (foreground 14 -> 8), cross-page move 77, measured identically on the five-file fixture and on a copy of the 1,045-file anonymized graph. Direct Files uses the same helpers and is covered by a_cross_directory_move_flushes_one_directory_per_side plus the unchanged tests/graph.rs neighborhood. Remaining gap to the audit's target of 3/5 is now only the projection receipt store's five surviving artifacts per intent, plus the six times per save the projection chain is entered at all - which is a publication-protocol question, not a barrier-rule one (specs/notes/2026-08-26-p-chain-flush-receipt.md). MS-05 narrows the original batch-wide safety statement only for the managed-local drain: its undrained journal frame now authorizes exact object repair, while public publication and the manifest remain strict. The separate REG-MANAGED-ARCHIVE-TORN-OBJECT-JOURNAL-REPAIR row carries the replacement crash proof and fail-closed limits. MS-11 makes the Android group-commit fallback host-executable: a simulated syncfs capability refusal flushes every exact staged file, while a real I/O failure stays fatal; focused Android NDK compilation and Windows native CI provide the platform evidence without launching the full matrix."
+  },
+  {
+   "id": "REG-MANAGED-ARCHIVE-TORN-OBJECT-JOURNAL-REPAIR",
+   "title": "Cold open repairs a torn archive object only from exact undrained managed-local journal bytes",
+   "family": "managed-storage-data-safety",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "android"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record"
+    ],
+    "scenario": "managed-storage.cold-open-exact-undrained-object-repair",
+    "failBefore": "proven at aa9e89a1: after one accepted local journal record installed an object final name whose bytes were then torn, cold open refused with stored object bytes do not match path instead of using the still-undrained canonical record as recovery authority"
+   },
+   "notes": "Internal MS-05 campaign change, not a pre-existing reachable crash bug on the packet base. The managed-local drain now installs object final names before its existing batch-wide filesystem flush while the exact journal record is still undrained; this creates a bounded pre-barrier torn-object state so the flush can follow object installation without weakening post-publication durability. Cold open performs a structural archive open, acquires the workspace sole-writer lease, decodes only uncheckpointed managed-local frames, replaces only one unambiguous digest-matching canonical object, rereads it, and then runs ordinary full validation. The same batch-wide flush makes every object and the staged manifest durable before the manifest is installed and before publication returns, so the journal checkpoint never retires the only recovery authority prematurely. A control in the same regression corrupts an object whose record was fully drained and proves activation still refuses; manifests, uncovered mismatches, ambiguous coverage, noncanonical bytes, and workspace mismatches never receive repair authority. Public archive publication remains strict; a source guard confines the turn-covered path to local_journal_drain. The measured 10/13 save/move barrier totals and barrier kinds do not change. Windows and macOS retain per-artifact durable publication. Lost two preinstall-barrier tests (implementation assertions); the cold-open torn-object repair test stating this row's user outcome survives. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
+  },
+  {
+   "id": "REG-MANAGED-DISPOSABLE-SQLITE-NORMAL",
+   "title": "Disposable managed SQLite projection commits do not claim per-event durability",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/sqlite.rs::tests::rebuild_streams_linearly_with_one_live_event_and_evidence_record",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_safe_reopen_rebuilds_a_deleted_disposable_projection",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_safe_reopen_rebuilds_an_unreadable_disposable_projection"
+    ],
+    "failBefore": "The exact pre-MS-06 tine-storage revision configured writable projection databases with synchronous=FULL, counted one durability barrier per ordinary or candidate transaction, and left earlier schema objects committed when a later DDL statement failed."
+   },
+   "notes": "Internal MS-06 cost-model correction. SQLite is a disposable frontier-stamped projection, never accepted-history authority. Its writable WAL now uses synchronous=NORMAL, fresh schema creation is one atomic transaction, and ordinary/candidate commits record zero per-transaction durability barriers. A completed projection becomes reusable only after the existing explicit WAL checkpoint and atomic file-set publication. Missing, stale, corrupt, or power-loss-damaged projection state is validated and rebuilt from the immutable baseline plus accepted manifests; the recovery tests pin that loss of this cache cannot lose accepted graph content. Upstream tine-storage fail-before/pass-after tests directly query the NORMAL pragma and force a late schema collision to prove all earlier DDL rolls back. Lost one bootstrap rebuild-count test; linear rebuild and both disposable-projection reopen proofs survive. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
+  },
+  {
+   "id": "REG-MANAGED-LAZY-FTS-DELTA",
+   "title": "Managed activation does not wait for FTS and ready saves maintain entity deltas",
+   "family": "managed-storage-performance-and-search",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": ["all"],
+   "layer": "rust-core-storage-and-frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_search_reports_building_then_returns_backend_results",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_search_build_failure_is_reported_once_without_hot_retrying"
+    ],
+    "failBefore": "The pre-MS-07 terminal builder inserted both FTS families on the activation critical path, and every whole-page replacement deleted and reinserted the page plus all block search rows even when one block's text changed."
+   },
+   "notes": "Internal MS-07 cost-model correction. Both indexes remain present. A frontier-stamped build cursor and same-transaction latest-after-state outbox make partial indexes unreadable, crash-resumable, and exact across concurrent edits. Raw FTS search reports building; managed fuzzy search declines its optimization and unlinked references use the full exact application-page path. A permanent disposable-cache failure stays fail-closed and visible but is latched until reopen instead of retrying at 100 Hz. The Quick Switcher explains that results remain complete but may be temporarily slower. Upstream tine-storage tests separately pin zero activation FTS rows, one-block/no-page and page-title logical-row budgets, edit-during-build catch-up, and file-backed mid-build reopen with a retained cursor and outbox; their counters deliberately exclude FTS5 shadow-table internals."
+  },
+  {
+   "id": "REG-JOURNAL-FEED-READ-ERROR-385",
+   "title": "A journal feed read failure is not presented as an empty graph",
+   "family": "journal-feed",
+   "sources": {
+    "issues": [
+     385
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "frontend-native-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/Page.test.tsx::Journals feed generation lifecycle::surfaces an initial feed read failure instead of claiming the graph has no journals",
+     "src/components/Page.test.tsx::Journals feed generation lifecycle::retains the old feed after a current-generation error and retries it"
+    ],
+    "failBefore": "The backend rejection was caught and converted into deferred retry state; with no prior feed, PageView remained loading or rendered the ordinary no-journals guidance instead of the causal error."
+   },
+   "notes": "The reporter's privacy-safe graph verification listed 748 local dated Markdown/Org journals, while the diagnostic recorded journal_feed_page as failed. This repair distinguishes a failed read from a successful empty inventory without weakening background refresh recovery. The native reason for the reporter's iCloud-specific failure remains reporter-verification evidence, not a claimed root cause."
+  },
+  {
+   "id": "REG-MANAGED-ANDROID-PROMOTED-RECEIPT-BARRIER-STRICT",
+   "title": "Promoted Android projection receipts never degrade a refused directory barrier",
+   "family": "managed-storage-durability",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_private_directory_durability_is_explicit_at_every_exception",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::android_promoted_receipt_revalidates_an_existing_parent_after_process_restart",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::android_promoted_receipt_refusal_or_panic_never_marks_the_parent_verified"
+    ],
+    "failBefore": "The Android receipt publisher and directory creator unconditionally used sync_reconstructible_directory, so PermissionDenied, Unsupported, and InvalidInput were swallowed even after the receipt-store identity had been promoted into receiver authority. The first repair still accepted an exact existing file or directory without retrying a previously refused strict barrier, and the generic private-directory helper also classified authoritative local-journal and retry namespaces as reconstructible. A later draft invalidated a previously verified receipt parent only after rename and fallible identity lookup. The closure regressions pin strict receipt entry points, pre-mutation invalidation, existing-name retry barriers, and the explicit strict-versus-reconstructible census for other private directory consumers."
+   },
+   "notes": "Internal MS-04/MS-11 campaign finding. User-visible harm and safety class: a save or received operation could report success after Android refused the parent-directory durability barrier for a promoted receipt or local journal, allowing a crash to lose a name while accepted history treats it as durable. Empty-store initialization, detached bootstrap state, and named disposable caches remain reconstructible and may use the narrow Android capability-refusal exception; operational receipts, local journals, move episodes, provider retry state, absence dispositions, recovery trash, and archive namespaces fail closed. MS-11 closes the process-death residual: each process begins with no verified receipt parents, invalidates any positive proof before mutation, and performs one strict barrier before its first create/recovery acceptance under each promoted parent. A successful mutation barrier verifies that parent for later exact names; refusal or panic leaves it unverified. Read-only inspection remains barrier-free. Host behavioral and architectural tests cover restart, refusal, panic, pre-mutation invalidation, and the private-directory classification; focused Android NDK compilation proves the cfg arm, while physical device observation remains MS-16."
+  },
+  {
+   "id": "REG-MANAGED-FOCUS-EXTERNAL-REFRESH-397",
+   "title": "Managed application-page selectors read same-structure external Markdown content consistently while reconciliation is pending",
+   "family": "managed-storage-external-reconciliation",
+   "sources": {
+    "issues": [
+     397
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all",
+    "windows"
+   ],
+   "layer": "native-watcher-and-tine-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::application_page_selectors_read_external_content_before_watcher_settles"
+    ],
+    "scenario": "managed-storage.focus-rescan-external-edit-selector-parity",
+    "failBefore": "proven at 6e7bdd42: after an external same-structure CRLF edit queued a managed full rescan but before it settled, exact-path hydration returned the disk winner while logical application-page hydration failed with ActorRefusedAt(\"hot_source_join\")."
+   },
+   "notes": "GH #397 reported the exact hot_source_join toast and 2-3 minute stale interval on Windows. Logical application hydration lacked the source-rebased read view already used by exact-path reads, so a bounded watcher continuation left that route stale until the full graph scan reached the page. Same-topology outside content edits now hydrate from current source bytes through read-only application-page routes while accepted history remains owned by the watcher. Mutation baselines keep the accepted-authority route, and structural or identity-changing edits still wait for normal reconciliation; this row does not claim a Windows or managed real-app observation-boundary run."
+  },
+  {
+   "id": "REG-MANAGED-LAZY-GENESIS-PARSE-RECEIPT",
+   "title": "Disposable SQLite rebuilds reuse bounded baseline semantics without reparsing healthy pages",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "needs-revalidation",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_v4_dual_decode_defaults_to_receiptless_fallback",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap",
+     "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
+     "crates/tine-core/src/outline.rs::tests::exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals",
+     "crates/tine-core/src/doc.rs::promoted_heading_tests::heading_layout_identity_uses_page_parse_events_without_per_block_outline_parses",
+     "crates/tine-core/src/doc.rs::promoted_heading_tests::lsdoc_extended_unbulleted_heading_forms_remain_byte_exact_with_layout_identity",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_one_block_save_stays_within_two_parser_passes"
+    ],
+    "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
+   },
+   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero. Lost all four receipt-reuse proofs (reuse without reparsing, stale-receipt reparse, oversized-receipt omission, schema tripwire) that state this row's outcome; the surviving parser-pass and parse-cache tests are neighbors, not substitutes. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
+  },
+  {
+   "id": "REG-MANAGED-MS14-R0-CURRENT-HEAD-AND-SPARSE-INTEGRITY",
+   "title": "Lazy-genesis integrity accepts sparse overlays, ordinary local mutations do not replay accepted history, and concurrent fallback never publishes stale author projections",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/import_integration_tests.rs::lazy_genesis_full_integrity_accepts_a_sparse_frontier_overlay",
+     "crates/tine-core/src/oplog/import_integration_tests.rs::ordinary_clean_save_and_move_never_reconstruct_the_accepted_frontier",
+     "crates/tine-core/src/oplog/import_integration_tests.rs::concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_current",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_twenty_page_history_curve_manual_benchmark"
+    ],
+    "scenario": "managed-storage.ms14-r0-current-head-and-history-curve",
+    "failBefore": "The sparse-overlay fixture was falsely diagnosed as corrupt because physical frontier rows were compared with total baseline-plus-overlay document count. The save/move counter observed two reconstruct_frontier calls during one ordinary local save because SQLite rematerialized the just-validated accepted event from immutable history. Independent review found that caching an original author draft after concurrent same-page reconciliation could bind stale page contents to the merged accepted root, including when a moved block retained a foreign immutable home outside the transaction's changed documents; the regression reproduced local winner plus remote base where immutable materialization contained local winner plus remote winner."
+   },
+   "notes": "MS-14 R0 isolates two independently releasable V1 corrections before any durable checkpoint format work. Full integrity now starts history validation from the authenticated lazy-genesis baseline and authenticates the sparse physical overlay at its actual row count, without weakening ordinary full-frontier equality. A one-batch, root-keyed local-author cache lets SQLite consume a retained page only when its complete projection frontier exactly matches the accepted root, including catalog, membership shard, and every borrowed immutable home; absent outcomes, concurrent reconciliation, restart, another batch/root, or any miss still use immutable history. The permanent counter pins zero reconstruct_frontier calls for ordinary save and cross-page move. The ignored fixed-20-page release harness measures both tail save latency and unsafe-reopen history growth with content-free open-stage attribution."
+  },
+  {
+   "id": "REG-MANAGED-SAVE-AFTER-HOT-DOCUMENT-EVICTION-20260830",
+   "title": "A managed page remains editable after unrelated pages evict its hot document",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::clean_foreground_page_can_be_saved_again_after_hot_document_eviction"
+    ],
+    "failBefore": "On the exact MS-15 base, 64 distinct page saves succeeded, but after the 65th page displaced the first document from the bounded hot set, a second save of the first page was refused during trusted-local predecessor capture because its manifested projection no longer matched the history-materialized deterministic rendering. The same second save passed when only 64 pages were involved."
+   },
+   "notes": "Discovered by the MS-15 anonymized-corpus recovery benchmark, then reduced to a content-independent 65-page synthetic fixture. The bounded cache had evicted both a CRDT document and its run-local head entry; the cold path mistook that cache miss for an untouched lazy-genesis document and omitted the accepted edit. A no-scratch clean runtime now recovers missing hot heads from its authoritative accepted frontier and reconstructs the exact accepted document tail. Projection and reconciliation checks remain unchanged. The corpus benchmark also excludes first-block replacements that would delete an externally imported id:: property: that is an intentional identity refusal, not a representative content edit."
+  },
+  {
+   "id": "REG-MANAGED-MS16-CURRENT-ACTOR-ONLY",
+   "title": "Production managed storage retains only the current clean actor and enrollment state",
+   "family": "managed-storage-architecture",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "scripts/check-retired-managed-v1.mjs"
+    ],
+    "scenario": "managed-storage.ms16-current-actor-only",
+    "failBefore": "On the exact MS-16 base b39ad92c, sync_runtime.rs still compiled PendingLocalMutation, PendingSharedJoin, SharedJoinProviderPass, ProviderDependencyIndex, legacy_binding, and provider_recovery_coverage_root into the production actor even though the one current clean constructor never populated them."
+   },
+   "notes": "MS-16 compiler-guided oracle extraction. The dead local-mutation slot, cursor-based shared join state, legacy provider dependency indexes, and write-only legacy actor fields were removed rather than preserved as a second runtime. The retired-managed-v1 source guard scans the production prefix of sync_runtime.rs and fails if the named residue returns. Test-only fixtures and the explicitly enumerated known-red Patricia/bootstrap corpus remain owned by final packet MS-14b."
+  },
+  {
+   "id": "REG-MANAGED-MS16-JOIN-DUPLICATE-PATH-AUTHORITY",
+   "title": "A second device can join when a synchronized duplicate-name file sorts before the shared page owner",
+   "family": "managed-storage-share-and-join",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all",
+    "android"
+   ],
+   "layer": "rust-core-storage-and-android-app-uid",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::duplicate_path_join_exception_is_fresh_activation_only_and_fails_closed",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem",
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt::activationEditCrashReopenShareJoinPeerReopenAndReturnWorkAsTheAppUidOnSharedStorage"
+    ],
+    "scenario": "managed-storage.ms16-duplicate-path-join-authority",
+    "failBefore": "The new MS-16 second-device leg copied the initiator's complete graph tree after share preparation. The initiator retained pages/Denní poznámky.md as the page owner and left the later archiv/2026 backup unowned; fresh joiner activation selected the earlier-sorting backup and refused the identical synchronized graph as local-only=1/shared-only=1."
+   },
+   "notes": "Join keeps fail-closed semantic comparison. It admits the duplicate-path case only for an otherwise untouched fresh activation, when the shared frontier's exact selected file is still present and parses to exactly the shared kind, preamble, outline, and externally imported ids, while the fresh local selection decodes to the same logical page identity. Policy-generated anchor ids are representation metadata and may be visible only in the disk parse. It never rewrites or deletes the duplicate. The focused unit test pins refusal after a local accepted edit, changed/absent provider-selected bytes, and the original semantic-diff diagnostic; the shared host/Android journey pins both duplicate files byte-for-byte and the exact owner path. The one Android app-UID journey proves activation, application save, crash-style reopen, external reconciliation, share, a distinct-device join and reopen, then Tauri's production graceful Return-to-Direct-Files composition."
+  },
+  {
+   "id": "REG-MANAGED-MOVE-EPISODE-ACK-001",
+   "title": "Accepted cross-page moves retire their private response-replay evidence after the frontend installs the authoritative page pair",
+   "family": "managed-storage-resource-lifecycle",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final performance audit"},
+   "platforms": ["all"],
+   "layer": "frontend-native-actor",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::acknowledged_cross_page_move_retires_only_response_replay_evidence",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_acknowledgement_cleanup_tolerates_stale_directory_entries",
+     "crates/tine-core/src/sync_runtime.rs::tests::live_acknowledgement_queue_saturation_drains_before_marker_publication",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_move_cleanup_cursor_stays_runnable_and_bounded_across_turns",
+     "src-tauri/src/commands.rs::managed_actor_command_boundary_tests::move_acknowledgement_wakes_actor_cleanup_after_every_attempt",
+     "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
+     "src/store.test.ts::retries replay-evidence acknowledgement outside the serialized move lane",
+     "src/store.test.ts::retires queued rapid moves when the graph binding changes",
+     "src/store.test.ts::starts a new graph acknowledgement lane while the old graph acknowledgement is stalled",
+     "src/store.test.ts::bounds a sustained rapid-move backlog while one actor command is pending"
+    ],
+    "scenario": "managed.move-episode-ack-bounds-private-response-evidence",
+    "failBefore": "proven by complete production-source census: every cross-page move published episode-<uuid>.bin and .complete and no path retired either file"
+   },
+   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. Before either response sidecar is removed, the actor durably publishes an exact cleanup authorization; bounded actor turns then retire that marker and any interrupted sidecars, including legacy orphan completions. Cleanup uses a retained, explicitly runnable directory cursor rather than repeated full enumeration, tolerates entries buffered before an authorized unlink, and makes bounded room before publishing a 257th live marker. The frontend acknowledges on a bounded graph-bound retry lane outside the serialized semantic move queue, and every native attempt wakes actor cleanup. Graph reset installs fresh semantic and acknowledgement lanes, so a stalled old graph cannot hold the new graph. A complete pair without a durable acknowledgement remains exact response-replay evidence after a crash; it is not safe to infer response delivery merely from batch acceptance. Failure to acknowledge does not turn a successful move into a false user-visible failure."
+  },
+  {
+   "id": "REG-DIRECT-FILES-WINDOWS-DURABLE-NAME-PUBLICATION-001",
+   "title": "A successful Direct Files save durably publishes the sole-authority Markdown or Org name on Windows",
+   "family": "direct-files-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["windows", "linux", "macos", "android"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
+     "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
+     "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts",
+     "crates/tine-core/src/model.rs::tests::checked_open_retries_editor_retired_cleanup_without_restoring_it",
+     "crates/tine-core/src/model.rs::tests::editor_retired_cleanup_is_never_document_authority"
+    ],
+    "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
+    "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
+   },
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
+  },
+  {
+   "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",
+   "title": "A reported storage-mode switch cannot resurrect the previously retired selector after a crash",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["all", "windows", "android"],
+   "layer": "tauri-native-and-rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/sync_runtime.rs::tests::storage_mode_selectors_use_typed_durable_private_authority_publication",
+     "src-tauri/src/sync_runtime.rs::tests::managed_activation_durably_retires_the_direct_selector_name",
+     "src-tauri/src/sync_runtime.rs::tests::candidate_publication_crash_cuts_select_only_direct_or_managed"
+    ],
+    "scenario": "managed-storage.durable-app-private-storage-mode-selector",
+    "failBefore": "The compiler-enforced source guard failed on the MS-19 candidate: managed activation retired the Direct selector with plain remove_file and Android initial binding creation flushed the file but not its parent entry."
+   },
+   "notes": "Both the Direct selector and managed binding now use one app-private sole-writer wrapper over tine-storage DurableDirectoryPublication. Create and exact replace are collision-aware; retirement durably moves exact bytes outside the selector grammar before best-effort cleanup. The change does not route Direct Files through managed history and does not add a Managed Storage format or migration path."
+  },
+  {
+   "id": "REG-THEME-CHECKER-PROVENANCE-410",
+   "title": "The registry theme checker certifies a ported theme that Tine then refuses to install",
+   "family": "theme-package-intake",
+   "sources": {"issues": [410], "commits": []},
+   "platforms": ["all"],
+   "layer": "node-cli-and-frontend-parser",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/themes/themeCheckerCli.test.ts::never certifies a port record the app would refuse to install",
+     "src/themes/themeCheckerCli.test.ts::keeps the published schema, the checker and the app on one vocabulary"
+    ],
+    "scenario": "themes.ported-theme-intake",
+    "failBefore": "proven"
+   },
+   "notes": "A theme author told by `tine-theme.mjs check` that a package passes must not then have it rejected on install. The checker asked only for portedFrom.source, portedFrom.revision and a non-empty authors array, so an unsupported ecosystem, a missing relationship, name or license, an unknown provenance field, an over-long author list and non-text values all cleared intake and were refused by parseThemeManifest in the app. The checker now mirrors that parser field for field. The contract is one-directional and encoded as such: the checker may refuse more than the app (the SPDX allow-list, required screenshots and the dotted id are registry intake policy), never less. plugin-sdk/schema/theme.schema.json and docs/themes/README.md were already correct; the CLI was the single drifted authority, and the new test pins all three together."
+  },
+  {
+   "id": "REG-MANAGED-WATCHER-LOGSEQ-BACKUP-FLOOD-001",
+   "title": "Logseq backup writes cannot enter Managed Storage reconciliation or flood diagnostics",
+   "family": "managed-storage-watcher-scope",
+   "sources": {"issues": [], "commits": [], "internal": "Martin field report 2026-08-31"},
+   "platforms": ["all"],
+   "layer": "tauri-watcher-and-frontend-feedback",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs::tests::sparse_watcher_never_routes_logseq_backup_observation_into_the_managed_actor",
+     "src-tauri/src/watcher.rs::tests::the_managed_poll_gate_arms_on_every_shape_the_direct_gate_catches",
+     "src/ui.toast.test.ts::keeps one visible report for repeated identical runtime diagnostics"
+    ],
+    "scenario": "managed-journal-feed excludedBackupNoise plus rapidMultiDayMove",
+    "failBefore": "proven: an exact inotify path under logseq/bak became a ManagedPath observation even though poll/full-scan discovery excluded the same path"
+   },
+   "notes": "The exact-event lane now consults the same fixed GraphTextScope exclusions as managed poll/full-scan discovery before constructing a watcher observation. The release journey creates the reported logseq/bak/journals/<day>/<timestamp>.Desktop.md shape after activation and then runs the rapid multi-day move stress. As a final presentation backstop, identical visible Managed Storage diagnostic toasts are deduplicated while one remains on screen."
+  },
+  {
+   "id": "REG-GRAPHTEXT-GATE-ORDER-001",
+   "title": "Annotating a PDF while the same hls__ page is being saved no longer wedges every graph-text write in the process",
+   "family": "data-safety",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/tests/graph_text_gate_order.rs::saving_and_annotating_the_same_hls_page_never_deadlocks",
+     "crates/tine-core/src/model.rs::tests::graph_text_writers_take_the_identity_gate_before_any_page_lock"
+    ],
+    "scenario": "graph-text.identity-gate-before-page-lock",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3a123bc1 in the RELEASE profile (the shipped configuration): saving and annotating the same hls__ page hung both writers permanently, 0 of 2 finished in 60s; the same tree passes in 0.51s after the fix. The saver holds the graph-global graph-text identity gate while it waits for the page lock the annotator holds, so no later graph-text write in the process can proceed either. Debug builds hit debug_assert at model.rs:1542 instead and never reached the hang, which is why it survived. Six writers took the two locks in the wrong order: resolve_vcs_marker_conflict, resolve_durable_live_save_conflict, resolve_sync_conflict, open_pdf, write_highlights and confirm_removed_page_projection_with_attempts. All six now take the identity gate before any page lock; the order is proved statically over model.rs's call graph; and the epoch read refuses instead of silently reading without authority."
   }
  ]
 }

@@ -6,6 +6,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  PROJECT_VERSION,
+  classifyRetiredManagedV1Problems,
+  oneReleaseCiExceptionActive,
+} from "./release-0.6.981-ci-exception.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const problems = [];
@@ -59,6 +65,36 @@ const retiredLifecycle = [
   "legacy_v1_namespace_present",
 ];
 
+// The clean baseline-plus-manifest actor is the only production actor. These
+// names belonged to the interleaved pre-cutover actor state and must not return
+// above Rust's test module merely because a legacy regression fixture still
+// mentions the old implementation.
+const retiredActorResidue = [
+  "PendingLocalMutation",
+  "PendingSharedJoin",
+  "SharedJoinProviderPass",
+  "SharedJoinLocalPass",
+  "SharedJoinPhase",
+  "ProviderDependencyIndex",
+  "correlated_move_feed_handoffs",
+  "legacy_binding",
+  "shared_descriptor",
+  "provider_observation_full",
+  "provider_scan_valid_heads",
+  "provider_scan_invalid_head",
+  "provider_head_generations",
+  "provider_own_heads",
+  "provider_discovery_scan_complete",
+  "provider_current_head",
+  "provider_dependency_recheck_frontier",
+  "provider_accepted_manifest_audit_covered_sequence",
+  "provider_accepted_manifest_revalidation_next_sequence",
+  "provider_accepted_manifest_revalidation_ready",
+  "provider_accepted_manifest_revalidation_after_external_tick",
+  "provider_namespace_repair_active",
+  "provider_recovery_coverage_root",
+];
+
 const retiredV1SplitPath = /\.join\(\s*["']\.tine-sync["']\s*\)\s*\.join\(\s*["']v1["']\s*\)/s;
 
 function sourceProblems(relative, source) {
@@ -70,6 +106,13 @@ function sourceProblems(relative, source) {
   for (const name of retiredLifecycle) {
     if (new RegExp(`\\b${name}\\b`).test(executable)) {
       findings.push(`retired prototype lifecycle ${name} is compiled in ${relative}`);
+    }
+  }
+  if (relative === "crates/tine-core/src/sync_runtime.rs") {
+    for (const name of retiredActorResidue) {
+      if (new RegExp(`\\b${name}\\b`).test(executable)) {
+        findings.push(`retired actor residue ${name} is compiled in ${relative}`);
+      }
     }
   }
 
@@ -89,20 +132,28 @@ function sourceProblems(relative, source) {
 
 function assertDetectorSelfTests() {
   const probes = [
-    ["literal child path", 'let path = ".tine-sync/v1";', "legacy v1 path"],
+    ["literal child path", 'let path = ".tine-sync/v1";', "legacy v1 path", "guard-self-test.rs"],
     [
       "split child path",
       'let path = root.join(".tine-sync").join("v1");',
       "legacy v1 split path",
+      "guard-self-test.rs",
     ],
     [
       "retired helper",
       "fn legacy_v1_namespace_present() {}",
       "legacy_v1_namespace_present",
+      "guard-self-test.rs",
+    ],
+    [
+      "retired actor state",
+      "struct PendingSharedJoin {}",
+      "PendingSharedJoin",
+      "crates/tine-core/src/sync_runtime.rs",
     ],
   ];
-  for (const [label, source, expected] of probes) {
-    if (!sourceProblems("guard-self-test.rs", source).some((finding) => finding.includes(expected))) {
+  for (const [label, source, expected, relative] of probes) {
+    if (!sourceProblems(relative, source).some((finding) => finding.includes(expected))) {
       throw new Error(`retired managed-v1 source guard self-test missed ${label}`);
     }
   }
@@ -114,10 +165,19 @@ for (const relative of sourceFiles) {
   problems.push(...sourceProblems(relative, compiledSource(relative)));
 }
 
-if (problems.length) {
-  console.error(`Retired managed-v1 source guard failed (${problems.length} problem(s)):`);
-  for (const problem of problems) console.error(`  ${problem}`);
+const classified = classifyRetiredManagedV1Problems(problems);
+if (classified.unexpected.length) {
+  console.error(`Retired managed-v1 source guard failed (${classified.unexpected.length} unexpected problem(s)):`);
+  for (const problem of classified.unexpected) console.error(`  ${problem}`);
   process.exit(1);
 }
 
-console.log(`Retired managed-v1 source guard OK: ${sourceFiles.length} production source files checked.`);
+if (classified.allowed.length) {
+  console.warn(
+    `Retired managed-v1 source guard accepted ${classified.allowed.length} exact pre-existing problem(s) only for v${ONE_RELEASE_CI_EXCEPTION_VERSION}; the exception expires for the next release.`
+  );
+}
+console.log(
+  `Retired managed-v1 source guard OK: ${sourceFiles.length} production source files checked for v${PROJECT_VERSION}`
+  + (oneReleaseCiExceptionActive() ? " with the one-release exact exception." : ".")
+);

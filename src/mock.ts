@@ -775,10 +775,14 @@ export function mockBackend(): Backend {
     },
     async bindCaptureGraph() {},
     async forgetKnownGraph() {},
+    async revealKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       const requested = new URLSearchParams(globalThis.location?.search ?? "").get("platform");
       if (requested === "android" || requested === "ios") return requested;
       return "desktop";
+    },
+    async appArchitecture(): Promise<string> {
+      return "x86_64";
     },
     async listInstalledPlugins() {
       return mockPlugins.map((plugin) => ({ ...plugin }));
@@ -937,6 +941,7 @@ export function mockBackend(): Backend {
         },
       };
     },
+    async acknowledgeManagedApplicationMove(): Promise<void> {},
     async recoverManagedApplicationSubtrees(
       bindingGeneration: number,
       request: ManagedApplicationMoveSubtreesRequest,
@@ -1012,6 +1017,7 @@ export function mockBackend(): Backend {
           shared_phase: null,
           provider_pending: 0,
           provider_runnable: false,
+          search_index_building: false,
         },
         can_activate: false,
         can_retry: false,
@@ -1127,6 +1133,19 @@ export function mockBackend(): Backend {
     async sparseV2Tick() {
       return { state: "idle", detail: null, epoch: null };
     },
+    async listAbsenceSweeps() {
+      return [];
+    },
+    async onAbsenceSweepChanged() {
+      return () => {};
+    },
+    async reapplyAbsenceSweep(sweepId) {
+      return { sweep_id: sweepId, action_id: "mock-reapply", authored_batch_ids: [] };
+    },
+    async restoreAbsenceSweep(sweepId) {
+      return { sweep_id: sweepId, action_id: "mock-restore", authored_batch_ids: [], fidelity: [] };
+    },
+    async keepAbsenceSweepDeletion() {},
     async sparseV2CleanShutdown() {
       if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
       const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
@@ -2085,6 +2104,9 @@ export function mockBackend(): Backend {
     async onGraphChangedBulk(): Promise<() => void> {
       return () => {};
     },
+    async onAssetChanged(): Promise<() => void> {
+      return () => {};
+    },
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },
@@ -2272,6 +2294,9 @@ export function mockBackend(): Backend {
     },
     async onGraphVerificationProgress(): Promise<() => void> {
       return () => {};
+    },
+    async diagnosticSessionActive(): Promise<void> {
+      /* no session marker in the browser dev shell */
     },
     async diagnosticFrontendEvent(): Promise<void> {
       // no-op in the browser mock

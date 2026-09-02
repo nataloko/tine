@@ -262,28 +262,30 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
     // Name-only creation needs one current parsed identity snapshot. App-open
     // graphs already have it; keep this public operation correct for cold callers.
     graph.with_pages(|_| ());
-    let mut created_pages = Vec::new();
-    let mut skipped_pages = Vec::new();
-    for planned in plan.pages {
-        if graph.create_markdown_page_if_absent(&planned.name, &planned.markdown)? {
-            created_pages.push(planned.name);
-        } else {
-            skipped_pages.push(planned.name);
+    graph.with_graph_text_write_transaction(move || {
+        let mut created_pages = Vec::new();
+        let mut skipped_pages = Vec::new();
+        for planned in plan.pages {
+            if graph.create_markdown_page_if_absent(&planned.name, &planned.markdown)? {
+                created_pages.push(planned.name);
+            } else {
+                skipped_pages.push(planned.name);
+            }
         }
-    }
-    let mut copied_assets = Vec::new();
-    for asset in plan.assets {
-        if graph.create_asset_if_absent(&asset.name, asset.bytes)? {
-            copied_assets.push(asset.name);
+        let mut copied_assets = Vec::new();
+        for asset in plan.assets {
+            if graph.create_asset_if_absent(&asset.name, asset.bytes)? {
+                copied_assets.push(asset.name);
+            }
         }
-    }
-    let created = !created_pages.is_empty() || !copied_assets.is_empty();
-    Ok(GuideCopyResult {
-        name: plan.viewed_name,
-        created,
-        created_pages,
-        skipped_pages,
-        copied_assets,
+        let created = !created_pages.is_empty() || !copied_assets.is_empty();
+        Ok(GuideCopyResult {
+            name: plan.viewed_name,
+            created,
+            created_pages,
+            skipped_pages,
+            copied_assets,
+        })
     })
 }
 
@@ -659,6 +661,9 @@ mod tests {
         assert!(page.markdown.contains("logseq/.tine-trash"));
         assert!(page.markdown.contains("Watch for external edits"));
         assert!(page.markdown.contains("Snapshots to keep"));
+        assert!(page.markdown.contains("Verify synchronized graph"));
+        assert!(page.markdown.contains("`logseq/config.edn` is live too"));
+        assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
 
         let index = GUIDE_TEMPLATES
@@ -755,6 +760,10 @@ mod tests {
         assert!(page.markdown.contains("- # Troubleshooting and recovery"));
         assert!(page.markdown.contains("TINE_DEBUG=1"));
         assert!(page.markdown.contains("Help improve Tine"));
+        assert!(page
+            .markdown
+            .contains("Create a privacy-safe diagnostic report"));
+        assert!(page.markdown.contains("**Verify synchronized graph**"));
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page
@@ -794,6 +803,49 @@ mod tests {
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absence_sweep_recovery_is_taught_in_both_guide_surfaces() {
+        let managed = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Managed sync")
+            .expect("managed-sync page is registered");
+        assert!(managed
+            .markdown
+            .contains("Review a detected group deletion"));
+        assert!(managed.markdown.contains("Four deleted pages"));
+        assert!(managed.markdown.contains("**Restore**"));
+        assert!(managed.markdown.contains("**Re-apply**"));
+        assert!(managed.markdown.contains("**Keep deletion**"));
+        assert!(managed.markdown.contains("Run Restore again"));
+        assert!(managed
+            .markdown
+            .contains("Closing either the warning or the panel makes no decision"));
+        assert!(managed
+            .markdown
+            .contains("[[Reference/Troubleshooting and recovery]]"));
+
+        let recovery = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Troubleshooting and recovery")
+            .expect("recovery page is registered");
+        assert!(recovery
+            .markdown
+            .contains("Review several deletions in Tine-managed storage"));
+        assert!(recovery
+            .markdown
+            .contains("Closing the warning or panel records no choice"));
+        assert!(recovery.markdown.contains("finished sweep remains visible"));
+
+        let dir = scratch("tine-guide-absence-sweep-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("managed-sync page was copied");
+        assert!(copied_markdown.contains("Run Restore again"));
+        assert!(copied_markdown.contains("[[tine-guide/Reference/Troubleshooting and recovery]]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -861,6 +913,7 @@ mod tests {
             .markdown
             .contains("- # Journals, tasks, and scheduling"));
         assert!(page.markdown.contains("TODO → DOING → DONE"));
+        assert!(page.markdown.contains("TODO ↔ DOING or LATER ↔ NOW"));
         assert!(page.markdown.contains("Scheduled &amp; Deadline"));
         assert!(page.markdown.contains("`++1w`"));
         assert!(page
@@ -914,6 +967,13 @@ mod tests {
         assert!(page.markdown.contains("- # Find and revisit"));
         assert!(page.markdown.contains("**Ctrl+K**"));
         assert!(page.markdown.contains("Open search tab"));
+        // GH #463: the keyboard reaches every destination the mouse does.
+        assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
+        assert!(page.markdown.contains("+ New group"));
+        // GH #464: the row's name is the link and the rest of the row is the
+        // drag handle, which is what makes the documented reorder reliable.
+        assert!(page.markdown.contains("the page's name is the link"));
+        assert!(page.markdown.contains("copy/export button"));
         assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
         assert!(page
             .markdown
@@ -967,7 +1027,12 @@ mod tests {
             .markdown
             .contains("- # Pages, links, references, and search"));
         assert!(page.markdown.contains("Unlinked References"));
+        assert!(page.markdown.contains("available page/tag chips"));
+        assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));
+        // A `file:` link does something on click (GH #444); say so, because
+        // nothing else in the app tells the reader which link forms are live.
+        assert!(page.markdown.contains("A `file:` link"));
         assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
@@ -1018,6 +1083,12 @@ mod tests {
         assert!(page.markdown.contains("**Notes**"));
         assert!(page.markdown.contains("**Copy ref**"));
         assert!(page.markdown.contains("hls__"));
+        assert!(page.markdown.contains("normal tab in a companion pane"));
+        assert!(page.markdown.contains("drag the PDF tab"));
+        assert!(page.markdown.contains("structural companion pane"));
+        assert!(page
+            .markdown
+            .contains("**Back** returns to the source page"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("[[Features/PDF annotation]]"));
 
@@ -1064,6 +1135,16 @@ mod tests {
         assert!(page.markdown.contains("**t l**"));
         assert!(page.markdown.contains("**t r**"));
         assert!(page.markdown.contains("**Shift+?**"));
+        assert!(page.markdown.contains("Favorites can be arranged"));
+        // The graph switcher's per-row menu is the discoverable route to a
+        // second window; Shift-click alone is invisible to a new user.
+        assert!(page.markdown.contains("**Open in a new window**"));
+        assert!(page.markdown.contains("**Show in folder**"));
+        // GH #427: the maximized size is remembered, so the Guide must say so
+        // rather than leaving people to rediscover the control every open.
+        assert!(page
+            .markdown
+            .contains("Tine remembers which size you left it at"));
         assert!(page.markdown.contains("[[Welcome to Tine]]"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
@@ -1107,7 +1188,25 @@ mod tests {
         assert!(page.markdown.contains("- # Keep context visible"));
         assert!(page.markdown.contains("**Shift-click**"));
         assert!(page.markdown.contains("**Ctrl+Shift+T**"));
+        // The pane gesture is Alt+click on ordinary links (GH #438), not the
+        // pre-#283 Ctrl+click — pin the modal so the Guide can't drift back.
+        assert!(page.markdown.contains("**Alt+click**"));
+        assert!(!page.markdown.contains("**Ctrl+click**"));
+        // GH #456/#463: the bullet answers the same ladder as a link, so the
+        // Guide names the bullet's dot for the pane gesture and names the
+        // Ctrl/Cmd routes to a background tab beside the middle-click.
+        assert!(page
+            .markdown
+            .contains("block reference, or bullet's dot to open it in another pane"));
+        assert!(page.markdown.contains("**Ctrl/Cmd-click**"));
+        assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
         assert!(page.markdown.contains("+ New workspace"));
+        assert!(page
+            .markdown
+            .contains("PDF readers use the same tabs and panes"));
+        assert!(page
+            .markdown
+            .contains("**Notes** opens the PDF's notes page"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("[[Start/Where things are]]"));
         assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
@@ -1159,6 +1258,12 @@ mod tests {
         assert!(page.markdown.contains("Unavailable on"));
         assert!(page.markdown.contains("graph.write.block"));
         assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("Tine-owned presentation styles"));
+        assert!(page.markdown.contains("Style and colors are independent"));
+        assert!(page.markdown.contains("notnote's editorial style"));
+        assert!(page
+            .markdown
+            .contains("The theme receives neither those tasks"));
         assert!(page.markdown.contains("[[Features/Plugins]]"));
 
         let index = GUIDE_TEMPLATES
@@ -1202,6 +1307,13 @@ mod tests {
         assert!(page.markdown.contains("Question 2"));
         assert!(page.markdown.contains("640 px"));
         assert!(page.markdown.contains("All files access"));
+        assert!(page
+            .markdown
+            .contains("PDFs use that same one-pane history"));
+        assert!(page
+            .markdown
+            .contains("Hardware Back to return first to the PDF"));
+        assert!(page.markdown.contains("experimental 32-bit Windows"));
         assert!(page.markdown.contains("no public iOS app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));
@@ -1250,6 +1362,24 @@ mod tests {
         assert!(copied_markdown.contains("[[tine-guide/Workflows/Keep context visible]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tips_document_stable_and_configurable_page_widths() {
+        let tips = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Tips & shortcuts")
+            .expect("tips page is registered");
+        assert!(tips.markdown.contains("Page width — t w"));
+        assert!(tips
+            .markdown
+            .contains("keeps the same width while you edit"));
+        assert!(tips.markdown.contains("Appearance** → **Advanced"));
+        // GH #456/#461/#463.
+        assert!(tips.markdown.contains("**Ctrl/Cmd-click** any bullet"));
+        assert!(tips.markdown.contains("**Alt-click** the same thing"));
+        assert!(tips.markdown.contains("whose only modifier is Alt"));
+        assert!(tips.markdown.contains("custom maximum"));
     }
 
     #[test]
@@ -1307,6 +1437,26 @@ mod tests {
             out.contains("[[Martin]] #demo #sheets-demo"),
             "non-guide refs must stay verbatim: {out}"
         );
+    }
+
+    #[test]
+    fn copied_guide_pages_are_owned_for_native_watcher_echoes() {
+        let dir = scratch("tine-guide-watcher-receipts");
+        let graph = Graph::open(&dir);
+
+        let copied = copy_guide_into_graph(&graph, "Tine Guide").unwrap();
+
+        assert!(!copied.created_pages.is_empty());
+        for name in copied.created_pages {
+            let entry = graph
+                .find_entry(&name, PageKind::Page)
+                .unwrap_or_else(|| panic!("missing copied Guide page {name}"));
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&entry.path),
+                "the native watcher must recognize Tine's own Guide publication for {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

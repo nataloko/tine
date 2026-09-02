@@ -6,8 +6,13 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  releaseE2eScenarioIsNonblocking,
+} from "./release-0.6.981-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
+import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const contractsPath = path.join(root, "tests/ui-regressions/e2e-contracts.json");
@@ -36,6 +41,10 @@ const receiptPath = process.env.TINE_E2E_BUILD_RECEIPT
   ? path.resolve(process.env.TINE_E2E_BUILD_RECEIPT)
   : `${app}.build.json`;
 const e2eMode = process.env.TINE_E2E_MODE ?? "ordinary";
+const promotionPlanPath = process.env.TINE_E2E_PROMOTION_PLAN
+  ? path.resolve(process.env.TINE_E2E_PROMOTION_PLAN)
+  : undefined;
+let activePromotionPlan;
 const allowedContractClasses = new Set(["exact-safety-interoperability", "core-operation", "stateful-ux", "flexible-presentation-heuristic"]);
 const allowedStabilities = new Set(["stable", "burn-in", "quarantined"]);
 
@@ -82,6 +91,9 @@ const suites = {
   "plugin-graph-ownership": [
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
   ],
+  "pdf-routes": [
+    ["pdf-routes", "scripts/e2e-pdf-routes.mjs", {}],
+  ],
   "og-parity-pilot": [
     ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
   ],
@@ -101,6 +113,12 @@ const suites = {
       // ceiling is not a meaningful product gate on slower hosted runners.
       E2E_SCENARIO_TIMEOUT_MS: "240000",
     }],
+  ],
+  "managed-journal-feed": [
+    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
+  ],
+  "absence-sweeps": [
+    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
   ],
   // Release-only local proof on a copied private corpus. This suite is kept
   // separate from hosted coverage so neither the source graph nor a derivative
@@ -135,6 +153,8 @@ const suites = {
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
     ["journal-future-feed", "scripts/e2e-journal-future-feed.mjs", {}],
+    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
+    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["formula-builder", "scripts/probe-formula-builder.mjs", {}],
@@ -143,6 +163,8 @@ const suites = {
     ["structured-paste", "scripts/e2e-structured-paste.mjs", {}],
     ["media", "scripts/e2e-media.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
+    ["pdf-routes", "scripts/e2e-pdf-routes.mjs", {}],
+    ["pdf-scroll-resources", "scripts/e2e-pdf-scroll-resources.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["pdf-ownership", "scripts/e2e-pdf-ownership.mjs", {}],
     ["plugin-revocation", "scripts/e2e-plugin-revocation.mjs", {}],
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
@@ -300,7 +322,7 @@ function validateBuildReceiptInputs() {
   const receipt = loadBuildReceipt();
   const schemaProblems = [];
   let normalizedTauriManifest;
-  if (receipt.schemaVersion !== 1) schemaProblems.push("schemaVersion must be 1");
+  if (![1, 2].includes(receipt.schemaVersion)) schemaProblems.push("schemaVersion must be 1 or 2");
   if (typeof receipt.sourceRevision !== "string" || !receipt.sourceRevision) schemaProblems.push("sourceRevision must be a non-empty string");
   if (typeof receipt.builtAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(receipt.builtAt) || Number.isNaN(Date.parse(receipt.builtAt))) {
     schemaProblems.push("builtAt must be an ISO timestamp");
@@ -308,6 +330,9 @@ function validateBuildReceiptInputs() {
   if (typeof receipt.frontendAsset !== "string" || !receipt.frontendAsset) schemaProblems.push("frontendAsset must be a non-empty string");
   if (!/^[a-f0-9]{64}$/i.test(receipt.appSha256 || "")) schemaProblems.push("appSha256 must be a SHA-256 hex digest");
   if (!/^[a-f0-9]{64}$/i.test(receipt.buildInputDigest || "")) schemaProblems.push("buildInputDigest must be a SHA-256 hex digest");
+  if (receipt.schemaVersion === 2 && !/^[a-f0-9]{64}$/i.test(receipt.productInputDigest || "")) {
+    schemaProblems.push("schemaVersion 2 productInputDigest must be a SHA-256 hex digest");
+  }
   if (typeof receipt.buildInputsDirty !== "boolean") schemaProblems.push("buildInputsDirty must be a boolean");
   if (!Array.isArray(receipt.buildInputChanges) || !receipt.buildInputChanges.every((change) => typeof change === "string")) {
     schemaProblems.push("buildInputChanges must be an array of strings");
@@ -327,24 +352,35 @@ function validateBuildReceiptInputs() {
   if (schemaProblems.length) {
     throw receiptRemediation(`invalid build receipt ${receiptPath}: ${schemaProblems.join(", ")}`);
   }
-  let checkoutState;
-  try {
-    checkoutState = normalizedTauriManifest
-      ? normalizedBuildInputState(root, normalizedTauriManifest)
-      : buildInputState(root);
-  } catch (error) {
-    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout (${error.message})`);
-  }
-  if (receipt.buildInputDigest !== checkoutState.digest) {
-    // Name the stray/changed working-tree entries — a download into the worktree
-    // (untracked, non-ignored) is the usual culprit, and the bare message hid it.
-    const stray = checkoutState.changes?.length
-      ? ` Working-tree entries not in the built inputs: ${checkoutState.changes.slice(0, 12).join(", ")}${checkoutState.changes.length > 12 ? ", …" : ""}.`
-      : "";
-    throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout.${stray}`);
-  }
-  if (receipt.sourceRevision !== checkoutRevision) {
-    throw receiptRemediation(`build receipt ${receiptPath} was built from ${receipt.sourceRevision}, not checkout ${checkoutRevision}`);
+  if (promotionPlanPath) {
+    let plan;
+    try {
+      plan = assertPromotionPlan(JSON.parse(fs.readFileSync(promotionPlanPath, "utf8")));
+      validatePromotionPlanForCheckout(root, plan, receipt);
+    } catch (error) {
+      throw receiptRemediation(`promotion plan ${promotionPlanPath} does not authorize this binary/proof checkout (${error.message})`);
+    }
+    activePromotionPlan = plan;
+  } else {
+    let checkoutState;
+    try {
+      checkoutState = normalizedTauriManifest
+        ? normalizedBuildInputState(root, normalizedTauriManifest)
+        : buildInputState(root);
+    } catch (error) {
+      throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout (${error.message})`);
+    }
+    if (receipt.buildInputDigest !== checkoutState.digest) {
+      // Name the stray/changed working-tree entries — a download into the worktree
+      // (untracked, non-ignored) is the usual culprit, and the bare message hid it.
+      const stray = checkoutState.changes?.length
+        ? ` Working-tree entries not in the built inputs: ${checkoutState.changes.slice(0, 12).join(", ")}${checkoutState.changes.length > 12 ? ", …" : ""}.`
+        : "";
+      throw receiptRemediation(`build receipt ${receiptPath} was built from different build inputs than the current checkout.${stray}`);
+    }
+    if (receipt.sourceRevision !== checkoutRevision) {
+      throw receiptRemediation(`build receipt ${receiptPath} was built from ${receipt.sourceRevision}, not checkout ${checkoutRevision}`);
+    }
   }
   if (receipt.buildInputsDirty) {
     throw receiptRemediation(`build receipt ${receiptPath} records dirty binary/frontend inputs`);
@@ -360,16 +396,27 @@ function validateBuildReceiptArtifact(receipt, appSha256, frontendAsset) {
     throw receiptRemediation(`build receipt ${receiptPath} names frontend asset ${receipt.frontendAsset}, but the current production frontend uses ${frontendAsset}`);
   }
   return {
-    kind: "build-receipt",
-    testedCommit: receipt.sourceRevision,
+    kind: activePromotionPlan ? "promoted-build-receipt" : "build-receipt",
+    testedCommit: activePromotionPlan?.targetCommit ?? receipt.sourceRevision,
     receiptPath,
     sourceRevision: receipt.sourceRevision,
+    binarySourceCommit: receipt.sourceRevision,
     builtAt: receipt.builtAt,
     frontendAsset: receipt.frontendAsset,
     appSha256: receipt.appSha256,
     buildInputDigest: receipt.buildInputDigest,
+    productInputDigest: receipt.productInputDigest,
     buildInputsDirty: receipt.buildInputsDirty,
     buildInputChanges: receipt.buildInputChanges,
+    ...(activePromotionPlan ? {
+      promotion: {
+        sourceRunId: activePromotionPlan.sourceRunId,
+        sourceCommit: activePromotionPlan.sourceCommit,
+        targetCommit: activePromotionPlan.targetCommit,
+        productInputDigest: activePromotionPlan.productInputDigest,
+        proofIdentity: activePromotionPlan.proofIdentity,
+      },
+    } : {}),
   };
 }
 
@@ -378,13 +425,14 @@ function resolveBuildProvenanceInputs() {
   throw receiptRemediation(`build receipt is required at ${receiptPath}`);
 }
 
-function failureIsBlocking(status, contractEntry) {
+function failureIsBlocking(status, contractEntry, scenarioId) {
   if (status !== "failed") return false;
   // A quarantined native harness remains in the suite to retain its diagnostic
   // evidence, but cannot block either ordinary or release mode until it has a
   // deterministic semantic readiness predicate again.
   if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
+    if (releaseE2eScenarioIsNonblocking(suiteName, scenarioId)) return false;
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
   return contractEntry.contracts.some((contract) => contract.blocking);
@@ -546,6 +594,9 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       archiveInfrastructureAttempt(dir, attempt);
       continue;
     }
+    const releaseException = status === "failed"
+      && e2eMode === "release"
+      && releaseE2eScenarioIsNonblocking(suiteName, id);
     const record = {
       id,
       script,
@@ -559,7 +610,13 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       attempts: attempt,
       infrastructureRetries: attempt - 1,
       durationMs: Date.now() - started,
-      blocking: failureIsBlocking(status, contractEntry),
+      blocking: failureIsBlocking(status, contractEntry, id),
+      ...(releaseException ? {
+        releaseException: {
+          version: ONE_RELEASE_CI_EXCEPTION_VERSION,
+          scenarioKey: `${suiteName}:${id}`,
+        },
+      } : {}),
     };
     if (status === "failed") {
       const failurePath = path.join(dir, "failure.json");

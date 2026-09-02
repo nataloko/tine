@@ -44,36 +44,37 @@ mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
-    block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
-    close_graph_window, conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
-    duplicate_journal_diff, durable_live_save_conflict_diff, edit_asset_external,
-    empty_asset_trash, existing_page_names, export_query_subtrees, get_backlink_filter_context,
-    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
-    import_asset, import_native_capture, journal_content_days, journal_feed_page,
-    list_journal_conflicts, list_journal_filename_migrations, list_orphan_assets, list_pages,
-    list_sync_conflicts, list_templates, list_vcs_marker_conflicts, live_save_conflict_diff,
-    load_workspaces, merge_pages, move_managed_application_subtrees, open_asset, open_page_file,
-    open_pdf, page_aliases, page_icons, page_print_html, preflight_managed_page_mutation,
-    prepare_tine_quit, present_conflict_override, preview_block, publish_html, query_facets,
-    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
-    read_local_image, read_text_file, recover_managed_application_subtrees, referenced_page_names,
-    rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
-    resolve_duplicate_journal_day, resolve_durable_live_save_conflict, resolve_live_save_conflict,
-    resolve_sync_conflict, resolve_vcs_marker_conflict, retire_editor_activation,
-    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
-    save_workspaces, search, set_default_home, set_default_journal_template,
-    set_doc_mode_enter_for_new_block, set_favorites, set_favorites_page, set_guide_announced,
-    set_journal_title_format, set_logical_outdenting, set_preferred_format, set_preferred_workflow,
-    set_show_brackets, set_start_of_week, set_timetracking_enabled, stream_asset_path,
-    sync_conflict_diff, text_block_diff, text_block_diff3, tine_open_devtools, tine_quit,
-    trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
-    write_highlights, write_pdf_view_state,
+    acknowledge_managed_application_move, activate_absent_editor, activate_editor,
+    apply_journal_filename_migrations, asset_trash_stats, block_ref_counts, block_referrers,
+    capture_live_save_conflict, capture_quick_switch, close_graph_window, conflict_queue,
+    copy_guide_into_graph, delete_page, detect_media_editor, duplicate_journal_diff,
+    durable_live_save_conflict_diff, edit_asset_external, empty_asset_trash, existing_page_names,
+    export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page, get_page_by_path,
+    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
+    journal_content_days, journal_feed_page, list_journal_conflicts,
+    list_journal_filename_migrations, list_orphan_assets, list_pages, list_sync_conflicts,
+    list_templates, list_vcs_marker_conflicts, live_save_conflict_diff, load_workspaces,
+    merge_pages, move_managed_application_subtrees, open_asset, open_page_file, open_pdf,
+    page_aliases, page_icons, page_print_html, preflight_managed_page_mutation, prepare_tine_quit,
+    present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
+    read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
+    recover_managed_application_subtrees, referenced_page_names, rename_file_to_page, rename_page,
+    rescan_graph_now, resolve_block, resolve_blocks, resolve_duplicate_journal_day,
+    resolve_durable_live_save_conflict, resolve_live_save_conflict, resolve_sync_conflict,
+    resolve_vcs_marker_conflict, retire_editor_activation, run_advanced_query, run_graph_search,
+    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
+    set_default_home, set_default_journal_template, set_doc_mode_enter_for_new_block,
+    set_favorites, set_favorites_page, set_guide_announced, set_journal_title_format,
+    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
+    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
+    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
+    write_pdf_view_state,
 };
 use debug::{
-    clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
-    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, flight_init,
-    install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
+    app_architecture, clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
+    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, diagnostic_session_active,
+    flight_init, install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
 use git::{
     git_commit, git_force_pull, git_force_push, git_init, git_pull, git_push, git_status,
@@ -93,8 +94,9 @@ use plugins::{
 };
 use settings::{
     forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
-    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, save_session,
-    set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match, set_smooth_scroll,
+    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, reveal_known_graph,
+    save_session, set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match,
+    set_smooth_scroll,
 };
 use spellcheck::{
     apply_spellcheck, apply_spellcheck_all, list_spellcheck_dictionaries, parse_spellcheck_langs,
@@ -105,9 +107,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 use sync_runtime::{
     activate_sparse_v2, adopt_sparse_v2_shared, cancel_sparse_v2, cancel_sparse_v2_cold,
-    join_sparse_v2_shared, prepare_sparse_v2_share, sparse_v2_clean_shutdown,
-    sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query, sparse_v2_recovery_location,
-    sparse_v2_status, sparse_v2_tick,
+    join_sparse_v2_shared, keep_absence_sweep_deletion, list_absence_sweeps,
+    prepare_sparse_v2_share, reapply_absence_sweep, restore_absence_sweep,
+    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
+    sparse_v2_recovery_location, sparse_v2_status, sparse_v2_tick,
 };
 #[cfg(desktop)]
 use tauri::Emitter;
@@ -564,6 +567,18 @@ pub fn run() {
             media_protocol::respond(ctx, request)
         });
 
+    // The frontend's platform identity. It cannot be derived from the WebView's
+    // user agent: iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X`
+    // UA from a stock WKWebView, so UA sniffing reported an iPad as a Mac
+    // desktop and every mobile affordance stayed hidden (GH #446). The build
+    // knows the truth, so hand it over before frontend code runs — the same
+    // idiom as `__TINE_NATIVE_FRAME__`, and synchronous for the same reason:
+    // an async `app_platform` round-trip would flash desktop-only chrome.
+    let builder = builder.append_invoke_initialization_script(format!(
+        "globalThis.__TINE_PLATFORM__ = {:?};",
+        crate::graph::app_platform()
+    ));
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let builder = builder.append_invoke_initialization_script(format!(
         "globalThis.__TINE_NATIVE_FRAME__ = {native_frame_active};"
@@ -635,7 +650,7 @@ pub fn run() {
     #[cfg(any(mobile, target_os = "windows"))]
     let builder = builder.plugin(tauri_plugin_opener::init());
 
-    let result = builder
+    let app = builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -768,6 +783,7 @@ pub fn run() {
             save_graph_verification_report,
             save_page,
             move_managed_application_subtrees,
+            acknowledge_managed_application_move,
             recover_managed_application_subtrees,
             preflight_managed_page_mutation,
             sparse_v2_status,
@@ -782,6 +798,10 @@ pub fn run() {
             sparse_v2_editor_load,
             sparse_v2_editor_save,
             sparse_v2_tick,
+            list_absence_sweeps,
+            reapply_absence_sweep,
+            restore_absence_sweep,
+            keep_absence_sweep_deletion,
             sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,
@@ -895,6 +915,7 @@ pub fn run() {
             save_workspaces,
             list_known_graphs,
             forget_known_graph,
+            reveal_known_graph,
             install_plugin,
             uninstall_plugin,
             list_installed_plugins,
@@ -915,6 +936,7 @@ pub fn run() {
             apply_spellcheck,
             list_spellcheck_dictionaries,
             debug_info,
+            app_architecture,
             debug_log,
             git_status,
             git_init,
@@ -925,6 +947,7 @@ pub fn run() {
             git_force_pull,
             diagnostic_ipc_event,
             diagnostic_frontend_event,
+            diagnostic_session_active,
             diagnostic_report,
             save_diagnostic_report,
             clear_diagnostics,
@@ -933,11 +956,22 @@ pub fn run() {
             close_graph_window,
             tine_open_devtools
         ])
-        .run(context);
-    if result.is_ok() {
-        mark_clean_shutdown();
-    }
-    result.expect("error while running tauri application");
+        .build(context)
+        .expect("error while running tauri application");
+    // `App::run` never returns: Tauri exits the process from inside the event
+    // loop (`std::process::exit`), so code placed after it is unreachable.
+    // The clean-shutdown marker must therefore be cleared from the loop's own
+    // `RunEvent::Exit`, which Tauri delivers to this callback before exiting;
+    // clearing it anywhere later never runs and every quit is falsely reported
+    // as unclean on the next launch (the flight recorder's `session-active`
+    // marker survives). Enforced at the real boundary by
+    // `scripts/e2e-absence-sweeps.mjs`, which reopens the app mid-journey and
+    // asserts the unclean-exit toast is absent.
+    app.run(|_app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            mark_clean_shutdown();
+        }
+    });
 }
 
 #[cfg(test)]

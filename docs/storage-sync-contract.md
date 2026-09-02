@@ -4,7 +4,7 @@ This document is the implementation contract for Tine's opt-in managed-storage
 runtime. Direct Files is the default product path and selects a mutually
 exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
 selected, no code below may inspect or modify `.tine-sync`, open an oplog,
-create managed scratch state, or start managed recovery.
+create managed private state, or start managed recovery.
 
 One native `StorageModeSupervisor` owns storage-transition identity, priority,
 serialization, and terminal outcomes. A transition has a monotonically
@@ -84,6 +84,16 @@ Settings action is always graceful: if drain or projection confirmation fails,
 it leaves managed evidence selected and offers the separately named emergency
 return rather than force-stopping managed authority implicitly.
 
+The graceful return's graph-local set-aside is a durable cross-directory
+rename, not merely a pathname move. It flushes `.tine-sync` before using the
+`recovery` entry, including when that visible entry may be residue from a prior
+refused attempt. Moving `v2` into recovery (or
+rolling that move back) flushes the destination parent before the source
+parent. A real directory-barrier failure is reported even though the rename may
+already be visible; the retained name remains recovery evidence and retry must
+reinspect current state. Filesystems which genuinely do not support directory
+flush retain the shared unsupported-operation policy.
+
 The authoritative layout names live in the pinned
 `tine_storage::formats` manifest. Core code imports them through the
 definition-free compatibility surface in
@@ -94,10 +104,13 @@ certified through `tine_storage::formats`.
 [ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
 activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
 is refused as authority and the product offers Return to Direct Files before a
-fresh clean activation. The old constructor and same-process handoff remain
-callable only under `cfg(test)` as a bounded differential oracle while their
-source modules are physically retired; no production open, activation, or
-actor thread can enter them. A partially
+fresh clean activation. Production contains one baseline-plus-manifest actor
+constructor and one share/join state machine. The cursor-based join state,
+legacy mutation slot, and legacy provider indexes are absent from production
+and pinned absent by the retired-source guard. Older constructors and handoff
+fixtures remain callable only under `cfg(test)` as bounded differential oracles;
+they are not an alternate runtime authority. The final enumerated known-red
+oracle corpus remains pending for MS-14b. A partially
 implemented genesis artifact is never authoritative: only the final clean
 activation marker selects the baseline-plus-manifest runtime. The exact
 removal/replacement ledger is
@@ -111,6 +124,12 @@ superseded by later operations; it does not copy the graph-sized genesis map.
 Subsequent accepted operations must preserve the genesis binding. Test-only
 legacy fixtures are not an alternate activation marker or permission to admit
 a partially constructed candidate.
+
+The clean engine's resident document and document-head maps are bounded
+acceleration only. Evicting a document from either map does not turn an edited
+page back into lazy genesis: a cold point load derives its current direct heads
+from the complete accepted frontier and reconstructs the accepted suffix before
+another save or projection check.
 
 Production sharing likewise has one route: clean activation publishes a clean
 baseline descriptor and clean joining installs that exact baseline plus its
@@ -258,16 +277,20 @@ and manifest tail.
 
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; its app-private name is retired with the whole private root on Return to Direct Files |
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
+| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4, page capsule v4/v5, plus commit v1 | authoritative baseline; new writes use capsule v5, readers retain receiptless-v4 recovery; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
-| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v5 and versioned rows | derived receipts and diagnostics |
-| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
-| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests |
-| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
+| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
+| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
+| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
+| application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
+| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
 
 Emergency return publishes the sibling app-private selector
@@ -275,21 +298,55 @@ Emergency return publishes the sibling app-private selector
 this before managed binding discovery, so retained managed bytes cannot
 resurrect themselves. The receipt is retired only after an explicit fresh
 managed activation has quarantined the former private root and published its
-new binding.
+new binding. Both selectors are small app-private sole-writer authorities:
+create, exact replacement, and active-name retirement go through
+`DurableDirectoryPublication`. On Windows this means certified write-through
+name operations; on Unix/Android the initial parent chain and final name are
+flushed before success. Retirement first moves the exact selector bytes to a
+fresh same-directory name outside the selector grammar, then removes that inert
+residue, so a crash cannot turn a reported Managed activation back into Direct
+Files merely by resurrecting the old active name.
+
+**Refusal scenario:** `MS-REF-STORAGE-MODE-PUBLICATION-UNAVAILABLE`. The
+in-scope failure is a crash or power loss after Tine reports an explicit storage
+mode switch. If the platform cannot prove the required durable name operation,
+or the exact app-private selector changed during publication, the transition
+refuses before acknowledging the new mode. This protects authority selection,
+not against an adversarial local writer.
 
 The following path families are **retired pre-0.7 artifacts**, not an alternate
 production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,
 `archive/promoted-runtime.state`, the block/name/path/UUID Patricia indexes,
 `archive/projection-work-index-v1/`, `archive/reference-catalog-v2/`, the old
 multi-record enrollment tree and reservation, `reconciliation/`, runtime
-scratch, `managed-local-journal-v1/`, `local-authorship-v1/`,
+scratch, `local-authorship-v1/`,
 `inactive-bootstrap-publication-v1/`, `inactive-shadow-projections-v1/`,
-`migration-source-backups-v1/`, and `bootstrap-source-capture-v1/`. Production
+and `migration-source-backups-v1/`. Production
 open never treats any of them as authority. Their production construction and
 recovery routes are physically removed; negative contract tests and the frozen
 pre-0.7 failure corpus may still name the formats. A real graph containing only
 this state is refused and can Return to Direct Files for a fresh clean
 activation.
+
+MS-14b retired the only production engine constructor that opened the native
+Patricia indexes, deleted their physical store/opening branches, and removed
+the detached/inactive-bootstrap protocol closure and its representation-only
+tests. The producer census pins the former entry roots, Patricia openers, and
+`PatriciaIndexStore` absent from production. The live run-local identity maps,
+clean source selection, clean lazy-genesis materialization, and sealed accepted
+history/checkpoint bindings remain; they are semantic runtime state, not a
+reader, writer, migration, or alternate bootstrap activation route.
+
+The final MS-14b closure also removes the former scratch-backed document,
+dependency, causal, evidence, and Loro stores and the separate physical
+engine-history control. Store-backed engines retain only nonterminal staged
+payloads in hot memory; terminal payloads are reloaded exactly from the
+immutable operation archive when needed. Compact accepted statuses, event
+evidence, semantic identity/path/name maps, and their digest roots remain
+inline. Exact historical frontier questions reconstruct from that retained
+semantic accepted evidence; current-point reads remain direct. The dependency
+is certified `tine-storage v0.11.0`, whose supported-target guard includes iOS
+in the durable no-clobber rename implementation.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
@@ -316,6 +373,20 @@ unchanged to typed conflict trash. Every move rechecks the artifact's physical
 identity and single-link status immediately before publication. A suffix
 lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
+
+Every Direct Files create, live-name retirement, staged publication, recovery
+restore, and recovery set-aside crosses the typed
+`DurableDirectoryPublication` boundary. The staged inode is flushed before it
+can become live. Windows uses write-through name publication; Unix-like hosts
+use their certified exact-name move plus directory durability policy. Tine
+never acknowledges the save merely because an ordinary rename became visible.
+Successful replacement retires the displaced recovery name through a typed
+`.editor-retired` name before deletion, so a crash cannot turn an unflushed
+name transition into a reported durable save. That exact producer-shaped name
+is cleanup-only: it never restores a document or becomes a conflict claimant.
+The same bounded no-follow checked-open walk removes any copy left by a crash
+or failed foreground unlink; a cleanup error fails that open without changing
+the artifact and the next checked open retries it.
 
 For an existing Direct editor save, the initial exact-file read supplies the
 serialization baseline. The late external-writer proof is the atomic
@@ -358,6 +429,12 @@ candidate/name set before applying the existing parser-owned matching and
 presentation semantics. They no longer use manual whole-graph candidate scans
 or second in-memory alias, reference-candidate, block-identity, referenced-name,
 or block-ref-count semantic caches as their ordinary route.
+Bounded block-referrer results are semantically bounded, not merely count
+bounded: managed candidate discovery covers the complete generation-bound
+candidate set, groups it in the same relative-path/document order as Direct
+Files, and only then applies the shared row and byte construction budget.
+`groups`, `total`, and `exceeded` therefore describe the exact same prefix in
+both modes; an internal-ID-ordered early subset is not an allowed optimization.
 The bounded generation-keyed
 memo of already-shaped frontend result DTOs remains Tine-native: SQLite cannot
 own parser AST semantics or presentation reuse, and dropping that memo would
@@ -383,7 +460,13 @@ replaces and deletes each old route.
 | joiner | its own local archive/enrollment after validating the exact shared descriptor and provider cut | rewriting the descriptor or adopting incomplete provider bytes |
 | provider transport | durable copy/rename/retirement of exact files | semantic acceptance; directory presence is not enrollment |
 | immutable oplog/archive | managed page/journal semantic truth | assets, PDF sidecars, config/settings |
-| SQLite, scratch, projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
+| SQLite and projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
+
+The native watcher may observe metadata changes below the approved assets
+capability solely to invalidate WebView render caches. That observation grants
+no managed actor admission, publishes no operation or provider object, and does
+not make Tine responsible for transferring or resolving asset bytes; the user's
+whole-directory synchronizer remains their transport.
 
 Authority is transferred only by a validated, durably published record while
 the current owner retains the relevant lease/capability. A path name, a newer
@@ -613,7 +696,24 @@ byte/inventory comparison under the watcher fence matches the sealed source.
 
 Each page capsule carries the exact original Markdown/Org bytes once, one
 deterministic CRDT checkpoint constructed directly from its terminal page
-state, plus its compact causal dependencies.
+state, plus its compact causal dependencies. New page-capsule v5 records may
+also carry a versioned, bounded SQLite semantic receipt binding the exact-source
+digest to a canonical materialized-page digest and payload. Receipt bytes are
+limited to 64 MiB and one million block rows; a larger page omits the receipt
+instead of refusing activation. Existing capsule-v4 records remain readable
+with no receipt. A missing, malformed, digest-mismatched, capsule-inconsistent,
+or parser-version-stale receipt is recovery evidence, not a refusal: disposable
+SQLite reconstruction reparses the exact source and performs the original
+capsule comparison. Only divergence established by that retained parse refuses
+reconstruction. A payload and digest consistently authored together are trusted
+at baseline construction under the crash/corruption threat model in §3; they
+are not a defense against a malicious byte-forging actor.
+Ordinary foreground saves separately retain at most three exact whole-document
+outline-parser results per worker thread (accepted base, requested target, and
+clean render base), only for sources up to 2 MiB and never for parser failures.
+Parser-owned unbulleted-heading event facts travel with that result rather than
+causing one more outline parse per block. This cache is not durable authority;
+an exact cache miss takes the complete path.
 One canonical activation-record pass fans each parsed page into both the
 baseline pack and bounded SQLite materialization chunks. Neither candidate is
 published by that construction pass, and SQLite does not re-read, re-parse, or
@@ -693,10 +793,11 @@ target are never repaired by this route; they remain external reconciliation or
 refusal. Once any manifest head exists for a path it also supersedes lazy
 genesis as predecessor authority, so an exact-byte mismatch cannot fall through
 to a baseline capsule (and a post-activation page can never be looked up there).
-The clean runtime has no completed-path index: a receiver-local completion that
-belongs to a superseded source batch remains durable historical receipt evidence
-but is not required to replay as the later merged point authority merely to
-perform a nonexistent index update.
+The clean runtime has no persistent projection-head or completed-*path* index.
+It does retain the intent-keyed own-endpoint completion index in §3.2b; a
+receiver-local completion that belongs to a superseded source batch remains
+durable historical receipt evidence and does not update that local half merely
+to replay as a later merged point authority.
 
 File synchronizers deliver the visible Markdown/Org projection and the hidden
 provider history independently. Before classifying concurrent semantic edits,
@@ -805,14 +906,28 @@ watcher epoch remains unacknowledged until that continuation and any
 observations queued behind it are reconciled, and clean shutdown drains this
 work before reporting `StoppedSafe`.
 
-SQLite schema 20 provides the physical replacement for all four native
+Application-page hydration has selector parity while bounded external
+reconciliation is pending. Exact-path and logical-name application reads may
+combine the exact current Markdown/Org source with the projected page only when
+path, outline topology, and block identities still match. This source-rebased
+value is a disposable read view, never accepted history. This packet applies it
+only to logical page reads; page-id-resolved mutation baselines such as page
+deletion continue to read accepted authority. The watcher remains the sole
+author of the external operation. A structural or identity-changing outside
+edit therefore waits for ordinary reconciliation rather than being guessed,
+while a same-topology content edit cannot make one selector fresh and another
+refuse at `hot_source_join`.
+
+SQLite schema 21 provides the physical replacement for all four native
 identity-index families. Page-name and portable-path rows contain one complete,
 application-owned causal point record; exact names and paths are inline and do
 not depend on a content-addressed side blob. External Logseq UUID introductions
 and block-home claims are append-only bounded histories which preserve every
 claimant. Every causal origin is explicitly either `Baseline` or an accepted
 `(batch, dot)`; activation never fabricates a bootstrap batch merely to seed an
-index. The old Patricia values remain only as a differential oracle until the
+index. Schema 21 additionally makes the disposable FTS readiness protocol
+explicit; it does not change the identity-record semantics. The old Patricia
+values remain only as a differential oracle until the
 single production cutover, and are then deleted rather than retained as a
 second ready route.
 
@@ -869,13 +984,21 @@ ambiguous baseline claims remain unresolved after reconstruction.
    state and does not create an empty semantic `hls__` page; the first
    annotation write creates or updates that page through the paired sidecar and
    managed-page publication path.
-3. SQLite, runtime scratch, and transient projection receipts are disposable.
+3. SQLite and transient projection receipts are disposable.
    Deleting or version-mismatching one may cause exactly one bounded rebuild,
    never a second rebuild on the following open. A complete rebuild must be
    linear in graph size and finish within 10 seconds on the release corpus.
    Reconciliation databases, Patricia lookup indexes, and persistent
    projection-work indexes are retired formats: production neither opens nor
    rebuilds them.
+   An unsafe retained-runtime reopen after 800 accepted page edits on the
+   release corpus must finish within the manual gate's 5-second ceiling.
+   Recovery retains one coarse user-visible operation and its 10-second waiting
+   heartbeat, while native diagnostics emit ordered, content-free completion
+   boundaries for baseline authentication, receipt precheck, graph and endpoint
+   open, object-store validation, committed-tail replay, projection open,
+   indexes/sweeps, journal open/drain, terminal projection repair, and completion
+   flush. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.
@@ -892,6 +1015,24 @@ ambiguous baseline claims remain unresolved after reconstruction.
    private binding or an explicit activation/join command. Its separate
    app-private graph-fact projection contains no managed state and grants no
    authority.
+9. Graph-text writes take two locks, and always in this order: the
+   **graph-text identity-mutation gate** (`ManagedTextWriteGate::lock_identity_mutation`,
+   graph-global, exclusive across threads, re-entrant per thread) first, then the
+   **per-page lock** (`Graph::page_lock`, per path). A writer that holds a page
+   lock and then reaches the gate deadlocks against every writer that takes them
+   the other way round — and because the gate is graph-global and its holder is
+   blocked, the whole process stops publishing graph text, not just that page.
+   The order is a static property of the code and is proved statically, by
+   `graph_text_writers_take_the_identity_gate_before_any_page_lock`, which walks
+   `model.rs`'s call graph and fails on any function holding a page lock that can
+   transitively acquire the gate. `debug_assert` cannot enforce it: the shipped
+   release profile compiles those out, so before 2026-09-01 the release binary
+   reached the deadlock where debug builds reached an assertion.
+   Reading the resource epoch (`identity_mutation_epoch_under_authority`) requires
+   the calling thread to hold the gate; it now refuses with
+   `graph_text_admission_unavailable` rather than reading a value another thread
+   is free to advance. That is an internal precondition, not a threat-model
+   refusal, and no in-scope scenario reaches it once the static order holds.
 
 ### 3.1 Refusal scenarios
 
@@ -913,6 +1054,50 @@ in this table.
 | `MS-REF-MALFORMED-IMPORT` | Imported/shared Markdown, Org, descriptor, manifest, or operation bytes cannot be decoded within declared bounds | Leave source/authoritative history unchanged and report the bounded invalid component |
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
+
+One retryable setup refusal is intentionally outside the durable-scenario table:
+
+| Operation | In-scope scenario | Required response |
+| --- | --- | --- |
+| prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
+
+#### Checks with no in-scope scenario, and what happened to them
+
+The rule that every refusal, fail-closed path, or re-verification of already
+established state must name a concrete in-scope failure applies to *silent*
+defensive work too. A barrier or re-proof that cannot name a scenario is not
+hardening; it is unpaid latency, and later a source of availability bugs.
+
+| Removed check | Where it was | Scenario it claimed | Why it has none | Replaced by |
+| --- | --- | --- | --- | --- |
+| `fsync` before reading a projection evidence file | `model::sync_and_read_projection_regular` | — | A read through the same process's page cache returns the bytes the writer wrote whether or not they are on the platter. Flushing cannot change the result and cannot detect corruption. | Plain bounded read (`read_projection_regular`) |
+| `fsync` before opening-and-reading a projection file | `model::sync_open_and_read_projection_regular` | — | As above. On Windows it additionally forced a write-capable open for a read. | `open_and_read_projection_regular` |
+| `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
+| Per-intent namespace **reservation** artifact (`<intent>.namespace-reservation`) and its refusals | `projection_store::open_intent_namespace` | — | Published before `mkdir` of `attempts/<intent>` and `forensics/<intent>` and re-read on every open. It detects only a directory renamed/replaced *inside Tine's app-private receipt store*, which needs an actor with write access as the user — out of scope. No crash, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, or honest multi-device divergence can rename a directory. A torn or lost 1 KB binding, by contrast, wedged the page's projection permanently. | Absence is recovery: `ensure_directory_nofollow` recreates the namespace and the drain republishes its byte-identical contents |
+| Per-intent namespace **authority** artifact (`<intent>.namespace-authority`) and its refusals | `projection_store::open_intent_namespace`, `projection_store::validate_live_intent_namespace` | — | As above. Its device/inode binding re-proved, from a file, a fact the live directory handle already answers for free. | The live `canonical_directory_identity` comparison against the identity the in-flight `DurableProjectionMutationAuthority` already records; no artifact, no barrier |
+| `fsync` of every **ancestor** of a projection target's parent chain | `model::sync_projection_chain_with_class` (leaf-to-root loop), reached from ~30 write/rename/preflight call sites | — | The operation changes entry lists in the chain leaf only. An ancestor Tine created in this operation is already flushed by `create_projection_chain_component` at creation; an ancestor it did not create already has a durable entry in its own parent, and no in-scope scenario (crash/power loss, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, honest multi-device divergence, malformed import) can un-durable an entry already on stable storage. See §2.10a-i for the one out-of-ownership case it did cover. | One barrier on the chain leaf, plus the existing per-creation barrier |
+
+The three `fsync`-on-read helpers fired three times per managed save and eight
+times per cross-page move. The two per-intent namespace binding artifacts fired
+**four times per projected page** (two namespaces x reservation + authority),
+costing eight barriers per page: eight of an ordinary save's 45 and sixteen of a
+cross-page move's 109. Removing them is the four-artifact cut Martin signed on
+2026-08-26 after the refusal census
+(`specs/notes/2026-08-26-p-census-receipt.md`) confirmed that no in-scope
+scenario relies on them.
+
+The refusals they carried are replaced by recovery, not by nothing: a per-intent
+recovery namespace that is absent on reopen is recreated
+(`projection_store::intent_namespace`), and everything inside it is
+content- or intent-addressed, so the drain — which still holds the undrained
+journal frame for the accepted edit — republishes byte-identical artifacts.
+`projection_integration_tests::a_missing_per_intent_recovery_namespace_is_recreated_instead_of_wedging_projection`
+is that recovery's test; it replaces
+`established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen`,
+which asserted the deleted refusal. Integrity of projection evidence is still checked, by the means
+that actually detects corruption: `projection_recovery_matches_record` compares
+the exact `BlobDescription` and the canonical file resource id. No read path may
+reintroduce a durability barrier.
 
 Every public durable open/activation refusal carries its scenario ID separately
 from its bounded reason/stage code. Retryable open failures do not invent a
@@ -943,6 +1128,101 @@ reads the production source and fails on any new bare construction, and on a
 collapse of the named-stage inventory. This closes the gap that left the
 Android post-activation save reporting `debug_detail="none"` with no stage — a
 refusal that could have come from any of 131 unnamed sites.
+
+### 3.1a The private receipt-store claim, and when it is checked
+
+`receipts/projection-receipts.claim` identifies the one implemented private
+receipt-store format by magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**.
+Earlier development magics — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — are
+recognized only so the low-level opener can refuse them without mutation. They
+have no reader, compatibility implementation, or migration path.
+
+**Why the version moved to 6.** The intent and completion records now carry an
+explicit target-kind discriminant (below). Managed storage has not shipped, so
+the only stores carrying a pre-(c) claim are development stores, and the 0.7
+blank-slate policy applies: the low-level store refuses before mutation; the
+Tauri graph-open boundary preserves the entire unrecognized private root as a
+backup, opens the untouched Markdown/Org tree as the reconstruction source,
+and automatically activates a fresh store in the one current format. The user
+does not migrate or manually re-activate anything.
+
+**Why packet 2c does not move it again.** Packet 2c retires only the
+own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
+record formats, and recovery protocol remain live and unchanged, so the
+wholesale-retirement premise for a `TINEPR7` claim is false. A store written by
+a pre-2c `(c)` build differs only by possibly retaining own-endpoint receipt
+artifacts. Current code neither authors nor consults those artifacts as
+authority: it reports their validated names, leaves their bytes untouched, and
+recovers own work exclusively from the durable turn/journal plus the local
+completion index. Refusing `TINEPR6` would reactivate an intermediate
+development store and could lose undrained frames without adding safety. The
+real-store recovery-equivalence oracle covers every specified crash cut for
+exactly this transition.
+
+| Claim observed | Response |
+| --- | --- |
+| current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
+| current magic, any other length, or a non-regular file | `MalformedStoreClaim`, refuse, zero mutation |
+| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation; the graph-open boundary archives the private root and automatically rebuilds current state from the intact Markdown/Org tree |
+| a version above the current one | `UnknownStoreVersion`, refuse, zero mutation |
+| absent, on a populated store root | `ClaimlessNonemptyStore`, refuse, zero mutation |
+| absent, on an absent or empty store root | initialization owns it; this is a fresh store |
+
+**Refusal scenario** (§3.1 rule): `MS-REF-PROTOCOL-INCOMPATIBLE`. The in-scope
+failure is an honest pre-(c) private store meeting a (c) build — reachable with
+no attacker and no corruption. The low-level refusal is the typed signal for
+the outer blank-slate lifecycle; it is not a user-facing migration request.
+
+**Where the check runs, and why there.** The full validation has always been the
+first thing the receipt store's `open` does, and it stays there as defense in
+depth. But on the clean cold-open path that `open` happens *after*
+`Graph::open_checked`, and `Graph::open_checked` is **not read-only**: its
+publication recovery renames graph files and moves artifacts to `.trash/`. A
+store this build cannot serve must not get that far. So a read-only **claim
+precheck** — `ProjectionReceiptStore::precheck_authoritative_claim` — runs at the
+HEAD of the clean cold open, immediately after clean-authority discovery returns
+and before any other step. It applies only to an authoritative store, where the
+claim provably predates the authority marker; a fresh store has no claim and
+initializes exactly as before.
+
+The precheck holds a current-magic claim to the **exact** version-specific
+envelope length. A magic-only check would pass a truncated claim, and graph
+publication recovery would then run before the in-place length check ever fired.
+
+A refusal propagates through the managed-open failure channel as a named notice
+(`OpenRefused`, carrying the scenario marker). During startup the Tauri
+graph-open boundary treats that exact protocol-incompatible marker, and an
+unrecognized outer binding, identically: archive the whole private root,
+publish Direct Files as the intact source, and automatically construct and
+publish the current managed store. The Direct Files selector durably records
+that this is a pending blank-slate rebuild before private state is moved, so a
+crash at any later cut or a failed first reconstruction retries automatically
+on the next open. If reconstruction itself fails, Direct Files remains serving
+and the failure is retained in diagnostics. The original unrecognized private
+root is archived once behind a durable completion marker. Later failed
+reconstruction candidates are reconstructible and rotate through one bounded
+recovery slot rather than minting an unbounded archive on every launch. An
+explicit or emergency Direct
+Files selection does not request this retry. This is one current format, not a
+compatibility reader or migration.
+
+#### Explicit target kind on intent and completion records
+
+An absent target flattens to the empty blob description, so byte length cannot
+tell "this page renders to nothing" apart from "this page must not exist". Both
+`ProjectionIntent` and `ProjectionCompletion` therefore carry an explicit
+`target_kind` (`present` | `absent`) in their canonical encoding, from store
+creation. There are no legacy records to classify.
+
+Two constraints hold today, and both are tested:
+
+* a record declaring an absent target may not declare target bytes;
+* `ProjectionIntent::id()` is **unchanged** — the kind is a stored field, not an
+  identity input — while `matches_replay_except_frontier` and a completion's
+  binding to its intent both compare it.
+
+The absence-decision map reads this field directly from both completion halves.
+Nothing may infer absence from byte length.
 
 ### 3.2 Clean-runtime save settlement
 
@@ -983,6 +1263,15 @@ and digest postings, and uncertain move retries point-query the pending batch
 identity. The derivative may read only the affected page identities and
 materialize those pages from the retained accepted catalog proof. It must not
 decode or validate the graph-sized catalog merely to apply a bounded move.
+Rapid application commands are serialized before their source/destination
+intent is resolved, so each command observes the accepted result of its
+predecessor rather than replaying a stale page pair. Once the frontend installs
+the actor-returned source/destination DTOs, it acknowledges that exact episode
+and batch. The actor revalidates the canonical episode, its completion proof,
+workspace/lineage binding, and accepted-or-visible semantic batch before
+retiring the two response-replay sidecars. The oplog batch remains authority;
+acknowledgement can only bound private response evidence and cannot undo or
+re-run the move.
 
 Page rename discovery follows the same bounded-work rule. An ordinary rename
 may point-read the exact normalized source and target names and range-read the
@@ -1003,6 +1292,22 @@ rehash every document touched earlier in the run or every earlier accepted
 batch. The incrementally maintained root is required to be byte-identical to a
 canonical complete rebuild; the complete rebuild remains only a differential
 oracle and an explicit rebuild operation.
+
+Checkpoint-generation support obeys the pre-0.7 blank-slate rule: production
+implements one current format, not old/new readers or a migration bridge. The
+canonical authenticated-map priority/node algorithm has one owner,
+`tine-storage::sealed_accepted_index`, shared by the clean runtime and
+SQLite. The same module owns the one current sealed batch/status/sequence/causal
+encoding and its bounded cross-checking reader; its caller-provided Tine
+evidence decoder validates the one current accepted-evidence encoding without
+reversing the crate dependency. The R1a adapter has no filesystem/publication
+capability, so a live checkpoint-generation marker remains impossible until a
+later cut deliberately changes that tested boundary. The physical layer has
+one current SQLite schema for both the live disposable projection and a
+separately built checkpoint candidate, plus a read-only injected sealed-history
+reader. It has no prior-schema enum, reader, compatibility fixture, or
+migration path. An unrecognized pre-0.7 private store is preserved as a backup
+and rebuilt from the untouched Markdown/Org tree by Tine.
 
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
@@ -1035,8 +1340,22 @@ A clean local mutation that reaches its manifest commit and then fails to apply
 disposable derived state (SQLite and/or exact Markdown projection) returns
 `CleanActorMutationOutcome::DurablePending` and retains an affine continuation
 in `CleanRuntimeActorCore::pending`. That continuation is advanced only by
-`retry_pending`. The legacy coordinator's `PendingLocalMutation::Published`
+`retry_pending_with_turns`. The legacy coordinator's `PendingLocalMutation::Published`
 continuation is a different object that the clean actor never writes.
+
+Every clean continuation resume — inline after the manifest commit, and on
+every retry — drains Markdown projection through the projection-turn journal:
+the resume appends the batch's `IngressLocal`/`IngressForeign` turn when the
+journal does not already retain it, and replays turns in order. There is no
+turnless projection arm: a managed projection mutation without a turn-derived
+attempt identity is refused in production
+(`ProjectionStoreError::MissingTurnAttemptContext`), and the 2026-08-28
+regression fix deleted the pre-turn resume executor that violated this. The
+refusal's in-scope scenario is not an external adversary but the codebase
+itself: it turns a silently identity-less projection write into a loud,
+recoverable failure, and the `clean_recovery_turns` integration test holds the
+drain green at the non-`cfg(test)` boundary where the unit suite's
+deterministic attempt-identity fallback cannot mask it.
 
 Therefore, when the clean runtime is installed, an application save that lands in
 `DurablePending` settles through the clean actor, bounded by
@@ -1083,6 +1402,354 @@ turns on a permanent failure buys no chance of settling and charges the whole
 cost to the user's save. Any change of phase or detail counts as progress and
 keeps the loop running to the budget.
 
+### 3.2a Projection turns and the second local journal
+
+A **projection turn** is one authoritative unit of graph-tree publication work.
+A durable turn is the whole authority for the names its replay may create and
+for the pages it may publish. Turns are `oplog::hot_engine::ProjectionTurn`.
+
+**Two sequence domains, two physical segments.** Managed-local append requires
+its physical journal sequence to equal the hot semantic overlay's next
+sequence, and only applying a *semantic* managed-local record advances that
+overlay. A projection-only record placed in the foreground journal would
+therefore consume a physical sequence with no semantic transition: it could
+never drain, and the next ordinary save would fail the equality check. So:
+
+| Domain | Segment | Counter | Producers |
+| --- | --- | --- | --- |
+| `ManagedLocal` | the foreground journal, `managed-local-journal/clean-workspace-{workspace}-{lineage}/` | the hot overlay's sequence, physical == semantic | foreground local authoring |
+| `ProjectionTurn` | the projection-turn journal, `managed-local-journal/projection-turns-{workspace}-{lineage}/` | its own monotonic counter, which never meets the other | ingress, terminal repair, superseded repair |
+
+Both use the same `LocalJournalSegmentV2` type and both checkpoint
+independently. Projection-turn **anchors are keyed by endpoint** (
+`endpoint-{endpoint}-selector-{generation:020}.anchor-v2`), from store creation:
+one grammar, no dual format, because a pre-(c) private store never reaches
+journal selection — the receipt-store claim precheck refuses it first.
+
+**Projection-domain turns carry authorization and names, not bytes.** Only
+`ManagedLocal`-domain pages may carry precondition/target bytes, because the
+foreground frame already carries that material. Projection-domain replay
+re-derives the current bytes from the accepted state *at replay time*, so a turn
+recorded before a newer merge simply publishes the newer render.
+
+#### Projection turn derivation schemes
+
+Every name a turn's replay may create is derived from the record alone. The
+`derivation_scheme` field is both a field and a hash input, so a build never
+re-derives with a scheme other than the one the record names, and a scheme
+implementation is never deleted while any on-disk record may reference it.
+
+| Scheme | Status | `turn_id` domain separator | Attempt-id domain separator |
+| --- | --- | --- | --- |
+| `derivation_scheme` = **1** | live | `tine/projection-turn/v1\0` | `tine/projection-attempt/v2\0` |
+
+Count of live projection-turn derivation schemes: **1**.
+
+`turn_id` is `SHA-256` over the domain separator, big-endian
+`derivation_scheme`, workspace UUID, lineage digest, device UUID, endpoint
+UUID, the one-byte sequence-domain discriminant (`0` = `ManagedLocal`,
+`1` = `ProjectionTurn`) and the big-endian sequence. `attempt_id(i)` is an
+RFC 9562 version-8 UUID over `turn_id`, the big-endian page index and the page
+UUID. The receipt-store resource id deliberately does not participate, so a
+turn's identity is a function of the record and nothing else. A record naming a
+scheme this build cannot evaluate is `MS-REF-PROTOCOL-INCOMPATIBLE`: the record
+is preserved, the turn is not replayed, and the page is reported. It is never
+treated as absent.
+
+#### Torn versus corrupt: the local-journal WAL rule
+
+The discriminator is the segment's **durable frontier**, not a heuristic.
+`LocalJournalSegmentV2` file-flushes a frame and durably publishes the successor
+frontier before append returns, and open validates every byte inside the
+committed frontier while truncating only bytes beyond it.
+
+| Case | Classification | Action |
+| --- | --- | --- |
+| bytes beyond the durable frontier | the append never returned, so by turn-before-mutation no graph mutation for those bytes can have started | the segment truncates them; nothing is owed; no residue probe exists or is needed |
+| any invalid frame at or below the frontier, tail or interior, checkpointed or not | `MS-REF-DISK-CORRUPT` — a disk/media error damaged an authoritative record whose effects may exist | refuse activation; retain the segment bytes as evidence; report the component. Never truncate, never skip |
+
+Open failures are classified **per variant**, because `open_selected` also
+reports states whose in-scope scenario is not disk corruption
+(`oplog::local_journal_drain::LocalJournalOpenRefusal`):
+
+| Open failure | In-scope scenario | Refusal |
+| --- | --- | --- |
+| corrupt frame, frontier violation, device/sequence binding failure | disk or media error damaged an authoritative record | `MS-REF-DISK-CORRUPT`, evidence retained |
+| segment already open, prepared artifact exists | an honest second Tine instance holds the segment | the existing concurrent-instance refusal; nothing is corrupt |
+| unsafe segment name, unsupported durable replacement | the journal namespace holds an entry this platform cannot safely open | the existing unsafe-filesystem refusal |
+| I/O or capability failure | transient storage unavailability | retryable; asserts nothing about record integrity |
+
+**Current status.** Production uses this record shape universally. Foreground
+local authoring still appends its semantic managed-local frame and the drain
+views that frame as a turn; ingress-local, ingress-foreign, terminal-local,
+terminal-foreign and superseded-repair producers append description-only
+records to the projection-turn journal. The common own-endpoint executor does
+not publish or recover projection receipts: its only recovery authority is the
+turn/journal and its only durable completion suppression is the local completion
+index. The foreign receiver executor continues to publish and recover the full
+receipt protocol, including base bytes and records, attempts, mutation
+authority, completion, pending cleanup, and forensic evidence.
+
+**Cold-open order is part of the write-safety contract.** After retained
+authority and archive/SQLite reconstruction, startup opens both local journals
+before terminal projection can mutate the graph. It drains the semantic
+managed-local domain first, then projection turns, recomputes terminal work,
+and probes each page for exact current bytes before appending a terminal turn.
+A journal that cannot open therefore refuses before terminal graph mutation;
+a completed-and-reclaimed terminal turn is not recreated on the next open.
+
+### 3.2b Device-wide absence-decision map and `DeferredAbsence`
+
+Every successful own-endpoint manifested projection passes through the common
+executor. Immediately after the graph mutation and exact-identity in-turn
+cleanup have completed, that seam stages one local-completion value in the
+engine: exact `ProjectionIntentId`,
+page id, path, `attempted | completed` state, `Present | Absent` target kind,
+and post-frontier. The intent id binds page, path, frontier, precondition and
+target; lookup is never by bare path. A completion by page P at X therefore
+cannot suppress a later creation by page Q at X.
+
+The engine coalesces staged entries into immutable generation-named objects at
+`archive/operations/sweeps/local-completion-index-v1/`. A flush installs one
+delta, and every `N = max(256, 2 × pages-at-compaction)` deltas the same staged
+publication also installs a full-map compaction. Compaction retains every exact
+intent still named by an uncheckpointed foreground frame or unretired
+projection continuation. An unreferenced local entry may be pruned only when
+either a later retained completion at the same `(page, path)` in the local or
+receiver half strictly dominates its frontier, or the receiver store retains no
+record at all for that key. Thus a local Absent completion that is the merged
+map's current answer is never removed while older receiver Present history
+remains beneath it; removing it would mis-defer a legitimate recreation.
+Superseded objects are pruned under the workspace lease subject to the same
+R16-C2 rule.
+
+Open performs one names-only enumeration. A compaction records the count and
+set digest of covered delta filenames; a current horizon reads that compaction
+plus only newer delta names. Extra names are behind-truth and are read as the
+delta. A torn or invalid summary chain rebuilds from valid retained delta
+objects, so this disposable cache adds no durable refusal.
+
+The coalesced O-C5 flush points are actor idle, clean shutdown, lease release,
+and the earlier of 60 seconds after the first buffered entry or 64 projecting
+turns. The first-entry deadline participates in the actor's receive timeout,
+including an otherwise quiet graph. Cold-open repair flushes synchronously at
+the repair-to-assembly boundary; every error exit after executing a projection
+uses an engine-plus-lease scope guard to attempt the same flush before unlock.
+`stop_without_clean_drain`, last-handle drop, and a failed guarded flush are
+crash-equivalent releases, not clean flush points.
+
+For an own-endpoint `Present` replay whose file is absent, a captured Present
+base proves update-shaped work and an exact matching completed intent proves a
+previously executed creation. Either case returns `DeferredAbsence`: finished
+without mutation, continuation retired, no completion/index entry written, and
+the Present terminal head left untouched. Foreground archive publication,
+engine admission, SQLite projection, checkpointing, and ordinary startup or
+differs-scan reconciliation continue. The current C-4 runtime immediately hands
+the deferral to §3.2c's sweep coalescer; the startup/differs scan remains its
+crash backstop. Absent-precondition work with no exact matching entry creates
+as before.
+
+Foreign replay builds a disposable absence-decision map once per managed open
+from the receiver summary plus the local completion index. The receiver summary
+is a chain-versioned, disposable object at
+`archive/operations/sweeps/receiver-absence-summary-v1/`; retained receipt
+records remain the truth. Its horizon is the count and set digest of the exact
+receiver evidence filenames it covers - completion AND intent names, because a
+durable intent without a completion is itself map evidence (incomplete-intent
+recovery and the local-index pruning guard consume it), so behind-truth must be
+detectable for both namespaces. Every summary install strictly follows the
+durable evidence it names. Open performs one names-only readdir of each of the
+two evidence namespaces. An equal horizon reads no receipt content; extra
+names are behind truth and delta-read exactly those completion/intent records;
+a summary naming evidence the directories lack, or any missing/torn/invalid
+chain, triggers exactly one full validated-catalog rebuild. Receiver evidence
+is immutable, add-only, and never production-deleted, so a valid summary can
+only be behind truth. Losing or corrupting it therefore
+changes cost only, never an absence decision or refusal outcome. The map is
+keyed by `(page, path)`. Its answer is the frontier-maximal completion across
+both halves; a defensive incomparable maximal set with mixed target kinds
+chooses the reversible Present/defer direction.
+
+The receiver executor consults that answer only after a fresh,
+capability-bound reread of the target path and before publishing a new intent:
+
+* maximal Present plus disk absence returns `DeferredAbsence`;
+* maximal Absent, or no completion in either half, preserves today's create;
+* a present disk file whose bytes mismatch keeps today's conflict flow.
+
+Exact-intent completion suppression remains a fast path only while disk still
+matches the recorded target. Disk absence always reaches the map, including a
+re-derived creation-shaped intent that finds its old completion.
+
+Retained incomplete receiver intents keep today's phase-driven protocol on the
+original precondition: re-authorization, exact recovery, then the existing
+evidence-gated fallback. Only an exhausted terminal is remapped, and only by a
+second fresh capability-bound reread: disk absence defers; a present byte
+mismatch remains the existing conflict. The phases, not an attempt-present
+shortcut, decide recovery.
+
+A receiver `DeferredAbsence` is finished without mutation: its continuation
+retires, no completion or local-index entry is written, and its Present
+terminal head stays untouched. Its provenance is `replay-deferred`. The engine
+hands that observation to the packet C-4 coalescer before another outbound
+actor turn; a crash before handoff remains covered by the ordinary mandatory
+startup/differs scan.
+
+O-C5 accepts two bounded residuals. A crash after own-endpoint execution but
+before its coalesced flush can lose at most the 60-second/64-turn suffix, so a
+later replay may recreate that user's own just-accepted save; current-state
+authorization prevents stale or foreign bytes from using this route. Once a
+local Absent completion has executed, the same crash window can lose its index
+entry and expose an older retained receiver Present completion. A later foreign
+recreation then mis-defers conservatively instead of projecting. The O-C5 cap
+bounds this second residual too; it never resurrects content and never silently
+loses it, because the downstream sweep retains the recoverable disposition.
+
+### 3.2c Absence sweeps, tiers, and publication hold
+
+An **absence observation** is a startup full-scan difference, a live watcher
+difference where accepted state is Present and disk is absent, or a
+`replay-deferred` disposition from §3.2b. The first observation durably opens a
+sweep. A sweep absorbs another observation only while it arrives less than
+`W = 60 seconds` after the previous observation, and closes after 60 seconds
+of quiet. All absences discovered by one startup scan form one sweep regardless
+of how many bounded scan turns it needs. Membership is the set union by
+deletion batch id; `k` is its count at evaluation and the percentage denominator
+is the accepted page count captured when the sweep opened.
+
+Tier precedence is exact and accept-by-default:
+
+1. tier 3 when `k >= min(50, ceil(0.10 × pages-at-open))`;
+2. otherwise tier 2 when `k >= 4`;
+3. otherwise tier 1.
+
+All tiers author ordinary accepted deletion batches immediately; local
+acceptance and inbound provider admission never wait for classification. Tier 1
+is quiet. Tier 2 and tier 3 become current `SyncAbsenceSweepEvent` snapshots on
+the runtime's read-only list surface. Each snapshot carries the tier and timing
+summary, explicit disposal, ordered `(page id, path)` members, and the latest
+durable action state including Restore cursor or recorded failure cause. An open
+sweep escalates in place as `k` crosses a boundary, appending its new tier and
+members. A read-only runtime subscription publishes the same snapshot at first
+surfacing and whenever its durable action state changes; Tauri relays it to only
+the window and binding generation that own that runtime. Disposed surfaced
+records remain listable as disposition history.
+
+The frontend keeps tier 1 quiet, raises a tier-2/tier-3 warning, and retains a
+dock/list/details surface with the member pages and live action state. Its
+Restore, Re-apply, and Keep-deletion controls map one-to-one to the three backend
+actions on `SyncRuntimeHandle`; a failed Restore shows its recorded cause and
+the re-run control invokes whole-sweep Restore again. Dismissing the warning or
+closing the surface changes presentation only. It never invokes a disposition;
+Keep-deletion is an explicit deliberate action.
+
+Each logical record is the append-only immutable chain in the layout table.
+The current state is its highest valid linked version and records: sweep id;
+open, last-observation, and close timestamps; pages-at-open; tier; tier-3 grace
+deadline; ordered `(path, page_id)` members; each member's deletion batch id,
+predecessor accepted-state frontier, and best-effort prior-Present intent id;
+explicit disposal; and versioned action history. Restore progress uses the
+already-defined authored-batch list and cursor containing chunk ordinal,
+remaining-operation watermark, and monotonic retry count; packet C-5a does not
+change this record format. O-C3 remains binding on future re-baselining:
+before it retires any batch, predecessor state, intent, or annotation object,
+it must pin or copy forward everything required to render every retained
+Restore record at its existing fidelity grade. The best-effort intent reference
+is provenance and layout evidence, never the restore payload source. Records
+are retain-all; there is no record-GC knob.
+
+The `sweeps/` directory is created idempotently only after the workspace lease
+is acquired and archive repair has completed. Open enumerates only the positive
+`<uuid>.<20 decimal digits>` grammar. It reconstructs records before drain
+resumption and before every publication-capable step, ignores unrelated residue,
+and falls back from a torn highest object to the preceding valid chain object.
+Terminal records are inert. Open or in-grace records resume under their
+recorded id, re-establish the barrier, repeat their structured notification,
+and re-arm the earliest deadline wake.
+
+The ordering invariant is tier-independent: the record is durable at sweep
+open before any member deletion batch commits. `execute_clean_external`
+finalizes the batch and absence set, then calls the `SweepRecorder` seam to
+append `{batch id, members}`, and only then crosses `commit_clean_prepared`.
+A crash between those steps leaves a recorded but uncommitted member. Reopen
+reconciles member batch ids against the accepted-batch set, drops that member,
+and lets the startup scan re-observe the still-absent file. No accepted deletion
+can therefore predate its sweep record.
+
+One named `publication_barrier_active()` predicate is true from sweep open. For
+tier 1/2 it ends at close. For tier 3 it extends until exactly five minutes
+after close or explicit disposal. It retains but excludes from runnable work
+all three history-bearing outbound families: forced batch plus frontier-head
+publication; full archive/descriptor/head repair; and prepare-share/baseline
+publication (which refuses as named in §3.1). Descriptor-only republication is
+the named exemption because it contains no batch, head, or frontier data.
+Inbound admission, conflict resolution, local durability, and local acceptance
+remain runnable. Both the actor receive timeout and the native watcher sleep
+are capped by the earliest close/grace deadline, and both timeout ends force a
+deadline turn on an otherwise quiet graph.
+
+This is the approved O-C4 propagation-timing delta: accepted external
+deletions are locally durable immediately, but their history-bearing outbound
+publication is delayed through the coalescence window and, at tier 3, through
+the five-minute grace. Dependency order is unchanged when the retained queue
+is released.
+
+Re-apply is an actor-owned disposition action. It compares every member with
+current accepted state and re-authors only still-live pages as ordinary
+`DeletePage` batches; already tombstoned members are no-ops. It performs no
+direct user-file operation. The ordinary guarded Absent projection removes the
+files, so watcher observations cannot fight the action. Started/progress/
+completion records make it restart-resumable and idempotent. Keep-deletion is
+also recorded before it releases grace.
+
+Restore is a whole-sweep actor action. It renders each member from the accepted
+predecessor state immediately before that member's deletion batch. A retained
+Present intent can contribute exact layout and annotation evidence, yielding a
+`byte_identical` fidelity grade. Without that evidence the ordinary canonical
+renderer yields `semantically_identical`: the accepted semantic state is exact,
+but layout may be regenerated. Activation-imported pages with no prior intent
+remain restorable. Completion disposes the sweep exactly like Re-apply and
+Keep-deletion, releasing any tier-3 grace hold immediately after all restore
+batches have authored. Projection remains ordinary manifested publication; a
+restored page therefore reappears through the common executor and its completed
+Present entry becomes frontier-maximal `(page, path)` evidence for later
+absence decisions.
+
+Restore uses `RevivePage`, a semantic operation that changes a catalog entry
+from Tombstone to Live at the recorded predecessor name, path, kind, home
+shard, and **same page id**. The semantic-effect schema carries a required,
+authenticated `revive_page` lifecycle discriminant on that `PageDelta`.
+Authoring validation and receiver decoding refuse Tombstone-to-Live without
+it. This protects malformed/imported content and honest peer divergence from
+silently resurrecting a tombstoned page. `CreatePage` continues to refuse a
+tombstoned id. This is one exact 0.7 decoder/schema version—there is no dual
+decoder or wire-version peek—and the enrollment graph-schema floor is
+unchanged. Already-shipped pre-0.7 builds treat the unsupported clean
+descriptor as benign non-join.
+
+The first operation in every revival batch is the catalog flip, making the
+following content operations legal in vector order. The remaining operations
+are a state-targeted semantic-tree diff from the **current** shard to the
+immutable predecessor snapshot: block insert/remove/move/edit, membership,
+preamble, and metadata changes. An already-equal page emits no content work.
+Peers admit and replay these as ordinary CRDT operations, so concurrent remote
+edits resolve through the normal merge rather than a special restore channel.
+
+An over-limit restore takes a bounded prefix and commits it as an ordinary
+batch, then appends a durable action cursor before planning the next chunk.
+If that accepted chunk retains derived projection work, Restore settles that
+local continuation before authoring another chunk; the absence publication
+barrier remains active throughout and still gates only the history-bearing
+outbound families. Every chunk re-diffs current state. Its cursor records `{chunk ordinal,
+remaining-operation watermark}`, where the watermark is the size of the full
+fresh diff before that chunk. The next recomputed watermark must be strictly
+smaller. A non-decreasing value means concurrent admission re-grew the diff;
+Restore retries at most three times, then appends a Failed action with the cause
+and returns a failed backend action for an explicit re-run. It never records a
+partial restore as successful. The final step recomputes and asserts an empty
+whole-page diff before appending Completed. Startup automatically resumes
+Started or Progress actions from their durable cursor.
+
 ### 2.10a Durability barriers by artifact class
 
 Platform durability policy is stated **per artifact class**, never globally.
@@ -1091,7 +1758,7 @@ and every projection directory barrier passes through it:
 
 | Class | What it covers | Policy |
 | --- | --- | --- |
-| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. |
+| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and promoted/operational receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. The empty receipt-store initialization exception is confined to §2.10c. |
 | `SharedReconstructibleProjection` | The Markdown/Org projection of an already-accepted manifest into the user's graph tree. | Strict everywhere except Android. On Android only, and only for `PermissionDenied`/`Unsupported`/`InvalidInput` (`EPERM`/`ENOTSUP`/`EINVAL`), the barrier **degrades**. Every other errno stays fatal. |
 
 The crash story for the degraded case still holds: the projection is derived
@@ -1121,6 +1788,254 @@ at the primitive, and
 `sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal`
 plus `…::a_projection_directory_barrier_refusal_stays_pending_off_android`
 at the save boundary.
+
+### 2.10a-i Durability barriers and the batch commit point
+
+A **durability barrier** is a syscall that forces bytes to stable storage:
+`fsync` of a file, `fsync` of a directory, or `syncfs` of a filesystem. Each one
+is a device round trip. Their *count per accepted operation* — not the time any
+single phase reports — is what turns an ordinary edit from milliseconds on a
+local SSD into hundreds of milliseconds on a slow or network filesystem, and it
+is invisible to phase timers because the multiplicity is spread across modules.
+
+**Invariant — acceptance authority precedes relaxed archive publication.** The
+managed-local journal frame is durable before archive materialization begins and
+is checkpointed only after publication completes. While that exact frame remains
+undrained, its canonical object bytes may authorize archive-object recovery. No
+other caller receives this relaxation: ordinary archive publishers take a strict
+pre-install data barrier, and the batch manifest always remains a strictly
+flushed commit marker.
+
+**The protocol** (`oplog/object_store.rs::ArchiveBatchPublication`):
+
+1. **Stage.** Each artifact is written under a temporary name in its own
+   namespace, with no barrier. Temporary names are not archive entries: every
+   reader — `ObjectStore::validate_namespace`, `inspect_batch`, every replay —
+   addresses artifacts by content-addressed or batch-addressed *final* names.
+2. **Journal-covered object install.** Only the managed-local drain inserts its
+   object final names at this point. Its exact frame is still undrained, so a
+   crash-torn object remains repairable. Strict callers skip this step.
+3. **One data barrier.** `syncfs` flushes the whole staged set. Strict callers
+   take it before any final name is visible; the managed-local drain takes it
+   after object installation while the manifest is still temporary.
+4. **Remaining installs.** Ordinary publishers insert every final name. The
+   managed-local drain inserts only its now-durable manifest commit marker.
+5. **Directory barriers.** One `fsync` per distinct namespace touched — two for
+   an ordinary batch (`objects`, `batches`).
+
+The strict path's barrier-before-install ordering remains unchanged. The
+journal-covered path deliberately admits one additional crash state only
+between steps 2 and 3: an object final name whose bytes were not fully flushed.
+Cold open first authenticates the archive structure, then—under the workspace's
+sole-writer lease—decodes only uncheckpointed managed-local frames and builds an
+exact digest-to-canonical-byte repair set. It replaces a mismatching object only
+when that set names one unambiguous exact replacement, rereads the result, and
+then runs the ordinary full namespace validation. An uncovered mismatch,
+ambiguous coverage, a noncanonical replacement, a workspace mismatch, or a torn
+manifest still refuses activation. Drained history is never recovery authority
+because step 3 makes every object durable before publication returns and before
+the caller may advance the checkpoint.
+
+`tine_storage::ExactImmutablePublicationBatch` now implements the strict form in
+the shared storage primitive: stage, flush all staged data, install no-replace,
+then flush every destination directory. Tine's local drain retains its narrower
+archive publisher because only it can apply the undrained-journal authorization
+and manifest carve-out.
+
+**Ordering between artifact classes.** The archive's **lineage claim** remains
+durable before every manifest that asserts it. The **local journal frame** is
+already durable before the drain starts. Objects install before the strictly
+flushed **manifest commit marker**, and the journal checkpoint advances only
+after both namespace directory barriers complete. Thus a durable manifest never
+points to an object lacking either durable archive bytes or exact undrained
+journal recovery authority.
+
+**Crash points.**
+
+| Crash at | On disk | Recovery |
+| --- | --- | --- |
+| During staging | Temporary names only, contents arbitrary | Batch not accepted. The journal frame is undrained, so the drain republishes the byte-identical batch. Temporaries are invisible to readers. |
+| After staging, before an install | As above | As above. |
+| During journal-covered object installs, before the barrier | A prefix of object names whose bytes may be torn; no manifest name. | Cold open repairs only exact undrained-journal-covered object mismatches before full validation. |
+| After the barrier, during remaining installs | Every surviving final name has durable, byte-correct content. | The drain republishes and verifies exact existing names. |
+| After installs, before a directory barrier | Some name insertions may disappear; every surviving name has durable, byte-correct content. | The drain republishes; the journal checkpoint has not advanced. |
+| After the directory barriers | The whole batch durable | The drain proceeds to checkpoint. |
+
+In every row the *accepted operation* is unaffected: it became durable in the
+local journal during the foreground save, before any of this runs.
+
+**In-scope scenarios defended:** crash/power loss, torn write, disk error,
+interrupted delivery, honest concurrent instance (the archive is a single-writer
+namespace held under lease), honest multi-device divergence (unchanged — this
+publication is device-local). **Out of scope:** an adversary who can write
+arbitrary bytes to the user's filesystem
+(`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`).
+
+**Platforms without `syncfs`** (Windows, macOS) publish each artifact through
+the ordinary durable publisher, so this optimization and repair state do not
+arise there. On Android, a strict caller whose vendor filesystem denies the
+filesystem-wide flush as a *capability* (`EPERM`/`ENOTSUP`/`EINVAL`) falls back
+to one `fsync` per staged artifact. Every other errno stays fatal. The
+journal-covered Android path installs object names while its journal frame is
+undrained, then uses the same whole-batch flush and exact cold-open repair
+authorization as Linux before it installs the manifest.
+
+**Read paths take no barriers.** `fsync` before reading a file defends nothing:
+a read is served from the same page cache the writer wrote into, so forcing
+those bytes to the platter cannot change the returned bytes, and it cannot
+detect corruption either. Three such helpers existed on the managed projection
+paths and fired three times per save and eight times per cross-page move; they
+are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
+
+**Invariant — managed projection takes one directory barrier per turn per leaf
+directory.** A projection turn defers reconstructible graph-directory barriers
+until its final name change, deduplicates them by opened leaf-directory
+identity, and flushes each distinct leaf exactly once before checkpoint. File
+barriers remain one per distinct staged inode. Strict private-authority and
+conflict-trash barriers are not coalesced into this reconstructible point.
+
+This collapse is managed-class-conditional. Direct Files does not execute a
+projection turn and its publication barriers are unchanged; the same
+`sync_projection_chain_with_class` primitive still flushes `chain.last()` and
+nothing above it immediately. The leaf-only argument has two halves and they
+are exhaustive:
+
+* An ancestor **Tine created during this operation** is made durable when it is
+  created, not afterwards: `model::create_projection_chain_component` is the
+  only place a chain component is created, and it flushes the parent that now
+  holds the new name before the chain builder descends into it. A crash between
+  the `mkdir` and the operation's own barrier therefore cannot lose the path the
+  operation is about to publish into
+  (`model::tests::projection_retry_resumes_after_synced_partial_parent_chain`
+  drives exactly that crash point and proves the retry converges).
+* An ancestor **Tine did not create in this operation** already had a durable
+  entry in *its* parent before the operation began. No in-scope scenario
+  un-durables an entry that is already on stable storage: crash/power loss,
+  torn write, disk error, sync-service delivery, external-editor race, honest
+  concurrent instance, honest multi-device divergence and malformed imported
+  content can all destroy or replace such a directory, but none of them can be
+  repaired by this process re-issuing `fsync` on it, and every one of them is
+  already handled by the guarded-conflict, no-follow and recovery machinery
+  above. The removed flushes are removed because **no in-scope scenario needs
+  them**, not because they were expensive — the refusal-scenario rule in
+  `AGENTS.md` §5 cuts both ways, and a barrier with no scenario is latency the
+  user pays for nothing.
+
+The one failure the removed flushes did cover is **another** process creating an
+ancestor directory and not flushing it itself — a durability obligation that
+belongs to that writer, that Tine cannot discharge on every subsequent write
+without paying the barrier forever, and that Linux's ordered metadata journals
+largely subsume anyway (a directory `fsync` commits the transaction that created
+its parent). It is recorded here rather than defended.
+
+Enforced by
+`model::tests::a_projection_operation_flushes_one_directory_whatever_its_depth`
+(chain depth must not change the barrier count) and
+`model::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier`
+(each created ancestor still costs its own barrier, exactly once), plus
+`model::tests::a_same_directory_move_takes_one_directory_barrier` and
+`model::tests::managed_barrier_collapse_does_not_change_direct_files_retire_publish_barriers` for the
+turn boundary and the class guard.
+
+**The budget, and where it stands.** `crate::durability_counters` counts every
+barrier `tine-core` initiates and
+`sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
+asserts the per-operation totals against
+`MANAGED_SAVE_BARRIER_BUDGET` = **10** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**13**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+appends and SQLite file-set publication are not reachable from this crate and
+are excluded (measured at three more per save, four per move).
+
+The packet-2b collapse reduced the complete packet-2b-pre ledgers from 35 to 29
+for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
+one coalesced local-completion chain install when this fixture reaches idle:
+one directory barrier plus one staged-publication filesystem barrier for the
+whole operation, never per page. Packet 2c removes own-endpoint receipt
+publication from that executor. MS-05 keeps the exact totals and barrier kinds;
+it moves the archive filesystem flush after the journal-covered object installs
+but before manifest install and journal checkpoint. The final exact attribution
+is: save foreground
+`file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
+`file_fsync=2 dir_fsync=6 syncfs=2 total=10`; move foreground is zero and move
+total is `file_fsync=6 dir_fsync=5 syncfs=2 total=13`. These are exact-equality
+assertions, not ceilings: either upward or downward drift requires a new
+attribution before the pin moves. The MS-05 barrier delta is therefore zero:
+the packet changes crash-safe ordering and recovery, not the number or kind of
+durability syscalls. The packet-2b removed 6/25 directory barriers were repeated
+`SharedReconstructibleProjection` barriers within turns; no strict authority or
+quarantine barrier was removed.
+
+The 2026-08-27 counter-completeness sweep raised those enforced numbers from
+25/74 without adding or moving a single durability syscall. This is measurement
+visibility, not a latency regression: the save fixture made five previously
+unattributed own-endpoint projection-receipt publications visible (five file +
+five directory barriers); the move fixture made sixteen such publication
+pairs, five mutation-authority replacement file barriers, and one clean-
+foreground retirement directory barrier visible. Packet 2c removes those own-
+endpoint barriers; the retained foreign receiver protocol remains outside the
+save/move fixtures. The exact ledgers and the source guard reject unreviewed
+barrier drift or any future raw barrier outside the counted wrappers.
+
+Packet C-4 adds no save- or move-path barrier. Sweep-chain installs occur only
+on the absence/observation path and use the ordinary staged/no-replace archive
+publication discipline. Each appended sweep version pays one staged-object
+file flush, its staged-publication filesystem barrier, and one coalesced
+`sweeps/` directory barrier. A sweep normally appends at open/membership,
+escalation or additional membership, close, and action progress; the cost is
+per sweep transition, never per ordinary save. The exact save/move pins above
+therefore remain 10/13 with foreground 3/0.
+
+**Barriers with no in-scope scenario are deleted, not budgeted.** Three
+mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each
+because no in-scope failure needed it, not because it was expensive:
+
+* The **post-publication re-`fsync` of the committed journal target** (one per
+  save). The published inode is the staged inode, already flushed before the
+  no-replace rename; re-syncing it proves nothing the staging barrier did not.
+  The reread and identity refusals around it stay — they are preconditions.
+* The **pending-cleanup round flip on an empty queue** (two directory barriers
+  per save; one per projected page on a move, when that page's queue is empty).
+  `ProjectionReceiptStore::pending_projection_cleanup_bounded` flipped the round
+  state durably whenever the *active* round was empty. When the *whole* queue is
+  empty — the ordinary save — the flip makes nothing reachable. It is now elided
+  when both rounds are empty and unchanged otherwise, including the case that
+  motivates it: new markers are appended to the inactive round, so an empty
+  active round with a retained inactive round still flips.
+* The **displaced-file pre-`fsync`** (one per projected page displaced; two per
+  cross-page move, none on an ordinary save). The file was about to be moved
+  aside and its exact pre-image is already durable in the recovery record by the
+  ancestor-chain argument above. The identity capture, the
+  `displaced != expected_base` refusal, the bound evidence capture and the
+  retirement all stay.
+
+Enforced by `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
+and `oplog::projection_store::tests::an_empty_pending_cleanup_queue_elides_the_durable_round_flip`.
+
+The cost-model audit's target is 3 and 5. The remaining gap is stated here
+rather than hidden:
+
+* The **foreign receiver projection receipt store** publishes five artifacts
+  per intent (base, intent, attempt reservation, mutation authority, completion)
+  = 10 barriers per received page, plus one forensic-evidence record and one
+  pending-cleanup marker for each recovery file a projection displaces. It
+  published *nine*
+  before the 2026-08-26 refusal census cut the four per-intent namespace
+  bindings; the survivors each name an in-scope crash/torn-write scenario and
+  are recorded in the census
+  (`specs/notes/2026-08-26-p-census-receipt.md`). They are still published one
+  at a time: each is separated from the next by a read-back of the artifact just
+  published, so staging them behind one barrier would have to carry the staged
+  bytes in memory as well. This cost belongs to foreign ingress, not the local
+  save/move ledgers; packet C-3 consumes the receiver history without weakening
+  this protocol.
+
+The remaining save/move gap is no longer receipt publication or repeated
+managed graph directory barriers; it is the turn/journal, graph publication,
+archive, and coalesced completion-index work shown by the exact 10/13 ledgers.
+Direct Files' user-visible Markdown publication keeps its
+temp + fsync + exact durable name publication + base-revision guard + lock.
+The platform-specific typed publication boundary supplies the name-durability
+guarantee, including write-through publication on Windows.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 
@@ -1347,13 +2262,51 @@ available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
 
-Before an enrollment binding exists, projection receipts are reconstructible
-bootstrap state rather than authority. If Android cannot reopen a receipt tree
-left by an interrupted or older activation, retry retains one sibling
+Directory-barrier refusal is classified at the receipt store's promotion
+boundary, not by platform or by syscall alone:
+
+| Receipt publication | Durability class | Android capability refusal | Required response |
+| --- | --- | --- | --- |
+| Initialization claim, top-level namespaces, pending-cleanup namespace and rounds, their initialization authority/state, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable. Before the first create/recovery acceptance under each promoted parent in every process, establish one strict parent barrier. A successful mutation barrier verifies that parent for later exact names in the same process; a refusal or panic removes verification. Thus a process death cannot erase debt, while read-only inspection and later same-process names pay no extra barrier. |
+
+`ProjectionReceiptStore::initialize` passes the first row's durability phase
+through both the top-level helpers and the nested pending-cleanup initializer;
+the ordinary receipt publisher and directory creator are the strict second
+row. This keeps an Android setup capability limitation from wedging activation
+without letting that setup exception leak into retained receiver authority.
+On a device that permits exact app-private writes but persistently refuses
+directory fsync, setup can still complete because its empty structure is
+reconstructible, but the first operational receipt refuses: managed storage is
+not usable without durability for its private authority. A promoted store that
+has lost only its nested empty pending-cleanup initialization structure also
+rebuilds that structure strictly and may refuse during open; it never discards
+or silently reconstructs operational receipt authority. The verification set
+starts empty in every process. Consequently an exact name left visible by a
+refused barrier is never accepted after restart merely because the in-memory
+record of that refusal disappeared; its parent is synchronized first.
+
+The analogous Android early returns are classified explicitly rather than
+sharing one object-store default. `object_store::ensure_directory_nofollow` is
+strict: an existing parent is synchronized before it may carry a private local
+journal, projection-turn journal, move episode, provider retry journal, absence
+disposition record, recovery-trash name, archive namespace, or other durable
+authority. `ensure_reconstructible_directory_nofollow` is the narrow exception
+for the local-completion and receiver-summary caches whose authoritative inputs
+remain elsewhere. Call-site source guards pin that split. `enrollment::open_component`
+creates its component chain before promotion, while promoted readers use
+`create=false`, so it retains the pre-promotion policy.
+
+Before an enrollment binding exists, the empty receipt store's initialization
+artifacts are reconstructible bootstrap state rather than authority; no
+operational receipt is published before the activation marker. If Android
+cannot reopen a receipt tree left by an interrupted or older activation, retry retains one sibling
 `receipts.pre-promotion-failed` diagnostic tree and initializes a clean receipt
 store from the unchanged Markdown/Org source. Once enrollment has promoted the
 receipt-store identity, this recovery is forbidden: normal exact identity and
-receipt recovery rules apply.
+receipt recovery rules apply. Recreating an absent or empty initialization
+structure is still allowed because it discards no operation receipt; a nonempty
+claimless store is refused.
 
 The same rule governs the archive a clean activation builds. Before the
 activation marker is committed, the archive carries no authority and is
@@ -1431,12 +2384,13 @@ authorize a production change without an independent current-runtime
 fail-before. Architectural guards that bind this document to the code therefore
 enter the release suite without a second hand-maintained allowlist.
 
-Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
-20. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
-SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
-only that derived representation and costs one rebuild; it must not migrate or
-reinterpret authoritative oplog bytes. Authoritative format changes require an
-explicit versioned migration and cannot be treated as a cache rebuild.
+The current disposable SQLite schema identity is 22, owned by
+`tine_storage::formats::SQLITE_SCHEMA_VERSION`. Bumping it invalidates only the
+derived SQLite representation and costs one rebuild; it must not reinterpret
+authoritative oplog bytes. Before 0.7, an unrecognized private Managed Storage
+format is preserved as a backup and rebuilt from Markdown/Org into the sole
+current format. Production does not carry an old-format reader, dual schemas,
+or an in-place migration bridge.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 
@@ -1532,6 +2486,85 @@ journey boundary by
 `sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem`
 and
 `…::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem`.
+
+### 2.10e Projection-turn identities and graph names
+
+Every managed projection name is derived from its durable turn record, not from
+receipt-store or process identity. Derivation scheme 1 hashes the domain tag
+`tine/projection-turn/v1\0`, the big-endian scheme number, workspace, lineage,
+device, endpoint, one-byte sequence domain and big-endian sequence into the
+32-byte `turn_id`. For page index `i`, it hashes
+`tine/projection-attempt/v2\0 || turn_id || u32_be(i) || page_id`, takes the
+first 16 bytes, and applies the RFC 9562 UUID version-8 and variant masks. The
+three graph names are then:
+
+```
+.{target}.{attempt_id.simple()}.projection.recovery
+.{target}.{attempt_id.simple()}.projection.staged
+.{target}.{attempt_id.simple()}.projection.withdrawn
+```
+
+Integers are big-endian and `simple()` is lowercase hexadecimal without
+hyphens. A foreign receiver receipt reservation records this supplied attempt
+id; it does not derive another one, and receiver recovery resumes its retained
+durable reservation or mutation authority. Own-endpoint replay never reads that
+namespace: every attempt id comes directly from the turn. Packet-2a/2b own-
+endpoint residue is inert, is reported by validated names only, and is neither
+resumed nor deleted. This is I2a: an undrained own turn can enumerate every
+graph name its executor may have left behind without receipt evidence.
+
+The live scheme list is `LIVE_PROJECTION_TURN_DERIVATION_SCHEMES`; an unknown
+scheme is a protocol refusal, never guessed. The byte-level derivation is
+enforced by `oplog::projection_turn_journal::tests`; the real-store recovery-
+equivalence oracle proves turn-only own recovery over every specified crash cut
+while the foreign receiver protocol remains unchanged.
+
+### 2.10f The interrupted-publication recovery walk
+
+Editor publication is the deliberate exception to derivable graph names (I2b).
+It is shared with Direct Files and uses process-scoped recovery names. New
+managed names carry four fields,
+`.{target}.{pid}.{seq}.{turn8}.editor-recovery`; the parser accepts that exact
+shape and the three-field legacy shape. It is a parser, not a suffix glob: the
+leading dot, numeric process fields, hexadecimal turn field when present,
+known suffix, and text-extension target must all validate.
+
+Every checked graph open performs one bounded, no-follow
+interrupted-publication walk before either journal is opened or replayed. The
+walk uses the retained managed-text inventory limits, reads no document
+contents, restores a sole claimant over a missing live name with no-replace,
+and moves every competing claimant to conflict trash. Traversal, bounds,
+permission, and unsafe-entry errors propagate through `open_checked`; they may
+not be converted into an empty result. This is I2c: a failed walk refuses
+activation before replay can publish onto an incompletely recovered tree.
+
+`model::tests::checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound`,
+`model::tests::editor_recovery_names_accept_legacy_and_turn_derived_shapes`, and
+`sync_runtime::tests::the_open_time_recovery_walk_precedes_every_journal_replay`
+enforce the bounds, grammar, API propagation, and source ordering.
+
+### 2.10g Retain-never-delete recovery
+
+Recovery may unlink a graph-tree object only inside the live turn that captured
+both its bytes and its exact open-file identity, and only while both still
+match. A reopened process has no such capability. Anything unbound, changed,
+occupied, or merely byte-identical under another identity is moved intact to
+`.trash/conflicts/`; it is never treated as scratch and unlinked.
+
+Quarantine is itself a durability protocol. It validates a no-follow,
+single-link source, renames no-replace into strict `PrivateDurableAuthority`
+conflict trash, flushes the destination chain first and the source chain second,
+then reopens and verifies identity. Created ancestors are flushed eagerly. A
+hard-link, folded-name, or other refusal leaves the source in place. On the
+foreign receiver path, its durable pending-cleanup receipt records the residue.
+On the own-endpoint path, the in-turn exact-identity capability refuses before
+the local completion is staged, so the owning journal turn cannot checkpoint
+and discard the debt. Thus every derived or discovered leftover is restored,
+quarantined, or reported in place before its turn checkpoints.
+
+The crash and external-race coverage lives in the packet-2b C3-C6, R2-R5 and
+X5-X6 tests, including occupied staged-name quarantine, in-turn exact-identity
+retirement, post-crash retention, and hard-link refusal.
 
 ## 4. Concord base ledger (Direct Files)
 

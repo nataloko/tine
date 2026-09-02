@@ -63,6 +63,7 @@ use super::{BatchId, DeviceId, LineageDigest, WorkspaceId};
 /// unbounded walk of a host filesystem.
 pub const MAX_PROVIDER_RESCAN_ENTRIES: usize = 4_096;
 pub const MAX_PROVIDER_RESCAN_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
 pub const MAX_PROVIDER_RESCAN_DEPTH: usize = 16;
 pub(crate) const SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE: &str = "clean-baselines-v1";
 pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
@@ -105,6 +106,7 @@ pub struct ProviderLocation {
     pub path: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSource {
@@ -248,11 +250,6 @@ struct ProviderTransactionAuthority {
 struct ProviderTransactionGate {
     authority: Arc<ProviderTransactionAuthority>,
     lock_file: fs::File,
-}
-
-enum ProviderSourceTransactionGate<'a> {
-    Mailbox,
-    Tree(&'a ProviderTransactionGate),
 }
 
 impl Drop for ProviderTransactionGate {
@@ -598,8 +595,7 @@ impl ProviderRuntime {
             staged
                 .write_all(&expected)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            staged
-                .sync_all()
+            crate::durability_counters::sync_file(&staged.file)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
             record.staging_identity = Some(provider_identity_record(provider_file_identity(
@@ -661,8 +657,7 @@ impl ProviderRuntime {
                     staged
                         .write_all(&expected)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    staged
-                        .sync_all()
+                    crate::durability_counters::sync_file(&staged.file)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
                     validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
                     record.staging_identity = Some(provider_identity_record(
@@ -882,15 +877,18 @@ impl SharedProviderFrontierHeadV1 {
         &self.frontier_tips
     }
 
+    #[cfg(test)]
     pub(crate) const fn manifest_recovery_coverage_root(&self) -> Option<super::ContentDigest> {
         self.manifest_recovery_coverage_root
     }
 
+    #[cfg(test)]
     pub(crate) fn has_current_manifest_recovery_coverage(&self) -> bool {
         self.manifest_recovery_format_version == SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
             && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root)
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_manifest_audit_coverage_sequence(&self) -> Option<u64> {
         if self.accepted_manifest_audit_format_version
             == SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION
@@ -903,10 +901,12 @@ impl SharedProviderFrontierHeadV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_current_accepted_manifest_audit_coverage(&self) -> bool {
         self.accepted_manifest_audit_coverage_sequence() == Some(self.accepted_generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_manifest_revalidation_next_sequence(&self) -> Option<u64> {
         let maximum = self.accepted_generation.checked_add(1)?;
         (self.accepted_manifest_revalidation_next_sequence != 0
@@ -955,12 +955,14 @@ impl SharedProviderFrontierHeadV1 {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct SharedProviderFile {
     pub(crate) path: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) kind: Option<ProviderItemKind>,
 }
 
+#[cfg(test)]
 pub(crate) struct SharedProviderScan {
     pub(crate) files: Vec<SharedProviderFile>,
 }
@@ -971,8 +973,6 @@ pub(crate) enum SharedProviderObservation {
     ChunkBoundary,
     Complete,
 }
-
-const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
 
 pub(crate) struct SharedProviderObservationCursor {
     phase: u8,
@@ -985,15 +985,6 @@ pub(crate) struct SharedProviderObservationCursor {
 impl SharedProviderObservationCursor {
     pub(crate) fn begin_next_chunk(&mut self) {
         self.observed_entries = 0;
-    }
-
-    pub(crate) fn has_completed_authority_discovery(&self) -> bool {
-        // A head cursor is authoritative only after descriptor, frontier-head,
-        // and publication-intent discovery. A full cursor must additionally
-        // exhaust recovery evidence plus canonical manifests and objects:
-        // those later namespaces can reveal ingress that changes accepted
-        // authority.
-        self.phase > if self.full { 7 } else { 3 }
     }
 
     #[cfg(test)]
@@ -1050,6 +1041,7 @@ impl SharedProviderTransport {
         self.publish(SHARED_ENROLLMENT_DESCRIPTOR_PATH, bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_object(
         &mut self,
         digest: super::ContentDigest,
@@ -1267,6 +1259,7 @@ impl SharedProviderTransport {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn full_observation_cursor(
         &self,
     ) -> Result<SharedProviderObservationCursor, ScenarioError> {
@@ -1438,6 +1431,7 @@ impl SharedProviderTransport {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn retire_frontier_head(&self, path: &str) -> Result<(), ScenarioError> {
         if !path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) {
             return Err(ScenarioError::InvalidProviderPath(path.into()));
@@ -1461,96 +1455,6 @@ impl SharedProviderTransport {
             None,
             ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
         )
-    }
-
-    pub(crate) fn record_pending_publication(
-        &self,
-        batch_id: super::BatchId,
-    ) -> Result<(), ScenarioError> {
-        let gate = self.journal.acquire_transaction_gate()?;
-        self.journal.require_transaction_gate(&gate)?;
-        let name = format!("{batch_id}.pending");
-        let bytes = batch_id.to_string().into_bytes();
-        if let Some(mut existing) = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )? {
-            return validate_local_file_bytes(&mut existing.file, &bytes, &name);
-        }
-        pending_publication_marker_creation_hook()?;
-        let mut file = create_local_file_exclusive(&self.pending_publication, &name)?;
-        file.write_all(&bytes)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        file.sync_all()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        validate_local_file_bytes(&mut file, &bytes, &name)?;
-        sync_provider_directory(&self.pending_publication)
-    }
-
-    pub(crate) fn pending_publication_cursor(
-        &self,
-    ) -> Result<SharedProviderPublicationCursor, ScenarioError> {
-        Ok(SharedProviderPublicationCursor {
-            entries: self
-                .pending_publication
-                .entries()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?,
-        })
-    }
-
-    pub(crate) fn next_pending_publication(
-        &self,
-        cursor: &mut SharedProviderPublicationCursor,
-    ) -> Result<Option<super::BatchId>, ScenarioError> {
-        let Some(entry) = cursor.entries.next() else {
-            return Ok(None);
-        };
-        let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 publication".into()))?;
-        let id = name
-            .strip_suffix(".pending")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .map(super::BatchId::from_uuid)
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-        let bytes = id.to_string().into_bytes();
-        let mut opened = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )?
-        .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
-        Ok(Some(id))
-    }
-
-    pub(crate) fn complete_pending_publication(
-        &self,
-        batch_id: super::BatchId,
-    ) -> Result<(), ScenarioError> {
-        let gate = self.journal.acquire_transaction_gate()?;
-        self.journal.require_transaction_gate(&gate)?;
-        let name = format!("{batch_id}.pending");
-        let bytes = batch_id.to_string().into_bytes();
-        let Some(mut opened) = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )?
-        else {
-            return Ok(());
-        };
-        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
-        self.pending_publication
-            .remove_file(&name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        sync_provider_directory(&self.pending_publication)
     }
 
     /// Remove one provider-generated conflict name only after the retained
@@ -1586,6 +1490,7 @@ impl SharedProviderTransport {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn scan(&self) -> Result<SharedProviderScan, ScenarioError> {
         let files = bounded_provider_files(
             self.runtime.tree(ProviderTree::Outbox),
@@ -1907,7 +1812,7 @@ impl ProviderRetryJournal {
                         create_provider_authority_key_exclusive(&directory, "authority.key")?;
                     file.write_all(&key)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    file.sync_all()
+                    crate::durability_counters::sync_file(&file)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
                     validate_local_file_bytes(&mut file, &key, "authority.key")?;
                     sync_provider_directory(&directory)?;
@@ -1936,7 +1841,7 @@ impl ProviderRetryJournal {
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 outer
                     .write_all(&authority_record_bytes)
-                    .and_then(|()| outer.sync_all())
+                    .and_then(|()| crate::durability_counters::sync_file(&outer))
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 validate_local_file_bytes(
                     &mut outer,
@@ -3321,96 +3226,6 @@ impl ProviderRetryJournal {
         sync_provider_directory(&self.completed)
     }
 
-    fn load_put_for_binding(
-        &self,
-        gate: &ProviderTransactionGate,
-        operation_binding: &str,
-    ) -> Result<Option<ProviderJournalRecord>, ScenarioError> {
-        self.require_transaction_gate(gate)?;
-        let mut found = None;
-        let mut scanned = 0_usize;
-        for entry in self
-            .records
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-            scanned = scanned
-                .checked_add(1)
-                .ok_or(ScenarioError::ProviderJournalLimit)?;
-            if scanned > MAX_PROVIDER_JOURNAL_PENDING {
-                return Err(ScenarioError::ProviderJournalLimit);
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            if !name.ends_with(".json") {
-                return Err(ScenarioError::UnsafeProviderJournal(name));
-            }
-            let opened = open_provider_regular_optional(
-                &self.records,
-                &name,
-                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
-                &name,
-            )
-            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-            let record = self.decode_record(&opened.bytes, &name)?;
-            self.validate_record_shape(gate, &record, true)?;
-            if record.operation == ProviderJournalOperation::Put
-                && record.operation_binding == operation_binding
-            {
-                if found.replace(record).is_some() {
-                    return Err(ScenarioError::UnsafeProviderJournal(
-                        operation_binding.into(),
-                    ));
-                }
-            }
-        }
-        if found.is_some() {
-            return Ok(found);
-        }
-        let mut completed_scanned = 0_usize;
-        for entry in self
-            .completed
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-            completed_scanned = completed_scanned
-                .checked_add(1)
-                .ok_or(ScenarioError::ProviderJournalLimit)?;
-            if completed_scanned > MAX_PROVIDER_JOURNAL_COMPLETED {
-                return Err(ScenarioError::ProviderJournalLimit);
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            let opened = open_provider_regular_optional(
-                &self.completed,
-                &name,
-                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
-                &name,
-            )
-            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-            let record = self.decode_record(&opened.bytes, &name)?;
-            self.validate_record_shape(gate, &record, false)?;
-            if record.operation == ProviderJournalOperation::Put
-                && record.operation_binding == operation_binding
-            {
-                if found.replace(record).is_some() {
-                    return Err(ScenarioError::UnsafeProviderJournal(
-                        operation_binding.into(),
-                    ));
-                }
-            }
-        }
-        Ok(found)
-    }
-
     fn validate_record(
         &self,
         gate: &ProviderTransactionGate,
@@ -3672,7 +3487,7 @@ impl ProviderRetryJournal {
                 let mut file = create_local_file_exclusive(&self.blobs, &creating_name)?;
                 file.write_all(blob)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                file.sync_all()
+                crate::durability_counters::sync_file(&file)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 validate_local_file_bytes(&mut file, blob, &creating_name)?;
                 sync_provider_directory(&self.blobs)?;
@@ -3682,8 +3497,7 @@ impl ProviderRetryJournal {
             provisional
                 .write_all(&record_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            provisional
-                .sync_all()
+            crate::durability_counters::sync_file(&provisional)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut provisional, &record_bytes, &provisional_name)?;
             sync_provider_directory(&self.records)?;
@@ -3701,7 +3515,7 @@ impl ProviderRetryJournal {
             let mut file = create_local_file_exclusive(&self.records, &record_name)?;
             file.write_all(&record_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            file.sync_all()
+            crate::durability_counters::sync_file(&file)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut file, &record_bytes, &record_name)?;
             sync_provider_directory(&self.records)?;
@@ -3728,8 +3542,7 @@ impl ProviderRetryJournal {
         temporary
             .write_all(&bytes)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        temporary
-            .sync_all()
+        crate::durability_counters::sync_file(&temporary)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
         validate_local_file_bytes(&mut temporary, &bytes, &temporary_name)?;
         sync_provider_directory(&self.records)?;
@@ -3806,8 +3619,7 @@ impl ProviderRetryJournal {
             update
                 .write_all(&completion_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            update
-                .sync_all()
+            crate::durability_counters::sync_file(&update)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut update, &completion_bytes, &update_name)?;
             sync_provider_directory(&self.completed)?;
@@ -3836,8 +3648,10 @@ impl ProviderRetryJournal {
     }
 }
 
+#[cfg(test)]
 struct ScenarioRoot(PathBuf);
 
+#[cfg(test)]
 impl ScenarioRoot {
     fn new() -> Result<Self, ScenarioError> {
         let path = std::env::temp_dir().join(format!("tine-oplog-simulator-{}", Uuid::new_v4()));
@@ -3846,12 +3660,14 @@ impl ScenarioRoot {
     }
 }
 
+#[cfg(test)]
 impl Drop for ScenarioRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(test)]
 fn provider_transaction_device_names(
     source: &ProviderSource,
     destination_device: &str,
@@ -3873,6 +3689,7 @@ fn valid_name(value: &str, max: usize) -> bool {
 /// Unix retirement uses an atomic exchange with a single-link placeholder so
 /// a racing replacement is preserved only as diagnostic residue. Windows
 /// retirement is handle-bound. No provider-visible residue authorizes retry.
+#[cfg(test)]
 fn run_provider_rename_with(
     provider: &ProviderRuntime,
     journal: &ProviderRetryJournal,
@@ -4029,8 +3846,7 @@ fn run_provider_rename_with(
         staged
             .write_all(&expected)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        staged
-            .sync_all()
+        crate::durability_counters::sync_file(&staged.file)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
         validate_provider_file_bytes(&mut staged, &expected, to_path)?;
         record.staging_identity = Some(provider_identity_record(provider_file_identity(
@@ -4102,6 +3918,7 @@ enum ProviderRemoveMissingSourcePolicy {
     RequirePresent,
     /// Retirement owns the exact path already; provider-side convergence may
     /// have completed the removal before this device starts its local journal.
+    #[cfg(test)]
     SettleIfAbsent,
 }
 
@@ -4172,6 +3989,7 @@ fn run_provider_remove_with(
                     ProviderRemoveMissingSourcePolicy::RequirePresent => {
                         Err(ScenarioError::UnknownProviderPath(path.into()))
                     }
+                    #[cfg(test)]
                     ProviderRemoveMissingSourcePolicy::SettleIfAbsent => Ok(()),
                 };
             };
@@ -4264,6 +4082,7 @@ fn run_provider_remove_with(
     journal.complete(&gate, &record)
 }
 
+#[cfg(test)]
 fn validate_journal_destination(
     journal: &ProviderRetryJournal,
     gate: &ProviderTransactionGate,
@@ -4373,35 +4192,7 @@ fn validate_retired_file(
     Ok(())
 }
 
-fn validate_provider_name_identity_or_quarantine(
-    journal: &ProviderRetryJournal,
-    gate: &ProviderTransactionGate,
-    parent: &Dir,
-    name: &str,
-    retained: &fs::File,
-    removed: &Dir,
-    path: &str,
-) -> Result<(), ScenarioError> {
-    journal.require_transaction_gate(gate)?;
-    let named = match open_provider_regular_optional(parent, name, MAX_PROVIDER_RESCAN_BYTES, path)
-    {
-        Ok(named) => named,
-        Err(_) => {
-            quarantine_provider_name(journal, gate, parent, name, removed, "destination-race")?;
-            return Err(ScenarioError::UnsafeProviderEntry(path.into()));
-        }
-    };
-    if let Some(named) = named.as_ref() {
-        if provider_files_have_same_identity(retained, &named.file)? {
-            return Ok(());
-        }
-    }
-    if named.is_some() {
-        quarantine_provider_name(journal, gate, parent, name, removed, "destination-race")?;
-    }
-    Err(ScenarioError::UnsafeProviderEntry(path.into()))
-}
-
+#[cfg(test)]
 fn quarantine_provider_name(
     journal: &ProviderRetryJournal,
     gate: &ProviderTransactionGate,
@@ -4601,8 +4392,7 @@ fn reconcile_provider_retirement(
                     diagnostic_name,
                     diagnostic_path,
                 )?;
-                placeholder
-                    .sync_all()
+                crate::durability_counters::sync_file(&placeholder)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 record.staging_identity = Some(provider_identity_record(provider_file_identity(
                     &placeholder,
@@ -4888,14 +4678,6 @@ fn preserve_retirement_race(
     )
     .map_err(|error| ScenarioError::Io(error.to_string()))?;
     sync_shared_provider_publication_directories(evidence, Some(source_dir))
-}
-
-fn valid_relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && Path::new(path).is_relative()
-        && !Path::new(path)
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
 }
 
 fn valid_provider_path(path: &str) -> bool {
@@ -5812,33 +5594,6 @@ fn validate_provider_file_bytes(
     Ok(())
 }
 
-enum ProviderDestinationState {
-    Absent,
-    ExactBytes,
-    ConflictingBytes,
-}
-
-/// Reconcile a destination against the exact retained bytes. This is the
-/// publication state machine's recovery point: a previous call may have made
-/// the name durable before an injected or validation error was returned.
-fn provider_destination_state(
-    destination_dir: &Dir,
-    destination_name: &str,
-    expected: &[u8],
-    destination_path: &str,
-) -> Result<ProviderDestinationState, ScenarioError> {
-    match open_provider_regular_optional(
-        destination_dir,
-        destination_name,
-        MAX_PROVIDER_RESCAN_BYTES,
-        destination_path,
-    )? {
-        None => Ok(ProviderDestinationState::Absent),
-        Some(opened) if opened.bytes == expected => Ok(ProviderDestinationState::ExactBytes),
-        Some(_) => Ok(ProviderDestinationState::ConflictingBytes),
-    }
-}
-
 fn validate_journal_staging(
     staging: &Dir,
     record: &ProviderJournalRecord,
@@ -5936,7 +5691,7 @@ fn publish_journal_destination(
         .set_len(0)
         .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
         .and_then(|()| destination.write_all(expected))
-        .and_then(|()| destination.sync_all())
+        .and_then(|()| crate::durability_counters::sync_file(&destination))
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
     validate_provider_open_file_bytes(&mut destination, expected, destination_path)?;
     provider_publication_after_publish_hook()?;
@@ -6162,16 +5917,9 @@ enum ProviderJournalBoundary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderPostValidationOperation {
+    #[cfg(test)]
     Rename,
     Remove,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderRemovalDurabilityStep {
-    DeletePending,
-    HandleDropped,
-    DirectorySyncing,
 }
 
 fn sync_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
@@ -6318,7 +6066,6 @@ std::thread_local! {
     static FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROVIDER_PUBLICATION_DURABILITY_STEPS: std::cell::RefCell<Vec<ProviderPublicationDurabilityStep>> = const { std::cell::RefCell::new(Vec::new()) };
-    static PROVIDER_REMOVAL_DURABILITY_STEPS: std::cell::RefCell<Vec<ProviderRemovalDurabilityStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static PROVIDER_POST_VALIDATION_HOOK: std::cell::RefCell<Option<(ProviderPostValidationOperation, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
     static PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static PROVIDER_RETIREMENT_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -6353,25 +6100,6 @@ fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
     } else {
         Ok(())
     }
-}
-
-#[cfg(not(test))]
-fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
-    Ok(())
-}
-
-fn provider_finish_after_gate_hook() {
-    #[cfg(test)]
-    PROVIDER_FINISH_AFTER_GATE_HOOK.with(|hook| {
-        if let Some(callback) = hook.borrow_mut().take() {
-            callback();
-        }
-    });
-}
-
-fn provider_source_inspection_visit() {
-    #[cfg(test)]
-    PROVIDER_SOURCE_INSPECTION_VISITS.with(|visits| visits.set(visits.get() + 1));
 }
 
 fn provider_post_validation_hook(_operation: ProviderPostValidationOperation) {
@@ -6487,6 +6215,7 @@ fn provider_journal_boundary_hook(_boundary: ProviderJournalBoundary) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn provider_scan_entry_visit() {
     #[cfg(test)]
     PROVIDER_SCAN_ENTRY_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
@@ -6515,12 +6244,6 @@ fn provider_rename_after_move_hook() -> Result<(), ScenarioError> {
 }
 
 #[cfg(not(test))]
-fn provider_rename_after_move_hook() -> Result<(), ScenarioError> {
-    provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
-    Ok(())
-}
-
-#[cfg(not(test))]
 fn provider_publication_after_publish_hook() -> Result<(), ScenarioError> {
     provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
     Ok(())
@@ -6533,22 +6256,6 @@ fn provider_publication_durability_hook(step: ProviderPublicationDurabilityStep)
 
 #[cfg(not(test))]
 fn provider_publication_durability_hook(_step: ProviderPublicationDurabilityStep) {}
-
-#[cfg(test)]
-fn provider_removal_durability_hook(step: ProviderRemovalDurabilityStep) {
-    PROVIDER_REMOVAL_DURABILITY_STEPS.with(|steps| steps.borrow_mut().push(step));
-}
-
-#[cfg(not(test))]
-#[allow(dead_code)]
-fn provider_removal_durability_hook(_step: ProviderRemovalDurabilityStep) {}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn close_provider_delete_pending_file(file: fs::File) {
-    provider_removal_durability_hook(ProviderRemovalDurabilityStep::DeletePending);
-    drop(file);
-    provider_removal_durability_hook(ProviderRemovalDurabilityStep::HandleDropped);
-}
 
 #[cfg(windows)]
 fn provider_rename_handle_noreplace(
@@ -7051,39 +6758,14 @@ impl Drop for InjectedSharedProviderFlaggedRenameFailure {
     }
 }
 
-#[cfg(windows)]
-#[allow(dead_code)]
-fn provider_remove_open_file(file: fs::File) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
-    };
-
-    let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: the retained handle selects the validated file object, the
-    // disposition structure is initialized for the exact call size, and the
-    // kernel retains neither pointer after the call.
-    let result = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfo,
-            (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
-            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-        )
-    };
-    if result != 0 {
-        close_provider_delete_pending_file(file);
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
+#[cfg(test)]
 struct ProviderDiskFile {
     path: String,
     bytes: Vec<u8>,
     temporary: bool,
 }
 
+#[cfg(test)]
 fn bounded_provider_files(
     root: &Dir,
     include_temporary: bool,

@@ -206,6 +206,9 @@ describe("GH #161 Android SafeBack owner", () => {
     const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
     const lib = readFileSync("src-tauri/src/lib.rs", "utf8");
     const nativePlugin = readFileSync("src-tauri/src/android_safe_back.rs", "utf8");
+    const defaultCapability = JSON.parse(
+      readFileSync("src-tauri/capabilities/default.json", "utf8"),
+    ) as { permissions: string[] };
 
     expect(backend).toContain("prepareQuit(): Promise<TineQuitPreparation>");
     expect(backend).toContain('return this.call<TineQuitPreparation>("prepare_tine_quit");');
@@ -217,7 +220,10 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(androidBack).toContain("native_prepare_uncertain");
     expect(androidBack).toContain("native_prepare_refused");
     expect(androidBack).toContain("native_prepare_partial");
-    expect(app).toContain('await invoke("plugin:app|exit");');
+    expect(app).toContain("finishActivity: exitAndroidActivity");
+    expect(androidBack).toContain('import("@tauri-apps/plugin-process")');
+    expect(androidBack).toContain("await exit(0)");
+    expect(defaultCapability.permissions).toContain("process:allow-exit");
     expect(commands).toContain("fn prepare_tine_quit_all_slots");
     expect(commands).toContain("enum TineQuitPreparation");
     expect(commands).toMatch(/Partial\s*\{\s*safe_slots: Vec<String>,\s*detail: String,\s*\}/);
@@ -229,5 +235,14 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(lib).toContain("builder.plugin(android_safe_back::init())");
     expect(nativePlugin).toContain('Builder::new("safe-back")');
     expect(nativePlugin).toContain('register_android_plugin(PLUGIN_IDENTIFIER, "SafeBackPlugin")');
+  });
+
+  it("hands a safely prepared root close to Tauri's installed process exit API", async () => {
+    const { exitAndroidActivity } = await import("./androidBack");
+    const exit = vi.fn(async (_code?: number) => {});
+
+    await exitAndroidActivity(async () => ({ exit }));
+
+    expect(exit).toHaveBeenCalledWith(0);
   });
 });

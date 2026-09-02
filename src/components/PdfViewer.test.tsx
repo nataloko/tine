@@ -35,7 +35,9 @@ function PdfViewer(props: {
   label: string;
   owner?: PdfOwnership;
   page?: number;
+  scale?: number;
   navigation?: () => any;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }) {
   return <OwnedPdfViewer {...props} owner={props.owner ?? testPdfOwner()} />;
 }
@@ -49,18 +51,15 @@ function KeyedPdfViewer(props: { target: () => any }) {
 }
 
 vi.mock("pdfjs-dist", () => ({
+  AnnotationMode: { DISABLE: 0 },
   GlobalWorkerOptions: {},
+  PixelsPerInch: { PDF_TO_CSS_UNITS: 4 / 3 },
   getDocument: getDocumentMock,
-  TextLayer: class {
-    render() {
-      return Promise.resolve();
-    }
-
-    update() {
-      return Promise.resolve();
-    }
-  },
 }));
+
+vi.mock("pdfjs-dist/web/pdf_viewer.mjs", async () =>
+  import("../testPdfPageViewMock")
+);
 
 vi.mock("pdfjs-dist/build/pdf.worker.min.mjs?url", () => ({
   default: "pdf.worker.test.js",
@@ -101,6 +100,33 @@ function page(width: number, height: number) {
     getTextContent: vi.fn().mockResolvedValue({ items: [] }),
     render: vi.fn().mockReturnValue({ promise: Promise.resolve(), cancel: vi.fn() }),
   };
+}
+
+function controlledPage(width: number, height: number) {
+  const jobs: Array<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    cancel: ReturnType<typeof vi.fn>;
+  }> = [];
+  const result = {
+    getViewport: vi.fn(({ scale }: { scale: number }) => ({ width: width * scale, height: height * scale })),
+    getTextContent: vi.fn().mockResolvedValue({ items: [] }),
+    render: vi.fn(() => {
+      let resolve = () => {};
+      let reject = (_error: unknown) => {};
+      const promise = new Promise<void>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
+      const cancel = vi.fn(() => reject(Object.assign(new Error("cancelled"), {
+        name: "RenderingCancelledException",
+      })));
+      jobs.push({ resolve, reject, cancel });
+      return { promise, cancel };
+    }),
+    jobs,
+  };
+  return result;
 }
 
 function documentWithPages(pages: ReturnType<typeof page>[]) {
@@ -261,6 +287,115 @@ describe("PdfViewer resource safety", () => {
       expect(canvas.width * canvas.height).toBeLessThanOrEqual(16_777_216);
       expect(largePage.render).toHaveBeenCalledOnce();
       expect(largePage.render.mock.calls[0][0].transform[0]).toBeLessThan(2);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("coalesces duplicate visibility triggers before they can render into the same canvas (GH #275)", async () => {
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const visiblePage = page(612, 792);
+    const pdf = documentWithPages([visiblePage]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="race.pdf" label="Race PDF" />, host);
+    try {
+      await flush();
+      const pageElement = host.querySelector(".pdf-page")!;
+      const observer = TestIntersectionObserver.instances[0];
+      observer.show(pageElement);
+      observer.show(pageElement);
+      await flush();
+
+      expect(visiblePage.render).toHaveBeenCalledOnce();
+      expect(host.querySelector(".pdf-load-error")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("runs one viewport raster at a time and drops queued pages that leave the prefetch region", async () => {
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const pages = [controlledPage(612, 792), controlledPage(612, 792), controlledPage(612, 792)];
+    const pdf = documentWithPages(pages as ReturnType<typeof page>[]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="queue.pdf" label="Queue PDF" />, host);
+    try {
+      await flush();
+      const pageElements = [...host.querySelectorAll<HTMLElement>(".pdf-page")];
+      const observer = TestIntersectionObserver.instances[0];
+      observer.show(pageElements[0]);
+      observer.show(pageElements[1]);
+      observer.show(pageElements[2]);
+      await flush();
+
+      expect(pages[0].render).toHaveBeenCalledOnce();
+      expect(pages[1].render).not.toHaveBeenCalled();
+      expect(pages[2].render).not.toHaveBeenCalled();
+      expect(host.querySelector(".pdf-scroll")?.getAttribute("data-active-renders")).toBe("1");
+
+      observer.hide(pageElements[1]);
+      pages[0].jobs[0].resolve();
+      await flush();
+
+      expect(pages[1].render).not.toHaveBeenCalled();
+      expect(pages[2].render).toHaveBeenCalledOnce();
+      pages[2].jobs[0].resolve();
+      await flush();
+      expect(host.querySelector(".pdf-scroll")?.getAttribute("data-active-renders")).toBe("0");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the previous page bitmap visible until a zoom replacement finishes", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const visiblePage = controlledPage(612, 792);
+    const pdf = documentWithPages([visiblePage as ReturnType<typeof page>]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="zoom.pdf" label="Zoom PDF" />, host);
+    try {
+      await flush();
+      const pageElement = host.querySelector<HTMLElement>(".pdf-page")!;
+      TestIntersectionObserver.instances[0].show(pageElement);
+      await flush();
+      visiblePage.jobs[0].resolve();
+      await flush();
+      const original = pageElement.querySelector("canvas")!;
+      expect(original.isConnected).toBe(true);
+
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      // The visible wrapper already owns optimistic scaling because the
+      // ordinary canvas is sized to 100% of it. A second inline transform
+      // would turn a 10% step into a transient 21% overshoot.
+      expect(pageElement.style.width).toBe("673.2px");
+      expect(original.style.transform).toBe("");
+      await vi.advanceTimersByTimeAsync(120);
+      await flush();
+      expect(visiblePage.render).toHaveBeenCalledTimes(2);
+      expect(pageElement.querySelector("canvas")).toBe(original);
+      expect(original.isConnected).toBe(true);
+      expect(original.width).toBeGreaterThan(0);
+
+      visiblePage.jobs[1].resolve();
+      await flush();
+      expect(pageElement.querySelector("canvas")).not.toBe(original);
+      expect(original.isConnected).toBe(false);
+      expect(original.width).toBe(0);
+      expect(original.height).toBe(0);
     } finally {
       dispose();
     }
@@ -594,6 +729,73 @@ describe("PdfViewer OG state and reference behavior", () => {
       expect(writeState).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(writeState).toHaveBeenCalledWith("paper.pdf", 2, 2.2);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps a typed page jump after Enter blurs the page field", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [],
+      page: 1,
+      scale: 1,
+    });
+    vi.spyOn(backend(), "writePdfViewState").mockResolvedValue(undefined);
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    getDocumentMock.mockReturnValue({
+      promise: Promise.resolve(documentWithPages([page(612, 792), page(612, 792)])),
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="paper.pdf" label="Paper" />, host);
+    try {
+      await flush();
+      const input = host.querySelector(".pdf-page-input") as HTMLInputElement;
+      input.focus();
+      input.value = "2";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await flush();
+
+      expect(document.activeElement).not.toBe(input);
+      expect(input.value).toBe("2");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("lets route-owned page and scale override the shared sidecar and publishes per-view changes", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [],
+      page: 2,
+      scale: 2,
+    });
+    vi.spyOn(backend(), "writePdfViewState").mockResolvedValue(undefined);
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792), page(612, 792)])) });
+    const states: Array<{ page: number; scale: number }> = [];
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => (
+      <PdfViewer
+        filename="paper.pdf"
+        label="Paper"
+        page={1}
+        scale={1.75}
+        onViewState={(state) => states.push(state)}
+      />
+    ), host);
+    try {
+      await flush();
+      expect((host.querySelector(".pdf-page-input") as HTMLInputElement).value).toBe("1");
+      expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("175%");
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.75 });
+
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      await flush();
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.93 });
     } finally {
       dispose();
     }
@@ -1431,6 +1633,21 @@ describe("PdfViewer released-OG themes and outline", () => {
     }
   });
 
+  it("keeps Close as the terminal PDF toolbar action", async () => {
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792)])) });
+    const view = mountViewer();
+    try {
+      await flush();
+      const actions = view.host.querySelector(".pdf-toolbar-actions")!;
+      const buttons = [...actions.querySelectorAll<HTMLButtonElement>("button")];
+      expect(buttons.at(-1)?.title).toBe("Close PDF");
+      expect(buttons.at(-1)?.getAttribute("aria-label")).toBe("Close PDF");
+      expect(buttons.at(-1)?.classList.contains("pdf-close-btn")).toBe(true);
+    } finally {
+      view.dispose();
+    }
+  });
+
   it("matches released OG 1.0.0 page-theme filtering without inverting highlight overlays", () => {
     const css = readFileSync("src/styles/app.css", "utf8");
     expect(css).toContain('.pdf-viewer[data-theme="light"] {\n  --pdf-container-bg: #fff;\n  --pdf-toolbar-bg: #fff;\n  --pdf-page-bg: #fff;');
@@ -1439,8 +1656,13 @@ describe("PdfViewer released-OG themes and outline", () => {
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="dark"\][^{]*\{[^}]*filter:[^}]*\bhue-rotate\b/s);
     expect(css).toMatch(/\.pdf-page \{[^}]*background: var\(--pdf-page-bg\);/s);
     expect(css).toContain('.pdf-viewer[data-theme="dark"] {\n  --pdf-container-bg: #202124;');
-    expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-page > :is\(canvas, \.textLayer\) \{[^}]*filter: invert\(1\);/s);
+    expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-page :is\(\.canvasWrapper, \.textLayer\) \{[^}]*filter: invert\(1\);/s);
     expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl \{[^}]*mix-blend-mode: screen/s);
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl-layer \{[^}]*filter:/s);
+  });
+
+  it("keeps page geometry stable when offscreen PDF canvases are evicted", () => {
+    const css = readFileSync("src/styles/app.css", "utf8");
+    expect(css).toMatch(/\.pdf-page \{[^}]*flex:\s*0 0 auto;/s);
   });
 });

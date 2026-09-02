@@ -3,14 +3,40 @@ import { backend } from "./backend";
 import { CUSTOM_CSS_STYLE_ID, LS_SHIM_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { galleryThemeById, galleryThemes } from "./styles/themes";
 import { installedThemeByKey } from "./themes/manager";
+import type { ThemePresentation } from "./themes/manifest";
 
 export const THEME_GALLERY_STYLE_ID = "tine-theme";
-const KEY = "theme.gallery";
+const LEGACY_KEY = "theme.gallery";
+const COMPOSITION_KEY = "theme.composition.v1";
 
-const [selectedId, setSelectedId] = createSignal("");
+const [selectedStyleId, setSelectedStyleId] = createSignal("");
+const [selectedColorId, setSelectedColorId] = createSignal("");
+const [selectedPresentation, setSelectedPresentation] = createSignal<ThemePresentation>({});
+let persistenceChain = Promise.resolve();
 
-export const selectedGalleryTheme = selectedId;
+export const selectedThemeStyle = selectedStyleId;
+export const selectedThemeColors = selectedColorId;
+export const selectedThemePresentation = selectedPresentation;
 export { galleryThemes };
+
+const PRESENTATION_ATTRIBUTES = {
+  contentTypography: "data-theme-content-typography",
+  journalHeader: "data-theme-journal-header",
+  todayTaskSummary: "data-theme-today-task-summary",
+} as const;
+
+function applyPresentation(presentation: ThemePresentation): void {
+  setSelectedPresentation(presentation);
+  if (typeof document === "undefined") return;
+  for (const [key, attribute] of Object.entries(PRESENTATION_ATTRIBUTES)) {
+    const value = presentation[key as keyof ThemePresentation];
+    if (value === undefined || value === "default" || value === "hidden") {
+      document.documentElement.removeAttribute(attribute);
+    } else {
+      document.documentElement.setAttribute(attribute, value);
+    }
+  }
+}
 
 export function ensureThemeStyle(): HTMLStyleElement | null {
   if (typeof document === "undefined") return null;
@@ -51,24 +77,96 @@ export function ensureThemeStyle(): HTMLStyleElement | null {
   return el;
 }
 
-export function applyTheme(id: string): void {
-  const theme = id ? galleryThemeById(id) ?? installedThemeByKey(id) : undefined;
-  const nextId = theme?.id ?? "";
-  setSelectedId(nextId);
+function themeById(id: string) {
+  return id ? galleryThemeById(id) ?? installedThemeByKey(id) : undefined;
+}
+
+function presentationId(id: string): string {
+  const theme = themeById(id);
+  return theme && "manifest" in theme && Object.keys(theme.manifest.presentation ?? {}).length > 0
+    ? theme.id
+    : "";
+}
+
+function colorId(id: string): string {
+  return themeById(id)?.id ?? "";
+}
+
+function persistComposition(): void {
+  const value = JSON.stringify({
+    style: selectedStyleId(),
+    colors: selectedColorId(),
+  });
+  persistenceChain = persistenceChain
+    .then(() => backend().setAppString(COMPOSITION_KEY, value))
+    .catch(() => {});
+}
+
+function applyComposition(style: string, colors: string): void {
+  const nextStyle = presentationId(style);
+  const nextColors = colorId(colors);
+  const styleTheme = themeById(nextStyle);
+  const colorTheme = themeById(nextColors);
+  setSelectedStyleId(nextStyle);
+  setSelectedColorId(nextColors);
+  applyPresentation(styleTheme && "manifest" in styleTheme ? styleTheme.manifest.presentation ?? {} : {});
   const el = ensureThemeStyle();
-  if (el) el.textContent = theme?.css ?? "";
-  void backend().setAppString(KEY, nextId).catch(() => {});
+  if (el) el.textContent = colorTheme?.css ?? "";
+  persistComposition();
+}
+
+/** Compatibility preset: select one theme's presentation and colors together. */
+export function applyTheme(id: string): void {
+  applyComposition(id, id);
+}
+
+export function applyThemeStyle(id: string): void {
+  applyComposition(id, selectedColorId());
+}
+
+export function applyThemeColors(id: string): void {
+  applyComposition(selectedStyleId(), id);
+}
+
+export function clearThemeSelection(id: string): void {
+  applyComposition(
+    selectedStyleId() === id ? "" : selectedStyleId(),
+    selectedColorId() === id ? "" : selectedColorId(),
+  );
+}
+
+export function reapplyThemeSelection(): void {
+  applyComposition(selectedStyleId(), selectedColorId());
 }
 
 export async function initThemeGallery(): Promise<void> {
   ensureThemeStyle();
-  let id = "";
+  let composition = "";
   try {
-    id = await backend().getAppString(KEY, "");
+    composition = await backend().getAppString(COMPOSITION_KEY, "");
   } catch {
-    id = "";
+    composition = "";
   }
-  applyTheme(id);
+  if (composition) {
+    try {
+      const value: unknown = JSON.parse(composition);
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const { style, colors } = value as Record<string, unknown>;
+        if (typeof style === "string" && typeof colors === "string") {
+          applyComposition(style, colors);
+          return;
+        }
+      }
+    } catch {}
+  }
+
+  let legacyId = "";
+  try {
+    legacyId = await backend().getAppString(LEGACY_KEY, "");
+  } catch {
+    legacyId = "";
+  }
+  applyTheme(legacyId);
 }
 
 if (typeof window !== "undefined") {

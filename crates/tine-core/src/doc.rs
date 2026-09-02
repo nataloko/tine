@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+pub use crate::property_line::parse_property_line;
+
 /// Recognized task markers (leading keyword of a block).
 pub const MARKERS: &[&str] = &[
     "TODO",
@@ -44,9 +46,14 @@ pub struct Document {
 /// each structural block in depth-first/source order. A parent's own interval
 /// ends at its first child's header; a leaf owns through the next structural
 /// header or file end.
+#[derive(Clone)]
 pub(crate) struct ParsedDocument {
     pub(crate) document: Document,
     pub(crate) block_spans: Vec<Range<usize>>,
+    /// Whether each source-order structural event was an lsdoc-owned
+    /// unbulleted Markdown ATX heading. This stays parallel to `block_spans` so
+    /// layout retention never has to invoke the outline parser per block.
+    pub(crate) unbulleted_markdown_headings: Vec<bool>,
     /// Empty structural lines immediately before each block header, in
     /// depth-first/source order. These are document formatting, not block raw.
     pub(crate) blank_lines_before_blocks: Vec<usize>,
@@ -832,80 +839,6 @@ pub(crate) fn property_key_norm(key: &str) -> String {
     key.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
-/// lsdoc's parser-space set (`Parsers.is_space`: space, tab, SUB, FF) — the
-/// characters lsdoc skips at the edge of a property line's key.
-fn mldoc_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | 0x1a | 0x0c)
-}
-
-fn skip_mldoc_spaces(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && mldoc_space(bytes[i]) {
-        i += 1;
-    }
-    &s[i..]
-}
-
-/// lsdoc's property-value trim set (`trim_markdown_property_value`: space, tab,
-/// newline, CR, FF — note: NO SUB) on both ends.
-fn trim_property_value(s: &str) -> &str {
-    fn trim(byte: u8) -> bool {
-        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
-    }
-    let bytes = s.as_bytes();
-    let mut start = 0usize;
-    let mut end = bytes.len();
-    while start < end && trim(bytes[start]) {
-        start += 1;
-    }
-    while end > start && trim(bytes[end - 1]) {
-        end -= 1;
-    }
-    &s[start..end]
-}
-
-/// The ONE hand-rolled Markdown property-line recognizer (`key:: value`),
-/// transcribed from lsdoc `markdown_property_line` so every non-parser caller
-/// (rename, conflict-strip id lines, template/content probes, logbook insertion,
-/// published title lookup — and, since DUP-7, managed command loading) reads a
-/// property line exactly the way the read path's lsdoc projection does:
-///
-/// - leading lsdoc parser spaces (space/tab/SUB/FF) skipped;
-/// - the key is every byte up to the first `::` — non-empty, and containing
-///   none of `:` space tab SUB FF CR LF (so Unicode keys, leading periods and
-///   `logseq.order-list-type`-style dotted keys parse, but `a b::` does not);
-/// - the separator must be followed by a literal space (or only-spaces remains
-///   — an empty value): `key::value` is NOT a property line, matching lsdoc.
-///
-/// Returns borrowed slices into `line`: no allocation per recognized line.
-/// The page-HEADER recognizer in model.rs (`page_header_property_line`) is a
-/// deliberately narrower grammar (column-zero keys, values kept verbatim) and
-/// must NOT be unified with this one — its test pins the distinction.
-pub fn parse_property_line(line: &str) -> Option<(&str, &str)> {
-    let rest = skip_mldoc_spaces(line);
-    let pos = rest.find("::")?;
-    let key = &rest[..pos];
-    if key.is_empty()
-        || key
-            .as_bytes()
-            .iter()
-            .any(|&b| b == b':' || mldoc_space(b) || b == b'\n' || b == b'\r')
-    {
-        return None;
-    }
-    let value = &rest[pos + 2..];
-    if let Some(value) = value.strip_prefix(' ') {
-        let value = skip_mldoc_spaces(value);
-        return Some((key, trim_property_value(value)));
-    }
-    value
-        .as_bytes()
-        .iter()
-        .all(|&b| mldoc_space(b))
-        .then_some((key, ""))
-}
-
 /// Original-case page names carried by OG-compatible `tags::`, `alias::`, or
 /// `aliases::` properties. Quoted whole values are ordinary text rather than a
 /// reference list; list items may be bare, `#tag`, or `[[page]]` spellings.
@@ -1079,12 +1012,10 @@ impl SerializeOpts {
                 blank_lines,
             });
             if parsed
-                .block_spans
+                .unbulleted_markdown_headings
                 .get(index)
-                .and_then(|span| source.get(span.clone()))
-                .is_some_and(|block_source| {
-                    crate::outline::markdown_unbulleted_heading_line_end(block_source).is_some()
-                })
+                .copied()
+                .unwrap_or(false)
             {
                 identity_bound_unbulleted_headings.insert(identity.block_identity.clone());
             }
@@ -1306,7 +1237,7 @@ fn emit_block(
 ) {
     let unbulleted_promoted_heading = promoted_heading_layout.is_some() && *block_index == 0;
     let unbulleted_identity_heading = identity_bound_unbulleted_headings.contains(&block.uuid)
-        && crate::outline::markdown_unbulleted_heading_line_end(&block.raw).is_some();
+        && crate::outline::markdown_atx_heading_line_end(&block.raw).is_some();
     let blank_lines = blank_lines_before_blocks
         .get(*block_index)
         .copied()
@@ -1742,15 +1673,45 @@ mod promoted_heading_tests {
     }
 
     #[test]
-    fn heading_led_markdown_admission_uses_original_and_canonical_parses_only() {
+    fn heading_led_markdown_admission_reuses_identical_canonical_parse() {
         crate::outline::reset_parse_attempts();
 
         assert!(markdown_structurally_round_trips(NESTED_SOURCE));
         assert_eq!(
             crate::outline::parse_attempts(),
-            2,
-            "heading-led admission needs only the retained original parse and canonical reparse"
+            1,
+            "an identical canonical source must reuse the exact original parse"
         );
+    }
+
+    #[test]
+    fn heading_layout_identity_uses_page_parse_events_without_per_block_outline_parses() {
+        let mut doc = parse(NESTED_SOURCE);
+        doc.roots[0].uuid = "heading-layout-identity".into();
+        let identities = layout_identities_of(&doc);
+
+        crate::outline::reset_parse_attempts();
+        let opts = SerializeOpts::detect_with_layout_identities(Some(NESTED_SOURCE), &identities);
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            1,
+            "layout retention must consume heading facts from the page parse"
+        );
+        assert_eq!(serialize_with(&doc, &opts), NESTED_SOURCE);
+    }
+
+    #[test]
+    fn lsdoc_extended_unbulleted_heading_forms_remain_byte_exact_with_layout_identity() {
+        for source in [
+            "####### Heading\n\t- child\n- sibling",
+            "###\n\t- child\n- sibling",
+        ] {
+            let mut doc = parse(source);
+            doc.roots[0].uuid = "extended-heading-layout-identity".into();
+            let identities = layout_identities_of(&doc);
+            let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+            assert_eq!(serialize_with(&doc, &opts), source, "source={source:?}");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { Show, Suspense, createEffect, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
@@ -13,11 +13,17 @@ import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
+import { AbsenceSweepCenter } from "./components/AbsenceSweepCenter";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
 import { ConflictBar } from "./components/ConflictBar";
 import { RightSidebar } from "./components/RightSidebar";
-import { Settings } from "./components/Settings";
+// Settings pulls in the plugin/theme catalogues, backup controls, and every
+// settings tab. Most launches never open it, so keep that work out of the
+// startup bundle and fetch it only when the settings surface is requested.
+const Settings = lazy(() =>
+  import("./components/Settings").then((m) => ({ default: m.Settings }))
+);
 import { HelpPopup } from "./components/HelpShortcuts";
 import { DatePicker } from "./components/DatePicker";
 import { FormulaEditor } from "./components/FormulaEditor";
@@ -37,10 +43,11 @@ import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
 import { applyGraphConfigChange, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
-import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type QueryRoute } from "./router";
+import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute } from "./router";
 import {
   theme,
   toggleTheme,
@@ -49,10 +56,6 @@ import {
   rightSidebarOpen,
   toggleRightSidebar,
   openSwitcher,
-  pdfTarget,
-  pdfPaneWidth,
-  setPdfPaneWidth,
-  persistPdfPaneWidth,
   sidebarWidth,
   setSidebarWidth,
   persistSidebarWidth,
@@ -60,6 +63,7 @@ import {
   firstLoadDone,
   setFirstLoadDone,
   openSettings,
+  settingsOpen,
   welcomeOpen,
   closeWelcome,
   shortcutOverrides,
@@ -128,6 +132,7 @@ import {
 } from "./git";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
+import { initSettingsLayout } from "./settingsLayout";
 import {
   conflictPolicyAlwaysAsk,
   holdExternalChange,
@@ -139,7 +144,7 @@ import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initLinkDefault } from "./editor/linkDefault";
-import { initDebug } from "./debug";
+import { dbg, initDebug } from "./debug";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 import { initNativeChrome, isMac, isMobilePlatform, osDrawsWindowControls } from "./nativeChrome";
 import {
@@ -150,6 +155,7 @@ import {
   layoutHasMultiplePanes,
   layoutRoot,
   paneRouter,
+  openPdfNotes,
   layoutPaneIds,
   setSplitRatio,
   visibleLayoutNode,
@@ -159,20 +165,27 @@ import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
 import { installBackgroundFlush } from "./backgroundFlush";
+import { installSessionActivity } from "./sessionActivity";
 import {
   installFocusFreshnessVerifier,
   installReloadOnFocus,
   trackGraphChangeApplication,
 } from "./reloadOnFocus";
 import { freshnessVisible } from "./freshnessBarrier";
-import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
+import { createAndroidRootCloseCoordinator, exitAndroidActivity, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
+import { currentPdfOwnership } from "./pdfOwnership";
+import { hlsPageName } from "./pdf";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
+import {
+  rebindAbsenceSweepScope,
+  ingestAbsenceSweepEvent,
+} from "./absenceSweeps";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -207,10 +220,7 @@ const safeClose = createSafeCloseCoordinator({
 
 const androidRootClose = createAndroidRootCloseCoordinator(safeClose, {
   prepareNativeClose: () => backend().prepareQuit(),
-  finishActivity: async () => {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("plugin:app|exit");
-  },
+  finishActivity: exitAndroidActivity,
   nativePrepareFailed: (failure) => pushToast(
     failure.status === "refused" || failure.status === "partial"
       ? "Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."
@@ -306,6 +316,8 @@ installReloadOnFocus();
 // at call time instead, which is why that gate needs no snapshot).
 const ALWAYS_ASK_DEMO =
   typeof location !== "undefined" && /[?&]alwaysask\b/.test(location.search);
+const ABSENCE_SWEEP_DEMO =
+  typeof location !== "undefined" && /[?&]absence-sweeps\b/.test(location.search);
 
 // Concord P5 policy toggle: "Reload from disk" on a held change re-enters the
 // ordinary external-change path with the policy bypassed for that one change, so
@@ -630,6 +642,196 @@ function PaneContent(props: { router: PaneRouter }): JSX.Element {
   );
 }
 
+function PaneRouteBody(props: {
+  paneId: string;
+  router: PaneRouter;
+  scrollerClass?: string;
+  identifyPane?: boolean;
+}): JSX.Element {
+  const route = () => props.router.route();
+  createEffect(() => {
+    if (route().kind === "pdf" || route().kind === "invalid") {
+      props.router.setScrollerElement(null);
+    }
+  });
+  return (
+    <Switch
+      fallback={
+        <PaneScroller
+          paneId={props.paneId}
+          router={props.router}
+          class={props.scrollerClass}
+          identifyPane={props.identifyPane}
+        >
+          <PaneContent router={props.router} />
+        </PaneScroller>
+      }
+    >
+      <Match when={route().kind === "pdf" ? route() : null}>
+        {(pdfRoute) => (
+          <div
+            class="pdf-pane pdf-route-pane"
+            classList={{ "pdf-pane-mobile": isMobilePlatform }}
+            data-pane-id={props.identifyPane === false ? undefined : props.paneId}
+            data-pdf-view-id={(pdfRoute() as PdfRoute).viewId}
+          >
+            <Suspense fallback={<div class="pdf-loading" />}>
+              <KeyedPdfViewer
+                route={() => pdfRoute() as Extract<ReturnType<PaneRouter["route"]>, { kind: "pdf" }>}
+                owner={currentPdfOwnership}
+                focused={() => focusedPaneId() === props.paneId}
+                onClose={() => { void props.router.closePdf(); }}
+                onOpenNotes={(block?: string) => {
+                  const current = props.router.route();
+                  if (current.kind === "pdf") openPdfNotes(props.paneId, hlsPageName(current.filename), block);
+                }}
+                onViewState={(state) => props.router.updateActivePdfViewState(state)}
+              />
+            </Suspense>
+          </div>
+        )}
+      </Match>
+      <Match when={route().kind === "invalid" ? route() : null} keyed>
+        {(invalidRoute) => (
+          <div class="pane-route-error" role="alert">
+            <h2>{invalidRoute.kind === "invalid" ? invalidRoute.title : "Unavailable tab"}</h2>
+            <p>{invalidRoute.kind === "invalid" ? invalidRoute.message : "This tab could not be restored."}</p>
+            <button type="button" onClick={() => { void props.router.closeTab(props.router.activeId()); }}>Close tab</button>
+          </div>
+        )}
+      </Match>
+    </Switch>
+  );
+}
+
+/** A page pane's end slack is a property of its natural content geometry, not
+ *  of whether a textarea happens to be mounted.  Long pages keep the same
+ *  breathing room in read and edit mode; fitting dashboard panes keep none.
+ *  This makes click/edit transitions height-stable (GH #390) while retaining
+ *  the pane-relative tail affordance from GH #369. */
+function PaneScroller(props: {
+  paneId: string;
+  router: PaneRouter;
+  class?: string;
+  identifyPane?: boolean;
+  children: JSX.Element;
+}): JSX.Element {
+  let scroller!: HTMLElement;
+  let inner!: HTMLDivElement;
+  const [naturalOverflow, setNaturalOverflow] = createSignal(false);
+
+  const measure = () => {
+    if (!scroller?.isConnected || !inner?.isConnected) return;
+    setNaturalOverflow(inner.scrollHeight > scroller.clientHeight + 1);
+  };
+
+  onMount(() => {
+    measure();
+    const frame = requestAnimationFrame(measure);
+    if (typeof ResizeObserver === "undefined") {
+      onCleanup(() => cancelAnimationFrame(frame));
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroller);
+    observer.observe(inner);
+    onCleanup(() => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    });
+  });
+  onMount(() => {
+    if (isTauri() || !ABSENCE_SWEEP_DEMO) return;
+    ingestAbsenceSweepEvent({
+      sweep_id: "11111111-1111-4111-8111-111111111111",
+      tier: "tier3",
+      absence_count: 8,
+      pages_at_open: 64,
+      opened_at_unix_ms: 1_777_000_000_000,
+      closed_at_unix_ms: 1_777_000_060_000,
+      grace_deadline_unix_ms: 1_777_000_360_000,
+      disposed_at_unix_ms: null,
+      members: [
+        { page_id: "1", path: "pages/Project roadmap.md" },
+        { page_id: "2", path: "journals/2026_08_28.md" },
+        { page_id: "3", path: "pages/Meeting notes.md" },
+        { page_id: "4", path: "research/Reading queue.org" },
+        { page_id: "5", path: "pages/Release checklist.md" },
+        { page_id: "6", path: "journals/2026_08_27.md" },
+        { page_id: "7", path: "pages/Ideas.md" },
+        { page_id: "8", path: "pages/Archive index.md" },
+      ],
+      latest_action: null,
+    }, { announce: true });
+  });
+  // One generation-scoped listener carries durable absence-sweep snapshots to
+  // the global recovery surface. Rebinding clears the old graph's list; panel
+  // dismissal is intentionally unrelated to this lifecycle.
+  //
+  // Both inputs MUST be memos: a bare `() => snapshot().field` accessor inside
+  // `on(...)` retriggers on every snapshot replacement even when the field
+  // value is unchanged (Solid dedupes per signal, and the snapshot signal
+  // holds a fresh object each status event). Restore's own completion emits
+  // such events, so the unmemoized form re-fired here and — via the
+  // unconditional clear it used to call — closed the recovery panel at the
+  // exact moment a Restore finished. The clear itself is additionally scoped
+  // to real generation changes inside rebindAbsenceSweepScope.
+  const sweepScopeGeneration = createMemo(
+    () => managedStorageRuntime.snapshot().bindingGeneration,
+  );
+  const sweepScopeAuthority = createMemo(
+    () => managedStorageRuntime.snapshot().applicationPageAdmission?.authority,
+  );
+  createEffect(on(
+    [sweepScopeGeneration, sweepScopeAuthority],
+    ([bindingGeneration, authority]) => {
+      if (!isTauri() && ABSENCE_SWEEP_DEMO) return;
+      rebindAbsenceSweepScope(bindingGeneration);
+      if (bindingGeneration === null || authority !== "managed_writable") return;
+      let disposed = false;
+      let unlisten = () => {};
+      void (async () => {
+        try {
+          const stop = await backend().onAbsenceSweepChanged(
+            bindingGeneration,
+            (sweep) => ingestAbsenceSweepEvent(sweep, { announce: true }),
+          );
+          if (disposed) {
+            stop();
+            return;
+          }
+          unlisten = stop;
+        } catch {
+          // The current snapshot remains useful if native event registration
+          // is temporarily unavailable.
+        }
+        const sweeps = await backend().listAbsenceSweeps();
+        if (disposed) return;
+        for (const sweep of sweeps) ingestAbsenceSweepEvent(sweep, { announce: true });
+      })().catch(() => {});
+      onCleanup(() => {
+        disposed = true;
+        unlisten();
+      });
+    },
+  ));
+
+  return (
+    <main
+      class={`main-content${props.class ? ` ${props.class}` : ""}`}
+      classList={{ "natural-content-overflow": naturalOverflow() }}
+      tabindex="-1"
+      data-pane-id={props.identifyPane === false ? undefined : props.paneId}
+      ref={(el) => {
+        scroller = el;
+        props.router.setScrollerElement(el);
+      }}
+    >
+      <div class="main-content-inner" ref={inner}>{props.children}</div>
+    </main>
+  );
+}
+
 function PaneLeaf(props: { paneId: string }): JSX.Element {
   const router = paneRouter(props.paneId);
   const multi = () => layoutHasMultiplePanes();
@@ -658,16 +860,7 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
             >
               <PaneTabSplitPreview paneId={props.paneId} />
               <PaneEdgeSegHighlight paneId={props.paneId} />
-              <main
-                class="main-content"
-                tabindex="-1"
-                data-pane-id={props.paneId}
-                ref={(el) => router.setScrollerElement(el)}
-              >
-                <div class="main-content-inner">
-                  <PaneContent router={router} />
-                </div>
-              </main>
+              <PaneRouteBody paneId={props.paneId} router={router} />
             </div>
           }
         >
@@ -689,11 +882,7 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
               paneStrip
               focused={focusedPaneId() === props.paneId}
             />
-            <main class="main-content pane-main-content" tabindex="-1" ref={(el) => router.setScrollerElement(el)}>
-              <div class="main-content-inner">
-                <PaneContent router={router} />
-              </div>
-            </main>
+            <PaneRouteBody paneId={props.paneId} router={router} scrollerClass="pane-main-content" identifyPane={false} />
           </div>
         </Show>
       </SurfaceContext.Provider>
@@ -847,7 +1036,9 @@ export function App(): JSX.Element {
   createEffect(on(
     () => managedStorageRuntime.snapshot().notice,
     (notice) => {
-      if (notice) pushToast(managedStorageRuntimeErrorMessage(notice.message), "error");
+      if (notice) {
+        pushToast(managedStorageRuntimeErrorMessage(notice.message), "error", { dedupe: true });
+      }
     },
     { defer: true },
   ));
@@ -923,37 +1114,44 @@ export function App(): JSX.Element {
   onMount(() => {
     let disposed = false;
     let started = false;
-    let unlisten = () => {};
+    let unlistenStorage = () => {};
+    let unlistenAssets = () => {};
     const start = () => {
       if (disposed || started) return;
       started = true;
       startupRecovery.start();
     };
-    // Subscribe before starting: native transition identity is the only
-    // progress authority, and early synchronous receipts must not be missed.
-    void backend().onStorageTransition((event) => {
-      storageTransitionRuntime.receive(event);
-      startupRecovery.receiveTransition(event);
-    }).then((stop) => {
+    // Install both observation bridges before opening the graph. Native
+    // managed-open phases can begin synchronously with the graph-open command,
+    // while an image may render before the watcher has finished binding its
+    // approved external-assets root. Starting after both listeners settle
+    // prevents either early event from falling into a WebView subscription gap.
+    void Promise.allSettled([
+      backend().onStorageTransition((event) => {
+        storageTransitionRuntime.receive(event);
+        startupRecovery.receiveTransition(event);
+      }),
+      backend().onAssetChanged((batch) => {
+        dbg(`asset-changed paths=${batch.paths.length}`);
+        applyObservedAssetChanges(batch.paths);
+      }),
+    ]).then(([storage, assets]) => {
+      if (storage.status === "fulfilled") unlistenStorage = storage.value;
+      if (assets.status === "fulfilled") unlistenAssets = assets.value;
       if (disposed) {
-        stop();
+        unlistenStorage();
+        unlistenAssets();
         return;
       }
-      unlisten = stop;
-      // Native managed-open phases can begin synchronously with the graph-open
-      // command.  Do not start that command until its progress listener is
-      // installed: otherwise Android WebView startup can lose the first (and,
-      // for a long clean-manifest recovery, only) phase receipt.
-      start();
-    }).catch(() => {
-      // If the event bridge itself is unavailable, startup still attempts the
+      // If either event bridge is unavailable, startup still attempts the
       // native command; command failure remains actionable without inventing a
       // timeout-based storage outcome.
       start();
     });
     onCleanup(() => {
       disposed = true;
-      unlisten();
+      unlistenStorage();
+      unlistenAssets();
       startupRecovery.dispose();
     });
   });
@@ -984,6 +1182,7 @@ export function App(): JSX.Element {
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
+  onMount(() => void initSettingsLayout());
   onMount(() => void initConflictPolicy());
   // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
   // always-ask policy on and hold one external change, so the bar is visible
@@ -1103,6 +1302,14 @@ export function App(): JSX.Element {
     endEdit: () => endEdit("graph-switch"),
     flushAll,
     closeInFlight: () => safeClose.inFlight(),
+  })));
+
+  // GH #426: the same lifecycle edge, read for a different question — on mobile
+  // the OS reaps a backgrounded app routinely, and the next launch must not
+  // call that an unclean exit. Mobile only; see sessionActivity.ts.
+  onMount(() => onCleanup(installSessionActivity({
+    isMobile: isMobilePlatform,
+    setActive: (active) => { void backend().diagnosticSessionActive(active).catch(() => {}); },
   })));
 
   onMount(() => {
@@ -1546,7 +1753,7 @@ export function App(): JSX.Element {
               </Show>
             </button>
             <button
-              class="icon-btn topbar-optional-action"
+              class="icon-btn topbar-sidebar-action"
               classList={{ active: rightSidebarOpen() }}
               title="Toggle right sidebar (t r)"
               onClick={(event) => topbarActions.rightSidebar(event.currentTarget)}
@@ -1623,38 +1830,6 @@ export function App(): JSX.Element {
           <PaneEdgeHighlights />
           <PaneSelectHint />
           <PaneTree node={visibleLayoutNode()} path={[]} />
-          <Show when={pdfTarget()}>
-        <div
-          class="pdf-pane"
-          classList={{ "pdf-pane-mobile": isMobilePlatform }}
-          data-pane-id="pdf"
-          style={{
-            flex: isMobilePlatform ? "1 1 100%" : `0 0 ${pdfPaneWidth()}px`,
-            width: isMobilePlatform ? "100%" : `${pdfPaneWidth()}px`,
-          }}
-        >
-          <div
-            class="pdf-pane-resizer"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              const startX = e.clientX;
-              const startW = pdfPaneWidth();
-              const onMove = (ev: MouseEvent) =>
-                setPdfPaneWidth(Math.min(1200, Math.max(320, startW + (startX - ev.clientX))));
-              const onUp = () => {
-                window.removeEventListener("mousemove", onMove);
-                window.removeEventListener("mouseup", onUp);
-                persistPdfPaneWidth();
-              };
-              window.addEventListener("mousemove", onMove);
-              window.addEventListener("mouseup", onUp);
-            }}
-          />
-          <Suspense fallback={<div class="pdf-loading" />}>
-            <KeyedPdfViewer target={pdfTarget} />
-          </Suspense>
-        </div>
-          </Show>
           </DrawerBackground>
           <RightSidebar />
         </div>
@@ -1682,7 +1857,11 @@ export function App(): JSX.Element {
       <PageProps />
       <ExportModal />
       <PdfExportDialog />
-      <Settings />
+      <Show when={settingsOpen()}>
+        <Suspense>
+          <Settings />
+        </Suspense>
+      </Show>
       <HelpPopup />
       {/* First-run onboarding: covers the (empty) app when no graph is configured.
           Rendered before Toasts so a "couldn't create graph" toast still shows on top. */}
@@ -1698,6 +1877,7 @@ export function App(): JSX.Element {
         </div>
       </Show>
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
+        <AbsenceSweepCenter />
         <Toasts />
       </DrawerBackground>
       <Lightbox />

@@ -37,6 +37,7 @@ impl IdentityOriginV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn batch_id(self) -> Option<BatchId> {
         match self {
             Self::Baseline => None,
@@ -44,6 +45,7 @@ impl IdentityOriginV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn causal_dot(self) -> Option<BatchCausalDot> {
         match self {
             Self::Baseline => None,
@@ -124,14 +126,17 @@ impl PageNameIdentityReleasedV1 {
         self.prior_page_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_name(&self) -> &LogicalPageName {
         &self.prior_exact_name
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_acquisition(&self) -> IdentityOriginV1 {
         self.prior_acquisition
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_state(&self) -> IdentityOriginV1 {
         self.prior_exact_state
     }
@@ -229,6 +234,7 @@ impl PageNameIdentityRecordV1 {
     /// Patricia represents imported baseline ownership as a fabricated
     /// accepted bootstrap operation; the clean design deliberately represents
     /// the same fact as `Baseline`. No other causal mismatch is accepted.
+    #[cfg(test)]
     pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
         self.key_digest == oracle.key_digest
             && match (&self.occupied, &oracle.occupied) {
@@ -261,6 +267,7 @@ impl PageNameIdentityRecordV1 {
     }
 }
 
+#[cfg(test)]
 fn origin_equivalent_to_legacy(clean: IdentityOriginV1, oracle: IdentityOriginV1) -> bool {
     clean == oracle
         || matches!(
@@ -334,10 +341,12 @@ impl PortablePathIdentityReleasedV1 {
         self.prior_page_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_path(&self) -> &ManagedPath {
         &self.prior_exact_path
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_acquisition(&self) -> IdentityOriginV1 {
         self.prior_acquisition
     }
@@ -432,6 +441,7 @@ impl PortablePathIdentityRecordV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
         self.key_digest == oracle.key_digest
             && match (&self.occupied, &oracle.occupied) {
@@ -1036,7 +1046,7 @@ mod tests {
             );
         }
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("SQLite schema 20 provides"));
+        assert!(contract.contains("SQLite schema 21 provides"));
         assert!(contract.contains("explicitly either `Baseline` or an accepted"));
         assert!(contract.contains("then deleted rather than retained as a\nsecond ready route"));
     }
@@ -1050,6 +1060,7 @@ mod tests {
             page_id,
             before: Some(before.clone()),
             after: Some(after.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let name_key = before.name().key_digest();
         let path_key = before.path().unwrap().portable_key().digest();
@@ -1138,6 +1149,7 @@ mod tests {
                     page_id,
                     before: Some(base.clone()),
                     after: Some(proposed_state.clone()),
+                    lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
                 }],
                 &BTreeMap::from([(page_id, Some(current_state.clone()))]),
                 &BTreeMap::from([(page_id, Some(proposed_state))]),
@@ -1216,6 +1228,7 @@ mod tests {
             page_id: next_page,
             before: None,
             after: Some(after.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let maps = (
             BTreeMap::from([(next_page, None)]),
@@ -1266,6 +1279,7 @@ mod tests {
             page_id: edited,
             before: Some(edited_state.clone()),
             after: Some(edited_state.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let transition = prepare_page_name_identity_transition(
             batch(63),

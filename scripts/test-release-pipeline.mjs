@@ -37,6 +37,10 @@ const iosIconVerifier = fs.readFileSync(
   "utf8"
 );
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
+const fdroidMonitorWorkflow = fs.readFileSync(
+  path.join(process.cwd(), ".github/workflows/fdroid-upstream-monitor.yml"),
+  "utf8"
+);
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
@@ -54,12 +58,27 @@ const androidManagedRuntimeScript = fs.readFileSync(
   path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
   "utf8"
 );
+const androidUiRuntimeScript = fs.readFileSync(
+  path.join(process.cwd(), ".github/scripts/android-ui-runtime.sh"),
+  "utf8"
+);
+const androidUiRuntimeTest = fs.readFileSync(
+  path.join(
+    process.cwd(),
+    "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt"
+  ),
+  "utf8"
+);
 const windowsWebviewDriverInstaller = fs.readFileSync(
   path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
   "utf8"
 );
 const issue295Scenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
+  "utf8"
+);
+const windowsManagedScenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
   "utf8"
 );
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
@@ -86,6 +105,58 @@ const windowsScenarios = [
   "e2e-print-security.mjs",
   "e2e-tab-overflow.mjs",
 ];
+
+execFileSync(process.execPath, [path.join(process.cwd(), "scripts/test-release-proof-reuse.mjs")], {
+  cwd: process.cwd(),
+  stdio: "pipe",
+});
+
+assert.doesNotMatch(releaseWorkflow, /\n  push:/, "release publication must not be triggered implicitly by a tag push");
+assert.match(
+  releaseWorkflow,
+  /workflow_dispatch:[\s\S]*?mode:[\s\S]*?options: \[build, promote\][\s\S]*?source_run_id:[\s\S]*?publish:/,
+  "release workflow does not expose the explicit build/promote and publication controls"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Release and proof-reuse contract fixtures[\s\S]*?test-release-pipeline\.mjs/,
+  "release preflight does not exercise proof-reuse negative fixtures"
+);
+assert.match(
+  releaseWorkflow,
+  /- run: npm ci\n\s+- name: Require updater signing key/,
+  "promotion preflight must install the dependencies used by shared release contracts"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Upload reusable Linux x64 proof input[\s\S]*?release-proof-linux-x64[\s\S]*?name: Upload reusable Windows x64 proof input[\s\S]*?release-proof-windows-x64/,
+  "no-publication candidates do not retain the exact binaries/frontends needed by promotion proofs"
+);
+assert.match(
+  releaseWorkflow,
+  /assemble-release-candidate\.mjs release-input release-candidate-assembled --receipt release-candidate-receipt\.json[\s\S]*?name: release-candidate-receipt/,
+  "candidate assembly does not publish a content-addressed candidate receipt"
+);
+assert.match(
+  releaseWorkflow,
+  /promotion-plan:[\s\S]*?check-release-promotion-source\.mjs[\s\S]*?create-release-promotion-plan\.mjs[\s\S]*?promotion-linux-proof:[\s\S]*?run-release-promotion-proofs\.mjs[\s\S]*?promotion-windows-proof:[\s\S]*?run-release-promotion-proofs\.mjs[\s\S]*?promote-release:[\s\S]*?verify-release-promotion\.mjs/,
+  "manual promotion does not verify its source, rerun changed proofs, and verify final receipts"
+);
+assert.match(
+  releaseWorkflow,
+  /promotion-linux-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan[\s\S]*?promotion-windows-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan/,
+  "promotion proof inputs must not dirty the product checkout"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Rerun changed advisory proof against exact source binary\n\s+shell: pwsh\n\s+run: node scripts\/run-release-promotion-proofs\.mjs --plan [^\n]+ --platform windows --output promotion-windows-proofs\.json/,
+  "Windows promotion proof invocation must use PowerShell-safe syntax"
+);
+assert.match(
+  releaseWorkflow,
+  /Upload, verify, and publish promoted release[\s\S]*?if: inputs\.publish && startsWith\(github\.ref, 'refs\/tags\/'\)/,
+  "proof-only promotion can publish without an explicit tagged publication request"
+);
 
 const trackedPaths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
   .split("\0")
@@ -116,6 +187,32 @@ assert.match(
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
 assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
+assert.match(
+  uiE2eWorkflow,
+  /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
+  "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
+);
+assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
+assert.match(
+  uiE2eWorkflow,
+  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
+  "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
+);
+assert.match(
+  windowsManagedScenario,
+  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
+  "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
+);
+assert.match(
+  windowsManagedScenario,
+  /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
+  "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
+);
+assert.match(
+  windowsManagedScenario,
+  /\.switcher-row:not\(\.block-result\)[\s\S]*?kind === "page" \|\| kind === "journal"[\s\S]*?name === title/,
+  "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
+);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
@@ -490,7 +587,35 @@ assert.match(websitePrivacy, /mailto:support@tine\.page/);
 // binary before it can be staged for the atomic assembler/publisher. Windows
 // consumes the staged portable binary in independent advisory jobs that neither
 // serialize assembly nor hide one runner-wide 0/N failure.
-assert.doesNotMatch(ciWorkflow, /\n  push:/, "ordinary CI still runs automatically on pushes");
+// Cost policy: a push may start ONLY the lightweight Linux validation job. The
+// expensive platform/performance matrix stays manual. This replaced a blanket
+// "ci.yml has no push trigger" assertion on 2026-09-01: that guard encoded the
+// cost rule by forbidding the trigger outright, which also removed the only
+// automatic gate on landed code, because section 6 integration fast-forwards
+// `master` without a pull request. The failure set drifted 45 -> 84 unseen.
+// Pinned both ways: the push trigger must EXIST and stay scoped to `master`,
+// and every expensive job must stay `workflow_dispatch`-only.
+assert.match(
+  ciWorkflow,
+  /\non:\n  push:\n    branches:\n      - master\n/,
+  "ci.yml must gate landed master code with the lightweight validation job"
+);
+for (const [jobId, condition] of [
+  ["test", "inputs.scope == 'full'"],
+  ["linux-core-nextest", "inputs.scope == 'full'"],
+  ["windows-compile", "inputs.scope == 'windows'"],
+  ["android-core-compile", "inputs.scope == 'full'"],
+  ["bench", "inputs.scope == 'full'"],
+]) {
+  const job = new RegExp(`\\n  ${jobId}:\\n[\\s\\S]*?\\n    if: ([^\\n]*)\\n`);
+  const found = ciWorkflow.match(job);
+  assert.ok(found, `ci.yml no longer defines the ${jobId} job`);
+  assert.ok(
+    found[1].includes("github.event_name == 'workflow_dispatch'"),
+    `ci.yml job ${jobId} must remain manual-dispatch only; a push must never start it`
+  );
+  assert.ok(found[1].includes(condition.split(" ==")[0]), `ci.yml job ${jobId} lost its scope selection`);
+}
 assert.match(
   ciWorkflow,
   /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- full[\s\S]*?- windows[\s\S]*?- android[\s\S]*?- performance/,
@@ -498,9 +623,38 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime/,
+  "manual CI does not expose the focused Android UI runtime proof scope"
+);
+assert.match(
+  ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime-205/,
+  "manual CI does not expose the isolated GH #205 Android proof scope"
+);
+assert.match(
+  ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime-pdf-routes/,
+  "manual CI does not expose the isolated PDF-route Android proof scope"
+);
+assert.match(
+  ciWorkflow,
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
+assert.match(
+  ciWorkflow,
+  /pr-validation:[\s\S]*?tool: wasm-pack@0\.15\.0[\s\S]*?name: Committed lsdoc WASM contract is current[\s\S]*?check-wasm-pin\.mjs[\s\S]*?name: F-Droid clean-source WASM rebuild succeeds[\s\S]*?npm run build:wasm[\s\S]*?check-wasm-pin\.mjs/,
+  "pull requests do not validate both committed and clean-source rebuilt WASM"
+);
+assert.match(
+  ciWorkflow,
+  /test:[\s\S]*?name: Full CI \/ Linux tests and release contracts[\s\S]*?tool: wasm-pack@0\.15\.0[\s\S]*?name: Committed lsdoc WASM contract is current[\s\S]*?check-wasm-pin\.mjs[\s\S]*?name: F-Droid clean-source WASM rebuild succeeds[\s\S]*?npm run build:wasm[\s\S]*?check-wasm-pin\.mjs/,
+  "full release CI does not validate both committed and clean-source rebuilt WASM"
+);
+assert.match(fdroidMonitorWorkflow, /schedule:[\s\S]*?cron: "17 6 \* \* \*"/);
+assert.match(fdroidMonitorWorkflow, /node scripts\/fdroid-upstream-monitor\.mjs/);
+assert.match(fdroidMonitorWorkflow, /steps\.fdroid\.outputs\.state == 'failed'/);
+assert.match(fdroidMonitorWorkflow, /labels: \[label, "bug"\]/);
 for (const name of REQUIRED_FULL_CI_JOBS) {
   if (/Full CI \/ Linux tine-core nextest shard [1-4]\/4/.test(name)) continue;
   assert.ok(ciWorkflow.includes(`name: ${name}`), `CI workflow is missing stable evidence job ${name}`);
@@ -713,16 +867,25 @@ assert.doesNotMatch(
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
 const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
+const androidUiRuntime = yamlBlock(ciJobs, "android-ui-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.equal(
   yamlScalar(androidCompile, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-compile')"
+);
+assert.match(
+  yamlNamedStep(
+    androidCompile,
+    "Android durability fallback policy unit tests (host-executable seams)",
+  ).join("\n"),
+  /android_group_commit[\s\S]*android_promoted_receipt/,
+  "the focused Android compile lane must execute both host-testable durability branches",
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "name", 4),
-  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen"
+  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files"
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "if", 4),
@@ -747,6 +910,137 @@ assert.match(
   /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
   "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
 );
+assert.equal(
+  yamlScalar(androidUiRuntime, "name", 4),
+  "Android UI runtime / MotionEvent proof receipts"
+);
+assert.equal(
+  yamlScalar(androidUiRuntime, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes')"
+);
+assert.match(
+  yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"),
+  /inputs\.scope == 'android-ui-runtime-pdf-routes'[\s\S]*?'pdf-routes'/,
+  "focused PDF-route Android proof scope must select only the native PDF Back journey"
+);
+assert.doesNotMatch(
+  androidUiRuntime.join("\n"),
+  /inputs\.scope == 'full'/,
+  "physical Android UI proof must remain a focused manual lane, not an all-frontend release gate"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs"), "uses", 8),
+  "reactivecircus/android-emulator-runner@v2"
+);
+const androidUiRuntimeUpload = yamlNamedStep(androidUiRuntime, "Upload Android UI runtime evidence");
+assert.equal(yamlScalar(androidUiRuntimeUpload, "if", 8), "always()");
+assert.equal(yamlScalar(androidUiRuntimeUpload, "uses", 8), "actions/upload-artifact@v4");
+assert.equal(
+  yamlScalar(yamlBlock(androidUiRuntimeUpload, "with", 8), "name", 10),
+  "android-ui-runtime-${{ github.sha }}"
+);
+assert.match(
+  androidUiRuntimeScript,
+  /adb shell pm clear page\.tine\.app[\s\S]*?adb shell am instrument -w/,
+  "Android UI runtime runner must reset the first-run graph and retain JUnit, screenshot, receipt, and targeted logcat evidence"
+);
+for (const evidence of [
+  "TINE_ANDROID_UI_RUNTIME_RECEIPT",
+  'cat "files/android-ui-runtime/$method.png"',
+  "adb exec-out run-as page.tine.app cat",
+  'screenshot_png_signature',
+  '89504e470d0a1a0a',
+  'jq -e --arg method',
+  "AndroidRuntime:E DEBUG:V chromium:E TineAndroidUi:I TestRunner:V libc:F",
+]) {
+  assert.ok(androidUiRuntimeScript.includes(evidence), `Android UI runtime runner is missing ${evidence}`);
+}
+for (const method of [
+  "responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
+  "longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
+  "initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
+]) {
+  assert.ok(
+    androidUiRuntimeScript.includes(method),
+    `Android UI runner must select the ${method} instrumentation method`
+  );
+  assert.ok(androidUiRuntimeTest.includes(`fun ${method}()`), `Android UI instrumentation is missing ${method}`);
+}
+assert.ok(
+  androidUiRuntimeScript.includes('TINE_ANDROID_UI_RUNTIME_ONLY:-') &&
+    androidUiRuntimeScript.includes('methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)'),
+  "isolated GH #205 dispatch must select only its responsive instrumentation method"
+);
+assert.ok(
+  androidUiRuntimeScript.includes('grep -cF "finished: $method"'),
+  "Android UI accounting must not count the separate run-finished summary as a second test"
+);
+assert.match(
+  androidUiRuntimeScript,
+  /cat "files\/android-ui-runtime\/\$method\.failure\.json"[\s\S]*?jq -e \. "\$failure_file"[\s\S]*?rm -f "\$failure_file"/,
+  "Android UI evidence must discard absent or invalid failure-file reads"
+);
+assert.match(
+  androidUiRuntimeScript,
+  /if ! run_journey "\$method"; then[\s\S]*?overall=1/,
+  "Android UI runner must run each selected method in a separately reset instrumentation lifetime"
+);
+assert.match(
+  androidUiRuntimeTest,
+  /MotionEvent\.obtain[\s\S]*?uiAutomation\.injectInputEvent/,
+  "Android UI instrumentation must inject real Android MotionEvents through Android UiAutomation"
+);
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /webView\.dispatchTouchEvent/,
+  "Android UI instrumentation must not bypass Android's screen-level input path"
+);
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /new PointerEvent|new MouseEvent|dispatchEvent\(new (?:PointerEvent|MouseEvent)/,
+  "Android UI instrumentation must not replace native input with synthetic JavaScript pointer events"
+);
+assert.match(
+  androidUiRuntimeTest,
+  /MutationObserver[\s\S]*?menuAdds[\s\S]*?previewAdds[\s\S]*?selectionEvents[\s\S]*?routeEvents/,
+  "page-reference long press must retain a mutation trace and reject preview, selection, and navigation side effects"
+);
+for (const nonVacuousBoundary of [
+  "welcomeGone",
+  "openDemoWelcomePage",
+  "awaitVisibleElementByScrolling",
+  "MotionEvent.ACTION_MOVE",
+  "directOptional",
+  "menuAdds",
+  "previewAdds",
+  "selectionEvents",
+  "routeEvents",
+  "first-line-caret-second-line-hold",
+  "tapAtEditorLine",
+  "longPressAtEditorLine",
+  "toolbarVisible",
+  "uiAutomation.takeScreenshot",
+]) {
+  assert.ok(
+    androidUiRuntimeTest.includes(nonVacuousBoundary),
+    `Android UI instrumentation is missing the non-vacuous ${nonVacuousBoundary} boundary`
+  );
+}
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /scenario\.close\(\)/,
+  "per-method force-stop must own WebView teardown because ActivityScenario.close crashes the hosted emulator's HWUI thread"
+);
+assert.ok(
+  androidUiRuntimeTest.includes("TINE_ANDROID_UI_RUNTIME_FAILURE"),
+  "Android UI instrumentation must preserve a screenshot and DOM receipt when a harness stage fails"
+);
+for (const semanticReceipt of ["WindowInsets.Type.ime()", "mobileToolbar", "selectionLength"]) {
+  assert.ok(
+    androidUiRuntimeTest.includes(semanticReceipt),
+    `initial native selection must receipt ${semanticReceipt}`
+  );
+}
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
   yamlScalar(androidTestApk, "if", 4),
@@ -980,7 +1274,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /windows-smoke:\n    needs: \[preflight, build\][\s\S]*?if: \$\{\{ always\(\) && needs\.preflight\.result == 'success' && needs\.build\.result != 'cancelled' \}\}[\s\S]*?continue-on-error: true[\s\S]*?name: release-windows-x64[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?npm run e2e:windows:smoke -- --scenario=\$\{\{ matrix\.scenario \}\}/,
+  /windows-smoke:\n    needs: \[preflight, build\][\s\S]*?inputs\.mode == 'build'[\s\S]*?needs\.preflight\.result == 'success'[\s\S]*?continue-on-error: true[\s\S]*?name: release-windows-x64[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?npm run e2e:windows:smoke -- --scenario=\$\{\{ matrix\.scenario \}\}/,
   "Windows advisory scenarios do not consume the staged app independently of assembly"
 );
 assert.match(
@@ -1205,7 +1499,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /name: Release pipeline contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  /name: Release product and offline-source contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
   "release preflight does not exercise the storage-pin negative fixtures"
 );
 

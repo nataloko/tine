@@ -7,9 +7,9 @@ use crate::oplog::{
     DocumentDependencies, DocumentId, FrontierV2, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
     ManagedTextKind, MaterializationStats, MaterializedBlock, MaterializedPage, PageId,
     PolicyGeneratedAnchorReason, ProjectionClaimEvidence, ProjectionClaimParticipant,
-    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionError, ProjectionIntent,
-    ProjectionPageState, ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
-    StoreError, WorkspaceId,
+    ProjectionCompletion, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionError,
+    ProjectionIntent, ProjectionPageState, ProjectionPrecondition, ProjectionReceiptStore,
+    ProjectionStoreError, StoreError, WorkspaceId,
 };
 use crate::Graph;
 use uuid::Uuid;
@@ -711,6 +711,7 @@ fn declared_oversized_target_is_rejected_before_any_evidence_publication() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        crate::oplog::ProjectionTargetKind::Present,
         BlobDescription::from_parts([0; 32], LIMIT + 1),
         Vec::new(),
     )
@@ -879,7 +880,10 @@ fn corrupt_missing_noncanonical_and_unknown_evidence_fail_closed() {
 
     let claim_dir = TestDir::new("future-claim");
     let mut claim = Vec::new();
-    claim.extend_from_slice(b"TINEPR5\0");
+    // The CURRENT magic naming a version this build does not know. It moves
+    // with the store format: the point of the case is "current family, future
+    // version", not the literal bytes.
+    claim.extend_from_slice(b"TINEPR6\0");
     claim.extend_from_slice(&99_u32.to_be_bytes());
     claim.extend_from_slice(&[0_u8; 32]);
     claim.extend_from_slice(workspace(1).as_uuid().as_bytes());
@@ -891,6 +895,133 @@ fn corrupt_missing_noncanonical_and_unknown_evidence_fail_closed() {
             if operation == "initialize private receipt store"
                 && matches!(*source, ProjectionStoreError::UnknownStoreVersion(99))
     ));
+}
+
+/// The living contract states the private receipt-store claim version and
+/// every prior magic it refuses. If a change moves one without the other, this
+/// fails.
+#[test]
+fn the_contract_states_the_receipt_store_claim_version() {
+    let contract = include_str!("../../../../docs/storage-sync-contract.md");
+    assert!(
+        contract.contains("The private receipt-store claim, and when it is checked"),
+        "the storage contract must carry the receipt-store claim section"
+    );
+    assert!(
+        contract.contains(&format!(
+            "`{}`, `STORE_CLAIM_VERSION` = {}",
+            crate::oplog::projection_store::store_claim_magic_display(),
+            crate::oplog::projection_store::store_claim_version()
+        )),
+        "the storage contract must state the current claim magic and version"
+    );
+    for magic in crate::oplog::projection_store::prior_store_claim_magics_display() {
+        assert!(
+            contract.contains(&format!("`{magic}`")),
+            "the storage contract must list refused prior claim magic {magic}"
+        );
+    }
+    assert!(
+        contract.contains("`STORE_CLAIM_LEN`"),
+        "the storage contract must name the exact-length rule the precheck enforces"
+    );
+    assert!(
+        contract.contains("`target_kind`"),
+        "the storage contract must describe the explicit target-kind field"
+    );
+}
+
+#[test]
+fn intent_and_completion_records_carry_an_explicit_target_kind() {
+    let dir = TestDir::new("explicit-target-kind");
+    let store = ProjectionReceiptStore::open(dir.path(), workspace(1)).unwrap();
+
+    // R16-C1: an absent target and a page that renders to zero bytes flatten to
+    // the SAME blob description. Only the explicit discriminant separates them,
+    // so a later consumer must never read byte length to decide.
+    let absent = ProjectionIntent::new(
+        workspace(1),
+        PageId::from_uuid(uuid(940)),
+        ManagedPath::parse("pages/target-kind.md").unwrap(),
+        FrontierV2::default(),
+        Vec::new(),
+        ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+        crate::oplog::ProjectionTargetKind::Absent,
+        BlobDescription::of(&[]),
+        Vec::new(),
+    )
+    .unwrap();
+    let empty_present = ProjectionIntent::new(
+        workspace(1),
+        PageId::from_uuid(uuid(940)),
+        ManagedPath::parse("pages/target-kind.md").unwrap(),
+        FrontierV2::default(),
+        Vec::new(),
+        ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+        crate::oplog::ProjectionTargetKind::Present,
+        BlobDescription::of(&[]),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(absent.target(), empty_present.target());
+    assert_eq!(
+        absent.target_kind(),
+        crate::oplog::ProjectionTargetKind::Absent
+    );
+    assert_eq!(
+        empty_present.target_kind(),
+        crate::oplog::ProjectionTargetKind::Present
+    );
+    assert!(absent.target_kind().is_absent());
+    assert!(!empty_present.target_kind().is_absent());
+    // The intent id derivation is deliberately unchanged by (c): the kind is a
+    // stored field, not an identity input.
+    assert_eq!(absent.id().unwrap(), empty_present.id().unwrap());
+    // ... and a replay that differs only in kind is NOT the same projection.
+    assert!(!absent.matches_replay_except_frontier(&empty_present));
+
+    // It survives the on-disk round trip, and a record whose declared kind
+    // contradicts its target bytes is refused.
+    for intent in [&absent, &empty_present] {
+        let bytes = intent.encode().unwrap();
+        assert!(
+            std::str::from_utf8(&bytes).unwrap().contains("target_kind"),
+            "the discriminant must be part of the canonical encoding"
+        );
+        assert_eq!(&ProjectionIntent::decode(&bytes).unwrap(), intent);
+    }
+    let mut contradictory = absent.encode().unwrap();
+    let text = String::from_utf8(std::mem::take(&mut contradictory)).unwrap();
+    let text = text.replace("\"byte_length\":0", "\"byte_length\":7");
+    assert!(
+        ProjectionIntent::decode(text.as_bytes()).is_err(),
+        "an absent target that declares bytes must be refused"
+    );
+
+    // Completions record the kind their intent declared.
+    store
+        .publish_intent(&empty_present, Some(b"- base\n"))
+        .unwrap();
+    let completion = ProjectionCompletion::for_intent(&empty_present, &[]).unwrap();
+    assert_eq!(
+        completion.target_kind(),
+        crate::oplog::ProjectionTargetKind::Present
+    );
+    let encoded = completion.encode().unwrap();
+    assert!(std::str::from_utf8(&encoded)
+        .unwrap()
+        .contains("target_kind"));
+    assert_eq!(
+        ProjectionCompletion::decode_bound(&encoded, &empty_present).unwrap(),
+        completion
+    );
+    // A completion carrying the other kind is not bound to this intent.
+    let absent_completion = ProjectionCompletion::for_intent(&absent, &[]).unwrap();
+    assert_eq!(
+        absent_completion.target_kind(),
+        crate::oplog::ProjectionTargetKind::Absent
+    );
+    assert!(absent_completion.validate_against(&empty_present).is_err());
 }
 
 #[test]
@@ -915,30 +1046,48 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
         .collect::<Vec<_>>();
     assert_eq!(after, before);
 
-    let prior = TestDir::new("prior-receipt-claim");
-    let mut claim = Vec::new();
-    claim.extend_from_slice(b"TINEPR4\0");
-    claim.extend_from_slice(&4_u32.to_be_bytes());
-    claim.extend_from_slice(workspace(1).as_uuid().as_bytes());
-    claim.extend_from_slice(&[0_u8; 1 + 16 + 16 + 32]);
-    fs::write(prior.path().join("projection-receipts.claim"), &claim).unwrap();
-    assert!(matches!(
-        ProjectionReceiptStore::open(prior.path(), workspace(1)),
-        Err(ProjectionStoreError::Operation { operation, source })
-            if operation == "initialize private receipt store"
-                && matches!(
-                    *source,
-                    ProjectionStoreError::UpgradeRequired {
-                        found: 4,
-                        current: 5
-                    }
-                )
-    ));
-    assert_eq!(
-        fs::read(prior.path().join("projection-receipts.claim")).unwrap(),
-        claim
-    );
-    assert_eq!(fs::read_dir(prior.path()).unwrap().count(), 1);
+    // Every prior magic, including the pre-(c) TINEPR5, is recognized only
+    // enough to refuse without mutation. There is no migration and no dual
+    // acceptance; the outer graph-open lifecycle owns backup and rebuild.
+    for (magic, found) in [(&b"TINEPR5\0"[..], 5_u32), (&b"TINEPR4\0"[..], 4)] {
+        let prior = TestDir::new("prior-receipt-claim");
+        let mut claim = Vec::new();
+        claim.extend_from_slice(magic);
+        claim.extend_from_slice(&found.to_be_bytes());
+        claim.extend_from_slice(workspace(1).as_uuid().as_bytes());
+        claim.extend_from_slice(&[0_u8; 1 + 16 + 16 + 32]);
+        fs::write(prior.path().join("projection-receipts.claim"), &claim).unwrap();
+        let error = ProjectionReceiptStore::open(prior.path(), workspace(1))
+            .expect_err("a prior store claim must be refused");
+        assert!(
+            matches!(
+                &error,
+                ProjectionStoreError::Operation { operation, source }
+                    if operation == "initialize private receipt store"
+                        && matches!(
+                            **source,
+                            ProjectionStoreError::UpgradeRequired {
+                                found: refused,
+                                current: 6
+                            } if refused == found
+                        )
+            ),
+            "unexpected error: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("backed up")
+                && message.contains("rebuilt")
+                && message.contains("Markdown/Org")
+                && !message.contains("re-activate"),
+            "the low-level refusal must name automatic blank-slate recovery, not manual re-activation: {message}"
+        );
+        assert_eq!(
+            fs::read(prior.path().join("projection-receipts.claim")).unwrap(),
+            claim
+        );
+        assert_eq!(fs::read_dir(prior.path()).unwrap().count(), 1);
+    }
 }
 
 #[test]
@@ -1027,10 +1176,22 @@ fn every_top_level_receipt_namespace_fails_closed_after_deletion_or_copy_replace
     }
 }
 
+/// A per-intent recovery namespace that is missing on reopen is **recreated**,
+/// not refused.
+///
+/// Refusal census 2026-08-26 (P-census). This test replaces
+/// `established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen`,
+/// which asserted the opposite: that a per-intent namespace bound by its
+/// reservation/authority artifact pair could never be recreated by name. That
+/// refusal defended only an actor able to rename directories inside Tine's
+/// app-private receipt store — out of scope per
+/// `specs/notes/2026-08-07-trust-model-and-threat-model-decision.md` — while
+/// making a lost or torn 1 KB binding artifact wedge the page's projection
+/// permanently. The artifacts and the refusals are gone; absence is recovery.
 #[test]
-fn established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen() {
+fn a_missing_per_intent_recovery_namespace_is_recreated_instead_of_wedging_projection() {
     for namespace in ["attempts", "forensics"] {
-        let root = TestDir::new(&format!("per-intent-authority-{namespace}"));
+        let root = TestDir::new(&format!("per-intent-recovery-{namespace}"));
         let store = ProjectionReceiptStore::open(root.path(), workspace(1)).unwrap();
         let projection = plan(
             &page(
@@ -1043,54 +1204,30 @@ fn established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_aft
         let intent_id = store.publish_intent(intent, None).unwrap();
         let name = intent_id.to_string();
         let live = root.path().join(namespace).join(&name);
-        let retained = root.path().join(namespace).join(format!("{name}-retained"));
-        fs::rename(&live, &retained).unwrap();
-
-        let missing = if namespace == "attempts" {
-            store.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            store.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            missing,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
-
-        copy_directory_tree(&retained, &live);
-        let replacement = if namespace == "attempts" {
-            store.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            store.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            replacement,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
+        assert!(live.is_dir());
         drop(store);
 
+        // The state a crash between `mkdir` and the next barrier can leave, and
+        // the state the deleted binding artifacts used to make unrecoverable.
         fs::remove_dir_all(&live).unwrap();
-        fs::remove_file(
-            root.path()
-                .join(namespace)
-                .join(format!("{name}.namespace-authority")),
-        )
-        .unwrap();
-        fs::remove_file(
-            root.path()
-                .join(namespace)
-                .join(format!("{name}.namespace-reservation")),
-        )
-        .unwrap();
+
         let reopened = ProjectionReceiptStore::open(root.path(), workspace(1)).unwrap();
-        let deleted = if namespace == "attempts" {
-            reopened.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            reopened.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            deleted,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
-        assert!(!live.exists());
+        let reservation = reopened
+            .reserve_attempt(intent)
+            .expect("a missing per-intent namespace is recreated, not refused");
+        // `begin_mutation` needs BOTH per-intent namespaces, so it is what
+        // proves the forensics namespace recovers too.
+        let authority = reopened
+            .begin_mutation(intent, Some(&reservation))
+            .expect("a missing per-intent namespace is recreated, not refused");
+        drop(authority);
+        assert!(
+            live.is_dir(),
+            "the {namespace} namespace is recreated on demand"
+        );
+        assert_eq!(
+            reopened.load_attempt_reservations(intent).unwrap(),
+            vec![reservation]
+        );
     }
 }

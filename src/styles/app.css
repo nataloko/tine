@@ -33,8 +33,26 @@ body {
    a monospace shorthand later in this file; safety must survive those rules. */
 :root {
   --tine-editable-emoji-font: "Noto Emoji Variable";
-  /* System-inset gutters for viewport-fixed chrome.
-     `.app-container` already pads the app SHELL by the four insets, but a
+  /* Width of the sidebar's drag-to-resize strip, and of the gutter the sidebar
+     reserves so that strip never lands on top of the scrollbar (GH #435). */
+  --sidebar-resizer-width: 7px;
+  /* The FIRST LINE of an ordinary block, owned in one place (GH #459). Every
+     column that has to sit on that line — the bullet, the fold arrow — derives
+     its height from these two, and so do `.block-content` and `.block-editor`
+     themselves, so the three can never disagree. Before this, `.block-controls`
+     carried a literal 26px: it matched the line-height but not the content's
+     2px top padding, which put every bullet in the graph exactly 2px above the
+     middle of its own first line, and 4px above it under the editorial-serif
+     typography theme (which changes the line box but could not move a literal).
+     A typography theme now overrides --ls-block-line-height and the column
+     follows. Integer px, not a unitless ratio: see `.block-content`. */
+  --ls-block-line-height: 26px;
+  --ls-block-content-pad-y: 2px;
+  /* One named owner for system-inset gutters. Browser/iOS surfaces use CSS
+     env() values. MainActivity already sizes Android's WebView inside the
+     native insets, so main.tsx selects `native-viewport` before render and the
+     four tokens become zero instead of reserving the same bars a second time.
+     `.app-container` pads the app SHELL by the active tokens, but a
      `position: fixed` overlay is laid out against the viewport and escapes that
      padding completely — so every full-viewport overlay has to reapply them.
      A larger vh/px constant cannot substitute: the status bar, cutout and
@@ -44,10 +62,20 @@ body {
      Overriding these four variables is also how the browser harness
      (scripts/check-mobile-safe-area.mjs) can measure inset behaviour in a
      desktop Chromium, where env() is always 0. */
-  --overlay-inset-top: env(safe-area-inset-top, 0px);
-  --overlay-inset-right: env(safe-area-inset-right, 0px);
-  --overlay-inset-bottom: env(safe-area-inset-bottom, 0px);
-  --overlay-inset-left: env(safe-area-inset-left, 0px);
+  --system-inset-top: env(safe-area-inset-top, 0px);
+  --system-inset-right: env(safe-area-inset-right, 0px);
+  --system-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --system-inset-left: env(safe-area-inset-left, 0px);
+  --overlay-inset-top: var(--system-inset-top);
+  --overlay-inset-right: var(--system-inset-right);
+  --overlay-inset-bottom: var(--system-inset-bottom);
+  --overlay-inset-left: var(--system-inset-left);
+}
+html[data-system-insets="native-viewport"] {
+  --system-inset-top: 0px;
+  --system-inset-right: 0px;
+  --system-inset-bottom: 0px;
+  --system-inset-left: 0px;
 }
 html[data-editable-emoji="windows"] {
   --tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable";
@@ -95,8 +123,8 @@ textarea {
      buttons sit behind the status bar and can't be tapped. All four insets are
      0 on desktop, so this is a no-op there. box-sizing keeps 100vh honest. */
   box-sizing: border-box;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  padding: var(--system-inset-top) var(--system-inset-right)
+    var(--system-inset-bottom) var(--system-inset-left);
 }
 
 /* Shown only if the wasm block renderer fails to load (degraded mode). */
@@ -140,6 +168,21 @@ textarea {
 .left-sidebar-scroll {
   height: 100%;
   overflow-y: auto;
+  /* GH #435: the resize strip is absolutely positioned over this element's right
+     edge — which is exactly where a classic (Windows) scrollbar lives, so the
+     strip was on top of the scrollbar and the user could resize the sidebar but
+     never grab the bar. A transparent right border moves the scrollbar inboard
+     by the strip's own width, so the two occupy disjoint columns and moving a
+     few pixels left reaches the scrollbar, as the reporter asked. The border is
+     transparent, so `.left-sidebar`'s background shows through unchanged.
+     scripts/check-sidebar-resizer-scrollbar.mjs holds the two apart. */
+  border-right: var(--sidebar-resizer-width) solid transparent;
+}
+
+/* In the mobile drawer the resize strip is hidden (below), so the sidebar keeps
+   its full width. */
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar-scroll {
+  border-right-width: 0;
 }
 
 /* One restrained scrollbar vocabulary for the three primary outline surfaces.
@@ -210,7 +253,9 @@ textarea {
   position: absolute;
   top: 0;
   right: 0;
-  width: 7px;
+  /* One width for the strip and for the gutter `.left-sidebar-scroll` reserves
+     for it; they must not drift apart or the strip covers the scrollbar again. */
+  width: var(--sidebar-resizer-width);
   height: 100%;
   cursor: col-resize;
   z-index: 20;
@@ -257,19 +302,19 @@ textarea {
 .app-container[data-mobile-drawer-mode="true"] .left-sidebar,
 .app-container[data-mobile-drawer-mode="true"] .right-sidebar {
   position: fixed;
-  top: env(safe-area-inset-top);
-  bottom: env(safe-area-inset-bottom);
+  top: var(--system-inset-top);
+  bottom: var(--system-inset-bottom);
   z-index: 90;
   width: min(
     var(--mobile-drawer-width, 320px),
-    calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right))
+    calc(100vw - 44px - var(--system-inset-left) - var(--system-inset-right))
   ) !important;
-  max-width: calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  max-width: calc(100vw - 44px - var(--system-inset-left) - var(--system-inset-right));
   flex: none !important;
   box-shadow: 0 8px 30px rgba(0, 0, 0, .28);
 }
-.app-container[data-mobile-drawer-mode="true"] .left-sidebar { left: env(safe-area-inset-left); right: auto; }
-.app-container[data-mobile-drawer-mode="true"] .right-sidebar { right: env(safe-area-inset-right); left: auto; }
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar { left: var(--system-inset-left); right: auto; }
+.app-container[data-mobile-drawer-mode="true"] .right-sidebar { right: var(--system-inset-right); left: auto; }
 .app-container[data-mobile-drawer-mode="true"] .sidebar-resizer,
 .app-container[data-mobile-drawer-mode="true"] .rs-resizer,
 .app-container[data-mobile-drawer-mode="true"] .resize-grip { display: none; }
@@ -522,12 +567,37 @@ textarea {
   background: var(--border-color);
 }
 
+/* A frameless desktop window carries three native-replacement window buttons in
+   this same row, so it reaches its real fit boundary earlier than Android/iOS
+   (or a system-decorated desktop window).  Treat that extra cluster as actual
+   occupied space instead of penalizing every phone with the desktop cutoff. */
 @container topbar (max-width: 460px) {
+  .topbar:has(.win-controls) .topbar-optional-action,
+  .topbar:has(.win-controls) .topbar-sidebar-action {
+    display: none;
+  }
+  .topbar:has(.win-controls) .topbar-right {
+    margin-left: auto;
+  }
+  .topbar:has(.win-controls) .topbar-overflow {
+    display: block;
+  }
+  .topbar:has(.win-controls) .topbar-overflow [data-topbar-overflow-action="back"],
+  .topbar:has(.win-controls) .topbar-overflow [data-topbar-overflow-action="forward"],
+  .topbar:has(.win-controls) .topbar-overflow .topbar-overflow-sep {
+    display: none;
+  }
+}
+
+@container topbar (max-width: 345px) {
   /* The tab strip is the flexible middle (.tab-bar flex:1 1 auto, min-width:0;
      .tab-strip-scroll overflow-x:auto) — it shrinks and scrolls, so it never
      clips the fixed clusters and must stay reachable on a narrow desktop window.
      Only the fixed-width low-priority action buttons overflow into the "…" menu.
-     (Real mobile already hides tabs via the isMobilePlatform Show + spacer.) */
+     (Real mobile already hides tabs via the isMobilePlatform Show + spacer.)
+     345px is the measured CONTENT-BOX fit boundary (the toolbar has 28px of
+     inline padding): at a 390px phone viewport every frequent action fits
+     directly, including the compact workspace switcher. */
   .topbar .topbar-optional-action {
     display: none;
   }
@@ -544,6 +614,12 @@ textarea {
   .topbar .topbar-overflow .topbar-overflow-sep {
     display: none;
   }
+  /* The reporter's 360px Android toolbar has room for this frequent one-tap
+     action after calendar/journals/theme collapse. Keep it direct and remove
+     the duplicate menu row; frameless desktop already collapsed it above. */
+  .topbar:not(:has(.win-controls)) .topbar-overflow [data-topbar-overflow-action="right-sidebar"] {
+    display: none;
+  }
 }
 
 /* At this floor the ~76px Back/Forward pair no longer has reliable room beside
@@ -556,6 +632,18 @@ textarea {
   .topbar .topbar-overflow [data-topbar-overflow-action="back"],
   .topbar .topbar-overflow [data-topbar-overflow-action="forward"],
   .topbar .topbar-overflow .topbar-overflow-sep {
+    display: block;
+  }
+}
+
+/* Last-resort floor for the fixed clusters themselves. The 280px viewport has
+   a 252px content box and still fits right-sidebar exactly once; only below
+   that measured boundary does it join the overflow menu. */
+@container topbar (max-width: 250px) {
+  .topbar:not(:has(.win-controls)) .topbar-sidebar-action {
+    display: none;
+  }
+  .topbar:not(:has(.win-controls)) .topbar-overflow [data-topbar-overflow-action="right-sidebar"] {
     display: block;
   }
 }
@@ -877,11 +965,11 @@ textarea {
   flex: 1 1 0;
 }
 
-/* The breathing room is an editing affordance. Restore its non-shrinking 40%
-   pane-relative basis only while this pane owns a mounted editor: long-page
-   tails can still move comfortably above the bottom edge, while read-only
-   dashboards never scroll through blank space. */
-.main-content:has(.block-editor)::after {
+/* The breathing room belongs to pages whose NATURAL content already overflows,
+   not to the transient presence of an editor. PaneScroller measures only the
+   real inner column, so long-page tails keep a stable 40% affordance through
+   read/edit transitions while fitting dashboards never gain a scroll range. */
+.main-content.natural-content-overflow::after {
   flex: 1 0 40%;
 }
 
@@ -1160,14 +1248,15 @@ textarea {
   /* Flex item of the pane scroller: keep the page column at natural height so
      only real content overflow (never a compressed column) drives scrolling. */
   flex: 0 0 auto;
-  max-width: var(--ls-main-content-max-width);
+  width: 100%;
+  max-width: var(--tine-main-content-max-width, var(--ls-main-content-max-width));
   margin: 0 auto;
   padding: 12px 48px 0;
 }
 
 /* Wide mode: drop the reading-width cap. */
 .wide-mode .main-content-inner {
-  max-width: 100%;
+  max-width: var(--tine-wide-content-max-width, var(--ls-main-content-max-width-wide));
 }
 
 /* Document mode: a cleaner prose view — hide bullets, collapse controls, and the
@@ -1391,9 +1480,30 @@ textarea {
   gap: 8px;
   padding: 5px 8px;
   border-radius: 6px;
-  cursor: pointer;
   color: var(--text-secondary);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* GH #464. A sidebar row is far wider than the page name in it, and all of that
+   width used to be the link: the hand cursor followed the pointer out over empty
+   space, and a reorder drag that ended a little short of the 4px threshold
+   navigated instead of moving the row. Only the TITLE is the link now — in the
+   cursor and in the hit test (`onLabel` in Sidebar.tsx) — and the rest of the
+   row belongs to the drag. This is also what Logseq does. `.nav-item` (Journals)
+   is one indivisible row with nothing to reorder, so it keeps the whole-row
+   link. */
+.nav-item,
+.nav-page-more {
+  cursor: pointer;
+}
+.nav-page-label {
+  cursor: pointer;
+  /* Sized to its own text, so the blank remainder of the row is genuinely blank
+     — but still the element that truncates, since the row is `overflow: hidden`
+     and a flex item will not shrink below its content without `min-width: 0`. */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1512,6 +1622,12 @@ textarea {
   padding-top: 3px;
   padding-bottom: 3px;
   gap: 4px;
+  /* Favorites are the rows that reorder, so their spare width says so (GH #464).
+     The title inside still shows the link cursor. */
+  cursor: grab;
+}
+#sidebar-favorites-list .nav-page:active {
+  cursor: grabbing;
 }
 /* The insertion line starts where the row WOULD land, so a drop that nests is
    visibly different from one that does not before the pointer is released. A
@@ -1642,6 +1758,20 @@ textarea {
   gap: 8px;
 }
 
+.page-title-main {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.page-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .page-title {
   font-size: var(--ls-page-title-size);
   font-weight: 600;
@@ -1670,6 +1800,68 @@ textarea {
   opacity: 0.6;
   color: var(--text-muted);
   vertical-align: -0.04em;
+}
+
+/* Theme API 0.2 presentation presets. Packages select these bounded host-owned
+   treatments; selectors, measurements, responsive behavior, and content stay
+   under Tine's control. */
+html[data-theme-content-typography="editorial-serif"] .page-section {
+  --tine-editable-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua",
+    Palatino, Georgia, var(--tine-editable-emoji-font), serif;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+    Georgia, serif;
+  font-size: 19px;
+}
+
+/* The serif face needs a taller line. Retune the block's line-box token rather
+   than `.block-content`/`.block-editor` directly, so the bullet column (which is
+   one line box tall) grows with the text instead of being left behind on the
+   default 26px — GH #459 is exactly that kind of drift. */
+html[data-theme-content-typography="editorial-serif"] .page-section {
+  --ls-block-line-height: 30px;
+}
+
+html[data-theme-journal-header="editorial"] .journal-title {
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+    Georgia, serif;
+  font-size: 34px;
+  font-weight: 700;
+}
+
+html[data-theme-journal-header="editorial"] .journal-title .title-cal {
+  display: none;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-row {
+  display: block;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 0;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
+  max-width: 100%;
+  margin: 4px 0 8px;
+  font-size: 46px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
+  justify-content: center;
+  margin-top: 9px;
+}
+
+.today-task-summary {
+  color: var(--text-secondary);
+  font-family: var(--ls-font-family);
+  font-size: 16px;
+  line-height: 1.35;
 }
 
 .fav-star {
@@ -2545,6 +2737,12 @@ textarea {
   .plugin-setting-control {
     min-width: 0;
     justify-content: flex-start;
+  }
+}
+
+@media (hover: none) {
+  html[data-theme-journal-header="editorial"] .journal-title:hover {
+    color: var(--text-title);
   }
 }
 .settings-advanced { margin-top: 10px; }
@@ -3535,6 +3733,9 @@ textarea {
     gap: 6px;
     min-width: 0;
   }
+  .page-title-actions {
+    gap: 4px;
+  }
   .page-title.journal-title {
     flex: 1 1 auto;
     min-width: 0;
@@ -3543,6 +3744,20 @@ textarea {
     white-space: nowrap;
     font-size: 16px;
     line-height: 1.15;
+  }
+  html[data-theme-journal-header="editorial"] .page-title.journal-title {
+    font-size: 28px;
+    line-height: 1.18;
+  }
+  html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
+    font-size: 38px;
+    white-space: normal;
+  }
+  html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
+    margin-top: 7px;
+  }
+  .today-task-summary {
+    font-size: 15px;
   }
   .page-title.journal-title .title-cal {
     margin-right: 0.25em;
@@ -3947,6 +4162,39 @@ textarea {
   color: var(--text-primary);
   font-size: 13px;
 }
+.settings-width-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: min(100%, 520px);
+}
+.settings-width-range {
+  width: 150px;
+  accent-color: var(--accent);
+}
+.settings-width-number {
+  width: 76px;
+}
+.settings-width-unit {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+@media (max-width: 640px) {
+  .settings-field-row:has(.settings-width-control) {
+    flex-wrap: wrap;
+  }
+  .settings-field-row:has(.settings-width-control) .settings-field-control,
+  .settings-width-control {
+    flex: 1 1 100%;
+    justify-content: flex-start;
+  }
+  .settings-width-range {
+    flex: 1 1 120px;
+    min-width: 100px;
+  }
+}
 .settings-input {
   padding: 4px 8px;
   border: 1px solid var(--border-color);
@@ -4090,6 +4338,19 @@ textarea {
 }
 
 /* context menu */
+/* A menu is chrome, never text. On iOS the menu is portalled under a finger
+   that is still down, and the platform's own long-press selection latched onto
+   the first item's label — the reporter saw "Copy / Look Up" raised over Tine's
+   menu with an action highlighted as selected text (GH #452). Native menus on
+   every platform are unselectable; so is this one. */
+.ctx-overlay,
+.ctx-menu,
+.ctx-item {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
 .ctx-overlay {
   position: fixed;
   inset: 0;
@@ -4279,8 +4540,8 @@ textarea {
 /* Block background color (set via the context menu). */
 .block-content.has-bg {
   border-radius: 5px;
-  padding: 1px 6px;
-  margin: -1px -6px;
+  padding: 1px 4px;
+  margin: -1px -4px;
 }
 
 /* Numbered list: the block's OWN bullet becomes its ordinal (OG numbers the
@@ -4289,6 +4550,7 @@ textarea {
 .bullet-container.ordered {
   width: auto;
   min-width: 18px;
+  margin-right: 4px;
 }
 .bullet-order {
   color: var(--text-secondary);
@@ -4589,19 +4851,28 @@ textarea {
   user-select: none;
 }
 
+/* The bullet column is exactly one first line of block text tall, so centring
+   inside it centres the bullet ON that line (GH #459). Derived, never a
+   literal — see the tokens at the top of this file. */
 .block-controls {
   display: flex;
   align-items: center;
-  height: 26px;
+  height: calc(var(--ls-block-line-height) + 2 * var(--ls-block-content-pad-y));
   flex: 0 0 auto;
 }
 
-/* A heading block's first line is taller than the normal 26px line box, so grow
-   the bullet column to match per level — keeps the bullet centered on the
-   heading line instead of floating above it. (em is the base font; the heading
-   text is 1.7em–0.9em, so its line box scales with the level.) */
-/* height = heading line box = heading font-size (1.7/1.4/1.2em) × the 1.6
-   .block-content line-height, so the bullet centers exactly on the line. */
+/* h1-h3 set a font-size large enough that their first line box is taller than
+   the block's own line box, so the bullet column grows per level to keep the
+   bullet on the heading's line rather than floating above it. (em is the block
+   font, so these scale with a typography theme.) h4-h6 need no override: their
+   glyphs are smaller than the block's line box, so the ordinary column above is
+   already their first line.
+   These three constants are ~1.2x the heading's true line box (heading
+   font-size x the 1.3 `.heading-text` line-height), which leaves the h1 bullet
+   about 2px BELOW the middle of its line — measured, and left alone here
+   deliberately: GH #459 reported the ordinary bullet, and re-tuning heading
+   geometry is a separate, visible change. scripts/check-block-first-line-alignment.mjs
+   holds them to within 3px of the heading's own line. */
 .block-main.bullet-h1 > .block-controls { height: 2.72em; }
 .block-main.bullet-h2 > .block-controls { height: 2.24em; }
 .block-main.bullet-h3 > .block-controls { height: 1.92em; }
@@ -4660,7 +4931,7 @@ textarea {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  margin-right: 4px;
+  margin-right: 6px;
   cursor: pointer;
 }
 
@@ -4733,18 +5004,18 @@ textarea {
   cursor: text;
   white-space: pre-wrap;
   word-break: break-word;
-  padding: 2px 0;
+  padding: var(--ls-block-content-pad-y) 0;
   /* Integer-px line-height (not unitless 1.6) so each line box is a whole number of
      px and the rendered box height equals the editor textarea's integer scrollHeight
      EXACTLY — otherwise the 25.6px fractional line rounds up on focus and the block
      shifts ~0.4px on every click (issue #12). Headings re-assert their own ratio below. */
-  line-height: 26px;
+  line-height: var(--ls-block-line-height);
   /* Full 1-line box height = line-height 26 + padding (2+2). An EMPTY block has no
      line box, so without this it collapses to a 26px border-box (padding only) — 4px
      SHORTER than the editor textarea, which always reserves one line (30px). That gap
      made a blank block jump +4px on click (issue #12 residual). Match 30px so the
      rendered box == the editor box whether or not the block has content. */
-  min-height: 30px;
+  min-height: calc(var(--ls-block-line-height) + 2 * var(--ls-block-content-pad-y));
   /* calt OFF. Inter's contextual alternates (calt) drew `->` as an arrow, but the
      SAME feature contextually re-positions the asterisk (`*(` centered vs `)*`
      raised — a visible glitch while editing `*(…)*`). Arrows now come from an
@@ -4775,14 +5046,22 @@ textarea {
   margin-left: var(--ls-block-indent);
 }
 
+/* GH #423: this bulk "fold every descendant" target was 14px wide and, being
+   z-index:1, was painted ON TOP of the leftmost 5px of the per-block fold arrow
+   next to it — so 5 of the arrow's 18 pixels folded the whole subtree instead
+   of one block, which is what the reporter kept hitting. It now stops at the
+   arrow's edge: 5px, centred on the 1px line it draws. OG (og-1.0.0 block.css
+   .block-children-left-border) uses 4px. Spanning the full height of the
+   children block keeps it easy to hit deliberately.
+   scripts/check-outline-guide-hitbox.mjs holds this geometry. */
 .block-children-left-border {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -9px;
+  left: -5px;
   z-index: 1;
-  width: 14px;
-  min-width: 14px;
+  width: 5px;
+  min-width: 5px;
   height: auto;
   margin: 0;
   padding: 0;
@@ -5087,9 +5366,9 @@ textarea {
 .sel-toolbar-mobile {
   position: fixed;
   top: auto;
-  bottom: var(--mobile-kb-toolbar-lift, calc(64px + env(safe-area-inset-bottom)));
-  left: max(6px, env(safe-area-inset-left));
-  right: max(6px, env(safe-area-inset-right));
+  bottom: var(--mobile-kb-toolbar-lift, calc(64px + var(--system-inset-bottom)));
+  left: max(6px, var(--system-inset-left));
+  right: max(6px, var(--system-inset-right));
   z-index: 81;
   justify-content: center;
 }
@@ -5129,8 +5408,8 @@ textarea {
 
 .mobile-keyboard-toolbar {
   position: fixed;
-  left: env(safe-area-inset-left);
-  right: env(safe-area-inset-right);
+  left: var(--system-inset-left);
+  right: var(--system-inset-right);
   z-index: 80;
   transform: translateY(-100%);
   display: flex;
@@ -5236,10 +5515,10 @@ textarea {
      full 1-line box (line-height 26 + padding 4); it floors the empty-value editor at
      the same height as the rendered empty block so entering/leaving edit on a blank
      block never changes height (and the editor can't shrink below the block). */
-  line-height: 26px;
-  min-height: 30px;
+  line-height: var(--ls-block-line-height);
+  min-height: calc(var(--ls-block-line-height) + 2 * var(--ls-block-content-pad-y));
   color: var(--text-primary);
-  padding: 2px 0;
+  padding: var(--ls-block-content-pad-y) 0;
   margin: 0;
   /* calt OFF while editing too (see .block-content): consistent asterisk heights,
      and the raw `->` stays raw in the textarea (the arrow glyph appears on render). */
@@ -5434,13 +5713,24 @@ textarea {
   text-decoration: none;
   position: relative; /* anchor for the hover-peek card (GH #40) */
   /* Touch long-press raises Tine's own context menu (GH #231); keep iOS's
-     native link callout bubble from stacking on top of it. Text selection is
-     unchanged (only the callout is suppressed). */
+     native link callout bubble from stacking on top of it. */
   -webkit-touch-callout: none;
 }
 
 .tag {
   -webkit-touch-callout: none;
+}
+
+/* On a touch platform the SAME hold that opens Tine's menu is also the OS's
+   text-selection gesture, and that gesture is owned by a native recognizer:
+   preventDefault() on our synthetic `contextmenu` cannot cancel it, and iOS
+   does not fire `contextmenu` for touch at all. The only thing that stops the
+   selection is refusing to be selectable (GH #452). Desktop keeps ordinary
+   selection — a mouse user can still drag across a link's text. */
+html[data-platform="ios"] :is(.page-ref, .tag),
+html[data-platform="android"] :is(.page-ref, .tag) {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .page-ref:hover {
@@ -7016,9 +7306,24 @@ body.file-drop-active::after {
   min-height: 30px;
   display: flex;
   align-items: center;
-  justify-content: center;
+  /* Left, not centred. The row spans the whole grid, and .sheet-table is
+     `width: max-content` inside a horizontal scroller, so a centred label sits
+     at the middle of the FULL table width — off-screen to the right on a wide
+     table, then sliding across the viewport as you scroll (GH #449). */
+  justify-content: flex-start;
   gap: 6px;
   padding: 4px 8px;
+}
+/* The row keeps its full-width hit area; only its content is pinned to the
+   left edge of the scroll viewport, so "+ Add row" is legible before, during
+   and after a horizontal scroll instead of travelling with the table. Same
+   mechanism as .sheet-sticky-left, which pins the title column. */
+.sheet-ghost-sticky {
+  position: sticky;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .sheet-table:hover .sheet-add-column-ghost,
 .sheet-table:focus-within .sheet-add-column-ghost,
@@ -7358,6 +7663,143 @@ body.file-drop-active::after {
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* -------------------------------------------------- absence sweep recovery */
+.absence-sweep-dock {
+  position: fixed;
+  left: calc(var(--overlay-inset-left) + 18px);
+  bottom: calc(var(--overlay-inset-bottom) + 18px);
+  z-index: 198;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: 10px;
+  padding: 9px 12px;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--bg-primary) 94%, var(--accent));
+  box-shadow: 0 9px 28px rgba(15, 23, 42, 0.2);
+  cursor: pointer;
+  font-size: 13px;
+}
+.absence-sweep-dock:hover { border-color: var(--accent); }
+.absence-sweep-dock strong { color: var(--accent); }
+.absence-sweep-dock-icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  color: #fff;
+  background: #b45309;
+  font-size: 18px;
+}
+.absence-sweep-panel {
+  position: fixed;
+  left: calc(var(--overlay-inset-left) + 18px);
+  bottom: calc(var(--overlay-inset-bottom) + 66px);
+  z-index: 199;
+  width: min(540px, calc(100vw - var(--overlay-inset-left) - var(--overlay-inset-right) - 36px));
+  max-height: min(690px, calc(100vh - var(--overlay-inset-top) - var(--overlay-inset-bottom) - 92px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  box-shadow: 0 20px 52px rgba(15, 23, 42, 0.3);
+}
+.absence-sweep-panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 15px;
+  border-bottom: 1px solid var(--border);
+}
+.absence-sweep-panel-header h2 { margin: 2px 0 3px; font-size: 21px; }
+.absence-sweep-panel-header p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.absence-sweep-eyebrow {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.absence-sweep-panel-close {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  font-size: 22px;
+}
+.absence-sweep-panel-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+.absence-sweep-list { overflow: auto; padding: 14px; }
+.absence-sweep-card {
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-secondary);
+}
+.absence-sweep-card + .absence-sweep-card { margin-top: 12px; }
+.absence-sweep-card-header { display: flex; justify-content: space-between; gap: 12px; }
+.absence-sweep-card-header h3 { display: inline; margin: 0 0 0 8px; font-size: 15px; }
+.absence-sweep-tier {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.absence-sweep-tier2 { background: #b45309; }
+.absence-sweep-tier3 { background: #b91c1c; }
+.absence-sweep-status { color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.absence-sweep-progress { display: flex; gap: 14px; margin-top: 11px; color: var(--accent); font-size: 12px; }
+.absence-sweep-failure {
+  margin: 11px 0 0;
+  padding: 9px 10px;
+  border-left: 3px solid #b91c1c;
+  border-radius: 5px;
+  color: color-mix(in srgb, #b91c1c 82%, var(--text-primary));
+  background: color-mix(in srgb, #b91c1c 9%, var(--bg-primary));
+  font-size: 12px;
+}
+.absence-sweep-members { margin: 13px 0; padding: 0; list-style: none; }
+.absence-sweep-members li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  font-size: 13px;
+}
+.absence-sweep-members code { overflow: hidden; color: var(--text-secondary); font-size: 11px; text-overflow: ellipsis; }
+.absence-sweep-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.absence-sweep-action {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.absence-sweep-action-primary { border-color: var(--accent); color: var(--accent); }
+.absence-sweep-action-danger { color: #b91c1c; }
+.absence-sweep-action:disabled { opacity: .48; cursor: wait; }
+.absence-sweep-panel-note { margin: 0; padding: 11px 18px; border-top: 1px solid var(--border); color: var(--text-secondary); font-size: 11px; }
+
+@media (max-width: 620px) {
+  .absence-sweep-panel { left: calc(var(--overlay-inset-left) + 8px); bottom: calc(var(--overlay-inset-bottom) + 58px); width: calc(100vw - var(--overlay-inset-left) - var(--overlay-inset-right) - 16px); }
+  .absence-sweep-dock { left: calc(var(--overlay-inset-left) + 8px); bottom: calc(var(--overlay-inset-bottom) + 8px); }
 }
 
 /* ------------------------------------------------------------- lightbox */
@@ -9206,12 +9648,13 @@ img.emoji {
 .nav-page.row-drop-before {
   box-shadow: inset 0 2px 0 var(--link-color);
 }
-/* A row reorder drag is not a text gesture: while one is armed nothing on the
-   page is selectable, so dragging a favorite no longer smears its title blue
-   (GH #211 follow-up, Martin 2026-08-25). Transient — the class is only present
-   between the drag threshold and the drop. */
-html.row-reorder-dragging,
-html.row-reorder-dragging * {
+/* A move-drag is not a text gesture: while one is armed nothing on the page is
+   selectable, so dragging a favorite no longer smears its title blue (GH #211
+   follow-up, Martin 2026-08-25) and dragging an outline block by its bullet no
+   longer turns every block it crosses blue on macOS (GH #424). Transient — the
+   class is only present between the drag threshold and the drop. */
+html.drag-selection-suppressed,
+html.drag-selection-suppressed * {
   user-select: none !important;
   -webkit-user-select: none !important;
 }
@@ -9289,6 +9732,25 @@ html.row-reorder-dragging * {
   overflow: hidden;
 }
 
+.pdf-route-pane {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  border-left: 0;
+}
+
+.pane-route-error {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+
 /* Android/iOS presents a PDF as a deliberate full-width takeover instead of
    shrinking the notes pane beside an over-wide fixed reader. */
 .pdf-pane-mobile {
@@ -9327,6 +9789,8 @@ html.row-reorder-dragging * {
   display: flex;
   flex-direction: column;
   height: 100%;
+  container-type: inline-size;
+  container-name: pdfviewer;
   color: var(--pdf-local-text);
   background: var(--pdf-container-bg);
 }
@@ -9355,7 +9819,11 @@ html.row-reorder-dragging * {
   --pdf-local-text: #e8eaed;
 }
 
-.pdf-viewer[data-theme="dark"] .pdf-page > :is(canvas, .textLayer) {
+.pdf-viewer[data-theme="dark"] .pdf-page :is(.canvasWrapper, .textLayer) {
+  filter: invert(1);
+}
+
+.pdf-viewer[data-theme="dark"] .pdf-page-view-host > canvas[data-pdf-tile-key] {
   filter: invert(1);
 }
 
@@ -9391,8 +9859,6 @@ html.row-reorder-dragging * {
   padding: 0 12px;
   border-bottom: 1px solid var(--border-color);
   background: var(--pdf-toolbar-bg);
-  container-type: inline-size;
-  container-name: pdftoolbar;
 }
 
 .pdf-title {
@@ -9414,8 +9880,8 @@ html.row-reorder-dragging * {
   min-width: 0;
 }
 
-/* Close leads the fixed control cluster, so a constrained reader can never
-   clip its only escape action from the far edge. */
+/* Close terminates the fixed control cluster, matching its conventional
+   discoverable position while remaining visible at the protected far edge. */
 .pdf-close-btn {
   flex: 0 0 auto;
 }
@@ -9528,11 +9994,11 @@ html.row-reorder-dragging * {
 /* The reader follows the topbar's container-query overflow pattern: the
    lower-priority tools remain available from the existing More menu while the
    pager, Find, zoom +/- and Close stay in the toolbar. */
-@container pdftoolbar (max-width: 520px) {
+@container pdfviewer (max-width: 520px) {
   .pdf-toolbar .pdf-overflow-action {
     display: none;
   }
-  .pdf-toolbar .pdf-settings-overflow {
+  .pdf-settings-overflow {
     display: grid;
   }
 }
@@ -9735,9 +10201,48 @@ html.row-reorder-dragging * {
 
 .pdf-page {
   position: relative;
+  /* The scroll surface is a flex column. Canvas eviction must not let empty
+     offscreen wrappers flex-shrink: their stable footprint is the scroll
+     geometry, and collapsing it makes one wheel step skip many pages while
+     also causing the observer to render distant pages. */
+  flex: 0 0 auto;
   margin-inline: auto;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
   background: var(--pdf-page-bg);
+}
+
+.pdf-page-view-host,
+.pdf-page-view-host > .pdfjs-page-view {
+  position: absolute;
+  inset: 0;
+}
+
+.pdf-page-view-host .canvasWrapper {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+.pdf-page-view-host .canvasWrapper canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  contain: content;
+}
+
+.pdf-page-view-host > canvas[data-pdf-tile-key] {
+  z-index: 1;
+  display: block;
+  contain: strict;
+}
+
+.pdf-page-view-host .textLayer {
+  z-index: 2;
 }
 
 .pdf-page .textLayer {
@@ -9746,12 +10251,43 @@ html.row-reorder-dragging * {
   overflow: hidden;
   opacity: 1;
   line-height: 1;
+  text-align: initial;
+  transform-origin: 0 0;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  z-index: 2;
+}
+
+.pdf-page .textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+}
+
+.pdf-page .textLayer ::selection {
+  background: rgba(0, 0, 255, 0.25);
+  background: color-mix(in srgb, AccentColor, transparent 75%);
+}
+
+.pdf-page .textLayer .endOfContent {
+  position: absolute;
+  display: block;
+  inset: 100% 0 0;
+  cursor: default;
+  user-select: none;
+}
+
+.pdf-page .textLayer.selecting .endOfContent {
+  top: 0;
 }
 
 .pdf-hl-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 3;
 }
 
 .pdf-hl {

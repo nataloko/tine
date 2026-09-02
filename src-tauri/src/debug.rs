@@ -282,11 +282,26 @@ impl FlightRecorder {
         Ok(())
     }
 
-    fn mark_clean_shutdown(&mut self) {
+    /// The `session-active` marker is the whole unclean-exit oracle: it is
+    /// written when a session starts and removed when the session reaches an
+    /// end we consider orderly, so the next launch reads its presence as "the
+    /// last run stopped without warning". Clearing it therefore means "from
+    /// here on, dying is expected"; re-arming means "we are live again, and a
+    /// death from here IS worth reporting".
+    fn set_session_active(&mut self, active: bool) {
         if let Some(file) = self.current.as_mut() {
             let _ = file.flush();
         }
-        let _ = std::fs::remove_file(self.dir.join("session-active"));
+        let marker = self.dir.join("session-active");
+        if active {
+            let _ = private_write_options(true, false).open(&marker);
+        } else {
+            let _ = std::fs::remove_file(&marker);
+        }
+    }
+
+    fn mark_clean_shutdown(&mut self) {
+        self.set_session_active(false);
     }
 }
 
@@ -323,6 +338,43 @@ pub(crate) fn mark_clean_shutdown() {
     if let Some(Some(recorder)) = FLIGHT.get() {
         if let Ok(mut recorder) = recorder.lock() {
             recorder.mark_clean_shutdown();
+        }
+    }
+}
+
+/// A mobile OS reclaiming a BACKGROUNDED app is routine housekeeping, not a
+/// crash. Before this, iOS and Android had no orderly end at all — there is no
+/// `RunEvent::Exit` when the system reaps a suspended app — so every launch
+/// greeted the user with "Tine did not close cleanly last time". GH #426:
+/// "It does happen every time in iOS/iPadOS. The OS kills the app when in
+/// background so I am having this issue all the time."
+///
+/// So on mobile the session ends when the app is hidden and restarts when the
+/// user returns: a crash they actually witness is still reported, a reap they
+/// never see is not.
+///
+/// Desktop deliberately ignores this. There an occluded or minimised window is
+/// still a running session, `RunEvent::Exit` already provides the orderly end
+/// (see `run()` in lib.rs), and honouring visibility would hide exactly the
+/// background crashes the recorder exists to catch.
+/// `visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps` holds
+/// that half; the frontend caller is gated too (`src/sessionActivity.ts`),
+/// which is where both platform branches are testable at runtime.
+#[tauri::command]
+pub(crate) fn diagnostic_session_active(active: bool) {
+    if !cfg!(mobile) {
+        return;
+    }
+    set_session_active(active);
+}
+
+fn set_session_active(active: bool) {
+    let mut fields = Map::new();
+    fields.insert("active".into(), json!(active));
+    record_fixed_event("runtime.session_active", fields);
+    if let Some(Some(recorder)) = FLIGHT.get() {
+        if let Ok(mut recorder) = recorder.lock() {
+            recorder.set_session_active(active);
         }
     }
 }
@@ -443,6 +495,7 @@ pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u
             command.as_str(),
             "diagnostic_ipc_event"
                 | "diagnostic_frontend_event"
+                | "diagnostic_session_active"
                 | "diagnostic_report"
                 | "save_diagnostic_report"
                 | "clear_diagnostics"
@@ -466,7 +519,44 @@ pub(crate) fn diagnostic_frontend_event(
     line: Option<u64>,
     column: Option<u64>,
     delay_ms: Option<u64>,
+    updater_stage: Option<String>,
+    updater_cause: Option<String>,
 ) {
+    if kind == "updater_failure" {
+        let Some(stage) = updater_stage.filter(|value| {
+            matches!(
+                value.as_str(),
+                "manifest_fetch"
+                    | "manifest_parse"
+                    | "target_selection"
+                    | "download"
+                    | "signature_verification"
+                    | "install"
+                    | "relaunch"
+            )
+        }) else {
+            return;
+        };
+        let Some(cause) = updater_cause.filter(|value| {
+            matches!(
+                value.as_str(),
+                "network"
+                    | "invalid_manifest"
+                    | "unsupported_target"
+                    | "invalid_signature"
+                    | "install_failed"
+                    | "relaunch_failed"
+                    | "unknown"
+            )
+        }) else {
+            return;
+        };
+        let mut fields = Map::new();
+        fields.insert("stage".into(), json!(stage));
+        fields.insert("cause".into(), json!(cause));
+        record_fixed_event("updater.failure", fields);
+        return;
+    }
     if !matches!(
         kind.as_str(),
         "uncaught_error" | "unhandled_rejection" | "heartbeat_delay"
@@ -479,6 +569,11 @@ pub(crate) fn diagnostic_frontend_event(
     fields.insert("column".into(), json!(column));
     fields.insert("delayMs".into(), json!(delay_ms));
     record_fixed_event("frontend.health", fields);
+}
+
+#[tauri::command]
+pub(crate) fn app_architecture() -> &'static str {
+    std::env::consts::ARCH
 }
 
 #[tauri::command]
@@ -666,7 +761,7 @@ pub(crate) async fn save_diagnostic_report(
         let path = chosen
             .into_path()
             .map_err(|_| "diagnostic save destination is not a local file".to_string())?;
-        std::fs::write(path, report.text)
+        tine_core::model::atomic_write(&path, report.text.as_bytes())
             .map_err(|error| format!("diagnostic report could not be saved: {error}"))?;
         Ok(true)
     }
@@ -715,6 +810,60 @@ mod tests {
         assert!(!dir.join("session-active").exists());
     }
 
+    /// GH #426, the mobile half: iOS/iPadOS reaps a backgrounded app as a
+    /// matter of course. The user did nothing wrong and saw nothing happen, so
+    /// the next launch must not accuse Tine of crashing.
+    #[test]
+    fn a_session_the_os_reaps_after_backgrounding_is_not_reported_unclean() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        {
+            let (mut recorder, _) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+            recorder.set_session_active(false); // the app went to the background
+                                                // and the process is never given
+                                                // a chance to exit politely.
+        }
+        let (_, previous_unclean) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+        assert!(!previous_unclean);
+    }
+
+    /// The other direction, which the fix must not trade away: a session the
+    /// user was looking at when it died is still an unclean exit.
+    #[test]
+    fn a_session_that_dies_after_coming_back_is_still_reported_unclean() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        {
+            let (mut recorder, _) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+            recorder.set_session_active(false); // backgrounded …
+            recorder.set_session_active(true); // … and then reopened by the user.
+        }
+        let (_, previous_unclean) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+        assert!(previous_unclean);
+    }
+
+    /// On desktop a minimised or occluded window is still a live session and a
+    /// crash behind it is exactly what the recorder exists to catch, so the
+    /// command is gated. The gate cannot be exercised at runtime here — the
+    /// recorder is a process-global `OnceLock` that no test may install — so it
+    /// is pinned the way this file already pins its other structural claims.
+    #[test]
+    fn visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps() {
+        let source = include_str!("debug.rs");
+        let body = source
+            .split("pub(crate) fn diagnostic_session_active(active: bool) {")
+            .nth(1)
+            .expect("diagnostic_session_active is the visibility entry point");
+        let gate = body
+            .split("set_session_active(active)")
+            .next()
+            .expect("the gate precedes the effect");
+        assert!(
+            gate.contains("if !cfg!(mobile) {\n        return;\n    }"),
+            "diagnostic_session_active must return early off mobile"
+        );
+    }
+
     #[test]
     fn build_metadata_rejects_strings_that_could_smuggle_report_content() {
         assert_eq!(
@@ -736,5 +885,51 @@ mod tests {
         assert!(!source.contains("fields.insert(\"path\""));
         assert!(!source.contains("fields.insert(\"detail\""));
         assert!(source.contains("verboseDebugLogIncluded\": false"));
+    }
+
+    #[test]
+    fn updater_diagnostics_accept_only_fixed_stage_and_cause_tokens() {
+        let source = include_str!("debug.rs");
+        for token in [
+            "manifest_fetch",
+            "manifest_parse",
+            "target_selection",
+            "download",
+            "signature_verification",
+            "install",
+            "relaunch",
+            "network",
+            "invalid_manifest",
+            "unsupported_target",
+            "invalid_signature",
+            "install_failed",
+            "relaunch_failed",
+        ] {
+            assert!(source.contains(&format!("\"{token}\"")));
+        }
+        assert!(source.contains("record_fixed_event(\"updater.failure\", fields)"));
+        assert!(!source.contains("fields.insert(\"updaterError\""));
+    }
+
+    #[test]
+    fn user_selected_reports_share_the_atomic_publish_family() {
+        let diagnostic = include_str!("debug.rs");
+        let verification = include_str!("graph_verification.rs");
+        let plain_write = ["std::fs::", "write(path"].concat();
+        let atomic_write = ["tine_core::model::", "atomic_write(&path"].concat();
+
+        for (label, source) in [
+            ("diagnostic", diagnostic),
+            ("graph verification", verification),
+        ] {
+            assert!(
+                !source.contains(&plain_write),
+                "{label} report export must not truncate its destination in place"
+            );
+            assert!(
+                source.contains(&atomic_write),
+                "{label} report export must use the crash-durable atomic family"
+            );
+        }
     }
 }

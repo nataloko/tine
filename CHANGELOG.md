@@ -8,6 +8,514 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.981] - 2026-09-01
+
+### Added
+
+- **The graph menu now has a right-click menu on every graph row.** Opening a
+  graph in a second window was reachable only by Shift-clicking a row, which
+  nothing announced. Right-clicking a row now offers **Open in a new window**
+  and **Open here**, plus **Show in folder**, **Copy path**, and **Remove from
+  this list**. The row for the graph this window already has open keeps both
+  open actions visible but inert and says why, so the menu does not change
+  shape from row to row; mobile, which has neither peer windows nor a file
+  manager, shows the actions that apply to it.
+
+- **PDFs are now ordinary pane tabs instead of a separate global side pane.**
+  Opening a graph PDF on desktop preserves the source and uses one reusable
+  companion pane; the PDF tab can be moved into any existing pane, split, or
+  quadrant, and its Notes action opens the `hls__` page in the structural
+  companion. Workspaces restore the layout and each PDF tab's page/zoom, while
+  legacy dedicated-pane sessions migrate without losing their existing panes.
+  Android keeps one route surface and Back returns through Notes, PDF, and the
+  source page in order.
+
+- **Alt+click opens an internal page or block link in the other pane.**
+  After the unified click contract moved Ctrl/Cmd+click to background tabs,
+  ordinary links had no mouse+modifier route to a pane; Alt+click is that
+  route again, matching the long-standing Alt+click / Alt+Enter gesture on
+  Search and Quick Switcher results. It splits right when there is only one
+  pane, and Shift+click (right sidebar), Ctrl/Cmd+click and middle-click
+  (background tab) keep their existing meanings everywhere. (GH #438)
+
+- **Declarative themes can now shape reading presentation without running code.**
+  Theme API 0.2 adds bounded Tine-owned presets for editorial serif typography,
+  journal headers, and a Today task summary, while existing color-only 0.1
+  themes remain compatible and `logseq/custom.css` still wins the cascade.
+
+- **Managed-storage group deletions now have an explicit recovery surface.**
+  Tier 2 and Tier 3 absence sweeps raise a warning and remain available in a
+  Deleted pages dock with their member pages and durable action status. Restore,
+  Re-apply, and Keep deletion map directly to the recorded backend actions;
+  failed restores retain their cause and can be re-run, while dismissing the
+  warning or closing the panel never records a deletion decision.
+
+### Changed
+
+- **Settings remembers whether you maximized it.** The maximize control added in v0.6.95 reset on every open, so anyone who prefers the wide dialog had to press it again each time. Settings now opens at the size you last left it, on this device, across restarts. If you have never pressed the control, nothing changes ([GH #427](https://github.com/martinkoutecky/tine/issues/427)).
+
+- **PDF rendering now uses PDF.js's maintained page-view lifecycle under one
+  window-wide admission and canvas-memory budget.** Visible/focused pages win
+  scheduling, stale work is cancelled, evicted views synchronously release
+  their backing stores, and zoom above 300% sharpens only visible clipped tiles
+  while retaining an aligned lower-resolution fallback. Area highlights use a
+  dedicated clipped capture, and a tab cannot multiply the old per-view
+  resource ceilings. (GH #393)
+
+### Fixed
+
+- **LaTeX math now renders inside italic and other emphasized Markdown.** A
+  whole agent response can be italic without turning valid `$…$` or `$$…$$`
+  fragments back into literal dollar text. The shared parser now preserves
+  top-level-valid math through ordinary italic, bold, strike, and highlight
+  containers while leaving invalid math, code spans, Org, and unrelated link
+  labels unchanged. ([GH #460](https://github.com/martinkoutecky/tine/issues/460))
+
+- **Typing a PDF page number and pressing Enter now stays on that page.** The
+  input could jump the reader and then immediately restore the old page number
+  when it lost focus, so the requested position was not retained or restored
+  with the PDF tab.
+
+- **Annotating a PDF while its notes page was being saved could freeze Tine
+  completely.** The two writers of an `hls__` page took the same two internal
+  locks in opposite orders, so each could end up waiting for the other. Because
+  one of those locks is shared by the whole graph, the freeze was not confined
+  to that page: once it happened, no further edit anywhere in the graph could be
+  saved until Tine was restarted. Six write paths took the locks in the wrong
+  order — PDF opening and annotation, the three conflict-resolution paths, and
+  one projection-recovery path — and all of them now take them in the order the
+  ordinary page save has always used. A check that walks the source now fails the
+  build if any future write path reintroduces the inversion. Only debug builds
+  ever reported this as an error; release builds, which is what everyone runs,
+  froze silently, which is why it survived so long.
+- **Clicking in the empty space after a block that ends in formatting now puts the caret at the very end.** On a block like `*some text in italics.*`, clicking past the last letter landed the caret between the letter and the closing marker you cannot see, so pressing Enter split the italics instead of starting the next block. The click is now read as "the end of this block" wherever it lands past the final glyph, for emphasis, bold, inline code and their Org equivalents alike; a deliberate click inside formatted text still lands exactly where you aimed ([GH #465](https://github.com/martinkoutecky/tine/issues/465)).
+- **Modifier-clicking a bullet now sends the block where the same modifier sends a link.** Ctrl/Cmd-click (or middle-click) opens the block zoomed in a background tab, Alt-click opens it in the other pane, and Shift-click still opens it in the right sidebar; before this, only Shift did anything and every other modifier just zoomed in place. Reference bullets in linked references, query results and embeds answer the same four gestures ([GH #456](https://github.com/martinkoutecky/tine/issues/456)).
+- **Shortcuts whose only modifier is Alt now work while you are editing a block.** A binding such as Alt+S for the next tab fired everywhere in the app except inside a block, where you had to add a second modifier; it now fires there too. Alt combinations you have not bound to anything still reach the text, so accented characters typed with Alt/Option are unaffected ([GH #461](https://github.com/martinkoutecky/tine/issues/461)).
+- **Ctrl/Cmd+Enter in search opens the highlighted result in a new tab**, matching what Ctrl/Cmd-click on the same result already did, and leaves the search open so you can fan several results out in a row ([GH #463](https://github.com/martinkoutecky/tine/issues/463)).
+- Sidebar: only the page title in a sidebar row is a link now, not the whole width of the row. The blank space to the right of a short name showed the hand cursor and opened the page, which made reordering favourites a coin toss — grab a row to move it, and it navigated instead. That space belongs to the drag now, and favourites show a grab cursor to say so. Right-clicking anywhere on a row still opens that page's menu ([GH #464](https://github.com/martinkoutecky/tine/issues/464)).
+- Block references: the small reference-count badge now sits on a block's **first** line instead of dropping to the bottom-right corner once the block wraps onto several lines. It is a right-floating chip, and a float rides whichever line the browser is on when it meets it — emitted after the text, that was the last line. It is now emitted before the text, so it looks the same on a long block as on a short one ([GH #454](https://github.com/martinkoutecky/tine/issues/454)).
+- Outline: a block's bullet now sits on the middle of that block's first line of text instead of 2px above it. The bullet's column was sized to the line height but not to the small padding above the text, so every bullet in the graph was slightly high — and twice as high under the editorial-serif typography preset, which makes the line taller. The line's height is now defined in one place and the bullet column follows it, so a typography theme moves both together ([GH #459](https://github.com/martinkoutecky/tine/issues/459)).
+- Settings: choosing **Graph**, **Journals** or **Backups & recovery** no longer makes the whole Settings window flash away and come back. Those three sections fetch something as they open, and that was enough to tear down the dialog around them; the section list, the search box and the window now stay put while a section loads ([GH #409](https://github.com/martinkoutecky/tine/issues/409)).
+- Diagnostics: Tine no longer claims it "did not close cleanly last time" every launch on iOS, iPadOS and Android. A phone or tablet reclaims a backgrounded app as a matter of course, and Tine counted that as a crash because it had no other way to tell that a mobile session had ended; it now treats going to the background as the end of the session and coming back as the start of a new one, so a crash you actually see is still reported ([GH #426](https://github.com/martinkoutecky/tine/issues/426)). The desktop half of the same report, the warning after an ordinary quit on Linux and Windows, is fixed separately in this release (below). One last warning is expected the first time you open this version, from the marker the previous one left behind.
+- Sidebar: the left sidebar's scrollbar can be grabbed with the mouse again. The drag-to-resize strip along the sidebar's edge was drawn on top of it, so on Windows the sidebar could be resized but never scrolled by dragging; the strip now sits beside the scrollbar rather than over it ([GH #435](https://github.com/martinkoutecky/tine/issues/435)).
+- Outline: clicking a block's fold arrow no longer folds the entire subtree. The guide line beside the children (which folds every descendant) was drawn on top of the fold arrow's leftmost pixels, so an aim that landed slightly left of centre hit the wrong control. The guide now stops at the arrow's edge ([GH #423](https://github.com/martinkoutecky/tine/issues/423)).
+- Theme packaging: `tine-theme.mjs check` no longer certifies a ported theme that Tine then refuses to install. It checked only the upstream source, revision and author list, so an unsupported `portedFrom.ecosystem`, a missing `relationship`, `name` or `license`, or an unknown provenance field passed the registry check and failed on install. The checker now holds `portedFrom` to the same vocabulary the app installs against ([GH #410](https://github.com/martinkoutecky/tine/issues/410)).
+
+- **Links to local files and folders now open.** A link written the Logseq way
+  (`[Test](file://D:\test.txt)`) or the Obsidian way
+  (`[Test](<file:///D:\test.txt>)`) rendered as a live link but did nothing at
+  all when clicked: the backend refused every scheme but http/https/mailto, and
+  the renderer discarded the refusal so nothing was reported either. `file:`
+  links now go to the OS default application for that file or folder, matching
+  Logseq, and any link that cannot be opened — a bad URL, a path that is no
+  longer there — says so instead of failing silently. Every other scheme stays
+  refused. (GH #444)
+
+- **Editing-toolbar buttons on mobile no longer depend on a WebView emitting a
+  click.** On iOS 27 the toolbar appeared but nothing responded to taps, while
+  the same build worked on iOS 18.5: the buttons acted only on the click a
+  browser synthesizes after a pointer press, and that press is deliberately
+  cancelled so the editor keeps focus. The tap itself now performs the action,
+  with click kept as the keyboard and assistive-technology path. (GH #434)
+
+- **Long-pressing a page link on iOS or Android no longer raises the system
+  text-selection bar over Tine's menu.** The same hold that opens Tine's context
+  menu is also the platform's own selection gesture, which no amount of event
+  handling on our side can call off — so page links and tags simply decline to
+  be selected on touch. Menus themselves are now unselectable everywhere. On
+  desktop you can still drag a selection across a link's text. (GH #452)
+
+- **Dragging a block by its bullet no longer paints a blue trail behind it.**
+  On macOS the drag doubled as a text selection and highlighted every block it
+  passed over, which made the landing spot hard to read. The same guard the
+  sidebar already used now covers the outline. (GH #424)
+
+- **A wide table no longer drags its "Add row" label across the screen.** The
+  control spans the whole table, so its centred label sat at the midpoint of the
+  full table width — off to one side and travelling as you scrolled sideways.
+  The row keeps its full-width click target; only the label is now pinned to the
+  visible edge, the way the first column already is. (GH #449)
+
+- **iPad now behaves like a tablet instead of a Mac.** The on-screen editing
+  toolbar (indent, move, insert) never appeared while editing on iPad, and
+  long-press, text selection and window chrome all took their desktop branch.
+  iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X` user agent from
+  a stock WebView, and Tine was reading the platform out of that string; it now
+  comes from the build itself. Split panes stay available on iPad — they follow
+  the size of the screen, not the name of the operating system. (GH #446)
+
+- **A reported switch between Direct Files and Managed Storage now survives a
+  crash at the selector boundary.** App-private storage-mode bindings use the
+  same certified durable create/replace/retire primitive as other authority
+  names, including Windows write-through retirement and Android parent-entry
+  flushing. Once activation reports Managed active, a stale Direct selector can
+  no longer reappear after power loss and take precedence at the next startup.
+
+- **Rapid Managed Storage moves no longer reuse a stale source page and then
+  flood “missing or foreign root” errors.** Repeated cross-day commands now
+  resolve one at a time against the preceding accepted move, while the actor's
+  temporary response-replay files are retired after the committed page pair is
+  installed. A native journey drives 120 uninterrupted move commands across
+  four journal-day boundaries and compares that pressure with a durable
+  20-block cross-page cut/paste.
+
+- **Direct Files saves now use durable write-through name publication on
+  Windows.** Creating, replacing, restoring, and retiring the sole-authority
+  Markdown/Org name all cross the certified typed storage boundary, so a power
+  loss cannot be acknowledged merely because a non-write-through rename was
+  briefly visible.
+
+- **A second device can join a synchronized graph that contains an honest
+  duplicate-name backup file.** A fresh scan may choose the earlier-sorting
+  backup even though the shared history already owns the canonical page path.
+  Join now accepts that shape only when the provider-owned exact file is still
+  present with exactly the shared semantics and both physical files decode to
+  the same page identity; the extra file remains untouched. The Android
+  app-UID journey now covers activation, share, a distinct-device join and
+  reopen, and the real graceful Return-to-Direct-Files composition.
+
+- **Managed Storage has one production actor and enrollment path.** Dead
+  pre-clean-runtime mutation, provider, cursor-join, and handoff state has been
+  removed from the retained actor, and a source guard prevents those fields or
+  types from returning to the production prefix of `sync_runtime.rs`.
+
+- **Managed Storage pages remain editable after heavy use evicts them from the
+  in-memory document cache.** A cold point load now reconstructs the page from
+  its accepted history instead of mistaking the cache miss for an untouched
+  page. Retained-runtime recovery also reports content-free native sub-stages
+  and has a tighter real-corpus performance gate.
+
+- **A remote `http:`/`https:` link whose URL ends in `.pdf` now opens in the
+  browser like every other external link, instead of being captured by Tine's
+  PDF viewer.** Only graph/local asset PDF references and their highlight
+  pages enter the viewer; an image-syntax remote PDF renders as an ordinary
+  external link as well rather than a broken image frame. (GH #442)
+
+- **The PDF reader's Close control is now the terminal toolbar action.** It
+  stays at the conventional far-right edge with an explicit accessible label,
+  instead of reading like another tool in the middle of the control cluster
+  (GH #443).
+
+- **Bounded managed block-referrer panels now show the same document-order
+  prefix and exact result count as Direct Files.** The SQLite-backed route
+  finishes generation-bound candidate discovery before applying the shared row
+  and byte budget, instead of truncating an internal-ID-ordered subset.
+
+- **Diagnostic and graph-verification report exports can no longer be left
+  partially written by a crash.** User-selected JSON destinations now use the
+  same temp-file, file-flush, atomic-replace, and directory-flush publication
+  family as other small durable outputs.
+
+- **Returning to Direct Files and restoring a backup now fail closed on real
+  directory durability errors.** Graph-local managed state set-aside and
+  rollback flush both changed parents in recovery-first order; the separate
+  capability-bound backup stack now durably reserves recovery directories,
+  retires live names, and publishes restored names before acknowledging them.
+
+- **Managed storage no longer reparses every baseline page when rebuilding its
+  disposable SQLite projection.** New baseline capsules carry a bounded,
+  versioned semantic receipt that is verified and reused during a healthy
+  rebuild. Existing receiptless baselines, oversized pages, parser upgrades,
+  and invalid receipts retain the prior exact-source reparse-and-compare path.
+  Foreground one-block saves also reuse exact bounded whole-document outline
+  parses, keeping both the first and steady post-drain save within two such
+  parser invocations; drains perform none.
+
+- **Managed storage now opens before its search indexes finish building.**
+  Both Unicode and CJK substring indexes are built in bounded background turns;
+  searches remain complete through an explicit slower fallback and show
+  “Search index building…” until readiness. Live edits are caught up before the
+  marker flips, and later one-block saves update only that block's search rows
+  instead of rewriting its whole page.
+
+- **Managed storage no longer forces a durable SQLite cache sync for every
+  accepted event or schema statement.** The disposable WAL projection now uses
+  `synchronous=NORMAL`, creates its schema in one atomic transaction, and keeps
+  durability at the existing explicit checkpoint and atomic file-set
+  publication boundary. A lost or corrupt cache still rebuilds from the
+  immutable baseline and accepted operation history.
+
+- **A crash during managed archive publication can no longer strand an edit
+  whose exact bytes are still durable in the local journal.** Cold open repairs
+  only torn object names covered unambiguously by an undrained local record,
+  under the workspace's sole-writer lease, and then performs the ordinary full
+  archive validation. Uncovered corruption and torn manifests still refuse
+  activation. Public archive publishers remain strict; the local drain installs
+  recoverable object names before its batch-wide flush, then installs the
+  already-durable manifest and only afterward may checkpoint the journal. The
+  enforced 10/13 save and cross-page-move barrier totals do not change.
+- **Android keeps the right-sidebar control one tap away at ordinary phone
+  widths and keeps Tine outside the system bars.** Lower-priority topbar actions
+  still move into `...` when space is constrained, while the right-sidebar
+  button remains direct until the last-resort tier; native status, navigation,
+  and display-cutout insets now bound the WebView itself. Android also treats
+  that native viewport as the sole inset owner, so OEM WebViews that expose CSS
+  safe-area values do not add a second wasteful band above the topbar (GH #205).
+
+- **Android no longer treats a refused directory durability barrier as success
+  for promoted managed-storage projection receipts.** Only the receipt store's
+  pre-enrollment initialization remains reconstructible; bases, intents,
+  attempts, mutation authority, completions, cleanup, and forensic records now
+  keep strict private-authority barriers on every platform. Each process now
+  verifies a promoted parent once before accepting an existing receipt name or
+  operational namespace, so a crash cannot erase knowledge of a refused
+  barrier; later same-process names and ordinary reads add no barrier. Android
+  devices that cannot provide app-private directory durability may initialize
+  the reconstructible empty store, but managed operations now refuse rather
+  than claiming unsafe success.
+
+- **Images changed by Syncthing, Dropbox, an external editor, or another Tine
+  window now refresh in place without reopening the graph.** Tine observes the
+  approved `assets/` directory separately from page reconciliation in Direct
+  Files and managed storage, including an approved external-assets target.
+  Asset bytes remain ordinary filesystem-synchronized files and never enter the
+  managed oplog or `.tine-sync`; open PDF/audio/video sessions are not replaced
+  mid-use and see new bytes when reopened.
+
+- Windows updater failures now leave a privacy-safe stage and cause in
+  Diagnostics, with a sanitized detailed chain available in debug mode. A
+  32-bit Windows build also links to the manual package instead of offering an
+  automatic install that its signed updater manifest does not publish (GH
+  #241). The reporter's underlying native network failure remains under
+  investigation.
+
+- Block background colors no longer crowd their bullets. Regular dots and
+  numbered-list ordinals now occupy the same 22px control track, while the
+  rounded highlight keeps text aligned with an unhighlighted or edited block.
+
+- **Same-structure external Markdown content edits no longer leave a managed
+  page stale or raise `hot_source_join` merely because Tine reached it through
+  a page-name route** (GH #397). Application-page routes now
+  agree on current source content while managed reconciliation is still in
+  progress. Structural edits such as adding, deleting, or moving bullets still
+  wait for the managed watcher to reconcile them safely.
+
+- Restoring deleted pages from the recovery panel no longer closes the panel
+  by itself the moment the restore completes: the disposed sweep stays visible
+  as actionless history until you close it.
+- Quitting Tine normally no longer shows a false "Tine did not close cleanly
+  last time" warning on the next launch. The clean-shutdown marker was cleared
+  in code placed after the app's event loop, which never runs, so every quit
+  since the flight recorder shipped was reported as a crash. This is the
+  desktop half of [GH #426](https://github.com/martinkoutecky/tine/issues/426).
+
+## [0.6.98] - 2026-08-27
+
+### Changed
+
+- **Managed-storage projection recovery is prepared for cheaper durable
+  publication.** Every projection-only producer now records one durable,
+  description-only turn before graph mutation, while foreground saves replay
+  through the same turn-level executor. Existing projection receipts remain as
+  redundant recovery evidence, startup drains semantic edits before projection
+  turns, and a disposable per-page SQLite digest avoids rendering an unchanged
+  page merely to prove it needs no terminal repair. Durability-barrier budgets
+  remain 25 for a save and 74 for a cross-page move.
+
+- **The shared parser is updated to lsdoc v0.5.6.** Raw HTML recognition now
+  indexes every supported tag in one source pass, static HTML export renders
+  safe Hiccup vectors as markup, and deeply nested projections serialize
+  iteratively instead of consuming the native stack. Native and browser-WASM
+  consumers use the same released parser and serialization contract.
+
+- **Startup no longer loads the complete Settings implementation before the
+  first page appears.** Settings and its plugin, theme, backup, and diagnostics
+  controls now load only when opened; the small journal-conflict row shared with
+  Concord remains available independently. Native startup is back within the
+  immutable v0.4.7 performance budget.
+
+- **Managed storage's private receipt-store format has been bumped**
+  (development only). Projection records now carry an explicit target-kind
+  discriminant, so a private store created by an earlier build is refused with a
+  named notice telling you to re-activate managed storage for that graph. Your
+  Markdown files are untouched by the refusal — the check runs before anything
+  can modify the graph. Managed storage has not shipped, so no released build
+  can have created such a store; this affects development machines only.
+
+- **Saving a page performs fewer disk-durability round trips** (28 → 25
+  core-initiated barriers per accepted single-block save; 77 → 74 for a
+  cross-page move). Three barriers defended no failure Tine's threat model
+  covers: a re-flush of a file that was already flushed before publication, a
+  durable queue-state write on an empty cleanup queue, and a flush of a file
+  about to be moved aside whose exact bytes are already recorded. Edits feel the
+  difference most on slow, networked, or synced filesystems.
+
+### Added
+
+- **Keyboard Shortcuts can now be searched in place** (GH #380). The existing
+  Settings search field filters command names, IDs, and bindings while that
+  section is open, including built-in shortcuts and a clear no-results state.
+
+### Fixed
+
+- **Built-in themes now recolor the main page in dark mode** (GH #401). The
+  no-flash startup frame now yields its high-specificity viewport colors to the
+  active theme tokens after startup, so Nord, Solarized, and Gruvbox apply
+  consistently to the page and sidebar while `custom.css` remains the final
+  user override.
+
+- **An exact `#` or `[[` page match no longer hides other matching pages**
+  (GH #186). The exact page remains the first/default result and suppresses the
+  redundant Create row, while prefix, substring, and fuzzy matches remain
+  available in the existing bounded literal autocomplete pool.
+
+- **A journal-feed read failure is no longer misreported as an empty graph**
+  (GH #385). The initial Journals view now shows the actual bounded backend
+  error, while a transient refresh failure still keeps an already visible feed
+  intact and retries later. This makes cloud-filesystem and access failures
+  diagnosable without mistaking present journal files for no journals.
+
+- **Unlinked References no longer falls back to a whole-graph scan while an
+  ordinary edit's one-page SQLite update is already in flight** (GH #400).
+  Reference reads wait for that bounded background delta, then use the exact
+  current candidate set; an unavailable or failed disposable projection still
+  falls back to the parser. Exact Direct Files byte conflicts remain unchanged
+  and continue to preserve both the disk version and the unsaved draft.
+
+- **Long pages no longer grow and shrink when a block enters or leaves edit
+  mode** (GH #390). Pane-relative end-of-page breathing room is now derived
+  from whether the page content naturally overflows, rather than from the
+  transient presence of a textarea, so its scroll geometry stays stable.
+
+- **A held mouse click now shows the block caret on mouse-down, matching
+  Logseq** (GH #368). Exact rendered-text caret placement still applies, and a
+  drag can still select text in the editor or escalate across blocks.
+
+- **Android and system-decorated windows keep frequent top-bar actions directly
+  visible whenever they fit** (GH #205). The overflow threshold now accounts
+  for whether Tine's three custom window controls actually occupy the row, so a
+  390px phone no longer hides calendar, journals, theme, and right sidebar in
+  the `...` menu while leaving usable space.
+
+- **Copying the in-app Guide no longer stops after its first page** (GH #391).
+  Guide pages now carry the same completed-write receipt as ordinary Direct
+  Files edits, so Tine's native watcher recognizes its own multi-page copy
+  instead of treating page one as an external change that blocks page two.
+
+- **Creating pages on Windows no longer lets a filesystem callback interrupt
+  the very Tine write that caused it** (GH #374). The earlier v0.6.97 repair
+  proved exact file-event echoes, but an ambiguous Windows callback could still
+  raise the graph-wide external-change frontier before waiting for the active
+  writer. Callback admission now serializes behind graph-text publication;
+  genuine ambiguous or external changes still go through the normal debounced
+  reconciliation before later creations are admitted.
+
+- **Rapid scrolling and zooming no longer make PDF pages compete for the UI
+  thread or flash blank while sharpening.** The reader now has one
+  viewport-prioritized full-page render scheduler, drops obsolete prefetch work,
+  pauses speculative rendering during fast wheel bursts, and defers selectable
+  text-layer construction until scrolling settles. A page's previous bitmap
+  remains visible until its sharper zoom replacement is complete. The longer-term
+  tile-aware viewer architecture is tracked in GH #393.
+
+- **Long PDFs no longer skip pages or overload the viewer during ordinary
+  scrolling.** Evicting an offscreen page's canvas could collapse its flex
+  wrapper, shrinking the document while it was being scrolled and making many
+  distant pages appear visible and render at once. Page placeholders now keep
+  stable geometry, so scrolling stays sequential and rendering remains local to
+  the viewport.
+
+- **F-Droid can rebuild Tine's browser parser from source again** (GH #392).
+  The logbook code shared with the small WASM wrapper had started reaching into
+  a tine-core-only module, while Tine's own release path kept using the already
+  generated WASM bundle. The property recognizer is now one dependency-free
+  source module shared by both crates. Pull requests and full release CI now
+  rebuild the WASM bundle from clean source. A daily monitor also files or
+  updates an Inbox issue when F-Droid's public auto-update pipeline reports a
+  new failure.
+
+- **Unlinked References now opens when a matching source page contains 10,000
+  or more blocks** (GH #388). Managed storage was applying the whole-page
+  editor payload limit before constructing the already-bounded reference
+  result. Large source pages now take one linear authenticated read while the
+  panel keeps its existing row and byte limits.
+
+- **PDFs no longer flash and disappear when two render triggers reach the same
+  page together** (GH #275). Visibility and navigation could both begin before
+  the first PDF page lookup finished, causing PDF.js to reject two simultaneous
+  renders into one canvas. Each page now has one render owner from before its
+  first asynchronous lookup through completion, zoom, eviction, or teardown.
+
+- **The block you are typing in stays above the Android keyboard toolbar**
+  (GH #384). Tine now accounts for its own toolbar when focus moves, the block
+  grows, or the keyboard viewport changes, instead of letting the active text
+  remain hidden behind the fixed controls.
+
+- **Pressing Back beyond the first Android page now closes Tine instead of
+  leaving a gray, unusable screen** (GH #386). Storage was already stopped
+  safely, but the final handoff called a Tauri command that does not exist.
+  Android now uses the installed process-exit API after the same guarded save
+  and shutdown checks.
+
+- **Enter at either side of an in-block line break now creates a clean new
+  block** (GH #361). The first fix handled the caret at the start of line two,
+  but pressing Enter at the end of line one still copied the newline into the
+  new block as an empty first line. Both caret positions now consume the same
+  structural boundary on desktop and mobile while preserving intentional blank
+  lines.
+
+- **Android page links now open their page menu consistently on long-press**
+  (GH #207). Body wiki links, links and page headers in Linked References, and
+  page results in search now distinguish Tine's deliberate hold from the
+  browser's native text-selection gesture. Quick taps, scrolling, and desktop
+  click gestures are unchanged.
+
+- **The keyboard-shortcut recorder now captures Control on macOS** (GH #378).
+  Physical Control is recorded as `ctrl`, while portable `mod` remains Command
+  on macOS and Control on Windows/Linux.
+- **Pages no longer become narrow or jump sideways when you start editing or
+  expand references** (GH #382). The pane-relative end-of-page space added in
+  v0.6.96 accidentally let the centered page column shrink to the width of its
+  current contents. Standard pages now hold a stable reading width, and Wide
+  mode fills the pane as intended. Settings → Appearance → Advanced also lets
+  you tune the standard width or give Wide mode a custom maximum on this device.
+
+- **Saving a page in a subfolder no longer costs extra waits for the disk.**
+  Every time Tine wrote or renamed a file in your graph, it asked the operating
+  system to confirm not just the folder it had actually changed, but every
+  folder above it up to the graph root. A page in `pages/Work/Notes.md` therefore
+  waited three times where a page in `pages/Notes.md` waited once, on roughly six
+  file operations per save. Only the folder that actually changed is confirmed
+  now; a folder Tine has just created is still confirmed at the moment it is
+  created, so a crash cannot lose the path your page was written into. On
+  Managed Storage an ordinary edit now waits on 28 disk flushes instead of 37,
+  and a cross-page move on 77 instead of 93 -- measured both on a test fixture
+  and on a 1,045-file copy of a real graph.
+
+- **Managed Storage saves wait on fewer disk flushes.** Each accepted edit used
+  to write four small bookkeeping files whose only job was to notice if
+  something had swapped out a folder inside Tine's own private data directory --
+  which nothing but a program already running as you could do, and which Tine
+  does not defend against by design. Each of those files cost two waits for the
+  disk to confirm, on every page an edit touches. They are gone, and Tine now
+  simply recreates the folder if it is missing instead of refusing to save the
+  page forever. An ordinary edit now waits on 37 disk flushes instead of 45, and
+  a cross-page move on 93 instead of 109. On a slow or network-backed disk that
+  wait is the bulk of the delay between finishing a keystroke and the file being
+  safely on disk.
+
+- **Opening and scrolling the Journals feed no longer walks the whole graph on
+  Managed Storage.** The feed was assembled by enumerating every page in the
+  graph and then loading the handful of days it actually shows -- on every
+  open, and again for each three-day step as you scroll back. The runtime now
+  keeps the graph's journal days indexed and rebuilds that index only when
+  something is actually accepted, so a feed page costs a lookup plus its own
+  page loads. Going back to Journals with nothing changed in between does no
+  graph-sized work at all, and the whole request is now answered in one
+  runtime turn instead of one per page.
+
+- **Managed Storage saves stop paying a disk round trip per internal file.**
+  Every accepted edit fanned its history out into several separately-flushed
+  private files, and each flush is a real device round trip: one single-block
+  save performed 55 of them and a cross-page move 130. On a local SSD that is
+  tens of milliseconds; on a slow, network, or phone filesystem it is what makes
+  an edit feel heavy. An accepted edit's history is now written and made durable
+  as ONE unit -- 45 and 109 -- and three flushes that ran before *reading* a
+  file, which could not affect what was read, are gone. Crash safety is
+  unchanged and is now stated and tested: a save interrupted by a crash or power
+  loss is either fully recorded or not recorded at all, never half-written, and
+  the graph still reopens and completes the same edit.
+
 ## [0.6.97] - 2026-08-26
 
 ### Added
@@ -513,7 +1021,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **No more white frame around the page after clicking empty space and pressing a key** (GH #345). Clicking an empty spot of the main content focused the page scroller, and the next keypress flipped the browser's focus heuristic, painting its default white frame around the whole content area. Only that default frame is suppressed — the pane-select ring and the usual focus cues on buttons and other controls are unchanged.
 
-- **Managed-storage block moves across journal-day boundaries now stay immediate and keep keyboard focus.** The source and destination publish as one durable foreground transaction, so archive/SQLite derivatives no longer dim or stall the interface before the block appears on the adjacent day. The foreground path is graph-size invariant at 100 and 10,000 pages, and rapid queued edits use exact pending-projection indexes instead of repeatedly scanning the journal prefix. Multi-page foreground prefixes now also drain from accepted state instead of letting later queued catalog heads block an earlier projection, and a peer move no longer stalls merely because this device concurrently advanced an unrelated page in its catalog. Page and namespace renames likewise use exact SQLite name/range lookups instead of enumerating every unrelated graph page before the indexed reference rewrite. Accepted saves advance authenticated roots by path-copying only changed documents and the new batch, provider-head publication reads an incremental frontier-tip set, and clean projection attach decodes only current path heads; none of these routine boundaries now clone or replay the graph/session history.
+- **Managed-storage block moves across journal-day boundaries now stay immediate and keep keyboard focus.** The source and destination publish as one durable foreground transaction, so archive/SQLite derivatives no longer dim or stall the interface before the block appears on the adjacent day. The foreground path is graph-size invariant at 100 and 10,000 pages, and rapid queued edits use exact pending-projection indexes instead of repeatedly scanning the journal prefix. Response-replay cleanup now runs on its own bounded retry lane, so a slow acknowledgement cannot stall the next move; actor cleanup remains crash-safe, bounded, and explicitly runnable. Multi-page foreground prefixes now also drain from accepted state instead of letting later queued catalog heads block an earlier projection, and a peer move no longer stalls merely because this device concurrently advanced an unrelated page in its catalog. Page and namespace renames likewise use exact SQLite name/range lookups instead of enumerating every unrelated graph page before the indexed reference rewrite. Accepted saves advance authenticated roots by path-copying only changed documents and the new batch, provider-head publication reads an incremental frontier-tip set, and clean projection attach decodes only current path heads; none of these routine boundaries now clone or replay the graph/session history.
 
 ## [0.6.94] - 2026-08-22
 
@@ -3751,7 +4259,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.90...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.98...HEAD
+[0.6.98]: https://github.com/martinkoutecky/tine/compare/v0.6.97...v0.6.98
 [0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
