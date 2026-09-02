@@ -5124,11 +5124,16 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
    exactly on the bullet on every renderer AND lets the dashes flow around the corner
    when animated. This is the fork's own renderer; upstream's plugin `thread-lines`
    decoration (the .plugin-thread-lines rules above) stays for installed plugins, and
-   the two never apply to the same block. Geometry is measured to Tine's bullet
-   column: a block's bullet centre is 26px right / 14px down from its .ls-block
-   top-left; a child .ls-block is one 30px indent in, so the PARENT bullet sits 4px
-   LEFT and ~18px ABOVE. --thread-color is set inline per marked block (per-depth
-   colour); --thread-thickness on .app-container.
+   the two never apply to the same block. Geometry follows the bullet-column
+   tokens (GH #459 centred the bullet on the first line and made typography
+   presets retune the line box): a block's bullet centre is 26px right and
+   calc(--ls-block-content-pad-y + --ls-block-line-height/2) down from its
+   .ls-block top-left (15px at the default tokens); a child .ls-block is one
+   30px indent in, so the PARENT bullet sits 4px LEFT and one first-row + the
+   3px inter-block gap ABOVE (18px at default). The elbow <path> is generated
+   from the same tokens in Block.tsx (threadElbowPath). --thread-color is set
+   inline per marked block (per-depth colour); --thread-thickness on
+   .app-container.
      · .thread-elbow  — a path node: vertical up to the parent bullet + a rounded turn
                         into this block's bullet. A fixed-size overflowing <svg> + <path>.
      · .thread-spine  — a preceding sibling of a path node: a straight vertical that
@@ -5156,17 +5161,19 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   height: 20px;
   overflow: visible;
 }
-/* Spine: box spans this block's own height (top:-18 → bottom:0) and CLIPS a long
-   vertical line to it, so the guide reaches the next sibling but never overshoots.
-   Origin is offset (-12,-18) so the line at block x=-4 is internal x=8, y=0=-18. */
+/* Spine: box spans this block's own height plus the token-derived upward overlap
+   to the parent-bullet row, and CLIPS a long vertical line to it, so the guide
+   reaches the next sibling but never overshoots. Origin is offset left by 12px so
+   the line at block x=-4 is internal x=8. The overlap mirrors threadElbowPath's
+   `gap` (18px at the default tokens). */
 .thread-enabled .ls-block > .thread-svg.thread-spine-svg {
   left: -12px;
-  top: -18px;
+  top: calc(-1 * (var(--ls-block-line-height) / 2 + var(--ls-block-content-pad-y) + 3px));
   /* An abspos <svg> ignores top+bottom stretch (it falls back to its intrinsic
      150px), so size it explicitly: 100% of the .ls-block (this block's full height,
-     incl. children) + the 18px upward overlap. overflow:hidden then clips the long
+     incl. children) + the upward overlap. overflow:hidden then clips the long
      line to exactly this block's extent. */
-  height: calc(100% + 18px);
+  height: calc(100% + var(--ls-block-line-height) / 2 + var(--ls-block-content-pad-y) + 3px);
   width: 24px;
   overflow: hidden;
 }

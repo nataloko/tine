@@ -403,6 +403,25 @@ function CollapseAllBorder(props: { id: string; readOnly: boolean }): JSX.Elemen
   );
 }
 
+// FORK: bullet-threading elbow geometry. GH #459 derives the bullet column from
+// --ls-block-line-height/--ls-block-content-pad-y and centres the bullet on the
+// first line, and typography presets retune the line-height token per
+// .page-section — so the elbow follows the same tokens instead of fixed
+// constants. Bullet centre y = pad + lh/2; the parent bullet sits one first-row
+// higher plus the fixed 3px inter-block gap (at the default 26px/2px tokens:
+// H-run at y=15, top at y=-18, matching the old measured path within 1px). Read
+// off the block itself so a scoped preset override is honoured; each elbow
+// re-measures on mount, which the active path does every time focus moves — a
+// theme switch mid-thread corrects itself on the next edit interaction.
+function threadElbowPath(host: Element): string {
+  const cs = getComputedStyle(host);
+  const lh = parseFloat(cs.getPropertyValue("--ls-block-line-height")) || 26;
+  const pad = parseFloat(cs.getPropertyValue("--ls-block-content-pad-y")) || 2;
+  const by = pad + lh / 2;
+  const gap = by + 3;
+  return `M -4 ${-gap} V ${by - 10} Q -4 ${by} 6 ${by} H 26`;
+}
+
 export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
   // ONE store read per block for the node itself. Every derivation below reads
   // `node()` several times over, and each raw `doc.byId[id]` costs two Solid
@@ -555,7 +574,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
     >
       {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
           it reflows + scrolls locked to the block. Elbow = a path curving into this
-          bullet; spine = a straight line clipped to the block height (see app.css). */}
+          bullet; spine = a straight line clipped to the block height (see app.css).
+          The elbow's path is re-derived from the bullet-column tokens on mount
+          (threadElbowPath); the fallback `d` is the default-token geometry. */}
       <Show when={threadingEnabled() && threadRole()}>
         <Show
           when={threadRole()?.elbow !== undefined}
@@ -565,8 +586,17 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
             </svg>
           }
         >
-          <svg class="thread-svg thread-elbow-svg" aria-hidden="true">
-            <path d="M -4 -18 V 4 Q -4 14 6 14 H 26" />
+          <svg
+            class="thread-svg thread-elbow-svg"
+            aria-hidden="true"
+            ref={(el) =>
+              queueMicrotask(() => {
+                const host = el.closest(".ls-block");
+                if (host) el.querySelector("path")?.setAttribute("d", threadElbowPath(host));
+              })
+            }
+          >
+            <path d="M -4 -18 V 5 Q -4 15 6 15 H 26" />
           </svg>
         </Show>
       </Show>
