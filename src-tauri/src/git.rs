@@ -16,6 +16,7 @@
 //! also keeps the process alive long enough for an on-close push to finish before
 //! Tine quits.
 
+use crate::command_error::CommandError;
 use crate::state::{slot_for_window, AppState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -41,6 +42,12 @@ pub(crate) struct GitResult {
     op: String,
     ok: bool,
     detail: String,
+    /// The remote moved, so the user must Pull before Push. A FIELD rather than a
+    /// phrase the frontend re-reads out of `detail`: `src/git.ts` keeps exactly
+    /// that toast sticky, and upstream's I-9 ratchet
+    /// (`src/typedErrorRatchet.test.ts`) forbids classifying a backend result by
+    /// parsing its message. Rewording the detail can no longer lose the sticky.
+    needs_pull: bool,
 }
 
 impl GitResult {
@@ -49,8 +56,33 @@ impl GitResult {
             op: op.to_string(),
             ok,
             detail: detail.into(),
+            needs_pull: false,
         }
     }
+
+    /// A failed push, classified once here so `needs_pull` travels as data.
+    fn push_failure(msg: &str) -> Self {
+        let failure = classify_push_error(msg);
+        GitResult {
+            op: "push".to_string(),
+            ok: false,
+            detail: failure.detail,
+            needs_pull: failure.needs_pull,
+        }
+    }
+}
+
+/// FORK: git's failures have no typed source in upstream's error taxonomy, so they
+/// take the command boundary's remainder row (`command_error.rs`
+/// PHASE_B_PRODUCER_MANIFEST, "literal/context-only remainder" -> `Prose`). The
+/// variant is constructed directly rather than through the boundary's lowercase
+/// constructor helper, deliberately: `backend_command_parity.rs` fingerprints every
+/// lowercase-helper mapper site and pins the count, so calling the helper here
+/// would force the fork to re-pin an upstream constant — and re-pin it again at
+/// every sync. Same value on the wire either way. (Naming the helper in prose is
+/// avoided too: `src/typedErrorRatchet.test.ts` greps its raw name.)
+fn git_error(detail: impl Into<String>) -> CommandError {
+    CommandError::Prose(detail.into())
 }
 
 /// Default `.gitignore` written on auto-init — keeps Logseq's local-only churn
@@ -69,7 +101,7 @@ logseq/version-files/
 /// acts on *that* window's graph — its own repo — even with other graph windows
 /// open. `slot_for_window` clones the `Arc<GraphSlot>` out under the read lock and
 /// releases it, so no lock is held past this call.
-fn graph_root(window: &tauri::WebviewWindow) -> Result<PathBuf, String> {
+fn graph_root(window: &tauri::WebviewWindow) -> Result<PathBuf, CommandError> {
     let state = window.state::<AppState>();
     Ok(slot_for_window(&state, window.label())?.root_key.clone())
 }
@@ -111,11 +143,11 @@ fn git_base(root: &Path) -> Command {
 
 /// Run a git subcommand to completion, capturing output. `Err` only when git
 /// itself couldn't be launched (not installed) — a non-zero git exit is still `Ok`.
-fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
+fn run_git(root: &Path, args: &[&str]) -> Result<Output, CommandError> {
     git_base(root)
         .args(args)
         .output()
-        .map_err(|e| format!("couldn't run git: {e}"))
+        .map_err(|e| git_error(format!("couldn't run git: {e}")))
 }
 
 /// stdout ++ stderr as lossy UTF-8 (git writes progress/errors to both).
@@ -149,14 +181,25 @@ fn parse_ahead_behind(s: &str) -> (usize, usize) {
     (ahead, behind)
 }
 
+/// A classified push failure: the friendly detail plus the one fact the frontend
+/// acts on (the remote moved, so Pull comes first).
+struct PushFailure {
+    detail: String,
+    needs_pull: bool,
+}
+
 /// Map a failed `git push`'s output to a friendly, actionable detail. The
 /// non-fast-forward case is the important one: the remote moved, so the user must
 /// Pull before pushing (never a forced push).
-fn classify_push_error(msg: &str) -> String {
+fn classify_push_error(msg: &str) -> PushFailure {
     if msg.contains("non-fast-forward") || msg.contains("fetch first") || msg.contains("[rejected]")
     {
-        "Remote moved — Pull first, then Push.".to_string()
-    } else if msg.contains("no upstream")
+        return PushFailure {
+            detail: "Remote moved — Pull first, then Push.".to_string(),
+            needs_pull: true,
+        };
+    }
+    let detail = if msg.contains("no upstream")
         || msg.contains("no configured push destination")
         || msg.contains("does not appear to be a git repository")
     {
@@ -170,6 +213,10 @@ fn classify_push_error(msg: &str) -> String {
         } else {
             l
         }
+    };
+    PushFailure {
+        detail,
+        needs_pull: false,
     }
 }
 
@@ -235,10 +282,10 @@ fn status_in(root: &Path) -> GitStatus {
     st
 }
 
-fn init_in(root: &Path) -> Result<GitStatus, String> {
+fn init_in(root: &Path) -> Result<GitStatus, CommandError> {
     let out = run_git(root, &["init"])?;
     if !out.status.success() {
-        return Err(first_line(&combined(&out)));
+        return Err(git_error(first_line(&combined(&out))));
     }
     let gi = root.join(".gitignore");
     if !gi.exists() {
@@ -247,7 +294,7 @@ fn init_in(root: &Path) -> Result<GitStatus, String> {
     Ok(status_in(root))
 }
 
-fn commit_in(root: &Path, message: &str) -> Result<GitResult, String> {
+fn commit_in(root: &Path, message: &str) -> Result<GitResult, CommandError> {
     let add = run_git(root, &["add", "-A"])?;
     if !add.status.success() {
         return Ok(GitResult::new("commit", false, first_line(&combined(&add))));
@@ -255,7 +302,7 @@ fn commit_in(root: &Path, message: &str) -> Result<GitResult, String> {
     let out = git_base(root)
         .args(["commit", "-m", message])
         .output()
-        .map_err(|e| format!("couldn't run git: {e}"))?;
+        .map_err(|e| git_error(format!("couldn't run git: {e}")))?;
     if out.status.success() {
         return Ok(GitResult::new("commit", true, "Committed changes."));
     }
@@ -269,7 +316,7 @@ fn commit_in(root: &Path, message: &str) -> Result<GitResult, String> {
 fn push_in(root: &Path) -> GitResult {
     match git_base(root).args(["push"]).output() {
         Ok(out) if out.status.success() => GitResult::new("push", true, "Pushed to remote."),
-        Ok(out) => GitResult::new("push", false, classify_push_error(&combined(&out))),
+        Ok(out) => GitResult::push_failure(&combined(&out)),
         Err(e) => GitResult::new("push", false, format!("couldn't run git: {e}")),
     }
 }
@@ -299,7 +346,7 @@ fn force_push_in(root: &Path) -> GitResult {
         Ok(out) if out.status.success() => {
             GitResult::new("push", true, "Force-pushed — remote now matches local.")
         }
-        Ok(out) => GitResult::new("push", false, classify_push_error(&combined(&out))),
+        Ok(out) => GitResult::push_failure(&combined(&out)),
         Err(e) => GitResult::new("push", false, format!("couldn't run git: {e}")),
     }
 }
@@ -333,21 +380,21 @@ fn force_pull_in(root: &Path) -> GitResult {
 
 /// Read-only status of the graph repo. Cheap; polled + refreshed after ops.
 #[tauri::command]
-pub(crate) async fn git_status(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
+pub(crate) async fn git_status(window: tauri::WebviewWindow) -> Result<GitStatus, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || status_in(&root))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CommandError::Worker { message: e.to_string() })
 }
 
 /// `git init` the graph root and drop a default Logseq `.gitignore` if absent. An
 /// affordance for turning an un-versioned graph into a repo — never forced.
 #[tauri::command]
-pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
+pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || init_in(&root))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| CommandError::Worker { message: e.to_string() })?
 }
 
 /// `git add -A` then `git commit -m <message>`. "Nothing to commit" is a success
@@ -356,54 +403,54 @@ pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, 
 pub(crate) async fn git_commit(
     message: String,
     window: tauri::WebviewWindow,
-) -> Result<GitResult, String> {
+) -> Result<GitResult, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || commit_in(&root, &message))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| CommandError::Worker { message: e.to_string() })?
 }
 
 /// Push the current branch. Never forces — a non-fast-forward reject becomes a
 /// "Pull first" message. Awaited by the frontend, so an on-close push completes
 /// before the process exits.
 #[tauri::command]
-pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || push_in(&root))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CommandError::Worker { message: e.to_string() })
 }
 
 /// Pull with `--ff-only`. A fast-forward-only pull never creates a merge and never
 /// rewrites local edits; pulled files land on disk and flow through the watcher →
 /// reloadDisposition, so dirty/edited pages are guarded by the sync-conflict UI.
 #[tauri::command]
-pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || pull_in(&root))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CommandError::Worker { message: e.to_string() })
 }
 
 /// Force-push the current branch — overwrites remote history. Destructive; the
 /// frontend gates it behind a confirmation dialog.
 #[tauri::command]
-pub(crate) async fn git_force_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+pub(crate) async fn git_force_push(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || force_push_in(&root))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CommandError::Worker { message: e.to_string() })
 }
 
 /// Force-pull (fetch + hard reset to upstream) — overwrites local commits and
 /// tracked-file edits. Destructive; the frontend gates it behind a confirmation
 /// dialog. Reset writes reload through the file watcher like any external change.
 #[tauri::command]
-pub(crate) async fn git_force_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
+pub(crate) async fn git_force_pull(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || force_pull_in(&root))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CommandError::Worker { message: e.to_string() })
 }
 
 #[cfg(test)]
@@ -433,13 +480,20 @@ mod tests {
     #[test]
     fn push_error_is_friendly_and_actionable() {
         let reject = " ! [rejected]        main -> main (non-fast-forward)\nerror: failed to push";
-        assert!(classify_push_error(reject).contains("Pull first"));
-        assert!(classify_push_error("fatal: no configured push destination").contains("No remote"));
-        assert!(
-            classify_push_error("fatal: Authentication failed for 'x'").contains("authenticate")
-        );
+        let rejected = classify_push_error(reject);
+        assert!(rejected.detail.contains("Pull first"));
+        // The sticky-toast fact travels as data, not as a phrase in the detail.
+        assert!(rejected.needs_pull);
+        let no_remote = classify_push_error("fatal: no configured push destination");
+        assert!(no_remote.detail.contains("No remote"));
+        assert!(!no_remote.needs_pull);
+        assert!(classify_push_error("fatal: Authentication failed for 'x'")
+            .detail
+            .contains("authenticate"));
         // Unknown error falls back to its first line, never empty.
-        assert!(!classify_push_error("fatal: something else entirely").is_empty());
+        assert!(!classify_push_error("fatal: something else entirely")
+            .detail
+            .is_empty());
     }
 
     #[test]

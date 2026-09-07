@@ -77,7 +77,9 @@ interface ClassifierSite {
 const ERROR_STRING_CLASSIFIER_ALLOWLIST: readonly ClassifierSite[] = [
   {
     file: "components/Macro.tsx",
-    line: 458,
+    // FORK: 458 upstream — the query-filter memos above this site push it down.
+    // Pure line drift; the site and its class are upstream's, unchanged.
+    line: 496,
     class: "bounded-result-code",
     why: "the query boundary's result-too-large prefix is a bounded wire code, not prose",
   },

@@ -92,7 +92,10 @@ async function runCommit(message: string, quiet: boolean): Promise<GitResult | n
 async function runPush(quiet: boolean): Promise<GitResult | null> {
   try {
     const r = await backend().gitPush();
-    if (!r.ok) pushToast(r.detail, "warn", { sticky: r.detail.includes("Pull first") });
+    // A push rejected because the remote moved stays sticky so the user can act on
+    // it. `needs_pull` is a field on the result, not a phrase parsed back out of
+    // `detail` — see GitResult in src-tauri/src/git.rs.
+    if (!r.ok) pushToast(r.detail, "warn", { sticky: r.needs_pull });
     else if (!quiet) pushToast(r.detail, "success");
     await refreshGitStatus();
     return r;

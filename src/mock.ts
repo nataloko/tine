@@ -2218,29 +2218,29 @@ export function mockBackend(): Backend {
       return this.gitStatus();
     },
     async gitCommit(message: string): Promise<GitResult> {
-      if (mockGit.dirty === 0) return { op: "commit", ok: true, detail: "Nothing to commit." };
+      if (mockGit.dirty === 0) return { op: "commit", ok: true, detail: "Nothing to commit.", needs_pull: false };
       mockGit.dirty = 0;
       mockGit.ahead += 1;
       mockGit.last = `mock ${message.slice(0, 24)}`;
-      return { op: "commit", ok: true, detail: "Committed changes." };
+      return { op: "commit", ok: true, detail: "Committed changes.", needs_pull: false };
     },
     async gitPush(): Promise<GitResult> {
       mockGit.ahead = 0;
-      return { op: "push", ok: true, detail: "Pushed to remote." };
+      return { op: "push", ok: true, detail: "Pushed to remote.", needs_pull: false };
     },
     async gitPull(): Promise<GitResult> {
       mockGit.behind = 0;
-      return { op: "pull", ok: true, detail: "Already up to date." };
+      return { op: "pull", ok: true, detail: "Already up to date.", needs_pull: false };
     },
     async gitForcePush(): Promise<GitResult> {
       mockGit.ahead = 0;
-      return { op: "push", ok: true, detail: "Force-pushed — remote now matches local." };
+      return { op: "push", ok: true, detail: "Force-pushed — remote now matches local.", needs_pull: false };
     },
     async gitForcePull(): Promise<GitResult> {
       mockGit.behind = 0;
       mockGit.dirty = 0;
       mockGit.ahead = 0;
-      return { op: "pull", ok: true, detail: "Reset to remote — local changes discarded." };
+      return { op: "pull", ok: true, detail: "Reset to remote — local changes discarded.", needs_pull: false };
     },
     async diagnosticReport(): Promise<DiagnosticReport> {
       return {

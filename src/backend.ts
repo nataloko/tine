@@ -1113,6 +1113,9 @@ export interface GitResult {
   op: string;
   ok: boolean;
   detail: string;
+  /** A push was rejected because the remote moved — Pull first. Carried as a
+   *  field so the frontend never has to classify `detail` as prose (I-9). */
+  needs_pull: boolean;
 }
 
 export interface DebugInfo {

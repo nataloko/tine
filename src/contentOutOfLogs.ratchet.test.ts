@@ -32,18 +32,24 @@ interface ConsoleSite {
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
 const CONSOLE_ALLOWLIST_SIZE = 21;
+// FORK: six `line` pins below sit BELOW fork insertions in their file (the git
+// commit-on-close block and the threading class list in App.tsx, the calc-mode
+// latch in Block.tsx, the saved-pages sink in persistence.ts, the manual-updater
+// edits in update.ts), so they read higher here than upstream's own numbers. Pure
+// line drift — the site, its method and its class are upstream's, unchanged. Take
+// upstream's numbers on a conflict and re-run this test to re-derive the offsets.
 const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class: string; why: string })[] = [
-  { file: "App.tsx", line: 1071, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
+  { file: "App.tsx", line: 1081, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
   { file: "capture.tsx", line: 173, method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
   { file: "capture.tsx", line: 600, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
-  { file: "components/Block.tsx", line: 1510, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
+  { file: "components/Block.tsx", line: 1588, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
   { file: "logbook.ts", line: 43, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
   { file: "main.tsx", line: 62, method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
   { file: "main.tsx", line: 70, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
   { file: "pdfRenderCoordinator.ts", line: 343, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
-  { file: "persistence.ts", line: 999, method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1004, method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1152, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },
+  { file: "persistence.ts", line: 1011, method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1016, method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1165, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },
   { file: "print.ts", line: 98, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a KaTeX/highlight rejection quotes the source it refused" },
   { file: "print.ts", line: 113, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
   { file: "print.ts", line: 157, method: "error", bucket: "d", class: "local-error", why: "iframe print failure is a DOM/print-subsystem error over no page identity" },
@@ -53,7 +59,7 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "ui.ts", line: 491, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
   { file: "ui.ts", line: 516, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
   { file: "ui.ts", line: 553, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
-  { file: "update.ts", line: 148, method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
+  { file: "update.ts", line: 155, method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
 ];
 
 function sourceFiles(dir: string, files: string[] = []): string[] {
