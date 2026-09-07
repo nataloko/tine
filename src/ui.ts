@@ -1238,9 +1238,11 @@ export function removeDeletedPageFromNavigation(targetOrName: PageTarget | strin
   });
   if (nextSidebar.length !== rightSidebar().length) setRightSidebar(nextSidebar);
 }
-/** Re-key navigation state after the backend has atomically renamed a page.
- * PageTarget calls affect one physical owner; string calls represent a logical
- * rename and also remap case-insensitive namespace descendants. */
+
+/** Re-key sidebar navigation state after the backend has atomically renamed a
+ * page. Keep ordering stable, collapse an existing destination duplicate, and
+ * persist both stores before the subsequent openPage(next) promotes the one
+ * canonical recent entry to the front. */
 export function renamePageInNavigation(from: PageTarget, to: PageTarget): void;
 export function renamePageInNavigation(from: string, to: string): void;
 export function renamePageInNavigation(fromOrName: PageTarget | string, toOrName: PageTarget | string) {
