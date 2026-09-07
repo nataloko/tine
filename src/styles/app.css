@@ -1259,6 +1259,16 @@ textarea {
   max-width: var(--tine-wide-content-max-width, var(--ls-main-content-max-width-wide));
 }
 
+/* Concord is a review workspace, not reading prose: use the pane's existing
+   wide cap while its resolver is mounted so both versions and their controls
+   have room without requiring the user to discover wide mode. Key this to the
+   persistent slot, not the panel itself — the dock physically reparents the
+   same panel node while expanded. Resolving the conflict removes the slot and
+   restores the ordinary reading width. */
+.main-content-inner:has(.page-conflict-slot) {
+  max-width: var(--tine-wide-content-max-width, var(--ls-main-content-max-width-wide));
+}
+
 /* Document mode: a cleaner prose view — hide bullets, collapse controls, and the
    child indent guides (structure still there, just visually quiet). */
 .document-mode .bullet-container {
@@ -2171,11 +2181,11 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
 }
 
 /* Reference batch export: header affordance (GH #348), mirrored on the
-   filter toggle. */
+   filter toggle. Pushing to the right edge is owned by the header rule near
+   `.references-header`, NOT by either button — see GH #475. */
 .reference-export-toggle {
   width: 26px;
   height: 26px;
-  margin-left: auto;
   padding: 5px;
   border: 0;
   border-radius: 5px;
@@ -4414,8 +4424,12 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   position: relative;
 }
 
+/* Hidden by `visibility`, not `display`, so ContextMenu can MEASURE the submenu
+   before deciding which side it opens on (GH #471). It is absolutely positioned,
+   so being laid out costs the menu no size and does not disturb the parent's own
+   viewport placement measurement. */
 .ctx-submenu-menu {
-  display: none;
+  visibility: hidden;
   position: absolute;
   left: 100%;
   top: -4px;
@@ -4427,8 +4441,22 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
 }
 
-.ctx-submenu:hover .ctx-submenu-menu {
-  display: block;
+.ctx-submenu:hover > .ctx-submenu-menu {
+  visibility: visible;
+}
+
+/* Side chosen by `placeSubmenu`, once per menu. Mirror to the left when opening
+   right would leave the window; overlay the menu itself when the viewport is too
+   narrow for the pair, which is the reporter's phone case. */
+.ctx-menu[data-submenu-side="left"] .ctx-submenu-menu {
+  left: auto;
+  right: 100%;
+}
+
+.ctx-menu[data-submenu-side="over"] .ctx-submenu-menu {
+  left: 0;
+  right: auto;
+  top: 100%;
 }
 
 .ctx-row {
@@ -8240,10 +8268,23 @@ img.emoji {
   user-select: none;
 }
 
+/* One owner for "push this header's trailing controls to the right": the FIRST
+   of them takes the free space and the rest sit beside it on the row's gap.
+   Two siblings each claiming `margin-left: auto` SPLIT the free space between
+   them, which is what left the Linked References copy button floating in the
+   middle of its row while the Unlinked one sat at the edge (GH #475). Copy is
+   rendered last in both sections, so it lands at the same edge in both. */
+.references-header > button {
+  margin-left: 0;
+}
+
+.references-header > button:first-of-type {
+  margin-left: auto;
+}
+
 .reference-filter-toggle {
   width: 26px;
   height: 26px;
-  margin-left: auto;
   padding: 5px;
   border: 0;
   border-radius: 5px;

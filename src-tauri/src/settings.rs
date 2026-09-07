@@ -56,8 +56,8 @@ static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// turn a cache-storage failure into apparent success.
 pub(crate) fn update_settings_strict_at(
     path: &std::path::Path,
-    mutate: impl Fn(&mut serde_json::Value) -> Result<(), String>,
-) -> Result<(), String> {
+    mutate: impl Fn(&mut serde_json::Value) -> Result<(), crate::command_error::CommandError>,
+) -> Result<(), crate::command_error::CommandError> {
     tine_core::model::atomic_update(path, &SETTINGS_LOCK, |content| {
         let mut json: serde_json::Value = serde_json::from_str(content)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -76,7 +76,7 @@ pub(crate) fn update_settings_strict_at(
             })
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })
-    .map_err(|error| error.to_string())
+    .map_err(crate::command_error::CommandError::from)
 }
 
 /// Merge one or more keys into the device-settings JSON, durably. `mutate` edits the
@@ -84,8 +84,9 @@ pub(crate) fn update_settings_strict_at(
 pub(crate) fn update_settings(
     app: &tauri::AppHandle,
     mutate: impl Fn(&mut serde_json::Value),
-) -> Result<(), String> {
-    let p = settings_path(app).ok_or("no app-data dir")?;
+) -> Result<(), crate::command_error::CommandError> {
+    let p = settings_path(app)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     tine_core::model::atomic_update(&p, &SETTINGS_LOCK, |content| {
         let mut json: serde_json::Value =
             serde_json::from_str(content).unwrap_or_else(|_| serde_json::json!({}));
@@ -97,29 +98,41 @@ pub(crate) fn update_settings(
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })
-    .map_err(|e| e.to_string())
+    .map_err(crate::command_error::CommandError::from)
 }
 
 /// Stable installation identity for managed sync. It lives in device-local app
 /// settings, never in the provider-shared graph: two installations writing the
 /// same device stream would violate the one-writer invariant. Loro peer ids are
 /// session-scoped separately; this UUID names the installation directory only.
-pub(crate) fn managed_sync_device_id(app: &tauri::AppHandle) -> Result<uuid::Uuid, String> {
-    let path = settings_path(app).ok_or("no app-data dir")?;
+pub(crate) fn managed_sync_device_id(
+    app: &tauri::AppHandle,
+) -> Result<uuid::Uuid, crate::command_error::CommandError> {
+    let path = settings_path(app)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     managed_sync_device_id_at(&path)
 }
 
-fn managed_sync_device_id_at(path: &std::path::Path) -> Result<uuid::Uuid, String> {
+fn managed_sync_device_id_at(
+    path: &std::path::Path,
+) -> Result<uuid::Uuid, crate::command_error::CommandError> {
     let chosen = std::sync::Mutex::new(None);
     update_settings_strict_at(path, |json| {
         let id = match json.get("managed_sync_device_id") {
             None => uuid::Uuid::new_v4(),
             Some(value) => value
                 .as_str()
-                .ok_or_else(|| "managed_sync_device_id must be a UUID string".to_string())
+                .ok_or_else(|| {
+                    crate::command_error::CommandError::prose(
+                        "managed_sync_device_id must be a UUID string",
+                    )
+                })
                 .and_then(|value| {
-                    uuid::Uuid::parse_str(value)
-                        .map_err(|_| "managed_sync_device_id is not a valid UUID".to_string())
+                    uuid::Uuid::parse_str(value).map_err(|_| {
+                        crate::command_error::CommandError::prose(
+                            "managed_sync_device_id is not a valid UUID",
+                        )
+                    })
                 })?,
         };
         json["managed_sync_device_id"] = serde_json::Value::String(id.to_string());
@@ -128,8 +141,12 @@ fn managed_sync_device_id_at(path: &std::path::Path) -> Result<uuid::Uuid, Strin
     })?;
     chosen
         .into_inner()
-        .map_err(|_| "managed sync device-id lock poisoned".to_string())?
-        .ok_or_else(|| "managed sync device id was not written".to_string())
+        .map_err(|_| {
+            crate::command_error::CommandError::prose("managed sync device-id lock poisoned")
+        })?
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("managed sync device id was not written")
+        })
 }
 
 fn graph_display_name(path: &str) -> String {
@@ -200,7 +217,7 @@ pub(crate) fn remember_external_assets_approval(
     app: &tauri::AppHandle,
     graph_root: &std::path::Path,
     assets_root: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let graph = graph_root.display().to_string();
     let assets = assets_root.display().to_string();
     update_settings(app, |json| {
@@ -217,7 +234,10 @@ fn remember_external_assets_approval_json(json: &mut serde_json::Value, graph: &
     json["external_assets_approvals"] = serde_json::Value::Object(approvals);
 }
 
-pub(crate) fn remember_graph(app: &tauri::AppHandle, path: &str) -> Result<(), String> {
+pub(crate) fn remember_graph(
+    app: &tauri::AppHandle,
+    path: &str,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(app, |json| remember_graph_json(json, path))
 }
 
@@ -231,7 +251,10 @@ pub(crate) fn list_known_graphs(app: tauri::AppHandle) -> Vec<KnownGraph> {
 }
 
 #[tauri::command]
-pub(crate) fn forget_known_graph(path: String, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn forget_known_graph(
+    path: String,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| forget_graph_json(json, &path))
 }
 
@@ -243,12 +266,17 @@ pub(crate) fn forget_known_graph(path: String, app: tauri::AppHandle) -> Result<
 /// ever has a row it was handed by `list_known_graphs`, so this costs nothing
 /// in practice; it keeps an arbitrary caller-chosen path out of the reveal argv.
 #[tauri::command]
-pub(crate) fn reveal_known_graph(path: String, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn reveal_known_graph(
+    path: String,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     if !list_known_graphs(app)
         .iter()
         .any(|known| known.path == path)
     {
-        return Err("that graph is not in the known-graph list".into());
+        return Err(crate::command_error::CommandError::prose(
+            "that graph is not in the known-graph list",
+        ));
     }
     #[cfg(desktop)]
     {
@@ -256,7 +284,9 @@ pub(crate) fn reveal_known_graph(path: String, app: tauri::AppHandle) -> Result<
     }
     #[cfg(not(desktop))]
     {
-        Err("showing a graph folder is available on desktop only".into())
+        Err(crate::command_error::CommandError::prose(
+            "showing a graph folder is available on desktop only",
+        ))
     }
 }
 
@@ -288,7 +318,10 @@ pub(crate) fn get_capture_enter_files(app: tauri::AppHandle) -> bool {
 }
 
 #[tauri::command]
-pub(crate) fn set_capture_enter_files(value: bool, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_capture_enter_files(
+    value: bool,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| {
         json["capture_enter_files"] = serde_json::Value::Bool(value);
     })
@@ -311,7 +344,10 @@ pub(crate) fn get_link_first_match(app: tauri::AppHandle) -> bool {
 }
 
 #[tauri::command]
-pub(crate) fn set_link_first_match(value: bool, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_link_first_match(
+    value: bool,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| {
         json["link_first_match"] = serde_json::Value::Bool(value);
     })
@@ -334,7 +370,10 @@ pub(crate) fn get_smooth_scroll(app: tauri::AppHandle) -> bool {
 }
 
 #[tauri::command]
-pub(crate) fn set_smooth_scroll(value: bool, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_smooth_scroll(
+    value: bool,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| {
         json["smooth_scroll"] = serde_json::Value::Bool(value);
     })
@@ -351,7 +390,11 @@ pub(crate) fn get_app_bool(key: String, default: bool, app: tauri::AppHandle) ->
 }
 
 #[tauri::command]
-pub(crate) fn set_app_bool(key: String, value: bool, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_app_bool(
+    key: String,
+    value: bool,
+    app: tauri::AppHandle,
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| {
         json[&key] = serde_json::Value::Bool(value);
     })
@@ -374,7 +417,7 @@ pub(crate) fn set_app_string(
     key: String,
     value: String,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     update_settings(&app, |json| {
         json[&key] = serde_json::Value::String(value.clone());
     })
@@ -391,7 +434,7 @@ fn legacy_session_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("tine-session.json"))
 }
 
-fn session_id(root: &std::path::Path) -> String {
+pub(crate) fn graph_storage_key(root: &std::path::Path) -> String {
     // Stable FNV-1a over the canonical path. The readable basename is cosmetic;
     // the hash prevents two same-named graphs in different folders colliding.
     let text = root.to_string_lossy();
@@ -407,7 +450,11 @@ fn session_id(root: &std::path::Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect::<String>();
-    format!("{name}-{hash:016x}.json")
+    format!("{name}-{hash:016x}")
+}
+
+fn session_id(root: &std::path::Path) -> String {
+    format!("{}.json", graph_storage_key(root))
 }
 
 fn session_path(app: &tauri::AppHandle, root: &std::path::Path) -> Option<PathBuf> {
@@ -449,21 +496,30 @@ fn migrated_workspaces_json(session: Option<&str>) -> String {
     .expect("workspace migration JSON is serializable")
 }
 
-fn validate_workspaces_json(data: &str) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
+fn validate_workspaces_json(data: &str) -> Result<(), crate::command_error::CommandError> {
+    let value: serde_json::Value =
+        serde_json::from_str(data).map_err(crate::command_error::CommandError::from)?;
     if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err("workspace registry version must be 1".into());
+        return Err(crate::command_error::CommandError::prose(
+            "workspace registry version must be 1",
+        ));
     }
     let active = value
         .get("activeId")
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
-        .ok_or("workspace registry requires an activeId")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("workspace registry requires an activeId")
+        })?;
     let entries = value
         .get("workspaces")
         .and_then(serde_json::Value::as_array)
         .filter(|entries| !entries.is_empty())
-        .ok_or("workspace registry requires at least one workspace")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose(
+                "workspace registry requires at least one workspace",
+            )
+        })?;
     if !entries.iter().any(|entry| {
         entry.get("id").and_then(serde_json::Value::as_str) == Some(active)
             && entry
@@ -472,48 +528,34 @@ fn validate_workspaces_json(data: &str) -> Result<(), String> {
                 .is_some()
             && entry.get("blob").is_some_and(serde_json::Value::is_object)
     }) {
-        return Err("active workspace is missing or invalid".into());
+        return Err(crate::command_error::CommandError::prose(
+            "active workspace is missing or invalid",
+        ));
     }
     Ok(())
 }
 
 static WORKSPACES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn atomic_write_workspaces(path: &std::path::Path, data: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().ok_or("workspace registry has no parent")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspaces.json");
-    let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(data.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)?;
-        // Same policy as the save path (DUP-5): "unsupported here" dir-fsync
-        // outcomes are tolerated, a real EIO/ENOSPC is REPORTED — the
-        // workspaces registry is durable user state, and swallowing the error
-        // is a false ack under the in-scope crash/power-loss threat.
-        tine_core::model::sync_dir_for_rename(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(|e| e.to_string())
+fn atomic_write_workspaces(
+    path: &std::path::Path,
+    data: &str,
+) -> Result<(), crate::command_error::CommandError> {
+    let parent = path.parent().ok_or_else(|| {
+        crate::command_error::CommandError::prose("workspace registry has no parent")
+    })?;
+    std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;
+    // Named audited app-private publication protocol (I-1/I-2): the shared
+    // primitive uses a unique create-new temp, file barrier, atomic rename,
+    // temp cleanup on failure, and strict directory-barrier error policy.
+    tine_core::model::atomic_write(path, data.as_bytes())
+        .map_err(crate::command_error::CommandError::from)
 }
 
-fn load_workspaces_at(path: &std::path::Path, session: &std::path::Path) -> Result<String, String> {
+fn load_workspaces_at(
+    path: &std::path::Path,
+    session: &std::path::Path,
+) -> Result<String, crate::command_error::CommandError> {
     let _guard = WORKSPACES_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -528,11 +570,14 @@ fn load_workspaces_at(path: &std::path::Path, session: &std::path::Path) -> Resu
             atomic_write_workspaces(path, &data)?;
             Ok(data)
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(crate::command_error::CommandError::settings(error)),
     }
 }
 
-fn save_workspaces_at(path: &std::path::Path, data: &str) -> Result<(), String> {
+fn save_workspaces_at(
+    path: &std::path::Path,
+    data: &str,
+) -> Result<(), crate::command_error::CommandError> {
     validate_workspaces_json(data)?;
     let _guard = WORKSPACES_LOCK
         .lock()
@@ -543,10 +588,12 @@ fn save_workspaces_at(path: &std::path::Path, data: &str) -> Result<(), String> 
 pub(crate) fn load_workspaces(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<String, String> {
-    let slot = slot_for_context(&state)?;
-    let session = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
-    let path = workspaces_path(&app, &slot.root_key).ok_or("no app-data dir")?;
+) -> Result<String, crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let session = session_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
+    let path = workspaces_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     load_workspaces_at(&path, &session)
 }
 
@@ -554,33 +601,76 @@ pub(crate) fn save_workspaces(
     data: String,
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<(), String> {
-    let slot = slot_for_context(&state)?;
-    let path = workspaces_path(&app, &slot.root_key).ok_or("no app-data dir")?;
+) -> Result<(), crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let path = workspaces_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     save_workspaces_at(&path, &data)
 }
 
-static SESSION_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn migrate_legacy_session_at(
+    path: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> Result<(), crate::command_error::CommandError> {
+    if path.exists() {
+        return Ok(());
+    }
+    let Some(legacy) = legacy.filter(|legacy| legacy.exists()) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::command_error::CommandError::prose("session file has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;
+    std::fs::rename(legacy, path).map_err(crate::command_error::CommandError::from)?;
+    // Named audited legacy-migration protocol (I-1/I-2, DUP-5): report real
+    // directory-barrier failures rather than falsely acknowledging a rename
+    // that may disappear after power loss. Unsupported barriers are tolerated
+    // by the shared helper.
+    tine_core::model::sync_dir_for_rename(parent).map_err(crate::command_error::CommandError::from)
+}
+
+fn load_session_at(
+    path: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> Result<Option<String>, crate::command_error::CommandError> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    migrate_legacy_session_at(path, legacy)?;
+    Ok(std::fs::read_to_string(path).ok())
+}
+
+fn save_session_at(
+    path: &std::path::Path,
+    data: &str,
+) -> Result<(), crate::command_error::CommandError> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::command_error::CommandError::prose("session file has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;
+    // Named audited app-private publication protocol (I-1/I-2). The lock
+    // serializes tab-action bursts; atomic_write additionally gives each call
+    // a unique create-new temp and the complete file + directory barriers.
+    tine_core::model::atomic_write(path, data.as_bytes())
+        .map_err(crate::command_error::CommandError::from)
+}
 
 #[tauri::command]
 pub(crate) fn load_session(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<Option<String>, String> {
-    let slot = slot_for_context(&state)?;
-    let path = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
-    if !path.exists() {
-        let _migration = SESSION_MIGRATION_LOCK.lock().unwrap();
-        if !path.exists() {
-            if let Some(legacy) = legacy_session_path(&app).filter(|p| p.exists()) {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                std::fs::rename(legacy, &path).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    Ok(std::fs::read_to_string(path).ok())
+) -> Result<Option<String>, crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let path = session_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
+    let legacy = legacy_session_path(&app);
+    load_session_at(&path, legacy.as_deref())
 }
 
 #[tauri::command]
@@ -588,28 +678,175 @@ pub(crate) fn save_session(
     data: String,
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Unique temp name per write so two concurrent saves (a burst of tab actions)
-    // can't clobber each other's temp file before the rename.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let slot = slot_for_context(&state)?;
-    let p = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = p.with_extension(format!("json.tmp{seq}"));
-    // Write to a temp file then atomically rename, so a crash mid-write can never
-    // leave a truncated session that fails to parse.
-    std::fs::write(&tmp, data.as_bytes()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
-    Ok(())
+) -> Result<(), crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let p = session_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
+    save_session_at(&p, &data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_private_durable_publications_stay_on_named_audited_paths() {
+        use crate::test_support::{
+            assert_production_region_uses_named_audited_writes, AuditedWriteAllowance,
+        };
+
+        let source = include_str!("settings.rs");
+        assert_production_region_uses_named_audited_writes(
+            source,
+            "tine_core::model::atomic_write",
+            &[
+                AuditedWriteAllowance {
+                    source_line: "std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;",
+                    expected_count: 3,
+                },
+                AuditedWriteAllowance {
+                    source_line: "std::fs::rename(legacy, path).map_err(crate::command_error::CommandError::from)?;",
+                    expected_count: 1,
+                },
+            ],
+        );
+
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
+        let raw_renames = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("std::fs::rename("))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect::<Vec<_>>();
+        let migration_protocol = production
+            .split("fn migrate_legacy_session_at(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn load_session_at(").next())
+            .expect("legacy session rename has a named audited protocol");
+        assert_eq!(
+            raw_renames.len(),
+            1,
+            "I-1/I-2 permit only the named audited legacy-session rename in settings.rs; raw renames found:\n{}. Use the blessed atomic_write_workspaces / tine_core::model::atomic_write exemplar.",
+            raw_renames.join("\n")
+        );
+        assert!(
+            migration_protocol.contains("std::fs::rename(")
+                && migration_protocol.contains("tine_core::model::sync_dir_for_rename("),
+            "I-1/I-2 require the named legacy-session migration to pair rename with the blessed strict directory barrier"
+        );
+    }
+
+    #[test]
+    fn session_load_ignores_a_stale_atomic_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("sessions/graph.json");
+        let current = r#"{"tabs":[{"id":"complete"}],"activeIndex":0}"#;
+        save_session_at(&session, current).unwrap();
+
+        let stale = session.parent().unwrap().join(".graph.json.999999.0.tmp");
+        std::fs::write(&stale, br#"{"tabs":["#).unwrap();
+
+        assert_eq!(
+            load_session_at(&session, None).unwrap().as_deref(),
+            Some(current)
+        );
+        assert!(
+            stale.exists(),
+            "load ignores unique hidden temps from a prior crash"
+        );
+    }
+
+    #[test]
+    fn concurrent_session_save_burst_keeps_a_complete_last_writer_and_no_temps() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 16;
+        let temp = tempfile::tempdir().unwrap();
+        let session = Arc::new(temp.path().join("sessions/graph.json"));
+        let initial =
+            serde_json::json!({"writer": "initial", "padding": "x".repeat(4096)}).to_string();
+        save_session_at(&session, &initial).unwrap();
+
+        let payloads = Arc::new(
+            (0..WRITERS)
+                .map(|writer| {
+                    serde_json::json!({"writer": writer, "padding": "x".repeat(4096)}).to_string()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let start = Arc::new(Barrier::new(WRITERS + 1));
+        let remaining = Arc::new(AtomicUsize::new(WRITERS));
+        let observer_path = Arc::clone(&session);
+        let observer_remaining = Arc::clone(&remaining);
+        let observer = std::thread::spawn(move || {
+            let mut observations = 0;
+            loop {
+                if let Ok(bytes) = std::fs::read_to_string(observer_path.as_ref()) {
+                    serde_json::from_str::<serde_json::Value>(&bytes)
+                        .expect("atomic replacement never exposes a truncated session");
+                    observations += 1;
+                }
+                if observer_remaining.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            observations
+        });
+
+        let writers = (0..WRITERS)
+            .map(|writer| {
+                let session = Arc::clone(&session);
+                let payloads = Arc::clone(&payloads);
+                let start = Arc::clone(&start);
+                let remaining = Arc::clone(&remaining);
+                std::thread::spawn(move || {
+                    start.wait();
+                    save_session_at(&session, &payloads[writer]).unwrap();
+                    remaining.fetch_sub(1, Ordering::Release);
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(observer.join().unwrap() > 0);
+
+        let final_bytes = std::fs::read_to_string(session.as_ref()).unwrap();
+        serde_json::from_str::<serde_json::Value>(&final_bytes).unwrap();
+        assert!(
+            payloads.iter().any(|payload| payload == &final_bytes),
+            "the final session is one complete last-writer payload"
+        );
+        let temp_prefix = format!(".{}.", session.file_name().unwrap().to_string_lossy());
+        let stray_temps = std::fs::read_dir(session.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&temp_prefix) && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            stray_temps.is_empty(),
+            "completed saves reclaim temps: {stray_temps:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_session_migration_moves_complete_bytes_to_the_scoped_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("session.json");
+        let session = temp.path().join("sessions/graph.json");
+        let prior = r#"{"tabs":[{"id":"legacy"}],"activeIndex":0}"#;
+        std::fs::write(&legacy, prior).unwrap();
+
+        assert_eq!(
+            load_session_at(&session, Some(&legacy)).unwrap().as_deref(),
+            Some(prior)
+        );
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read_to_string(session).unwrap(), prior);
+    }
 
     #[test]
     fn known_graphs_are_deduplicated_mru_and_removable() {

@@ -1,13 +1,19 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
-import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
+import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
 import { activeId, closeTab, route, tabRoute, tabs } from "../router";
 import { backend } from "../backend";
 import { closePane, focusPane, layoutPaneIds, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
 import { loadSingle, resetStore } from "../store";
 import type { PageDto, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { resetSaveState } from "../persistence";
+
+beforeEach(() => {
+  setGraphTransitioning(false);
+  setGraphMeta({ root: "/graphs/A" } as never);
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -18,6 +24,8 @@ afterEach(() => {
   resetPaneLayoutToSingle({ tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }], activeIndex: 0 });
   managedStorageRuntime.clear();
   resetStore();
+  setGraphMeta(null);
+  setGraphTransitioning(false);
   document.body.innerHTML = "";
 });
 
@@ -345,7 +353,7 @@ describe("QuickSwitcher search syntax help", () => {
     });
     const savePage = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
       if (dto.path) disk.set(dto.path, JSON.stringify(dto));
-      return "saved-exact-rev";
+      return { revision: "saved-exact-rev" };
     });
     vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
       hits: [{
@@ -559,7 +567,7 @@ describe("QuickSwitcher search syntax help", () => {
   });
 
   it("refreshes canonical page inventory after a direct create", async () => {
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("created-rev");
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "created-rev" });
     const before = pageInventoryRev();
     const root = document.createElement("div");
     document.body.append(root);
@@ -584,15 +592,50 @@ describe("QuickSwitcher search syntax help", () => {
     }
   });
 
+  it("does not navigate a created-page result after the graph binding changes", async () => {
+    let finish!: (result: { revision: string }) => void;
+    vi.spyOn(backend(), "savePage").mockImplementation(
+      () => new Promise<{ revision: string }>((resolve) => { finish = resolve; }),
+    );
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    try {
+      openSwitcher();
+      const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+      input.value = "Wrong graph page";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await vi.waitFor(() => {
+        const row = [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+          .find((candidate) => candidate.textContent?.includes("Create page: Wrong graph page"));
+        expect(row).toBeDefined();
+      });
+      const create = [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+        .find((candidate) => candidate.textContent?.includes("Create page: Wrong graph page"))!;
+      create.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      await vi.waitFor(() => expect(backend().savePage).toHaveBeenCalledOnce());
+      resetSaveState();
+      setGraphMeta({ root: "/graphs/B" } as never);
+      finish({ revision: "created-rev" });
+      await vi.waitFor(() => expect(toasts().some((toast) => toast.message.includes("graph changed"))).toBe(true));
+      expect(route()).toEqual({ kind: "journals" });
+    } finally {
+      dispose();
+    }
+  });
+
   it("opens an empty virtual Search tab from an enabled authoring action", async () => {
     const root = document.createElement("div");
     document.body.append(root);
     const dispose = render(() => <QuickSwitcher />, root);
     openSwitcher();
     const graphSearch = vi.spyOn(backend(), "runGraphSearch");
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await vi.waitFor(() =>
+      expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
     const openTab = root.querySelector("[data-open-search-tab]") as HTMLButtonElement;
-    expect(openTab.disabled).toBe(false);
     expect(openTab.textContent).toContain("Open search tab");
     openTab.click();
     expect(route()).toMatchObject({ kind: "query", sourceKind: "search", source: "", presentation: "search" });
@@ -633,8 +676,11 @@ describe("QuickSwitcher search syntax help", () => {
     openSwitcher(); await Promise.resolve();
     const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
     input.value = "/(unclosed/"; input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(false);
+    await vi.waitFor(() =>
+      expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
     closeSwitcher();
 
     const other = splitPane("main", "row")!;
@@ -683,8 +729,13 @@ describe("QuickSwitcher search syntax help", () => {
     const input = root.querySelector(".switcher-input") as HTMLInputElement;
     input.value = "Tine";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    await Promise.resolve();
+    // The debounced graph search is what this waits on; assert on the rows it
+    // produces rather than on a fixed delay.
+    await vi.waitFor(() =>
+      expect(
+        root.querySelector('.switcher-row[role="option"] .search-result-excerpt'),
+      ).not.toBeNull(),
+    );
 
     expect(input.getAttribute("role")).toBe("combobox");
     expect(input.getAttribute("aria-controls")).toBe("switcher-results");

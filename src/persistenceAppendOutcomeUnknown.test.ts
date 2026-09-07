@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const saves: string[] = [];
 const toasts: Array<{ message: string; tone: string }> = [];
-let nextSave: () => Promise<string>;
+let nextSave: () => Promise<{ revision: string }>;
 
 vi.mock("./store", () => ({
   doc: { loaded: true, pages: [] },
@@ -27,6 +27,12 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    kind = "managed-actor-refusal";
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
   backend: () => ({
     savePage: (page: { name: string }) => {
       saves.push(page.name);
@@ -46,12 +52,13 @@ vi.mock("./ui", () => ({
 }));
 
 const { dirtyPages, markDirty, resetSaveState } = await import("./persistence");
+const { ManagedActorRefusalError } = await import("./backend");
 
 describe("managed append outcome uncertainty", () => {
   beforeEach(() => {
     saves.length = 0;
     toasts.length = 0;
-    nextSave = () => Promise.resolve("saved");
+    nextSave = () => Promise.resolve({ revision: "saved" });
     resetSaveState();
     vi.useFakeTimers();
   });
@@ -61,10 +68,9 @@ describe("managed append outcome uncertainty", () => {
   });
 
   it("keeps drafts dirty and suppresses every automatic retry until reset", async () => {
-    nextSave = () => Promise.reject(new Error(
-      "sync actor refused application page intent at committing the semantic page transaction "
-      + "(reason code: trusted_local.append_outcome_unknown)"
-    ));
+    nextSave = () => Promise.reject(
+      new ManagedActorRefusalError("trusted_local.append_outcome_unknown")
+    );
     markDirty("First");
     await vi.advanceTimersByTimeAsync(500);
 
@@ -82,7 +88,7 @@ describe("managed append outcome uncertainty", () => {
     expect(toasts).toHaveLength(1);
 
     resetSaveState();
-    nextSave = () => Promise.resolve("after-reopen");
+    nextSave = () => Promise.resolve({ revision: "after-reopen" });
     markDirty("Second");
     await vi.advanceTimersByTimeAsync(500);
     expect(saves).toEqual(["First", "Second"]);
@@ -92,7 +98,9 @@ describe("managed append outcome uncertainty", () => {
     let attempts = 0;
     nextSave = () => {
       attempts++;
-      return attempts === 1 ? Promise.reject(new Error("EBUSY")) : Promise.resolve("saved");
+      return attempts === 1
+        ? Promise.reject(new Error("EBUSY"))
+        : Promise.resolve({ revision: "saved" });
     };
     markDirty("Transient");
     await vi.advanceTimersByTimeAsync(500);

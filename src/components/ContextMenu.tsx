@@ -49,6 +49,7 @@ import {
   blockWritable,
   pageByName,
   buildClipboardPayload,
+  insertOutlineBefore,
 } from "../store";
 import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
 import { canConvertPipeTableToGrid, convertGridToPipeTable, convertPipeTableToGrid } from "../sheet/conversions";
@@ -62,7 +63,7 @@ import {
   focusCell,
   setCellSel,
 } from "../sheet/selection";
-import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
+import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, formulaReferenceName, isFieldId, type FieldId } from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
 import { copyBlockOutline, writeClipboardText } from "../clipboard";
@@ -122,6 +123,26 @@ export function placeContextMenu(
   return { left, top };
 }
 
+/** Which side a submenu opens on, once the parent menu itself has been placed.
+ *
+ *  Submenus used to be pure CSS at `left: 100%`, with no idea where the window
+ *  ended, so a menu opened over the rightmost column of a table pushed its
+ *  submenu off the screen entirely (GH #471). Right stays the default; left is
+ *  the mirror when the right side would overflow; `over` is the last resort for
+ *  a viewport too narrow for the pair, where the submenu overlays its own menu
+ *  instead of leaving the screen. Pure, because jsdom cannot lay out. */
+export function placeSubmenu(
+  menuLeft: number,
+  menuWidth: number,
+  submenuWidth: number,
+  vw: number,
+  margin = 6,
+): "right" | "left" | "over" {
+  if (menuLeft + menuWidth + submenuWidth <= vw - margin) return "right";
+  if (menuLeft - submenuWidth >= margin) return "left";
+  return "over";
+}
+
 export function ContextMenu(): JSX.Element {
   const close = (restoreFocus = true) => {
     const current = contextMenu();
@@ -135,6 +156,7 @@ export function ContextMenu(): JSX.Element {
   };
   let menuEl: HTMLDivElement | undefined;
   const [place, setPlace] = createSignal<{ left: number; top: number } | null>(null);
+  const [submenuSide, setSubmenuSide] = createSignal<"right" | "left" | "over">("right");
 
   // Viewport-aware placement. The menu opens at the click point, but a tall menu
   // opened low (e.g. "Delete namespace" near the sidebar bottom, GH nit) would
@@ -152,7 +174,18 @@ export function ContextMenu(): JSX.Element {
       const el = menuEl;
       if (!el || contextMenu() !== cm) return;
       const r = el.getBoundingClientRect();
-      setPlace(placeContextMenu(x, y, r.width, r.height, window.innerWidth, window.innerHeight));
+      const placed = placeContextMenu(x, y, r.width, r.height, window.innerWidth, window.innerHeight);
+      setPlace(placed);
+      // Submenus are laid out but hidden by `visibility`, so they are measurable
+      // here (GH #471). One side for the whole menu: two sibling submenus opening
+      // opposite ways would be worse than either.
+      const widest = Math.max(
+        0,
+        ...[...el.querySelectorAll<HTMLElement>(".ctx-submenu-menu")].map((sub) =>
+          sub.getBoundingClientRect().width,
+        ),
+      );
+      setSubmenuSide(placeSubmenu(placed.left, r.width, widest, window.innerWidth));
       if (cm.kind === "page") {
         el.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
       }
@@ -182,6 +215,7 @@ export function ContextMenu(): JSX.Element {
           <div
             ref={menuEl}
             class="ctx-menu"
+            data-submenu-side={submenuSide()}
             role={m().kind === "page" ? "menu" : undefined}
             aria-label={m().kind === "page" ? "Page actions" : undefined}
             style={{
@@ -681,12 +715,6 @@ function SheetMenu(props: {
   );
 }
 
-function formulaReferenceName(field: FieldId): string | null {
-  if (field.startsWith("formula:")) return null;
-  if (field.startsWith("prop:")) return field.slice(5);
-  return field;
-}
-
 // Right-click menu for an INLINE block ref `((uuid))` — acts on the referenced
 // (target) block: open it in the sidebar, jump to it, or copy a ref/embed. (OG's
 // menu also has delete/replace, which edit the containing block's text — those are
@@ -1131,6 +1159,20 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
     { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+    // The keyboard route to "a block above this one" is Enter at offset 0, which
+    // splits. A block that owns its own Enter key — a code block, where Enter
+    // inserts a newline — therefore has no keyboard route, and when it is the
+    // FIRST block of a page there is no earlier block to insert after either, so
+    // the top of the page was unreachable (GH #480). This item is the route, and
+    // it is offered on every block rather than only that case: the same dead end
+    // exists for the first child of any subtree whose first block is a code block.
+    {
+      label: "Insert block above",
+      run: () => {
+        const inserted = insertOutlineBefore(id, [{ raw: "", children: [] }]);
+        if (inserted !== id) startEditing(inserted, 0);
+      },
+    },
     { label: "Copy block ref", run: () => void copyBlockRef(id, (u) => `((${u}))`, "Copied block ref") },
     { label: "Copy block embed", run: () => void copyBlockRef(id, (u) => `{{embed ((${u}))}}`, "Copied block embed") },
     { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },

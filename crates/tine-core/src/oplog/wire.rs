@@ -70,6 +70,33 @@ pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
 pub const MAX_PROVIDER_PATH_BYTES: usize = 512;
 pub const MAX_PROVIDER_JOURNAL_PENDING: usize = 4;
 pub const MAX_PROVIDER_JOURNAL_COMPLETED: usize = 16_384;
+/// The completed-record count at which an operation compacts the journal
+/// against live provider state before adding one more record.
+///
+/// A `completed/` record is crash-recovery evidence for ONE exact provider
+/// operation, not history: as soon as current provider state answers the same
+/// question the record answers, the record is retirable
+/// (`ProviderRetryJournal::completed_record_retirement`). Before this change
+/// nothing retired the ordinary cases, so the steady state grew with the
+/// lifetime of the store and every publish/rename/remove failed outright once
+/// it reached `MAX_PROVIDER_JOURNAL_COMPLETED` — a stuck state reachable by
+/// ordinary long use. Compaction is triggered by count, but what it retires is
+/// decided by provider state, never by age or arrival order: hash-named
+/// records have no "oldest", and a time or count window could replay or
+/// suppress the wrong operation after namespace loss or reappearance.
+///
+/// The value is small on purpose. `ProviderRetryJournal::load` decodes and
+/// authenticates EVERY completed record on every operation, so the completed
+/// count is also the per-operation cost of the ordinary path: at
+/// `MAX_PROVIDER_JOURNAL_COMPLETED` that was thousands of HMAC verifications
+/// per publish. The spec's provisional ceiling for the steady state is 1,024;
+/// nothing needs a window that wide, because provider state — not this store —
+/// is what makes an exact repeat settle once a record is retired.
+pub const PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER: usize = 64;
+const _: () = assert!(
+    PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER < MAX_PROVIDER_JOURNAL_COMPLETED,
+    "compaction must trigger strictly before the structural scan bound"
+);
 pub const MAX_PROVIDER_JOURNAL_BLOB_BYTES: usize = MAX_PROVIDER_RESCAN_BYTES;
 pub const MAX_PROVIDER_JOURNAL_RECORD_BYTES: usize = 4 * 1024;
 pub const MAX_PROVIDER_JOURNAL_COMPLETION_BYTES: usize =
@@ -153,6 +180,48 @@ enum ProviderJournalPhase {
     RetireIntent,
     Retired,
     Cleanup,
+}
+
+/// What one compaction sweep retired, split by the reason it was allowed to.
+///
+/// Both counters are load-bearing rather than decorative: a sweep that only
+/// ever reports `moot` is retiring records whose operations vanished from the
+/// provider, which is a very different world from one where healthy completed
+/// evidence compacts. `retired_completed_provider_records_still_settle_exact_repeat_operations`
+/// puts one provider in both states at once and asserts both counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderJournalCompaction {
+    /// Retired because current provider state already shows the operation's
+    /// outcome.
+    reflected: usize,
+    /// Retired because the operation's premises changed under us.
+    moot: usize,
+}
+
+impl ProviderJournalCompaction {
+    #[cfg(test)]
+    fn retired(self) -> usize {
+        self.reflected.saturating_add(self.moot)
+    }
+}
+
+/// Why a completed provider-journal record no longer needs to exist.
+///
+/// Decided by CURRENT provider state, never by age: completed records are
+/// hash-named and carry no chronology, so a time or count window over them
+/// could replay or suppress the wrong operation after namespace loss or
+/// reappearance. This is never serialized; it is the answer a sweep computes
+/// and then acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderJournalRetirement {
+    /// Current provider state already shows this operation's outcome, so an
+    /// exact repeat settles from that state alone.
+    Reflected,
+    /// The operation's premises changed under us — the destination it
+    /// authenticated is gone, or the source it retired came back. The record
+    /// can authorize nothing, and RETAINING it is what makes an exact repeat
+    /// fail instead of converging.
+    Moot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -321,10 +390,8 @@ impl ProviderRuntime {
         let parent = root
             .parent()
             .ok_or_else(|| ScenarioError::UnsafeProviderEntry(root.display().to_string()))?;
-        let canonical_parent =
-            fs::canonicalize(parent).map_err(|error| ScenarioError::Io(error.to_string()))?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let canonical_parent = fs::canonicalize(parent)?;
+        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
         ensure_shared_provider_directory(&parent_capability, name)?;
         let provider = open_provider_directory(&parent_capability, name)?;
         for tree in ["inbox", "outbox"] {
@@ -368,10 +435,7 @@ impl ProviderRuntime {
             return Err(ScenarioError::InvalidProviderPath(path.into()));
         }
         let mut components = path.split('/').peekable();
-        let mut parent = self
-            .tree(tree)
-            .try_clone()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let mut parent = self.tree(tree).try_clone()?;
         while let Some(component) = components.next() {
             if components.peek().is_none() {
                 return Ok((parent, component.into()));
@@ -398,10 +462,7 @@ impl ProviderRuntime {
             return Err(ScenarioError::InvalidProviderPath(path.into()));
         }
         let mut components = path.split('/').peekable();
-        let mut parent = self
-            .tree(tree)
-            .try_clone()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let mut parent = self.tree(tree).try_clone()?;
         let mut parent_path = self.tree_path(tree);
         while let Some(component) = components.next() {
             if components.peek().is_none() {
@@ -537,7 +598,7 @@ impl ProviderRuntime {
                 bytes,
                 &record,
             )?;
-            return journal.complete(gate, &record);
+            return journal.complete(gate, self, &record);
         }
         let expected = journal.read_blob(gate, &record)?;
         if record.phase == ProviderJournalPhase::Prepared {
@@ -592,11 +653,8 @@ impl ProviderRuntime {
                 .ok_or_else(|| ScenarioError::UnsafeProviderJournal(record.operation_id.clone()))?;
             let mut staged =
                 create_provider_journal_staging(&temporary_dir, staging_name, &location.path)?;
-            staged
-                .write_all(&expected)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            crate::durability_counters::sync_file(&staged.file)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            staged.write_all(&expected)?;
+            crate::durability_counters::sync_file(&staged.file)?;
             validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
             record.staging_identity = Some(provider_identity_record(provider_file_identity(
                 &staged.file,
@@ -654,11 +712,8 @@ impl ProviderRuntime {
                         staging_name,
                         &location.path,
                     )?;
-                    staged
-                        .write_all(&expected)
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    crate::durability_counters::sync_file(&staged.file)
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    staged.write_all(&expected)?;
+                    crate::durability_counters::sync_file(&staged.file)?;
                     validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
                     record.staging_identity = Some(provider_identity_record(
                         provider_file_identity(&staged.file)?,
@@ -703,7 +758,7 @@ impl ProviderRuntime {
             &expected,
             &record,
         )?;
-        journal.complete(gate, &record)
+        journal.complete(gate, self, &record)
     }
 }
 
@@ -1016,17 +1071,14 @@ impl SharedProviderTransport {
         let provider_parent = provider_root.parent().ok_or_else(|| {
             ScenarioError::UnsafeProviderEntry(provider_root.display().to_string())
         })?;
-        fs::create_dir_all(provider_parent)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        fs::create_dir_all(provider_parent)?;
         let journal_device = private_journal_root.parent().ok_or_else(|| {
             ScenarioError::UnsafeProviderJournal(private_journal_root.display().to_string())
         })?;
-        fs::create_dir_all(journal_device).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        fs::create_dir_all(journal_device)?;
         let journal = ProviderRetryJournal::open(private_journal_root.to_path_buf())?;
-        let canonical_journal_device = fs::canonicalize(journal_device)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        let journal_device = Dir::open_ambient_dir(&canonical_journal_device, ambient_authority())
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let canonical_journal_device = fs::canonicalize(journal_device)?;
+        let journal_device = Dir::open_ambient_dir(&canonical_journal_device, ambient_authority())?;
         ensure_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
         let pending_publication =
             open_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
@@ -1109,40 +1161,35 @@ impl SharedProviderTransport {
         Ok(path)
     }
 
+    /// Publish generated bytes at one canonical provider path.
+    ///
+    /// One publication answers one question — "are these exact bytes at this
+    /// exact name?" — so there is one implementation of it: this delegates to
+    /// [`Self::publish_exact`] with the general provider read bound. It used
+    /// to be a second, subtly different answer that always refused a
+    /// destination that already existed, so it depended on a completed journal
+    /// record to make an exact repeat settle. That made manifest, descriptor
+    /// and frontier-head publications the one put family whose completed
+    /// record could not be retired against provider state.
     fn publish(&mut self, path: &str, bytes: &[u8]) -> Result<(), ScenarioError> {
-        let gate = self.journal.acquire_transaction_gate()?;
-        let source = format!("generated:{}", provider_digest(bytes));
-        let location = ProviderLocation {
-            device: "local".into(),
-            tree: ProviderTree::Outbox,
-            path: path.into(),
-        };
-        self.journal.recycle_completed_put_for_absent_destination(
-            &gate,
-            &source,
-            &source,
-            &self.runtime,
-            &location,
-            bytes,
-        )?;
-        self.runtime.put_complete(
-            &self.journal,
-            &gate,
-            &source,
-            &source,
-            &location,
-            bytes,
-            None,
-            None,
-        )
+        self.publish_exact(path, bytes, MAX_PROVIDER_RESCAN_BYTES)
     }
 
+    /// Publish generated bytes at one canonical provider path, reading any
+    /// already-present destination under `limit`.
+    ///
+    /// The identical-destination branch is what makes a put's completed
+    /// journal record retirable: an exact repeat after retirement settles
+    /// from the destination bytes themselves, and a destination holding
+    /// DIFFERENT bytes refuses with `ProviderConflictingBytes` — the same
+    /// answer `validate_put_destination` gives while the record is retained.
     fn publish_exact(
         &mut self,
         path: &str,
         bytes: &[u8],
         limit: usize,
     ) -> Result<(), ScenarioError> {
+        reject_provider_temporary_path(path)?;
         let gate = self.journal.acquire_transaction_gate()?;
         let source = format!("generated:{}", provider_digest(bytes));
         let location = ProviderLocation {
@@ -1293,19 +1340,14 @@ impl SharedProviderTransport {
         loop {
             if cursor.phase == 0 {
                 if cursor.entries.is_none() {
-                    cursor.entries = Some(
-                        self.runtime
-                            .tree(ProviderTree::Outbox)
-                            .entries()
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?,
-                    );
+                    cursor.entries = Some(self.runtime.tree(ProviderTree::Outbox).entries()?);
                 }
                 let Some(entry) = cursor.entries.as_mut().expect("cursor opened").next() else {
                     cursor.entries = None;
                     cursor.phase = 1;
                     continue;
                 };
-                let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+                let entry = entry?;
                 // A name this build cannot even spell is a name no canonical
                 // namespace has, so it is one more entry nothing reads.
                 let Ok(name) = entry.file_name().into_string() else {
@@ -1323,9 +1365,7 @@ impl SharedProviderTransport {
                     }
                     continue;
                 }
-                let kind = entry
-                    .file_type()
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                let kind = entry.file_type()?;
                 if kind.is_symlink() || !kind.is_dir() {
                     return Err(ScenarioError::UnsafeProviderEntry(format!(
                         "{}: expected a real no-follow directory",
@@ -1360,11 +1400,7 @@ impl SharedProviderTransport {
                     cursor.phase = cursor.phase.saturating_add(1);
                     continue;
                 };
-                cursor.entries = Some(
-                    directory
-                        .entries()
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?,
-                );
+                cursor.entries = Some(directory.entries()?);
             }
             if !cursor.full && cursor.observed_entries >= cursor.entry_limit {
                 return Ok(SharedProviderObservation::ChunkBoundary);
@@ -1374,7 +1410,7 @@ impl SharedProviderTransport {
                 cursor.phase = cursor.phase.saturating_add(1);
                 continue;
             };
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            let entry = entry?;
             let name = entry.file_name().into_string().map_err(|_| {
                 ScenarioError::UnsafeProviderEntry(format!("{namespace}/non-UTF-8"))
             })?;
@@ -1382,11 +1418,7 @@ impl SharedProviderTransport {
             if path.len() > MAX_PROVIDER_PATH_BYTES || !valid_provider_path(&path) {
                 return Err(ScenarioError::UnsafeProviderEntry(path));
             }
-            if !entry
-                .file_type()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-                .is_file()
-            {
+            if !entry.file_type()?.is_file() {
                 return Err(ScenarioError::UnsafeProviderEntry(path));
             }
             if provider_transient_path(&path) {
@@ -1545,7 +1577,7 @@ pub(crate) fn inspect_cold_shared_provider_prefix(
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(ColdSharedProviderPrefix::Partial)
         }
-        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+        Err(error) => return Err(ScenarioError::from(error)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(ColdSharedProviderPrefix::Refused);
@@ -1556,7 +1588,7 @@ pub(crate) fn inspect_cold_shared_provider_prefix(
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(ColdSharedProviderPrefix::Partial)
         }
-        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+        Err(error) => return Err(ScenarioError::from(error)),
     };
     if outbox_metadata.file_type().is_symlink() || !outbox_metadata.is_dir() {
         return Ok(ColdSharedProviderPrefix::Refused);
@@ -1568,7 +1600,7 @@ pub(crate) fn inspect_cold_shared_provider_prefix(
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(ColdSharedProviderPrefix::Partial)
         }
-        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+        Err(error) => return Err(ScenarioError::from(error)),
     };
     if enrollment_metadata.file_type().is_symlink() || !enrollment_metadata.is_dir() {
         return Ok(ColdSharedProviderPrefix::Refused);
@@ -1580,7 +1612,7 @@ pub(crate) fn inspect_cold_shared_provider_prefix(
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(ColdSharedProviderPrefix::Partial)
         }
-        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+        Err(error) => return Err(ScenarioError::from(error)),
     };
     if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
         return Ok(ColdSharedProviderPrefix::Refused);
@@ -1594,15 +1626,14 @@ fn inspect_shared_provider_descriptor_with(
     let metadata = match fs::symlink_metadata(provider_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+        Err(error) => return Err(ScenarioError::from(error)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ScenarioError::UnsafeProviderEntry(
             provider_root.display().to_string(),
         ));
     }
-    let root = Dir::open_ambient_dir(provider_root, ambient_authority())
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let root = Dir::open_ambient_dir(provider_root, ambient_authority())?;
     // A provider tree that exists but is INCOMPLETE is the ordinary state of a
     // folder a sync tool is still filling: Syncthing and Dropbox deliver
     // entries in arbitrary order and may hold a directory back for minutes.
@@ -1690,10 +1721,8 @@ impl ProviderRetryJournal {
         let device_parent_path = device_path
             .parent()
             .ok_or_else(|| ScenarioError::UnsafeProviderJournal(root.display().to_string()))?;
-        let canonical_device_parent = fs::canonicalize(device_parent_path)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        let device_parent = Dir::open_ambient_dir(&canonical_device_parent, ambient_authority())
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let canonical_device_parent = fs::canonicalize(device_parent_path)?;
+        let device_parent = Dir::open_ambient_dir(&canonical_device_parent, ambient_authority())?;
         let device_directory = open_provider_directory(&device_parent, device_name)?;
         let device_identity = provider_directory_identity(&device_directory)?;
         let (authority_file, initial_lock_file, authority_created) =
@@ -1767,9 +1796,7 @@ impl ProviderRetryJournal {
                             "provider authority binding changed".into(),
                         ));
                     }
-                    let mut outer = authority_file
-                        .try_clone()
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    let mut outer = authority_file.try_clone()?;
                     validate_local_file_bytes(
                         &mut outer,
                         authority_record_bytes,
@@ -1778,26 +1805,10 @@ impl ProviderRetryJournal {
                     (opened, key, identity)
                 } else {
                     if open_provider_authority_key_optional(&directory, "authority.key")?.is_some()
-                        || records
-                            .entries()
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?
-                            .next()
-                            .is_some()
-                        || blobs
-                            .entries()
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?
-                            .next()
-                            .is_some()
-                        || quarantine
-                            .entries()
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?
-                            .next()
-                            .is_some()
-                        || completed
-                            .entries()
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?
-                            .next()
-                            .is_some()
+                        || records.entries()?.next().is_some()
+                        || blobs.entries()?.next().is_some()
+                        || quarantine.entries()?.next().is_some()
+                        || completed.entries()?.next().is_some()
                     {
                         return Err(ScenarioError::UnsafeProviderJournal(
                             "missing outer provider authority".into(),
@@ -1810,10 +1821,8 @@ impl ProviderRetryJournal {
                     key[16..].copy_from_slice(second.as_bytes());
                     let mut file =
                         create_provider_authority_key_exclusive(&directory, "authority.key")?;
-                    file.write_all(&key)
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    crate::durability_counters::sync_file(&file)
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    file.write_all(&key)?;
+                    crate::durability_counters::sync_file(&file)?;
                     validate_local_file_bytes(&mut file, &key, "authority.key")?;
                     sync_provider_directory(&directory)?;
                     let identity = provider_file_identity(&file)?;
@@ -1836,13 +1845,10 @@ impl ProviderRetryJournal {
                 });
             let authority_record_bytes = canonical_provider_authority_bytes(&authority_record)?;
             if authority_created {
-                let mut outer = authority_file
-                    .try_clone()
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                let mut outer = authority_file.try_clone()?;
                 outer
                     .write_all(&authority_record_bytes)
-                    .and_then(|()| crate::durability_counters::sync_file(&outer))
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    .and_then(|()| crate::durability_counters::sync_file(&outer))?;
                 validate_local_file_bytes(
                     &mut outer,
                     &authority_record_bytes,
@@ -1857,13 +1863,9 @@ impl ProviderRetryJournal {
             )?;
 
             let transaction_authority = Arc::new(ProviderTransactionAuthority {
-                device_parent: device_parent
-                    .try_clone()
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?,
+                device_parent: device_parent.try_clone()?,
                 device_name: device_name.into(),
-                device_directory: device_directory
-                    .try_clone()
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?,
+                device_directory: device_directory.try_clone()?,
                 device_identity,
                 authority_file,
                 authority_identity,
@@ -1933,11 +1935,8 @@ impl ProviderRetryJournal {
             (&self.blobs, "blob"),
             (&self.quarantine, "quarantine"),
         ] {
-            for entry in directory
-                .entries()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-            {
-                let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            for entry in directory.entries()? {
+                let entry = entry?;
                 files = files
                     .checked_add(1)
                     .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2003,7 +2002,7 @@ impl ProviderRetryJournal {
                 self.transaction_authority
                     .local_held
                     .store(false, Ordering::Release);
-                return Err(ScenarioError::Io(error.to_string()));
+                return Err(ScenarioError::from(error));
             }
         };
         let acquired = match provider_lock_file_exclusive_nonblocking(&lock_file) {
@@ -2012,7 +2011,7 @@ impl ProviderRetryJournal {
                 self.transaction_authority
                     .local_held
                     .store(false, Ordering::Release);
-                return Err(ScenarioError::Io(error.to_string()));
+                return Err(ScenarioError::from(error));
             }
         };
         if !acquired {
@@ -2129,12 +2128,8 @@ impl ProviderRetryJournal {
         validate_local_file_bytes(&mut named_key, &self.authentication_key, "authority.key")?;
 
         let mut root_entries = 0_usize;
-        for entry in self
-            .directory
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.directory.entries()? {
+            let entry = entry?;
             root_entries = root_entries
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2142,9 +2137,7 @@ impl ProviderRetryJournal {
                 .file_name()
                 .into_string()
                 .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            let file_type = entry.file_type()?;
             let valid = match name.as_str() {
                 "records" | "blobs" | "quarantine" | "completed" => file_type.is_dir(),
                 "authority.key" => file_type.is_file(),
@@ -2168,12 +2161,8 @@ impl ProviderRetryJournal {
         let mut blob_owners = BTreeMap::<String, usize>::new();
         let mut pending_files = 0_usize;
         let mut pending_bytes = 0_usize;
-        for entry in self
-            .records
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.records.entries()? {
+            let entry = entry?;
             pending_files = pending_files
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2267,12 +2256,8 @@ impl ProviderRetryJournal {
         }
 
         let mut completed_files = 0_usize;
-        for entry in self
-            .completed
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.completed.entries()? {
+            let entry = entry?;
             completed_files = completed_files
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2306,12 +2291,8 @@ impl ProviderRetryJournal {
 
         let mut blobs = 0_usize;
         let mut orphan_blobs = Vec::new();
-        for entry in self
-            .blobs
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.blobs.entries()? {
+            let entry = entry?;
             blobs = blobs
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2470,12 +2451,8 @@ impl ProviderRetryJournal {
     ) -> Result<(), ScenarioError> {
         self.require_transaction_gate(gate)?;
         let mut names = Vec::new();
-        for entry in self
-            .quarantine
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.quarantine.entries()? {
+            let entry = entry?;
             if names.len() >= MAX_PROVIDER_JOURNAL_PENDING {
                 return Err(ScenarioError::ProviderJournalLimit);
             }
@@ -2483,10 +2460,7 @@ impl ProviderRetryJournal {
                 .file_name()
                 .into_string()
                 .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            if !entry
-                .file_type()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-                .is_file()
+            if !entry.file_type()?.is_file()
                 || !name
                     .strip_suffix(".creating")
                     .is_some_and(valid_provider_journal_id)
@@ -2536,8 +2510,7 @@ impl ProviderRetryJournal {
                 quarantine_name,
                 &self.blobs,
                 quarantine_name,
-            )
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            )?;
             sync_provider_publication_directories(&self.blobs, Some(&self.quarantine))?;
             provider_journal_boundary_hook(ProviderJournalBoundary::OrphanRestored)?;
             return Ok(());
@@ -2554,9 +2527,7 @@ impl ProviderRetryJournal {
         if provider_file_identity(&retained.file)? != quarantined_identity {
             return Err(ScenarioError::UnsafeProviderJournal(quarantine_name.into()));
         }
-        self.quarantine
-            .remove_file(quarantine_name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        self.quarantine.remove_file(quarantine_name)?;
         sync_provider_directory(&self.quarantine)?;
         provider_journal_boundary_hook(ProviderJournalBoundary::OrphanPrivateDeleted)
     }
@@ -2571,8 +2542,7 @@ impl ProviderRetryJournal {
             if self.quarantine.exists(blob_name) {
                 return Err(ScenarioError::UnsafeProviderJournal(blob_name.clone()));
             }
-            provider_rename_named_noreplace(&self.blobs, blob_name, &self.quarantine, blob_name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            provider_rename_named_noreplace(&self.blobs, blob_name, &self.quarantine, blob_name)?;
             sync_provider_publication_directories(&self.quarantine, Some(&self.blobs))?;
             provider_journal_boundary_hook(ProviderJournalBoundary::OrphanQuarantined)?;
             provider_orphan_after_quarantine_hook();
@@ -2644,8 +2614,7 @@ impl ProviderRetryJournal {
 
     fn sign_record(&self, record: &mut ProviderJournalRecord) -> Result<(), ScenarioError> {
         record.authentication_tag.clear();
-        let bytes =
-            serde_json::to_vec(record).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let bytes = serde_json::to_vec(record)?;
         record.authentication_tag = hmac_sha256_hex(&self.authentication_key, &bytes);
         Ok(())
     }
@@ -2657,15 +2626,13 @@ impl ProviderRetryJournal {
     ) -> Result<ProviderJournalRecord, ScenarioError> {
         let record: ProviderJournalRecord = serde_json::from_slice(bytes)
             .map_err(|_| ScenarioError::UnsafeProviderJournal(name.into()))?;
-        let canonical =
-            serde_json::to_vec(&record).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let canonical = serde_json::to_vec(&record)?;
         if canonical != bytes || record.authentication_tag.len() != 64 {
             return Err(ScenarioError::UnsafeProviderJournal(name.into()));
         }
         let mut unsigned = record.clone();
         let supplied = std::mem::take(&mut unsigned.authentication_tag);
-        let unsigned_bytes =
-            serde_json::to_vec(&unsigned).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let unsigned_bytes = serde_json::to_vec(&unsigned)?;
         let expected = hmac_sha256_hex(&self.authentication_key, &unsigned_bytes);
         if !constant_time_bytes_equal(supplied.as_bytes(), expected.as_bytes()) {
             return Err(ScenarioError::UnsafeProviderJournal(name.into()));
@@ -2677,12 +2644,8 @@ impl ProviderRetryJournal {
         self.require_transaction_gate(gate)?;
         let mut scanned = 0_usize;
         let mut updates = Vec::new();
-        for entry in self
-            .records
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.records.entries()? {
+            let entry = entry?;
             scanned = scanned
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2756,17 +2719,14 @@ impl ProviderRetryJournal {
                         {
                             return Err(ScenarioError::UnsafeProviderJournal(creating_name));
                         }
-                        self.blobs
-                            .rename(&creating_name, &self.blobs, blob_name)
-                            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                        self.blobs.rename(&creating_name, &self.blobs, blob_name)?;
                         sync_provider_directory(&self.blobs)?;
                         provider_journal_boundary_hook(ProviderJournalBoundary::BlobInstalled)?;
                     }
                 }
             }
             self.records
-                .rename(&update_name, &self.records, &record_name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                .rename(&update_name, &self.records, &record_name)?;
             sync_provider_directory(&self.records)?;
         }
         Ok(())
@@ -2779,12 +2739,8 @@ impl ProviderRetryJournal {
         self.require_transaction_gate(gate)?;
         let mut scanned = 0_usize;
         let mut updates = Vec::new();
-        for entry in self
-            .completed
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.completed.entries()? {
+            let entry = entry?;
             scanned = scanned
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2824,13 +2780,11 @@ impl ProviderRetryJournal {
                 return Err(ScenarioError::UnsafeProviderJournal(update_name));
             }
             self.validate_record_shape(gate, &record, false)?;
-            self.completed
-                .rename(
-                    &update_name,
-                    &self.completed,
-                    Self::record_name(operation_id),
-                )
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            self.completed.rename(
+                &update_name,
+                &self.completed,
+                Self::record_name(operation_id),
+            )?;
             sync_provider_directory(&self.completed)?;
         }
         Ok(())
@@ -2845,12 +2799,8 @@ impl ProviderRetryJournal {
         self.require_transaction_gate(gate)?;
         let mut files = 0_usize;
         let mut total_bytes = 0_usize;
-        for entry in self
-            .completed
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in self.completed.entries()? {
+            let entry = entry?;
             files = files
                 .checked_add(1)
                 .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2916,11 +2866,8 @@ impl ProviderRetryJournal {
             (&self.blobs, false, false),
             (&self.quarantine, false, true),
         ] {
-            for entry in directory
-                .entries()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-            {
-                let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            for entry in directory.entries()? {
+                let entry = entry?;
                 files = files
                     .checked_add(1)
                     .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -2940,12 +2887,7 @@ impl ProviderRetryJournal {
                         .or_else(|| name.strip_suffix(".creating"))
                 }
                 .is_some_and(valid_provider_journal_id);
-                if !valid_name
-                    || !entry
-                        .file_type()
-                        .map_err(|error| ScenarioError::Io(error.to_string()))?
-                        .is_file()
-                {
+                if !valid_name || !entry.file_type()?.is_file() {
                     return Err(ScenarioError::UnsafeProviderJournal(name));
                 }
                 let file = open_provider_file_nofollow(directory, &name)
@@ -3005,11 +2947,8 @@ impl ProviderRetryJournal {
             (&self.completed, true, MAX_PROVIDER_JOURNAL_COMPLETED),
         ] {
             let mut scanned = 0_usize;
-            for entry in directory
-                .entries()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-            {
-                let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            for entry in directory.entries()? {
+                let entry = entry?;
                 scanned = scanned
                     .checked_add(1)
                     .ok_or(ScenarioError::ProviderJournalLimit)?;
@@ -3133,9 +3072,7 @@ impl ProviderRetryJournal {
         {
             return Ok(());
         }
-        self.completed
-            .remove_file(&record_name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        self.completed.remove_file(&record_name)?;
         sync_provider_directory(&self.completed)
     }
 
@@ -3220,10 +3157,185 @@ impl ProviderRetryJournal {
         {
             return Ok(());
         }
-        self.completed
-            .remove_file(&record_name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        self.completed.remove_file(&record_name)?;
         sync_provider_directory(&self.completed)
+    }
+
+    /// Classify one completed record against live provider state.
+    ///
+    /// This generalizes the two `recycle_completed_*` functions above, which
+    /// are the exemplars: each asks ONE question of the bound provider
+    /// namespace and retires an exact record when the answer makes it
+    /// unnecessary. Every completed record is retirable in every provider
+    /// state; the returned variant records WHY, because that is what the
+    /// diagnostics and the packet receipt need. The per-operation questions:
+    ///
+    /// * `Put` — is the published destination still there? **Present:**
+    ///   `Reflected`; an exact repeat compares the destination bytes and
+    ///   settles, or refuses with `ProviderConflictingBytes` when they
+    ///   differ, which is exactly what the retained record's
+    ///   `validate_put_destination` would have said.  **Absent:** `Moot`, the
+    ///   case `recycle_completed_put_for_absent_destination` already handles
+    ///   at operation entry; an exact repeat republishes.
+    /// * `Rename` — is the retired source back? **Back:** `Moot`; an exact
+    ///   repeat redoes the rename, and it is the RETAINED record that makes
+    ///   that repeat fail (`validate_journal_destination` cannot authorize a
+    ///   destination the record no longer describes). **Gone:** `Reflected`;
+    ///   an exact repeat settles from this device's own retirement
+    ///   diagnostic, which is derived from the retired bytes and therefore
+    ///   needs no journal record
+    ///   (`operation_settled_by_retirement_diagnostic`).
+    /// * `Remove` — is the removed source back? **Back:** `Moot`; the exact
+    ///   repeat either settles from that same retirement diagnostic, when the
+    ///   returned bytes are the ones this operation removed, or performs an
+    ///   ordinary authorized removal. This generalizes
+    ///   `recycle_completed_remove_for_reappeared_source`, which handled only
+    ///   the complete-namespace-loss half of it.
+    ///   **Gone:** `Reflected`; an exact repeat settles for a
+    ///   `SettleIfAbsent` caller, and reports `UnknownProviderPath` for a
+    ///   `RequirePresent` caller — the same state-derived answer that policy
+    ///   gives for any absent source. `docs/storage-sync-contract.md` carries
+    ///   that refusal row and its in-scope scenario.
+    ///
+    /// Nothing here looks at time, arrival order, or a count of records:
+    /// completed records are hash-named and have no chronology, so a window
+    /// over them could replay or suppress the wrong operation after namespace
+    /// loss or reappearance.
+    fn completed_record_retirement(
+        &self,
+        gate: &ProviderTransactionGate,
+        provider: &ProviderRuntime,
+        record: &ProviderJournalRecord,
+    ) -> Result<ProviderJournalRetirement, ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let bound_path_present =
+            provider_path_is_present_regular_file(provider, record.tree, &record.from_path)?;
+        Ok(match record.operation {
+            ProviderJournalOperation::Put => {
+                if bound_path_present {
+                    ProviderJournalRetirement::Reflected
+                } else {
+                    ProviderJournalRetirement::Moot
+                }
+            }
+            ProviderJournalOperation::Rename | ProviderJournalOperation::Remove => {
+                if bound_path_present {
+                    ProviderJournalRetirement::Moot
+                } else {
+                    ProviderJournalRetirement::Reflected
+                }
+            }
+        })
+    }
+
+    /// Retire every completed record whose operation current provider state
+    /// already answers, and report how many were retired.
+    ///
+    /// This is the I-10 terminal recovery action for the completed store: the
+    /// journal never refuses the user's next operation on its own capacity,
+    /// it re-observes provider state and compacts. Retirement needs no
+    /// generation directory or commit pointer: each completed record is
+    /// INDEPENDENTLY retirable and its retirement is idempotent, so a crash
+    /// part-way through leaves a prefix retired and the rest untouched, which
+    /// is a state this same sweep reaches again on the next run. There is no
+    /// mixed generation to publish atomically.
+    ///
+    /// A record whose operation is still in flight — the same `operation_id`
+    /// is present in `records/` — is left alone: the pending record is the
+    /// authority for an unfinished operation, and the two copies of one
+    /// authenticated Cleanup record that a crash can leave behind are what the
+    /// ordinary retry validator reads. Both `recycle_completed_*` exemplars
+    /// make the same check.
+    fn reconcile_completed_against_provider(
+        &self,
+        gate: &ProviderTransactionGate,
+        provider: &ProviderRuntime,
+    ) -> Result<ProviderJournalCompaction, ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let mut scanned = 0_usize;
+        let mut names = Vec::new();
+        for entry in self.completed.entries()? {
+            let entry = entry?;
+            scanned = scanned
+                .checked_add(1)
+                .ok_or(ScenarioError::ProviderJournalLimit)?;
+            if scanned > MAX_PROVIDER_JOURNAL_COMPLETED + 1 {
+                return Err(ScenarioError::ProviderJournalLimit);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
+            if name.ends_with(".json") {
+                names.push(name);
+            }
+        }
+        names.sort();
+        let mut compaction = ProviderJournalCompaction::default();
+        for name in names {
+            let Some(opened) = open_provider_regular_optional(
+                &self.completed,
+                &name,
+                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+                &name,
+            )
+            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
+            else {
+                continue;
+            };
+            let record = self.decode_record(&opened.bytes, &name)?;
+            self.validate_record_shape(gate, &record, false)?;
+            if record.phase != ProviderJournalPhase::Cleanup
+                || Self::record_name(&record.operation_id) != name
+            {
+                return Err(ScenarioError::UnsafeProviderJournal(name));
+            }
+            // A crash may leave the same authenticated Cleanup record in both
+            // pending and completed directories. Preserve both copies for the
+            // normal retry validator instead of discarding its completion
+            // proof.
+            if open_provider_regular_optional(
+                &self.records,
+                &name,
+                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+                &name,
+            )
+            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
+            .is_some()
+            {
+                continue;
+            }
+            let counter = match self.completed_record_retirement(gate, provider, &record)? {
+                ProviderJournalRetirement::Reflected => &mut compaction.reflected,
+                ProviderJournalRetirement::Moot => &mut compaction.moot,
+            };
+            *counter = counter
+                .checked_add(1)
+                .ok_or(ScenarioError::ProviderJournalLimit)?;
+            self.completed.remove_file(&name)?;
+            sync_provider_directory(&self.completed)?;
+            provider_journal_boundary_hook(ProviderJournalBoundary::CompletionRetired)?;
+        }
+        Ok(compaction)
+    }
+
+    /// The current `completed/` entry count, read from names alone.
+    fn completed_record_count(
+        &self,
+        gate: &ProviderTransactionGate,
+    ) -> Result<usize, ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let mut count = 0_usize;
+        for entry in self.completed.entries()? {
+            entry?;
+            count = count
+                .checked_add(1)
+                .ok_or(ScenarioError::ProviderJournalLimit)?;
+            if count > MAX_PROVIDER_JOURNAL_COMPLETED + 1 {
+                return Err(ScenarioError::ProviderJournalLimit);
+            }
+        }
+        Ok(count)
     }
 
     fn validate_record(
@@ -3425,8 +3537,7 @@ impl ProviderRetryJournal {
         self.require_transaction_gate(gate)?;
         let mut signed = record.clone();
         self.sign_record(&mut signed)?;
-        let record_bytes =
-            serde_json::to_vec(&signed).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let record_bytes = serde_json::to_vec(&signed)?;
         if record_bytes.len() > MAX_PROVIDER_JOURNAL_RECORD_BYTES {
             return Err(ScenarioError::ProviderJournalLimit);
         }
@@ -3485,38 +3596,28 @@ impl ProviderRetryJournal {
                 validate_local_file_bytes(&mut existing.file, blob, &creating_name)?;
             } else {
                 let mut file = create_local_file_exclusive(&self.blobs, &creating_name)?;
-                file.write_all(blob)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                crate::durability_counters::sync_file(&file)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                file.write_all(blob)?;
+                crate::durability_counters::sync_file(&file)?;
                 validate_local_file_bytes(&mut file, blob, &creating_name)?;
                 sync_provider_directory(&self.blobs)?;
             }
             provider_journal_boundary_hook(ProviderJournalBoundary::BlobDurable)?;
             let mut provisional = create_local_file_exclusive(&self.records, &provisional_name)?;
-            provisional
-                .write_all(&record_bytes)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            crate::durability_counters::sync_file(&provisional)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            provisional.write_all(&record_bytes)?;
+            crate::durability_counters::sync_file(&provisional)?;
             validate_local_file_bytes(&mut provisional, &record_bytes, &provisional_name)?;
             sync_provider_directory(&self.records)?;
             provider_journal_boundary_hook(ProviderJournalBoundary::CreationRecordDurable)?;
-            self.blobs
-                .rename(&creating_name, &self.blobs, name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            self.blobs.rename(&creating_name, &self.blobs, name)?;
             sync_provider_directory(&self.blobs)?;
             provider_journal_boundary_hook(ProviderJournalBoundary::BlobInstalled)?;
             self.records
-                .rename(&provisional_name, &self.records, &record_name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                .rename(&provisional_name, &self.records, &record_name)?;
             sync_provider_directory(&self.records)?;
         } else {
             let mut file = create_local_file_exclusive(&self.records, &record_name)?;
-            file.write_all(&record_bytes)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            crate::durability_counters::sync_file(&file)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            file.write_all(&record_bytes)?;
+            crate::durability_counters::sync_file(&file)?;
             validate_local_file_bytes(&mut file, &record_bytes, &record_name)?;
             sync_provider_directory(&self.records)?;
         }
@@ -3532,28 +3633,22 @@ impl ProviderRetryJournal {
         self.validate_record(gate, record)?;
         let mut signed = record.clone();
         self.sign_record(&mut signed)?;
-        let bytes =
-            serde_json::to_vec(&signed).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let bytes = serde_json::to_vec(&signed)?;
         if bytes.len() > MAX_PROVIDER_JOURNAL_RECORD_BYTES {
             return Err(ScenarioError::ProviderJournalLimit);
         }
         let temporary_name = format!("{}.update", record.operation_id);
         let mut temporary = create_local_file_exclusive(&self.records, &temporary_name)?;
-        temporary
-            .write_all(&bytes)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        crate::durability_counters::sync_file(&temporary)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        temporary.write_all(&bytes)?;
+        crate::durability_counters::sync_file(&temporary)?;
         validate_local_file_bytes(&mut temporary, &bytes, &temporary_name)?;
         sync_provider_directory(&self.records)?;
         provider_journal_boundary_hook(ProviderJournalBoundary::UpdateDurable)?;
-        self.records
-            .rename(
-                &temporary_name,
-                &self.records,
-                Self::record_name(&record.operation_id),
-            )
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        self.records.rename(
+            &temporary_name,
+            &self.records,
+            Self::record_name(&record.operation_id),
+        )?;
         sync_provider_directory(&self.records)?;
         provider_journal_boundary_hook(ProviderJournalBoundary::UpdateInstalled)
     }
@@ -3561,6 +3656,7 @@ impl ProviderRetryJournal {
     fn complete(
         &self,
         gate: &ProviderTransactionGate,
+        provider: &ProviderRuntime,
         record: &ProviderJournalRecord,
     ) -> Result<(), ScenarioError> {
         self.require_transaction_gate(gate)?;
@@ -3591,17 +3687,14 @@ impl ProviderRetryJournal {
             .map_err(|_| ScenarioError::UnsafeProviderJournal(blob_name.into()))?
             .is_some()
             {
-                self.blobs
-                    .remove_file(blob_name)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                self.blobs.remove_file(blob_name)?;
             }
             sync_provider_directory(&self.blobs)?;
             provider_journal_boundary_hook(ProviderJournalBoundary::BlobRemoved)?;
         }
         let mut signed = cleanup;
         self.sign_record(&mut signed)?;
-        let completion_bytes =
-            serde_json::to_vec(&signed).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let completion_bytes = serde_json::to_vec(&signed)?;
         let completion_name = Self::record_name(&record.operation_id);
         if let Some(mut completed) = open_provider_regular_optional(
             &self.completed,
@@ -3613,19 +3706,26 @@ impl ProviderRetryJournal {
         {
             validate_local_file_bytes(&mut completed.file, &completion_bytes, &completion_name)?;
         } else {
+            // Compact before reserving room, never refuse for want of it: a
+            // completed record is evidence for one finished operation, and
+            // every one of them is retirable as soon as live provider state
+            // answers the same question. Reaching the trigger is therefore an
+            // instruction to re-observe the provider, not a reason to fail the
+            // user's next publish, rename or remove (I-10).
+            if self.completed_record_count(gate)?.saturating_add(1)
+                > PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER
+            {
+                self.reconcile_completed_against_provider(gate, provider)?;
+            }
             self.validate_completed_usage(gate, 1, completion_bytes.len())?;
             let update_name = format!("{}.update", record.operation_id);
             let mut update = create_local_file_exclusive(&self.completed, &update_name)?;
-            update
-                .write_all(&completion_bytes)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            crate::durability_counters::sync_file(&update)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            update.write_all(&completion_bytes)?;
+            crate::durability_counters::sync_file(&update)?;
             validate_local_file_bytes(&mut update, &completion_bytes, &update_name)?;
             sync_provider_directory(&self.completed)?;
             self.completed
-                .rename(&update_name, &self.completed, &completion_name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                .rename(&update_name, &self.completed, &completion_name)?;
             sync_provider_directory(&self.completed)?;
         }
         provider_journal_boundary_hook(ProviderJournalBoundary::CompletionDurable)?;
@@ -3638,9 +3738,7 @@ impl ProviderRetryJournal {
         .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
         .is_some()
         {
-            self.records
-                .remove_file(&record_name)
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            self.records.remove_file(&record_name)?;
             sync_provider_directory(&self.records)?;
         }
         provider_journal_boundary_hook(ProviderJournalBoundary::RecordRemoved)?;
@@ -3655,7 +3753,7 @@ struct ScenarioRoot(PathBuf);
 impl ScenarioRoot {
     fn new() -> Result<Self, ScenarioError> {
         let path = std::env::temp_dir().join(format!("tine-oplog-simulator-{}", Uuid::new_v4()));
-        fs::create_dir(&path).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        fs::create_dir(&path)?;
         Ok(Self(path))
     }
 }
@@ -3734,13 +3832,60 @@ fn run_provider_rename_with(
     )? {
         Some(record) => record,
         None => {
-            let source = open_provider_regular_optional(
+            let Some(source) = open_provider_regular_optional(
                 &from_dir,
                 &from_name,
                 MAX_PROVIDER_RESCAN_BYTES,
                 from_path,
             )?
-            .ok_or_else(|| ScenarioError::UnknownProviderPath(from_path.into()))?;
+            else {
+                // The source is gone. Either this rename never ran, or it ran
+                // and its completed journal record has since been retired
+                // against live provider state. Only this device's own
+                // retirement diagnostic separates the two, and it can: its
+                // name is derived from the retired bytes, which are the bytes
+                // now at the destination, so it authenticates this exact
+                // operation with no journal record at all.
+                let settled = match open_provider_regular_optional(
+                    &to_dir,
+                    &to_name,
+                    MAX_PROVIDER_RESCAN_BYTES,
+                    to_path,
+                )? {
+                    Some(destination) => operation_settled_by_retirement_diagnostic(
+                        provider,
+                        ProviderJournalOperation::Rename,
+                        &operation_binding,
+                        &source_provenance,
+                        tree,
+                        from_path,
+                        Some(to_path),
+                        &destination.bytes,
+                    )?,
+                    None => false,
+                };
+                if settled {
+                    return Ok(());
+                }
+                return Err(ScenarioError::UnknownProviderPath(from_path.into()));
+            };
+            // The source is back. If this exact rename already ran, the
+            // destination and this device's retirement diagnostic still say
+            // so, and the retained completed record used to settle the
+            // repeat. Retiring that record must not turn the repeat into a
+            // conflict against the destination it published itself.
+            if operation_settled_by_retirement_diagnostic(
+                provider,
+                ProviderJournalOperation::Rename,
+                &operation_binding,
+                &source_provenance,
+                tree,
+                from_path,
+                Some(to_path),
+                &source.bytes,
+            )? {
+                return Ok(());
+            }
             let operation_id = ProviderRetryJournal::operation_id(
                 ProviderJournalOperation::Rename,
                 &operation_binding,
@@ -3795,7 +3940,7 @@ fn run_provider_rename_with(
     if record.phase == ProviderJournalPhase::Cleanup {
         validate_journal_destination(journal, &gate, &provider, &record, &expected, &removed)?;
         validate_retired_source(&provider, &record)?;
-        return journal.complete(&gate, &record);
+        return journal.complete(&gate, provider, &record);
     }
     let temporary_dir = open_provider_directory(provider.tree(tree), PROVIDER_TEMP_NAMESPACE)?;
     if record.phase == ProviderJournalPhase::Prepared {
@@ -3843,11 +3988,8 @@ fn run_provider_rename_with(
             .as_deref()
             .ok_or_else(|| ScenarioError::UnsafeProviderJournal(record.operation_id.clone()))?;
         let mut staged = create_provider_journal_staging(&temporary_dir, staging_name, to_path)?;
-        staged
-            .write_all(&expected)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        crate::durability_counters::sync_file(&staged.file)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        staged.write_all(&expected)?;
+        crate::durability_counters::sync_file(&staged.file)?;
         validate_provider_file_bytes(&mut staged, &expected, to_path)?;
         record.staging_identity = Some(provider_identity_record(provider_file_identity(
             &staged.file,
@@ -3908,7 +4050,7 @@ fn run_provider_rename_with(
         provider_journal_after_phase_hook(ProviderJournalPhase::Retired)?;
     }
     validate_retired_source(&provider, &record)?;
-    journal.complete(&gate, &record)
+    journal.complete(&gate, provider, &record)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3999,6 +4141,23 @@ fn run_provider_remove_with(
             {
                 return Err(ScenarioError::ProviderConflictingBytes(path.into()));
             }
+            // The source is present again with the same bytes. If this exact
+            // removal already ran, this device's own retirement diagnostic
+            // still names it, and the retained completed record used to
+            // settle the repeat. Retiring that record must not turn the
+            // repeat into a collision with the diagnostic it wrote itself.
+            if operation_settled_by_retirement_diagnostic(
+                provider,
+                ProviderJournalOperation::Remove,
+                &operation_binding,
+                &source_provenance,
+                tree,
+                path,
+                None,
+                &source.bytes,
+            )? {
+                return Ok(());
+            }
             let operation_id = ProviderRetryJournal::operation_id(
                 ProviderJournalOperation::Remove,
                 &operation_binding,
@@ -4051,7 +4210,7 @@ fn run_provider_remove_with(
         open_provider_directory(provider.tree(tree), PROVIDER_RENAME_EVIDENCE_NAMESPACE)?;
     if record.phase == ProviderJournalPhase::Cleanup {
         validate_retired_source(provider, &record)?;
-        return journal.complete(&gate, &record);
+        return journal.complete(&gate, provider, &record);
     }
     if record.phase == ProviderJournalPhase::Prepared {
         ensure_provider_diagnostic_capacity(&removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
@@ -4079,7 +4238,7 @@ fn run_provider_remove_with(
         provider_journal_after_phase_hook(ProviderJournalPhase::Retired)?;
     }
     validate_retired_source(provider, &record)?;
-    journal.complete(&gate, &record)
+    journal.complete(&gate, provider, &record)
 }
 
 #[cfg(test)]
@@ -4166,6 +4325,96 @@ fn validate_retired_source(
     Ok(())
 }
 
+/// Did this device already complete exactly this rename or remove, judged by
+/// its own retirement diagnostic?
+///
+/// A completed rename or remove moved the source it retired to
+/// `removed/retired-{operation_id}`, and the operation id is a hash over the
+/// operation, its binding, its provenance, the paths, and the SOURCE length
+/// and digest. So `source_bytes` reconstructs the id, and a retirement
+/// diagnostic under that exact name holding those exact bytes is proof that
+/// THIS device performed THIS operation — not that some other writer happens
+/// to have produced a similar-looking provider state. For a rename the
+/// destination must additionally still hold those bytes, because that is the
+/// outcome the retained record used to verify before settling.
+///
+/// This evidence is what lets `completed_record_retirement` retire rename and
+/// remove records: what an exact repeat needs outlives the record itself. It
+/// answers `false` for anything it cannot prove, and `false` is the ordinary
+/// "this operation has not run" answer.
+fn operation_settled_by_retirement_diagnostic(
+    provider: &ProviderRuntime,
+    operation: ProviderJournalOperation,
+    operation_binding: &str,
+    source_provenance: &str,
+    tree: ProviderTree,
+    from_path: &str,
+    to_path: Option<&str>,
+    source_bytes: &[u8],
+) -> Result<bool, ScenarioError> {
+    if let Some(to_path) = to_path {
+        let (to_dir, to_name) = provider.parent_and_name(tree, to_path, false)?;
+        let Some(destination) =
+            open_provider_regular_optional(&to_dir, &to_name, MAX_PROVIDER_RESCAN_BYTES, to_path)?
+        else {
+            return Ok(false);
+        };
+        if destination.bytes != source_bytes {
+            return Ok(false);
+        }
+    }
+    let source_len =
+        u64::try_from(source_bytes.len()).map_err(|_| ScenarioError::ProviderJournalLimit)?;
+    let operation_id = ProviderRetryJournal::operation_id(
+        operation,
+        operation_binding,
+        source_provenance,
+        tree,
+        from_path,
+        to_path,
+        source_len,
+        &provider_digest(source_bytes),
+    );
+    let diagnostic_path = format!("{PROVIDER_REMOVED_NAMESPACE}/retired-{operation_id}");
+    let (removed, diagnostic_name) = provider.parent_and_name(tree, &diagnostic_path, false)?;
+    let Some(retired) = open_provider_regular_optional(
+        &removed,
+        &diagnostic_name,
+        MAX_PROVIDER_RESCAN_BYTES,
+        &diagnostic_path,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(retired.bytes == source_bytes)
+}
+
+/// Is exactly this provider path a delivered, no-follow regular file right now?
+///
+/// The completed-record retirement sweep asks presence, not content: reading
+/// the bytes of every published destination would make compaction cost the
+/// size of the graph. Content still decides the OUTCOME of an exact repeat —
+/// `publish_exact` compares destination bytes, `validate_put_destination`
+/// compares them for a retained record — but it does not decide whether the
+/// record is needed, because both answers are the same with and without it.
+///
+/// An entry a file-sync tool has not delivered, or one that is present but is
+/// not a real regular file, reads as absent here: both are states in which the
+/// retained record can authorize nothing.
+fn provider_path_is_present_regular_file(
+    provider: &ProviderRuntime,
+    tree: ProviderTree,
+    path: &str,
+) -> Result<bool, ScenarioError> {
+    let Some((parent, name)) = provider.delivered_parent_and_name(tree, path)? else {
+        return Ok(false);
+    };
+    let Ok(file) = open_provider_file_nofollow(&parent, &name) else {
+        return Ok(false);
+    };
+    Ok(validate_provider_regular_file(&file, path).is_ok())
+}
+
 fn validate_retired_file(
     removed: &Dir,
     diagnostic_name: &str,
@@ -4232,8 +4481,7 @@ fn quarantine_provider_name(
         removed,
         &diagnostic_name,
         "quarantining a raced shared provider name",
-    )
-    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    )?;
     sync_shared_provider_publication_directories(removed, Some(source_dir))
 }
 
@@ -4254,11 +4502,8 @@ fn ensure_provider_diagnostic_capacity(
     additional_entries: usize,
 ) -> Result<(), ScenarioError> {
     let mut entries = 0_usize;
-    for entry in directory
-        .entries()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-    {
-        let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+    for entry in directory.entries()? {
+        let entry = entry?;
         entries = entries
             .checked_add(1)
             .ok_or(ScenarioError::ProviderRescanLimit)?;
@@ -4272,11 +4517,7 @@ fn ensure_provider_diagnostic_capacity(
             .file_name()
             .into_string()
             .map_err(|_| ScenarioError::UnsafeProviderEntry(format!("{namespace}/non-UTF-8")))?;
-        if !entry
-            .file_type()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-            .is_file()
-        {
+        if !entry.file_type()?.is_file() {
             return Err(ScenarioError::UnsafeProviderEntry(format!(
                 "{namespace}/{name}"
             )));
@@ -4336,8 +4577,7 @@ fn reconcile_provider_retirement(
                     return Err(ScenarioError::UnsafeProviderEntry(source_path.into()));
                 }
                 provider_retirement_after_validation_hook();
-                provider_rename_handle_noreplace(&source.file, removed, diagnostic_name)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                provider_rename_handle_noreplace(&source.file, removed, diagnostic_name)?;
                 sync_shared_provider_publication_directories(removed, Some(source_dir))?;
             }
             (None, Some(retired))
@@ -4392,8 +4632,7 @@ fn reconcile_provider_retirement(
                     diagnostic_name,
                     diagnostic_path,
                 )?;
-                crate::durability_counters::sync_file(&placeholder)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                crate::durability_counters::sync_file(&placeholder)?;
                 record.staging_identity = Some(provider_identity_record(provider_file_identity(
                     &placeholder,
                 )?));
@@ -4437,8 +4676,7 @@ fn reconcile_provider_retirement(
                     source_name,
                     removed,
                     diagnostic_name,
-                )
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                )?;
                 sync_shared_provider_publication_directories(removed, Some(source_dir))?;
                 provider_journal_boundary_hook(ProviderJournalBoundary::RetirementExchangeDurable)?;
                 source = open_provider_regular_optional(
@@ -4510,8 +4748,7 @@ fn reconcile_provider_retirement(
                     evidence,
                     &evidence_name,
                     "retiring the shared provider retirement placeholder",
-                )
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                )?;
                 sync_shared_provider_publication_directories(evidence, Some(source_dir))?;
                 provider_journal_boundary_hook(
                     ProviderJournalBoundary::RetirementPlaceholderQuarantined,
@@ -4549,11 +4786,8 @@ fn ensure_provider_retirement_evidence(
 ) -> Result<(), ScenarioError> {
     let mut count = 0_usize;
     let mut bytes = 0_usize;
-    for entry in evidence
-        .entries()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-    {
-        let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+    for entry in evidence.entries()? {
+        let entry = entry?;
         count = count
             .checked_add(1)
             .ok_or(ScenarioError::ProviderRescanLimit)?;
@@ -4572,12 +4806,7 @@ fn ensure_provider_retirement_evidence(
             .strip_prefix("retire-placeholder-")
             .or_else(|| name.strip_prefix("retirement-race-"))
             .is_some_and(valid_provider_journal_id);
-        if !valid_name
-            || !entry
-                .file_type()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?
-                .is_file()
-        {
+        if !valid_name || !entry.file_type()?.is_file() {
             return Err(ScenarioError::UnsafeProviderEntry(format!(
                 "{PROVIDER_RENAME_EVIDENCE_NAMESPACE}/{name}"
             )));
@@ -4646,9 +4875,7 @@ fn reconcile_private_retirement_evidence(
     if provider_file_identity(&retained.file)? != retained_identity {
         return Err(ScenarioError::UnsafeProviderEntry(evidence_name.into()));
     }
-    evidence
-        .remove_file(evidence_name)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    evidence.remove_file(evidence_name)?;
     sync_shared_provider_directory(evidence)?;
     provider_journal_boundary_hook(ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted)
 }
@@ -4675,8 +4902,7 @@ fn preserve_retirement_race(
         evidence,
         &race_name,
         "preserving a shared provider retirement race",
-    )
-    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    )?;
     sync_shared_provider_publication_directories(evidence, Some(source_dir))
 }
 
@@ -4939,9 +5165,7 @@ fn validate_provider_regular_file_with_link_count(
     path: &str,
     require_single_link: bool,
 ) -> Result<fs::Metadata, ScenarioError> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let metadata = file.metadata()?;
     // Provider files deliberately cross process, device, and filesystem
     // ownership boundaries. Their authority comes from validated immutable
     // content and exact capability-relative paths, never the Unix uid.
@@ -4969,9 +5193,7 @@ fn validate_provider_regular_file_with_link_count(
         FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
     };
 
-    let metadata = file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let metadata = file.metadata()?;
     let mut standard = FILE_STANDARD_INFO::default();
     // SAFETY: `file` owns a live handle, `standard` is writable for its full
     // declared size, and GetFileInformationByHandleEx does not retain either.
@@ -4984,9 +5206,7 @@ fn validate_provider_regular_file_with_link_count(
         )
     };
     if result == 0 {
-        return Err(ScenarioError::Io(
-            std::io::Error::last_os_error().to_string(),
-        ));
+        return Err(std::io::Error::last_os_error().into());
     }
     if !metadata.is_file()
         || metadata.file_attributes()
@@ -5018,9 +5238,7 @@ fn validate_provider_regular_file_with_link_count(
 
 #[cfg(unix)]
 fn provider_file_identity(file: &fs::File) -> Result<ProviderFileIdentity, ScenarioError> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let metadata = file.metadata()?;
     Ok(ProviderFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -5045,9 +5263,7 @@ fn provider_file_identity(file: &fs::File) -> Result<ProviderFileIdentity, Scena
         )
     };
     if result == 0 {
-        return Err(ScenarioError::Io(
-            std::io::Error::last_os_error().to_string(),
-        ));
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(ProviderFileIdentity {
         volume: information.VolumeSerialNumber,
@@ -5186,7 +5402,7 @@ fn canonical_provider_authority_bytes(
             PROVIDER_DEVICE_AUTHORITY_NAME.into(),
         ));
     }
-    let bytes = serde_json::to_vec(record).map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let bytes = serde_json::to_vec(record)?;
     if bytes.len() > MAX_PROVIDER_AUTHORITY_BYTES {
         return Err(ScenarioError::ProviderJournalLimit);
     }
@@ -5211,9 +5427,7 @@ fn decode_provider_authentication_key(
 fn read_provider_authority_record(
     authority_file: &fs::File,
 ) -> Result<(Vec<u8>, ProviderAuthorityRecord), ScenarioError> {
-    let mut file = authority_file
-        .try_clone()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let mut file = authority_file.try_clone()?;
     let metadata = validate_provider_regular_file(&file, PROVIDER_DEVICE_AUTHORITY_NAME)
         .map_err(|_| ScenarioError::UnsafeProviderJournal(PROVIDER_DEVICE_AUTHORITY_NAME.into()))?;
     let advertised =
@@ -5221,16 +5435,14 @@ fn read_provider_authority_record(
     if advertised > MAX_PROVIDER_AUTHORITY_BYTES {
         return Err(ScenarioError::ProviderJournalLimit);
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::with_capacity(advertised);
     Read::by_ref(&mut file)
         .take(
             u64::try_from(MAX_PROVIDER_AUTHORITY_BYTES + 1)
                 .map_err(|_| ScenarioError::ProviderJournalLimit)?,
         )
-        .read_to_end(&mut bytes)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .read_to_end(&mut bytes)?;
     if bytes.len() != advertised || bytes.len() > MAX_PROVIDER_AUTHORITY_BYTES {
         return Err(ScenarioError::UnsafeProviderJournal(
             PROVIDER_DEVICE_AUTHORITY_NAME.into(),
@@ -5248,10 +5460,7 @@ fn read_provider_authority_record(
 }
 
 fn provider_directory_identity(directory: &Dir) -> Result<ProviderFileIdentity, ScenarioError> {
-    let file = directory
-        .try_clone()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-        .into_std_file();
+    let file = directory.try_clone()?.into_std_file();
     provider_file_identity(&file)
 }
 
@@ -5374,13 +5583,8 @@ fn open_or_create_provider_outer_authority(
 fn open_and_lock_provider_outer_authority(
     device_directory: &Dir,
 ) -> Result<(fs::File, fs::File, bool), ScenarioError> {
-    let lock_file = device_directory
-        .try_clone()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-        .into_std_file();
-    if !provider_lock_file_exclusive_nonblocking(&lock_file)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-    {
+    let lock_file = device_directory.try_clone()?.into_std_file();
+    if !provider_lock_file_exclusive_nonblocking(&lock_file)? {
         return Err(ScenarioError::UnsafeProviderJournal(
             "provider transaction gate is held by another process".into(),
         ));
@@ -5399,12 +5603,8 @@ fn open_and_lock_provider_outer_authority(
     device_directory: &Dir,
 ) -> Result<(fs::File, fs::File, bool), ScenarioError> {
     let (authority, created) = open_or_create_provider_outer_authority(device_directory)?;
-    let lock_file = authority
-        .try_clone()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    if !provider_lock_file_exclusive_nonblocking(&lock_file)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-    {
+    let lock_file = authority.try_clone()?;
+    if !provider_lock_file_exclusive_nonblocking(&lock_file)? {
         return Err(ScenarioError::UnsafeProviderJournal(
             "provider transaction gate is held by another process".into(),
         ));
@@ -5495,21 +5695,14 @@ fn validate_local_file_bytes(
         .map_err(|_| ScenarioError::UnsafeProviderJournal(name.into()))?;
     let expected_len =
         u64::try_from(expected.len()).map_err(|_| ScenarioError::ProviderJournalLimit)?;
-    if file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-        .len()
-        != expected_len
-    {
+    if file.metadata()?.len() != expected_len {
         return Err(ScenarioError::UnsafeProviderJournal(name.into()));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut actual = Vec::with_capacity(expected.len());
     Read::by_ref(file)
         .take(expected_len.saturating_add(1))
-        .read_to_end(&mut actual)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .read_to_end(&mut actual)?;
     if actual != expected {
         return Err(ScenarioError::UnsafeProviderJournal(name.into()));
     }
@@ -5544,8 +5737,7 @@ fn open_provider_regular_optional(
     let mut bytes = Vec::with_capacity(advertised);
     Read::by_ref(&mut file)
         .take(read_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit || bytes.len() != advertised {
         return Err(ScenarioError::ProviderRescanLimit);
     }
@@ -5566,31 +5758,18 @@ fn validate_provider_file_bytes(
     validate_provider_regular_file_with_link_count(&staged.file, path, staged.name.is_some())?;
     let expected_len =
         u64::try_from(expected.len()).map_err(|_| ScenarioError::ProviderRescanLimit)?;
-    if staged
-        .file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-        .len()
-        != expected_len
-    {
+    if staged.file.metadata()?.len() != expected_len {
         return Err(ScenarioError::UnsafeProviderEntry(path.into()));
     }
-    staged
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    staged.file.seek(SeekFrom::Start(0))?;
     let mut actual = Vec::with_capacity(expected.len());
     Read::by_ref(&mut staged.file)
         .take(expected_len.saturating_add(1))
-        .read_to_end(&mut actual)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .read_to_end(&mut actual)?;
     if actual != expected {
         return Err(ScenarioError::UnsafeProviderEntry(path.into()));
     }
-    staged
-        .file
-        .seek(SeekFrom::Start(expected_len))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    staged.file.seek(SeekFrom::Start(expected_len))?;
     Ok(())
 }
 
@@ -5691,8 +5870,7 @@ fn publish_journal_destination(
         .set_len(0)
         .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
         .and_then(|()| destination.write_all(expected))
-        .and_then(|()| crate::durability_counters::sync_file(&destination))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .and_then(|()| crate::durability_counters::sync_file(&destination))?;
     validate_provider_open_file_bytes(&mut destination, expected, destination_path)?;
     provider_publication_after_publish_hook()?;
 
@@ -5747,9 +5925,7 @@ fn cleanup_journal_staging(
         .as_ref()
         .ok_or_else(|| ScenarioError::UnsafeProviderJournal(record.operation_id.clone()))?;
     if provider_file_matches_identity(&diagnostic.file, identity)? {
-        removed
-            .remove_file(&diagnostic_name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        removed.remove_file(&diagnostic_name)?;
         sync_shared_provider_directory(&removed)?;
     }
     Ok(())
@@ -5817,8 +5993,7 @@ fn quarantine_unowned_staging(
         &removed,
         &diagnostic_name,
         "quarantining abandoned shared provider staging",
-    )
-    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    )?;
     sync_shared_provider_publication_directories(&removed, Some(staging))
 }
 
@@ -5865,21 +6040,14 @@ fn validate_provider_open_file_bytes(
     validate_provider_regular_file(file, path)?;
     let expected_len =
         u64::try_from(expected.len()).map_err(|_| ScenarioError::ProviderRescanLimit)?;
-    if file
-        .metadata()
-        .map_err(|error| ScenarioError::Io(error.to_string()))?
-        .len()
-        != expected_len
-    {
+    if file.metadata()?.len() != expected_len {
         return Err(ScenarioError::UnsafeProviderEntry(path.into()));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut actual = Vec::with_capacity(expected.len());
     Read::by_ref(file)
         .take(expected_len.saturating_add(1))
-        .read_to_end(&mut actual)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        .read_to_end(&mut actual)?;
     if actual != expected {
         return Err(ScenarioError::UnsafeProviderEntry(path.into()));
     }
@@ -5912,6 +6080,10 @@ enum ProviderJournalBoundary {
     RetirementPlaceholderPrivateDeleted,
     BlobRemoved,
     CompletionDurable,
+    /// One completed record was retired against live provider state. Firing
+    /// per retirement is what lets a test cut the compaction sweep in half and
+    /// prove that a partly-swept journal reopens and converges.
+    CompletionRetired,
     RecordRemoved,
 }
 
@@ -5923,7 +6095,7 @@ enum ProviderPostValidationOperation {
 }
 
 fn sync_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
-    sync_dir_required(directory).map_err(|error| ScenarioError::Io(error.to_string()))
+    sync_dir_required(directory).map_err(ScenarioError::from)
 }
 
 fn sync_shared_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
@@ -5935,7 +6107,7 @@ fn sync_shared_provider_directory(directory: &Dir) -> Result<(), ScenarioError> 
         {
             Ok(())
         }
-        Err(error) => Err(ScenarioError::Io(error.to_string())),
+        Err(error) => Err(ScenarioError::from(error)),
     }
 }
 
@@ -6094,9 +6266,7 @@ pub(crate) fn fail_next_provider_publication_after_physical_write() {
 #[cfg(test)]
 fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
     if FAIL_PENDING_PUBLICATION_MARKER_CREATION.with(|fail| fail.replace(false)) {
-        Err(ScenarioError::Io(
-            "injected pending publication marker creation failure".into(),
-        ))
+        Err(ScenarioError::Io(ErrorKind::Other))
     } else {
         Ok(())
     }
@@ -6178,9 +6348,8 @@ fn provider_journal_after_phase_hook(phase: ProviderJournalPhase) -> Result<(), 
         }
     });
     if fail {
-        Err(ScenarioError::Io(format!(
-            "injected provider journal crash after {phase:?}"
-        )))
+        let _ = phase;
+        Err(ScenarioError::Io(ErrorKind::Other))
     } else {
         Ok(())
     }
@@ -6202,9 +6371,8 @@ fn provider_journal_boundary_hook(boundary: ProviderJournalBoundary) -> Result<(
         }
     });
     if fail {
-        Err(ScenarioError::Io(format!(
-            "injected provider journal crash at {boundary:?}"
-        )))
+        let _ = boundary;
+        Err(ScenarioError::Io(ErrorKind::Other))
     } else {
         Ok(())
     }
@@ -6225,9 +6393,7 @@ fn provider_scan_entry_visit() {
 fn provider_publication_after_publish_hook() -> Result<(), ScenarioError> {
     provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
     if FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE.with(|hook| hook.replace(false)) {
-        return Err(ScenarioError::Io(
-            "injected provider publication validation failure".into(),
-        ));
+        return Err(ScenarioError::Io(ErrorKind::Other));
     }
     Ok(())
 }
@@ -6236,9 +6402,7 @@ fn provider_publication_after_publish_hook() -> Result<(), ScenarioError> {
 fn provider_rename_after_move_hook() -> Result<(), ScenarioError> {
     provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
     if FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE.with(|hook| hook.replace(false)) {
-        return Err(ScenarioError::Io(
-            "injected provider rename validation failure".into(),
-        ));
+        return Err(ScenarioError::Io(ErrorKind::Other));
     }
     Ok(())
 }
@@ -6667,9 +6831,7 @@ fn shared_diagnostic_name_is_taken(
         return Ok(true);
     }
     drop(existing);
-    directory
-        .remove_file(name)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    directory.remove_file(name)?;
     sync_shared_provider_directory(directory)?;
     Ok(false)
 }
@@ -6786,11 +6948,8 @@ fn bounded_provider_files(
         if depth > MAX_PROVIDER_RESCAN_DEPTH {
             return Err(ScenarioError::ProviderRescanLimit);
         }
-        for entry in directory
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        for entry in directory.entries()? {
+            let entry = entry?;
             provider_scan_entry_visit();
             *entries = entries
                 .checked_add(1)
@@ -6809,9 +6968,7 @@ fn bounded_provider_files(
             if relative.len() > MAX_PROVIDER_PATH_BYTES || !valid_provider_path(&relative) {
                 return Err(ScenarioError::ProviderRescanLimit);
             }
-            let file_type = entry
-                .file_type()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            let file_type = entry.file_type()?;
             if file_type.is_symlink() {
                 return Err(ScenarioError::UnsafeProviderEntry(relative));
             }
@@ -7577,10 +7734,10 @@ mod tests {
 
         // (1) Unrelated identical destination. Threat: an honest concurrent
         // instance or a file-sync service already delivered a file carrying
-        // our canonical name. The exact object path revalidates and accepts
-        // byte-identical content without rewriting it; the plain manifest
-        // path refuses any pre-existing occupant outright and leaves it
-        // untouched.
+        // our canonical name. Every publication answers this the same way,
+        // because `publish` and `publish_exact` are one implementation:
+        // byte-identical content is accepted without rewriting it, and an
+        // occupant holding DIFFERENT bytes is refused and left untouched.
         {
             let (_root, provider_root, journal_root, mut transport) = open_fixture();
             let destination = destination_of(&provider_root);
@@ -7597,8 +7754,10 @@ mod tests {
                 .join(PROVIDER_MANIFESTS_NAMESPACE)
                 .join(format!("{manifest_id}.manifest"));
             std::fs::write(&manifest_path, b"occupant manifest bytes").unwrap();
+            // A DIFFERENT occupant at our canonical manifest name is still
+            // refused, and still left exactly as delivered.
             assert!(matches!(
-                transport.publish_manifest(manifest_id, b"occupant manifest bytes"),
+                transport.publish_manifest(manifest_id, b"our own manifest bytes"),
                 Err(ScenarioError::ProviderConflictingBytes(path))
                     if path.ends_with(".manifest")
             ));
@@ -7606,6 +7765,18 @@ mod tests {
                 std::fs::read(&manifest_path).unwrap(),
                 b"occupant manifest bytes"
             );
+            // A byte-identical occupant settles without rewriting it and
+            // without minting a journal record — the same answer the object
+            // path gives, and what lets a manifest's completed record be
+            // retired against provider state (§2.10c-i).
+            transport
+                .publish_manifest(manifest_id, b"occupant manifest bytes")
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&manifest_path).unwrap(),
+                b"occupant manifest bytes"
+            );
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
         }
 
         // (2) Deterministic staging-name collision. Threat: a previous
@@ -7663,7 +7834,7 @@ mod tests {
                     ));
                 assert!(matches!(
                     transport.publish_object_exact(ContentDigest::of(bytes), bytes),
-                    Err(ScenarioError::Io(message)) if message.contains("injected")
+                    Err(ScenarioError::Io(ErrorKind::Other))
                 ));
             }
             let staging = staging_path_of(&provider_root);
@@ -7970,7 +8141,7 @@ mod tests {
                 assert!(
                     matches!(
                         transport.publish_object_exact(ContentDigest::of(bytes), bytes),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                        Err(ScenarioError::Io(ErrorKind::Other))
                     ),
                     "{fault:?}"
                 );
@@ -8083,10 +8254,7 @@ mod tests {
                     ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
                 );
                 assert!(
-                    matches!(
-                        rename(&device, 7),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
-                    ),
+                    matches!(rename(&device, 7), Err(ScenarioError::Io(ErrorKind::Other))),
                     "{boundary:?}"
                 );
             }
@@ -8184,7 +8352,7 @@ mod tests {
                 );
                 assert!(matches!(
                     rename(&device, 7),
-                    Err(ScenarioError::Io(message)) if message.contains("injected provider rename")
+                    Err(ScenarioError::Io(ErrorKind::Other))
                 ));
             }
             assert!(!inbox.join("objects/source").exists());
@@ -8250,10 +8418,7 @@ mod tests {
                     ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
                 );
                 assert!(
-                    matches!(
-                        rename(&device, 7),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
-                    ),
+                    matches!(rename(&device, 7), Err(ScenarioError::Io(ErrorKind::Other))),
                     "{boundary:?}"
                 );
             }
@@ -8426,10 +8591,7 @@ mod tests {
                     ProviderRetryBoundary::Remove(ProviderRetryFault::AfterDurablePhase(phase)),
                 );
                 assert!(
-                    matches!(
-                        remove(&device, 7),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
-                    ),
+                    matches!(remove(&device, 7), Err(ScenarioError::Io(ErrorKind::Other))),
                     "{phase:?}"
                 );
             }
@@ -8464,10 +8626,7 @@ mod tests {
                     ProviderRetryBoundary::Remove(ProviderRetryFault::AtJournalBoundary(boundary)),
                 );
                 assert!(
-                    matches!(
-                        remove(&device, 7),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
-                    ),
+                    matches!(remove(&device, 7), Err(ScenarioError::Io(ErrorKind::Other))),
                     "{boundary:?}"
                 );
             }
@@ -8565,6 +8724,405 @@ mod tests {
 
     /// One private boundary inside the orphan-blob retirement that runs at
     /// journal open.
+    /// Harvest A2 acceptance gate. The provider retry journal's completed
+    /// store is bounded by LIVE PROVIDER STATE, not by the lifetime of the
+    /// store, and reaching its capacity never refuses the user's next
+    /// operation.
+    ///
+    /// Before this packet `completed/` grew by one hash-named record per
+    /// provider operation ever performed, nothing retired the ordinary cases,
+    /// and every publish/rename/remove failed outright with
+    /// `ProviderJournalLimit` once the store reached
+    /// `MAX_PROVIDER_JOURNAL_COMPLETED` — a stuck state reachable by ordinary
+    /// long use (I-10).
+    ///
+    /// The packet's claim has two halves with very different costs, so they
+    /// are two tests over one implementation:
+    ///
+    /// * **Steady state.** Compaction fires at
+    ///   `PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER` (64), so a few
+    ///   hundred operations already prove that `completed/` stops growing.
+    ///   That is the regression that catches the defect, and it runs here.
+    /// * **Never refusing past the structural cap.** The old
+    ///   `ProviderJournalLimit` refusal lived at
+    ///   `MAX_PROVIDER_JOURNAL_COMPLETED` (16_384), so exercising it needs
+    ///   real volume. That is the `#[ignore]`d variant below.
+    ///
+    /// Why split: at 20,000 operations this performed 20,000 real
+    /// `publish_object_exact` calls plus a directory scan every 997, which
+    /// exceeded nextest's 600s `profile.ci` cap under load. It has no timing
+    /// assertion — it is a resource-lifecycle test, not a benchmark — so a
+    /// timeout was pure harness cost, and the "fails first run, passes on
+    /// rerun" shape it produced is invisible to a baseline-by-names
+    /// comparison, because a test that finishes passes.
+    #[test]
+    fn provider_journal_completed_records_retire_against_live_provider_state() {
+        // Many multiples of the compaction trigger (64), which is what the
+        // steady-state assertions below actually measure.
+        exercise_provider_journal_completed_retirement(400);
+    }
+
+    /// The volume half: drive past `MAX_PROVIDER_JOURNAL_COMPLETED` (16_384)
+    /// by a clear margin, so the old capacity refusal would be exercised many
+    /// times over rather than skirted. Deliberate, not a CI gate — run it with
+    /// `cargo test -p tine-core --lib -- --ignored <name>` when changing the
+    /// journal's caps, its compaction trigger, or its retirement predicate.
+    #[test]
+    #[ignore = "20,000 real provider publications; exceeds the CI per-test cap. Run deliberately when changing journal caps or retirement."]
+    fn provider_journal_completed_store_never_refuses_past_its_structural_cap() {
+        exercise_provider_journal_completed_retirement(20_000);
+    }
+
+    fn exercise_provider_journal_completed_retirement(operations: usize) {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let completed_root = journal_root.join("completed");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+
+        // Sample often enough to actually observe the store rise toward the
+        // trigger and be compacted back, at any volume. A fixed stride tuned
+        // for 20,000 operations samples the 400-operation run exactly once, at
+        // index 0, which makes `peak_completed` report 1 and turns both peak
+        // assertions into tautologies. Roughly twenty samples either way, and
+        // never fewer than one per compaction cycle.
+        let sample_stride = (operations / 20)
+            .min(PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER)
+            .max(1);
+        let mut peak_completed = 0_usize;
+        for index in 0..operations {
+            let bytes = format!("harvest a2 provider object {index}").into_bytes();
+            provider
+                .publish_object_exact(ContentDigest::of(&bytes), &bytes)
+                .unwrap_or_else(|error| {
+                    panic!("publication {index} must never fail on journal capacity: {error}")
+                });
+            if index % sample_stride == 0 {
+                peak_completed = peak_completed.max(retained_dir_count(&completed_root));
+            }
+        }
+
+        let completed = retained_dir_count(&completed_root);
+        // The measured gate numbers, for the packet receipt and for anyone
+        // re-running this after changing the trigger.
+        eprintln!(
+            "harvest A2 gate: {operations} completed provider operations, \
+             peak completed/ {peak_completed}, final completed/ {completed}, \
+             trigger {PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER}, \
+             structural bound {MAX_PROVIDER_JOURNAL_COMPLETED}"
+        );
+        assert!(
+            completed <= PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER,
+            "{operations} completed operations left {completed} records, \
+             which is lifetime growth, not a steady state"
+        );
+        assert!(
+            peak_completed <= PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER,
+            "the completed store peaked at {peak_completed} records"
+        );
+        // The compaction must have actually run: `operations` records could not
+        // otherwise fit under the trigger.
+        assert!(peak_completed > 0);
+
+        // A reopen revalidates the whole authenticated journal graph. A
+        // compacted store must still pass that validation.
+        drop(provider);
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+
+        // Ordinary work continues past the old cap, in both directions the
+        // retirement predicate distinguishes: a destination still present
+        // (reflected) and one a provider lost (moot).
+        let reflected: &[u8] = b"harvest a2 provider object 0";
+        provider
+            .publish_object_exact(ContentDigest::of(reflected), reflected)
+            .unwrap();
+        let lost_path = provider_root.join("outbox").join(format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(reflected)
+        ));
+        std::fs::remove_file(&lost_path).unwrap();
+        provider
+            .publish_object_exact(ContentDigest::of(reflected), reflected)
+            .unwrap();
+        assert_eq!(std::fs::read(&lost_path).unwrap(), reflected);
+    }
+
+    /// Retiring a completed record must not cost an exact repeat of its
+    /// operation its idempotency, and must not cost a genuine conflict its
+    /// refusal. Both answers move from the journal record to live provider
+    /// state; neither answer changes.
+    #[test]
+    fn retired_completed_provider_records_still_settle_exact_repeat_operations() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let completed_root = journal_root.join("completed");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+
+        let object: &[u8] = b"retired completed record object";
+        let manifest_batch = BatchId::new();
+        let manifest: &[u8] = b"retired completed record manifest";
+        let descriptor: &[u8] = b"retired completed record descriptor";
+        provider
+            .publish_object_exact(ContentDigest::of(object), object)
+            .unwrap();
+        provider.publish_manifest(manifest_batch, manifest).unwrap();
+        provider.publish_descriptor(descriptor).unwrap();
+        assert_eq!(retained_dir_count(&completed_root), 3);
+
+        // One destination is lost the way a file-sync service can lose one,
+        // so the sweep must exercise BOTH retirement reasons in one run.
+        let object_path = provider_root.join("outbox").join(format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(object)
+        ));
+        std::fs::remove_file(&object_path).unwrap();
+
+        let compaction = {
+            let gate = provider.journal.acquire_transaction_gate().unwrap();
+            provider
+                .journal
+                .reconcile_completed_against_provider(&gate, &provider.runtime)
+                .unwrap()
+        };
+        assert_eq!(compaction.retired(), 3);
+        assert_eq!(compaction.moot, 1, "the lost object destination is moot");
+        assert_eq!(
+            compaction.reflected, 2,
+            "the manifest and descriptor destinations are still there"
+        );
+        assert_eq!(retained_dir_count(&completed_root), 0);
+
+        // Exact repeats settle from provider state alone.
+        provider.publish_manifest(manifest_batch, manifest).unwrap();
+        provider.publish_descriptor(descriptor).unwrap();
+        assert_eq!(
+            std::fs::read(
+                provider_root
+                    .join("outbox")
+                    .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+            )
+            .unwrap(),
+            descriptor
+        );
+        // The moot one republishes rather than settling.
+        provider
+            .publish_object_exact(ContentDigest::of(object), object)
+            .unwrap();
+        assert_eq!(std::fs::read(&object_path).unwrap(), object);
+
+        // And a genuine conflict is still a conflict: the same canonical name
+        // with different bytes must refuse, exactly as it did while the
+        // completed record was retained.
+        assert!(matches!(
+            provider.publish_descriptor(b"a different descriptor"),
+            Err(ScenarioError::ProviderConflictingBytes(path)) if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH
+        ));
+    }
+
+    /// Compaction needs no generation directory or commit pointer: every
+    /// completed record is independently retirable and its retirement is
+    /// idempotent, so a crash part-way through leaves a prefix retired and the
+    /// rest untouched — a state the next sweep reaches again.
+    #[test]
+    fn a_crash_across_completed_record_retirement_reopens_and_still_settles() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let completed_root = journal_root.join("completed");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+
+        let first: &[u8] = b"crash across retirement first object";
+        let second: &[u8] = b"crash across retirement second object";
+        provider
+            .publish_object_exact(ContentDigest::of(first), first)
+            .unwrap();
+        provider
+            .publish_object_exact(ContentDigest::of(second), second)
+            .unwrap();
+        assert_eq!(retained_dir_count(&completed_root), 2);
+
+        {
+            let _fault = install_provider_retry_boundary_fault_for_test(
+                ProviderRetryBoundary::Put(ProviderRetryFault::AtJournalBoundary(
+                    ProviderJournalBoundary::CompletionRetired,
+                )),
+            );
+            let gate = provider.journal.acquire_transaction_gate().unwrap();
+            assert!(matches!(
+                provider
+                    .journal
+                    .reconcile_completed_against_provider(&gate, &provider.runtime),
+                Err(ScenarioError::Io(ErrorKind::Other))
+            ));
+        }
+        assert_eq!(
+            retained_dir_count(&completed_root),
+            1,
+            "the crash cut the sweep after exactly one retirement"
+        );
+
+        // Crash/power cut: all process state is lost and only the on-disk
+        // provider tree and private journal survive.
+        drop(provider);
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider
+            .publish_object_exact(ContentDigest::of(first), first)
+            .unwrap();
+        provider
+            .publish_object_exact(ContentDigest::of(second), second)
+            .unwrap();
+        // The republished object whose record the sweep already retired
+        // settled from provider state and minted no new record; the one whose
+        // record survived the crash settled from that record. Either way the
+        // survivor is still retirable.
+        let compaction = {
+            let gate = provider.journal.acquire_transaction_gate().unwrap();
+            provider
+                .journal
+                .reconcile_completed_against_provider(&gate, &provider.runtime)
+                .unwrap()
+        };
+        assert_eq!(compaction.retired(), 1);
+        assert_eq!(compaction.reflected, 1);
+        assert_eq!(retained_dir_count(&completed_root), 0);
+    }
+
+    /// A retired completed RENAME record leaves its idempotency to this
+    /// device's own retirement diagnostic — and to nothing weaker. A rename
+    /// whose destination merely happens to exist is still an unknown source
+    /// path, so retirement cannot be blind.
+    #[test]
+    fn retired_completed_rename_settles_only_on_its_own_retirement_evidence() {
+        let bytes: &[u8] = b"retired completed rename bytes";
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+        let completed_root = root.0.join("provider-local-journal/completed");
+
+        run_provider_rename(
+            &device,
+            7,
+            ProviderTree::Inbox,
+            "objects/source",
+            "objects/destination",
+        )
+        .unwrap();
+        assert_eq!(retained_dir_count(&completed_root), 1);
+
+        let journal = device.provider_journal.as_ref().unwrap();
+        let compaction = {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &device.provider)
+                .unwrap()
+        };
+        assert_eq!(compaction.reflected, 1);
+        assert_eq!(retained_dir_count(&completed_root), 0);
+
+        // The exact repeat settles from the retirement diagnostic.
+        run_provider_rename(
+            &device,
+            7,
+            ProviderTree::Inbox,
+            "objects/source",
+            "objects/destination",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(inbox.join("objects/destination")).unwrap(),
+            bytes
+        );
+        // Necessity: the settle is evidence-bound, not "the destination
+        // exists". A different event, a different source, or a destination
+        // this device never produced is still an unknown source path.
+        assert!(matches!(
+            run_provider_rename(
+                &device,
+                9,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination"
+            ),
+            Err(ScenarioError::UnknownProviderPath(path)) if path == "objects/source"
+        ));
+        assert!(matches!(
+            run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/other-source",
+                "objects/destination"
+            ),
+            Err(ScenarioError::UnknownProviderPath(path)) if path == "objects/other-source"
+        ));
+    }
+
+    /// A retired completed REMOVE leaves both of its answers to provider
+    /// state: a caller that settles when its target is already absent still
+    /// settles, and a caller that requires the target present gets the same
+    /// unknown-path answer that policy gives for any absent source.
+    #[test]
+    fn retired_completed_remove_settles_for_the_policy_that_tolerates_absence() {
+        let bytes: &[u8] = b"retired completed remove bytes";
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        std::fs::write(inbox.join("objects/removed-source"), bytes).unwrap();
+        let completed_root = root.0.join("provider-local-journal/completed");
+
+        run_provider_remove(&device, 11, ProviderTree::Inbox, "objects/removed-source").unwrap();
+        assert!(!inbox.join("objects/removed-source").exists());
+        assert_eq!(retained_dir_count(&completed_root), 1);
+
+        let journal = device.provider_journal.as_ref().unwrap();
+        let compaction = {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &device.provider)
+                .unwrap()
+        };
+        assert_eq!(compaction.reflected, 1);
+        assert_eq!(retained_dir_count(&completed_root), 0);
+
+        run_provider_remove_with(
+            &device.provider,
+            journal,
+            &device.name,
+            11,
+            ProviderTree::Inbox,
+            "objects/removed-source",
+            None,
+            ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
+        )
+        .unwrap();
+        assert!(matches!(
+            run_provider_remove(&device, 11, ProviderTree::Inbox, "objects/removed-source"),
+            Err(ScenarioError::UnknownProviderPath(path)) if path == "objects/removed-source"
+        ));
+
+        // The same bytes come back at the same path, the way a file-sync
+        // service redelivers one. The exact repeat settles from this device's
+        // own retirement diagnostic — as the retained completed record used to
+        // make it settle — and leaves the redelivered file alone rather than
+        // deleting it on the strength of an old authorization.
+        std::fs::write(inbox.join("objects/removed-source"), bytes).unwrap();
+        run_provider_remove(&device, 11, ProviderTree::Inbox, "objects/removed-source").unwrap();
+        assert_eq!(
+            std::fs::read(inbox.join("objects/removed-source")).unwrap(),
+            bytes
+        );
+        assert_eq!(retained_dir_count(&completed_root), 0);
+
+        // Necessity: the settle is bound to this device's evidence for this
+        // exact operation, never to "the path is there". A different event id
+        // over the same path is an ordinary, authorized removal.
+        run_provider_remove(&device, 12, ProviderTree::Inbox, "objects/removed-source").unwrap();
+        assert!(!inbox.join("objects/removed-source").exists());
+        assert_eq!(retained_dir_count(&completed_root), 1);
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ProviderOrphanBoundary {
         /// Crash/power cut right after the unowned creation blob moved into
@@ -8657,7 +9215,7 @@ mod tests {
                     ));
                 assert!(matches!(
                     transport.publish_object_exact(ContentDigest::of(bytes), bytes),
-                    Err(ScenarioError::Io(message)) if message.contains("injected")
+                    Err(ScenarioError::Io(ErrorKind::Other))
                 ));
             }
             drop(transport);
@@ -8692,7 +9250,7 @@ mod tests {
                 assert!(
                     matches!(
                         SharedProviderTransport::open(&provider_root, &journal_root),
-                        Err(ScenarioError::Io(message)) if message.contains("journal crash")
+                        Err(ScenarioError::Io(ErrorKind::Other))
                     ),
                     "{boundary:?}"
                 );
@@ -8824,7 +9382,7 @@ mod tests {
                 install_provider_orphan_boundary_fault_for_test(ProviderOrphanBoundary::Restored);
             assert!(matches!(
                 SharedProviderTransport::open(&provider_root, &journal_root),
-                Err(ScenarioError::Io(message)) if message.contains("journal crash")
+                Err(ScenarioError::Io(ErrorKind::Other))
             ));
             drop(race);
             drop(fault);
@@ -9642,14 +10200,9 @@ mod tests {
             let refusal = transport
                 .publish_object_exact(ContentDigest::of(bytes), bytes)
                 .expect_err("a real I/O error on the flagged rename must not be tolerated");
-            let ScenarioError::Io(detail) = &refusal else {
-                panic!("expected a filesystem refusal: {refusal:?}");
-            };
-            assert!(
-                detail.contains(PROVIDER_NOREPLACE_RENAME_PRIMITIVE)
-                    && detail.contains("quarantining abandoned shared provider staging")
-                    && detail.contains("->"),
-                "the refusal must name its operation and both names: {detail}"
+            assert_eq!(
+                refusal,
+                ScenarioError::Io(std::io::Error::from_raw_os_error(libc::EIO).kind())
             );
             assert_eq!(
                 std::fs::read(&staging).unwrap(),
@@ -9721,7 +10274,7 @@ mod tests {
                             "objects/source",
                             "objects/destination",
                         ),
-                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                        Err(ScenarioError::Io(ErrorKind::Other))
                     ),
                     "{boundary:?} must be reachable on the fallback path"
                 );
@@ -10265,7 +10818,8 @@ pub enum ScenarioError {
     ProviderRescanLimit,
     ProviderJournalLimit,
     UnsafeProviderJournal(String),
-    Io(String),
+    Io(std::io::ErrorKind),
+    Json(serde_json::error::Category),
     NonCanonical,
 }
 
@@ -10288,10 +10842,44 @@ impl fmt::Display for ScenarioError {
             Self::UnsafeProviderJournal(entry) => {
                 write!(f, "unsafe provider retry journal: {entry}")
             }
-            Self::Io(error) => write!(f, "scenario filesystem operation failed: {error}"),
+            Self::Io(kind) => write!(f, "scenario filesystem operation failed: {kind:?}"),
+            Self::Json(category) => {
+                write!(f, "scenario JSON operation failed: {category:?}")
+            }
             Self::NonCanonical => f.write_str("scenario bytes are not canonical"),
         }
     }
 }
 
 impl std::error::Error for ScenarioError {}
+
+impl From<std::io::Error> for ScenarioError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+impl From<serde_json::Error> for ScenarioError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error.classify())
+    }
+}
+
+impl From<super::object_store::StoreError> for ScenarioError {
+    fn from(error: super::object_store::StoreError) -> Self {
+        match error {
+            super::object_store::StoreError::Io(error) => Self::Io(error.kind()),
+            _ => Self::NonCanonical,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn scenario_io_error_keeps_only_the_typed_error_kind() {
+    let error: ScenarioError = std::io::Error::from(std::io::ErrorKind::NotFound).into();
+    assert!(matches!(
+        error,
+        ScenarioError::Io(std::io::ErrorKind::NotFound)
+    ));
+}

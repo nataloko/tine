@@ -7,6 +7,7 @@ import {
   createSignal,
   createUniqueId,
   onCleanup,
+  type Accessor,
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
@@ -25,19 +26,29 @@ import {
   MARKERS,
   PRIORITIES,
   BETWEEN_FIELDS,
+  MAX_QUERY_BUILDER_DEPTH,
   SORT_PRESETS,
   type Clause,
   type BetweenField,
   type SortPreset,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
-import { openFormulaEditor, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { sharedQueryResult } from "../queryResultCache";
+import {
+  dataRev,
+  graphEpoch,
+  graphMeta,
+  openFormulaEditor,
+  pushToast,
+  queryBuilderAutoOpen,
+  setQueryBuilderAutoOpen,
+} from "../ui";
 import { blockProperty, doc, formatForBlock, pageByName } from "../store";
 import { facetsOf } from "../render/facets";
 import { pageProperties } from "../render/block";
 import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import { decodeFormulaExpr } from "../sheet/formula";
-import { registerTransientLayer, type TransientLayer } from "../transientLayers";
+import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
 // The DSL text is the single source of truth — we parse it to a tree, apply an
@@ -47,15 +58,29 @@ import { registerTransientLayer, type TransientLayer } from "../transientLayers"
 // `stop` keeps clicks inside the bar from bubbling to the block's onClick, which
 // would drop the block into raw-text edit mode and replace the builder.
 const stop = (e: MouseEvent) => e.stopPropagation();
+
+type QueryFacets = [string, string[]][];
+type QueryFacetsAccessor = Accessor<QueryFacets | undefined>;
 const locKey = (l: number[]) => l.join(".");
 
 type ClauseKind = Clause["kind"];
 
+// Every popover in the bar — clause menu, add-filter picker, sort, summarize —
+// registers here, so all four answer Escape/Back AND "the user pressed somewhere
+// else" the same way. GH #472 is what happens when they do not: two of the four
+// had hand-rolled the outside-press effect and two had not, so a clause menu
+// stayed open while the user clicked into and edited a different block.
+// The trigger is passed as inside-the-popover so its own click can toggle.
 function registerVisiblePopover(open: () => boolean, layer: TransientLayer) {
   createEffect(() => {
     if (!open()) return;
     const unregister = registerTransientLayer(layer);
     onCleanup(unregister);
+  });
+  dismissOnOutsidePointer({
+    open,
+    inside: () => [layer.root?.(), layer.trigger?.()],
+    dismiss: () => layer.dismiss("explicit"),
   });
 }
 
@@ -112,7 +137,6 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
   // The free-text escape hatch: sort by an arbitrary property name.
   const [field, setField] = createSignal("");
   const [dir, setDir] = createSignal<"asc" | "desc">("asc");
-  let wrapEl: HTMLSpanElement | undefined;
   let triggerEl: HTMLButtonElement | undefined;
   let pickerEl: HTMLDivElement | undefined;
   const layerId = `query-sort-${createUniqueId()}`;
@@ -122,17 +146,6 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
     root: () => pickerEl ?? null,
     trigger: () => triggerEl ?? null,
     dismiss: () => { setOpen(false); return true; },
-  });
-  // Dismiss the popover when clicking anywhere outside it (another chip, the bar
-  // background, or off the block). Capture phase so it fires regardless of the
-  // bar's stopPropagation; only active while open.
-  createEffect(() => {
-    if (!open()) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapEl && !wrapEl.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown, true);
-    onCleanup(() => document.removeEventListener("mousedown", onDown, true));
   });
   const isPreset = (c: { field: string; dir: "asc" | "desc" } | null) =>
     !!c && SORT_PRESETS.some((p) => p.field === c.field && p.dir === c.dir);
@@ -162,7 +175,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
     setOpen(false);
   };
   return (
-    <span class="qb-add-wrap" ref={wrapEl}>
+    <span class="qb-add-wrap">
       {/* A stable "+ sort" affordance — it does NOT morph into the current sort
           value (the active sort shows as its own chip in the bar). It just gains
           an `active` highlight and opens the popover to change/clear. */}
@@ -171,7 +184,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
         class="qb-sort"
         classList={{ active: !!cur() }}
         title={cur() ? `Sorted by ${clauseLabel({ kind: "sortBy", field: cur()!.field, dir: cur()!.dir })}. Click to change.` : "Sort results"}
-        onClick={(e) => { stop(e); openPopover(); }}
+        onClick={(e) => { stop(e); open() ? setOpen(false) : openPopover(); }}
       >
         + sort
       </button>
@@ -224,17 +237,15 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
 // independent (you can group by page AND count per group). The numbers are
 // computed in the frontend from the returned block list (Macro.tsx); this just
 // edits the DSL directive that rides along.
-function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; parentTransientId?: string }): JSX.Element {
+function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; facets: QueryFacetsAccessor; parentTransientId?: string }): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
   // pick a property to aggregate; "group" = pick a property to group by.
   const [pick, setPick] = createSignal<"sum" | "avg" | "group" | null>(null);
-  const [facets] = createResource(() => backend().queryFacets());
-  const keys = () => (facets() ?? []).map(([k]) => k);
+  const keys = () => (props.facets() ?? []).map(([k]) => k);
   const agg = () => currentAgg(props.tree());
   const group = () => currentGroup(props.tree());
   const active = () => !!agg() || !!group();
-  let wrapEl: HTMLSpanElement | undefined;
   let triggerEl: HTMLButtonElement | undefined;
   let pickerEl: HTMLDivElement | undefined;
   const layerId = `query-summarize-${createUniqueId()}`;
@@ -244,14 +255,6 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
     root: () => pickerEl ?? null,
     trigger: () => triggerEl ?? null,
     dismiss: () => { setOpen(false); return true; },
-  });
-  createEffect(() => {
-    if (!open()) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapEl && !wrapEl.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown, true);
-    onCleanup(() => document.removeEventListener("mousedown", onDown, true));
   });
   const openPopover = () => {
     setPick(null);
@@ -279,7 +282,7 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
     return parts.join(", ");
   };
   return (
-    <span class="qb-add-wrap" ref={wrapEl}>
+    <span class="qb-add-wrap">
       <button
         ref={triggerEl}
         class="qb-sort"
@@ -364,6 +367,21 @@ export function QueryBuilder(props: {
   parentTransientId?: string;
 }): JSX.Element {
   const tree = createMemo(() => parseQuery(props.dsl()));
+  // N builders on one page asked the SAME whole-graph facets question N times
+  // per (graphEpoch, dataRev). The scope is per-builder by decision (P0), so the
+  // fix is not a shared scope but a shared REQUEST: `sharedQueryResult` collapses
+  // identical in-flight/resolved work under its own key namespace, exactly as the
+  // page-tag query does. `queryFacets(true)` (autocomplete) asks a different
+  // question and deliberately keeps its own path. Harvest W4-P1 item 3.
+  const [facets] = createResource(
+    () => `${graphEpoch()}\0${dataRev()}`,
+    (requestKey) =>
+      sharedQueryResult(
+        `${graphMeta()?.root ?? ""}\0${graphEpoch()}`,
+        `query-facets\0${requestKey}`,
+        () => backend().queryFacets(),
+      ),
+  );
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
   // Open the root add-picker immediately when this block was just created via
@@ -382,7 +400,9 @@ export function QueryBuilder(props: {
   // (block builtins + the property keys used across the graph); `formulas` are the
   // named formulas the expression may reference (`formula.x`), taken from the query
   // block's own + its page's `tine.formula.*` properties, mirroring the sheet views.
-  const [facets] = createResource(() => backend().queryFacets());
+  // FORK: the field hints read the SHARED `facets` resource above rather than
+  // asking `queryFacets()` again — one whole-graph facets question per
+  // (graphEpoch, dataRev) for the whole bar, ƒ filter included.
   const filterFields = () => [...BUILTIN_FILTER_FIELDS, ...(facets() ?? []).map(([k]) => k)];
   const queryFormulas = createMemo<[string, string][]>(() => {
     const blockId = props.blockId;
@@ -415,11 +435,11 @@ export function QueryBuilder(props: {
 
   return (
     <div class="qb-bar" onClick={stop}>
-      <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply}
+      <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply} facets={facets}
         openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
         parentTransientId={props.parentTransientId} />
       <SortControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
-      <SummarizeControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
+      <SummarizeControl tree={tree} apply={apply} facets={facets} parentTransientId={props.parentTransientId} />
       <Show when={props.blockId}>
         <button
           class="qb-sort qb-advanced"
@@ -461,6 +481,7 @@ interface NodeCtx {
   clause: Clause;
   tree: () => Clause;
   apply: (next: Clause) => void;
+  facets: QueryFacetsAccessor;
   openMenu: () => string | null;
   setOpenMenu: (k: string | null) => void;
   adding: () => string | null;
@@ -469,6 +490,9 @@ interface NodeCtx {
 }
 
 function Node(props: NodeCtx): JSX.Element {
+  if (props.loc.length >= MAX_QUERY_BUILDER_DEPTH) {
+    return <span class="qb-depth-limit">Query nesting truncated at {MAX_QUERY_BUILDER_DEPTH} levels</span>;
+  }
   const isOp = () => props.clause.kind === "op";
   const op = () => props.clause as Clause & { kind: "op" };
 
@@ -613,7 +637,7 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
           </>
         }>
           <div class="qb-picker-title">Edit value</div>
-          <ValuePicker kind={editKind()} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
+          <ValuePicker facets={props.facets} kind={editKind()} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
         </Show>
       </div>
     </Show>
@@ -652,6 +676,7 @@ function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
       </button>
       <Show when={open()}>
         <AddPicker
+          facets={props.facets}
           rootRef={(element) => { pickerEl = element; }}
           onCommit={(c) => props.apply(addChild(props.tree(), props.loc, c))}
           onSetOp={(op) => props.apply(setOp(props.tree(), props.loc, op))}
@@ -682,6 +707,7 @@ const FILTER_TYPES: { kind: ClauseKind; label: string }[] = [
 ];
 
 function AddPicker(props: {
+  facets: QueryFacetsAccessor;
   onCommit: (c: Clause) => void;
   onSetOp: (op: "and" | "or") => void;
   rootRef?: (element: HTMLDivElement) => void;
@@ -717,7 +743,7 @@ function AddPicker(props: {
         </For>
       </Show>
       <Show when={step() !== "type"}>
-        <ValuePicker kind={step() as ClauseKind} onCommit={commit} />
+        <ValuePicker facets={props.facets} kind={step() as ClauseKind} onCommit={commit} />
       </Show>
     </div>
   );
@@ -725,7 +751,7 @@ function AddPicker(props: {
 
 // Renders the value collector for a given clause kind. Shared by the add-filter
 // picker and the in-place "Edit value" flow.
-function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void }): JSX.Element {
+function ValuePicker(props: { facets: QueryFacetsAccessor; kind: ClauseKind; onCommit: (c: Clause) => void }): JSX.Element {
   return (
     <>
       <Show when={props.kind === "page"}>
@@ -738,7 +764,7 @@ function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void })
         <MultiPick options={PRIORITIES} onCommit={(levels) => props.onCommit({ kind: "priority", levels })} />
       </Show>
       <Show when={props.kind === "property"}>
-        <PropertyPick onCommit={(key, value) => props.onCommit({ kind: "property", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "property", key, value })} />
       </Show>
       <Show when={props.kind === "between"}>
         <BetweenPick onCommit={(field, start, end) => props.onCommit({ kind: "between", field, start, end })} />
@@ -750,7 +776,7 @@ function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void })
         <PageInput placeholder="Namespace (parent page)" onCommit={(ns) => props.onCommit({ kind: "namespace", ns })} />
       </Show>
       <Show when={props.kind === "pageProperty"}>
-        <PropertyPick onCommit={(key, value) => props.onCommit({ kind: "pageProperty", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "pageProperty", key, value })} />
       </Show>
       <Show when={props.kind === "content"}>
         <TextInput placeholder="Text to search for" onCommit={(text) => props.onCommit({ kind: "content", text })} />
@@ -844,12 +870,11 @@ function MultiPick(props: { options: string[]; onCommit: (picked: string[]) => v
 
 // Property: choose a key (autocompleted from used properties), then a value
 // (from that key's known values, "any", or free text).
-function PropertyPick(props: { onCommit: (key: string, value: string | null) => void }): JSX.Element {
-  const [facets] = createResource(() => backend().queryFacets());
+function PropertyPick(props: { facets: QueryFacetsAccessor; onCommit: (key: string, value: string | null) => void }): JSX.Element {
   const [key, setKey] = createSignal("");
   const [chosen, setChosen] = createSignal<string | null>(null);
-  const keys = () => (facets() ?? []).map(([k]) => k);
-  const valuesFor = (k: string) => (facets() ?? []).find(([kk]) => kk === k)?.[1] ?? [];
+  const keys = () => (props.facets() ?? []).map(([k]) => k);
+  const valuesFor = (k: string) => (props.facets() ?? []).find(([kk]) => kk === k)?.[1] ?? [];
   const [val, setVal] = createSignal("");
 
   return (

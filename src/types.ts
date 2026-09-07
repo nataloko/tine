@@ -108,15 +108,11 @@ export interface EditorActivationHandle {
  *
  * Direct Files may return the activation that now owns a successful first
  * creation (including its resolved target). Managed storage keeps its existing
- * revision-only semantics and therefore omits `activation`. The string arm is
- * retained for compatibility with older/mock managed backends during the
- * transport transition. */
-export type SavePageResult =
-  | string
-  | {
-      revision: string;
-      activation?: EditorActivationHandle;
-    };
+ * revision-only semantics and therefore omits `activation`. */
+export type SavePageResult = {
+  revision: string;
+  activation?: EditorActivationHandle;
+};
 
 /** One authoritative Journals-feed transaction.  Cursor fields are ordinal
  * journal days, never counts of returned DTOs (a selected file may vanish). */
@@ -990,6 +986,10 @@ export interface GraphMeta {
   shortcuts: Record<string, string>;
   start_of_week: number; // Logseq :start-of-week, 0=Monday … 6=Sunday (default 6)
   block_hidden_properties: string[];
+  /** Logseq `:ref/linked-references-collapsed-threshold` — a page opens its
+   *  Linked References collapsed once the total backlink count reaches this.
+   *  Absent or non-integer in config.edn means OG's default, 100. */
+  linked_references_collapsed_threshold: number;
   default_journal_template: string | null;
   /** Graph-portable startup page from config.edn `:default-home {:page "..."}`. */
   default_home?: string | null;

@@ -106,69 +106,122 @@ fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
     assert_eq!(page_header_property_line("a b:: v"), None);
 }
 
-// DUP guard (2026-08-25 duplication audit): the `BlockDto` → `DocBlock`
-// field mapping existed as TWO inline copies (here in
-// `dto_blocks_to_doc_checked` and in `query.rs::application_query_doc_block`)
-// that had to be kept in agreement manually. The mapping is the contract —
-// which DTO fields carry into the parseable tree (and that the lazy
-// projection starts empty) — so it is one function and this source guard
-// forbids a second spelling.
+// I-12: every production `DocBlock` literal is a reviewed constructor boundary.
+// This is syntax-aware so a renamed `uuid: dto.id.clone()` mapping cannot evade
+// the old substring check. Managed DTO conversions use
+// `dto_block_to_doc_block`; cheap raw-only leaves use `DocBlock::new`.
 #[test]
-fn only_one_blockdto_to_docblock_field_mapping_exists() {
-    let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut spellings = Vec::new();
-    let mut stack = vec![crate_src];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
+fn production_docblock_struct_literals_are_reviewed() {
+    use syn::visit::{self, Visit};
+
+    #[derive(Default)]
+    struct Literals {
+        owner: Option<String>,
+        owners: std::collections::BTreeSet<String>,
+    }
+    fn test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("test")
+                || (attribute.path().is_ident("cfg")
+                    && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test")))
+        })
+    }
+    impl<'ast> Visit<'ast> for Literals {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if test_only(&item.attrs) {
+                return;
             }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
+            let previous = self.owner.replace(item.sig.ident.to_string());
+            visit::visit_item_fn(self, item);
+            self.owner = previous;
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if test_only(&item.attrs) {
+                return;
             }
-            // An externalised test module (`#[cfg(test)] #[path = "x_tests.rs"]
-            // mod tests;` in the sibling `x.rs`) is entirely test code, so it
-            // is skipped whole rather than split. Proving the declaration
-            // exists — instead of trusting the `_tests.rs` name — is what keeps
-            // this exclusion from quietly swallowing a production file.
-            if let Some(owner) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.strip_suffix("_tests"))
-            {
-                let owner_path = path.with_file_name(format!("{owner}.rs"));
-                let declaration = format!(
-                    "#[path = \"{}\"]",
-                    path.file_name().unwrap().to_string_lossy()
-                );
-                if std::fs::read_to_string(&owner_path)
-                    .is_ok_and(|owner_source| owner_source.contains(&declaration))
-                {
-                    continue;
-                }
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
-            // Only production code counts: the trailing `mod tests` pins and
-            // documents the rule (inline cfg(test) items above it are rare
-            // and contain no DTO conversion).
-            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            if production.contains("uuid: block.id.clone()") {
-                spellings.push(
-                    path.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+            let previous = self.owner.replace(item.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, item);
+            self.owner = previous;
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_mod(self, item);
             }
         }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if expression
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "DocBlock")
+            {
+                self.owners.insert(
+                    self.owner
+                        .clone()
+                        .expect("a production DocBlock literal has an enclosing item"),
+                );
+            }
+            visit::visit_expr_struct(self, expression);
+        }
     }
-    spellings.sort();
+
+    let allowed = [
+        (
+            "crates/tine-core/src/doc.rs",
+            "clone",
+            "Clone resets the lazy projection memo",
+        ),
+        (
+            "crates/tine-core/src/doc.rs",
+            "new",
+            "DocBlock::new is the raw-only canonical constructor",
+        ),
+        (
+            "crates/tine-core/src/model.rs",
+            "dto_block_to_doc_block",
+            "the one BlockDto field mapping",
+        ),
+        (
+            "crates/tine-core/src/pdf.rs",
+            "highlight_block",
+            "PDF import constructs parser-native highlight blocks",
+        ),
+        (
+            "crates/tine-core/src/query.rs",
+            "property_projection",
+            "page pre-block projection has no BlockDto source",
+        ),
+    ];
+    let reasons = allowed
+        .iter()
+        .map(|(file, owner, reason)| ((*file, *owner), *reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut actual = Vec::new();
+    for file in crate::projection_producer_census::production_rust() {
+        let syntax = syn::parse_file(&file.raw)
+            .unwrap_or_else(|error| panic!("{} is valid Rust: {error}", file.relative));
+        let mut literals = Literals::default();
+        literals.visit_file(&syntax);
+        for owner in literals.owners {
+            let reason = reasons
+                .get(&(file.relative.as_str(), owner.as_str()))
+                .copied()
+                .unwrap_or("UNCLASSIFIED: use dto_block_to_doc_block or DocBlock::new");
+            actual.push((file.relative.as_str(), owner, reason));
+        }
+    }
+    actual.sort();
+    let mut expected = allowed
+        .into_iter()
+        .map(|(file, owner, reason)| (file, owner.to_owned(), reason))
+        .collect::<Vec<_>>();
+    expected.sort();
     assert_eq!(
-        spellings,
-        vec!["src/model.rs"],
-        "the BlockDto -> DocBlock field mapping must stay in exactly one function"
+        actual, expected,
+        "I-12: every production DocBlock literal is reviewed; managed DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
     );
 }
 
@@ -7347,6 +7400,48 @@ fn copy_tree(source: &Path, destination: &Path) {
 ///
 /// Opt-in, because it needs a corpus this repository does not ship:
 /// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
+/// Wave 3 Cc C6 acceptance gate over the anonymized corpus, through the
+/// MANAGED constructor (`managed_entry_for_managed_path`), not the graph-wide
+/// converter that `crates/tine-core/tests/graph.rs::managed_inventory_kind_census`
+/// exercises. Prints aggregate kind counts only; corpus content is never
+/// printed. Before C6 every eligible file under `journals/` was a Journal
+/// regardless of its stem; after C6 identity follows the journal-title parse,
+/// so a `journals/<non-date>.md` file is a Page, as in OG and Direct mode.
+#[test]
+#[ignore = "manual Wave 3 Cc gate: managed-constructor inventory kinds; set TINE_MANAGED_INVENTORY_CENSUS_GRAPH"]
+fn managed_constructor_inventory_kind_census() {
+    let Some(source) = std::env::var_os("TINE_MANAGED_INVENTORY_CENSUS_GRAPH") else {
+        eprintln!("skipped: set TINE_MANAGED_INVENTORY_CENSUS_GRAPH to a corpus directory");
+        return;
+    };
+    let graph = Graph::open(PathBuf::from(source));
+    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
+    let (mut pages, mut journals, mut journal_dir_pages, mut rejected) =
+        (0usize, 0usize, 0usize, 0usize);
+    for (path, _bytes) in &inventory {
+        match graph.managed_entry_for_managed_path(path) {
+            Ok(entry) => match entry.kind {
+                PageKind::Journal => journals += 1,
+                PageKind::Page => {
+                    pages += 1;
+                    if entry.rel_path.starts_with("journals/") {
+                        journal_dir_pages += 1;
+                    }
+                }
+            },
+            Err(_) => rejected += 1,
+        }
+    }
+    eprintln!(
+        "managed_constructor_inventory_kind_census total={} pages={} journals={} journal_dir_pages={} rejected={}",
+        inventory.len(),
+        pages,
+        journals,
+        journal_dir_pages,
+        rejected
+    );
+}
+
 /// the source is never mutated.
 #[test]
 #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]
@@ -7386,6 +7481,41 @@ fn real_graph_direct_save_does_not_rebuild_the_identity_index() {
         builds_before, builds_after,
         "a warm Direct save rebuilt the whole-graph identity index on a real graph; \
              the inventory's Direct-path verdict is wrong"
+    );
+}
+
+#[test]
+#[ignore = "manual W4-E4 gate: unchanged Direct saves on an anonymized corpus copy"]
+fn direct_save_typed_errors_accept_anonymized_corpus_copy() {
+    let root = fs::canonicalize(PathBuf::from(
+        std::env::var_os("TINE_DIRECT_SAVE_CORPUS_COPY")
+            .expect("set TINE_DIRECT_SAVE_CORPUS_COPY to a disposable anonymized graph copy"),
+    ))
+    .expect("the disposable anonymized graph copy must be readable");
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let mut attempted = 0_usize;
+    let mut failures = 0_usize;
+
+    for entry in graph.list_pages() {
+        let Ok(Some(page)) = graph.load_by_path(&entry.rel_path) else {
+            failures += 1;
+            continue;
+        };
+        if page.read_only || page.guide {
+            continue;
+        }
+        attempted += 1;
+        if graph.save_page(&page, page.rev.as_deref()).is_err() {
+            failures += 1;
+        }
+    }
+
+    eprintln!("direct_save_corpus_copy attempted={attempted} failures={failures}");
+    assert!(attempted > 0, "the corpus copy contained no writable pages");
+    assert_eq!(
+        failures, 0,
+        "unchanged Direct saves failed on the corpus copy"
     );
 }
 
@@ -7942,7 +8072,7 @@ fn read_asset_limited_rejects_before_returning_oversized_bytes() {
     assert_eq!(g.read_asset_limited("large.pdf", 5).unwrap(), b"12345");
     let err = g.read_asset_limited("large.pdf", 4).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("asset exceeds 4 byte limit"));
+    assert_eq!(err.to_string(), r#"{"kind":"asset-too-large"}"#);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -11390,14 +11520,18 @@ fn projection_boundary_race_is_rejected_before_displacement() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Pins every bounded save-failure code to the exact message its production
-/// site emits. If someone rewords one of those messages, this fails and they
-/// have to update the classifier deliberately -- which is the point, because
-/// a silently-reclassified failure reads as `unknown` in a user's report and
-/// tells us nothing.
+/// Pins every bounded save-failure string to the typed code assigned at its
+/// production site. Rewording the display source cannot reclassify the error.
 #[test]
 fn direct_save_failure_codes_are_stable() {
     use std::io::{Error, ErrorKind};
+    let typed = |code: &str, source: Error| {
+        let code = DirectSaveFailureCode::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+            .unwrap_or_else(|| panic!("missing DirectSaveFailureCode variant for {code}"));
+        DirectSaveError::into_io(code, source)
+    };
     for (code, error) in [
         // model.rs `capture_managed_text_entries` symlink arm.
         (
@@ -11553,44 +11687,97 @@ fn direct_save_failure_codes_are_stable() {
             Error::new(ErrorKind::PermissionDenied, "permission denied"),
         ),
     ] {
+        let error = typed(code, error);
         assert_eq!(
             direct_save_failure_code(&error),
             code,
             "classifier drifted for: {error}"
         );
     }
-    for (suffix, message) in [
-        ("save_baseline_present", "save baseline present"),
-        ("save_baseline_absent", "save baseline absent"),
-        ("commit_recheck", "commit recheck"),
-        ("replace_pre_retirement", "replace pre-retirement"),
-        ("replace_retired_mismatch", "retired mismatch"),
-        ("replace_publication_collision", "publication collision"),
-        (
-            "create_publication_collision",
-            "create publication collision",
-        ),
-        ("final_reread_absent", "final reread absent"),
-        ("final_reread_present", "final reread present"),
-        ("replace_post_publication", "post-publication validation"),
-    ] {
-        let minted = Error::new(
-            ErrorKind::AlreadyExists,
-            format!("editor conflict: {message}"),
-        );
+}
+
+/// The site-to-code binding for the whole conflict vocabulary, driven through
+/// the REAL producers rather than through a stamped fixture.
+///
+/// This is the half that can discard a user's work. `conflict.*` is the
+/// banner class, and the banner's "Use disk version" throws away the unsaved
+/// edit, so a site that mints the wrong `conflict.*` code -- or mints one at
+/// all where the failure is not a conflict -- is a data-loss defect. Before
+/// the classifier was typed, the prose test caught that by construction;
+/// stamping the expected code onto a fixture and reading it back would not,
+/// so every case here goes through `EditorConflictSite`'s own accessors and
+/// through `Graph::tokenless_conflict_error`.
+///
+/// `EditorConflictSite::ALL` has a pinned length, so a new site cannot be
+/// added without appearing here.
+#[test]
+fn direct_save_conflict_sites_produce_their_own_codes() {
+    for (site, suffix) in EditorConflictSite::ALL.into_iter().zip([
+        "save_baseline_present",
+        "save_baseline_absent",
+        "commit_recheck",
+        "replace_pre_retirement",
+        "replace_retired_mismatch",
+        "replace_publication_collision",
+        "create_publication_collision",
+        "final_reread_absent",
+        "final_reread_present",
+        "replace_post_publication",
+    ]) {
+        // The banner class, as `conflict_error_from_snapshot` reads it. That
+        // producer needs a graph to mint an authority epoch; the branch under
+        // test is its code selection, which is this accessor.
         assert_eq!(
-            direct_save_failure_code(&minted),
-            format!("conflict.{suffix}")
+            site.conflict_code().as_str(),
+            format!("conflict.{suffix}"),
+            "conflict site drifted from its banner code: {}",
+            site.message()
         );
-        let tokenless = Error::new(
-            ErrorKind::WouldBlock,
-            format!("tokenless editor conflict: {message}: continued churn"),
+
+        // The retry class, through the real producer end to end.
+        let tokenless = Graph::tokenless_conflict_error(
+            site,
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "continued churn"),
         );
         assert_eq!(
             direct_save_failure_code(&tokenless),
-            format!("conflict_retry.{suffix}")
+            format!("conflict_retry.{suffix}"),
+            "tokenless conflict site drifted from its retry code: {}",
+            site.tokenless_message()
+        );
+        assert_eq!(
+            direct_save_conflict_epoch(&tokenless),
+            None,
+            "a tokenless conflict has no authority epoch to present"
         );
     }
+}
+
+/// The same binding for the precheck helpers, which are free functions and so
+/// can be driven directly. `initial_shadow_limit_error` and
+/// `managed_text_inventory_limit_error` are the two the save path calls when a
+/// bound is exceeded; both are `precheck.limit`, and neither may become a
+/// conflict.
+#[test]
+fn direct_save_precheck_helpers_produce_their_own_codes() {
+    for error in [
+        initial_shadow_limit_error("entries"),
+        managed_text_inventory_limit_error("bytes"),
+    ] {
+        assert_eq!(direct_save_failure_code(&error), "precheck.limit");
+        assert_eq!(direct_save_conflict_epoch(&error), None);
+    }
+}
+
+#[test]
+fn direct_save_failure_code_does_not_inherit_conflict_from_page_text() {
+    let error = std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "exact-identity restore failed for pages/path-pinned page does not match its captured exact owner.md",
+    );
+
+    assert_eq!(direct_save_failure_code(&error), "unknown");
+    assert_eq!(direct_save_conflict_epoch(&error), None);
 }
 
 /// Existing saves inspect only their exact retained parent, and skip
@@ -12707,6 +12894,429 @@ fn direct_save_latency_manual_benchmark() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn direct_query_bench_fixture_bytes() -> &'static [u8] {
+    b"title:: B4 Measurement Target\ncategory:: work\ntags:: work\n\n- TODO needle [[B4 Measurement Target]] #work\n  status:: active\n"
+}
+
+fn direct_query_bench_open() -> (PathBuf, Graph, usize, usize) {
+    let dir = match std::env::var("TINE_DIRECT_QUERY_BENCH_GRAPH_COPY") {
+        Ok(source) => {
+            let dir = scratch("direct-query-bench-copy");
+            copy_directory_tree(Path::new(&source), &dir);
+            dir
+        }
+        Err(_) => {
+            let pages = std::env::var("TINE_DIRECT_QUERY_BENCH_PAGES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000);
+            let (dir, graph) = direct_save_bench_graph("direct-query-bench", pages);
+            drop(graph);
+            dir
+        }
+    };
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::write(
+        dir.join("pages/B4 Measurement Target.md"),
+        direct_query_bench_fixture_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/B4 Measurement Unrelated.md"),
+        b"- b4-unrelated-before\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/B4___Measurement Namespace.md"),
+        b"- b4 namespace probe\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::write(dir.join("journals/2026_09_03.md"), b"- b4 journal probe\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join(".b4-measurement/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_direct_query_projection(&graph);
+    let (pages, blocks) = graph.with_pages(|pages| {
+        fn count_blocks(blocks: &[DocBlock]) -> usize {
+            blocks
+                .iter()
+                .map(|block| 1 + count_blocks(&block.children))
+                .sum()
+        }
+        (
+            pages.len(),
+            pages
+                .iter()
+                .map(|(_, document)| count_blocks(&document.roots))
+                .sum(),
+        )
+    });
+    (dir, graph, pages, blocks)
+}
+
+fn wait_for_direct_query_projection(graph: &Graph) {
+    let started = Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "Direct query benchmark projection did not converge"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn direct_query_bench_edit(graph: &Graph, serial: usize) {
+    let mut page = graph
+        .load_by_path("pages/B4 Measurement Target.md")
+        .unwrap()
+        .unwrap();
+    page.blocks[0].raw =
+        format!("TODO needle [[B4 Measurement Target]] #work variant-{serial}\nstatus:: active");
+    graph
+        .save_page(&page, page.rev.as_deref())
+        .expect("Direct query benchmark content-only save");
+}
+
+fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
+    let started = Instant::now();
+    let result = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+    std::hint::black_box((result.total, result.exceeded));
+    started.elapsed()
+}
+
+fn direct_query_bench_report(
+    class: &str,
+    phase: &str,
+    samples: &mut [Duration],
+    pages: usize,
+    blocks: usize,
+    indexed_reads: u64,
+) {
+    samples.sort();
+    let ms = |duration: Duration| duration.as_secs_f64() * 1_000.0;
+    println!(
+        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} indexed_reads={indexed_reads}",
+        ms(samples[samples.len() / 2]),
+        ms(samples[samples.len() * 95 / 100]),
+        ms(samples[samples.len() - 1]),
+        samples.len(),
+    );
+}
+
+fn direct_query_bench_cache_keys(graph: &Graph) -> std::collections::BTreeSet<String> {
+    graph
+        .derived_cache
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|cache| cache.results.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn direct_query_bench_prime_invalidation(graph: &Graph) -> std::collections::BTreeSet<String> {
+    *graph.derived_cache.write().unwrap() = None;
+    for query in [
+        "(task TODO)",
+        "\"b4-unrelated-before\"",
+        "\"b4-never-present\"",
+        "(page-ref \"B4 Measurement Target\")",
+    ] {
+        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+    }
+    let keys = direct_query_bench_cache_keys(graph);
+    assert_eq!(keys.len(), 4, "the invalidation probe must seed four memos");
+    keys
+}
+
+fn direct_query_bench_report_invalidation(
+    edit: &str,
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+    generation_before: u64,
+    generation_after: u64,
+) {
+    let retained = before.intersection(after).count();
+    let evicted = before.difference(after).count();
+    println!(
+        "b4_invalidation edit={edit} before={} retained={retained} evicted={evicted} cache_gen_before={generation_before} cache_gen_after={generation_after}",
+        before.len(),
+    );
+}
+
+/// B4 step 0 measurement. This release-only ignored benchmark compares memo
+/// hits with invalidated evaluation for one representative of each sequencing
+/// class, measures projection readiness immediately after a Direct delta, and
+/// records scoped memo retention. Point it at a copied graph with
+/// TINE_DIRECT_QUERY_BENCH_GRAPH_COPY; graph content is never printed.
+#[test]
+#[ignore = "manual benchmark: Direct query classes, facets, and invalidation"]
+fn direct_query_latency_manual_benchmark() {
+    assert!(
+        !cfg!(debug_assertions),
+        "release-only; run cargo test -p tine-core --release --lib direct_query_latency_manual_benchmark -- --ignored --nocapture --test-threads=1"
+    );
+    let rounds = std::env::var("TINE_DIRECT_QUERY_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(9)
+        .max(3);
+    let (dir, graph, pages, blocks) = direct_query_bench_open();
+    let classes = [
+        ("sparse_task", "(task TODO)"),
+        ("page_ref", "(page-ref \"B4 Measurement Target\")"),
+        (
+            "task_non_sparse",
+            "(and (task TODO) (page \"B4 Measurement Target\"))",
+        ),
+        ("block_property", "(property \"status\" \"active\")"),
+        ("page_property", "(page-property \"category\" \"work\")"),
+        ("page_tags", "(page-tags \"work\")"),
+        ("page", "(page \"B4 Measurement Target\")"),
+        ("namespace", "(namespace B4)"),
+        ("journal", "(journal)"),
+        (
+            "mixed_and",
+            "(and (property \"status\" \"active\") (page \"B4 Measurement Target\"))",
+        ),
+        (
+            "complete_or",
+            "(or (page \"B4 Measurement Target\") (namespace B4))",
+        ),
+        ("plain_text", "\"needle\""),
+        ("friendly_search", "(search \"needle\")"),
+        (
+            "boolean_composition",
+            "(and \"needle\" (page-ref \"B4 Measurement Target\"))",
+        ),
+    ];
+    let mut serial = 0;
+    for (class, query) in classes {
+        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+        let mut memo = (0..rounds)
+            .map(|_| direct_query_bench_sample(&graph, query))
+            .collect::<Vec<_>>();
+        direct_query_bench_report(class, "memo", &mut memo, pages, blocks, 0);
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let mut invalidated = Vec::with_capacity(rounds);
+        for sample in 0..rounds {
+            serial += 1;
+            direct_query_bench_edit(&graph, serial);
+            wait_for_direct_query_projection(&graph);
+            *graph.derived_cache.write().unwrap() = None;
+            graph.reset_direct_projection_candidate_probe_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            let candidate_before = graph.direct_projection_indexed_reads_test();
+            let elapsed = direct_query_bench_sample(&graph, query);
+            let candidate_queries_completed = graph
+                .direct_projection_indexed_reads_test()
+                .saturating_sub(candidate_before);
+            let fallback_reads = graph
+                .direct_projection_fallback_reads_test()
+                .saturating_sub(fallback_before);
+            let full_graph_evaluations = crate::query::full_graph_query_evaluations();
+            let evaluated_pages = graph
+                .direct_projection_candidate_evaluated_paths_test()
+                .len();
+            println!(
+                "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
+                std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
+                sample + 1,
+                elapsed.as_secs_f64() * 1_000.0,
+            );
+            invalidated.push(elapsed);
+        }
+        let indexed_reads = graph
+            .direct_projection_indexed_reads_test()
+            .saturating_sub(indexed_before);
+        direct_query_bench_report(
+            class,
+            "invalidated_ready",
+            &mut invalidated,
+            pages,
+            blocks,
+            indexed_reads,
+        );
+    }
+
+    let mut ready_hits = 0_usize;
+    let mut ready_misses = 0_usize;
+    let indexed_before = graph.direct_projection_indexed_reads_test();
+    let mut immediate = Vec::with_capacity(rounds);
+    for save in 0..rounds {
+        serial += 1;
+        direct_query_bench_edit(&graph, serial);
+        let generation = graph.cache_generation();
+        let immediate_ready = graph.direct_projection_ready_test();
+        if immediate_ready {
+            ready_hits += 1;
+        } else {
+            ready_misses += 1;
+        }
+        immediate.push(direct_query_bench_sample(&graph, "(task TODO)"));
+        let readiness_started = Instant::now();
+        wait_for_direct_query_projection(&graph);
+        let ready_latency_ms = readiness_started.elapsed().as_secs_f64() * 1_000.0;
+        let oracle =
+            crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
+        let candidate_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        let actual = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        let oracle_equal = (actual.total, actual.exceeded) == (oracle.total, oracle.exceeded)
+            && serde_json::to_vec(actual.groups.as_ref()).unwrap()
+                == serde_json::to_vec(&oracle.groups).unwrap();
+        println!(
+            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete candidate_reads={} fallback_reads={} oracle_equal={oracle_equal}",
+            std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
+            save + 1,
+            graph.direct_projection_indexed_reads_test().saturating_sub(candidate_before),
+            graph.direct_projection_fallback_reads_test().saturating_sub(fallback_before),
+        );
+    }
+    let indexed_reads = graph
+        .direct_projection_indexed_reads_test()
+        .saturating_sub(indexed_before);
+    direct_query_bench_report(
+        "sparse_task",
+        "data_rev_immediate",
+        &mut immediate,
+        pages,
+        blocks,
+        indexed_reads,
+    );
+    println!(
+        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} indexed_reads={indexed_reads}",
+        ready_hits + ready_misses,
+    );
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.blocks[0].raw = "b4-unrelated-after".into();
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "content_only",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert_eq!((after.len(), before.difference(&after).count()), (2, 2));
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.pre_block = Some("alias:: B4 Measurement Alias\n".into());
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "alias_change",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut new_page = direct_save_bench_new_page("B4 Measurement New Page");
+    new_page.blocks[0].id = Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
+    graph.save_page(&new_page, None).unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "page_set_change",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    graph.derived_cache.write().unwrap().as_mut().unwrap().today -= 1;
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.blocks[0].raw = "b4-unrelated-day-rollover".into();
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "day_rollover_simulated",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let facet_sizes = std::env::var("TINE_DIRECT_QUERY_BENCH_FACET_SIZES")
+        .unwrap_or_else(|_| "1000,4000".into())
+        .split(',')
+        .map(|value| value.trim().parse::<usize>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(facet_sizes.len(), 2, "facet benchmark requires two sizes");
+    for size in facet_sizes {
+        let (facet_dir, facet_graph) = direct_save_bench_graph("direct-query-facets", size);
+        facet_graph
+            .attach_direct_projection(facet_dir.join(".b4-facets/projection.sqlite"))
+            .unwrap();
+        wait_for_direct_query_projection(&facet_graph);
+        let facet_blocks = size.saturating_mul(24).saturating_add(1);
+        let mut query_facets = Vec::with_capacity(rounds);
+        let mut autocomplete = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = Instant::now();
+            std::hint::black_box(facet_graph.property_facets());
+            query_facets.push(started.elapsed());
+            let started = Instant::now();
+            std::hint::black_box(
+                facet_graph.autocomplete_property_facets_bounded(usize::MAX, usize::MAX),
+            );
+            autocomplete.push(started.elapsed());
+        }
+        for (family, samples) in [
+            ("query_facets", &mut query_facets),
+            ("autocomplete_property_facets", &mut autocomplete),
+        ] {
+            samples.sort();
+            println!(
+                "b4_facet family={family} pages={} blocks={facet_blocks} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={}",
+                size + 1,
+                samples[samples.len() / 2].as_secs_f64() * 1_000.0,
+                samples[samples.len() * 95 / 100].as_secs_f64() * 1_000.0,
+                samples[samples.len() - 1].as_secs_f64() * 1_000.0,
+                samples.len(),
+            );
+        }
+        let _ = fs::remove_dir_all(&facet_dir);
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn copy_directory_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -13712,9 +14322,9 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
     let path = ManagedPath::parse("content/pages/25-07-2026.md").unwrap();
 
     let configured = graph.managed_entry_for_managed_path(&path).unwrap();
-    assert_eq!(configured.kind, PageKind::Page);
-    assert_eq!(configured.name, "25-07-2026");
-    assert_eq!(configured.date_key, None);
+    assert_eq!(configured.kind, PageKind::Journal);
+    assert_eq!(configured.name, "2026-07-25");
+    assert!(configured.date_key.is_some());
 
     let bytes = b"title:: 26-07-2026\n\n- parser-owned title\n";
     let content = std::str::from_utf8(bytes).unwrap();
@@ -14503,7 +15113,7 @@ fn initial_shadow_handles_overlapping_roots_in_both_directions() {
             "content",
             "content/journals",
             vec![
-                ("content/journals/archive.org", PageKind::Journal),
+                ("content/journals/archive.org", PageKind::Page),
                 ("content/project.md", PageKind::Page),
             ],
         ),
@@ -14512,7 +15122,7 @@ fn initial_shadow_handles_overlapping_roots_in_both_directions() {
             "content/pages",
             "content",
             vec![
-                ("content/archive.org", PageKind::Journal),
+                ("content/archive.org", PageKind::Page),
                 ("content/pages/project.md", PageKind::Page),
             ],
         ),
@@ -15105,8 +15715,21 @@ fn production_projection_has_no_alternate_graph_writer_entrypoint() {
     assert!(source.contains("self.serialize_page_document("));
 }
 
+/// GH #466. The rule this guard states on failure: every Direct Files graph-text
+/// name transition (create, live-name retirement, staged publication, recovery
+/// restore, recovery set-aside) goes through `move_graph_text_exact_no_replace`
+/// — the exact-byte protocol over the graph tree's own no-clobber rename family
+/// (I-16) — and never through `tine_storage::DurableDirectoryPublication`,
+/// whose Android arm is hard-link-then-unlink and fails with `EACCES` on the
+/// shared storage a Direct Files graph lives in. v0.6.981 shipped exactly that
+/// and every Android save failed. Imitate `move_graph_text_exact_no_replace`
+/// in `model.rs`; the storage boundary stays for app-private authorities only.
 #[test]
-fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
+fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
+    const RULE: &str = "GH #466 / I-16: Direct Files graph-text name transitions use \
+        move_graph_text_exact_no_replace (the graph tree's renameat2(RENAME_NOREPLACE) \
+        family), never tine-storage's DurableDirectoryPublication, whose Android arm is a \
+        hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
     let source = include_str!("model.rs");
     let create = source
         .split_once("    fn managed_atomic_create_with_proof(")
@@ -15115,9 +15738,14 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .split_once("\n    fn managed_atomic_write_with_conflict(")
         .expect("next Direct Files write function")
         .0;
-    assert!(create.contains("DurableDirectoryPublication::open(target.parent())"));
-    assert!(create.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
-    assert!(!create.contains("rename_projection_noreplace("));
+    assert!(
+        create.contains(
+            "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
+        ),
+        "{RULE}"
+    );
+    assert!(!create.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!create.contains(".move_exact_no_replace("), "{RULE}");
 
     let write = source
         .split_once("    fn managed_atomic_write_validated(")
@@ -15127,9 +15755,15 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .expect("Direct Files bounded replacement")
         .0;
     assert!(write.contains("self.managed_atomic_replace_bound("));
-    assert!(write.contains("DurableDirectoryPublication::open(target.parent())"));
-    assert!(write.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
-    assert!(!write.contains("target.parent().rename("));
+    assert!(
+        write.contains(
+            "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
+        ),
+        "{RULE}"
+    );
+    assert!(!write.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!write.contains(".move_exact_no_replace("), "{RULE}");
+    assert!(!write.contains("target.parent().rename("), "{RULE}");
 
     let replace = source
         .split_once("    fn managed_atomic_replace_bound(")
@@ -15138,11 +15772,53 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .split_once("\n    fn managed_move_noreplace(")
         .expect("next projection method")
         .0;
-    assert!(replace.contains("EditorPublicationAuthority::DirectFile => direct_publication"));
-    assert!(replace.matches(".move_exact_no_replace(").count() >= 3);
+    // The retire/publish closure, the recovery set-aside, and the restore.
     assert!(
-        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace")
+        replace.matches("move_graph_text_exact_no_replace(").count() >= 3,
+        "{RULE}"
     );
+    assert!(!replace.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!replace.contains(".move_exact_no_replace("), "{RULE}");
+    assert!(
+        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace"),
+        "the Direct arm must carry the exact-byte protocol, not the bare rename"
+    );
+    assert!(
+        replace.contains("EditorPublicationAuthority::ReconstructibleManagedProjection => {"),
+        "the managed projection arm keeps its own capability-fallback rename"
+    );
+}
+
+/// GH #466. The exact-byte protocol the Direct Files name transition carries:
+/// a matching source is published under a name nothing else holds, an
+/// occupied destination is never replaced, and a source whose bytes are not
+/// the expected ones (an external writer got there first) is never published.
+#[test]
+fn graph_text_exact_move_publishes_expected_bytes_and_refuses_a_replaced_source() {
+    let root = scratch("gh466-graph-text-exact-move");
+    fs::create_dir_all(&root).unwrap();
+    let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+
+    dir.write("staged.md", b"- staged\n").unwrap();
+    move_graph_text_exact_no_replace(&dir, "staged.md", "Page.md", b"- staged\n").unwrap();
+    assert_eq!(fs::read(root.join("Page.md")).unwrap(), b"- staged\n");
+    assert!(!root.join("staged.md").exists());
+
+    dir.write("other.md", b"- other\n").unwrap();
+    let occupied =
+        move_graph_text_exact_no_replace(&dir, "other.md", "Page.md", b"- other\n").unwrap_err();
+    assert_eq!(occupied.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(root.join("Page.md")).unwrap(), b"- staged\n");
+    assert_eq!(fs::read(root.join("other.md")).unwrap(), b"- other\n");
+
+    let replaced = move_graph_text_exact_no_replace(&dir, "other.md", "Fresh.md", b"- expected\n")
+        .unwrap_err();
+    assert_eq!(replaced.kind(), io::ErrorKind::AlreadyExists);
+    assert!(replaced.to_string().contains("source name"), "{replaced}");
+    assert!(!root.join("Fresh.md").exists());
+    assert_eq!(fs::read(root.join("other.md")).unwrap(), b"- other\n");
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ---- #21: path-pinned pages + duplicate-day reconcile ----

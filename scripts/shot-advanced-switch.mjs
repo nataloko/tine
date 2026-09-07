@@ -10,21 +10,17 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 
 const PORT = 5263;
 const OUT = "screenshots";
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(url); if (r.ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
-
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  // FORK: upstream's shared readiness helper (a scripts/*.mjs may not define its
+  // own waitForServer — e2e-capabilities.test.mjs I-12/DUP-12b enforces it), with
+  // the fork's system-Chromium escape hatch on the launch below.
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({
     executablePath: process.env.TINE_CHROMIUM || undefined,
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],

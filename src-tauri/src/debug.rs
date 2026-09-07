@@ -46,9 +46,20 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn debug_enabled() -> bool {
+/// Parse the process-level debug opt-in. The ONLY production reader of
+/// `TINE_DEBUG` / `--debug`: `debug_init` calls it once, at startup, and pushes
+/// the answer into `tine-core`, which owns the flag because core cannot call
+/// src-tauri (I-12). Nothing else may re-derive it from the environment.
+fn debug_opt_in_requested() -> bool {
     matches!(std::env::var("TINE_DEBUG"), Ok(v) if !v.is_empty() && v != "0")
         || std::env::args().any(|a| a == "--debug")
+}
+
+/// Thin delegate to the one producer, `tine-core`'s
+/// `runtime_debug_diagnostics_enabled()`. Kept because 15 src-tauri callers
+/// read better against a local name; it computes nothing of its own.
+pub(crate) fn debug_enabled() -> bool {
+    tine_core::sync_runtime::runtime_debug_diagnostics_enabled()
 }
 
 fn debug_log_path() -> PathBuf {
@@ -60,6 +71,10 @@ fn debug_log_path() -> PathBuf {
 /// Initialize the directed, detailed trace before Tauri exists. It remains
 /// opt-in and retains its historical path/format contract.
 pub(crate) fn debug_init() {
+    // The one place the opt-in is parsed, and the one place the flag is set.
+    // Everything downstream — in this crate and in `tine-core` — reads it back
+    // through `runtime_debug_diagnostics_enabled()`.
+    tine_core::sync_runtime::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {
@@ -81,8 +96,11 @@ pub(crate) fn debug_init() {
 
 /// Emit one detailed line to stderr and, when explicitly enabled, the directed
 /// debug file. This function does not write to the privacy-safe flight recorder.
-pub(crate) fn diag(msg: impl AsRef<str>) {
-    let msg = msg.as_ref();
+pub(crate) fn diag(msg: impl std::fmt::Display) {
+    if !debug_enabled() {
+        return;
+    }
+    let msg = msg.to_string();
     eprintln!("[tine] {msg}");
     if let Some(Some(lock)) = DEBUG_LOG.get() {
         if let Ok(mut file) = lock.lock() {
@@ -126,7 +144,28 @@ pub(crate) fn install_panic_logger() {
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        record_fixed_event("runtime.panic", Map::new());
+        let current_thread = std::thread::current();
+        let mut fields = Map::new();
+        fields.insert(
+            "location".into(),
+            info.location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_else(|| "unknown".into())
+                .into(),
+        );
+        fields.insert(
+            "thread".into(),
+            current_thread.name().unwrap_or("unnamed").into(),
+        );
+        let message_kind = if info.payload().is::<&str>() {
+            "str"
+        } else if info.payload().is::<String>() {
+            "string"
+        } else {
+            "non_string"
+        };
+        fields.insert("message_kind".into(), message_kind.into());
+        record_fixed_event("runtime.panic", fields);
         if debug_enabled() {
             diag(format!("PANIC: {info}"));
             diag(format!(
@@ -202,7 +241,28 @@ struct FlightRecorder {
     current: Option<File>,
     current_bytes: u64,
     segment_max_bytes: u64,
-    _process_lock: File,
+    process_lock: File,
+}
+
+/// Release the single-writer lock explicitly, rather than as a side effect of
+/// dropping the descriptor.
+///
+/// `flock` belongs to the OPEN FILE DESCRIPTION, not to the descriptor, so
+/// closing one copy releases nothing while any other copy of that description
+/// is still open. This process forks — every `Command::spawn` duplicates every
+/// open description into the child, and the copy lives until the child reaches
+/// `exec` and `O_CLOEXEC` closes it. A recorder dropped inside that window
+/// leaves its lock held by the child's copy, and the next `open` on the same
+/// directory gets `EAGAIN` from `try_lock_exclusive`. That is a race against
+/// nothing but scheduler luck, which is why it only ever showed up under
+/// parallel test load — and why it cost this project four extra `cargo test -p
+/// tine` runs in one lane. `unlock` acts on the description itself, so it
+/// releases the lock for every copy at once and orders the release before the
+/// drop returns.
+impl Drop for FlightRecorder {
+    fn drop(&mut self) {
+        let _ = self.process_lock.unlock();
+    }
 }
 
 impl FlightRecorder {
@@ -234,7 +294,7 @@ impl FlightRecorder {
                 current: Some(file),
                 current_bytes: 0,
                 segment_max_bytes,
-                _process_lock: process_lock,
+                process_lock,
             },
             previous_unclean,
         ))
@@ -438,6 +498,30 @@ pub(crate) fn record_storage_transition(
         fields.insert("outcome".into(), enum_token(outcome));
     }
     record_fixed_event("storage.transition", fields);
+}
+
+pub(crate) fn record_checkpoint_capture_skip(
+    reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip,
+) {
+    let mut fields = Map::new();
+    fields.insert(
+        "reason".into(),
+        json!(match reason {
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached => {
+                "runtime_not_attached"
+            }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IndexedRuntime => "indexed_runtime",
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::BlockedRuntime => "blocked_runtime",
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::UnsettledRuntime => {
+                "unsettled_runtime"
+            }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::DurableFrontierAhead => {
+                "durable_frontier_ahead"
+            }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::CaptureFailed => "capture_failed",
+        }),
+    );
+    record_fixed_event("managed.checkpoint_capture_skipped", fields);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -740,7 +824,7 @@ pub(crate) async fn save_diagnostic_report(
     state: State<'_, AppState>,
     build_commit: String,
     build_time: String,
-) -> Result<bool, String> {
+) -> Result<bool, crate::command_error::CommandError> {
     let report = build_diagnostic_report(&state, build_commit, build_time);
     #[cfg(desktop)]
     {
@@ -754,34 +838,51 @@ pub(crate) async fn save_diagnostic_report(
                 .blocking_save_file()
         })
         .await
-        .map_err(|error| format!("diagnostic save dialog failed: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic save dialog failed: {error}"
+            ))
+        })?;
         let Some(chosen) = chosen else {
             return Ok(false);
         };
-        let path = chosen
-            .into_path()
-            .map_err(|_| "diagnostic save destination is not a local file".to_string())?;
-        tine_core::model::atomic_write(&path, report.text.as_bytes())
-            .map_err(|error| format!("diagnostic report could not be saved: {error}"))?;
+        let path = chosen.into_path().map_err(|_| {
+            crate::command_error::CommandError::prose(
+                "diagnostic save destination is not a local file",
+            )
+        })?;
+        tine_core::model::atomic_write(&path, report.text.as_bytes()).map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic report could not be saved: {error}"
+            ))
+        })?;
         Ok(true)
     }
     #[cfg(not(desktop))]
     {
         let _ = (app, report);
-        Err("Save report is available on desktop; use Copy report on this device.".into())
+        Err(crate::command_error::CommandError::prose(
+            "Save report is available on desktop; use Copy report on this device.",
+        ))
     }
 }
 
 #[tauri::command]
-pub(crate) fn clear_diagnostics() -> Result<(), String> {
+pub(crate) fn clear_diagnostics() -> Result<(), crate::command_error::CommandError> {
     let Some(Some(recorder)) = FLIGHT.get() else {
         return Ok(());
     };
     recorder
         .lock()
-        .map_err(|_| "diagnostic recorder is unavailable".to_string())?
+        .map_err(|_| {
+            crate::command_error::CommandError::prose("diagnostic recorder is unavailable")
+        })?
         .clear()
-        .map_err(|error| format!("diagnostic events could not be cleared: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic events could not be cleared: {error}"
+            ))
+        })?;
     record_fixed_event("diagnostics.cleared", Map::new());
     Ok(())
 }
@@ -789,6 +890,81 @@ pub(crate) fn clear_diagnostics() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "child-process probe for stderr capture"]
+    fn diag_disabled_child_probe() {
+        diag("diag-disabled-probe");
+    }
+
+    #[test]
+    fn diag_is_silent_when_debug_is_disabled() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "debug::tests::diag_disabled_child_probe",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr-capture child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "diag leaked to stderr with debugging disabled: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child-process probe for panic event capture"]
+    fn panic_event_child_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        flight_init(dir.clone());
+        install_panic_logger();
+        let caught = std::thread::Builder::new()
+            .name("panic-event-probe".into())
+            .spawn(|| std::panic::catch_unwind(|| std::panic::panic_any(7_u8)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(caught.is_err());
+        let events = std::fs::read_to_string(dir.join("current.jsonl")).unwrap();
+        let event = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "runtime.panic")
+            .expect("panic event");
+        assert_eq!(event["thread"], "panic-event-probe");
+        assert_eq!(event["message_kind"], "non_string");
+        assert!(event["location"].as_str().unwrap().contains("debug.rs:"));
+        assert!(!events.contains("7_u8"));
+    }
+
+    #[test]
+    fn caught_named_thread_panic_records_fixed_shape_location_thread_and_kind() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "debug::tests::panic_event_child_probe",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "panic-event child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn recorder_retains_previous_unclean_run_and_bounds_each_segment() {
@@ -825,6 +1001,36 @@ mod tests {
         }
         let (_, previous_unclean) = FlightRecorder::open(dir.clone(), 4096).unwrap();
         assert!(!previous_unclean);
+    }
+
+    /// The two tests above are the pair that kept failing on a first parallel
+    /// run and passing on the rerun — four extra `cargo test -p tine`
+    /// invocations in one lane alone. Both do the same thing: drop a recorder
+    /// and immediately open another on the same directory. That only works if
+    /// dropping actually released the single-writer lock, and dropping the
+    /// descriptor is NOT that: `flock` belongs to the open file description, so
+    /// it survives until the last copy of the description closes. This process
+    /// spawns children, and every spawn duplicates the description into a child
+    /// that holds it until `exec`.
+    ///
+    /// Reproduce that window deterministically with an explicit `dup`, which
+    /// leaves the kernel in exactly the state a mid-`exec` child does.
+    #[test]
+    fn a_recorder_releases_its_lock_even_while_a_duplicated_descriptor_lives() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        let duplicate = {
+            let (recorder, _) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+            recorder.process_lock.try_clone().unwrap()
+        };
+        let reopened = FlightRecorder::open(dir.clone(), 4096);
+        drop(duplicate);
+        assert!(
+            reopened.is_ok(),
+            "the recorder must unlock explicitly, not leave release to the last \
+             descriptor close: {:?}",
+            reopened.err(),
+        );
     }
 
     /// The other direction, which the fix must not trade away: a session the
@@ -881,10 +1087,26 @@ mod tests {
     #[test]
     fn fixed_event_shape_contains_no_free_form_message_fields() {
         let source = include_str!("debug.rs");
+        let contract = include_str!("../../docs/contracts/diagnostics.md");
         assert!(!source.contains("fields.insert(\"message\""));
         assert!(!source.contains("fields.insert(\"path\""));
         assert!(!source.contains("fields.insert(\"detail\""));
         assert!(source.contains("verboseDebugLogIncluded\": false"));
+        assert!(source.contains("managed.checkpoint_capture_skipped"));
+        for reason in [
+            "runtime_not_attached",
+            "indexed_runtime",
+            "blocked_runtime",
+            "unsettled_runtime",
+            "durable_frontier_ahead",
+            "capture_failed",
+        ] {
+            assert!(source.contains(reason));
+            assert!(
+                contract.contains(reason),
+                "the bounded checkpoint-skip cause and diagnostics contract must change together"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { createSignal } from "solid-js";
-import { backend, type LegacyPluginRegistryCache, type PluginRegistryCacheLoad } from "../backend";
+import { backend, type PluginRegistryCacheLoad } from "../backend";
 import {
   PLUGIN_API_VERSION,
   PLUGIN_CAPABILITIES,
@@ -12,6 +12,7 @@ import { pluginManager } from "./manager";
 import { SUPPORTED_THEME_API_VERSIONS, parseThemeManifest, type ThemeApiVersion } from "../themes/manifest";
 import { applyThemeRevocations, installThemePackage, themeVersionIsRevoked } from "../themes/manager";
 import { reapplyThemeSelection } from "../themeGallery";
+import { serializedWrites } from "../serializedWrites";
 
 export const COMMUNITY_REGISTRY_URL =
   "https://raw.githubusercontent.com/martinkoutecky/tine-plugin-registry/main/index.json";
@@ -126,7 +127,7 @@ let hasVerifiedRegistry = false;
 let unsafeCacheHeld = false;
 let refreshGeneration = 0;
 let latestVerifiedGeneration = 0;
-let liveApplyChain = Promise.resolve();
+const liveApplyWrites = serializedWrites("community-registry-live-apply");
 
 function object(value: unknown, where: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${where} is invalid`);
@@ -442,31 +443,18 @@ export async function loadVerifiedCachedRegistry(
     return { kind: "unsafe", reason: error instanceof Error ? error.message : String(error) };
   }
   if (loaded.kind === "absent" || loaded.kind === "unsafe") return loaded;
-  const candidate = loaded.kind === "envelope" ? loaded.envelope : loaded;
+  const candidate = loaded.envelope;
   try {
     const verified = snapshot(await verifiedIndex(candidate.indexJson, candidate.signature));
-    if (loaded.kind === "legacy") {
-      const expectedLegacy: LegacyPluginRegistryCache = {
-        indexJson: loaded.indexJson,
-        signature: loaded.signature,
-      };
-      try {
-        await backend().storePluginRegistryCache(loaded.indexJson, loaded.signature, expectedLegacy);
-        setRegistryPersistenceError(null);
-      } catch (error) {
-        setRegistryPersistenceError(`Verified registry cache migration was not persisted: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    } else {
-      setRegistryPersistenceError(null);
-    }
-    return { kind: "verified", snapshot: verified, source: loaded.kind };
+    setRegistryPersistenceError(null);
+    return { kind: "verified", snapshot: verified, source: "envelope" };
   } catch (error) {
     return { kind: "unsafe", reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
 export type VerifiedCachedRegistryLoad =
-  | { kind: "verified"; snapshot: VerifiedRegistrySnapshot; source: "envelope" | "legacy" }
+  | { kind: "verified"; snapshot: VerifiedRegistrySnapshot; source: "envelope" }
   | { kind: "absent" }
   | { kind: "unsafe"; reason: string };
 
@@ -494,7 +482,7 @@ async function applyLiveSnapshot(
   generation: number,
   cache: { indexJson: string; signature: string }
 ): Promise<void> {
-  liveApplyChain = liveApplyChain.then(async () => {
+  await liveApplyWrites.run(async () => {
     if (generation !== latestVerifiedGeneration) return;
     await pluginManager.applyRevocations(current.revoked);
     if (generation !== latestVerifiedGeneration) return;
@@ -515,7 +503,6 @@ async function applyLiveSnapshot(
       setRegistryPersistenceError(`The verified live registry is active but was not saved for restart: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
-  await liveApplyChain;
 }
 
 export async function refreshCommunityRegistry(

@@ -1,101 +1,212 @@
-// Concord live Direct Files conflict journey.
+// Harvest B3 live-conflict capsule matrix.
 //
-// A retained editor draft races an external atomic replacement. The guarded
-// save must become an in-page Concord object (never the legacy global bar), the
-// draft must survive a process restart, and a no-loss resolution must persist
-// ordinary Markdown containing both sides.
+// For Direct Files and Tine-managed storage, two retained drafts race external
+// atomic replacements. A full process restart must restore both exact drafts;
+// one is resolved to the retained draft and one to the current storage owner.
+// The graph-keyed native capsule is observed before restart, shrinks after the
+// first resolution, and is durably absent before the second success is shown.
 //
 // Usage: TINE_APP=/path/to/tine node scripts/e2e-concord-live-save.mjs
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import {
+  freeLoopbackPort,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
-const G = "/tmp/tgraph-concord-live-save";
 const APP = process.env.TINE_APP || `${process.env.HOME}/research/tine`;
 const TD = process.env.TAURI_DRIVER
   || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
-const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4500);
-const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4501);
-const pageFile = `${G}/pages/Note.md`;
+const DRIVER_PORT = process.env.E2E_DRIVER_PORT
+  ? Number(process.env.E2E_DRIVER_PORT)
+  : await freeLoopbackPort();
+const NATIVE_PORT = process.env.E2E_NATIVE_PORT
+  ? Number(process.env.E2E_NATIVE_PORT)
+  : await freeLoopbackPort(new Set([DRIVER_PORT]));
+const RUN_LABEL = (process.env.TINE_E2E_RUN_LABEL || "concord-live-save")
+  .replaceAll(/[^A-Za-z0-9_.-]/g, "-");
+const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || "/tmp");
+fs.mkdirSync(ARTIFACTS, { recursive: true });
 
-fs.rmSync(G, { recursive: true, force: true });
-fs.mkdirSync(`${G}/pages`, { recursive: true });
-fs.mkdirSync(`${G}/journals`, { recursive: true });
-fs.mkdirSync(`${G}/logseq`, { recursive: true });
-fs.writeFileSync(pageFile, "- common base\n");
-fs.writeFileSync(`${G}/journals/2026_08_22.md`, "- open [[Note]]\n");
+function waitFor(check, timeout, message, interval = 100) {
+  const deadline = Date.now() + timeout;
+  return (async () => {
+    let last;
+    while (Date.now() < deadline) {
+      try {
+        const value = await check();
+        if (value) return value;
+      } catch (error) {
+        last = error;
+      }
+      await sleep(interval);
+    }
+    throw new Error(`${message}${last ? `; last observation: ${String(last)}` : ""}`);
+  })();
+}
 
-const xdg = "/tmp/txdg-concord-live-save";
-fs.rmSync(xdg, { recursive: true, force: true });
-for (const dir of ["data", "config", "cache"]) fs.mkdirSync(`${xdg}/${dir}`, { recursive: true });
-const env = {
-  ...process.env,
-  TINE_GRAPH: G,
-  XDG_DATA_HOME: `${xdg}/data`,
-  XDG_CONFIG_HOME: `${xdg}/config`,
-  XDG_CACHE_HOME: `${xdg}/cache`,
-  WEBKIT_DISABLE_DMABUF_RENDERER: "1",
-  LIBGL_ALWAYS_SOFTWARE: "1",
-  WEBKIT_DISABLE_COMPOSITING_MODE: "1",
-  GDK_BACKEND: "x11",
-};
+function windowIds(env, pattern = "^Tine$") {
+  try {
+    return execFileSync("xdotool", ["search", "--onlyvisible", "--name", pattern], {
+      encoding: "utf8",
+      env,
+    }).trim().split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
-const log = fs.openSync("/tmp/td-concord-live-save.log", "w");
-const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env, stdio: ["ignore", log, log], detached: true });
-await sleep(3000);
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
 
-async function newSession() {
-  return remote({
-    hostname: "127.0.0.1",
-    port: DRIVER_PORT,
-    path: "/",
-    capabilities: tauriCapabilities(APP, "concord-live-save"),
-    logLevel: "error",
-    connectionRetryCount: 1,
-    connectionRetryTimeout: 60_000,
+function atomicReplace(file, text) {
+  const replacement = `${file}.external`;
+  fs.writeFileSync(replacement, text);
+  fs.renameSync(replacement, file);
+}
+
+function capsuleFiles(root) {
+  const found = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(candidate);
+      else if (entry.name.endsWith(".v1.json") && candidate.includes("conflict-capsules")) {
+        found.push(candidate);
+      }
+    }
+  };
+  walk(root);
+  return found;
+}
+
+function readCapsule(root) {
+  const files = capsuleFiles(root);
+  if (files.length !== 1) throw new Error(`expected one capsule file, found ${files.length}`);
+  return { file: files[0], envelope: JSON.parse(fs.readFileSync(files[0], "utf8")) };
+}
+
+function assertCapsuleRecord(capsule, item, mode, expectedBaseRev) {
+  if (!capsule
+    || capsule.source !== "live-save"
+    || capsule.page_name !== item.name
+    || capsule.page_path !== item.path
+    || capsule.kind !== "page"
+    || !capsule.live) {
+    throw new Error(`${mode}:${item.name}: graph/page capsule binding is invalid`);
+  }
+  if (!JSON.stringify(capsule.live.page).includes(item.local)) {
+    throw new Error(`${mode}:${item.name}: exact retained draft bytes are missing`);
+  }
+  if (typeof capsule.live.base_rev !== "string"
+    || (expectedBaseRev !== undefined && capsule.live.base_rev !== expectedBaseRev)) {
+    throw new Error(`${mode}:${item.name}: exact load baseline is missing or changed`);
+  }
+  if (mode === "managed") {
+    if (capsule.live.disk_rev !== undefined || capsule.live.conflict_epoch !== -1) {
+      throw new Error(`${mode}:${item.name}: replacement authority leaked into the durable capsule`);
+    }
+  } else if (typeof capsule.live.disk_rev !== "string") {
+    throw new Error(`${mode}:${item.name}: durable Direct disk revision is missing`);
+  }
+}
+
+async function visibleButtonContaining(browser, text) {
+  for (const button of await browser.$$("button")) {
+    if (await button.isDisplayed() && (await button.getText()).includes(text)) return button;
+  }
+  return undefined;
+}
+
+async function acceptNativeConfirmation(env, label, before) {
+  const dialog = await waitFor(
+    () => windowIds(env).find((id) => !before.has(id)),
+    30_000,
+    `${label} did not show its native confirmation`,
+  );
+  execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
+  execFileSync("xdotool", ["key", "--clearmodifiers", "alt+y"], { env });
+  await waitFor(() => !windowIds(env).includes(dialog), 30_000, `${label} confirmation did not close`);
+}
+
+async function enableManagedStorage(browser, env) {
+  const trigger = await browser.$('button[title^="Settings"]');
+  await trigger.waitForDisplayed({ timeout: 30_000 });
+  await trigger.click();
+  await browser.$(".settings-modal").waitForDisplayed({ timeout: 30_000 });
+  const tab = await waitFor(
+    () => visibleButtonContaining(browser, "Backups & recovery"),
+    30_000,
+    "Backups & recovery settings tab was absent",
+  );
+  await tab.click();
+  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
+  await experimental.waitForDisplayed({ timeout: 30_000 });
+  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
+  const action = await waitFor(
+    () => visibleButtonContaining(browser, "Enable Tine-managed storage..."),
+    30_000,
+    "managed activation action was absent",
+  );
+  const before = new Set(windowIds(env));
+  await action.click();
+  await acceptNativeConfirmation(env, "managed activation", before);
+  await browser.waitUntil(async () => (await browser.$("body").getText()).includes("Tine-managed storage active"), {
+    timeout: 300_000,
+    interval: 250,
+    timeoutMsg: "managed activation did not reach active",
+  });
+  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
+  await close.click();
+  await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
+}
+
+async function openPage(browser, title) {
+  const journals = await browser.$(".nav-item*=Journals");
+  await journals.waitForClickable({ timeout: 30_000 });
+  await journals.click();
+  let link;
+  try {
+    link = await waitFor(async () => {
+      for (const candidate of await browser.$$(".page-ref")) {
+        if ((await candidate.getText()).trim() === title) return candidate;
+      }
+      return undefined;
+    }, 30_000, `${title} was absent from the routed journal links`);
+  } catch (error) {
+    const state = await browser.execute(() => ({
+      body: document.body?.innerText.slice(0, 4000),
+      pageRefs: [...document.querySelectorAll(".page-ref")]
+        .map((node) => node.textContent?.trim() ?? ""),
+      titles: [...document.querySelectorAll(".page-title, .journal-title, .journal-day")]
+        .map((node) => node.textContent?.trim() ?? ""),
+    }));
+    throw new Error(`${String(error)}; routed state: ${JSON.stringify(state)}`);
+  }
+  await link.click();
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === title, {
+    timeout: 15_000,
+    timeoutMsg: `${title} did not open`,
   });
 }
 
-async function openNote(browser) {
-  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
-  const title = await browser.$("h1.page-title");
-  if (!(await title.isExisting()) || (await title.getText()) !== "Note") {
-    const ref = await browser.$(".page-ref");
-    await ref.waitForExist({ timeout: 10_000 });
-    await ref.click();
-    await browser.waitUntil(async () =>
-      (await browser.$("h1.page-title").getText()) === "Note",
-    { timeout: 10_000, timeoutMsg: "Note did not open" });
-  }
-}
-
-async function assertLiveConflict(browser, phase) {
-  const resolver = await browser.$(".page-conflict");
-  await resolver.waitForExist({ timeout: 20_000 });
-  await browser.waitUntil(async () => {
-    const cells = await browser.execute(() =>
-      [...document.querySelectorAll(".page-conflict .sync-merge-cell")]
-        .map((cell) => cell.textContent ?? "")
-    );
-    return cells.some((value) => value.includes("local laptop draft"))
-      && cells.some((value) => value.includes("disk from phone"));
-  }, { timeout: 20_000, timeoutMsg: `${phase}: resolver did not retain both sides` });
-  if (await browser.$(".conflict-banner").isExisting()) {
-    throw new Error(`${phase}: legacy Direct Files conflict bar appeared`);
-  }
-}
-
-let browser;
-let failure;
-try {
-  browser = await newSession();
-  await openNote(browser);
+async function editPage(browser, text) {
   await browser.$(".page-blocks .ls-block .block-content").click();
   const editor = await browser.$(".page-blocks textarea.block-editor");
   await editor.waitForExist({ timeout: 5_000 });
@@ -109,76 +220,257 @@ try {
       inputType: "insertText",
       data: next,
     }));
-  }, "local laptop draft");
+  }, text);
+}
 
-  // Beat the ordinary save debounce with a Syncthing-style atomic replacement.
-  const replacement = `${pageFile}.external`;
-  fs.writeFileSync(replacement, "- disk from phone\n");
-  fs.renameSync(replacement, pageFile);
-  await assertLiveConflict(browser, "initial conflict");
-
-  // A whole app restart, not merely navigation/remount. The retained draft is
-  // app-private and the graph file remains the external winner.
-  await browser.deleteSession();
-  browser = undefined;
-  await sleep(1500);
-  browser = await newSession();
-  await openNote(browser);
-  await assertLiveConflict(browser, "after restart");
-
-  await browser.execute(() => {
-    for (const button of document.querySelectorAll(".page-conflict button")) {
-      const text = button.textContent?.trim();
-      if (text?.includes("Keep both everywhere")) button.setAttribute("data-concord-keep-both", "true");
-      if (text === "Apply resolution") button.setAttribute("data-concord-apply", "true");
-    }
-  });
-  const keepBoth = await browser.$('[data-concord-keep-both="true"]');
-  await keepBoth.click();
-  await browser.$('[data-concord-apply="true"]').click();
-  await sleep(500);
-  const applyState = await browser.execute(() => ({
-    conflicts: document.querySelectorAll(".page-conflict").length,
-    toasts: [...document.querySelectorAll(".toast")].map((toast) => toast.textContent),
-    capsule: localStorage.getItem("tine.concord.live-conflicts.v1"),
-  }));
-  if (applyState.conflicts) console.error("APPLY STATE:", JSON.stringify(applyState));
-  await waitForFileText(
-    pageFile,
-    (text) => text.includes("local laptop draft") && text.includes("disk from phone"),
-    "no-loss live conflict resolution",
-  );
-  await browser.waitUntil(async () => (await browser.$$(".page-conflict")).length === 0, {
-    timeout: 10_000,
-    timeoutMsg: "resolved Concord object stayed visible",
-  });
+async function assertLiveConflict(browser, local, current, phase) {
+  const resolver = await browser.$(".page-conflict");
+  await resolver.waitForExist({ timeout: 30_000 });
   await browser.waitUntil(async () => {
-    const text = await browser.$(".page-blocks").getText();
-    return text.includes("local laptop draft") && text.includes("disk from phone");
-  }, { timeout: 10_000, timeoutMsg: "resolved page did not install both sides in the UI" });
-  const final = fs.readFileSync(pageFile, "utf8");
-  if (final.includes("<<<<<<<") || final.includes(">>>>>>>")) {
-    throw new Error("resolution wrote conflict markers into the graph");
+    const state = await browser.execute(() => ({
+      text: document.querySelector(".page-conflict")?.textContent ?? "",
+      labels: [...document.querySelectorAll(".page-conflict .sync-merge-collabels span")]
+        .map((label) => label.textContent?.trim() ?? ""),
+    }));
+    return state.text.includes("Your draft and the current file both changed")
+      && state.text.includes(local)
+      && state.text.includes(current)
+      && state.labels.includes("Your retained draft")
+      && state.labels.includes("Current file on disk");
+  }, { timeout: 30_000, timeoutMsg: `${phase}: resolver did not retain both sides` });
+}
+
+async function resolveEverywhere(browser, side) {
+  const selector = side === "mine" ? "All mine" : "All theirs";
+  const choose = await waitFor(
+    () => visibleButtonContaining(browser, selector),
+    15_000,
+    `${selector} action was absent`,
+  );
+  await choose.click();
+  const apply = await waitFor(
+    () => visibleButtonContaining(browser, "Apply resolution"),
+    15_000,
+    "Apply resolution action was absent",
+  );
+  await apply.click();
+  await browser.waitUntil(async () => (await browser.$$(".page-conflict")).length === 0, {
+    timeout: 30_000,
+    timeoutMsg: "resolved capsule stayed visible",
+  });
+}
+
+async function waitForApp(browser, phase) {
+  await browser.$("body").waitForExist({ timeout: 30_000 });
+  try {
+    await browser.$(".ls-block, .page-title").waitForExist({ timeout: 30_000 });
+  } catch (error) {
+    const state = await browser.execute(() => ({
+      body: document.body?.innerText,
+      html: document.body?.innerHTML.slice(0, 2000),
+      location: location.href,
+    }));
+    throw new Error(`${phase}: app content did not appear: ${JSON.stringify(state)}; ${String(error)}`);
   }
-  console.log("PASS: live Direct conflict survived restart and resolved in-page with both sides");
+}
+
+async function runBackend(mode) {
+  const suffix = mode === "managed" ? "managed" : "direct";
+  const graph = `/tmp/tgraph-concord-live-save-${suffix}`;
+  const xdg = `/tmp/txdg-concord-live-save-${suffix}`;
+  const data = `${xdg}/data`;
+  const mineName = "B3EKeepDraft";
+  const theirsName = "B3EUseCurrent";
+  const mineFile = `${graph}/pages/${mineName}.md`;
+  const theirsFile = `${graph}/pages/${theirsName}.md`;
+  fs.rmSync(graph, { recursive: true, force: true });
+  fs.rmSync(xdg, { recursive: true, force: true });
+  for (const dir of [`${graph}/pages`, `${graph}/journals`, `${graph}/logseq`, data, `${xdg}/config`, `${xdg}/cache`]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(mineFile, "- common mine base\n");
+  fs.writeFileSync(theirsFile, "- common theirs base\n");
+  const now = new Date();
+  const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
+  fs.writeFileSync(`${graph}/journals/${journal}.md`, `- [[${mineName}]]\n- [[${theirsName}]]\n`);
+
+  const env = {
+    ...process.env,
+    TINE_GRAPH: graph,
+    XDG_DATA_HOME: data,
+    XDG_CONFIG_HOME: `${xdg}/config`,
+    XDG_CACHE_HOME: `${xdg}/cache`,
+    WEBKIT_DISABLE_DMABUF_RENDERER: "1",
+    LIBGL_ALWAYS_SOFTWARE: "1",
+    WEBKIT_DISABLE_COMPOSITING_MODE: "1",
+    GDK_BACKEND: "x11",
+  };
+  let driver;
+  let driverLog;
+  let browser;
+
+  const startDriver = async (phase) => {
+    driverLog = fs.openSync(path.join(
+      ARTIFACTS,
+      `${RUN_LABEL}-${suffix}-${phase}-tauri-driver.log`,
+    ), "w");
+    driver = spawn(
+      TD,
+      webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"),
+      { env, stdio: ["ignore", driverLog, driverLog], detached: true },
+    );
+    await sleep(3000);
+  };
+  const stopDriver = async (deleteSession) => {
+    if (deleteSession && browser) {
+      try { await browser.deleteSession(); } catch {}
+    }
+    browser = undefined;
+    const pid = driver?.pid;
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch {}
+      await waitFor(
+        () => driver.exitCode !== null || !processAlive(pid),
+        30_000,
+        `${suffix}: tauri-driver did not stop`,
+      );
+    }
+    driver = undefined;
+    try { if (driverLog !== undefined) fs.closeSync(driverLog); } catch {}
+    driverLog = undefined;
+  };
+  const newSession = async () => {
+    const browser = await remote({
+      hostname: "127.0.0.1",
+      port: DRIVER_PORT,
+      path: "/",
+      capabilities: tauriCapabilities(APP, `concord-live-save-${suffix}`),
+      logLevel: "error",
+      connectionRetryCount: 1,
+      connectionRetryTimeout: 60_000,
+    });
+    // Keep a genuinely spacious desktop pane for Concord's review-width
+    // contract; narrow-pane behavior has its own container-query coverage.
+    await browser.setWindowSize(1400, 900);
+    return browser;
+  };
+  const forceKillApp = async () => {
+    const window = await waitFor(
+      () => windowIds(env)[0],
+      30_000,
+      `${suffix}: native app window was absent before SIGKILL`,
+    );
+    const pid = Number(execFileSync("xdotool", ["getwindowpid", window], {
+      encoding: "utf8",
+      env,
+    }).trim());
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error(`${suffix}: native window exposed invalid app pid ${pid}`);
+    }
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !processAlive(pid), 30_000, `${suffix}: SIGKILL did not stop Tine pid ${pid}`);
+    browser = undefined;
+    await stopDriver(false);
+  };
+
+  try {
+    await startDriver("initial");
+    browser = await newSession();
+    await waitForApp(browser, `${suffix}:initial`);
+    if (mode === "managed") await enableManagedStorage(browser, env);
+
+    const cases = [
+      {
+        name: mineName,
+        path: `pages/${mineName}.md`,
+        file: mineFile,
+        local: `${suffix} retained laptop draft`,
+        current: `${suffix} current phone body`,
+        outage: `${suffix} newer phone body during outage`,
+      },
+      {
+        name: theirsName,
+        path: `pages/${theirsName}.md`,
+        file: theirsFile,
+        local: `${suffix} second retained draft`,
+        current: `${suffix} second current body`,
+        outage: `${suffix} newer second body during outage`,
+      },
+    ];
+    for (const item of cases) {
+      await openPage(browser, item.name);
+      await editPage(browser, item.local);
+      atomicReplace(item.file, `- ${item.current}\n`);
+      await assertLiveConflict(browser, item.local, item.current, `${suffix}:${item.name}:initial`);
+    }
+
+    const beforeRestart = await waitFor(() => {
+      const files = capsuleFiles(data);
+      if (files.length !== 1) return undefined;
+      const observed = readCapsule(data);
+      return observed.envelope.capsules?.length === 2 ? observed : undefined;
+    }, 30_000, `${suffix}: native capsule did not contain both retained drafts`);
+    const byName = new Map(beforeRestart.envelope.capsules.map((capsule) => [capsule.page_name, capsule]));
+    const baseRevs = new Map();
+    for (const item of cases) {
+      const capsule = byName.get(item.name);
+      assertCapsuleRecord(capsule, item, mode);
+      baseRevs.set(item.name, capsule.live.base_rev);
+    }
+
+    await forceKillApp();
+    for (const item of cases) atomicReplace(item.file, `- ${item.outage}\n`);
+    await startDriver("restart");
+    browser = await newSession();
+    await waitForApp(browser, `${suffix}:restart`);
+
+    const afterRestart = await waitFor(() => {
+      const observed = readCapsule(data);
+      return observed.envelope.capsules?.length === 2 ? observed : undefined;
+    }, 30_000, `${suffix}: restart did not retain both durable capsules`);
+    if (afterRestart.file !== beforeRestart.file) {
+      throw new Error(`${suffix}: restart restored the capsules under a different graph binding`);
+    }
+    const restoredByName = new Map(
+      afterRestart.envelope.capsules.map((capsule) => [capsule.page_name, capsule]),
+    );
+    for (const item of cases) {
+      assertCapsuleRecord(restoredByName.get(item.name), item, mode, baseRevs.get(item.name));
+    }
+
+    await openPage(browser, mineName);
+    await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
+    await resolveEverywhere(browser, "mine");
+    await waitForFileText(mineFile, (text) => text.includes(cases[0].local), `${suffix}: keep retained draft`);
+    const afterFirst = readCapsule(data).envelope.capsules;
+    if (afterFirst.length !== 1 || afterFirst[0].page_name !== theirsName) {
+      throw new Error(`${suffix}: first resolution was acknowledged before durable capsule retirement`);
+    }
+
+    await openPage(browser, theirsName);
+    await assertLiveConflict(browser, cases[1].local, cases[1].outage, `${suffix}:theirs:restart`);
+    await resolveEverywhere(browser, "theirs");
+    await waitForFileText(theirsFile, (text) => text.includes(cases[1].outage), `${suffix}: use current owner`);
+    if (capsuleFiles(data).length !== 0) {
+      throw new Error(`${suffix}: final resolution was acknowledged before capsule file retirement`);
+    }
+    const legacy = await browser.execute(() => localStorage.getItem("tine.concord.live-conflicts.v1"));
+    if (legacy !== null) throw new Error(`${suffix}: retired localStorage channel survived first use`);
+    console.log(`PASS: ${suffix} SIGKILL restart restored exact capsules, re-observed newer owners, and resolved both sides`);
+  } finally {
+    try { await stopDriver(true); } catch {}
+    await sleep(1500);
+  }
+}
+
+let failure;
+try {
+  await runBackend("direct");
+  await runBackend("managed");
+  console.log("PASS: Harvest B3 Direct/Managed restart capsule matrix");
 } catch (error) {
   failure = error;
-  console.error("FAIL:", error?.message ?? error);
-  try {
-    if (browser) {
-      const state = await browser.execute(() => ({
-        conflicts: document.querySelectorAll(".page-conflict").length,
-        page: document.querySelector(".page-blocks")?.textContent,
-        capsule: localStorage.getItem("tine.concord.live-conflicts.v1"),
-        toasts: [...document.querySelectorAll(".toast")].map((toast) => toast.textContent),
-      }));
-      console.error("STATE:", JSON.stringify(state));
-      fs.writeFileSync("/tmp/e2e-concord-live-save.png", await browser.takeScreenshot(), "base64");
-    }
-  } catch {}
-} finally {
-  try { if (browser) await browser.deleteSession(); } catch {}
-  try { process.kill(-driver.pid, "SIGKILL"); } catch {}
+  console.error("FAIL:", error?.stack ?? error);
 }
 
 process.exit(failure ? 1 : 0);

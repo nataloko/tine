@@ -57,6 +57,11 @@ pub enum PageKind {
 
 const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
 
+#[cfg(test)]
+thread_local! {
+    static DIRECT_CANDIDATE_EVALUATED_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// On-disk file format of a page. Markdown (`.md`/`.markdown`) is the default; Logseq org
 /// graphs use `.org`. A graph may mix the two — format is decided per file by
 /// extension, never graph-wide (matching OG, which stores `:block/format` per
@@ -2421,6 +2426,197 @@ pub struct ConflictOverride {
     pub observation_epoch: u64,
 }
 
+/// Closed producer vocabulary for failures returned by a Direct Files save.
+/// The strings are the stable diagnostic/retry contract; user-controlled error
+/// prose is display-only and never participates in classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectSaveFailureCode {
+    PrecheckSymlink,
+    PrecheckInterrupted,
+    PrecheckPortableCollision,
+    PrecheckResourceAlias,
+    PrecheckNotPortable,
+    PrecheckNofollow,
+    PrecheckLimit,
+    IdentityChangedSinceLoad,
+    IdentityOwnedElsewhere,
+    IdentityNameTaken,
+    ConflictRetrySaveBaselinePresent,
+    ConflictRetrySaveBaselineAbsent,
+    ConflictRetryCommitRecheck,
+    ConflictRetryReplacePreRetirement,
+    ConflictRetryReplaceRetiredMismatch,
+    ConflictRetryReplacePublicationCollision,
+    ConflictRetryCreatePublicationCollision,
+    ConflictRetryFinalRereadAbsent,
+    ConflictRetryFinalRereadPresent,
+    ConflictRetryReplacePostPublication,
+    ConflictAuthoritySuperseded,
+    ConflictAuthorityOtherEpisode,
+    ConflictAuthoritySpent,
+    ConflictSaveBaselinePresent,
+    ConflictSaveBaselineAbsent,
+    ConflictCommitRecheck,
+    ConflictReplacePreRetirement,
+    ConflictReplaceRetiredMismatch,
+    ConflictReplacePublicationCollision,
+    ConflictCreatePublicationCollision,
+    ConflictFinalRereadAbsent,
+    ConflictFinalRereadPresent,
+    ConflictReplacePostPublication,
+    ConflictPinnedOwner,
+    ConflictBaseRev,
+    Unknown,
+}
+
+impl DirectSaveFailureCode {
+    pub const ALL: [Self; 36] = [
+        Self::PrecheckSymlink,
+        Self::PrecheckInterrupted,
+        Self::PrecheckPortableCollision,
+        Self::PrecheckResourceAlias,
+        Self::PrecheckNotPortable,
+        Self::PrecheckNofollow,
+        Self::PrecheckLimit,
+        Self::IdentityChangedSinceLoad,
+        Self::IdentityOwnedElsewhere,
+        Self::IdentityNameTaken,
+        Self::ConflictRetrySaveBaselinePresent,
+        Self::ConflictRetrySaveBaselineAbsent,
+        Self::ConflictRetryCommitRecheck,
+        Self::ConflictRetryReplacePreRetirement,
+        Self::ConflictRetryReplaceRetiredMismatch,
+        Self::ConflictRetryReplacePublicationCollision,
+        Self::ConflictRetryCreatePublicationCollision,
+        Self::ConflictRetryFinalRereadAbsent,
+        Self::ConflictRetryFinalRereadPresent,
+        Self::ConflictRetryReplacePostPublication,
+        Self::ConflictAuthoritySuperseded,
+        Self::ConflictAuthorityOtherEpisode,
+        Self::ConflictAuthoritySpent,
+        Self::ConflictSaveBaselinePresent,
+        Self::ConflictSaveBaselineAbsent,
+        Self::ConflictCommitRecheck,
+        Self::ConflictReplacePreRetirement,
+        Self::ConflictReplaceRetiredMismatch,
+        Self::ConflictReplacePublicationCollision,
+        Self::ConflictCreatePublicationCollision,
+        Self::ConflictFinalRereadAbsent,
+        Self::ConflictFinalRereadPresent,
+        Self::ConflictReplacePostPublication,
+        Self::ConflictPinnedOwner,
+        Self::ConflictBaseRev,
+        Self::Unknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrecheckSymlink => "precheck.symlink",
+            Self::PrecheckInterrupted => "precheck.interrupted",
+            Self::PrecheckPortableCollision => "precheck.portable_collision",
+            Self::PrecheckResourceAlias => "precheck.resource_alias",
+            Self::PrecheckNotPortable => "precheck.not_portable",
+            Self::PrecheckNofollow => "precheck.nofollow",
+            Self::PrecheckLimit => "precheck.limit",
+            Self::IdentityChangedSinceLoad => "identity.changed_since_load",
+            Self::IdentityOwnedElsewhere => "identity.owned_elsewhere",
+            Self::IdentityNameTaken => "identity.name_taken",
+            Self::ConflictRetrySaveBaselinePresent => "conflict_retry.save_baseline_present",
+            Self::ConflictRetrySaveBaselineAbsent => "conflict_retry.save_baseline_absent",
+            Self::ConflictRetryCommitRecheck => "conflict_retry.commit_recheck",
+            Self::ConflictRetryReplacePreRetirement => "conflict_retry.replace_pre_retirement",
+            Self::ConflictRetryReplaceRetiredMismatch => "conflict_retry.replace_retired_mismatch",
+            Self::ConflictRetryReplacePublicationCollision => {
+                "conflict_retry.replace_publication_collision"
+            }
+            Self::ConflictRetryCreatePublicationCollision => {
+                "conflict_retry.create_publication_collision"
+            }
+            Self::ConflictRetryFinalRereadAbsent => "conflict_retry.final_reread_absent",
+            Self::ConflictRetryFinalRereadPresent => "conflict_retry.final_reread_present",
+            Self::ConflictRetryReplacePostPublication => "conflict_retry.replace_post_publication",
+            Self::ConflictAuthoritySuperseded => "conflict_authority.superseded",
+            Self::ConflictAuthorityOtherEpisode => "conflict_authority.other_episode",
+            Self::ConflictAuthoritySpent => "conflict_authority.spent",
+            Self::ConflictSaveBaselinePresent => "conflict.save_baseline_present",
+            Self::ConflictSaveBaselineAbsent => "conflict.save_baseline_absent",
+            Self::ConflictCommitRecheck => "conflict.commit_recheck",
+            Self::ConflictReplacePreRetirement => "conflict.replace_pre_retirement",
+            Self::ConflictReplaceRetiredMismatch => "conflict.replace_retired_mismatch",
+            Self::ConflictReplacePublicationCollision => "conflict.replace_publication_collision",
+            Self::ConflictCreatePublicationCollision => "conflict.create_publication_collision",
+            Self::ConflictFinalRereadAbsent => "conflict.final_reread_absent",
+            Self::ConflictFinalRereadPresent => "conflict.final_reread_present",
+            Self::ConflictReplacePostPublication => "conflict.replace_post_publication",
+            Self::ConflictPinnedOwner => "conflict.pinned_owner",
+            Self::ConflictBaseRev => "conflict.base_rev",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Typed inner error retained inside the public `io::Error` save surface.
+#[derive(Debug)]
+pub struct DirectSaveError {
+    code: DirectSaveFailureCode,
+    conflict_epoch: Option<u64>,
+    source: io::Error,
+}
+
+impl DirectSaveError {
+    pub fn into_io(code: DirectSaveFailureCode, source: io::Error) -> io::Error {
+        Self::into_io_with_conflict_epoch(code, None, source)
+    }
+
+    pub fn into_io_with_conflict_epoch(
+        code: DirectSaveFailureCode,
+        conflict_epoch: Option<u64>,
+        source: io::Error,
+    ) -> io::Error {
+        let kind = source.kind();
+        io::Error::new(
+            kind,
+            Self {
+                code,
+                conflict_epoch,
+                source,
+            },
+        )
+    }
+
+    pub fn ensure_io(source: io::Error) -> io::Error {
+        if source
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+            .is_some()
+        {
+            source
+        } else {
+            Self::into_io(DirectSaveFailureCode::Unknown, source)
+        }
+    }
+
+    pub const fn code(&self) -> DirectSaveFailureCode {
+        self.code
+    }
+
+    pub const fn conflict_epoch(&self) -> Option<u64> {
+        self.conflict_epoch
+    }
+}
+
+impl fmt::Display for DirectSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DirectSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// App-private recovery material for a live Direct Files conflict. The caller
 /// persists this outside the graph so an unresolved draft survives navigation,
 /// a clean shutdown, or a process crash. `disk_rev` is the exact revision the
@@ -2461,6 +2657,22 @@ enum EditorConflictSite {
 }
 
 impl EditorConflictSite {
+    /// Every conflict-minting site. Exhaustive by construction: the length is
+    /// pinned, so adding a variant without adding it here fails to compile and
+    /// the site-to-code guards cannot silently stop covering it.
+    const ALL: [Self; 10] = [
+        Self::SaveBaselinePresent,
+        Self::SaveBaselineAbsent,
+        Self::CommitRecheck,
+        Self::ReplacePreRetirement,
+        Self::ReplaceRetiredMismatch,
+        Self::ReplacePublicationCollision,
+        Self::CreatePublicationCollision,
+        Self::FinalRereadAbsent,
+        Self::FinalRereadPresent,
+        Self::ReplacePostPublication,
+    ];
+
     fn message(self) -> &'static str {
         match self {
             Self::SaveBaselinePresent => "editor conflict: save baseline present",
@@ -2491,6 +2703,48 @@ impl EditorConflictSite {
             Self::FinalRereadPresent => "tokenless editor conflict: final reread present",
             Self::ReplacePostPublication => {
                 "tokenless editor conflict: post-publication validation"
+            }
+        }
+    }
+
+    fn conflict_code(self) -> DirectSaveFailureCode {
+        match self {
+            Self::SaveBaselinePresent => DirectSaveFailureCode::ConflictSaveBaselinePresent,
+            Self::SaveBaselineAbsent => DirectSaveFailureCode::ConflictSaveBaselineAbsent,
+            Self::CommitRecheck => DirectSaveFailureCode::ConflictCommitRecheck,
+            Self::ReplacePreRetirement => DirectSaveFailureCode::ConflictReplacePreRetirement,
+            Self::ReplaceRetiredMismatch => DirectSaveFailureCode::ConflictReplaceRetiredMismatch,
+            Self::ReplacePublicationCollision => {
+                DirectSaveFailureCode::ConflictReplacePublicationCollision
+            }
+            Self::CreatePublicationCollision => {
+                DirectSaveFailureCode::ConflictCreatePublicationCollision
+            }
+            Self::FinalRereadAbsent => DirectSaveFailureCode::ConflictFinalRereadAbsent,
+            Self::FinalRereadPresent => DirectSaveFailureCode::ConflictFinalRereadPresent,
+            Self::ReplacePostPublication => DirectSaveFailureCode::ConflictReplacePostPublication,
+        }
+    }
+
+    fn tokenless_code(self) -> DirectSaveFailureCode {
+        match self {
+            Self::SaveBaselinePresent => DirectSaveFailureCode::ConflictRetrySaveBaselinePresent,
+            Self::SaveBaselineAbsent => DirectSaveFailureCode::ConflictRetrySaveBaselineAbsent,
+            Self::CommitRecheck => DirectSaveFailureCode::ConflictRetryCommitRecheck,
+            Self::ReplacePreRetirement => DirectSaveFailureCode::ConflictRetryReplacePreRetirement,
+            Self::ReplaceRetiredMismatch => {
+                DirectSaveFailureCode::ConflictRetryReplaceRetiredMismatch
+            }
+            Self::ReplacePublicationCollision => {
+                DirectSaveFailureCode::ConflictRetryReplacePublicationCollision
+            }
+            Self::CreatePublicationCollision => {
+                DirectSaveFailureCode::ConflictRetryCreatePublicationCollision
+            }
+            Self::FinalRereadAbsent => DirectSaveFailureCode::ConflictRetryFinalRereadAbsent,
+            Self::FinalRereadPresent => DirectSaveFailureCode::ConflictRetryFinalRereadPresent,
+            Self::ReplacePostPublication => {
+                DirectSaveFailureCode::ConflictRetryReplacePostPublication
             }
         }
     }
@@ -5053,6 +5307,11 @@ fn rename_source_remove_failpoint() -> io::Result<()> {
     Ok(())
 }
 
+/// OG's default when `:ref/linked-references-collapsed-threshold` is absent.
+fn default_linked_references_collapsed_threshold() -> u32 {
+    100
+}
+
 // `PartialEq` is load-bearing, not a convenience: the config watcher refreshes
 // a graph and then compares the meta it produced against the meta the frontend
 // already has, so a rewrite that changes no setting emits nothing.
@@ -5068,6 +5327,10 @@ pub struct GraphMeta {
     pub start_of_week: u32,
     /// Extra property keys to hide from the rendered properties area.
     pub block_hidden_properties: Vec<String>,
+    /// Backlink count at which a page opens its Linked References collapsed
+    /// (`:ref/linked-references-collapsed-threshold`, OG default 100).
+    #[serde(default = "default_linked_references_collapsed_threshold")]
+    pub linked_references_collapsed_threshold: u32,
     /// Template name applied to a new, empty journal page (if configured).
     pub default_journal_template: Option<String>,
     /// Graph-portable startup page from `:default-home {:page "..."}`.
@@ -5824,6 +6087,94 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 
+    fn direct_projection_candidate_query(
+        &self,
+        plan: &crate::query::SimpleQueryCandidatePlan,
+        query_src: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<crate::query::BoundedGroups> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        // The candidate-count escape hatch scales with the graph, so the
+        // projection needs the graph's page count to apply it. `None` here
+        // covers both "the projection could not answer" and "its candidate set
+        // was not selective enough to be worth materializing"; either way the
+        // caller notes one fallback read and takes the parser walk.
+        let graph_page_count = self
+            .cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |pages| pages.len());
+        let paths = projection.simple_query_candidate_paths(generation, plan, graph_page_count)?;
+        #[cfg(test)]
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|recorded| {
+            *recorded.borrow_mut() = paths.iter().cloned().collect();
+        });
+        let pages = self.direct_projection_pages_for_paths(generation, paths)?;
+        let pages = pages
+            .into_iter()
+            .map(|(entry, document)| {
+                let page = page_dto_checked(&entry, &document).ok()?;
+                Some(crate::query::ApplicationQueryPage {
+                    page,
+                    roots: Arc::new(document.roots.clone()),
+                    recency: self.journal_format.page_recency_secs(
+                        entry.kind == PageKind::Journal,
+                        &entry.name,
+                        &entry.path,
+                    ),
+                    journal: entry.date_key,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let result = crate::query::run_application_query_pages_bounded(
+            &pages, query_src, max_rows, max_bytes,
+        );
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_property_facets(
+        &self,
+        autocomplete: bool,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let result = projection.property_facets(
+            generation,
+            autocomplete,
+            &self.config.block_hidden_properties,
+            max_items,
+            max_bytes,
+        )?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_note_fallback_read(&self) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.note_fallback_read();
+        }
+    }
+
     fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self
@@ -6009,6 +6360,46 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.indexed_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_fallback_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.fallback_reads())
+    }
+
+    /// The candidate set the lowering produces, with the escape hatch driven
+    /// explicitly: `graph_page_count` sets the cutoff exactly as production
+    /// does, so a test can observe both the routed and the abandoned side.
+    /// Pass `usize::MAX` for the raw, uncapped lowering result.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_candidate_paths_test(
+        &self,
+        plan: &crate::query::SimpleQueryCandidatePlan,
+        graph_page_count: usize,
+    ) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .simple_query_candidate_paths(generation, plan, graph_page_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow_mut().clear());
+        crate::query::reset_full_graph_query_evaluations();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_candidate_evaluated_paths_test(
+        &self,
+    ) -> Vec<std::path::PathBuf> {
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow().clone())
     }
 
     #[cfg(test)]
@@ -6368,7 +6759,7 @@ impl Graph {
         if cancelled.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "graph verification cancelled",
+                crate::sync_runtime::tagged_backend_error("operation-cancelled", None),
             ));
         }
         let managed = ManagedPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
@@ -6397,7 +6788,7 @@ impl Graph {
             if cancelled.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "graph verification cancelled",
+                    crate::sync_runtime::tagged_backend_error("operation-cancelled", None),
                 ));
             }
             let read = file.read(&mut buffer)?;
@@ -7194,10 +7585,13 @@ impl Graph {
                     if graph_wide {
                         continue;
                     }
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "managed text entry is a symlink or reparse point: {child_relative}"
+                    return Err(DirectSaveError::into_io(
+                        DirectSaveFailureCode::PrecheckSymlink,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "managed text entry is a symlink or reparse point: {child_relative}"
+                            ),
                         ),
                     ));
                 }
@@ -7609,39 +8003,24 @@ impl Graph {
     /// configured-root interpretation this authority has always produced.
     /// Ordinary graph text outside those roots is decoded from its file name
     /// alone through the same graph-wide decoder `Graph::list_pages` already
-    /// uses, because that is what OG does: `logseq.common.graph/get-files`
-    /// walks the whole graph directory, `graph-parser.extract/get-page-name`
-    /// takes only the last path component, and
-    /// `graph-parser.block/convert-page-if-journal` decides journal-ness by
-    /// parsing that title as a date. The containing directory therefore never
+    /// uses, because that is what OG does at
+    /// 6e7afa8eb040686ff057156ee877193b581dd369:
+    /// `deps/graph-parser/src/logseq/graph_parser/extract.cljc`
+    /// (`get-page-name`) takes only the last path component, and
+    /// `deps/graph-parser/src/logseq/graph_parser/block.cljs`
+    /// (`convert-page-if-journal`) decides journal-ness by parsing that title
+    /// as a date. The containing directory therefore never
     /// chooses Page versus Journal, and the exact nested spelling is retained.
     pub(crate) fn managed_entry_for_managed_path(
         &self,
         path: &ManagedPath,
     ) -> Result<PageEntry, ReceiptError> {
-        let kind = match self.classify_managed_text_path(path) {
-            Ok(ManagedTextKind::Page) => PageKind::Page,
-            Ok(ManagedTextKind::Journal) => PageKind::Journal,
+        match self.classify_managed_text_path(path) {
+            Ok(ManagedTextKind::Page | ManagedTextKind::Journal) => {}
             Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
-        };
-        let filename = path.file_name();
-        let stem = split_logseq_text_filename(filename)
-            .map(|(stem, _)| stem)
-            .ok_or_else(|| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))?;
-        let (name, date_key) = match kind {
-            PageKind::Journal => match self.journal_format.parse(stem) {
-                Some(date) => (self.journal_format.title(date), Some(date.ordinal_key())),
-                None => (stem.to_owned(), None),
-            },
-            PageKind::Page => (decode_page_name(stem, self.config.file_name_format), None),
-        };
-        Ok(PageEntry {
-            name,
-            kind,
-            date_key,
-            rel_path: path.as_str().to_owned(),
-            path: self.root.join(path.as_str()),
-        })
+        }
+        self.graph_entry_for_relative_path(path.as_str())
+            .map_err(|_| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))
     }
 
     /// OG-compatible decode for supported graph text that no configured root
@@ -7861,9 +8240,12 @@ impl Graph {
         path: &Path,
     ) -> io::Result<Option<(String, ContentDigest)>> {
         let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guarded graph-text target is not portable: {error}"),
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckNotPortable,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text target is not portable: {error}"),
+                ),
             )
         })?;
         let target = match self.managed_target(permit, path, false) {
@@ -7951,9 +8333,12 @@ impl Graph {
     ) -> io::Result<()> {
         let target = self.managed_target(permit, path, false)?;
         let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guarded graph-text target is not portable: {error}"),
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckNotPortable,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text target is not portable: {error}"),
+                ),
             )
         })?;
         self.validate_existing_graph_text_target_exact(
@@ -8071,9 +8456,12 @@ impl Graph {
                     let file_type = entry.file_type()?;
                     if file_type.is_symlink() {
                         if strict_creation {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "projection path has no retained no-follow directory or file",
+                            return Err(DirectSaveError::into_io(
+                                DirectSaveFailureCode::PrecheckNofollow,
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "projection path has no retained no-follow directory or file",
+                                ),
                             ));
                         }
                         continue;
@@ -8089,11 +8477,14 @@ impl Graph {
                         projection_optional_regular_metadata(&prefix.directory, name)?;
                         match open_projection_file_nofollow(&prefix.directory, name) {
                             Ok(_) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::AlreadyExists,
-                                    format!(
-                                        "graph text paths share one portable case/NFC identity: {relative} and {}",
-                                        managed_path.as_str()
+                                return Err(DirectSaveError::into_io(
+                                    DirectSaveFailureCode::PrecheckPortableCollision,
+                                    io::Error::new(
+                                        io::ErrorKind::AlreadyExists,
+                                        format!(
+                                            "graph text paths share one portable case/NFC identity: {relative} and {}",
+                                            managed_path.as_str()
+                                        ),
                                     ),
                                 ));
                             }
@@ -8114,10 +8505,13 @@ impl Graph {
                     if strict_creation && relative != requested_relative {
                         projection_real_directory(&prefix.directory, name)?;
                         let _alias = open_projection_dir_nofollow(&prefix.directory, name)?;
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!(
-                                "graph text paths share one portable case/NFC identity: {relative} and {requested_relative}"
+                        return Err(DirectSaveError::into_io(
+                            DirectSaveFailureCode::PrecheckPortableCollision,
+                            io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "graph text paths share one portable case/NFC identity: {relative} and {requested_relative}"
+                                ),
                             ),
                         ));
                     }
@@ -8150,9 +8544,12 @@ impl Graph {
     ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
         let target_relative = self.rel_path(target);
         let target_path = ManagedPath::parse(target_relative.clone()).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guarded graph-text target is not portable: {error}"),
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckNotPortable,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text target is not portable: {error}"),
+                ),
             )
         })?;
         let index = self.guarded_graph_text_identity_index()?;
@@ -8161,11 +8558,14 @@ impl Graph {
             .get(&target_path.portable_key())
             .and_then(|members| members.iter().find(|member| *member != &target_path))
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "graph text paths share one portable case/NFC identity: {} and {target_relative}",
-                    sibling.as_str()
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckPortableCollision,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "graph text paths share one portable case/NFC identity: {} and {target_relative}",
+                        sibling.as_str()
+                    ),
                 ),
             ));
         }
@@ -8179,11 +8579,14 @@ impl Graph {
                         .find(|member| member.as_str() != target_relative)
                 })
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} and {target_relative}",
-                        sibling
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::PrecheckResourceAlias,
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "graph text files alias one physical resource: {} and {target_relative}",
+                            sibling
+                        ),
                     ),
                 ));
             }
@@ -9031,8 +9434,6 @@ impl Graph {
         // precedes it. Re-run only the path-local portable/no-follow boundary
         // after the chain exists; the graph-wide census remains singular.
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
-        let publication = DurableDirectoryPublication::open(target.parent())
-            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         if self.graph_text_external_observation_pending() {
@@ -9055,9 +9456,8 @@ impl Graph {
                 "effective page identity evidence changed before no-replace publication",
             ));
         }
-        if let Err(error) = publication
-            .move_exact_no_replace(&temp, &target.filename, bytes)
-            .map_err(managed_trash_filesystem_error)
+        if let Err(error) =
+            move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)
         {
             let _ = target.parent().remove_file(&temp);
             if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
@@ -9158,8 +9558,6 @@ impl Graph {
         }
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
-        let publication = DurableDirectoryPublication::open(target.parent())
-            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         let validation_result = match validation {
@@ -9188,9 +9586,8 @@ impl Graph {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
-        let result = publication
-            .move_exact_no_replace(&temp, &target.filename, bytes)
-            .map_err(managed_trash_filesystem_error);
+        let result =
+            move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes);
         if let Err(error) = result {
             let _ = target.parent().remove_file(&temp);
             if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
@@ -9286,15 +9683,6 @@ impl Graph {
             None => format!(".{}.{process}.{sequence}.editor-recovery", target.filename,),
         };
         let retired_cleanup = format!(".{}.{process}.{sequence}.editor-retired", target.filename,);
-        let direct_publication = if publication_authority == EditorPublicationAuthority::DirectFile
-        {
-            Some(
-                DurableDirectoryPublication::open(target.parent())
-                    .map_err(managed_trash_filesystem_error)?,
-            )
-        } else {
-            None
-        };
         let mut retired = false;
         let mut published = false;
         let mut conflict_site = None;
@@ -9328,11 +9716,9 @@ impl Graph {
             }
             let rename_noreplace =
                 |from: &str, to: &str, expected: &[u8]| match publication_authority {
-                    EditorPublicationAuthority::DirectFile => direct_publication
-                        .as_ref()
-                        .expect("Direct Files publication was preflighted")
-                        .move_exact_no_replace(from, to, expected)
-                        .map_err(managed_trash_filesystem_error),
+                    EditorPublicationAuthority::DirectFile => {
+                        move_graph_text_exact_no_replace(target.parent(), from, to, expected)
+                    }
                     EditorPublicationAuthority::ReconstructibleManagedProjection => {
                         rename_reconstructible_projection_noreplace(target.parent(), from, to)
                     }
@@ -9400,10 +9786,13 @@ impl Graph {
                 }
                 return Err(error);
             }
-            if let Some(publication) = direct_publication.as_ref() {
-                publication
-                    .move_exact_no_replace(&recovery, &retired_cleanup, &retired_bytes)
-                    .map_err(managed_trash_filesystem_error)?;
+            if publication_authority == EditorPublicationAuthority::DirectFile {
+                move_graph_text_exact_no_replace(
+                    target.parent(),
+                    &recovery,
+                    &retired_cleanup,
+                    &retired_bytes,
+                )?;
                 let _ = target.parent().remove_file(&retired_cleanup);
             } else {
                 target.parent().remove_file(&recovery)?;
@@ -9437,11 +9826,14 @@ impl Graph {
                         validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         match publication_authority {
-                            EditorPublicationAuthority::DirectFile => direct_publication
-                                .as_ref()
-                                .expect("Direct Files publication was preflighted")
-                                .move_exact_no_replace(&recovery, &target.filename, &recovery_bytes)
-                                .map_err(managed_trash_filesystem_error),
+                            EditorPublicationAuthority::DirectFile => {
+                                move_graph_text_exact_no_replace(
+                                    target.parent(),
+                                    &recovery,
+                                    &target.filename,
+                                    &recovery_bytes,
+                                )
+                            }
                             EditorPublicationAuthority::ReconstructibleManagedProjection => {
                                 rename_reconstructible_projection_noreplace(
                                     target.parent(),
@@ -10260,9 +10652,12 @@ impl Graph {
             }
         }
         Err(last_disagreement.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Interrupted,
-                "managed inventory changed during retained identity capture",
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckInterrupted,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "managed inventory changed during retained identity capture",
+                ),
             )
         }))
     }
@@ -10287,9 +10682,12 @@ impl Graph {
             true,
         )?;
         if !initial_shadow_captures_match(&first, &second) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "managed inventory changed during retained identity capture",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckInterrupted,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "managed inventory changed during retained identity capture",
+                ),
             ));
         }
         let combined_capture_bytes =
@@ -11053,6 +11451,9 @@ impl Graph {
             },
             shortcuts: self.config.shortcuts.clone(),
             start_of_week: self.config.start_of_week,
+            linked_references_collapsed_threshold: self
+                .config
+                .linked_references_collapsed_threshold,
             block_hidden_properties: self.config.block_hidden_properties.clone(),
             default_journal_template: self.config.default_journal_template.clone(),
             default_home: self.config.default_home.clone(),
@@ -11783,9 +12184,13 @@ impl Graph {
         // a `yyyy_MM_dd` file) must appear ONCE — both files resolve to the same
         // page name, so otherwise the day renders twice. The stray stays visible
         // via journal_conflicts() for reconciliation.
-        let mut js = dedup_journal_days(raw);
-        js.sort_by_key(|e| std::cmp::Reverse(e.date_key.unwrap_or(0)));
-        js
+        //
+        // This dedup/ordering rule is journal_feed's, not this file's: it used to
+        // be a second hand-written copy here, whose canonicality test read only
+        // `path` where journal_feed's reads `rel_path` first. Two copies of the
+        // rule that decides which file represents a day is how a day silently
+        // drops out of a user's history.
+        crate::journal_feed::journal_feed_candidates_desc(raw)
     }
 
     /// Feed membership is narrower than the raw journal inventory: future
@@ -13342,17 +13747,23 @@ impl Graph {
             }
         }
         if existing_identity {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a page with that name already exists",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityNameTaken,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a page with that name already exists",
+                ),
             ));
         }
         let enc = encode_page_name(name, self.config.file_name_format);
         for target in configured_text_variant_paths(&dir, &enc) {
             if self.managed_exists(&write, &target)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "a page with that name already exists",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::IdentityNameTaken,
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "a page with that name already exists",
+                    ),
                 ));
             }
         }
@@ -15221,6 +15632,31 @@ impl Graph {
                     )
             });
         }
+        let plan = crate::query::simple_query_candidate_plan(query_src);
+        match plan {
+            crate::query::SimpleQueryCandidatePlan::Empty => return Arc::new(Vec::new()),
+            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
+                if self.direct_projection_ready() {
+                    return self.derived_memo(format!("q\0{query_src}"), || {
+                        self.direct_projection_candidate_query(
+                            &plan,
+                            query_src,
+                            usize::MAX,
+                            usize::MAX,
+                        )
+                        .map_or_else(
+                            || {
+                                self.direct_projection_note_fallback_read();
+                                crate::query::run_query(self, query_src)
+                            },
+                            |result| result.groups,
+                        )
+                    });
+                }
+                self.direct_projection_note_fallback_read();
+            }
+            crate::query::SimpleQueryCandidatePlan::All => {}
+        }
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
         })
@@ -15253,6 +15689,36 @@ impl Graph {
                         })
                 },
             );
+        }
+        let plan = crate::query::simple_query_candidate_plan(query_src);
+        match plan {
+            crate::query::SimpleQueryCandidatePlan::Empty => {
+                return BoundedRefGroups {
+                    groups: Arc::new(Vec::new()),
+                    total: 0,
+                    exceeded: false,
+                };
+            }
+            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
+                if self.direct_projection_ready() {
+                    return self.derived_memo_bounded(
+                        format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
+                        || {
+                            self.direct_projection_candidate_query(
+                                &plan, query_src, max_rows, max_bytes,
+                            )
+                            .unwrap_or_else(|| {
+                                self.direct_projection_note_fallback_read();
+                                crate::query::run_query_bounded(
+                                    self, query_src, max_rows, max_bytes,
+                                )
+                            })
+                        },
+                    );
+                }
+                self.direct_projection_note_fallback_read();
+            }
+            crate::query::SimpleQueryCandidatePlan::All => {}
         }
         self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
             crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
@@ -15475,15 +15941,18 @@ impl Graph {
                     && other.path != entry.path
                     && crate::refs::same_page(&other.name, &new_name)
             }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "target page identity already exists elsewhere in the graph",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::IdentityNameTaken,
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "target page identity already exists elsewhere in the graph",
+                    ),
                 ));
             }
             if new_path != entry.path && self.managed_exists(&write, &new_path)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "target page exists",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::IdentityNameTaken,
+                    io::Error::new(io::ErrorKind::AlreadyExists, "target page exists"),
                 ));
             }
             for other_format_target in
@@ -15493,9 +15962,12 @@ impl Graph {
                     && other_format_target != new_path
                     && self.managed_exists(&write, &other_format_target)?
                 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "target page exists in another supported text extension",
+                    return Err(DirectSaveError::into_io(
+                        DirectSaveFailureCode::IdentityNameTaken,
+                        io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "target page exists in another supported text extension",
+                        ),
                     ));
                 }
             }
@@ -15765,9 +16237,9 @@ impl Graph {
         // change) on any mismatch (an external editor / Syncthing pull landed).
         for e in &edits {
             if e.is_move && e.dst != e.src && self.managed_exists(&write, &e.dst)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "target page exists",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::IdentityNameTaken,
+                    io::Error::new(io::ErrorKind::AlreadyExists, "target page exists"),
                 ));
             }
             // A hard read failure is not the same thing as an empty file. Treating
@@ -16197,7 +16669,38 @@ impl Graph {
     /// query builder's property-filter autocomplete. Excludes internal/metadata
     /// properties (id, collapsed, hl-*, …).
     pub fn property_facets(&self) -> Vec<(String, Vec<String>)> {
-        crate::query::property_facets(self)
+        self.property_facets_bounded(usize::MAX, usize::MAX).0
+    }
+
+    pub fn property_facets_bounded(
+        &self,
+        max_values: usize,
+        max_bytes: usize,
+    ) -> (Vec<(String, Vec<String>)>, bool) {
+        if self.direct_projection_ready() {
+            if let Some(result) =
+                self.direct_projection_property_facets(false, max_values, max_bytes)
+            {
+                return result;
+            }
+        }
+        self.direct_projection_note_fallback_read();
+        crate::query::property_facets_bounded(self, max_values, max_bytes)
+    }
+
+    pub fn autocomplete_property_facets_bounded(
+        &self,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> (Vec<(String, Vec<String>)>, bool) {
+        if self.direct_projection_ready() {
+            if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes)
+            {
+                return result;
+            }
+        }
+        self.direct_projection_note_fallback_read();
+        crate::query::autocomplete_property_facets_bounded(self, max_items, max_bytes)
     }
 
     // ---- Assets & PDF highlights ----
@@ -16405,14 +16908,14 @@ impl Graph {
         if metadata.len() > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("asset exceeds {} byte limit", max_bytes),
+                crate::sync_runtime::tagged_backend_error("asset-too-large", None),
             ));
         }
         let bytes = fs::read(path)?;
         if bytes.len() as u64 > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("asset exceeds {} byte limit", max_bytes),
+                crate::sync_runtime::tagged_backend_error("asset-too-large", None),
             ));
         }
         Ok(bytes)
@@ -16535,6 +17038,44 @@ impl Graph {
         Ok(format!("{key}/{name}"))
     }
 
+    fn move_pdf_area_image_to_trash(
+        &self,
+        source_key: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<Option<(PathBuf, PathBuf)>> {
+        let name = format!("{page}_{id}_{stamp}.png");
+        top_level_asset_name(&name)?;
+        let source = self.assets_path().join(source_key).join(&name);
+        if !source.exists() {
+            return Ok(None);
+        }
+        self.ensure_asset_write_target(&source)?;
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
+        self.ensure_trash_write_target(&trash)?;
+        let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
+        top_level_asset_name(&trash_name)?;
+        let destination = trash.join(trash_name);
+        move_to_trash(&source, &destination, &trash)?;
+        Ok(Some((source, destination)))
+    }
+
+    /// Roll back a crop written before its highlight sidecar transaction failed.
+    /// The nested source path is derived from the same PDF tuple as the writer;
+    /// callers never receive a general nested-asset deletion capability.
+    pub fn rollback_pdf_area_image(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<()> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        self.move_pdf_area_image_to_trash(&key, page, id, stamp)?;
+        Ok(())
+    }
+
     /// After the highlight sidecar + hls page pair is durably committed, move
     /// deleted area crops to recoverable asset trash. OG removes this exact crop
     /// with its highlight (`extensions/pdf/core.cljs:155-159` and
@@ -16556,7 +17097,6 @@ impl Graph {
         if deleted.is_empty() {
             return;
         }
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
         for highlight in deleted {
             let Some(stamp) = highlight.image else {
                 continue;
@@ -16581,26 +17121,11 @@ impl Graph {
                 continue;
             }
 
-            let name = format!("{}_{}_{}.png", highlight.page, highlight.id, stamp);
-            if top_level_asset_name(&name).is_err() {
+            let Ok(Some((source, destination))) =
+                self.move_pdf_area_image_to_trash(source_key, highlight.page, &highlight.id, stamp)
+            else {
                 continue;
-            }
-            let source = self.assets_path().join(source_key).join(&name);
-            if !source.is_file()
-                || self.ensure_asset_write_target(&source).is_err()
-                || self.ensure_trash_write_target(&trash).is_err()
-                || fs::create_dir_all(&trash).is_err()
-            {
-                continue;
-            }
-            let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
-            if top_level_asset_name(&trash_name).is_err() {
-                continue;
-            }
-            let destination = trash.join(trash_name);
-            if move_to_trash(&source, &destination, &trash).is_err() {
-                continue;
-            }
+            };
 
             // A non-cooperating writer can change the sidecar between the
             // last-moment read and rename. Put the crop back if that happened.
@@ -19474,7 +19999,9 @@ impl Graph {
             Ok(entry) => entry,
             Err(_error) => {
                 #[cfg(debug_assertions)]
-                eprintln!("file reconcile deferred for {}: {_error}", path.display());
+                if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                    eprintln!("file reconcile deferred after a content-free I/O failure");
+                }
                 None
             }
         }
@@ -20276,24 +20803,33 @@ impl Graph {
         // see — a stray duplicate click would disarm the banner permanently.
         if let Some(live) = state.tokens.get(path) {
             if live.observation_epoch != presented.observation_epoch {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "conflict override authority is newer than the conflict this request answers",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::ConflictAuthoritySuperseded,
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "conflict override authority is newer than the conflict this request answers",
+                    ),
                 ));
             }
         }
         let token = state.tokens.remove(path);
         let consumed_epoch = Self::advance_conflict_observation_epoch(&mut state, path) - 1;
         let token = token.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "conflict override authority is missing or already consumed",
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictAuthoritySpent,
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict override authority is missing or already consumed",
+                ),
             )
         })?;
         if token.observation_epoch != consumed_epoch || token.editor_episode != *editor_episode {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "conflict override authority belongs to a different editor episode",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictAuthorityOtherEpisode,
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict override authority belongs to a different editor episode",
+                ),
             ));
         }
         // The caller must name the observation it was SHOWN, not merely hold a
@@ -20322,25 +20858,26 @@ impl Graph {
         bytes: Option<String>,
     ) -> io::Error {
         let Some(editor_episode) = editor_episode else {
-            return io::Error::new(io::ErrorKind::AlreadyExists, "conflict");
+            return DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictBaseRev,
+                io::Error::new(io::ErrorKind::AlreadyExists, "conflict"),
+            );
         };
         let observation_epoch = self.mint_conflict_authority(path, editor_episode, snapshot, bytes);
-        // The epoch rides along so the UI can echo it back on "Keep mine" and
-        // name the observation the user was actually shown. `contains`-based
-        // code classification is unaffected by the suffix.
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} {CONFLICT_OBSERVATION_TAG}{observation_epoch}]",
-                site.message()
-            ),
+        DirectSaveError::into_io_with_conflict_epoch(
+            site.conflict_code(),
+            Some(observation_epoch),
+            io::Error::new(io::ErrorKind::AlreadyExists, site.message()),
         )
     }
 
     fn tokenless_conflict_error(site: EditorConflictSite, observation: io::Error) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!("{}: {observation}", site.tokenless_message()),
+        DirectSaveError::into_io(
+            site.tokenless_code(),
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{}: {observation}", site.tokenless_message()),
+            ),
         )
     }
 
@@ -20363,9 +20900,12 @@ impl Graph {
         path: &Path,
     ) -> io::Result<()> {
         let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guarded graph-text target is not portable: {error}"),
+            DirectSaveError::into_io(
+                DirectSaveFailureCode::PrecheckNotPortable,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text target is not portable: {error}"),
+                ),
             )
         })?;
         self.validate_graph_text_portable_aliases_path_local(write, &managed_path, false)
@@ -20379,7 +20919,10 @@ impl Graph {
         site: EditorConflictSite,
     ) -> io::Error {
         let Some(editor_episode) = editor_episode else {
-            return io::Error::new(io::ErrorKind::AlreadyExists, "conflict");
+            return DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictBaseRev,
+                io::Error::new(io::ErrorKind::AlreadyExists, "conflict"),
+            );
         };
         if let Err(error) = self.validate_editor_conflict_portable_path(write, path) {
             return error;
@@ -20459,9 +21002,12 @@ impl Graph {
             }
         };
         if !owner_matches {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "path-pinned page does not match its captured exact owner",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictPinnedOwner,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "path-pinned page does not match its captured exact owner",
+                ),
             ));
         }
         Ok(())
@@ -20808,9 +21354,12 @@ impl Graph {
             PinnedSaveAuthority::LoadedRevision(Some(base_rev)),
         )?;
         if validation.requested_identity_elsewhere {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "another graph document owns this effective page identity",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityOwnedElsewhere,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
             ));
         }
         let loaded = validation.target.ok_or_else(|| {
@@ -20863,9 +21412,12 @@ impl Graph {
                 revision == base_rev && *identity == loaded.file_identity
             });
         if !retained_matches {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "existing page identity changed since load",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityChangedSinceLoad,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "existing page identity changed since load",
+                ),
             ));
         }
 
@@ -20900,9 +21452,12 @@ impl Graph {
             .get(&semantic_key)
             .is_some_and(|members| members.iter().any(|member| member != &managed_path))
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "another graph document owns this effective page identity",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityOwnedElsewhere,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
             ));
         }
         // The retained guarded admission index above already proves the exact
@@ -21082,6 +21637,113 @@ impl Graph {
         })
     }
 
+    /// Compose the durable recovery record for one Direct cross-page move
+    /// (packet B2; I-3, I-2). See `crate::direct_move_recovery` and
+    /// `docs/contracts/direct-move-recovery.md`.
+    ///
+    /// The caller has already performed the in-memory move, so `destination`
+    /// and `sources` are the POST-move DTOs. For each participant this resolves
+    /// the exact file the ordinary save will write, reads its current bytes (the
+    /// preimage) and serializes the proposed bytes (the postimage) through the
+    /// SAME `serialize_page_dto_for_path` boundary the save itself uses — so the
+    /// recorded postimage is byte-identical to what the save publishes, which is
+    /// what lets recovery complete the move without a parser (I-4).
+    ///
+    /// `Ok(None)` means "no record is needed": every participant resolves to the
+    /// same file, i.e. the move is degenerate and is a single ordinary save that
+    /// the existing base-revision guard already makes safe. Composition never
+    /// refuses the move — an `Err` here is reported and the move proceeds
+    /// unbracketed, exactly as it did before B2, because refusing to move a page
+    /// because device-private state is unavailable would be an availability bug,
+    /// not hardening (contract §4).
+    pub fn prepare_direct_cross_page_move(
+        &self,
+        destination: &PageDto,
+        sources: &[PageDto],
+    ) -> io::Result<Option<crate::direct_move_recovery::PreparedDirectMove>> {
+        use crate::direct_move_recovery::{
+            DirectMoveRecord, ImageRef, MoveParticipant, ParticipantRole, PreparedDirectMove,
+            RECORD_SCHEMA,
+        };
+
+        let write = self.admit_managed_text_writer()?;
+        let mut images: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut participants: Vec<MoveParticipant> = Vec::new();
+        let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+        for (role, page) in std::iter::once((ParticipantRole::Destination, destination))
+            .chain(sources.iter().map(|page| (ParticipantRole::Source, page)))
+        {
+            if page.guide || page.read_only {
+                return Ok(None); // never persisted; a record would name a file that is never written
+            }
+            let (path, _cache) = self.save_target(&write, page)?;
+            if !seen.insert(path.clone()) {
+                // The same physical file on both sides of the move. Degenerate:
+                // one ordinary save, already convergent.
+                return Ok(None);
+            }
+            let existing: Option<String> = match fs::read(&path) {
+                Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "page file is not UTF-8; no move record composed",
+                    )
+                })?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let (_doc, postimage) =
+                self.serialize_page_dto_for_path(page, &path, existing.as_deref())?;
+
+            let preimage_ref = match &existing {
+                None => ImageRef::Absent,
+                Some(content) => {
+                    let bytes = content.as_bytes().to_vec();
+                    let image = ImageRef::blob_of(&bytes);
+                    if let ImageRef::Blob { sha256, .. } = &image {
+                        images.entry(sha256.clone()).or_insert(bytes);
+                    }
+                    image
+                }
+            };
+            let postimage_bytes = postimage.as_bytes().to_vec();
+            let postimage_ref = ImageRef::blob_of(&postimage_bytes);
+            if let ImageRef::Blob { sha256, .. } = &postimage_ref {
+                images.entry(sha256.clone()).or_insert(postimage_bytes);
+            }
+
+            participants.push(MoveParticipant {
+                role,
+                relative_path: self.rel_path(&path),
+                page_name: page.name.clone(),
+                page_kind: match page.kind {
+                    PageKind::Journal => "journal".to_string(),
+                    PageKind::Page => "page".to_string(),
+                },
+                base_revision: existing.as_deref().map(content_rev),
+                preimage: preimage_ref,
+                postimage: postimage_ref,
+            });
+        }
+
+        if participants.len() < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(PreparedDirectMove {
+            record: DirectMoveRecord {
+                schema: RECORD_SCHEMA,
+                move_id: crate::direct_move_recovery::new_move_id(),
+                graph_root: self.root.display().to_string(),
+                created_unix_ms: crate::direct_move_recovery::unix_millis_now(),
+                participants,
+            },
+            images,
+        }))
+    }
+
     /// Save a page, refusing to clobber an external change. If the file on disk
     /// no longer matches what Tine last knew (another app or a Syncthing pull
     /// wrote it), returns an `AlreadyExists` "conflict" error WITHOUT writing,
@@ -21128,9 +21790,12 @@ impl Graph {
             },
         )?;
         if validation.requested_identity_elsewhere {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "another graph document owns this effective page identity",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityOwnedElsewhere,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
             ));
         }
         let creation_proof = validation.creation_proof;
@@ -21252,7 +21917,14 @@ impl Graph {
         }
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "conflict_authority.explicit_required: force_save_page requires an explicitly captured observation; use force_save_page_at_revision",
+            DirectSaveError {
+                code: DirectSaveFailureCode::ConflictAuthoritySpent,
+                conflict_epoch: None,
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict_authority.explicit_required: force_save_page requires an explicitly captured observation; use force_save_page_at_revision",
+                ),
+            },
         ))
     }
 
@@ -21290,15 +21962,21 @@ impl Graph {
         match editor_episode.activation {
             Some(activation) if self.editor_activation_is_live(&path, activation) => {}
             Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "conflict_authority.superseded: the editor activation answering this conflict is no longer live",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::ConflictAuthoritySuperseded,
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "conflict_authority.superseded: the editor activation answering this conflict is no longer live",
+                    ),
                 ));
             }
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "conflict_authority.spent: a conflict override requires a live editor activation",
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::ConflictAuthoritySpent,
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "conflict_authority.spent: a conflict override requires a live editor activation",
+                    ),
                 ));
             }
         }
@@ -21317,9 +21995,12 @@ impl Graph {
         .then_some((page.kind, page.name.as_str()));
         let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
         if validation.requested_identity_elsewhere {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "another graph document owns this effective page identity",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::IdentityOwnedElsewhere,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
             ));
         }
         let validation_snapshot = validation.target.as_ref().map(|loaded| {
@@ -22201,15 +22882,10 @@ fn isolate_page_parse(
         }
         Ok(None) => Ok(None),
         Err(payload) => {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("unknown panic payload");
-            eprintln!(
-                "Tine search index skipped page {:?}: page parse/projection panicked: {detail}",
-                e.rel_path
-            );
+            let _ = payload;
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                eprintln!("Tine search index skipped one page after a parse/projection panic");
+            }
             Err(e.rel_path)
         }
     }
@@ -22278,37 +22954,6 @@ fn reserve_asset(assets: &Path, name: &str) -> io::Result<(String, fs::File)> {
             _ => i += 1,
         }
     }
-}
-
-/// Collapse journal entries that resolve to the SAME date down to one (the
-/// canonical `yyyy_MM_dd` file) — a leftover title-named duplicate must not show
-/// the day twice in the feed, quick-switch, or All-Pages. Non-journal entries and
-/// the input order are preserved.
-fn dedup_journal_days(entries: Vec<PageEntry>) -> Vec<PageEntry> {
-    let is_canonical = |e: &PageEntry| {
-        e.path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| JournalDate::from_file_stem(s).is_some())
-    };
-    let mut idx_of: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    let mut out: Vec<PageEntry> = Vec::new();
-    for e in entries {
-        match e.date_key {
-            Some(k) if e.kind == PageKind::Journal => {
-                if let Some(&i) = idx_of.get(&k) {
-                    if is_canonical(&e) && !is_canonical(&out[i]) {
-                        out[i] = e;
-                    }
-                } else {
-                    idx_of.insert(k, out.len());
-                    out.push(e);
-                }
-            }
-            _ => out.push(e),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -22393,7 +23038,9 @@ fn walk_page_files(dir: &Path, mut visit: impl FnMut(PathBuf)) {
 /// `alias::`/`tags::`/`icon::`. Free text in `theirs`' pre-block is dropped (rare;
 /// the conflict copy is trashed-recoverable). Mirrors the property-carry in
 /// [`Graph::merge_pages`].
-fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
+/// Exposed so the Tauri conflict-capsule resolver composes this one
+/// pre-block union instead of re-implementing it over `BlockDto` (D-14).
+pub fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
     let mine = mine.unwrap_or("");
     let Some(theirs) = theirs else {
         return (!mine.is_empty()).then(|| mine.to_string());
@@ -22809,7 +23456,9 @@ pub(crate) fn generated_document_page_dto(
     })
 }
 
-pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
+/// The one bounded `PageDto` -> `Document` conversion. Exposed so native
+/// callers (the conflict-capsule commands) never re-grow a recursive twin.
+pub fn page_dto_document(page: &PageDto) -> io::Result<Document> {
     Ok(Document {
         pre_block: page.pre_block.clone(),
         roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
@@ -23889,9 +24538,12 @@ fn open_projection_dir_nofollow(dir: &Dir, name: &str) -> io::Result<Dir> {
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             != 0
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "projection parent is not a real no-follow directory",
+        return Err(DirectSaveError::into_io(
+            DirectSaveFailureCode::PrecheckNofollow,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projection parent is not a real no-follow directory",
+            ),
         ));
     }
     Ok(Dir::from_std_file(file))
@@ -24246,9 +24898,12 @@ fn read_projection_optional_bound_capture_impl(
 
     let mut rebound = open_projection_file_nofollow(dir, name)?;
     if !projection_files_have_same_identity(&opened, &rebound)? {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "managed target was replaced or changed during capture",
+        return Err(DirectSaveError::into_io(
+            DirectSaveFailureCode::PrecheckInterrupted,
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed target was replaced or changed during capture",
+            ),
         ));
     }
     let expected = BlobDescription::of(&bytes);
@@ -24694,7 +25349,7 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
 /// Managed page input is accepted only through depth 128. All operation-time
 /// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
 /// not consume attacker-controlled call stack or an uncharged all-node stack.
-const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
+pub(crate) const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
 
 #[derive(Clone, Copy)]
 #[cfg(test)]
@@ -28249,9 +28904,14 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                     // leave out a file the user considers part of it.
                     continue;
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("managed text entry is a symlink or reparse point: {child_relative}"),
+                return Err(DirectSaveError::into_io(
+                    DirectSaveFailureCode::PrecheckSymlink,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "managed text entry is a symlink or reparse point: {child_relative}"
+                        ),
+                    ),
                 ));
             }
             if file_type.is_dir() {
@@ -28284,9 +28944,12 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                 directories_by_exact_relative.insert(child_relative.clone(), resource);
                 let rebound = open_projection_dir_nofollow(&directory, name)?;
                 if projection_dir_identity(&child)? != projection_dir_identity(&rebound)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        format!("managed directory changed during capture: {child_relative}"),
+                    return Err(DirectSaveError::into_io(
+                        DirectSaveFailureCode::PrecheckInterrupted,
+                        io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!("managed directory changed during capture: {child_relative}"),
+                        ),
                     ));
                 }
                 if pending.len() == limits.pending_directories {
@@ -29686,10 +30349,13 @@ fn projection_file_link_count(_file: &fs::File) -> io::Result<u64> {
 fn validate_graph_text_single_link(file: &fs::File, relative: &str) -> io::Result<()> {
     let link_count = projection_file_link_count(file)?;
     if link_count != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "graph text files alias one physical resource: {relative} has link count {link_count}"
+        return Err(DirectSaveError::into_io(
+            DirectSaveFailureCode::PrecheckResourceAlias,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "graph text files alias one physical resource: {relative} has link count {link_count}"
+                ),
             ),
         ));
     }
@@ -29797,168 +30463,68 @@ fn graph_text_admission_unavailable(cause: &str) -> io::Error {
     )
 }
 
-/// Classify a Direct-Markdown save failure into a BOUNDED code.
-///
-/// Two reasons this exists rather than logging the error itself. First, the
-/// error messages carry graph-relative paths, and a user's page titles are their
-/// private data -- a diagnostic that cannot be pasted into a bug report is not a
-/// diagnostic. Second, "the save failed" is useless triage: the failure classes
-/// behind it (a symlink somewhere in the walk, ambient filesystem churn between
-/// the capture's two passes, a same-bytes external replace that moved the inode,
-/// a rejected reparse point) have completely different fixes, and today they are
-/// indistinguishable from outside the process.
-///
-/// The strings matched here are produced by this module, so this is internal
-/// consistency rather than parsing a foreign format. `direct_save_failure_codes_
-/// are_stable` pins each code to the site that produces it.
-/// Marker introducing the observation epoch in a banner-class conflict message.
-pub(crate) const CONFLICT_OBSERVATION_TAG: &str = "[observation ";
-
 /// The observation epoch a banner-class conflict was minted at, if this error
 /// carries one. The UI stores it with the banner and presents it back on "Keep
 /// mine" so the override answers the conflict the user saw, not whatever
 /// authority happens to be current when the request runs.
 pub fn direct_save_conflict_epoch(error: &io::Error) -> Option<u64> {
-    let message = error.to_string();
-    let start = message.rfind(CONFLICT_OBSERVATION_TAG)? + CONFLICT_OBSERVATION_TAG.len();
-    let rest = &message[start..];
-    rest[..rest.find(']')?].parse().ok()
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<DirectSaveError>())
+        .and_then(DirectSaveError::conflict_epoch)
 }
 
+/// Read the BOUNDED failure code a Direct-Markdown save producer stamped on
+/// this error, or `unknown` if it did not stamp one.
+///
+/// Two reasons the code exists rather than logging the error itself. First, the
+/// error messages carry graph-relative paths, and a user's page titles are their
+/// private data -- a diagnostic that cannot be pasted into a bug report is not a
+/// diagnostic. Second, "the save failed" is useless triage: the failure classes
+/// behind it (a symlink somewhere in the walk, ambient filesystem churn between
+/// the capture's two passes, a same-bytes external replace that moved the inode,
+/// a rejected reparse point) have completely different fixes, and from outside
+/// the process they are otherwise indistinguishable.
+///
+/// This function matches NOTHING. The code is a typed field on `DirectSaveError`
+/// set where the failure is constructed, so a page whose own title contains one
+/// of the display sentences can no longer be classified as a conflict -- the
+/// misclassification that made the banner's "Use disk version" discard an
+/// unsaved edit. `direct_save_failure_code_does_not_inherit_conflict_from_page_text`
+/// pins that.
+///
+/// The risk this moved the failure mode TO is a producer stamping the wrong
+/// variant, so the guards are on the producers, not here:
+/// `direct_save_conflict_sites_produce_their_own_codes` drives every
+/// `EditorConflictSite` through the real minting helpers,
+/// `direct_save_precheck_helpers_produce_their_own_codes` drives the free
+/// helpers, and `every_direct_save_failure_code_has_a_production_producer`
+/// scans shipped source for a construction site per variant.
 pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
-    let message = error.to_string();
-    let has = |needle: &str| message.contains(needle);
-    // Anchored, not `contains`. Every raw error below can carry a graph-relative
-    // PATH, and a page name is the user's to choose — so a `contains` test lets a
-    // file named after one of these sentences give an unrelated failure that
-    // family's provenance. The three authority messages are always the WHOLE
-    // error (`consume_conflict_authority` and the command boundary construct
-    // them directly and nothing wraps them), so anchoring costs nothing and
-    // makes the code mean what it says.
-    //
-    // The arms that predate this still use `contains`, and the same weakness
-    // reaches them — and it is DATA-LOSS-CAPABLE, not merely cosmetic. A page
-    // named `path-pinned page does not match its captured exact owner.md` makes
-    // an unrelated exact-identity restore failure classify as
-    // `conflict.pinned_owner`; `direct_save_error_message` collapses that to a
-    // bare `conflict`, and the false banner it raises offers "Use disk version",
-    // which discards the unsaved edit. (A colon-bearing exemplar would not work:
-    // raw `:` paths are non-portable and encoded.) Anchoring those arms would
-    // reclassify the errors legitimately composed as `{primary}; …`, so it needs
-    // its own packet and its own verification; it is recorded, not done here.
-    // (GH #254 increment 2, sixth re-verification, HIGH backlog.)
-    let starts = |needle: &str| message.starts_with(needle);
-    if has("is a symlink or reparse point") {
-        "precheck.symlink"
-    } else if has("changed during retained identity capture") || has("changed during capture") {
-        "precheck.interrupted"
-    } else if has("share one portable case/NFC identity") {
-        "precheck.portable_collision"
-    } else if has("alias one physical resource") {
-        "precheck.resource_alias"
-    } else if has("is not portable") {
-        "precheck.not_portable"
-    } else if has("not a real no-follow directory") || has("no retained no-follow") {
-        "precheck.nofollow"
-    } else if has("bound exceeded") {
-        "precheck.limit"
-    } else if has("existing page identity changed since load") {
-        "identity.changed_since_load"
-    } else if has("owns this effective page identity") {
-        "identity.owned_elsewhere"
-    } else if has("tokenless editor conflict: save baseline present") {
-        "conflict_retry.save_baseline_present"
-    } else if has("tokenless editor conflict: save baseline absent") {
-        "conflict_retry.save_baseline_absent"
-    } else if has("tokenless editor conflict: commit recheck") {
-        "conflict_retry.commit_recheck"
-    } else if has("tokenless editor conflict: replace pre-retirement") {
-        "conflict_retry.replace_pre_retirement"
-    } else if has("tokenless editor conflict: retired mismatch") {
-        "conflict_retry.replace_retired_mismatch"
-    } else if has("tokenless editor conflict: publication collision") {
-        "conflict_retry.replace_publication_collision"
-    } else if has("tokenless editor conflict: create publication collision") {
-        "conflict_retry.create_publication_collision"
-    } else if has("tokenless editor conflict: final reread absent") {
-        "conflict_retry.final_reread_absent"
-    } else if has("tokenless editor conflict: final reread present") {
-        "conflict_retry.final_reread_present"
-    } else if has("tokenless editor conflict: post-publication validation") {
-        "conflict_retry.replace_post_publication"
-    } else if starts("conflict override authority is newer") {
-        // A "Keep mine" that named an observation the disk has since moved past.
-        // Its own family, NOT `conflict.*`: the frontend must not read it as a
-        // fresh banner (there is no new authority in it) and must not read it as
-        // a transient failure either -- the banner it answers is now dead, so the
-        // only safe response is to observe again and re-raise a live one.
-        "conflict_authority.superseded"
-    } else if starts("conflict override authority belongs to a different editor episode") {
-        "conflict_authority.other_episode"
-    } else if starts("conflict override authority is missing or already consumed") {
-        "conflict_authority.spent"
-    } else if has("editor conflict: save baseline present") {
-        "conflict.save_baseline_present"
-    } else if has("editor conflict: save baseline absent") {
-        "conflict.save_baseline_absent"
-    } else if has("editor conflict: commit recheck") {
-        "conflict.commit_recheck"
-    } else if has("editor conflict: replace pre-retirement") {
-        "conflict.replace_pre_retirement"
-    } else if has("editor conflict: retired mismatch") {
-        "conflict.replace_retired_mismatch"
-    } else if has("editor conflict: publication collision") {
-        "conflict.replace_publication_collision"
-    } else if has("editor conflict: create publication collision") {
-        "conflict.create_publication_collision"
-    } else if has("editor conflict: final reread absent") {
-        "conflict.final_reread_absent"
-    } else if has("editor conflict: final reread present") {
-        "conflict.final_reread_present"
-    } else if has("editor conflict: post-publication validation") {
-        "conflict.replace_post_publication"
-    } else if has("does not match its captured exact owner") {
-        // The file changed between load and save without the watcher seeing it.
-        // A genuine content conflict, and one "keep mine" can now resolve.
-        "conflict.pinned_owner"
-    } else if message == "conflict" {
-        "conflict.base_rev"
-    } else if has("a page with that name already exists")
-        || has("target page exists")
-        || has("target page identity already exists elsewhere")
-    {
-        "identity.name_taken"
-    } else {
-        // Deliberately NOT a `conflict.*` catch-all on AlreadyExists.
-        //
-        // Every `conflict.*` code becomes the literal string the frontend
-        // matches to raise the keep-mine/use-disk banner, and that banner can
-        // only resolve a content conflict. `AlreadyExists` is raised by roughly
-        // forty-five other conditions in this module -- managed and projection
-        // internals, reservation-name collisions, recovery-name collisions --
-        // for which the banner offers two buttons that cannot help and whose
-        // "use disk" arm discards the user's edits. Worse, the catch-all
-        // replaced the message text, so a failure that RETAINED the user's
-        // bytes under a recovery name reached them as an unexplained conflict.
-        //
-        // An unclassified failure now reports its real message. If a new
-        // condition genuinely is a resolvable conflict, give it its own
-        // `conflict.*` code above, where the decision is visible.
-        "unknown"
-    }
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<DirectSaveError>())
+        .map(|typed| typed.code().as_str())
+        .unwrap_or(DirectSaveFailureCode::Unknown.as_str())
 }
 
 fn initial_shadow_limit_error(resource: &'static str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("initial shadow {resource} bound exceeded"),
+    DirectSaveError::into_io(
+        DirectSaveFailureCode::PrecheckLimit,
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("initial shadow {resource} bound exceeded"),
+        ),
     )
 }
 
 fn managed_text_inventory_limit_error(resource: &'static str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("managed text inventory {resource} bound exceeded"),
+    DirectSaveError::into_io(
+        DirectSaveFailureCode::PrecheckLimit,
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("managed text inventory {resource} bound exceeded"),
+        ),
     )
 }
 
@@ -30665,6 +31231,59 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
         from,
         to,
         crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The Direct Files graph-text name transition: the exact-byte move protocol of
+/// `tine_storage::DurableDirectoryPublication::move_exact_no_replace`, carried
+/// by the graph tree's own no-clobber rename.
+///
+/// GH #466. v0.6.981 routed every Direct Files create, live-name retirement,
+/// staged publication, recovery restore and recovery set-aside through the
+/// storage crate's move, whose Android arm is hard-link-then-unlink — a
+/// primitive the FUSE-backed shared storage a Direct Files graph lives in
+/// refuses — so every Android save failed with `Permission denied (os error
+/// 13)`. That crate's move is written for app-private sole-writer namespaces
+/// (the storage-mode selectors, `durable_private_authority_directory`), where
+/// hard links exist; the graph tree is never such a namespace. Its name
+/// transitions use [`rename_projection_noreplace`], the primitive v0.6.98
+/// shipped here on every target (I-16: `renameat2(RENAME_NOREPLACE)` through
+/// the raw syscall on Linux and Android, `renameatx_np(RENAME_EXCL)` on Apple,
+/// `FileRenameInformation` on Windows), which also names the refused call in
+/// its receipt (I-9) instead of surfacing a bare errno.
+///
+/// Protocol: `from` must hold exactly `expected` (a staged or retired inode an
+/// external writer replaced is a collision, never published); the rename never
+/// replaces `to`; the parent barrier is required — the graph tree is the sole
+/// authority for these bytes; `to` is re-read to prove what became visible.
+/// `crate::model::tests::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename`
+/// pins every Direct Files site to this function.
+fn move_graph_text_exact_no_replace(
+    dir: &Dir,
+    from: &str,
+    to: &str,
+    expected: &[u8],
+) -> io::Result<()> {
+    if read_projection_regular(dir, from)? != expected {
+        return Err(graph_text_transition_byte_collision("source"));
+    }
+    rename_projection_noreplace(dir, from, to)?;
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+        0,
+        1,
+    )?;
+    if read_projection_regular(dir, to)? != expected {
+        return Err(graph_text_transition_byte_collision("published"));
+    }
+    Ok(())
+}
+
+fn graph_text_transition_byte_collision(position: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("graph text name transition found different bytes at its {position} name"),
     )
 }
 

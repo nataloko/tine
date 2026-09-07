@@ -19,7 +19,7 @@ const calls: {
   conflictEpoch: number | null;
   managedConflictObservation: { path: string; revision: string } | null;
 }[] = [];
-let nextResult: (() => Promise<string>) | null = null;
+let nextResult: (() => Promise<{ revision: string }>) | null = null;
 let observedManagedPage: { rev: string; path: string } | null = null;
 let draftPath = "pages/Notes.md";
 
@@ -46,6 +46,13 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
+  isSaveConflictError: (error: unknown) =>
+    typeof error === "object" && error !== null && "kind" in error && error.kind === "save-conflict",
   backend: () => ({
     savePage: (
       page: { name: string },
@@ -57,7 +64,7 @@ vi.mock("./backend", () => ({
       calls.push({ name: page.name, force, conflictEpoch, managedConflictObservation });
       const result = nextResult;
       nextResult = null;
-      return result ? result() : Promise.resolve("rev-after");
+      return result ? result() : Promise.resolve({ revision: "rev-after" });
     },
     getPageByPath: () => Promise.resolve(observedManagedPage),
     getPage: () => Promise.resolve(observedManagedPage),
@@ -86,13 +93,18 @@ const {
 } = await import("./persistence");
 
 // GH #254 increment 2, fourth correction-delta re-verification, HIGH. A Direct
-// save error is "{bounded code}: {raw error}", and raw errors carry graph
-// PATHS — so a page the user is entitled to name `conflict_authority.notes` put
-// that family marker inside an unrelated failure's message. A substring test
-// then routed a permanent precheck failure into the authority handler, which
-// deletes the epoch, re-dirties the page and fire-and-forgets another save: one
-// user request became four backend calls and would have kept feeding the queue
-// instead of reaching the bounded retry/toast path.
+// save error's display detail carries graph PATHS — so a page the user is
+// entitled to name `conflict_authority.notes` puts that family marker inside an
+// unrelated failure's text. When a substring test read it, a permanent precheck
+// failure was routed into the authority handler, which deletes the epoch,
+// re-dirties the page and fire-and-forgets another save: one user request became
+// four backend calls and kept feeding the queue instead of reaching the bounded
+// retry/toast path.
+//
+// W4-E4 made that unreachable by SHAPE rather than by care: `saveFailureCode`
+// reads a typed `reasonCode` and never inspects prose. These cases still send
+// the page name in the payload, so if a prose fallback is ever reintroduced
+// they fail rather than quietly passing.
 describe("a failure is classified by its code, not by the page's name", () => {
   beforeEach(() => {
     calls.length = 0;
@@ -113,16 +125,30 @@ describe("a failure is classified by its code, not by the page's name", () => {
     it(`does not read "${family}." out of a page path`, async () => {
       const name = `${family}.notes`;
       markDirty(name);
-      nextResult = () => Promise.reject(new Error(
-        `precheck.symlink: managed text entry is a symlink or reparse point: pages/${name}.md`
-      ));
+      // The page name still travels in the display detail — that is the whole
+      // point of the test. Typing the code moved this from "the classifier
+      // must ignore the name" to "the name cannot reach the classifier", but
+      // the fixture keeps carrying it so the guard still fails if some future
+      // fallback starts reading prose again.
+      nextResult = () => Promise.reject({
+        kind: "direct-save-failure",
+        reasonCode: "precheck.symlink",
+        ioErrorKind: "InvalidInput",
+        message: `managed text entry is a symlink or reparse point: pages/${name}.md`,
+      });
 
       expect(await forceSave(name)).toBe(false);
+
+      // The user-visible half of the same rule: a permanent precheck failure is
+      // not a conflict, so it must not raise the banner whose only live button
+      // discards their unsaved edits.
+      expect(conflicted.has(name)).toBe(false);
 
       // Exactly the one request, then the bounded transient path — not a
       // self-feeding chain of re-observations.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(calls.length).toBe(1);
+      expect(conflicted.has(name)).toBe(false);
     });
   }
 
@@ -156,7 +182,10 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
   it("retracts the spent banner and lets the retry reach the backend", async () => {
     markDirty("Notes");
     conflicted.add("Notes"); // the banner the user is looking at
-    nextResult = () => Promise.reject(new Error("conflict_retry.replace_pre_retirement: ..."));
+    nextResult = () => Promise.reject({
+      kind: "direct-save-failure",
+      reasonCode: "conflict_retry.replace_pre_retirement",
+    });
 
     expect(await forceSave("Notes")).toBe(false);
 
@@ -173,12 +202,15 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
   it("re-raises a real conflict from the retry, with a fresh banner", async () => {
     markDirty("Notes");
     conflicted.add("Notes");
-    nextResult = () => Promise.reject(new Error("conflict_retry.commit_recheck: ..."));
+    nextResult = () => Promise.reject({
+      kind: "direct-save-failure",
+      reasonCode: "conflict_retry.commit_recheck",
+    });
 
     await forceSave("Notes");
     expect(conflicted.has("Notes")).toBe(false);
 
-    nextResult = () => Promise.reject(new Error("conflict"));
+    nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
     await vi.waitFor(() => expect(calls.length).toBe(2));
     await vi.waitFor(() => expect(conflicted.has("Notes")).toBe(true));
   });
@@ -187,7 +219,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
   // live and must stay up.
   it("leaves a banner-class conflict exactly as it was", async () => {
     markDirty("Notes");
-    nextResult = () => Promise.reject(new Error("conflict"));
+    nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
 
     expect(await forceSave("Notes")).toBe(false);
 
@@ -210,7 +242,7 @@ describe("managed save conflict resolution", () => {
 
   it("retains the draft and binds Keep mine to the exact managed revision it observed", async () => {
     observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    nextResult = () => Promise.reject("managed.conflict: stale_base");
     setBaseRev("Notes", "managed-editor-base");
     markDirty("Notes");
 
@@ -218,7 +250,7 @@ describe("managed save conflict resolution", () => {
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(true);
 
-    nextResult = () => Promise.resolve("managed-mine");
+    nextResult = () => Promise.resolve({ revision: "managed-mine" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[1]).toMatchObject({
       force: true,
@@ -232,13 +264,13 @@ describe("managed save conflict resolution", () => {
 
   it("re-observes after a second managed winner and never upgrades an earlier click", async () => {
     observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    nextResult = () => Promise.reject("managed.conflict: stale_base");
     setBaseRev("Notes", "managed-editor-base");
     markDirty("Notes");
     await flushPage("Notes");
 
     observedManagedPage = { rev: "managed-winner-b", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    nextResult = () => Promise.reject("managed.conflict: stale_base");
     expect(await forceSave("Notes")).toBe(false);
     expect(calls[1]).toMatchObject({
       force: true,
@@ -248,7 +280,7 @@ describe("managed save conflict resolution", () => {
       },
     });
 
-    nextResult = () => Promise.resolve("managed-mine");
+    nextResult = () => Promise.resolve({ revision: "managed-mine" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[2]).toMatchObject({
       force: true,
@@ -262,14 +294,14 @@ describe("managed save conflict resolution", () => {
   it("binds a losing new-page draft to the identifiable winner's exact path and revision", async () => {
     draftPath = "";
     observedManagedPage = { rev: "managed-created-winner", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject(new Error("managed.conflict: page_already_exists"));
+    nextResult = () => Promise.reject("managed.conflict: page_already_exists");
     markDirty("Notes");
 
     expect(await flushPage("Notes")).toBe(false);
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(true);
 
-    nextResult = () => Promise.resolve("managed-new-draft-won");
+    nextResult = () => Promise.resolve({ revision: "managed-new-draft-won" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[1]).toMatchObject({
       force: true,
@@ -283,7 +315,7 @@ describe("managed save conflict resolution", () => {
 
   it("fails closed when the exact managed owner was deleted or renamed", async () => {
     observedManagedPage = null;
-    nextResult = () => Promise.reject(new Error("managed.conflict: missing_page"));
+    nextResult = () => Promise.reject("managed.conflict: missing_page");
     setBaseRev("Notes", "managed-editor-base");
     markDirty("Notes");
 

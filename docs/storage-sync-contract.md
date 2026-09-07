@@ -102,11 +102,12 @@ literal. Format/schema constants remain beside their codecs and are likewise
 certified through `tine_storage::formats`.
 
 [ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
-activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
-is refused as authority and the product offers Return to Direct Files before a
-fresh clean activation. Production contains one baseline-plus-manifest actor
-constructor and one share/join state machine. The cursor-based join state,
-legacy mutation slot, and legacy provider indexes are absent from production
+activation format. Existing pre-0.7 enrollment, sharing descriptors, and
+multipart-bootstrap state have no production codec or lifecycle arm. They are
+preserved as protocol-incompatible evidence and the product offers Return to
+Direct Files before a fresh clean activation. Production contains one
+baseline-plus-manifest actor constructor and one share/join state machine. The
+cursor-based join state, legacy mutation slot, and legacy provider indexes are absent from production
 and pinned absent by the retired-source guard. Older constructors and handoff
 fixtures remain callable only under `cfg(test)` as bounded differential oracles;
 they are not an alternate runtime authority. The final enumerated known-red
@@ -185,7 +186,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | Relative path under `shared/` | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
-| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | clean magic-prefixed descriptor v1; legacy JSON is recognized only to refuse pre-0.7 state | immutable identity for the shared graph |
+| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | the one current clean magic-prefixed descriptor v1; any pre-0.7 shape is unrecognized protocol-incompatible evidence | immutable identity for the shared graph |
 | `{inbox,outbox}/clean-baselines-v1/<root>.index` | initiator | clean joiner | canonical lazy-genesis provider index v1 | immutable; descriptor-bound; published after every baseline chunk |
 | `{inbox,outbox}/clean-baselines-v1/<root>.<file>.<chunk>.chunk` | initiator | clean joiner | fixed-size exact chunk of a sealed lazy-genesis file | immutable; reassembled only through the descriptor-bound index |
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
@@ -195,7 +196,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
 | `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
 | `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
-| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit | retired provider items | bounded cleanup evidence |
+| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence, capped at `MAX_PROVIDER_RESIDUE_ENTRIES` |
 | `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |
 
 The device-private provider journal also has `pending-publication-v1/` and
@@ -275,23 +276,40 @@ root, `lazy-genesis.marker` is the sole managed-authority commit marker. All
 projection and query state may be reconstructed from the immutable baseline
 and manifest tail.
 
+Live-save conflicts use a storage-mode-independent app-private protocol beside
+those managed components: `<app-data>/conflict-capsules/<graph-key>.v1.json`,
+where `graph-key` is the session-style sanitized graph basename plus FNV-1a of
+the root path. `ConflictCapsuleEnvelope` contains the exact retained PageDto,
+its load baseline, and page binding, but never Managed replacement authority.
+The whole graph envelope is replaced through `atomic_write` (unique create-new
+temporary file, file barrier, atomic rename, directory barrier); stale torn
+temporaries are ignored and reclaimed on reopen. An envelope that does not
+decode (torn or foreign bytes at this app-private boundary) is set aside as
+`<graph-key>.v1.json.unreadable-<uuid>` with a directory barrier and the queue
+reopens empty; it never blocks capture or resolution. Explicit resolution re-proves
+the active backend's authority and durably rewrites the envelope, or removes
+and directory-syncs the final file, before the frontend acknowledges success.
+This state is recovery material only: it grants neither graph authority nor a
+Managed storage selection, and no byte is written into the user's graph.
+
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; its app-private name is retired with the whole private root on Return to Direct Files |
-| private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
+| private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1, including the active authority-directory `generation` | written last; sole local managed-authority selector and join commit point |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4, page capsule v4/v5, plus commit v1 | authoritative baseline; new writes use capsule v5, readers retain receiptless-v4 recovery; installed before the marker and never mutated |
-| `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
-| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
-| `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
+| `archive/lazy-genesis.<generation>/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation/join installation | clean open/join through the marker generation resolver | immutable baseline pack, manifest schema 5, page capsule v5, plus commit v1 | authoritative only when named by the marker; generation 0 is the fresh-store publication, and unreferenced generations are reclaimed on open. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded |
+| `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
+| `archive/operations.<generation>/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
+| `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations.<generation>/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
-| device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
+| device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock; `completed/` bounded by live provider state, not store lifetime (§2.10c-i) | private transport recovery; never semantic authority |
 
 Emergency return publishes the sibling app-private selector
 `storage-mode-selections/<graph-digest>.direct-v1.json`. Ordinary startup checks
@@ -345,8 +363,36 @@ immutable operation archive when needed. Compact accepted statuses, event
 evidence, semantic identity/path/name maps, and their digest roots remain
 inline. Exact historical frontier questions reconstruct from that retained
 semantic accepted evidence; current-point reads remain direct. The dependency
-is certified `tine-storage v0.11.0`, whose supported-target guard includes iOS
-in the durable no-clobber rename implementation.
+is certified `tine-storage v0.12.0`. Its supported-target guards include Linux,
+Windows, macOS, iOS, and Android for both exact-file and whole-directory
+no-clobber publication.
+
+### 1.2a App-private immutable plugin packages
+
+Installed plugin packages live below the app-data `plugins/` root as
+`<plugin-id>/<version>/{manifest.json,plugin.wasm}`. The package is immutable:
+same-version/same-bytes installation is idempotent, while the same version with
+different bytes is refused. Manifest and capability policy stay in the Tauri
+plugin layer; physical publication and removal use the certified
+`tine-storage v0.12.0` package protocol.
+
+Publication stages a complete directory at the store root under
+`.install-<id>-<version>-<pid>-<sequence>`. Each file and then the staging
+directory is synchronized before a native no-replace move installs the version;
+Unix synchronizes both changed parents and Windows uses its certified
+write-through name operation. Retirement durably moves the active directory to
+`.retired-<id>-<version>-<pid>-<sequence>` at the store root before recursive
+reclaim. Both transient grammars are disjoint from plugin ids because valid ids
+cannot begin with a dot.
+
+Every plugin-store open reclaims `.install-*` and `.retired-*` entries and any
+active package directory lacking the exact two-file regular-file shape. This is
+recovery, not interpretation: fully shaped packages still undergo the ordinary
+bounded manifest, identity, symlink, and WebAssembly validation. Uninstall
+first clears selection/settings through the audited settings replacement, then
+retires package bytes. A crash at that seam therefore leaves cleared settings
+and either a complete unselected package that can be retired on retry, or an
+already retired/absent package; no state requires manual filesystem surgery.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
@@ -375,11 +421,21 @@ lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
 
 Every Direct Files create, live-name retirement, staged publication, recovery
-restore, and recovery set-aside crosses the typed
-`DurableDirectoryPublication` boundary. The staged inode is flushed before it
-can become live. Windows uses write-through name publication; Unix-like hosts
-use their certified exact-name move plus directory durability policy. Tine
-never acknowledges the save merely because an ordinary rename became visible.
+restore, and recovery set-aside is one exact-byte name transition
+(`move_graph_text_exact_no_replace`): the source must still hold the expected
+bytes, the graph tree's own no-clobber rename publishes it
+(`renameat2(RENAME_NOREPLACE)` through the raw syscall on Linux and Android,
+`renameatx_np(RENAME_EXCL)` on Apple platforms, `FileRenameInformation` with
+`ReplaceIfExists=false` on Windows), the parent directory barrier is required,
+and the published name is re-read to prove what became visible. The staged
+inode is flushed before it can become live. The typed
+`DurableDirectoryPublication` boundary of `tine-storage` is NOT used on this
+path: its Android arm is hard-link-then-unlink, which the FUSE-backed shared
+storage a Direct Files graph lives in refuses (GH #466, v0.6.981: every
+Android save failed with `Permission denied (os error 13)`). That boundary
+remains the primitive for app-private sole-writer authorities such as the
+storage-mode selectors, where hard links exist. Tine never acknowledges the
+save merely because an ordinary rename became visible.
 Successful replacement retires the displaced recovery name through a typed
 `.editor-retired` name before deletion, so a crash cannot turn an unflushed
 name transition into a reported durable save. That exact producer-shaped name
@@ -419,10 +475,13 @@ The switched read families are the conservative task-query subset already
 accepted by `sparse_task_query_eligibility` (task markers plus priority,
 scheduled/deadline and presentation directives), literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
-inventory used by autocomplete and navigation. They also include page aliases
-and real-page ownership, explicit backlink and safely tokenizable unlinked-
-reference candidate selection, persisted/runtime block-identity lookup,
-block-referrer candidates, and distinct-referrer counts. Once current, these families
+inventory used by autocomplete and navigation. They also include the shared
+property-facet rows used by the query builder and editor autocomplete, and the
+PageRef simple-query candidate plan lowered through the same SQL read family in
+both storage regimes. The switched families further include page aliases and
+real-page ownership, explicit backlink and safely tokenizable unlinked-reference
+candidate selection, persisted/runtime block-identity lookup, block-referrer
+candidates, and distinct-referrer counts. Once current, these families
 enumerate SQLite task candidates and re-evaluate every returned raw block
 through the existing parser query evaluator, or obtain a generation-bound
 candidate/name set before applying the existing parser-owned matching and
@@ -446,6 +505,26 @@ parsed page cache and deliberately retains no separate semantic memo. Non-UUID
 also use that parser fallback. All other query, navigation, and search families retain their existing
 implementation until an equivalent generation-bound differential packet
 replaces and deletes each old route.
+
+When the exact current parser-cache generation is ready, every
+`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the
+shared lowering and evaluates only those pages, unless the candidate set is
+larger than one thirty-second of the graph's page count or 32 pages, whichever
+is greater, in which case the projection read is abandoned and the parser
+fallback runs instead. `Empty` returns without projection or graph access. `All`
+uses the parser whole-graph evaluator. An unavailable, stale, failed, or raced
+projection uses the parser fallback.
+
+That cutoff is a cost decision, not a correctness one: both routes return the
+same answer, and abandoning simply returns the query to the behaviour it had
+before the route existed. It exists because the shared lowering returns a page
+SUPERSET rather than the answer, so an unselective plan names most of the graph;
+measured on the 1,045-file anonymized corpus, routing such a plan cost
+1.08 -> 11.19 ms for a non-sparse task query and 0.46 -> 3.31 ms for `(journal)`,
+while every plan below the cutoff got between 1.6x and 13x faster. The cutoff
+scales with the graph because the walk it replaces costs one cheap in-memory
+predicate per page, so the route only wins while the candidate set is a small
+fraction of the whole.
 
 ## 2. Enrollment and synchronization state machine
 
@@ -504,6 +583,10 @@ from that observation instead of completing under stale authority.
    agree. Authority is still inactive.
 4. **LocalActive** — promotion publishes the accepted runtime state; the actor
    acquires enrollment/archive leases and becomes the sole managed writer.
+   Once the activation marker and immutable baseline have been retained, a
+   later runtime-open failure must keep that authoritative set whole. The next
+   explicit open resumes from it; it must not reclaim only the archive and
+   strand a half-live marker.
 5. **Blocked / incompatible / corrupt / ambiguous** — typed terminal or
    retryable evidence; no fallback writer is silently admitted.
 6. **StoppedSafe / StoppedCrashed / Terminal** — clean drain publishes a safe
@@ -536,12 +619,16 @@ fallback.
    the complete disk-expressible page/outline semantics with the currently
    synchronized Markdown/Org graph. A mismatch leaves both authorities
    unchanged; equality installs the provider history without rewriting graph
-   bytes. A refusal's shareable first line reports complete page and mismatch
-   category counts. Local diagnostics additionally name at most 32 differing
-   relative paths and whether each is local-only, shared-only, or differs in
-   kind, preamble, outline, or externally supplied block IDs; they never print
-   note content or UUID values. Local-only endpoint and device identities
-   remain local.
+   bytes. The refusal crosses the native boundary as the typed
+   `shared-frontier-mismatch` payload (`docs/contracts/typed-errors.md`): its
+   detail reports complete page and mismatch category counts and names at
+   most 32 differing relative paths with whether each is local-only,
+   shared-only, or differs in kind, preamble, outline, or externally supplied
+   block IDs, plus how many further mismatches were omitted. The join panel
+   shows those paths only to the user who attempted the join; the general
+   shareable diagnostic line stays path-free, and nothing ever prints note
+   content or UUID values. Local-only endpoint and device identities remain
+   local.
 3. **SharePrepared/Joining → SharedActive.** Each device records its role
    (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
    shared identity; local endpoint/device IDs remain local.
@@ -687,12 +774,24 @@ intent and permits setup/resume UI, but it is not semantic authority. Until the
 final marker exists, Direct Files remains the sole authority and every baseline,
 SQLite, receipt, and episode artifact is disposable.
 
-The marker binds exactly the workspace, lineage, immutable baseline root,
-sealed source-capture description, accepted-frontier digest, and watcher fence.
+The marker binds exactly the workspace, lineage, authority-directory generation,
+immutable baseline root, sealed source-capture description, accepted-frontier
+digest, and watcher fence.
 SQLite identity is deliberately absent: SQLite is a frontier-stamped disposable
 projection and can be rebuilt without changing the marker or semantic truth.
 The marker is published only after the baseline is durable and one final
 byte/inventory comparison under the watcher fence matches the sealed source.
+
+**Harvest W3-R1 generation commit.** Fresh activation publishes
+`lazy-genesis.0` and `operations.0`. A shared join writes its verified baseline
+and operation archive under the next generation, synchronizes the archive
+directory, and then replaces `lazy-genesis.marker`; that one marker rename is
+the commit point. It never renames or hides the active generation first. Cold
+open resolves both directories from the marker through one resolver and
+reclaims `.clean-join-*` staging directories plus every generation the marker
+does not name. Therefore a crash after publishing either directory, after the
+directory barrier, or after marker replacement opens the complete old or new
+pair—never a half-swapped pair.
 
 Each page capsule carries the exact original Markdown/Org bytes once, one
 deterministic CRDT checkpoint constructed directly from its terminal page
@@ -718,6 +817,19 @@ One canonical activation-record pass fans each parsed page into both the
 baseline pack and bounded SQLite materialization chunks. Neither candidate is
 published by that construction pass, and SQLite does not re-read, re-parse, or
 replay the graph to derive the same terminal state a second time.
+Managed inventory derives Page-versus-Journal identity from the decoded file
+name and configured journal title format, matching Logseq's
+`get-page-name` and `convert-page-if-journal` at OG revision
+`6e7afa8eb040686ff057156ee877193b581dd369`, respectively in
+`deps/graph-parser/src/logseq/graph_parser/extract.cljc` and
+`deps/graph-parser/src/logseq/graph_parser/block.cljs`; the containing
+configured pages/journals directory
+is path ownership, not semantic-kind evidence. Both current-hot and
+caller-borrowed materialization use one membership/block collector. The hot
+arm clones at most one non-page home at a time (no all-home arena), preserves
+the existing distinct-home statistics, and alone applies the current accepted
+exact-title selection; historical and prospective state materialization does
+not consult that later root.
 The single catalog checkpoint is constructed by the same direct terminal-state
 builder, and the sealed manifest binds its non-derivable catalog document ID.
 These checkpoints are baseline semantic/causal state, not fabricated interactive
@@ -775,6 +887,74 @@ otherwise unrelated page creation, and projection validation reconstructs that
 larger frontier. A merely durable pre-shutdown status or an effect-equivalent
 accepted prefix cannot make an unreplayed manifest ready.
 
+Clean open first attempts the disposable `clean-open-checkpoint-v1` state. Its
+single `current` pointer is the commit point; payload and generation bytes land
+completely in the inactive one of two bounded slots before that pointer changes.
+An interrupted write therefore leaves the prior pointed generation complete.
+Every create and replacement uses the audited durable directory-publication
+boundary. There is exactly one current format, no migration reader, and no
+preserved backup for rejected checkpoint bytes because the operation archive is
+the sole semantic authority. A checkpoint whose roster names an accepted
+manifest or required object that the archive no longer holds is not a
+checkpoint defect: the checkpoint is discarded and the missing archive
+evidence surfaces as `MS-REF-DISK-CORRUPT` (scenario: disk error or torn
+sync-service delivery of the archive), the same scenario the full-replay path
+would report.
+
+The checkpoint contains every clean-runtime field that changes later
+admission, conflict, or query decisions, including the exact ephemeral
+page-name ownership state, current path/name/UUID claims and conflicts,
+accepted frontier and resident CRDT documents, projection-head batch locators,
+and the accepted sequence. The accepted roster is not a parallel list: it is
+the canonical `tine-storage` sealed accepted index with exact accepted evidence,
+causal records, status map and sequence root. The checkpoint also records each
+roster manifest fingerprint and the union of object names those manifests
+require. Run-local capabilities, cursor nonces, timing counters, LRU-only
+caches, attached graph/receipt handles, and an unaccepted foreground journal
+overlay are excluded; they are newly minted, rebuilt, or replayed by their own
+authority before use.
+
+On open, ordinary archive namespace validation still reads, digests and decodes
+every manifest and object exactly as before. During that existing manifest read
+the store retains a disposable fingerprint map. Checkpoint tail discovery then
+does names-only enumeration: roster members are neither reopened nor
+semantically replayed. A roster fingerprint mismatch discards the checkpoint
+and sequence-zero full-replays so the live archive wins. A roster-referenced
+manifest missing from the names set, an undecodable manifest found by ordinary
+namespace validation, or a required object missing from the object-name set is
+authoritative archive damage and surfaces immediately through the existing
+managed-open archive-damage path; discarding the checkpoint cannot repair it.
+The detection-latency change is therefore narrow: semantic re-application of
+pre-roster history moves from every open to checkpoint fallback/repair, while
+manifest decoding/identity binding, object digest validation, and required-name
+existence detection remain on every open.
+
+After checkpoint restore, only archive manifest names outside its roster enter
+the same dependency-staged fixed point described above. A failure to admit that
+tail discards the restored state and retries from sequence zero. The SQLite
+genesis choice reads the engine's accepted-frontier predicate directly; an
+empty tail is not evidence of genesis. Open counters distinguish checkpoint
+and full-replay paths and report roster/name work, checkpoint capture work and
+payload bytes, the actual tail replayed, and durable lag.
+
+Snapshot capture is coherent on the owning actor and is attempted after every
+accepted managed save. The actor captures canonical semantic state plus only
+the accepted roster and required-object additions after the publisher's durable
+frontier. The background publisher folds that delta into the preceding payload
+using the same `clean-open-checkpoint-v1` format; no second reader or authority
+is introduced. At the accepted 2026-09-02 gate, capture work at N=800 divided
+by N=50 must be at most `A5_ACCEPTED_CAPTURE_RATIO = 1.25`. Each
+capture hands immutable canonical bytes to at most one background writer; one
+newest snapshot replaces any queued snapshot. This coalescing bounds memory,
+not freshness. Publication failure is logged and the next trigger retries
+without affecting correctness. Durable lag has no hard bound and never applies
+foreground backpressure: a crash replays exactly the unpublished tail. Lag
+above 64 marks the next coalesced rewrite elevated and
+immediate, still off the waited path. Archive rebaselining, co-designed with
+0.7 sync, is the committed terminal bound that will reduce the roster,
+namespace scans, and checkpoint state to graph-proportional plus recent tail;
+this checkpoint does not compact or delete authoritative history.
+
 An unrelated accepted batch may advance a page's causal frontier without
 changing its rendered bytes. A concurrent merge can also change those bytes
 without carrying a new projection row for the page. A clean projection head is
@@ -812,6 +992,23 @@ sibling has deterministic conflict-pair identity so later convergence can
 retire it, but retirement is permitted only while its text is unchanged and it
 has no children; any user-touched sibling remains user data.
 
+Conflict evaluation uses one disposable, run-local index stamped by accepted
+sequence. Each accepted semantic delta adds its touched blocks and concurrent
+same-block pairs. Pure projection creates also meet through the exact page,
+path, and target-byte digest because their sparse block identities may differ;
+the existing forest-shape proof remains authoritative. A later touch that
+causally descends from both members removes the settled pair. Evaluation visits
+only the currently unresolved pairs and their causal branch members, never the
+full retained history. When a descendant settles a pair, the index carries
+only that pair's transitive members as sparse branch ancestry; a later
+concurrent descendant can therefore retire the deterministic sibling authored
+for the earlier pair without rediscovering unrelated history. A cold or
+checkpoint-backed open rebuilds the index from immutable accepted batches
+before conflict work is reseeded, and any stamp mismatch does the same before
+the next acceptance or evaluation. The index is neither resolution evidence
+nor persisted authority: dropping it cannot change an answer, and no history
+cap or fixed lookback participates in classification.
+
 Concurrent new blocks may legitimately choose the same sibling-order key.
 Projection orders that temporary merged state by `(order key, block identity)`;
 equal order keys are not corruption and must not block provider recovery. A
@@ -841,6 +1038,17 @@ accepted work renders to the bytes already on disk. A receiver that can
 authorize neither the delivered intent nor the current accepted state retains
 the obligation as a published continuation rather than reporting completion, so
 Safe is never published over a missing projection.
+
+Completion publication carries the `ProjectionPlan` that authorized the graph
+mutation through the completion boundary. Ordinary execution compares that
+plan's workspace, page, path, frontier, and claim evidence with the current
+accepted page before exposing point-addressable authority. Recovery first
+reconstructs one plan from the durable intent and exact base, requires the full
+reconstructed intent to equal the durable intent, uses that same plan for the
+recovery mutation, and then performs the same current-authority comparison.
+Completion recording never invokes the planner again. This preserves the
+stale-frontier and reused-path refusal while making the plan that actually
+authorized the completed bytes—not a later re-derivation—the compared value.
 
 A receiver-local projection can legitimately differ byte-for-byte from the
 source target while expressing the same accepted semantic page. On a later
@@ -997,8 +1205,14 @@ ambiguous baseline claims remain unresolved after reconstruction.
    heartbeat, while native diagnostics emit ordered, content-free completion
    boundaries for baseline authentication, receipt precheck, graph and endpoint
    open, object-store validation, committed-tail replay, projection open,
-   indexes/sweeps, journal open/drain, terminal projection repair, and completion
-   flush. These observations confer no authority.
+   indexes/sweeps, journal open, own-endpoint retirement scan,
+   absence-decision-map open, journal drain, terminal projection repair, and
+   completion flush, followed by one content-free work-counter record
+   (`SyncRuntimeCleanOpenCounters`) attributing that open's counted work —
+   batches replayed, receipt evidence names and content reads, full-catalog
+   passes, summary and local-completion chain reads, and archive
+   inspections. Every counter is produced after the work it describes; no open
+   decision reads one. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.
@@ -1033,6 +1247,18 @@ ambiguous baseline claims remain unresolved after reconstruction.
    `graph_text_admission_unavailable` rather than reading a value another thread
    is free to advance. That is an internal precondition, not a threat-model
    refusal, and no in-scope scenario reaches it once the static order holds.
+10. The hot engine's four run-local identity indexes (page names, portable
+   paths, block claims, Logseq claims) have NO fixed capacity and never refuse
+   for occupancy. They grow with lifetime-DISTINCT identities (a rename
+   retains the released old key; deletion frees nothing) and are rebuilt from
+   accepted history at every open; the stated bound on that growth is archive
+   rebaselining (SPEC-A A5 decision record). The removed 4,096-entry caps
+   named no in-scope scenario and were a permanent wedge across reopen — the
+   block-claim member refused only at acceptance, after the drain had
+   published the manifest, turning a reported save into a permanently
+   unopenable store. Guarded by
+   `a4_run_local_identity_indexes_have_no_fixed_capacity` and the `a4_*`
+   past-capacity tests (`hot_engine_integration_tests.rs`).
 
 ### 3.1 Refusal scenarios
 
@@ -1054,12 +1280,25 @@ in this table.
 | `MS-REF-MALFORMED-IMPORT` | Imported/shared Markdown, Org, descriptor, manifest, or operation bytes cannot be decoded within declared bounds | Leave source/authoritative history unchanged and report the bounded invalid component |
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
+| `APP-REF-PLUGIN-IMMUTABLE-COLLISION` | Two honest concurrent installs, or a crash-recovered retry racing a completed install, present different bytes for the same plugin id and version | Keep the no-clobber winner byte-exact and refuse the other install as `immutable plugin version ... different bytes`; never overwrite or merge the package |
 
-One retryable setup refusal is intentionally outside the durable-scenario table:
+Three retryable refusals are intentionally recorded outside the durable-scenario
+table:
 
 | Operation | In-scope scenario | Required response |
 | --- | --- | --- |
+| local activation fails after retaining its activation marker and immutable baseline but before actor open | Crash or runtime-open failure lands between authoritative retain and the first active actor | Preserve the marker, baseline, archive, and enrollment as one authoritative set; the next explicit open resumes and completes activation |
+| shared-join generation publication is interrupted before or after marker replacement | Crash lands between baseline generation publication, operation generation publication, the archive-directory barrier, and the marker commit point | Resolve the baseline and operation archive named by the durable marker, reclaim every unreferenced generation/candidate, and resume from that complete pair; no durable refusal is emitted |
 | prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
+| exact provider removal whose caller requires the source present, on a path that is already absent | Sync-service delivery, an honest concurrent instance, or this device's own earlier completed removal has already taken the path; the completed journal record for that removal has since been compacted against provider state (§2.10c-i) | Report `UnknownProviderPath` for the exact path. This is the same answer the `RequirePresent` policy gives for any absent source; the caller re-observes provider state (the clean provider path walk reads the path before it asks for the removal). A caller whose policy is `SettleIfAbsent` settles instead. |
+
+The two internal generation refusals below are pinned to the durable scenario
+vocabulary above. They are not new public scenario IDs.
+
+| Refusal stem | Scenario ID | In-scope scenario and required response |
+| --- | --- | --- |
+| `clean authority orphan is not a private directory` | `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool substituted a symlink, special file, or regular file where cleanup owns only private directories. Refuse without following or removing the substituted entry. |
+| `clean shared join generation destination already exists` | `MS-REF-STALE-GENERATION` | An honest concurrent instance advanced the generation after this join validated its prior marker. Abort the stale join; reopen follows the marker-named complete pair and reclaims unreferenced generation state. |
 
 #### Checks with no in-scope scenario, and what happened to them
 
@@ -1132,32 +1371,34 @@ refusal that could have come from any of 131 unnamed sites.
 ### 3.1a The private receipt-store claim, and when it is checked
 
 `receipts/projection-receipts.claim` identifies the one implemented private
-receipt-store format by magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**.
-Earlier development magics — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — are
+receipt-store format by magic. The current claim is **`TINEPR7\0`, `STORE_CLAIM_VERSION` = 7**.
+Earlier development magics — `TINEPR6\0`, `TINEPR5\0`, `TINEPR4\0`,
+`TINEPR3\0` — are
 recognized only so the low-level opener can refuse them without mutation. They
 have no reader, compatibility implementation, or migration path.
 
-**Why the version moved to 6.** The intent and completion records now carry an
-explicit target-kind discriminant (below). Managed storage has not shipped, so
-the only stores carrying a pre-(c) claim are development stores, and the 0.7
-blank-slate policy applies: the low-level store refuses before mutation; the
-Tauri graph-open boundary preserves the entire unrecognized private root as a
-backup, opens the untouched Markdown/Org tree as the reconstruction source,
+**Why the version moved to 7.** Local forensic evidence previously accepted a
+schema-1 record beside the schema-2 current record. Removing that private
+dual-decoder requires invalidating its containing store too: a TINEPR6 store is
+now rejected at the claim precheck rather than failing later on an unreadable
+record. Managed storage has not shipped, so the 0.7 blank-slate policy applies:
+the Tauri graph-open boundary preserves the entire unrecognized private root as
+a backup, opens the untouched Markdown/Org tree as the reconstruction source,
 and automatically activates a fresh store in the one current format. The user
 does not migrate or manually re-activate anything.
 
 **Why packet 2c does not move it again.** Packet 2c retires only the
 own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
 record formats, and recovery protocol remain live and unchanged, so the
-wholesale-retirement premise for a `TINEPR7` claim is false. A store written by
+wholesale-retirement premise for a claim bump was false by itself. A store written by
 a pre-2c `(c)` build differs only by possibly retaining own-endpoint receipt
 artifacts. Current code neither authors nor consults those artifacts as
 authority: it reports their validated names, leaves their bytes untouched, and
 recovers own work exclusively from the durable turn/journal plus the local
-completion index. Refusing `TINEPR6` would reactivate an intermediate
-development store and could lose undrained frames without adding safety. The
-real-store recovery-equivalence oracle covers every specified crash cut for
-exactly this transition.
+completion index. The independent forensic-decoder retirement above is the
+containing-format reason the claim now moves; packet 2c still contributes no
+additional format change. The real-store recovery-equivalence oracle covers
+every specified crash cut for the 2c transition.
 
 | Claim observed | Response |
 | --- | --- |
@@ -1205,6 +1446,11 @@ recovery slot rather than minting an unbounded archive on every launch. An
 explicit or emergency Direct
 Files selection does not request this retry. This is one current format, not a
 compatibility reader or migration.
+
+Both private-root moves (`archive_private_root` and the bounded failed-candidate
+replacement) synchronize the recovery destination parent first and the source
+parent second after rename. A power loss therefore cannot acknowledge removal
+of the private-root name without also making its retained recovery name durable.
 
 #### Explicit target kind on intent and completion records
 
@@ -1510,7 +1756,7 @@ target; lookup is never by bare path. A completion by page P at X therefore
 cannot suppress a later creation by page Q at X.
 
 The engine coalesces staged entries into immutable generation-named objects at
-`archive/operations/sweeps/local-completion-index-v1/`. A flush installs one
+`archive/operations.<generation>/sweeps/local-completion-index-v1/`. A flush installs one
 delta, and every `N = max(256, 2 × pages-at-compaction)` deltas the same staged
 publication also installs a full-map compaction. Compaction retains every exact
 intent still named by an uncheckpointed foreground frame or unretired
@@ -1552,7 +1798,7 @@ as before.
 Foreign replay builds a disposable absence-decision map once per managed open
 from the receiver summary plus the local completion index. The receiver summary
 is a chain-versioned, disposable object at
-`archive/operations/sweeps/receiver-absence-summary-v1/`; retained receipt
+`archive/operations.<generation>/sweeps/receiver-absence-summary-v1/`; retained receipt
 records remain the truth. Its horizon is the count and set digest of the exact
 receiver evidence filenames it covers - completion AND intent names, because a
 durable intent without a completion is itself map evidence (incomplete-intent
@@ -1569,6 +1815,53 @@ changes cost only, never an absence decision or refusal outcome. The map is
 keyed by `(page, path)`. Its answer is the frontier-maximal completion across
 both halves; a defensive incomparable maximal set with mixed target kinds
 chooses the reversible Present/defer direction.
+
+Normal Managed opens attach the clean archive store **before** they open the
+absence-decision map, on both the activation and the clean-reopen path, so
+`archive_store == None` — whose full-validated-catalog fallback
+`HotEngine::open_absence_decision_map` retains — is the generic/offline-engine
+case, not a normal-session fork. That ordering is pinned by
+`w4_p1_storage_contract_pins_receiver_summary_frequency_schema`, which also
+keeps the measured table below in step with the probe that produced it.
+
+**Measured open attribution (Harvest W4-P1 item 5, B052).** Ordinary
+single-device desktop Managed cycles on a real-scale anonymized graph copy: each
+cycle performs the stated accepted saves, a clean shutdown, and one cold
+`SyncRuntimeHandle::open_with_progress` whose `SyncRuntimeCleanOpenCounters` are
+captured. Reproduce with
+`sync_runtime::tests::w4_p1_receiver_summary_reopen_frequency_probe`
+(`#[ignore]`, release-only, `TINE_MS_AUDIT_GRAPH_COPY`). Content-read and delta
+figures are totals across the cycles.
+
+| field | value |
+| --- | --- |
+| `checkedHead` | `d1f98c61fe9422ab70b58d38b374604ae499b6da` |
+| `corpusFiles` | `1046` |
+| `corpusPages` | `1045` |
+| `corpusBlocks` | `4758` |
+| `cycles` | `20` |
+| `savesPerCycle` | `1` |
+| `shutdownKind` | `clean-safe` |
+| `archiveStoreAttached` | `yes-by-production-call-order` |
+| `fullCatalogPass0` | `20` |
+| `fullCatalogPass1` | `0` |
+| `summaryRebuiltFalse` | `20` |
+| `summaryRebuiltTrue` | `0` |
+| `receiptContentReads` | `0` |
+| `summaryContentReads` | `20` |
+| `deltaCompletions` | `0` |
+| `deltaIntents` | `0` |
+
+The full-catalog fallback fired in none of the 20 opens and the delta path ran
+in all 20, so it is reachable in a normal session rather than dead code. The
+measurement is bounded: this corpus carries no foreign receiver evidence, so the
+delta path was exercised against an empty evidence set; it says nothing about
+delta-read cost under a populated evidence set or about multi-device sessions.
+It also attributes no cause, because `open_cache(..).ok().flatten()` collapses
+`Ok(None)` with every `Err`, a coverage mismatch reaches the same
+`rebuilt`/`full_catalog_passes` values, and the no-archive branch synthesizes
+those same values; separating them needs a producer reason counter that does not
+exist yet.
 
 The receiver executor consults that answer only after a fresh,
 capability-bound reread of the target path and before publishing a new intent:
@@ -2322,6 +2615,29 @@ archive that no later attempt can attribute, and every retry refuses
 `SyncConflict` permanently for a graph whose only authority is still the
 Markdown/Org tree beside it.
 
+### Harvest W4-R2 — unmarked activation-generation recovery
+
+The marker publication is the sole activation commit. A process abort can skip
+Rust destructors and the attempt-level retraction, so a current-layout
+generation published before that marker remains inert rather than becoming
+authority. On the next explicit activation, the existing generation resolver
+retires a wholly recognized unmarked archive, removes the disposable SQLite
+file set, and rebuilds from the unchanged Markdown/Org source. An unknown entry
+prevents that attribution and remains untouched for the ordinary foreign-residue
+refusal.
+
+| Crash cut | State observed by the next activation | Recovery |
+| --- | --- | --- |
+| after durable baseline publication, before SQLite publication | unmarked `lazy-genesis.0` and `operations.0`; no authority marker; SQLite absent | retire both inert generation directories and rebuild generation 0 from Direct Files |
+| after SQLite publication, before the final source proof | the same unmarked generation pair plus a disposable SQLite file set; no authority marker | retire the SQLite file set and both inert generation directories, then rebuild |
+| after the final source proof, before marker publication | complete unmarked baseline, operation archive, and SQLite projection; no authority marker | retire all uncommitted derived state and rebuild; source identity is proved again |
+| during atomic marker publication | either one of the no-marker states above or one complete valid marker | no marker follows the corresponding recovery row; a valid marker selects generation 0 and ordinary managed open follows it |
+
+`managed_activation_abort_cuts_retire_unmarked_generation_and_retry` pins the
+three pre-marker process-abort cuts. Marker atomicity is provided by the audited
+marker publication primitive and is not reproduced by a test-only partial-file
+shape.
+
 A refusal from that final source proof names what moved: the row count and, for
 the first rows, the exact path together with the field that changed (filesystem
 resource identity, link count, or content description), and whether the row
@@ -2391,6 +2707,83 @@ authoritative oplog bytes. Before 0.7, an unrecognized private Managed Storage
 format is preserved as a backup and rebuilt from Markdown/Org into the sole
 current format. Production does not carry an old-format reader, dual schemas,
 or an in-place migration bridge.
+
+### 2.10c-i The provider retry journal's completed store is bounded by provider state
+
+`ProviderRetryJournal` (`oplog/wire.rs`, device-private, outside the graph)
+keeps one record per provider filesystem operation it performs. Records in
+`records/` describe operations still in flight; records in `completed/` are
+crash-recovery and exact-operation idempotency evidence for operations that
+finished. Both are named by a content-derived operation id — a hash over the
+operation, its binding, its provenance, the paths, and the source length and
+digest — so **neither directory has a chronology**. There is no "oldest"
+completed record, and a time or count window over them could replay or
+suppress the wrong operation after a provider namespace was lost, replaced, or
+rolled back.
+
+**Retention bound.** `completed/` is bounded by *live provider state*, never by
+the lifetime of the store. Before an operation adds a completed record, if the
+store holds `PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER` (64) records or
+more it is first compacted against the provider
+(`reconcile_completed_against_provider`). The structural scan bound
+`MAX_PROVIDER_JOURNAL_COMPLETED` (16,384) remains, and compaction keeps the
+store far below it. The trigger is deliberately small because
+`ProviderRetryJournal::load` decodes and authenticates *every* completed record
+on *every* operation, so the completed count is also the ordinary path's
+per-operation cost; a wider window buys nothing, because what makes an exact
+repeat settle after retirement is provider state, not a retained record.
+Reaching the trigger is an instruction to re-observe the provider, **not** a
+reason to fail the user's next publish, rename or remove.
+
+**What compaction retires, and why each is safe.** The predicate is derived
+from the operation type and current provider state; it never consults age or
+arrival order. It is the generalization of the two `recycle_completed_*`
+functions that already existed for two of these cases.
+
+| Record | Provider-state question | Retired when | Why an exact repeat still reaches the same outcome |
+| --- | --- | --- | --- |
+| `Put` | Is the published destination still present? | Always — present is *reflected*, absent is *moot* | Present: the repeat compares the destination bytes and settles, or refuses `ProviderConflictingBytes` when they differ — the same answer the retained record's `validate_put_destination` gave. Absent: the repeat republishes, which is what `recycle_completed_put_for_absent_destination` already arranged at operation entry. |
+| `Rename` | Is the retired source back? | Always — gone is *reflected*, back is *moot* | The repeat settles from this device's own retirement diagnostic `removed/retired-<operation id>`, whose name is derived from the retired bytes and which must still hold them, with the destination still holding them too. Retaining the record is what would make a repeat over a returned source fail. |
+| `Remove` | Is the removed source back? | Always — gone is *reflected*, back is *moot* | Source back: the repeat settles from the same retirement diagnostic. Source gone: a caller whose missing-source policy is `SettleIfAbsent` settles; a caller whose policy is `RequirePresent` gets `UnknownProviderPath`, the same state-derived answer that policy gives for any absent source (see the refusal row below). |
+
+A record whose `operation_id` also appears in `records/` is never retired: a
+crash can leave the same authenticated Cleanup record in both directories, and
+the pending copy is what the ordinary retry validator reads.
+
+**Compaction commits per record, and needs no generation pointer.** Each
+completed record is *independently* retirable and its retirement is idempotent,
+so a crash part-way through a sweep leaves a prefix retired and the rest
+untouched — a state the next sweep reaches again by itself. There is no mixed
+generation to publish atomically, so the generation-directory/commit-pointer
+shape that multi-file compaction would require does not apply here. Every
+individual removal is a `remove_file` followed by a directory `fsync`.
+`oplog::wire::tests::a_crash_across_completed_record_retirement_reopens_and_still_settles`
+cuts a sweep at the `CompletionRetired` boundary, reopens, and proves both
+operations still settle.
+
+**One publication answers one question.** `SharedProviderTransport::publish`
+and `publish_exact` are one implementation. `publish` used to be a second,
+subtly different answer that refused any destination that already existed, so
+manifest, descriptor and frontier-head publications depended on a retained
+completed record to make an exact repeat settle. They no longer do.
+
+**Proof.** `oplog::wire::tests::provider_journal_completed_records_retire_against_live_provider_state`
+drives 20,000 completed provider operations — past `MAX_PROVIDER_JOURNAL_COMPLETED`
+— and asserts no operation fails and that the steady-state `completed/` count
+stays at or below the trigger.
+`…::retired_completed_provider_records_still_settle_exact_repeat_operations`,
+`…::retired_completed_rename_settles_only_on_its_own_retirement_evidence` and
+`…::retired_completed_remove_settles_for_the_policy_that_tolerates_absence`
+prove exact idempotency after retirement, and that the settle is bound to this
+device's evidence for that exact operation rather than to a destination that
+merely exists.
+
+**Known neighbouring bound, not addressed here.** `{inbox,outbox}/removed/` is
+capped at `MAX_PROVIDER_RESIDUE_ENTRIES` (512) by
+`ensure_provider_diagnostic_capacity`, which refuses beyond it, and nothing
+retires those diagnostics. That is a separate lifetime-growth bound in the
+provider tree rather than in the journal; it is recorded here so the next
+reader does not mistake this section's guarantee for covering it.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 
@@ -2565,6 +2958,33 @@ quarantined, or reported in place before its turn checkpoints.
 The crash and external-race coverage lives in the packet-2b C3-C6, R2-R5 and
 X5-X6 tests, including occupied staged-name quarantine, in-turn exact-identity
 retirement, post-crash retention, and hard-link refusal.
+
+On Windows, backup restore's capability-bound move to graph-local recovery uses
+hard-link-create followed by source removal, never check-then-rename. If a sync
+service such as Syncthing or Dropbox delivers the same recovery name between
+observation and publication, hard-link creation returns `AlreadyExists`; the
+delivered entry is not replaced and the original live source remains. Linux,
+Android, macOS, iOS, and Windows are explicit compile-time arms; an unknown
+target cannot inherit a Tine platform's publication policy by negated fallback.
+
+## Harvest W4-E3 — bounded clean-open source taxonomy
+
+Clean managed construction and recovery map their 16 concrete source classes
+once into the crate-private `CleanOpenError`. Its public projection preserves
+the existing `OpenRefused { detail }` shape but makes the detail tagged JSON:
+`kind` is `clean-open` and `reason_code` identifies the source class. No source
+display text, path, or note name is serialized.
+
+The reason codes and their exact source classes are pinned in
+`docs/contracts/typed-errors.md`. Their refusal scenarios are existing §3.1
+rows: bootstrap, projection, provider-scenario, and batch validation use
+`MS-REF-MALFORMED-IMPORT`/`MS-REF-BOUNDS`; damaged authoritative records use
+`MS-REF-DISK-CORRUPT`; provider collisions use `MS-REF-SYNC-CONFLICT`;
+lease/authority races use `MS-REF-CONCURRENT-WRITER` or
+`MS-REF-STALE-GENERATION`; unsafe entries use `MS-REF-UNSAFE-FS-KIND`; and
+unknown current-format claims use `MS-REF-PROTOCOL-INCOMPATIBLE`. Plain I/O
+unavailability remains retryable. Disposable SQLite damage still rebuilds per
+§3.1 and D-3 rather than becoming a durable refusal.
 
 ## 4. Concord base ledger (Direct Files)
 

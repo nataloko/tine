@@ -2,7 +2,7 @@ import { For, Show, createResource, createSignal, createMemo, createEffect, onCl
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
 import { openRouteInOtherPane } from "../panes";
-import { openPageInSidebar, openPageContextMenu } from "../ui";
+import { graphMeta, openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
@@ -90,10 +90,21 @@ function fallbackFilterEntry(block: BlockDto): SearchableFilterEntry {
   return searchableFilterEntry({ text: text.join("\n"), facets: [...facets.values()] });
 }
 
+/** How many backlinks a page needs before its Linked References open collapsed.
+ *
+ *  The graph decides: `:ref/linked-references-collapsed-threshold` in config.edn,
+ *  which Tine used to ignore in favour of a hard-wired 100 (GH #479). The
+ *  constant survives only as OG's own fallback for a graph that does not set the
+ *  key. Zero is a real setting — "always collapsed", which is what the users in
+ *  the Logseq thread behind that key wanted — so this must not treat a falsy
+ *  threshold as "unset". */
+const OG_REFERENCE_COLLAPSE_THRESHOLD = 100;
+const referenceCollapseThreshold = () =>
+  graphMeta()?.linked_references_collapsed_threshold ?? OG_REFERENCE_COLLAPSE_THRESHOLD;
+
 // The "Linked References" section (backlinks). Live, editable, collapsible, and
 // filterable by co-referenced page (click a chip: include → exclude → off),
 // mirroring OG's reference filter.
-const OG_REFERENCE_COLLAPSE_THRESHOLD = 100;
 
 export function LinkedReferences(props: { name: string }): JSX.Element {
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
@@ -307,7 +318,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   };
   const count = () => shown().reduce((acc, g) => acc + g.blocks.length, 0);
   const totalCount = () => mergedGroups().reduce((acc, g) => acc + g.blocks.length, 0);
-  const collapsed = () => collapsedOverride() ?? totalCount() >= OG_REFERENCE_COLLAPSE_THRESHOLD;
+  // OG: `default-collapsed? (>= total threshold)` over the TOTAL backlink count,
+  // not the filtered one (components/reference.cljs at 6e7afa8e).
+  const collapsed = () => collapsedOverride() ?? totalCount() >= referenceCollapseThreshold();
   const occurrenceLimit = createMemo(() => {
     let shown = 0;
     let total = 0;
@@ -372,18 +385,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             </svg>
           </span>
           Linked References <span class="references-count">{count()}</span>
-          <button
-            type="button"
-            class="reference-export-toggle"
-            aria-label="Copy / export linked references"
-            title="Copy / export selected linked references"
-            onClick={(event) => {
-              event.stopPropagation();
-              setExportChooserOpen(true);
-            }}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
-          </button>
+          {/* Copy is rendered LAST so it lands on the same right edge as the
+              Unlinked References copy button, which has no filter beside it
+              (GH #475). Do not reorder without checking that section too. */}
           <button
             type="button"
             class="reference-filter-toggle"
@@ -397,6 +401,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             }}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2z" /></svg>
+          </button>
+          <button
+            type="button"
+            class="reference-export-toggle"
+            aria-label="Copy / export linked references"
+            title="Copy / export selected linked references"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExportChooserOpen(true);
+            }}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
           </button>
         </div>
         <Show when={!collapsed()}>

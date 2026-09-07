@@ -1,8 +1,10 @@
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
+use crate::oplog::query_lowering::drain_after;
 use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
+    PropertyFacetAccumulator, SimpleQueryCandidatePlan,
 };
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
@@ -68,6 +70,8 @@ struct ProjectionShared {
     #[cfg(test)]
     indexed_reads: AtomicU64,
     #[cfg(test)]
+    fallback_reads: AtomicU64,
+    #[cfg(test)]
     referenced_name_reads: AtomicU64,
     #[cfg(test)]
     fuzzy_candidate_reads: AtomicU64,
@@ -97,6 +101,8 @@ impl DirectProjection {
             worker_busy: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -220,22 +226,17 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut by_block = BTreeMap::new();
         let uses_recency = eligibility.uses_recency;
-        const BATCH: usize = 1024;
         for marker in eligibility.markers {
-            let mut after = None;
-            loop {
-                let rows = read
-                    .task_candidate_locators_after(&marker, after, BATCH)
-                    .ok()?;
-                let count = rows.len();
-                for row in rows {
-                    after = Some((row.page_id, row.block_id));
+            drain_after(
+                |after, batch| read.task_candidate_locators_after(&marker, after, batch),
+                |row| (row.page_id, row.block_id),
+                |row| {
                     by_block.entry(row.block_id).or_insert(row);
-                }
-                if count < BATCH {
-                    break;
-                }
-            }
+                    Ok(())
+                },
+                |_, _| None,
+            )
+            .ok()?;
         }
         if self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
             || !self.shared.ready.load(Ordering::Acquire)
@@ -313,6 +314,161 @@ impl DirectProjection {
         current
     }
 
+    /// Abandon the projection read when the lowering's candidate set is not
+    /// selective enough to beat the parser walk it would replace.
+    ///
+    /// The walk costs one cheap in-memory predicate per page of the whole
+    /// graph, so its cost is proportional to the graph. The projection route
+    /// costs a SQL scan plus, per candidate, a SQLite point read, a page DTO
+    /// construction and a document clone — each far more expensive than one
+    /// walk step. So the route only wins while the candidate set is a small
+    /// FRACTION of the graph, which is why the cutoff scales with the graph
+    /// rather than being an absolute count.
+    ///
+    /// `1/32` is taken from the measured corpus (1,049 pages, 14,538 blocks;
+    /// `tine-agents/evidence/wave4/b4b/`). Every class the route made faster
+    /// there produced at most 3 candidates (0.29% of the graph); the two
+    /// classes it made dramatically slower produced 91 and 104 (8.7% and 9.9%,
+    /// costing 1.08 -> 11.19 ms and 0.46 -> 3.31 ms). `1/32` sits about 10x
+    /// above every measured winner and about 2.8x below every measured loser.
+    /// The floor keeps small graphs — including test fixtures — on the route,
+    /// where the absolute cost of materializing a few candidates is trivial.
+    ///
+    /// Abandoning is the safe direction: it returns exactly today's behaviour.
+    /// A cutoff set too low forfeits a speedup; one set too high reintroduces a
+    /// 10x stall on the typing path.
+    fn candidate_cutoff(graph_page_count: usize) -> usize {
+        const SELECTIVE_FRACTION: usize = 32;
+        const SMALL_GRAPH_FLOOR: usize = 32;
+        (graph_page_count / SELECTIVE_FRACTION).max(SMALL_GRAPH_FLOOR)
+    }
+
+    pub(crate) fn simple_query_candidate_paths(
+        &self,
+        cache_generation: u64,
+        plan: &SimpleQueryCandidatePlan,
+        graph_page_count: usize,
+    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
+            &read,
+            plan,
+            &std::collections::HashSet::new(),
+        )
+        .ok()?;
+
+        // RETIREMENT-CANDIDATE: the candidate-count escape hatch below, together
+        // with the Direct whole-graph parser walk it hands the query back to.
+        //
+        // WHAT MAY BE DELETED: this `candidate_cutoff` test and the
+        // `run_query`/`run_query_bounded` fallback arms that call
+        // `Graph::direct_projection_note_fallback_read` after it fires. Deleting
+        // them makes every ready `SimpleQueryCandidatePlan::Indexed` plan
+        // unconditionally candidate-only.
+        //
+        // CONDITION FOR DELETION: the hatch exists only because
+        // `lower_simple_query_candidate_plan` returns a page SUPERSET rather
+        // than the answer — `and` takes the first leaf instead of intersecting,
+        // `Page`/`Namespace`/`Journal` full-scan `navigation_pages`, values never
+        // push down, and the block ids SQL already returned are discarded at the
+        // trait boundary. When the lowering returns the ANSWER, the candidate set
+        // is selective by construction, this test can never fire, and it goes.
+        // That work is card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`, not this packet.
+        //
+        // WHAT CURRENTLY BLOCKS DELETION — read this before deleting the walk
+        // along with the hatch: the parser walk is not merely the fallback, it is
+        // the CORRECTNESS ORACLE for the real lowering that would replace it, and
+        // no external oracle exists (Logseq's DB version evaluates in in-memory
+        // DataScript with SQLite as a mere datom store; Dataview is frozen; Bases
+        // is closed). The walk answers every query from the parsed documents in
+        // ~1 ms over the 1,045-file anonymized graph, so the acceptance gate for
+        // a real lowering is DIFFERENTIAL AGAINST THE WALK — the shape
+        // `crate::query::tests::sparse_task_query_runner_matches_existing_page_evaluator`
+        // already uses. The walk therefore outlives the lowering by at least one
+        // release as a test-only oracle; it is NOT deletable the moment SQL
+        // works. Retire the hatch first, keep the walk, and retire the walk only
+        // after a release of differential agreement.
+        if lowered.page_ids.len() > Self::candidate_cutoff(graph_page_count) {
+            return None;
+        }
+
+        let mut paths = std::collections::BTreeSet::new();
+        for page_id in lowered.page_ids {
+            let page = read
+                .page_with_header_validation(page_id, |_, kind| match kind {
+                    0 | 1 => Ok(()),
+                    _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
+                        format!("unknown Direct Files text kind {kind}"),
+                    )),
+                })
+                .ok()??;
+            paths.insert(PathBuf::from(page.path));
+        }
+        let current = self.ready_at(cache_generation).then_some(paths);
+        #[cfg(test)]
+        if current.is_some() {
+            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        current
+    }
+
+    pub(crate) fn property_facets(
+        &self,
+        cache_generation: u64,
+        autocomplete: bool,
+        hidden_properties: &[String],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut accumulator = if autocomplete {
+            PropertyFacetAccumulator::autocomplete(hidden_properties, max_items, max_bytes)
+        } else {
+            PropertyFacetAccumulator::query_builder(max_items, max_bytes)
+        };
+        drain_after(
+            |cursor, batch| read.property_facet_rows_after(!autocomplete, cursor, batch),
+            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                accumulator.offer(&row.normalized_name, &row.value);
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        #[cfg(test)]
+        self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        Some(accumulator.finish())
+    }
+
+    pub(crate) fn note_fallback_read(&self) {
+        #[cfg(test)]
+        self.shared.fallback_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn referenced_page_names(&self, cache_generation: u64) -> Option<Vec<String>> {
         if !self.ready_at(cache_generation) {
             return None;
@@ -322,34 +478,33 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, String, String, [u8; 16])> = None;
         let mut names = std::collections::HashMap::<String, String>::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_reference_names_after(
+        drain_after(
+            |after: Option<(String, String, String, [u8; 16])>, batch| {
+                read.navigation_reference_names_after(
                     after.as_ref().map(|(path, raw, normalized, id)| {
                         (path.as_str(), raw.as_str(), normalized.as_str(), id)
                     }),
-                    BATCH,
+                    batch,
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((
-                    row.owner_path,
+            },
+            |row| {
+                (
+                    row.owner_path.clone(),
                     row.raw_name.clone(),
-                    row.normalized_name,
+                    row.normalized_name.clone(),
                     row.source_page_id,
-                ));
+                )
+            },
+            |row| {
                 names
                     .entry(crate::refs::page_key(&row.raw_name))
                     .or_insert(row.raw_name);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -375,22 +530,19 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut paths = std::collections::HashSet::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .fuzzy_subsequence_candidate_pages_after(normalized_needle, after, BATCH)
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some(row.page_id);
+        drain_after(
+            |after, batch| {
+                read.fuzzy_subsequence_candidate_pages_after(normalized_needle, after, batch)
+            },
+            |row| row.page_id,
+            |row| {
                 paths.insert(row.path);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         let current = self.ready_at(cache_generation).then_some(paths);
         #[cfg(test)]
         if current.is_some() {
@@ -413,31 +565,30 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, String, [u8; 16])> = None;
         let mut aliases = Vec::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_aliases_after(
+        drain_after(
+            |after: Option<(String, String, [u8; 16])>, batch| {
+                read.navigation_aliases_after(
                     after
                         .as_ref()
                         .map(|(path, alias, id)| (path.as_str(), alias.as_str(), id)),
-                    BATCH,
+                    batch,
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((
+            },
+            |row| {
+                (
                     row.owner_path.clone(),
                     row.normalized_alias.clone(),
                     row.source_page_id,
-                ));
+                )
+            },
+            |row| {
                 aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(aliases)
     }
 
@@ -453,21 +604,18 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, [u8; 16])> = None;
         let mut names = crate::query::RealPageNames::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_pages_after_with_header_validation(
+        drain_after(
+            |after: Option<(String, [u8; 16])>, batch| {
+                read.navigation_pages_after_with_header_validation(
                     after.as_ref().map(|(path, _)| path.as_str()),
                     after.as_ref().map(|(_, id)| id),
-                    BATCH,
+                    batch,
                     |_, _| Ok(()),
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((row.path.clone(), row.page_id));
+            },
+            |row| (row.path.clone(), row.page_id),
+            |row| {
                 let path = PathBuf::from(&row.path);
                 match names.get_mut(&row.name_key) {
                     Some((winner_path, winner_name)) if path < *winner_path => {
@@ -479,11 +627,11 @@ impl DirectProjection {
                         names.insert(row.name_key, (path, row.name));
                     }
                 }
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(names)
     }
 
@@ -509,40 +657,31 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let mut page_ids = std::collections::BTreeSet::new();
-        const BATCH: usize = 1024;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
-                    let mut after = None;
-                    loop {
-                        let rows = read
-                            .page_referrer_candidates_after(name, after, BATCH)
-                            .ok()?;
-                        let count = rows.len();
-                        for row in rows {
-                            after = Some((row.source_page_id, row.source));
+                    drain_after(
+                        |after, batch| read.page_referrer_candidates_after(name, after, batch),
+                        |row| (row.source_page_id, row.source),
+                        |row| {
                             page_ids.insert(row.source_page_id);
-                        }
-                        if count < BATCH {
-                            break;
-                        }
-                    }
+                            Ok(())
+                        },
+                        |_, _| None,
+                    )
+                    .ok()?;
                 }
                 ReferenceKind::Plain => {
-                    let mut after = None;
-                    loop {
-                        let rows = read
-                            .plain_text_candidate_pages_after(name, after, BATCH)
-                            .ok()?;
-                        let count = rows.len();
-                        for row in rows {
-                            after = Some(row.page_id);
+                    drain_after(
+                        |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
+                        |row| row.page_id,
+                        |row| {
                             page_ids.insert(row.page_id);
-                        }
-                        if count < BATCH {
-                            break;
-                        }
-                    }
+                            Ok(())
+                        },
+                        |_, _| None,
+                    )
+                    .ok()?;
                 }
             }
         }
@@ -573,10 +712,9 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let block = match read.block(uuid).ok()? {
-            Some(block) => Some(block),
+            Some(block) => crate::query::logseq_uuid_owner([block], false),
             None => {
-                let mut claimants = read.blocks_by_logseq_uuid(uuid, 2).ok()?;
-                (claimants.len() == 1).then(|| claimants.pop().expect("one UUID claimant"))
+                crate::query::logseq_uuid_owner(read.blocks_by_logseq_uuid(uuid, 2).ok()?, false)
             }
         };
         let page = match block {
@@ -601,23 +739,22 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut counts = std::collections::HashMap::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read.block_reference_counts_after(after, BATCH).ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some(row.raw_uuid_claim);
-                counts.insert(
-                    Uuid::from_bytes(row.raw_uuid_claim).to_string(),
-                    usize::try_from(row.distinct_source_blocks).ok()?,
-                );
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+        drain_after(
+            |after, batch| read.block_reference_counts_after(after, batch),
+            |row| row.raw_uuid_claim,
+            |row| {
+                let distinct = usize::try_from(row.distinct_source_blocks).map_err(|_| {
+                    tine_storage::sqlite::MaterializationError::Corrupt(
+                        "block reference count exceeds usize".into(),
+                    )
+                })?;
+                counts.insert(Uuid::from_bytes(row.raw_uuid_claim).to_string(), distinct);
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(counts)
     }
 
@@ -635,22 +772,17 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut page_ids = std::collections::BTreeSet::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .block_referrer_candidates_after(uuid, after, BATCH)
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((row.source_page_id, row.source_block_id));
+        drain_after(
+            |after, batch| read.block_referrer_candidates_after(uuid, after, batch),
+            |row| (row.source_page_id, row.source_block_id),
+            |row| {
                 page_ids.insert(row.source_page_id);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         let mut paths = std::collections::BTreeSet::new();
         for page_id in page_ids {
             let page = read
@@ -669,6 +801,11 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_reads(&self) -> u64 {
+        self.shared.fallback_reads.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -702,6 +839,24 @@ impl Drop for DirectProjection {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.stop = true;
         self.shared.changed.notify_one();
+    }
+}
+
+/// Report a Direct Files projection failure that leaves the parser fallback in
+/// charge.
+///
+/// The always-on line names the failure family in fixed words and carries
+/// nothing else. I-5: the detail at both call sites is free-form prose from the
+/// projection WRITE path, and that path names the graph — `apply_pending`
+/// formats `entry.rel_path` straight into its error string, and
+/// `MaterializationError`'s payloads are free-form `String`s produced while
+/// storing parsed page text. I-9: the family still reaches the always-on
+/// record, because a user who is not running under `TINE_DEBUG` otherwise sees
+/// only a silently slower graph. The prose stays on the directed debug channel.
+fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
+    eprintln!("[tine] Direct Files SQLite projection {family}");
+    if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+        eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
     }
 }
 
@@ -741,7 +896,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let mut database = match open_projection_database(&shared.path) {
         Ok(database) => database,
         Err(error) => {
-            eprintln!("[tine] Direct Files SQLite projection disabled: {error}");
+            report_projection_failure("disabled: its database could not be opened", &error);
             shared.worker_available.store(false, Ordering::Release);
             shared.changed.notify_all();
             return;
@@ -784,9 +939,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             shared.worker_failed.store(true, Ordering::Release);
             shared.worker_busy.store(false, Ordering::Release);
             shared.changed.notify_all();
-            eprintln!(
-                "[tine] Direct Files SQLite projection is stale; using parser fallback: {error}"
-            );
+            report_projection_failure("is stale; using parser fallback", &error);
             continue;
         }
         if had_full {
@@ -1331,6 +1484,482 @@ mod tests {
         let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
         let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
         assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn b4_page_ref_and_property_facets_record_indexed_reads() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("b4-indexed-reads");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/source.md"),
+            "category:: work\ntags:: work\n\n- TODO points to [[Target]]\n  status:: active\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+        std::fs::write(root.join("pages/Project___Child.md"), "- namespace child\n").unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(root.join("journals/2026_09_03.md"), "- journal block\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        for query in [
+            "(page-ref Target)",
+            "(and (page-ref Target) \"points\")",
+            "(and \"points\" (page-ref Target))",
+        ] {
+            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
+            assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
+            assert_eq!(
+                (indexed.total, indexed.exceeded),
+                (oracle.total, oracle.exceeded)
+            );
+        }
+        assert_eq!(
+            graph.property_facets(),
+            crate::query::property_facets(&graph)
+        );
+        assert_eq!(
+            graph.autocomplete_property_facets_bounded(100, 1_000_000),
+            crate::query::autocomplete_property_facets_bounded(&graph, 100, 1_000_000)
+        );
+        assert!(
+            graph.direct_projection_indexed_reads_test() >= indexed_before + 5,
+            "PageRef and both property-facet entry points must use the generation-bound SQLite read"
+        );
+
+        for query in [
+            "(and (task TODO) (page source))",
+            "(property status active)",
+            "(page-property category work)",
+            "(page source)",
+            "(namespace Project)",
+            "(journal)",
+            "(and (property status active) (page source))",
+            "(or (page source) (page Target))",
+        ] {
+            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+            let expected_paths = graph
+                .direct_projection_candidate_paths_test(
+                    &crate::query::simple_query_candidate_plan(query),
+                    usize::MAX,
+                )
+                .unwrap();
+            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            graph.reset_direct_projection_candidate_probe_test();
+            let actual = graph.run_query_bounded(query, 100, 1_000_000);
+            assert_eq!(
+                signature(&actual.groups),
+                signature(&oracle.groups),
+                "{query}"
+            );
+            assert_eq!(
+                (actual.total, actual.exceeded),
+                (oracle.total, oracle.exceeded),
+                "{query}"
+            );
+            assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_before + 1, "{query}: exactly one candidate query must complete; expected candidate paths {expected_paths:?}");
+            assert_eq!(
+                crate::query::full_graph_query_evaluations(),
+                0,
+                "{query}: production invocation entered the forbidden full-graph evaluator"
+            );
+            assert_eq!(
+                graph.direct_projection_fallback_reads_test(),
+                fallback_before,
+                "{query}: ready candidate route fell back"
+            );
+            assert_eq!(
+                graph
+                    .direct_projection_candidate_evaluated_paths_test()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_paths,
+                "{query}: production must evaluate exactly the lowering's candidate paths"
+            );
+        }
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.reset_direct_projection_candidate_probe_test();
+        let empty = graph.run_query_bounded("(", 100, 1_000_000);
+        assert!(empty.groups.is_empty());
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            0,
+            "Plan::Empty must not enter the graph evaluator"
+        );
+        assert_eq!(
+            graph.direct_projection_indexed_reads_test(),
+            indexed_before,
+            "Plan::Empty must not touch the projection"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before,
+            "Plan::Empty must not record fallback access"
+        );
+
+        graph.reset_direct_projection_candidate_probe_test();
+        let _ = graph.run_query_bounded("\"points\"", 100, 1_000_000);
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            1,
+            "Plan::All alone uses the parser whole-graph evaluator"
+        );
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.direct_projection_mark_stale_test();
+        let fallback_query = "(and (page-ref Target) (not (page Missing)))";
+        let oracle = crate::query::run_query_bounded(&graph, fallback_query, 100, 1_000_000);
+        let fallback = graph.run_query_bounded(fallback_query, 100, 1_000_000);
+        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
+        assert_eq!(
+            graph.property_facets(),
+            crate::query::property_facets(&graph)
+        );
+        assert!(
+            graph.direct_projection_fallback_reads_test() >= fallback_before + 2,
+            "stale PageRef and facet reads must record parser fallbacks"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An `Indexed` plan whose candidate set is a large fraction of the graph
+    /// abandons the projection and hands the query back to the parser walk.
+    ///
+    /// The user outcome this protects: on a real graph, `(journal)` and
+    /// non-sparse `(and (task ...) ...)` name most of the pages, and
+    /// materializing every one of them through SQLite made those query blocks
+    /// 7x and 10x SLOWER than the walk they replaced. The hatch is what keeps a
+    /// query block from stalling typing on the very shapes the route cannot
+    /// help. It must fire on the unselective shape and must NOT fire on a
+    /// selective one in the same graph.
+    #[test]
+    fn b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("b4-candidate-cutoff");
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        // 50 real journal dates, comfortably past the 32-page small-graph
+        // floor. Two months, because a date that does not exist (2026-09-31)
+        // is not a journal and would not become a candidate.
+        for (month, days) in [(9, 30), (10, 20)] {
+            for day in 1..=days {
+                std::fs::write(
+                    root.join(format!("journals/2026_{month:02}_{day:02}.md")),
+                    "- journal block\n",
+                )
+                .unwrap();
+            }
+        }
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/source.md"),
+            "- TODO points to [[Target]]\n  status:: active\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        // The lowering itself still produces the whole unselective candidate
+        // set; the hatch is a routing decision, not a change to the lowering.
+        let unselective = "(journal)";
+        let raw = graph
+            .direct_projection_candidate_paths_test(
+                &crate::query::simple_query_candidate_plan(unselective),
+                usize::MAX,
+            )
+            .expect("the lowering answers the unselective plan");
+        assert!(
+            raw.len() > 32,
+            "fixture must exceed the cutoff; got {} candidates",
+            raw.len()
+        );
+
+        // Run the oracle BEFORE resetting the probes, so the oracle's own walk
+        // is not counted as the production invocation's route evidence.
+        let oracle = crate::query::run_query_bounded(&graph, unselective, 500, 4_000_000);
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.reset_direct_projection_candidate_probe_test();
+        let abandoned = graph.run_query_bounded(unselective, 500, 4_000_000);
+
+        assert_eq!(
+            signature(&abandoned.groups),
+            signature(&oracle.groups),
+            "abandoning must not change the answer"
+        );
+        assert_eq!(
+            (abandoned.total, abandoned.exceeded),
+            (oracle.total, oracle.exceeded),
+            "abandoning must not change the bound outcome"
+        );
+        assert_eq!(
+            graph.direct_projection_indexed_reads_test(),
+            indexed_before,
+            "an abandoned plan must complete no candidate query"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before + 1,
+            "abandoning must record exactly one fallback read on the existing hatch"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            1,
+            "an abandoned plan takes the parser whole-graph walk exactly once"
+        );
+        assert!(
+            graph
+                .direct_projection_candidate_evaluated_paths_test()
+                .is_empty(),
+            "an abandoned plan must materialize no candidate pages"
+        );
+
+        // Same graph, same readiness: a selective plan still routes.
+        let selective = "(page-ref Target)";
+        let selective_paths = graph
+            .direct_projection_candidate_paths_test(
+                &crate::query::simple_query_candidate_plan(selective),
+                usize::MAX,
+            )
+            .expect("the lowering answers the selective plan");
+        assert!(selective_paths.len() <= 32, "selective fixture drifted");
+        let selective_oracle = crate::query::run_query_bounded(&graph, selective, 500, 4_000_000);
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.reset_direct_projection_candidate_probe_test();
+        let routed = graph.run_query_bounded(selective, 500, 4_000_000);
+        assert_eq!(
+            signature(&routed.groups),
+            signature(&selective_oracle.groups)
+        );
+        assert_eq!(
+            graph.direct_projection_indexed_reads_test(),
+            indexed_before + 1,
+            "a selective plan must still complete exactly one candidate query"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before,
+            "a selective plan must not fall back"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            0,
+            "a selective plan must not enter the full-graph evaluator"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "manual B4 corpus gate; set TINE_B4_QUERY_CORPUS"]
+    fn b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence() {
+        fn copy_tree(source: &Path, target: &Path) {
+            std::fs::create_dir_all(target).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let destination = target.join(entry.file_name());
+                if kind.is_dir() {
+                    copy_tree(&entry.path(), &destination);
+                } else if kind.is_file() {
+                    std::fs::copy(entry.path(), destination).unwrap();
+                }
+            }
+        }
+
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let source = PathBuf::from(
+            std::env::var("TINE_B4_QUERY_CORPUS").expect("TINE_B4_QUERY_CORPUS is required"),
+        );
+        let root = scratch("b4-corpus");
+        if source.is_dir() {
+            copy_tree(&source, &root);
+        } else {
+            std::fs::create_dir_all(root.join("pages")).unwrap();
+            std::fs::copy(&source, root.join("pages/corpus-fixture.md")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/B4 Indexed Source.md"),
+            "b4-page-facet:: yes\ntags:: b4-tag\n\n- TODO synthetic [[B4 Indexed Target]]\n  b4-facet:: yes\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/B4___Namespace.md"),
+            "- synthetic namespace\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(root.join("journals/2026_09_03.md"), "- synthetic journal\n").unwrap();
+        std::fs::write(
+            root.join("pages/B4 Indexed Target.md"),
+            "- synthetic target\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join(".b4-private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        // The real graph is the only place the candidate-count escape hatch can
+        // be observed end to end: `(journal)` lowers to a candidate set the size
+        // of the journal directory, which no synthetic fixture reproduces at
+        // scale. Both sides of the hatch are asserted, and the oracle equality
+        // below holds on BOTH — that equality is what makes the parser walk the
+        // correctness oracle the retirement marker names.
+        let graph_page_count = graph.with_pages(|pages| pages.len());
+        let cutoff = DirectProjection::candidate_cutoff(graph_page_count);
+        let mut routed = 0usize;
+        let mut abandoned = 0usize;
+        for query in [
+            "(page-ref \"B4 Indexed Target\")",
+            "(and (task TODO) (page \"B4 Indexed Source\"))",
+            "(property b4-facet yes)",
+            "(page-property b4-page-facet yes)",
+            "(page \"B4 Indexed Source\")",
+            "(namespace B4)",
+            "(journal)",
+            "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
+            "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
+        ] {
+            let plan = crate::query::simple_query_candidate_plan(query);
+            let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
+            // `usize::MAX` asks for the raw lowering result; the production
+            // cutoff then decides whether that set is worth materializing.
+            let raw_paths = graph
+                .direct_projection_candidate_paths_test(&plan, usize::MAX)
+                .unwrap();
+            let hatch_fires = raw_paths.len() > cutoff;
+            // Probe the production cutoff itself, before any counter is
+            // captured, so the probe's own read cannot skew the assertions.
+            let routed_paths =
+                graph.direct_projection_candidate_paths_test(&plan, graph_page_count);
+            assert_eq!(
+                routed_paths.is_none(),
+                hatch_fires,
+                "{query}: {} candidates against cutoff {cutoff} must decide the route",
+                raw_paths.len()
+            );
+            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            graph.reset_direct_projection_candidate_probe_test();
+            let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+            assert_eq!(
+                signature(&indexed.groups),
+                signature(&oracle.groups),
+                "{query}: routed result must equal the parser oracle (hatch_fires={hatch_fires})"
+            );
+            assert_eq!(
+                (indexed.total, indexed.exceeded),
+                (oracle.total, oracle.exceeded)
+            );
+            if hatch_fires {
+                abandoned += 1;
+                assert_eq!(
+                    graph.direct_projection_indexed_reads_test(),
+                    indexed_before,
+                    "{query}: an abandoned candidate set must not count an indexed read"
+                );
+                assert_eq!(
+                    graph.direct_projection_fallback_reads_test(),
+                    fallback_before + 1,
+                    "{query}: an abandoned candidate set must note exactly one fallback read"
+                );
+                assert_eq!(
+                    crate::query::full_graph_query_evaluations(),
+                    1,
+                    "{query}: an abandoned candidate set must take the parser walk"
+                );
+                assert!(
+                    graph
+                        .direct_projection_candidate_evaluated_paths_test()
+                        .is_empty(),
+                    "{query}: an abandoned candidate set must materialize no pages"
+                );
+            } else {
+                routed += 1;
+                assert_eq!(
+                    graph.direct_projection_indexed_reads_test(),
+                    indexed_before + 1
+                );
+                assert_eq!(
+                    graph.direct_projection_fallback_reads_test(),
+                    fallback_before
+                );
+                assert_eq!(crate::query::full_graph_query_evaluations(), 0);
+                assert_eq!(
+                    graph
+                        .direct_projection_candidate_evaluated_paths_test()
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    raw_paths
+                );
+            }
+        }
+        // Neither branch may go vacuous: a corpus that never routes proves
+        // nothing about the projection, and one that never abandons proves
+        // nothing about the hatch.
+        assert!(
+            routed > 0 && abandoned > 0,
+            "the corpus gate must exercise both sides of the hatch \
+             (routed={routed}, abandoned={abandoned}, cutoff={cutoff}, pages={graph_page_count})"
+        );
+        assert!(
+            graph.property_facets() == crate::query::property_facets(&graph),
+            "corpus query-builder facets differ from the parser oracle"
+        );
+        assert!(
+            graph.autocomplete_property_facets_bounded(20_000, 32 * 1024 * 1024)
+                == crate::query::autocomplete_property_facets_bounded(
+                    &graph,
+                    20_000,
+                    32 * 1024 * 1024,
+                ),
+            "corpus autocomplete facets differ from the parser oracle"
+        );
+        // One indexed read per routed query, plus the two facet families above.
+        assert!(graph.direct_projection_indexed_reads_test() >= (routed + 2) as u64);
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.direct_projection_mark_stale_test();
+        let fallback_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
+        let oracle =
+            crate::query::run_query_bounded(&graph, fallback_query, 20_000, 32 * 1024 * 1024);
+        let fallback = graph.run_query_bounded(fallback_query, 20_000, 32 * 1024 * 1024);
+        assert!(
+            signature(&fallback.groups) == signature(&oracle.groups),
+            "corpus stale fallback differs from the parser oracle"
+        );
+        assert!(graph.direct_projection_fallback_reads_test() > fallback_before);
+
+        let pages = graph.with_pages(|pages| pages.len());
+        println!(
+            "b4_corpus_gate pages={pages} indexed_reads={} fallback_reads={}",
+            graph.direct_projection_indexed_reads_test(),
+            graph.direct_projection_fallback_reads_test()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1931,6 +2560,9 @@ mod tests {
         let contract = include_str!("../../../docs/storage-sync-contract.md");
         assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
         assert!(contract.contains("sparse_task_query_eligibility"));
+        assert!(contract.contains("shared\nproperty-facet rows"));
+        assert!(contract.contains("PageRef simple-query candidate plan"));
+        assert!(contract.contains("same SQL read family in\nboth storage regimes"));
         assert!(contract.contains("literal fuzzy-search candidate"));
         assert!(contract.contains("referenced-page\ninventory"));
         assert!(contract.contains("retains no separate semantic memo"));
@@ -1942,6 +2574,30 @@ mod tests {
             contract.contains("memo of already-shaped frontend result DTOs remains Tine-native")
         );
         assert!(contract.contains("grants no\n   authority"));
+
+        // The routing rule is asserted inside its own section, not anywhere in
+        // the document: a whole-document `contains` passes with the sentence
+        // parked under an unrelated heading, which is exactly how a contract
+        // stops describing the subsystem it claims to describe.
+        let heading = "### 1.3 Direct Files disposable graph projection";
+        let start = contract.find(heading).expect("Direct projection section");
+        let body = &contract[start + heading.len()..];
+        let section = body
+            .find("\n## ")
+            .map_or(body, |end| &body[..end])
+            .to_owned();
+        for sentence in [
+            "every\n`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the\nshared lowering and evaluates only those pages",
+            "larger than one thirty-second of the graph's page count or 32 pages, whichever\nis greater, in which case the projection read is abandoned and the parser\nfallback runs instead",
+            "`Empty` returns without projection or graph access.",
+            "`All`\nuses the parser whole-graph evaluator.",
+            "An unavailable, stale, failed, or raced\nprojection uses the parser fallback.",
+        ] {
+            assert!(
+                section.contains(sentence),
+                "§1.3 must state the Indexed routing rule verbatim: {sentence}"
+            );
+        }
     }
 
     #[test]
@@ -2172,5 +2828,101 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// Child half of the two `retired_class_c_*` probes. Emits BOTH retired
+    /// class-(c) reports, each with its own planted marker, through the exact
+    /// production reporter and the exact error types the call sites hand it.
+    #[test]
+    #[ignore = "child process for the retired class-(c) stderr probe"]
+    fn w4_i5b_projection_failure_marker_child() {
+        if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
+            crate::sync_runtime::set_runtime_debug_diagnostics(true);
+        }
+        // Exactly what `open_projection_database` returns: a free-form
+        // `MaterializationError` payload.
+        report_projection_failure(
+            "disabled: its database could not be opened",
+            &tine_storage::sqlite::MaterializationError::Sqlite(
+                "planted-open-marker-Zq7Page".to_owned(),
+            ),
+        );
+        // Exactly what `apply_pending` returns: a `String` naming the
+        // graph-relative page it was projecting.
+        report_projection_failure(
+            "is stale; using parser fallback",
+            &"parsed page has no exact source revision: pages/planted-apply-marker-Zq7Page.md"
+                .to_owned(),
+        );
+    }
+
+    fn projection_failure_child_stderr(set_flag: &str) -> String {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "direct_projection::tests::w4_i5b_projection_failure_marker_child",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .env("TINE_I5B_SET_FLAG", set_flag)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "projection-failure child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// I-5, retired class-(c) row `direct_projection.rs` "projection database
+    /// could not be opened": the always-on line carried a free-form
+    /// `MaterializationError` payload.
+    #[test]
+    fn retired_class_c_projection_database_open_emits_no_planted_marker() {
+        let marker = "planted-open-marker-Zq7Page";
+        assert!(
+            !projection_failure_child_stderr("0").contains(marker),
+            "I-5: the always-on projection-open failure still carried its error prose. \
+             The always-on line names the failure family only; the detail belongs behind \
+             `runtime_debug_diagnostics_enabled()` (I-9 keeps the family, not the prose)."
+        );
+        assert!(
+            projection_failure_child_stderr("1").contains(marker),
+            "the directed debug channel must still carry the detail, or this probe proves \
+             nothing about where the prose went"
+        );
+    }
+
+    /// I-5, retired class-(c) row `direct_projection.rs` "projection is stale;
+    /// using parser fallback": `apply_pending` formats the graph-relative page
+    /// path into the error this line used to print always-on.
+    #[test]
+    fn retired_class_c_projection_apply_failure_emits_no_planted_marker() {
+        let marker = "planted-apply-marker-Zq7Page";
+        assert!(
+            source_of_this_file().contains("parsed page has no exact source revision: {}"),
+            "non-vacuity: this probe exists because `apply_pending` names the page it was \
+             projecting in its error string. If that error no longer does, re-derive the row's \
+             class before relaxing the probe."
+        );
+        assert!(
+            !projection_failure_child_stderr("0").contains(marker),
+            "I-5: the always-on parser-fallback line still carried the graph-relative page \
+             path from `apply_pending`. The always-on line names the failure family only."
+        );
+        assert!(
+            projection_failure_child_stderr("1").contains(marker),
+            "the directed debug channel must still carry the detail, or this probe proves \
+             nothing about where the prose went"
+        );
+    }
+
+    fn source_of_this_file() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct_projection.rs"),
+        )
+        .unwrap()
     }
 }

@@ -108,23 +108,33 @@ impl SparseV2ActivationRecord {
         }
     }
 
-    fn validate_for(&self, graph_root: &Path) -> Result<(), String> {
+    fn validate_for(&self, graph_root: &Path) -> Result<(), crate::command_error::CommandError> {
         if self.schema_version != BINDING_SCHEMA_VERSION {
-            return Err("Tine-managed storage has an unsupported local setup version.".into());
+            return Err(crate::command_error::CommandError::prose(
+                "Tine-managed storage has an unsupported local setup version.",
+            ));
         }
         if self.graph_root != graph_root.display().to_string()
             || self.graph_meta.root != self.graph_root
         {
-            return Err("Tine-managed storage data belongs to a different graph.".into());
+            return Err(crate::command_error::CommandError::prose(
+                "Tine-managed storage data belongs to a different graph.",
+            ));
         }
         Ok(())
     }
 
-    fn private_root(&self, app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    fn private_root(
+        &self,
+        app: &tauri::AppHandle,
+    ) -> Result<PathBuf, crate::command_error::CommandError> {
         sparse_private_root(app, Path::new(&self.graph_root))
     }
 
-    fn open_request(&self, app: &tauri::AppHandle) -> Result<SyncRuntimeOpenRequest, String> {
+    fn open_request(
+        &self,
+        app: &tauri::AppHandle,
+    ) -> Result<SyncRuntimeOpenRequest, crate::command_error::CommandError> {
         let private = self.private_root(app)?;
         Ok(self.open_request_at(&private))
     }
@@ -155,7 +165,7 @@ impl SparseV2ActivationRecord {
     fn activation_request(
         &self,
         app: &tauri::AppHandle,
-    ) -> Result<SyncLocalActivationRequest, String> {
+    ) -> Result<SyncLocalActivationRequest, crate::command_error::CommandError> {
         let private = self.private_root(app)?;
         Ok(self.activation_request_at(&private))
     }
@@ -196,21 +206,29 @@ fn graph_private_key(graph_root: &Path) -> String {
         .collect::<String>()
 }
 
-fn sparse_private_root(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
+fn sparse_private_root(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+) -> Result<PathBuf, crate::command_error::CommandError> {
+    let app_data = app.path().app_data_dir().map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "couldn't resolve private app-data directory: {error}"
+        ))
+    })?;
     Ok(app_data
         .join(SPARSE_BINDING_DIR)
         .join(graph_private_key(graph_root)))
 }
 
-fn direct_selection_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
+fn direct_selection_path(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+) -> Result<PathBuf, crate::command_error::CommandError> {
+    let app_data = app.path().app_data_dir().map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "couldn't resolve private app-data directory: {error}"
+        ))
+    })?;
     Ok(direct_selection_path_at(&app_data, graph_root))
 }
 
@@ -222,16 +240,26 @@ fn direct_selection_path_at(app_data: &Path, graph_root: &Path) -> PathBuf {
     ))
 }
 
-fn direct_selection_is_active(app: &tauri::AppHandle, graph_root: &Path) -> Result<bool, String> {
+fn direct_selection_is_active(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+) -> Result<bool, crate::command_error::CommandError> {
     let path = direct_selection_path(app, graph_root)?;
     direct_selection_is_active_at(&path, graph_root)
 }
 
-fn direct_selection_is_active_at(path: &Path, graph_root: &Path) -> Result<bool, String> {
+fn direct_selection_is_active_at(
+    path: &Path,
+    graph_root: &Path,
+) -> Result<bool, crate::command_error::CommandError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("Couldn't read Direct Files selection: {error}")),
+        Err(error) => {
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't read Direct Files selection: {error}"
+            )))
+        }
     };
     match serde_json::from_slice::<DirectSelectionReceipt>(&bytes) {
         Ok(receipt)
@@ -270,12 +298,16 @@ fn publish_direct_selection(
     app: &tauri::AppHandle,
     graph_root: &Path,
     reason: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let path = direct_selection_path(app, graph_root)?;
     publish_direct_selection_at(&path, graph_root, reason)
 }
 
-fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> Result<(), String> {
+fn publish_direct_selection_at(
+    path: &Path,
+    graph_root: &Path,
+    reason: &str,
+) -> Result<(), crate::command_error::CommandError> {
     let receipt = DirectSelectionReceipt {
         schema_version: DIRECT_SELECTION_SCHEMA_VERSION,
         graph_root: graph_root.display().to_string(),
@@ -286,58 +318,87 @@ fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> 
             value.push('\n');
             value
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     tine_core::model::durable_private_authority_update(path, &DIRECT_SELECTION_WRITE, |_| {
         Ok(encoded.clone())
     })
-    .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Couldn't select Direct Files for this graph: {error}"
+        ))
+    })
 }
 
-fn retire_direct_selection(app: &tauri::AppHandle, graph_root: &Path) -> Result<(), String> {
+fn retire_direct_selection(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+) -> Result<(), crate::command_error::CommandError> {
     let path = direct_selection_path(app, graph_root)?;
     retire_direct_selection_at(&path)
 }
 
-fn retire_direct_selection_at(path: &Path) -> Result<(), String> {
-    tine_core::model::durable_private_authority_retire(path, &DIRECT_SELECTION_WRITE)
-        .map_err(|error| format!("Couldn't retire the prior Direct Files selection: {error}"))
+fn retire_direct_selection_at(path: &Path) -> Result<(), crate::command_error::CommandError> {
+    tine_core::model::durable_private_authority_retire(path, &DIRECT_SELECTION_WRITE).map_err(
+        |error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't retire the prior Direct Files selection: {error}"
+            ))
+        },
+    )
 }
 
-fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
+fn binding_path(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+) -> Result<PathBuf, crate::command_error::CommandError> {
     Ok(sparse_private_root(app, graph_root)?.join(SPARSE_BINDING_FILE))
 }
 
-fn sparse_recovery_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn sparse_recovery_root(
+    app: &tauri::AppHandle,
+) -> Result<PathBuf, crate::command_error::CommandError> {
     app.path()
         .app_data_dir()
         .map(|root| root.join(SPARSE_RECOVERY_DIR))
-        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))
+        .map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "couldn't resolve private app-data directory: {error}"
+            ))
+        })
 }
 
 fn read_binding_at(
     path: &Path,
     graph_root: &Path,
-) -> Result<Option<SparseV2ActivationRecord>, String> {
+) -> Result<Option<SparseV2ActivationRecord>, crate::command_error::CommandError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!("Couldn't read Tine-managed storage data: {error}"));
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't read Tine-managed storage data: {error}"
+            )));
         }
     };
-    let record: SparseV2ActivationRecord = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Tine-managed storage data is corrupted: {error}"))?;
+    let record: SparseV2ActivationRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::command_error::CommandError::json(format!(
+            "Tine-managed storage data is corrupted: {error}"
+        ))
+    })?;
     record.validate_for(graph_root)?;
     Ok(Some(record))
 }
 
-fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<(), String> {
+fn persist_binding_at(
+    path: &Path,
+    record: &SparseV2ActivationRecord,
+) -> Result<(), crate::command_error::CommandError> {
     let encoded = serde_json::to_string_pretty(record)
         .map(|mut value| {
             value.push('\n');
             value
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     tine_core::model::durable_private_authority_update(path, &BINDING_WRITE, |existing| {
         if existing.trim().is_empty() || existing.trim() == "{}" {
             return Ok(encoded.clone());
@@ -356,7 +417,11 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
         }
         Ok(encoded.clone())
     })
-    .map_err(|error| format!("Couldn't save Tine-managed storage setup: {error}"))
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Couldn't save Tine-managed storage setup: {error}"
+        ))
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -934,6 +999,9 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
 pub(crate) fn tick_dto(tick: SyncRuntimeTick) -> SparseV2TickDto {
     match tick {
         SyncRuntimeTick::Idle => tick_value("idle", None, None),
+        SyncRuntimeTick::CheckpointCaptureSkipped { .. } => {
+            tick_value("checkpoint_capture_skipped", None, None)
+        }
         SyncRuntimeTick::LocalMutation(outcome) => {
             tick_value("local_mutation", Some(format!("{outcome:?}")), None)
         }
@@ -1003,11 +1071,21 @@ const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_
 /// user their graph might be shared with another device.
 const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 8] = SHARED_PROVIDER_TREE_NAMESPACES;
 
-fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+fn sorted_directory_entries(
+    path: &Path,
+) -> Result<Vec<std::fs::DirEntry>, crate::command_error::CommandError> {
     let mut entries = std::fs::read_dir(path)
-        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?
+        .map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't inspect sync data: {error}"
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't inspect sync data: {error}"
+            ))
+        })?;
     entries.sort_by_key(|entry| entry.file_name());
     Ok(entries)
 }
@@ -1024,16 +1102,20 @@ fn has_exact_directory_names(entries: &[std::fs::DirEntry], expected: &[&str]) -
 /// Is this tree exactly what opening a shared provider transport leaves, with
 /// nothing published into it? Not "what activation writes" — activation writes
 /// nothing here at all.
-fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> {
+fn is_empty_local_provider_scaffold(
+    shared_root: &Path,
+) -> Result<bool, crate::command_error::CommandError> {
     let root_entries = sorted_directory_entries(shared_root)?;
     if !has_exact_directory_names(&root_entries, &PROVIDER_SCAFFOLD_TREES) {
         return Ok(false);
     }
 
     for tree in root_entries {
-        let file_type = tree
-            .file_type()
-            .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+        let file_type = tree.file_type().map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't inspect sync data: {error}"
+            ))
+        })?;
         if !file_type.is_dir() || file_type.is_symlink() {
             return Ok(false);
         }
@@ -1042,9 +1124,11 @@ fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> 
             return Ok(false);
         }
         for namespace in namespaces {
-            let file_type = namespace
-                .file_type()
-                .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+            let file_type = namespace.file_type().map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "Couldn't inspect sync data: {error}"
+                ))
+            })?;
             if !file_type.is_dir()
                 || file_type.is_symlink()
                 || !sorted_directory_entries(&namespace.path())?.is_empty()
@@ -1056,13 +1140,19 @@ fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> 
     Ok(true)
 }
 
-fn provider_namespace_evidence(path: &Path) -> Result<ProviderNamespaceEvidence, String> {
+fn provider_namespace_evidence(
+    path: &Path,
+) -> Result<ProviderNamespaceEvidence, crate::command_error::CommandError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ProviderNamespaceEvidence::LocalOnly);
         }
-        Err(error) => return Err(format!("Couldn't inspect sync data: {error}")),
+        Err(error) => {
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
+                "Couldn't inspect sync data: {error}"
+            )))
+        }
     };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
@@ -1076,9 +1166,11 @@ fn provider_namespace_evidence(path: &Path) -> Result<ProviderNamespaceEvidence,
         return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
     }
     let shared = &entries[0];
-    let file_type = shared
-        .file_type()
-        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+    let file_type = shared.file_type().map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Couldn't inspect sync data: {error}"
+        ))
+    })?;
     if !file_type.is_dir() || file_type.is_symlink() {
         return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
     }
@@ -1176,7 +1268,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
-    ) -> Result<ExplicitStorageSelection, String> {
+    ) -> Result<ExplicitStorageSelection, crate::command_error::CommandError> {
         Ok(match self.binding_record(app, graph_root)? {
             Some(record) => ExplicitStorageSelection::Managed(record),
             None => ExplicitStorageSelection::DirectFiles,
@@ -1187,7 +1279,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
-    ) -> Result<Option<SparseV2ActivationRecord>, String> {
+    ) -> Result<Option<SparseV2ActivationRecord>, crate::command_error::CommandError> {
         if direct_selection_is_active(app, graph_root)? {
             return Ok(None);
         }
@@ -1230,7 +1322,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::command_error::CommandError> {
         let private = sparse_private_root(app, graph_root)?;
         let recovery = sparse_recovery_root(app)?;
         clear_blank_slate_backup_complete(&private, &recovery)?;
@@ -1239,7 +1331,9 @@ impl SyncRuntimeFacade {
         // tree in Direct Files and retries the automatic rebuild.
         publish_direct_selection(app, graph_root, BLANK_SLATE_REBUILD_REASON)?;
         let archived = archive_private_root(&private, &recovery).map_err(|error| {
-            format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
+            crate::command_error::CommandError::sync_runtime({
+                format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
+            })
         })?;
         mark_blank_slate_backup_complete(&private, &recovery)?;
         crate::debug::diag(format!(
@@ -1257,7 +1351,7 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         graph_root: &Path,
         graph_meta: GraphMeta,
-    ) -> Result<SparseV2ActivationRecord, String> {
+    ) -> Result<SparseV2ActivationRecord, crate::command_error::CommandError> {
         let direct_selected = direct_selection_is_active(app, graph_root)?;
         let blank_slate_rebuild = self.blank_slate_rebuild_pending(app, graph_root)?;
         if !direct_selected {
@@ -1285,7 +1379,7 @@ impl SyncRuntimeFacade {
         graph_root: &Path,
         graph_meta: GraphMeta,
         descriptor: &SyncSharedEnrollmentDescriptor,
-    ) -> Result<SparseV2ActivationRecord, String> {
+    ) -> Result<SparseV2ActivationRecord, crate::command_error::CommandError> {
         let private = sparse_private_root(app, graph_root)?;
         let recovery = sparse_recovery_root(app)?;
         prepare_shared_binding_record_at_paths(
@@ -1302,7 +1396,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::command_error::CommandError> {
         let root = Path::new(&record.graph_root);
         persist_binding_at(&binding_path(app, root)?, record)?;
         retire_direct_selection(app, root)
@@ -1312,7 +1406,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, crate::command_error::CommandError> {
         direct_selection_is_active(app, graph_root)
     }
 
@@ -1320,7 +1414,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, crate::command_error::CommandError> {
         let path = direct_selection_path(app, graph_root)?;
         Ok(direct_selection_requests_blank_slate_rebuild_at(
             &path, graph_root,
@@ -1335,7 +1429,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         self.open_record_with_progress(app, record, |_| {})
     }
 
@@ -1348,7 +1442,7 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
         mut progress: impl FnMut(SyncRuntimeOpenProgress),
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         crate::debug::diag("managed storage open: begin authenticated existing-state recovery");
         let opened = SyncRuntimeHandle::open_with_progress(record.open_request(app)?, |update| {
             match &update {
@@ -1420,6 +1514,32 @@ impl SyncRuntimeFacade {
                             diagnostics.replayed_generations,
                         ));
                 }
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters } => {
+                    crate::debug::diag(format!(
+                            "managed storage open: clean open counters accepted_batches={} committed_tail_replayed={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+                            counters.accepted_batches,
+                            counters.committed_tail_replayed,
+                            counters.sweep_chains,
+                            counters.receipt_evidence_names,
+                            counters.receipt_content_reads,
+                            counters.receipt_full_catalog_passes,
+                            counters.summary_content_reads,
+                            counters.summary_rebuilt,
+                            counters.summary_delta_completions,
+                            counters.summary_delta_intents,
+                            counters.local_completion_names,
+                            counters.local_completion_content_reads,
+                            counters.local_completion_rebuilt,
+                            counters.local_completion_entries,
+                            counters.retired_own_intent_probes,
+                            counters.retired_own_receipt_artifacts,
+                            counters.archive_directory_enumerations,
+                            counters.archive_manifest_reads,
+                            counters.archive_object_reads,
+                            counters.archive_inspected_manifests,
+                            counters.archive_inspected_objects,
+                        ));
+                }
             }
             progress(update);
         });
@@ -1439,7 +1559,7 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         _label: &str,
         record: &SparseV2ActivationRecord,
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         // The supervisor owns the public typed operation. Detailed engine
         // phases remain native diagnostics and must not create a second
         // frontend recovery state machine.
@@ -1450,7 +1570,7 @@ impl SyncRuntimeFacade {
         &self,
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         self.activate_record_with_progress(app, record, |_| {})
     }
 
@@ -1459,7 +1579,7 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
         progress: impl FnMut(SyncLocalActivationPhase),
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         Ok(SparseV2Binding::from_activation(
             SyncRuntimeHandle::activate_or_resume_local_with_progress(
                 record.activation_request(app)?,
@@ -1473,7 +1593,7 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
         progress: impl FnMut(SyncLocalActivationProgress),
-    ) -> Result<SparseV2Binding, String> {
+    ) -> Result<SparseV2Binding, crate::command_error::CommandError> {
         Ok(SparseV2Binding::from_activation(
             SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
                 record.activation_request(app)?,
@@ -1686,7 +1806,7 @@ fn activate_record_with_diagnostics(
     label: &str,
     binding_generation: u64,
     record: &SparseV2ActivationRecord,
-) -> Result<PreparedActivationBinding, String> {
+) -> Result<PreparedActivationBinding, crate::command_error::CommandError> {
     let started = Instant::now();
     let latest_progress = Arc::new(Mutex::new(None));
     let largest_page_path = Arc::new(Mutex::new(None));
@@ -1741,19 +1861,21 @@ fn activate_record_with_diagnostics(
                 "sparse-v2 activation failed after {} ms: {detail}",
                 started.elapsed().as_millis()
             ));
-            Err(detail)
+            Err(crate::command_error::CommandError::sync_runtime(detail))
         }
     }
 }
 
 pub(crate) fn active_handle(
     slot: &crate::state::GraphSlot,
-) -> Result<&tine_core::sync_runtime::SyncRuntimeHandle, String> {
+) -> Result<&tine_core::sync_runtime::SyncRuntimeHandle, crate::command_error::CommandError> {
     slot.sparse_runtime()
-        .ok_or_else(|| SPARSE_V2_NOT_ACTIVE.to_string())
+        .ok_or_else(|| crate::command_error::CommandError::sync_runtime(SPARSE_V2_NOT_ACTIVE))
 }
 
-fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2StatusDto, String> {
+fn sparse_v2_status_for_slot(
+    slot: &crate::state::GraphSlot,
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let mut status = match slot.sparse_binding() {
         Some(binding) => {
             let mut status = SparseV2StatusDto::from_binding(binding, slot.binding_generation);
@@ -1794,17 +1916,20 @@ pub(crate) struct ManagedReadinessReceipt {
 pub(crate) fn prove_managed_application_ready(
     slot: &crate::state::GraphSlot,
     largest_page_path: Option<&str>,
-) -> Result<ManagedReadinessReceipt, String> {
+) -> Result<ManagedReadinessReceipt, crate::command_error::CommandError> {
     let started = Instant::now();
     let handle = active_handle(slot)?;
     let inventory_started = Instant::now();
-    let pages = match handle
-        .application_page_inventory()
-        .map_err(|error| format!("managed readiness page inventory failed: {error}"))?
-    {
+    let pages = match handle.application_page_inventory().map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "managed readiness page inventory failed: {error}"
+        ))
+    })? {
         SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
         SyncApplicationPageInventoryOutcome::Deferred { .. } => {
-            return Err("managed readiness page inventory remained deferred".into())
+            return Err(crate::command_error::CommandError::prose(
+                "managed readiness page inventory remained deferred",
+            ))
         }
     };
     let inventory_ms = inventory_started.elapsed().as_millis() as u64;
@@ -1824,13 +1949,18 @@ pub(crate) fn prove_managed_application_ready(
             .load_application_page(SyncApplicationPageLoadRequest {
                 page: SyncApplicationPageSelector::ExactPath { path: path.clone() },
             })
-            .map_err(|error| format!("managed readiness representative page failed: {error}"))?
-        {
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "managed readiness representative page failed: {error}"
+                ))
+            })? {
             SyncApplicationPageLoadOutcome::Loaded { .. } => {}
             SyncApplicationPageLoadOutcome::Missing { .. }
             | SyncApplicationPageLoadOutcome::Ambiguous
             | SyncApplicationPageLoadOutcome::Deferred { .. } => {
-                return Err("managed readiness could not open its representative page".into())
+                return Err(crate::command_error::CommandError::prose(
+                    "managed readiness could not open its representative page",
+                ))
             }
         }
     }
@@ -1848,10 +1978,12 @@ pub(crate) fn prove_managed_application_ready(
 fn sparse_v2_status_for_observation(
     slot: &crate::state::GraphSlot,
     snapshot: SyncRuntimeStatusSnapshot,
-) -> Result<SparseV2StatusDto, String> {
-    let binding = slot
-        .sparse_binding()
-        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?;
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
+    let binding = slot.sparse_binding().ok_or_else(|| {
+        crate::command_error::CommandError::sync_runtime(
+            "managed cross-page move recovery requires managed storage",
+        )
+    })?;
     let cancel_reason =
         cancel_warning_for_observation(binding, &slot.root_key.join(".tine-sync/v2"), &snapshot);
     let mut status =
@@ -1875,15 +2007,19 @@ fn move_recovery_result(
     expected_episode_id: &str,
     outcome: SyncApplicationMoveSubtreesOutcome,
     snapshot: SyncRuntimeStatusSnapshot,
-) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+) -> Result<
+    crate::commands::ManagedApplicationMoveSubtreesRecoveryResult,
+    crate::command_error::CommandError,
+> {
     if move_outcome_episode_id(&outcome) != expected_episode_id {
-        return Err("managed cross-page move recovery returned a different episode".into());
+        return Err(crate::command_error::CommandError::prose(
+            "managed cross-page move recovery returned a different episode",
+        ));
     }
     if snapshot.lifecycle != SyncRuntimeLifecycle::Active {
-        return Err(
-            "managed cross-page move recovery requires process reopen after a terminal runtime"
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "managed cross-page move recovery requires process reopen after a terminal runtime",
+        ));
     }
     let status = sparse_v2_status_for_observation(slot, snapshot)?;
     let application_page_admission = status.application_page_admission.clone();
@@ -1904,30 +2040,48 @@ fn recover_managed_application_subtrees_with(
     label: &str,
     binding_generation: u64,
     request: SyncApplicationMoveSubtreesRequest,
-    reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
-) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
-    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?
+    reopen: impl FnOnce(
+        &Path,
+    ) -> Result<
+        (SparseV2Binding, tine_core::model::GraphMeta),
+        crate::command_error::CommandError,
+    >,
+) -> Result<
+    crate::commands::ManagedApplicationMoveSubtreesRecoveryResult,
+    crate::command_error::CommandError,
+> {
+    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
-    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
+    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if predecessor.root_key != root {
-        return Err("graph changed while move recovery waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while move recovery waited for its transition lane",
+        ));
     }
     let action = predecessor
         .sparse_binding()
-        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?
+        .ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime(
+                "managed cross-page move recovery requires managed storage",
+            )
+        })?
         .action();
 
     match action {
         SparseV2BindingAction::ReturnRetained => {
             let handle = predecessor.sparse_runtime().ok_or_else(|| {
-                "managed cross-page move recovery has no retained actor".to_owned()
+                crate::command_error::CommandError::sync_runtime({
+                    "managed cross-page move recovery has no retained actor".to_owned()
+                })
             })?;
             let observation = handle
                 .resolve_application_move_subtrees(request.clone())
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::command_error::CommandError::from)?;
             let result = move_recovery_result(
                 binding_generation,
                 &predecessor,
@@ -1948,10 +2102,13 @@ fn recover_managed_application_subtrees_with(
             let observation = successor
                 .sparse_runtime()
                 .ok_or_else(|| {
-                    "managed cross-page move recovery could not reopen an active actor".to_owned()
+                    crate::command_error::CommandError::sync_runtime({
+                        "managed cross-page move recovery could not reopen an active actor"
+                            .to_owned()
+                    })
                 })?
                 .resolve_application_move_subtrees(request.clone())
-                .map_err(|error| error.to_string())?;
+                .map_err(crate::command_error::CommandError::from)?;
             let result = move_recovery_result(
                 binding_generation,
                 &successor,
@@ -1961,19 +2118,19 @@ fn recover_managed_application_subtrees_with(
             )?;
 
             state.storage_supervisor.publish_managed_maintenance(|| {
-                state.graphs.write().unwrap().replace_if_current(
-                    label,
-                    binding_generation,
-                    &root,
-                    Arc::clone(&successor),
-                )
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .replace_if_current(label, binding_generation, &root, Arc::clone(&successor))
+                    .map_err(crate::command_error::CommandError::from)
             })?;
             crate::state::poke_watcher(state);
             Ok(result)
         }
-        SparseV2BindingAction::ActivateOrResume => {
-            Err("managed cross-page move recovery cannot activate an incomplete runtime".into())
-        }
+        SparseV2BindingAction::ActivateOrResume => Err(crate::command_error::CommandError::prose(
+            "managed cross-page move recovery cannot activate an incomplete runtime",
+        )),
     }
 }
 
@@ -1982,13 +2139,20 @@ pub(crate) fn recover_managed_application_subtrees_blocking(
     label: &str,
     binding_generation: u64,
     request: SyncApplicationMoveSubtreesRequest,
-) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+) -> Result<
+    crate::commands::ManagedApplicationMoveSubtreesRecoveryResult,
+    crate::command_error::CommandError,
+> {
     let state = app.state::<crate::state::AppState>();
     recover_managed_application_subtrees_with(&state, label, binding_generation, request, |root| {
         let record = state
             .sync_runtime
             .binding_record(app, root)?
-            .ok_or_else(|| "Tine-managed storage setup is missing.".to_owned())?;
+            .ok_or_else(|| {
+                crate::command_error::CommandError::sync_runtime(
+                    "Tine-managed storage setup is missing.",
+                )
+            })?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
         let binding = state.sync_runtime.open_record(app, &record)?;
         Ok((binding, graph_meta))
@@ -1998,15 +2162,17 @@ pub(crate) fn recover_managed_application_subtrees_blocking(
 #[tauri::command]
 pub(crate) async fn sparse_v2_status(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         sparse_v2_status_for_slot(&slot)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 /// Explicitly retire one Direct authority and activate/resume managed storage.
@@ -2020,24 +2186,31 @@ pub(crate) async fn sparse_v2_status(
 pub(crate) async fn activate_sparse_v2(
     app: tauri::AppHandle,
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2StatusDto, String> {
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let label = state.window.label().to_string();
-    let binding_generation = state.binding_generation.ok_or("missing-graph-binding")?;
+    let binding_generation = state
+        .binding_generation
+        .ok_or_else(|| crate::command_error::CommandError::prose("missing-graph-binding"))?;
     drop(state);
     tauri::async_runtime::spawn_blocking(move || {
         activate_sparse_v2_blocking(&app, &label, binding_generation)
     })
     .await
-    .map_err(|error| format!("Tine-managed storage setup worker failed: {error}"))?
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Tine-managed storage setup worker failed: {error}"
+        ))
+    })?
 }
 
 pub(crate) fn activate_sparse_v2_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<SparseV2StatusDto, String> {
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_guard(
@@ -2050,7 +2223,9 @@ pub(crate) fn activate_sparse_v2_blocking(
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
-        return Err("managed activation was superseded while waiting for its graph lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "managed activation was superseded while waiting for its graph lane",
+        ));
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
     transition.advance(StorageTransitionPhase::ActivatingManaged)?;
@@ -2093,13 +2268,16 @@ fn prepare_sparse_v2_activation(
     label: &str,
     binding_generation: u64,
     root: PathBuf,
-) -> Result<PreparedActivationOutcome, String> {
+) -> Result<PreparedActivationOutcome, crate::command_error::CommandError> {
     let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if slot.root_key != root {
-        return Err("graph changed while activation waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while activation waited for its transition lane",
+        ));
     }
 
     if let Some(binding) = slot.sparse_binding() {
@@ -2119,7 +2297,9 @@ fn prepare_sparse_v2_activation(
         let record = state
             .sync_runtime
             .binding_record(app, &root)?
-            .ok_or("Tine-managed storage setup is missing.")?;
+            .ok_or_else(|| {
+                crate::command_error::CommandError::prose("Tine-managed storage setup is missing.")
+            })?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
         let core_started = Instant::now();
         let prepared = match action {
@@ -2162,7 +2342,9 @@ fn prepare_sparse_v2_activation(
         ));
     }
 
-    let graph = slot.legacy_graph()?;
+    let graph = slot
+        .legacy_graph()
+        .map_err(crate::command_error::CommandError::from)?;
     let graph_meta = graph.meta();
     let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
@@ -2219,7 +2401,7 @@ fn publish_managed_candidate(
     state: &crate::state::AppState,
     label: &str,
     candidate: PreparedManagedCandidate,
-) -> Result<SparseV2StatusDto, String> {
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let record = candidate.record.clone();
     publish_managed_candidate_with(
         state,
@@ -2236,21 +2418,19 @@ fn publish_managed_candidate_with(
     state: &crate::state::AppState,
     label: &str,
     candidate: PreparedManagedCandidate,
-    persist_successor: impl FnOnce() -> Result<(), String>,
-    restore_direct_selection: impl FnOnce(&Path) -> Result<(), String>,
-) -> Result<SparseV2StatusDto, String> {
-    let current = state
-        .graphs
-        .read()
-        .unwrap()
-        .slot(label)
-        .ok_or_else(|| "stale-graph-binding".to_owned())?;
+    persist_successor: impl FnOnce() -> Result<(), crate::command_error::CommandError>,
+    restore_direct_selection: impl FnOnce(&Path) -> Result<(), crate::command_error::CommandError>,
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
+    let current =
+        state.graphs.read().unwrap().slot(label).ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime("stale-graph-binding")
+        })?;
     if current.binding_generation != candidate.predecessor.binding_generation
         || current.root_key != candidate.predecessor.root_key
     {
-        return Err(
-            "The graph changed while the managed candidate was prepared. Retry setup.".into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "The graph changed while the managed candidate was prepared. Retry setup.",
+        ));
     }
     // Acquire the predecessor's graph-text mutation authority before taking
     // the registry write lock.  This both avoids a lock-order inversion and
@@ -2258,7 +2438,8 @@ fn publish_managed_candidate_with(
     let source_graph = candidate
         .direct_source_generation
         .map(|_| current.legacy_graph())
-        .transpose()?;
+        .transpose()
+        .map_err(crate::command_error::CommandError::from)?;
     let _source_publication = if let Some(expected_generation) = candidate.direct_source_generation
     {
         let graph = source_graph
@@ -2267,8 +2448,8 @@ fn publish_managed_candidate_with(
         Some(
             graph
                 .lock_graph_text_identity_publication(expected_generation)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "The Markdown/Org graph changed while managed storage was being prepared. Direct Files remains active; retry setup.".to_owned())?,
+                .map_err(crate::command_error::CommandError::from)?
+                .ok_or_else(|| crate::command_error::CommandError::sync_runtime("The Markdown/Org graph changed while managed storage was being prepared. Direct Files remains active; retry setup."))?,
         )
     } else {
         None
@@ -2277,28 +2458,30 @@ fn publish_managed_candidate_with(
     let mut graphs = state.graphs.write().unwrap();
     let current = graphs
         .slot(label)
-        .ok_or_else(|| "stale-graph-binding".to_owned())?;
+        .ok_or_else(|| crate::command_error::CommandError::sync_runtime("stale-graph-binding"))?;
     if current.binding_generation != candidate.predecessor.binding_generation
         || current.root_key != candidate.predecessor.root_key
     {
-        return Err(
-            "The graph changed while the managed candidate was prepared. Retry setup.".into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "The graph changed while the managed candidate was prepared. Retry setup.",
+        ));
     }
     let predecessor_was_direct = candidate.direct_source_generation.is_some();
     if let Err(error) = persist_successor() {
         if predecessor_was_direct {
             let rollback = restore_direct_selection(&candidate.predecessor.root_key);
-            return Err(match rollback {
+            return Err(crate::command_error::CommandError::sync_runtime(match rollback {
                 Ok(()) => format!(
                     "managed selector publication failed ({error}); Direct Files selection was restored"
                 ),
                 Err(rollback) => format!(
                     "managed selector publication failed ({error}) and Direct Files selection could not be restored ({rollback})"
                 ),
-            });
+            }));
         }
-        return Err(format!("managed runtime publication failed: {error}"));
+        return Err(crate::command_error::CommandError::sync_runtime(format!(
+            "managed runtime publication failed: {error}"
+        )));
     }
     if let Err(error) = graphs.replace_if_current(
         label,
@@ -2307,17 +2490,17 @@ fn publish_managed_candidate_with(
         Arc::clone(&candidate.replacement),
     ) {
         if !predecessor_was_direct {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "managed runtime publication was superseded: {error}"
-            ));
+            )));
         }
         let rollback = restore_direct_selection(&candidate.predecessor.root_key);
-        return Err(match rollback {
+        return Err(crate::command_error::CommandError::sync_runtime(match rollback {
             Ok(()) => format!("managed publication was superseded: {error}"),
             Err(rollback) => format!(
                 "managed publication was superseded ({error}) and Direct Files selection could not be restored ({rollback})"
             ),
-        });
+        }));
     }
     drop(graphs);
     crate::state::poke_watcher(state);
@@ -2345,7 +2528,7 @@ pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
 fn archive_private_root(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, crate::command_error::CommandError> {
     let metadata = match std::fs::symlink_metadata(private_root) {
         Ok(metadata) => metadata,
         // A failed or partially-created activation need not have retained any
@@ -2353,45 +2536,78 @@ fn archive_private_root(
         // to strand the user.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "Couldn't inspect Tine-managed storage recovery state: {error}"
-            ));
+            )));
         }
     };
     if metadata.file_type().is_symlink() {
-        return Err("Tine-managed storage recovery state is a symbolic link, so it could not be archived safely.".into());
+        return Err(crate::command_error::CommandError::prose("Tine-managed storage recovery state is a symbolic link, so it could not be archived safely."));
     }
     std::fs::create_dir_all(recovery_root).map_err(|error| {
-        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        })
     })?;
     let recovery_metadata = std::fs::symlink_metadata(recovery_root).map_err(|error| {
-        format!("Couldn't inspect Tine-managed storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't inspect Tine-managed storage recovery state: {error}")
+        })
     })?;
     if !recovery_metadata.is_dir() || recovery_metadata.file_type().is_symlink() {
-        return Err("Tine-managed storage recovery state is not a local directory, so it could not be archived safely.".into());
+        return Err(crate::command_error::CommandError::prose("Tine-managed storage recovery state is not a local directory, so it could not be archived safely."));
     }
     let key = private_root
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or("Tine-managed storage recovery state has no valid local key.")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose(
+                "Tine-managed storage recovery state has no valid local key.",
+            )
+        })?;
     let destination = recovery_root.join(format!("{key}-{}", Uuid::new_v4()));
     std::fs::rename(private_root, &destination).map_err(|error| {
-        format!("Couldn't preserve Tine-managed storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't preserve Tine-managed storage recovery state: {error}")
+        })
+    })?;
+    sync_provider_namespace_rename(
+        destination.parent().ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime({
+                "Tine-managed storage recovery destination has no parent directory.".to_string()
+            })
+        })?,
+        private_root.parent().ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime({
+                "Tine-managed storage recovery source has no parent directory.".to_string()
+            })
+        })?,
+    )
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't durably preserve Tine-managed storage recovery state: {error}")
+        })
     })?;
     Ok(Some(destination))
 }
 
-fn blank_slate_recovery_key(private_root: &Path) -> Result<&str, String> {
+fn blank_slate_recovery_key(
+    private_root: &Path,
+) -> Result<&str, crate::command_error::CommandError> {
     private_root
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| "Tine-managed storage recovery state has no valid local key.".into())
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose(
+                "Tine-managed storage recovery state has no valid local key.",
+            )
+        })
 }
 
 fn blank_slate_backup_complete_path(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, crate::command_error::CommandError> {
     Ok(recovery_root.join(format!(
         "{}{BLANK_SLATE_BACKUP_COMPLETE_SUFFIX}",
         blank_slate_recovery_key(private_root)?
@@ -2401,43 +2617,49 @@ fn blank_slate_backup_complete_path(
 fn blank_slate_backup_is_complete(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<bool, String> {
+) -> Result<bool, crate::command_error::CommandError> {
     let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
     match std::fs::read(&marker) {
         Ok(bytes) => Ok(bytes == b"complete\n"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
+        Err(error) => Err(crate::command_error::CommandError::sync_runtime(format!(
             "Couldn't inspect the pre-0.7 managed-storage backup marker: {error}"
-        )),
+        ))),
     }
 }
 
 fn clear_blank_slate_backup_complete(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
     match std::fs::remove_file(marker) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
+        Err(error) => Err(crate::command_error::CommandError::sync_runtime(format!(
             "Couldn't reset the pre-0.7 managed-storage backup marker: {error}"
-        )),
+        ))),
     }
 }
 
 fn mark_blank_slate_backup_complete(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     std::fs::create_dir_all(recovery_root).map_err(|error| {
-        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        })
     })?;
     let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
     tine_core::model::atomic_update(&marker, &DIRECT_SELECTION_WRITE, |_| {
         Ok("complete\n".to_owned())
     })
-    .map_err(|error| format!("Couldn't record the pre-0.7 managed-storage backup: {error}"))
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Couldn't record the pre-0.7 managed-storage backup: {error}"
+        ))
+    })
 }
 
 /// Retain at most one disposable failed rebuild candidate. The original
@@ -2447,21 +2669,25 @@ fn mark_blank_slate_backup_complete(
 fn replace_failed_blank_slate_candidate(
     private_root: &Path,
     recovery_root: &Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, crate::command_error::CommandError> {
     let metadata = match std::fs::symlink_metadata(private_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "Couldn't inspect the failed managed-storage rebuild: {error}"
-            ));
+            )));
         }
     };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err("The failed managed-storage rebuild is not a safe local directory.".into());
+        return Err(crate::command_error::CommandError::prose(
+            "The failed managed-storage rebuild is not a safe local directory.",
+        ));
     }
     std::fs::create_dir_all(recovery_root).map_err(|error| {
-        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+        })
     })?;
     let destination = recovery_root.join(format!(
         "{}{BLANK_SLATE_FAILED_CANDIDATE_SUFFIX}",
@@ -2470,23 +2696,47 @@ fn replace_failed_blank_slate_candidate(
     match std::fs::symlink_metadata(&destination) {
         Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {
             std::fs::remove_dir_all(&destination).map_err(|error| {
-                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+                crate::command_error::CommandError::sync_runtime({
+                    format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+                })
             })?;
         }
         Ok(_) => {
             std::fs::remove_file(&destination).map_err(|error| {
-                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+                crate::command_error::CommandError::sync_runtime({
+                    format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+                })
             })?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "Couldn't inspect the prior failed managed-storage rebuild: {error}"
-            ));
+            )));
         }
     }
     std::fs::rename(private_root, &destination).map_err(|error| {
-        format!("Couldn't set aside the failed managed-storage rebuild: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't set aside the failed managed-storage rebuild: {error}")
+        })
+    })?;
+    sync_provider_namespace_rename(
+        destination.parent().ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime({
+                "The failed managed-storage recovery destination has no parent directory."
+                    .to_string()
+            })
+        })?,
+        private_root.parent().ok_or_else(|| {
+            crate::command_error::CommandError::sync_runtime({
+                "The failed managed-storage rebuild has no parent directory.".to_string()
+            })
+        })?,
+    )
+    .map_err(|error| {
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't durably set aside the failed managed-storage rebuild: {error}")
+        })
     })?;
     Ok(Some(destination))
 }
@@ -2495,7 +2745,7 @@ fn prepare_blank_slate_retry_at_paths(
     private_root: &Path,
     recovery_root: &Path,
     record: SparseV2ActivationRecord,
-) -> Result<SparseV2ActivationRecord, String> {
+) -> Result<SparseV2ActivationRecord, crate::command_error::CommandError> {
     if blank_slate_backup_is_complete(private_root, recovery_root)? {
         replace_failed_blank_slate_candidate(private_root, recovery_root)?;
     } else {
@@ -2504,7 +2754,9 @@ fn prepare_blank_slate_retry_at_paths(
         // current-format reconstruction begins. If the prior rename already
         // succeeded, absence is sufficient and the marker closes the gap.
         archive_private_root(private_root, recovery_root).map_err(|error| {
-            format!("Couldn't preserve the original pre-0.7 managed-storage state: {error}")
+            crate::command_error::CommandError::sync_runtime({
+                format!("Couldn't preserve the original pre-0.7 managed-storage state: {error}")
+            })
         })?;
         mark_blank_slate_backup_complete(private_root, recovery_root)?;
     }
@@ -2518,7 +2770,7 @@ fn prepare_shared_binding_record_at_paths(
     graph_meta: GraphMeta,
     device_id: DeviceId,
     descriptor: &SyncSharedEnrollmentDescriptor,
-) -> Result<SparseV2ActivationRecord, String> {
+) -> Result<SparseV2ActivationRecord, crate::command_error::CommandError> {
     let record =
         SparseV2ActivationRecord::from_shared(graph_root, graph_meta, device_id, descriptor);
     prepare_fresh_authority_at_paths(private_root, recovery_root, record, "shared-graph join")
@@ -2529,11 +2781,13 @@ fn prepare_fresh_authority_at_paths(
     recovery_root: &Path,
     record: SparseV2ActivationRecord,
     operation: &str,
-) -> Result<SparseV2ActivationRecord, String> {
+) -> Result<SparseV2ActivationRecord, crate::command_error::CommandError> {
     archive_private_root(private_root, recovery_root).map_err(|error| {
-        format!(
+        crate::command_error::CommandError::sync_runtime({
+            format!(
             "Couldn't quarantine prior unselected managed-storage state before {operation}: {error}"
         )
+        })
     })?;
     Ok(record)
 }
@@ -2551,7 +2805,9 @@ enum ProviderNamespaceArchive {
 /// namespace.  A Direct Files restart deliberately refuses an unclaimed v2
 /// namespace, so archiving only private app-data would leave a delayed
 /// lockout.  This is a same-filesystem rename, never a delete or copy.
-fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespaceArchive, String> {
+fn archive_graph_provider_namespace(
+    graph_root: &Path,
+) -> Result<ProviderNamespaceArchive, crate::command_error::CommandError> {
     archive_graph_provider_namespace_with(graph_root, |shared| {
         matches!(
             inspect_shared_enrollment_for_cold_discovery(shared),
@@ -2563,7 +2819,7 @@ fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespa
 fn archive_graph_provider_namespace_with(
     graph_root: &Path,
     joinable: impl FnOnce(&Path) -> bool,
-) -> Result<ProviderNamespaceArchive, String> {
+) -> Result<ProviderNamespaceArchive, crate::command_error::CommandError> {
     let source = graph_root.join(".tine-sync/v2");
     let metadata = match std::fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
@@ -2571,13 +2827,13 @@ fn archive_graph_provider_namespace_with(
             return Ok(ProviderNamespaceArchive::Absent);
         }
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "Couldn't inspect graph-local managed-storage state before returning to Direct files: {error}"
-            ));
+            )));
         }
     };
     if metadata.file_type().is_symlink() {
-        return Err("Graph-local managed-storage state is a symbolic link, so it could not be archived safely.".into());
+        return Err(crate::command_error::CommandError::prose("Graph-local managed-storage state is a symbolic link, so it could not be archived safely."));
     }
     // A COMPLETE provider tree is the other device's live enrollment, and this
     // folder is synced: archiving it here removes the descriptor from the
@@ -2592,43 +2848,54 @@ fn archive_graph_provider_namespace_with(
         );
         return Ok(ProviderNamespaceArchive::Absent);
     }
-    let tine_sync = source
-        .parent()
-        .ok_or("Graph-local managed-storage state has no .tine-sync parent.")?;
-    let parent_metadata = std::fs::symlink_metadata(tine_sync).map_err(|error| {
+    let tine_sync = source.parent().ok_or_else(|| {
+        crate::command_error::CommandError::prose(
+            "Graph-local managed-storage state has no .tine-sync parent.",
+        )
+    })?;
+    let parent_metadata = std::fs::symlink_metadata(tine_sync).map_err(|error| crate::command_error::CommandError::sync_runtime({
         format!(
             "Couldn't inspect graph-local managed-storage parent before returning to Direct files: {error}"
         )
-    })?;
+    }))?;
     if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
-        return Err("Graph-local managed-storage parent is not a local directory, so it could not be archived safely.".into());
+        return Err(crate::command_error::CommandError::prose("Graph-local managed-storage parent is not a local directory, so it could not be archived safely."));
     }
     let recovery = tine_sync.join("recovery");
     match std::fs::create_dir(&recovery) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
                 "Couldn't prepare graph-local managed-storage recovery state: {error}"
-            ));
+            )));
         }
     }
     let recovery_metadata = std::fs::symlink_metadata(&recovery).map_err(|error| {
-        format!("Couldn't inspect graph-local managed-storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't inspect graph-local managed-storage recovery state: {error}")
+        })
     })?;
     if !recovery_metadata.is_dir() || recovery_metadata.file_type().is_symlink() {
-        return Err("Graph-local managed-storage recovery state is not a local directory, so it could not be archived safely.".into());
+        return Err(crate::command_error::CommandError::prose("Graph-local managed-storage recovery state is not a local directory, so it could not be archived safely."));
     }
     // Re-barrier an existing recovery entry too: it may be the visible residue
     // of a prior attempt whose directory flush was refused.
     tine_core::model::sync_dir_for_rename(tine_sync).map_err(|error| {
-        format!("Couldn't durably prepare graph-local managed-storage recovery state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't durably prepare graph-local managed-storage recovery state: {error}")
+        })
     })?;
     let destination = recovery.join(format!("v2-{}", Uuid::new_v4()));
-    std::fs::rename(&source, &destination)
-        .map_err(|error| format!("Couldn't preserve graph-local managed-storage state: {error}"))?;
+    std::fs::rename(&source, &destination).map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Couldn't preserve graph-local managed-storage state: {error}"
+        ))
+    })?;
     sync_provider_namespace_rename(&recovery, tine_sync).map_err(|error| {
-        format!("Couldn't durably preserve graph-local managed-storage state: {error}")
+        crate::command_error::CommandError::sync_runtime({
+            format!("Couldn't durably preserve graph-local managed-storage state: {error}")
+        })
     })?;
     Ok(ProviderNamespaceArchive::Moved {
         source,
@@ -2647,11 +2914,13 @@ fn archive_graph_provider_namespace_with(
 /// tool, propagate that removal back to the device that is sharing.
 fn preserve_graph_provider_namespace(
     _graph_root: &Path,
-) -> Result<ProviderNamespaceArchive, String> {
+) -> Result<ProviderNamespaceArchive, crate::command_error::CommandError> {
     Ok(ProviderNamespaceArchive::Absent)
 }
 
-fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result<(), String> {
+fn restore_graph_provider_namespace(
+    archive: ProviderNamespaceArchive,
+) -> Result<(), crate::command_error::CommandError> {
     let ProviderNamespaceArchive::Moved {
         source,
         destination,
@@ -2659,21 +2928,25 @@ fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result
     else {
         return Ok(());
     };
-    std::fs::rename(&destination, &source).map_err(|error| {
+    std::fs::rename(&destination, &source).map_err(|error| crate::command_error::CommandError::sync_runtime({
         format!(
             "Tine-managed storage could not restore graph-local provider state after preserving private recovery state failed: {error}"
         )
-    })?;
+    }))?;
     let destination_parent = source.parent().ok_or_else(|| {
-        "Tine-managed storage restore destination has no parent directory.".to_string()
+        crate::command_error::CommandError::sync_runtime({
+            "Tine-managed storage restore destination has no parent directory.".to_string()
+        })
     })?;
     let source_parent = destination.parent().ok_or_else(|| {
-        "Tine-managed storage recovery source has no parent directory.".to_string()
+        crate::command_error::CommandError::sync_runtime({
+            "Tine-managed storage recovery source has no parent directory.".to_string()
+        })
     })?;
     sync_provider_namespace_rename(destination_parent, source_parent).map_err(|error| {
-        format!(
+        crate::command_error::CommandError::sync_runtime(format!(
             "Tine-managed storage could not durably restore graph-local provider state: {error}"
-        )
+        ))
     })
 }
 
@@ -2719,7 +2992,7 @@ impl DirectFilesShutdown {
 /// actor is then crash-stopped and joined before any managed files move.
 fn shutdown_for_direct_files_escape(
     slot: &crate::state::GraphSlot,
-) -> Result<DirectFilesShutdown, String> {
+) -> Result<DirectFilesShutdown, crate::command_error::CommandError> {
     let Some(handle) = slot.sparse_runtime() else {
         return Ok(DirectFilesShutdown::Clean);
     };
@@ -2729,16 +3002,16 @@ fn shutdown_for_direct_files_escape(
             let detail = snapshot
                 .detail
                 .unwrap_or_else(|| "the managed actor reached a terminal state".into());
-            handle.stop_without_clean_drain().map_err(|error| {
+            handle.stop_without_clean_drain().map_err(|error| crate::command_error::CommandError::sync_runtime({
                 format!("Tine-managed storage could not stop for the confirmed Direct Files return: {error}")
-            })?;
+            }))?;
             Ok(DirectFilesShutdown::Forced { detail })
         }
         Err(error) => {
             let detail = error.to_string();
-            handle.stop_without_clean_drain().map_err(|stop| {
+            handle.stop_without_clean_drain().map_err(|stop| crate::command_error::CommandError::sync_runtime({
                 format!("Tine-managed storage could not stop for the confirmed Direct Files return after its clean drain failed ({detail}): {stop}")
-            })?;
+            }))?;
             Ok(DirectFilesShutdown::Forced { detail })
         }
     }
@@ -2746,21 +3019,21 @@ fn shutdown_for_direct_files_escape(
 
 fn shutdown_for_graceful_direct_files(
     slot: &crate::state::GraphSlot,
-) -> Result<DirectFilesShutdown, String> {
+) -> Result<DirectFilesShutdown, crate::command_error::CommandError> {
     let Some(handle) = slot.sparse_runtime() else {
         return Ok(DirectFilesShutdown::Clean);
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => Ok(DirectFilesShutdown::Clean),
-        Ok(SyncShutdownOutcome::Terminal(snapshot)) => Err(format!(
+        Ok(SyncShutdownOutcome::Terminal(snapshot)) => Err(crate::command_error::CommandError::sync_runtime(format!(
             "Tine-managed storage could not confirm a safe projection before returning to Direct Files: {}. Use the emergency return if you accept that managed operations may be newer than Markdown.",
             snapshot
                 .detail
                 .unwrap_or_else(|| "the managed actor reached a terminal state".into())
-        )),
-        Err(error) => Err(format!(
+        ))),
+        Err(error) => Err(crate::command_error::CommandError::sync_runtime(format!(
             "Tine-managed storage could not drain safely before returning to Direct Files: {error}. Use the emergency return if you accept that managed operations may be newer than Markdown."
-        )),
+        ))),
     }
 }
 
@@ -2771,7 +3044,7 @@ fn publish_stopped_managed_recovery_slot(
     graph_meta: GraphMeta,
     detail: String,
     transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
-) -> Result<Arc<crate::state::GraphSlot>, String> {
+) -> Result<Arc<crate::state::GraphSlot>, crate::command_error::CommandError> {
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         retryable_binding("local_active", detail),
         root_key,
@@ -2782,7 +3055,8 @@ fn publish_stopped_managed_recovery_slot(
             .graphs
             .write()
             .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
+            .bind(label.to_string(), Arc::clone(&replacement))
+            .map_err(crate::command_error::CommandError::from)?;
         crate::state::poke_watcher(state);
         Ok(())
     })?;
@@ -2791,8 +3065,8 @@ fn publish_stopped_managed_recovery_slot(
 
 fn commit_transition<T>(
     transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
-    publish: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    publish: impl FnOnce() -> Result<T, crate::command_error::CommandError>,
+) -> Result<T, crate::command_error::CommandError> {
     match transition {
         Some(transition) => transition.commit_recovery_step(publish),
         None => publish(),
@@ -2807,15 +3081,23 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-    archive_provider: impl FnOnce(&Path) -> Result<ProviderNamespaceArchive, String>,
-    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+    shutdown: impl FnOnce(
+        &crate::state::GraphSlot,
+    ) -> Result<DirectFilesShutdown, crate::command_error::CommandError>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, crate::command_error::CommandError>,
+    archive_provider: impl FnOnce(
+        &Path,
+    ) -> Result<
+        ProviderNamespaceArchive,
+        crate::command_error::CommandError,
+    >,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, crate::command_error::CommandError>,
     transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
-    after_shutdown: impl FnOnce(&DirectFilesShutdown) -> Result<(), String>,
-) -> Result<SparseV2CancelResult, String> {
-    slot.sparse_binding()
-        .ok_or("This graph is already using Direct files.")?;
+    after_shutdown: impl FnOnce(&DirectFilesShutdown) -> Result<(), crate::command_error::CommandError>,
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
+    slot.sparse_binding().ok_or_else(|| {
+        crate::command_error::CommandError::prose("This graph is already using Direct files.")
+    })?;
     // The slot is the live, exact graph binding.  Explicit recovery must not
     // require parsing a possibly-corrupt or absent private binding merely to
     // learn a path we already own.
@@ -2836,12 +3118,15 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
                     .graphs
                     .write()
                     .unwrap()
-                    .bind(label.to_string(), current)?;
+                    .bind(label.to_string(), current)
+                    .map_err(crate::command_error::CommandError::from)?;
                 crate::state::poke_watcher(state);
                 Ok(())
             })?;
         }
-        return Err("The graph changed while returning to Direct files. Try again.".into());
+        return Err(crate::command_error::CommandError::prose(
+            "The graph changed while returning to Direct files. Try again.",
+        ));
     }
 
     let shutdown = match shutdown(&slot) {
@@ -2855,11 +3140,11 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
                     .write()
                     .unwrap()
                     .bind(label.to_string(), slot)
-                    .map_err(|restore| {
+                    .map_err(|restore| crate::command_error::CommandError::sync_runtime({
                         format!(
                             "{error}; Tine-managed storage could not be restored in memory: {restore}"
                         )
-                    })?;
+                    }))?;
                 crate::state::poke_watcher(state);
                 Ok(())
             })?;
@@ -2891,14 +3176,16 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     if let Err(error) = archive(private_root, recovery_root) {
         let reason = match restore_graph_provider_namespace(provider_archive) {
             Ok(()) => error,
-            Err(restore) => format!("{error}; {restore}"),
+            Err(restore) => {
+                crate::command_error::CommandError::sync_runtime(format!("{error}; {restore}"))
+            }
         };
         return Err(reason);
     }
 
     let binding_generation = commit_transition(transition, || {
         publish_direct(&direct_root, approved_assets)
-    }).map_err(|error| {
+    }).map_err(|error| crate::command_error::CommandError::sync_runtime({
         // Before Direct publication the retryable no-actor slot remains the
         // only authority.  Remove only that slot; if a later lifecycle step
         // already published Direct Files, leave its usable binding intact.
@@ -2916,7 +3203,7 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         format!(
             "Tine-managed storage recovery state was preserved, but Direct files could not reopen: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
         )
-    })?;
+    }))?;
     let status = SparseV2StatusDto::legacy(binding_generation);
     Ok(SparseV2CancelResult {
         binding_generation,
@@ -2937,9 +3224,11 @@ fn cancel_sparse_v2_at_paths_with_archive(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-) -> Result<SparseV2CancelResult, String> {
+    shutdown: impl FnOnce(
+        &crate::state::GraphSlot,
+    ) -> Result<DirectFilesShutdown, crate::command_error::CommandError>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, crate::command_error::CommandError>,
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
     cancel_sparse_v2_at_paths_with_archive_and_publish(
         state,
         label,
@@ -2953,7 +3242,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::command_error::CommandError::from)?;
             let replacement = Arc::new(crate::state::GraphSlot::new(
                 graph,
                 direct_root.to_path_buf(),
@@ -2963,7 +3252,8 @@ fn cancel_sparse_v2_at_paths_with_archive(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(crate::command_error::CommandError::from)?;
             crate::state::poke_watcher(state);
             Ok(binding_generation)
         },
@@ -2984,10 +3274,12 @@ fn set_aside_managed_history_at_paths(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
-) -> Result<SparseV2CancelResult, String> {
+    shutdown: impl FnOnce(
+        &crate::state::GraphSlot,
+    ) -> Result<DirectFilesShutdown, crate::command_error::CommandError>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, crate::command_error::CommandError>,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, crate::command_error::CommandError>,
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
     cancel_sparse_v2_at_paths_with_archive_and_publish(
         state,
         label,
@@ -3011,8 +3303,10 @@ fn cancel_sparse_v2_at_paths(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
-) -> Result<SparseV2CancelResult, String> {
+    shutdown: impl FnOnce(
+        &crate::state::GraphSlot,
+    ) -> Result<DirectFilesShutdown, crate::command_error::CommandError>,
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
     cancel_sparse_v2_at_paths_with_archive(
         state,
         label,
@@ -3036,19 +3330,26 @@ pub(crate) fn run_android_managed_return_to_direct_files(
     graph_root: &Path,
     private_root: &Path,
     open_request: SyncRuntimeOpenRequest,
-) -> Result<String, String> {
+) -> Result<String, crate::command_error::CommandError> {
     let markdown_path = graph_root.join(tine_core::managed_storage_journey::JOURNEY_EDITED_PAGE);
-    let markdown_before = std::fs::read(&markdown_path)
-        .map_err(|error| format!("Return journey could not read its Markdown witness: {error}"))?;
+    let markdown_before = std::fs::read(&markdown_path).map_err(|error| {
+        crate::command_error::CommandError::sync_runtime(format!(
+            "Return journey could not read its Markdown witness: {error}"
+        ))
+    })?;
     let opened = SyncRuntimeHandle::open(open_request);
     if opened.status != SyncRuntimeOpenStatus::Active {
-        return Err(format!(
+        return Err(crate::command_error::CommandError::sync_runtime(format!(
             "Return journey could not reopen managed storage: {:?}",
             opened.status
-        ));
+        )));
     }
     let graph_meta = tine_core::model::Graph::open_checked(graph_root)
-        .map_err(|error| format!("Return journey could not inspect Direct Files: {error}"))?
+        .map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Return journey could not inspect Direct Files: {error}"
+            ))
+        })?
         .meta();
     let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         SparseV2Binding::from_open(opened),
@@ -3069,6 +3370,11 @@ pub(crate) fn run_android_managed_return_to_direct_files(
         .graphs
         .write()
         .unwrap()
+        // No `map_err` here: `GraphRegistry::bind` is typed (W4-E2) and this
+        // helper now returns `CommandError` too (W4-E2b), so `?` is the whole
+        // conversion. Nothing on a Linux host compiles this
+        // `#[cfg(target_os = "android")]` body — CI is the first gate that
+        // does, which is how the E2 version of this line broke Android twice.
         .bind("managed-storage-smoke".into(), Arc::clone(&slot))?;
 
     let private_name = private_root
@@ -3095,25 +3401,40 @@ pub(crate) fn run_android_managed_return_to_direct_files(
             .read()
             .unwrap()
             .slot("managed-storage-smoke")
-            .ok_or("Return journey published no graph slot")?;
-        direct
-            .legacy_graph()
-            .map_err(|error| format!("Return journey did not publish Direct Files: {error}"))?;
+            .ok_or_else(|| {
+                crate::command_error::CommandError::prose("Return journey published no graph slot")
+            })?;
+        direct.legacy_graph().map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Return journey did not publish Direct Files: {error}"
+            ))
+        })?;
         if private_root.exists() {
-            return Err("Return journey left the live managed private root in place".into());
-        }
-        let archived = std::fs::read_dir(&recovery_root)
-            .map_err(|error| format!("Return journey published no private-state archive: {error}"))?
-            .count();
-        if archived != 1 {
-            return Err(format!(
-                "Return journey expected one private-state archive, found {archived}"
+            return Err(crate::command_error::CommandError::prose(
+                "Return journey left the live managed private root in place",
             ));
         }
-        let markdown_after = std::fs::read(&markdown_path)
-            .map_err(|error| format!("Return journey lost its Markdown witness: {error}"))?;
+        let archived = std::fs::read_dir(&recovery_root)
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "Return journey published no private-state archive: {error}"
+                ))
+            })?
+            .count();
+        if archived != 1 {
+            return Err(crate::command_error::CommandError::sync_runtime(format!(
+                "Return journey expected one private-state archive, found {archived}"
+            )));
+        }
+        let markdown_after = std::fs::read(&markdown_path).map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Return journey lost its Markdown witness: {error}"
+            ))
+        })?;
         if markdown_after != markdown_before {
-            return Err("Return journey changed the authoritative Markdown witness".into());
+            return Err(crate::command_error::CommandError::prose(
+                "Return journey changed the authoritative Markdown witness",
+            ));
         }
         Ok(format!(
             "return_to_direct=ok binding_generation={} private_archives={archived}",
@@ -3121,8 +3442,11 @@ pub(crate) fn run_android_managed_return_to_direct_files(
         ))
     })();
     let cleanup = if recovery_root.exists() {
-        std::fs::remove_dir_all(&recovery_root)
-            .map_err(|error| format!("Return journey cleanup failed after proof: {error}"))
+        std::fs::remove_dir_all(&recovery_root).map_err(|error| {
+            crate::command_error::CommandError::sync_runtime(format!(
+                "Return journey cleanup failed after proof: {error}"
+            ))
+        })
     } else {
         Ok(())
     };
@@ -3130,12 +3454,17 @@ pub(crate) fn run_android_managed_return_to_direct_files(
         (Ok(receipt), Ok(())) => Ok(receipt),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        (Err(error), Err(cleanup)) => Err(crate::command_error::CommandError::sync_runtime(
+            format!("{error}; {cleanup}"),
+        )),
     }
 }
 
 #[cfg(test)]
-fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<GraphMeta, String> {
+fn cold_recovery_graph_meta(
+    private_root: &Path,
+    root_key: &Path,
+) -> Result<GraphMeta, crate::command_error::CommandError> {
     match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {
         Ok(Some(record)) => Ok(SyncRuntimeFacade::graph_meta(&record)),
         // A second device is expected to have shared graph-local state before
@@ -3146,11 +3475,11 @@ fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<Grap
         // are still archived byte-for-byte before Direct Files is published.
         Ok(None) | Err(_) => tine_core::model::Graph::open_checked(root_key)
             .map(|graph| graph.meta())
-            .map_err(|error| {
+            .map_err(|error| crate::command_error::CommandError::sync_runtime({
                 format!(
                     "Tine could not verify the Markdown/Org graph before returning to Direct files: {error}. Nothing was changed."
                 )
-            }),
+            })),
     }
 }
 
@@ -3162,21 +3491,19 @@ fn reserve_cold_recovery_slot(
     label: &str,
     root_key: PathBuf,
     graph_meta: GraphMeta,
-) -> Result<Arc<crate::state::GraphSlot>, String> {
+) -> Result<Arc<crate::state::GraphSlot>, crate::command_error::CommandError> {
     let mut graphs = state.graphs.write().unwrap();
     if graphs.slot(label).is_some() {
-        return Err(
-            "This window already owns a graph while recovery was requested. Nothing was changed; retry from the current recovery panel."
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "This window already owns a graph while recovery was requested. Nothing was changed; retry from the current recovery panel.",
+        ));
     }
     if graphs.entries().into_iter().any(|(_, slot)| {
         slot.root_key.starts_with(&root_key) || root_key.starts_with(&slot.root_key)
     }) {
-        return Err(
-            "The remembered graph is already open or opening in another window. Nothing was changed."
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "The remembered graph is already open or opening in another window. Nothing was changed.",
+        ));
     }
     let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         retryable_binding(
@@ -3190,7 +3517,9 @@ fn reserve_cold_recovery_slot(
     graphs
         .bind(label.to_string(), Arc::clone(&slot))
         .map_err(|_| {
-            "Tine could not reserve the remembered graph for recovery. Nothing was changed."
+            crate::command_error::CommandError::sync_runtime({
+                "Tine could not reserve the remembered graph for recovery. Nothing was changed."
+            })
         })?;
     drop(graphs);
     crate::state::poke_watcher(state);
@@ -3204,22 +3533,20 @@ fn exact_live_cold_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
     root_key: &Path,
-) -> Result<Option<Arc<crate::state::GraphSlot>>, String> {
+) -> Result<Option<Arc<crate::state::GraphSlot>>, crate::command_error::CommandError> {
     let slot = state.graphs.read().unwrap().slot(label);
     let Some(slot) = slot else {
         return Ok(None);
     };
     if slot.root_key != root_key {
-        return Err(
-            "This recovery action is stale because the window opened a different graph. Nothing was changed."
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "This recovery action is stale because the window opened a different graph. Nothing was changed.",
+        ));
     }
     if !slot.is_sparse_v2() {
-        return Err(
-            "This recovery action is stale because the window is already using Direct files. Nothing was changed."
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "This recovery action is stale because the window is already using Direct files. Nothing was changed.",
+        ));
     }
     Ok(Some(slot))
 }
@@ -3232,8 +3559,8 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-) -> Result<SparseV2ColdCancelResult, String> {
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, crate::command_error::CommandError>,
+) -> Result<SparseV2ColdCancelResult, crate::command_error::CommandError> {
     if let Some(slot) = exact_live_cold_recovery_slot(state, label, &root_key)? {
         return cancel_sparse_v2_at_paths_with_archive(
             state,
@@ -3268,7 +3595,7 @@ fn cancel_sparse_v2_cold_at_paths(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-) -> Result<SparseV2ColdCancelResult, String> {
+) -> Result<SparseV2ColdCancelResult, crate::command_error::CommandError> {
     cancel_sparse_v2_cold_at_paths_with_archive(
         state,
         label,
@@ -3285,26 +3612,30 @@ pub(crate) async fn cancel_sparse_v2_cold(
     path: String,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
-) -> Result<SparseV2ColdCancelResult, String> {
+) -> Result<SparseV2ColdCancelResult, crate::command_error::CommandError> {
     let label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || cancel_sparse_v2_cold_blocking(&app, &label, path))
         .await
-        .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
+        .map_err(|_| {
+            crate::command_error::CommandError::prose(
+                "Cold Direct Files recovery worker stopped before completion.",
+            )
+        })?
 }
 
 fn cancel_sparse_v2_cold_blocking(
     app: &tauri::AppHandle,
     label: &str,
     path: String,
-) -> Result<SparseV2ColdCancelResult, String> {
+) -> Result<SparseV2ColdCancelResult, crate::command_error::CommandError> {
     // Canonicalization is read-only. Emergency return intentionally does not
     // wait for the managed root lane: its first durable mutation selects the
     // current Markdown tree as Direct Files, and stale managed workers are
     // barred from later publication by the supervisor operation ID.
-    let submitted_root = crate::state::canonical_graph_root(&path).map_err(|_| {
+    let submitted_root = crate::state::canonical_graph_root(&path).map_err(|_| crate::command_error::CommandError::sync_runtime({
         "The selected recovery folder is unavailable. Retry graph lookup or choose another graph."
             .to_string()
-    })?;
+    }))?;
     let state = app.state::<crate::state::AppState>();
     let operation_id =
         state
@@ -3332,17 +3663,17 @@ fn cancel_sparse_v2_cold_blocking(
             StorageTransitionPhase::PublishingDirect,
         )?;
         let prepared = crate::graph::prepare_direct_files_open(app, submitted_root.clone())
-            .map_err(|error| {
+            .map_err(|error| crate::command_error::CommandError::sync_runtime({
                 format!(
                     "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not open: {error}. Retry opening this graph or choose another graph."
                 )
-            })?;
+            }))?;
         state.storage_supervisor.commit_if_current(operation_id, || {
             crate::graph::publish_prepared_direct_files(app, label, &state, prepared)
                 .map_err(|error| {
-                    format!(
+                    crate::command_error::CommandError::sync_runtime(format!(
                         "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not publish: {error}. Retry opening this graph or choose another graph."
-                    )
+                    ))
                 })
         })
     })();
@@ -3378,22 +3709,24 @@ fn cancel_sparse_v2_cold_blocking(
 #[tauri::command]
 pub(crate) async fn cancel_sparse_v2(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2CancelResult, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         cancel_sparse_v2_blocking(&app, &label, binding_generation)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 fn cancel_sparse_v2_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<SparseV2CancelResult, String> {
+) -> Result<SparseV2CancelResult, crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_recovery_guard(
@@ -3406,12 +3739,17 @@ fn cancel_sparse_v2_blocking(
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
-        return Err("the graceful Direct Files return was superseded while waiting".into());
+        return Err(crate::command_error::CommandError::prose(
+            "the graceful Direct Files return was superseded while waiting",
+        ));
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if slot.root_key != root {
-        return Err("graph changed while return waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while return waited for its transition lane",
+        ));
     }
     let private_root = sparse_private_root(&app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(&app)?;
@@ -3430,7 +3768,7 @@ fn cancel_sparse_v2_blocking(
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::command_error::CommandError::from)?;
             let replacement = Arc::new(crate::state::GraphSlot::new(
                 graph,
                 direct_root.to_path_buf(),
@@ -3440,7 +3778,8 @@ fn cancel_sparse_v2_blocking(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(crate::command_error::CommandError::from)?;
             crate::state::poke_watcher(&state);
             Ok(binding_generation)
         },
@@ -3469,37 +3808,44 @@ fn cancel_sparse_v2_blocking(
 #[tauri::command]
 pub(crate) async fn prepare_sparse_v2_share(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         prepare_sparse_v2_share_blocking(&app, &label, binding_generation)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 fn prepare_sparse_v2_share_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<SparseV2StatusDto, String> {
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if slot.root_key != root {
-        return Err("graph changed while share setup waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while share setup waited for its transition lane",
+        ));
     }
     let record = state
         .sync_runtime
         .binding_record(app, &root)?
-        .ok_or("Tine-managed storage setup is missing.")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("Tine-managed storage setup is missing.")
+        })?;
     active_handle(&slot)?
         .prepare_shared()
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     let candidate = prepare_reopened_managed_candidate(
         app,
         &state,
@@ -3517,25 +3863,16 @@ pub(crate) fn shared_enrollment_descriptor_path(graph_root: &Path) -> PathBuf {
         .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
 }
 
-/// What a device that cannot find sync data should be told.
-///
-/// "This graph does not yet contain sync data from another device" is true and
-/// a dead end: it names neither what was looked for nor either thing the user
-/// can actually check. Both causes are ordinary — the other device has not
-/// finished its half, or the file-sync tool never carried `.tine-sync/`, which
-/// several exclude by default because it starts with a dot.
-fn shared_enrollment_not_here_yet(graph_root: &Path) -> String {
-    format!(
-        concat!(
-            "This graph does not yet contain sync data from another device.\n\n",
-            "Tine looked for {}.\n\n",
-            "Two things usually explain that. The other device may not have finished ",
-            "\"Set up sync with another device\" yet. Or your file-sync tool is not copying the ",
-            "hidden .tine-sync folder — several tools skip dot-directories unless you ",
-            "tell them not to.",
-        ),
-        shared_enrollment_descriptor_path(graph_root).display()
-    )
+/// Fixed-shape wire refusal for absent shared data. The frontend owns the safe
+/// wording and actionable provider-path remedy.
+pub(crate) fn shared_enrollment_not_here_yet(
+    _graph_root: &Path,
+) -> crate::command_error::CommandError {
+    crate::command_error::CommandError::tagged("sync-data-unavailable", None::<String>, None)
+}
+
+pub(crate) fn adoption_archived_error() -> crate::command_error::CommandError {
+    crate::command_error::CommandError::tagged("adoption-archived", None::<String>, None)
 }
 
 /// Reconstitute the sole application actor after a durable enrollment cut.
@@ -3549,15 +3886,17 @@ fn prepare_reopened_managed_candidate(
     predecessor: Arc<crate::state::GraphSlot>,
     record: SparseV2ActivationRecord,
     stage: &str,
-) -> Result<PreparedManagedCandidate, String> {
+) -> Result<PreparedManagedCandidate, crate::command_error::CommandError> {
     let graph_meta = SyncRuntimeFacade::graph_meta(&record);
     let binding = state
         .sync_runtime
         .open_record(app, &record)
         .map_err(|error| {
-            let detail = format!("{stage} failed: {error}");
-            crate::debug::diag(&detail);
-            detail
+            crate::command_error::CommandError::sync_runtime({
+                let detail = format!("{stage} failed: {error}");
+                crate::debug::diag(&detail);
+                detail
+            })
         })?;
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding,
@@ -3565,9 +3904,11 @@ fn prepare_reopened_managed_candidate(
         graph_meta,
     ));
     let readiness = prove_managed_application_ready(&replacement, None).map_err(|error| {
-        let detail = format!("{stage} readiness failed: {error}");
-        crate::debug::diag(&detail);
-        detail
+        crate::command_error::CommandError::sync_runtime({
+            let detail = format!("{stage} readiness failed: {error}");
+            crate::debug::diag(&detail);
+            detail
+        })
     })?;
     Ok(PreparedManagedCandidate {
         predecessor,
@@ -3583,22 +3924,24 @@ fn prepare_reopened_managed_candidate(
 #[tauri::command]
 pub(crate) async fn join_sparse_v2_shared(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         join_sparse_v2_shared_blocking(&app, &label, binding_generation)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 fn join_sparse_v2_shared_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<SparseV2StatusDto, String> {
+) -> Result<SparseV2StatusDto, crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_guard(
@@ -3611,7 +3954,9 @@ fn join_sparse_v2_shared_blocking(
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
-        return Err("managed join was superseded while waiting for its graph lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "managed join was superseded while waiting for its graph lane",
+        ));
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
     transition.advance(StorageTransitionPhase::JoiningManaged)?;
@@ -3641,19 +3986,41 @@ fn prepare_sparse_v2_join(
     label: &str,
     binding_generation: u64,
     root: PathBuf,
-) -> Result<PreparedActivationOutcome, String> {
-    fn join_failure(stage: &str, error: impl std::fmt::Display) -> String {
+) -> Result<PreparedActivationOutcome, crate::command_error::CommandError> {
+    fn join_failure(
+        stage: &str,
+        error: impl std::fmt::Display,
+    ) -> crate::command_error::CommandError {
         let detail = error.to_string();
         crate::debug::diag(format!(
             "managed sync join failed: stage={stage}; detail={detail}"
         ));
-        format!("managed sync join failed at {stage}: {detail}")
+        crate::command_error::CommandError::sync_runtime(format!(
+            "managed sync join failed at {stage}: {detail}"
+        ))
+    }
+
+    fn join_runtime_failure(
+        stage: &str,
+        error: tine_core::sync_runtime::SyncRuntimeRequestError,
+    ) -> crate::command_error::CommandError {
+        match error {
+            tine_core::sync_runtime::SyncRuntimeRequestError::TaggedBackend(payload) => {
+                crate::command_error::CommandError::from(
+                    tine_core::sync_runtime::SyncRuntimeRequestError::TaggedBackend(payload),
+                )
+            }
+            other => join_failure(stage, other),
+        }
     }
 
     let state = app.state::<crate::state::AppState>();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if slot.root_key != root {
-        return Err("graph changed while join waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while join waited for its transition lane",
+        ));
     }
     let descriptor =
         inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
@@ -3663,10 +4030,12 @@ fn prepare_sparse_v2_join(
         let record = state
             .sync_runtime
             .binding_record(app, &root)?
-            .ok_or("Tine-managed storage setup is missing.")?;
+            .ok_or_else(|| {
+                crate::command_error::CommandError::prose("Tine-managed storage setup is missing.")
+            })?;
         active_handle(&slot)?
             .join_shared(descriptor)
-            .map_err(|error| join_failure("provider scan", error))?;
+            .map_err(|error| join_runtime_failure("provider scan", error))?;
         let candidate = prepare_reopened_managed_candidate(
             app,
             &state,
@@ -3676,7 +4045,9 @@ fn prepare_sparse_v2_join(
         )?;
         return Ok(PreparedActivationOutcome::Candidate(candidate));
     }
-    let graph = slot.legacy_graph()?;
+    let graph = slot
+        .legacy_graph()
+        .map_err(crate::command_error::CommandError::from)?;
     let graph_meta = graph.meta();
     let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
@@ -3696,13 +4067,13 @@ fn prepare_sparse_v2_join(
     )
     .map_err(|error| join_failure("local activation", error))?;
     let Some(handle) = activated.binding.handle() else {
-        return Err(join_bootstrap_unavailable_detail(
-            activated.binding.availability(),
+        return Err(crate::command_error::CommandError::sync_runtime(
+            join_bootstrap_unavailable_detail(activated.binding.availability()),
         ));
     };
     handle
         .join_shared(descriptor)
-        .map_err(|error| join_failure("provider scan", error))?;
+        .map_err(|error| join_runtime_failure("provider scan", error))?;
     let binding = state
         .sync_runtime
         .open_record(app, &record)
@@ -3846,7 +4217,9 @@ pub(crate) struct SparseV2AdoptionResult {
 /// the point of no return, which is why the panel can name it in the
 /// confirmation rather than only in the receipt.
 #[tauri::command]
-pub(crate) async fn sparse_v2_recovery_location(app: tauri::AppHandle) -> Result<String, String> {
+pub(crate) async fn sparse_v2_recovery_location(
+    app: tauri::AppHandle,
+) -> Result<String, crate::command_error::CommandError> {
     sparse_recovery_root(&app).map(|root| root.display().to_string())
 }
 
@@ -3869,40 +4242,47 @@ pub(crate) async fn sparse_v2_recovery_location(app: tauri::AppHandle) -> Result
 #[tauri::command]
 pub(crate) async fn adopt_sparse_v2_shared(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2AdoptionResult, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2AdoptionResult, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         adopt_sparse_v2_shared_blocking(&app, &label, binding_generation)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 fn adopt_sparse_v2_shared_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<SparseV2AdoptionResult, String> {
+) -> Result<SparseV2AdoptionResult, crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     let root = slot.root_key.clone();
     if slot.sparse_binding().is_none() {
-        return Err(
-            "This device is already using Direct files, so it has no Tine-managed storage history to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead."
-                .into(),
-        );
+        return Err(crate::command_error::CommandError::sync_runtime(
+            "This device is already using Direct files, so it has no Tine-managed storage history to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead.",
+        ));
     }
     // An incomplete provider tree is "not yet", not a reason to start
     // dismantling this device's own storage.
     crate::graph::refuse_unclaimed_sparse_archive(&root)?;
     let descriptor =
         inspect_shared_enrollment_for_cold_discovery(&root.join(".tine-sync/v2/shared"))
-            .map_err(|error| format!("Couldn't read the shared sync data: {error}"))?
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "Couldn't read the shared sync data: {error}"
+                ))
+            })?
             .ok_or_else(|| shared_enrollment_not_here_yet(&root))?;
     let record = state
         .sync_runtime
         .binding_record(app, &root)?
-        .ok_or("Tine-managed storage setup is missing.")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("Tine-managed storage setup is missing.")
+        })?;
     let relation = shared_graph_relation(
         (
             record.workspace_id,
@@ -3916,7 +4296,7 @@ fn adopt_sparse_v2_shared_blocking(
         ),
     );
     if let Some(refusal) = shared_graph_relation_refusal(relation) {
-        return Err(refusal.into());
+        return Err(crate::command_error::CommandError::prose(refusal));
     }
     let status = sparse_v2_status_for_slot(&slot)?;
     if let Some(refusal) = shared_cut_refusal(
@@ -3925,22 +4305,21 @@ fn adopt_sparse_v2_shared_blocking(
             .as_ref()
             .and_then(|runtime| runtime.shared_phase.as_deref()),
     ) {
-        return Err(refusal.into());
+        return Err(crate::command_error::CommandError::prose(refusal));
     }
     drop(slot);
 
     let (set_aside, archive_location) =
         set_aside_managed_history_for_adoption(app, label, binding_generation)?;
     let archive_location = archive_location.map(|path| path.display().to_string());
-    // One line, because the panel's redaction keeps only the first one. The
-    // token is stable so the panel can attach the archive location it already
-    // read, rather than repeating a native path through the redactor.
-    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation)
-        .map_err(|error| {
-            format!(
-                "Tine-managed storage adoption stopped after this device's own history was archived; Direct files is serving your Markdown/Org files unchanged and nothing was merged, so the join action can retry the remaining half on its own: {error}"
-            )
-        })?;
+    // The fixed kind lets the panel attach the archive location it already
+    // read without repeating a native path through the error boundary.
+    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation).map_err(
+        |error| {
+            crate::debug::diag(format!("managed adoption failed after archive: {error}"));
+            adoption_archived_error()
+        },
+    )?;
     let binding_generation = status.binding_generation;
     Ok(SparseV2AdoptionResult {
         adoption_statement: match &archive_location {
@@ -3963,9 +4342,10 @@ fn set_aside_managed_history_for_adoption(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
-) -> Result<(SparseV2CancelResult, Option<PathBuf>), String> {
+) -> Result<(SparseV2CancelResult, Option<PathBuf>), crate::command_error::CommandError> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_recovery_guard(
@@ -3978,12 +4358,17 @@ fn set_aside_managed_history_for_adoption(
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
-        return Err("adoption was superseded while waiting for its graph lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "adoption was superseded while waiting for its graph lane",
+        ));
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(crate::command_error::CommandError::from)?;
     if slot.root_key != root {
-        return Err("graph changed while adoption waited for its transition lane".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph changed while adoption waited for its transition lane",
+        ));
     }
     let private_root = sparse_private_root(app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(app)?;
@@ -4007,7 +4392,7 @@ fn set_aside_managed_history_for_adoption(
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::command_error::CommandError::from)?;
             let replacement = Arc::new(crate::state::GraphSlot::new(
                 graph,
                 direct_root.to_path_buf(),
@@ -4017,7 +4402,8 @@ fn set_aside_managed_history_for_adoption(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(crate::command_error::CommandError::from)?;
             crate::state::poke_watcher(&state);
             Ok(binding_generation)
         },
@@ -4043,172 +4429,200 @@ fn set_aside_managed_history_for_adoption(
 pub(crate) async fn sparse_v2_query(
     request: tine_core::sync_runtime::SyncRuntimeQueryRequest,
     state: crate::state::GraphContext<'_>,
-) -> Result<tine_core::sync_runtime::SyncRuntimeQueryReply, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<tine_core::sync_runtime::SyncRuntimeQueryReply, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .query(request)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn sparse_v2_editor_load(
     request: tine_core::sync_runtime::SyncEditorLoadRequest,
     state: crate::state::GraphContext<'_>,
-) -> Result<tine_core::sync_runtime::SyncEditorLoadOutcome, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<tine_core::sync_runtime::SyncEditorLoadOutcome, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .load_editor_page(request)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn sparse_v2_editor_save(
     request: tine_core::sync_runtime::SyncEditorSaveRequest,
     state: crate::state::GraphContext<'_>,
-) -> Result<tine_core::sync_runtime::SyncEditorSaveOutcome, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<tine_core::sync_runtime::SyncEditorSaveOutcome, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .save_editor_page(request)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn sparse_v2_tick(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2TickDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2TickDto, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        active_handle(&slot)?
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
+        let tick = active_handle(&slot)?
             .tick()
-            .map(tick_dto)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)?;
+        if let SyncRuntimeTick::CheckpointCaptureSkipped { reason } = &tick {
+            crate::debug::record_checkpoint_capture_skip(*reason);
+        }
+        Ok(tick_dto(tick))
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn list_absence_sweeps(
     state: crate::state::GraphContext<'_>,
-) -> Result<Vec<tine_core::sync_runtime::SyncAbsenceSweepEvent>, String> {
+) -> Result<Vec<tine_core::sync_runtime::SyncAbsenceSweepEvent>, crate::command_error::CommandError>
+{
     // managed-command-routing: managed. Absence sweeps exist only under managed
     // storage and this reaches the sparse actor through `active_handle` +
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .absence_sweep_events()
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn reapply_absence_sweep(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
-) -> Result<tine_core::sync_runtime::SyncAbsenceSweepActionOutcome, String> {
+) -> Result<
+    tine_core::sync_runtime::SyncAbsenceSweepActionOutcome,
+    crate::command_error::CommandError,
+> {
     // managed-command-routing: managed. Absence sweeps exist only under managed
     // storage and this reaches the sparse actor through `active_handle` +
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .reapply_absence_sweep(&sweep_id)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn restore_absence_sweep(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
-) -> Result<tine_core::sync_runtime::SyncAbsenceSweepRestoreOutcome, String> {
+) -> Result<
+    tine_core::sync_runtime::SyncAbsenceSweepRestoreOutcome,
+    crate::command_error::CommandError,
+> {
     // managed-command-routing: managed. Absence sweeps exist only under managed
     // storage and this reaches the sparse actor through `active_handle` +
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .restore_absence_sweep(&sweep_id)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn keep_absence_sweep_deletion(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     // managed-command-routing: managed. Absence sweeps exist only under managed
     // storage and this reaches the sparse actor through `active_handle` +
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .dispose_absence_sweep_keep_deletion(&sweep_id)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
 pub(crate) async fn sparse_v2_clean_shutdown(
     state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2RuntimeStatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+) -> Result<SparseV2RuntimeStatusDto, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(crate::command_error::CommandError::from)?;
         active_handle(&slot)?
             .clean_shutdown()
             .map(shutdown_status)
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 /// A graph slot can authorize a process/window exit only after its managed
@@ -4222,27 +4636,31 @@ pub(crate) enum CleanShutdownSlot {
     Safe,
 }
 
-fn clean_shutdown_outcome(outcome: SyncShutdownOutcome) -> Result<CleanShutdownSlot, String> {
+fn clean_shutdown_outcome(
+    outcome: SyncShutdownOutcome,
+) -> Result<CleanShutdownSlot, crate::command_error::CommandError> {
     match outcome {
         SyncShutdownOutcome::Safe(_) => Ok(CleanShutdownSlot::Safe),
-        SyncShutdownOutcome::Terminal(snapshot) => Err(format!(
+        SyncShutdownOutcome::Terminal(snapshot) => {
+            Err(crate::command_error::CommandError::sync_runtime(format!(
             "Tine-managed storage reached a terminal state and cannot authorize process exit: {}",
             snapshot
                 .detail
                 .unwrap_or_else(|| "no terminal detail was recorded".into())
-        )),
+        )))
+        }
     }
 }
 
 pub(crate) fn clean_shutdown_slot(
     slot: &crate::state::GraphSlot,
-) -> Result<CleanShutdownSlot, String> {
+) -> Result<CleanShutdownSlot, crate::command_error::CommandError> {
     let Some(handle) = slot.sparse_runtime() else {
         return Ok(CleanShutdownSlot::Direct);
     };
     handle
         .clean_shutdown()
-        .map_err(|error| error.to_string())
+        .map_err(crate::command_error::CommandError::from)
         .and_then(clean_shutdown_outcome)
 }
 
@@ -4305,6 +4723,25 @@ mod tests {
         SyncLocalMutationOutcome, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
+
+    #[test]
+    fn checkpoint_capture_skip_has_its_own_tick_value() {
+        let skipped = tick_dto(SyncRuntimeTick::CheckpointCaptureSkipped {
+            reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached,
+        });
+        let recovering = tick_dto(SyncRuntimeTick::Recovering);
+        assert_eq!(skipped.state, "checkpoint_capture_skipped");
+        assert_ne!(
+            skipped.state, recovering.state,
+            "I-11: a skipped disposable checkpoint capture is not recovery; keep the diagnostics tick vocabulary distinct"
+        );
+        let contract = include_str!("../../docs/contracts/diagnostics.md");
+        assert!(
+            contract.contains("`checkpoint_capture_skipped`")
+                && contract.contains("checkpoint_capture_skip_has_its_own_tick_value"),
+            "I-11: the diagnostics contract and native tick vocabulary must change together"
+        );
+    }
 
     #[test]
     fn emergency_direct_selection_is_atomic_sticky_and_graph_scoped() {
@@ -4549,8 +4986,11 @@ mod tests {
             let tail = &source[start..];
             let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
             let command = &tail[..end];
+            let compact: String = command.split_whitespace().collect();
             assert!(
-                command.contains("owned_graph_context(state)?"),
+                compact.contains(
+                    "owned_graph_context(state).map_err(crate::command_error::CommandError::from)?"
+                ),
                 "{name} must own the exact window binding before await"
             );
             assert!(
@@ -4624,27 +5064,16 @@ mod tests {
         );
     }
 
-    /// A join that finds nothing must not dead-end the user. "This graph does
-    /// not yet contain sync data from another device" is true and unactionable:
-    /// it names neither the file it looked for nor either ordinary reason it is
-    /// missing — the other device has not finished, or the sync tool is not
-    /// carrying the hidden `.tine-sync/` folder.
+    /// The native boundary carries only the fixed kind; no path or prose is
+    /// load-bearing.
     #[test]
-    fn a_join_with_no_sync_data_names_the_file_and_both_likely_causes() {
+    fn a_join_with_no_sync_data_emits_only_the_fixed_kind() {
         let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
-        assert!(
-            message.contains(
-                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
-            ),
-            "{message}"
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            r#"{"kind":"sync-data-unavailable"}"#
         );
-        assert!(message.contains("may not have finished"), "{message}");
-        assert!(message.contains("hidden .tine-sync folder"), "{message}");
-        assert!(message.contains("skip dot-directories"), "{message}");
-        assert!(
-            !message.contains("  "),
-            "the message must not carry source-indentation runs: {message:?}"
-        );
+        assert!(!message.to_string().contains("/graphs/notes"));
         assert_eq!(
             shared_enrollment_descriptor_path(Path::new("/graphs/notes")),
             PathBuf::from(
@@ -4653,25 +5082,19 @@ mod tests {
         );
     }
 
-    /// The message above is helpful and the user never saw it. The panel keeps
-    /// only the FIRST LINE of a native error (`safeManagedErrorDetail`), so the
-    /// path and both causes were cut and the dead-end sentence was all that
-    /// reached the phone. The panel re-authors the rest as a remedy; this pins
-    /// the two halves together, because a remedy keyed on text the native side
-    /// no longer emits is the same silence again.
+    /// The fixed native kind and frontend subclass are pinned together. The
+    /// frontend can reword its message without changing control flow.
     #[test]
-    fn the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact() {
+    fn the_not_yet_refusal_reaches_the_panel_as_a_typed_kind() {
         let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
-        let first_line = message.lines().next().expect("the message has a line");
         let panel = include_str!("../../src/components/Settings.tsx");
 
-        // What the panel matches on must survive the truncation to line one.
-        let key = "does not yet contain sync data";
-        assert!(first_line.contains(key), "{first_line}");
-        assert!(
-            panel.contains(&format!("detail.includes(\"{key}\")")),
-            "the panel must recognize the refusal it re-authors"
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            r#"{"kind":"sync-data-unavailable"}"#
         );
+        assert!(panel.contains("error instanceof SyncDataUnavailableError"));
+        assert!(!panel.contains("detail.includes(\"does not yet contain sync data\")"));
 
         // The relative path the panel names must be the one this message means.
         let relative = ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
@@ -5029,7 +5452,11 @@ mod tests {
             &state,
             "main",
             candidate(Some(source_generation)),
-            || Err("ambiguous managed selector publication".into()),
+            || {
+                Err(crate::command_error::CommandError::prose(
+                    "ambiguous managed selector publication",
+                ))
+            },
             |_| {
                 restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
@@ -5053,7 +5480,11 @@ mod tests {
             &state,
             "main",
             candidate(None),
-            || Err("managed-to-managed publication failure".into()),
+            || {
+                Err(crate::command_error::CommandError::prose(
+                    "managed-to-managed publication failure",
+                ))
+            },
             |_| {
                 restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
@@ -5216,13 +5647,16 @@ mod tests {
             .map(|offset| join_start + offset)
             .expect("join command boundary");
         let join = &source[join_start..join_end];
+        let compact_join: String = join.split_whitespace().collect();
         let retained_branch = join
             .find("if slot.sparse_binding().is_some()")
             .expect("already-managed join branch");
-        let direct_branch = join
-            .find("let graph = slot.legacy_graph()?;")
+        let direct_branch = compact_join
+            .find(
+                "letgraph=slot.legacy_graph().map_err(crate::command_error::CommandError::from)?;",
+            )
             .expect("Direct Files join branch");
-        let direct = &join[direct_branch..];
+        let direct = &compact_join[direct_branch..];
         let archive_predecessor = direct
             .find("prepare_shared_binding_record(")
             .expect("Direct Files join must prepare a fresh descriptor-bound private root");
@@ -5281,6 +5715,34 @@ mod tests {
             assert!(
                 !command.contains(forbidden),
                 "emergency return must not depend on `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_slate_private_root_renames_barrier_both_parents() {
+        let source = include_str!("sync_runtime.rs");
+        for signature in [
+            "fn archive_private_root(",
+            "fn replace_failed_blank_slate_candidate(",
+        ] {
+            let start = source
+                .find(signature)
+                .expect("rename helper remains present");
+            let body = &source[start
+                ..source[start..]
+                    .find("\n}\n")
+                    .map(|offset| start + offset + 3)
+                    .expect("rename helper remains bounded")];
+            let rename = body
+                .find("std::fs::rename(")
+                .expect("private-root publication remains a rename");
+            let barrier = body
+                .find("sync_provider_namespace_rename(")
+                .expect("private-root rename must sync destination and source parents");
+            assert!(
+                rename < barrier,
+                "the rename must precede its directory barriers"
             );
         }
     }
@@ -5383,7 +5845,11 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            |_| Err("injected adoption drain failure".into()),
+            |_| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected adoption drain failure",
+                ))
+            },
             archive_private_root,
             |_, _| panic!("adoption must not publish Direct files after a failed drain"),
         )
@@ -5422,7 +5888,11 @@ mod tests {
             &fixture.recovery_root,
             None,
             shutdown_for_direct_files_escape,
-            |_, _| Err("injected adoption archive failure".into()),
+            |_, _| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected adoption archive failure",
+                ))
+            },
             |_, _| panic!("adoption must not publish Direct files after a failed archive"),
         )
         .unwrap_err();
@@ -5463,7 +5933,11 @@ mod tests {
             None,
             shutdown_for_direct_files_escape,
             archive_private_root,
-            |_, _| Err("injected adoption Direct files failure".into()),
+            |_, _| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected adoption Direct files failure",
+                ))
+            },
         )
         .unwrap_err();
 
@@ -5515,7 +5989,7 @@ mod tests {
             |direct_root, approved_assets| {
                 let graph =
                     tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(crate::command_error::CommandError::from)?;
                 let replacement = Arc::new(crate::state::GraphSlot::new(
                     graph,
                     direct_root.to_path_buf(),
@@ -5526,7 +6000,8 @@ mod tests {
                     .graphs
                     .write()
                     .unwrap()
-                    .bind("main".into(), replacement)?;
+                    .bind("main".into(), replacement)
+                    .map_err(crate::command_error::CommandError::from)?;
                 Ok(binding_generation)
             },
         )
@@ -5793,7 +6268,11 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            |_, _| Err("injected cold archive failure".into()),
+            |_, _| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected cold archive failure",
+                ))
+            },
         )
         .unwrap_err();
         assert!(error.contains("injected cold archive failure"));
@@ -6390,7 +6869,11 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            |_| Err("injected force-stop refusal".into()),
+            |_| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected force-stop refusal",
+                ))
+            },
         )
         .unwrap_err();
 
@@ -6430,7 +6913,9 @@ mod tests {
                 let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
                 assert!(retryable.is_sparse_v2());
                 assert!(retryable.sparse_runtime().is_none());
-                Err("injected archive rename failure".into())
+                Err(crate::command_error::CommandError::prose(
+                    "injected archive rename failure",
+                ))
             },
         )
         .unwrap_err();
@@ -6501,7 +6986,11 @@ mod tests {
             &fixture.recovery_root,
             None,
             shutdown_for_direct_files_escape,
-            |_, _| Err("injected private archive failure".into()),
+            |_, _| {
+                Err(crate::command_error::CommandError::prose(
+                    "injected private archive failure",
+                ))
+            },
         )
         .unwrap_err();
         assert!(error.contains("injected private archive failure"));
@@ -6763,6 +7252,7 @@ mod tests {
             logbook_with_second_support: true,
             logbook_enabled_in_timestamped_blocks: false,
             logbook_enabled_in_all_blocks: false,
+            linked_references_collapsed_threshold: 100,
             guide_announced: false,
         };
         let record = SparseV2ActivationRecord::new(&graph, meta, DeviceId::new());
@@ -7119,8 +7609,8 @@ mod tests {
         let slot =
             crate::state::GraphSlot::from_sparse_v2(binding, graph_root.clone(), meta.clone());
         assert_eq!(
-            slot.legacy_graph().err().as_deref(),
-            Some(crate::state::SPARSE_V2_UNSUPPORTED)
+            slot.legacy_graph().err().unwrap().to_string(),
+            crate::state::SPARSE_V2_UNSUPPORTED
         );
         let handle = slot
             .sparse_runtime()
@@ -7593,7 +8083,11 @@ mod tests {
             "main",
             previous_generation,
             request.clone(),
-            |_| Err("pre-publication reopen failure".into()),
+            |_| {
+                Err(crate::command_error::CommandError::prose(
+                    "pre-publication reopen failure",
+                ))
+            },
         );
         assert_eq!(failed.unwrap_err(), "pre-publication reopen failure");
         assert_eq!(

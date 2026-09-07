@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { backend } from "../backend";
+import { serializedWrites } from "../serializedWrites";
 import { parseThemeManifest, themeManifestCss, themeVersionKey, type ThemeManifest } from "./manifest";
 
 const STORAGE_KEY = "theme.packages.v1";
@@ -14,6 +15,7 @@ export interface InstalledTheme {
 
 const [installedThemes, setInstalledThemes] = createSignal<InstalledTheme[]>([]);
 const [revokedThemeVersions, setRevokedThemeVersions] = createSignal<ReadonlySet<string>>(new Set());
+const packageWrites = serializedWrites("theme.packages.v1");
 export { installedThemes, revokedThemeVersions };
 
 function parseStoredThemes(text: string): ThemeManifest[] {
@@ -39,6 +41,20 @@ function managed(manifests: ThemeManifest[]): InstalledTheme[] {
 
 async function persist(themes: InstalledTheme[]) {
   await backend().setAppString(STORAGE_KEY, JSON.stringify(themes.map((theme) => theme.manifest)));
+}
+
+function mutateInstalledThemes<T>(
+  update: (current: InstalledTheme[]) => { next: InstalledTheme[]; result: T },
+): Promise<T> {
+  return packageWrites.run(async () => {
+    // Every mutation rewrites the same STORAGE_KEY array. Re-read the signal
+    // inside the serialized tail so a queued different-theme mutation sees
+    // all preceding durable changes instead of publishing a stale snapshot.
+    const { next, result } = update(installedThemes());
+    await persist(next);
+    setInstalledThemes(next);
+    return result;
+  });
 }
 
 export async function initThemePackages(initialRevocations: ReadonlySet<string> = new Set()): Promise<void> {
@@ -69,18 +85,19 @@ export async function installThemePackage(value: unknown): Promise<InstalledThem
   if (themeVersionIsRevoked(key)) {
     throw new Error("this theme version was revoked by the signed registry");
   }
-  const current = installedThemes();
-  if (!current.some((theme) => theme.key === key) && current.length >= MAX_INSTALLED_THEMES) {
-    throw new Error(`at most ${MAX_INSTALLED_THEMES} theme versions may be installed`);
-  }
-  const next = [...current.filter((theme) => theme.key !== key), ...managed([manifest])];
-  await persist(next);
-  setInstalledThemes(next);
-  return next[next.length - 1];
+  return mutateInstalledThemes((current) => {
+    if (!current.some((theme) => theme.key === key) && current.length >= MAX_INSTALLED_THEMES) {
+      throw new Error(`at most ${MAX_INSTALLED_THEMES} theme versions may be installed`);
+    }
+    const installed = managed([manifest])[0];
+    const next = [...current.filter((theme) => theme.key !== key), installed];
+    return { next, result: installed };
+  });
 }
 
 export async function uninstallThemePackage(key: string): Promise<void> {
-  const next = installedThemes().filter((theme) => theme.key !== key);
-  await persist(next);
-  setInstalledThemes(next);
+  await mutateInstalledThemes((current) => ({
+    next: current.filter((theme) => theme.key !== key),
+    result: undefined,
+  }));
 }

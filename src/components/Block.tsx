@@ -28,6 +28,7 @@ import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairE
 import { typoTypeReplace } from "../render/typography";
 import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
+import { failureShape } from "../failureShape";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
 import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
@@ -81,6 +82,7 @@ import {
   formatForBlock,
   depthOf,
   managedBulkOutlinePlan,
+  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
   preflightManagedBulkInsertion,
   consumeManagedBulkInsertionAdmission,
   reportManagedBulkInsertionRefusal,
@@ -89,8 +91,10 @@ import {
   setCollapsedDescendants,
   blockExternalId,
   takeEditorLease,
+  type ManagedBulkInsertionPreflight,
   type OutlineScope,
 } from "../store";
+import { dispatchBulkInsertion } from "../storageDispatch";
 import {
   clearFocusSurface,
   editingId,
@@ -150,6 +154,7 @@ import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
+import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { seedAssetBlob } from "../assetCache";
 import { openInNewTab, type Route } from "../router";
 import { openRouteInOtherPane } from "../panes";
@@ -1414,12 +1419,23 @@ export function Editor(props: { id: string }): JSX.Element {
     nodes: readonly OutlineNode[],
     reusedHost: boolean,
   ) => {
-    const admission = preflightManagedBulkInsertion(props.id, (limits) => managedBulkOutlinePlan(
-      nodes,
-      depthOf(props.id) + 1,
-      reusedHost ? 1 : 0,
-      limits,
-    ));
+    const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+      { targetId: props.id },
+      {
+        direct: () => ({ kind: "direct" }),
+        unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
+        managed: (managedAdmission) => preflightManagedBulkInsertion(
+          managedAdmission,
+          props.id,
+          (limits) => managedBulkOutlinePlan(
+            nodes,
+            depthOf(props.id) + 1,
+            reusedHost ? 1 : 0,
+            limits,
+          ),
+        ),
+      },
+    );
     if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
     return admission;
   };
@@ -1569,7 +1585,7 @@ export function Editor(props: { id: string }): JSX.Element {
       } catch (error) {
         // Completion is an optional aid. A transient facet-query failure must
         // never reject the editor input event or pile up global error toasts.
-        console.warn("Property autocomplete unavailable", error);
+        console.warn("Property autocomplete unavailable", failureShape(error));
         if (sameAcTrigger(ac(), t)) setAcItems([]);
         return;
       }
@@ -1820,7 +1836,39 @@ export function Editor(props: { id: string }): JSX.Element {
   // Seed + insert an asset from raw bytes at the caret, then persist to assets/
   // in the background (repointing the link if the backend de-dups the name).
   // Shared by clipboard-image paste and mobile capture (camera / voice memo).
-  const insertAssetBytes = async (bytes: Uint8Array, origName?: string, captureExt?: string) => {
+  interface AssetEditorToken {
+    readonly scope: GraphScope;
+    readonly textarea: HTMLTextAreaElement;
+    readonly editingBlockId: string | null;
+  }
+  const captureAssetEditorToken = (): AssetEditorToken | null => {
+    const scope = captureGraphScope();
+    return scope ? Object.freeze({
+      scope,
+      textarea: ref,
+      editingBlockId: editingId(),
+    }) : null;
+  };
+  const assetEditorIsCurrent = (token: AssetEditorToken | null): token is AssetEditorToken =>
+    token !== null
+    && isScopeCurrent(token.scope)
+    && editorMounted
+    && ref === token.textarea
+    && token.textarea.isConnected
+    && editingId() === token.editingBlockId;
+  const reportStaleAsset = () =>
+    pushToast("The asset was saved, but it was not inserted because the graph or block changed.", "info");
+
+  const insertAssetBytes = async (
+    token: AssetEditorToken,
+    bytes: Uint8Array,
+    origName?: string,
+    captureExt?: string,
+  ) => {
+    if (!assetEditorIsCurrent(token)) {
+      reportStaleAsset();
+      return;
+    }
     const candidate = captureExt !== undefined ? captureAssetFileName(captureExt) : assetFileName(origName);
     // Cache key is the bare filename — assetRelPath() strips the `assets/` prefix
     // before loadAssetBlob() (see render/inline.tsx). Seed it so the asset renders
@@ -1833,6 +1881,10 @@ export function Editor(props: { id: string }): JSX.Element {
       stored = await trackAssetWrite(backend().saveAsset(candidate, bytes));
     } catch {
       pushToast(`Couldn’t save to assets/`, "error");
+      return;
+    }
+    if (!assetEditorIsCurrent(token)) {
+      reportStaleAsset();
       return;
     }
     if (stored !== candidate) seedAssetBlob(stored, bytes);
@@ -1856,8 +1908,15 @@ export function Editor(props: { id: string }): JSX.Element {
     });
   };
 
-  const insertStoredAssets = (assets: { stored: string; label?: string }[]) => {
+  const insertStoredAssets = (
+    token: AssetEditorToken,
+    assets: { stored: string; label?: string }[],
+  ) => {
     if (!assets.length) return;
+    if (!assetEditorIsCurrent(token)) {
+      reportStaleAsset();
+      return;
+    }
     const page = pageByName(doc.byId[props.id]?.page ?? "");
     const markdown = assets.map(({ stored, label }) => assetMarkdown(stored, {
       label,
@@ -1920,6 +1979,8 @@ export function Editor(props: { id: string }): JSX.Element {
    * If a platform exposes only browser File objects, save those sequentially so
    * at most one bounded byte buffer/base64 IPC payload is live at a time. */
   const pasteClipboardFiles = async (eventFiles: File[]) => {
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     const toastId = pushToast("Pasting files…", "info");
     let skipped = 0;
     let nativeUnavailable = false;
@@ -1957,7 +2018,7 @@ export function Editor(props: { id: string }): JSX.Element {
                 // A Windows bitmap clipboard can appear as one invalid native
                 // path plus one valid WebView2 image File. Once the bytes win,
                 // suppress that native pseudo-entry's skipped count (GH #78).
-                await insertAssetBytes(bytes);
+                await insertAssetBytes(editorToken, bytes);
               } else skipped += Math.max(1, native.skipped);
             } catch {
               skipped += Math.max(1, native.skipped);
@@ -1990,7 +2051,7 @@ export function Editor(props: { id: string }): JSX.Element {
           }
         }
       }
-      insertStoredAssets(stored);
+      insertStoredAssets(editorToken, stored);
     } finally {
       dismissToast(toastId);
       if (stored.length) {
@@ -2009,6 +2070,8 @@ export function Editor(props: { id: string }): JSX.Element {
 
   // Mobile: take/pick a photo (Android camera plugin) → insert at the caret.
   const capturePhotoCmd = async () => {
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     let res;
     try {
       res = await backend().capturePhoto();
@@ -2020,7 +2083,7 @@ export function Editor(props: { id: string }): JSX.Element {
       const candidate = captureAssetFileName(res.ext || "jpg");
       try {
         const stored = await trackAssetWrite(backend().importNativeCapture(res.path, candidate));
-        insertStoredAssets([{ stored }]);
+        insertStoredAssets(editorToken, [{ stored }]);
       } catch (err) {
         pushToast(`Couldn’t import the photo (${String(err)})`, "error");
       }
@@ -2029,8 +2092,11 @@ export function Editor(props: { id: string }): JSX.Element {
 
   // Mobile: toggle voice-memo recording. First tap starts (prompts for mic
   // permission); second tap stops and inserts the recorded audio at the caret.
+  let mobileRecordingEditorToken: AssetEditorToken | null = null;
   const voiceMemoToggle = async () => {
     if (isRecordingAudio()) {
+      const editorToken = mobileRecordingEditorToken;
+      mobileRecordingEditorToken = null;
       setRecordingAudio(false);
       let res;
       try {
@@ -2043,13 +2109,16 @@ export function Editor(props: { id: string }): JSX.Element {
         const candidate = captureAssetFileName(res.ext || "m4a");
         try {
           const stored = await trackAssetWrite(backend().importNativeCapture(res.path, candidate));
-          insertStoredAssets([{ stored }]);
+          if (editorToken) insertStoredAssets(editorToken, [{ stored }]);
+          else reportStaleAsset();
         } catch (err) {
           pushToast(`Couldn’t import the recording (${String(err)})`, "error");
         }
       }
       return;
     }
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     let res;
     try {
       res = await backend().startRecording();
@@ -2058,6 +2127,7 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     if (res.status === "recording") {
+      mobileRecordingEditorToken = editorToken;
       setRecordingAudio(true);
       pushToast("Recording… tap the mic again to stop", "info");
     }
@@ -2073,11 +2143,13 @@ export function Editor(props: { id: string }): JSX.Element {
       stopDesktopVoiceRecording();
       return;
     }
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     try {
       const status = await startDesktopVoiceRecording(desktopRecordingOwner, {
         complete: async (bytes, mime, limited) => {
           if (limited) pushToast("Recording limit reached; saving the captured audio", "info");
-          await insertAssetBytes(bytes, undefined, recordingExt(mime));
+          await insertAssetBytes(editorToken, bytes, undefined, recordingExt(mime));
         },
         error: (message) => pushToast(`Couldn’t save the recording (${message})`, "error"),
       });
@@ -2092,28 +2164,15 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const uploadAsset = async () => {
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     const path = await backend().pickFile();
     if (!path) return;
     try {
       // Store with a timestamped name (keeps the original + a sortable insert time).
       const orig = path.split(/[\\/]/).pop() || undefined;
       const saved = await trackAssetWrite(backend().importAsset(path, assetFileName(orig)));
-      const page = pageByName(doc.byId[props.id]?.page ?? "");
-      const md = assetMarkdown(saved, {
-        label: orig,
-        pagePath: page?.path,
-        format: formatForBlock(props.id),
-      });
-      const pos = ref.selectionStart;
-      const nr = ref.value.slice(0, pos) + md + ref.value.slice(pos);
-      commit(nr); // reattach hidden id::/collapsed:: (nr is visible-only text)
-      const c = pos + md.length;
-      queueMicrotask(() => {
-        ref.value = nr;
-        ref.setSelectionRange(c, c);
-        ref.focus();
-        autosize();
-      });
+      insertStoredAssets(editorToken, [{ stored: saved, label: orig }]);
     } catch {
       // ignore failed imports
     }
@@ -2124,6 +2183,8 @@ export function Editor(props: { id: string }): JSX.Element {
   // to Tine the rendered image refreshes (assetRefresh). Mirrors uploadAsset, but
   // the file is created from the registry's blank template rather than picked.
   const createDrawioDiagram = async () => {
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     const ed = MEDIA_EDITORS.find((e) => e.id === "drawio");
     if (!ed?.blank) return;
     try {
@@ -2136,21 +2197,7 @@ export function Editor(props: { id: string }): JSX.Element {
       const saved = await trackAssetWrite(
         backend().saveAsset(captureAssetFileName(ed.blank.ext), bytes)
       );
-      const page = pageByName(doc.byId[props.id]?.page ?? "");
-      const md = assetMarkdown(saved, {
-        pagePath: page?.path,
-        format: formatForBlock(props.id),
-      });
-      const pos = ref.selectionStart;
-      const nr = ref.value.slice(0, pos) + md + ref.value.slice(pos);
-      commit(nr); // reattach hidden id::/collapsed:: (nr is visible-only text)
-      const c = pos + md.length;
-      queueMicrotask(() => {
-        ref.value = nr;
-        ref.setSelectionRange(c, c);
-        ref.focus();
-        autosize();
-      });
+      insertStoredAssets(editorToken, [{ stored: saved }]);
       const cmd = await resolveMediaEditorCommand(ed);
       void backend()
         .editAssetExternal(saved, cmd)
@@ -2833,7 +2880,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const start = ref.selectionStart;
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
-    startEditing(props.id, start);
+    startEditing(props.id, start, null, structuralSurface());
     const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
@@ -2980,14 +3027,14 @@ export function Editor(props: { id: string }): JSX.Element {
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
       if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
-      commit(ref.value); indentBlock(props.id, ref.selectionStart); return true;
+      commit(ref.value); indentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
     },
     "editor/outdent": (e) => {
       e.preventDefault();
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll && ll.indent.length > 0) { nudgeListItem(ll, -2); return true; }
       if (outlineScope?.forceExpandedRoot === doc.byId[props.id]?.parent) return true;
-      commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true;
+      commit(ref.value); outdentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
     },
   };
   const mobileKeyEvent = { preventDefault() {} } as KeyboardEvent;
@@ -3857,6 +3904,8 @@ export function Editor(props: { id: string }): JSX.Element {
       (t) => t.startsWith("image/") || t === "Files"
     );
     const toastId = looksImage ? pushToast("Pasting image…", "info") : 0;
+    const editorToken = captureAssetEditorToken();
+    if (!editorToken) return;
     void (async () => {
       let bytes: Uint8Array | null = null;
       try {
@@ -3865,7 +3914,7 @@ export function Editor(props: { id: string }): JSX.Element {
         if (toastId) dismissToast(toastId);
       }
       if (!bytes) return;
-      insertAssetBytes(bytes);
+      await insertAssetBytes(editorToken, bytes);
     })();
   };
 

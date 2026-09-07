@@ -68,6 +68,16 @@ import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
 import { recordGraphOpenCommand } from "./graphOpenTrace";
 
+export type ConflictCapsuleAuthority =
+  | { kind: "direct_durable"; expected_disk_rev: string }
+  | { kind: "direct_live"; conflict_epoch: number }
+  | { kind: "managed"; path: string; revision: string };
+
+export interface ConflictCapsuleReview {
+  diff: SyncConflictDiff;
+  authority: ConflictCapsuleAuthority;
+}
+
 // Encode asset bytes as one base64 string for the save_*/copy_image IPC. The old
 // `Array.from(bytes)` produced a JSON number[] — ~4-5x the payload + a multi-MB
 // per-element parse and a giant throwaway array on the webview thread for every
@@ -191,15 +201,271 @@ export interface PluginRegistryCacheEnvelope {
   signature: string;
 }
 
-export interface LegacyPluginRegistryCache {
-  indexJson: string;
-  signature: string;
+export type BackendErrorKind =
+  | "save-conflict"
+  | "direct-save-failure"
+  | "sync-data-unavailable"
+  | "managed-graph-mismatch"
+  | "shared-frontier-mismatch"
+  | "adoption-archived"
+  | "sparse-shutdown-refused"
+  | "asset-too-large"
+  | "operation-cancelled"
+  | "managed-actor-refusal";
+
+const BACKEND_ERROR_MESSAGES: Record<
+  Exclude<BackendErrorKind, "save-conflict" | "direct-save-failure" | "managed-actor-refusal">,
+  string
+> = {
+  "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
+  "managed-graph-mismatch": "The shared descriptor names another managed graph.",
+  "shared-frontier-mismatch": "This device's notes are not in the shared provider frontier.",
+  "adoption-archived": "Adoption stopped after this device's own history was archived.",
+  "sparse-shutdown-refused": "Tine-managed storage could not verify a clean stop.",
+  "asset-too-large": "The asset exceeds the safe size limit.",
+  "operation-cancelled": "The operation was cancelled.",
+};
+
+/** The sole frontend family for JSON-tagged native failures. Components branch
+ * on subclasses and never parse the payload string or user-facing wording. */
+export class BackendError extends Error {
+  constructor(readonly kind: BackendErrorKind, message: string) {
+    super(message);
+    this.name = "BackendError";
+  }
+
+  override toString(): string {
+    return this.message;
+  }
+}
+
+export class SyncDataUnavailableError extends BackendError {
+  constructor() {
+    super("sync-data-unavailable", BACKEND_ERROR_MESSAGES["sync-data-unavailable"]);
+    this.name = "SyncDataUnavailableError";
+  }
+}
+
+export class ManagedGraphMismatchError extends BackendError {
+  constructor() {
+    super("managed-graph-mismatch", BACKEND_ERROR_MESSAGES["managed-graph-mismatch"]);
+    this.name = "ManagedGraphMismatchError";
+  }
+}
+
+export type SharedFrontierMismatchSide = "local-only" | "shared-only" | "changed";
+export type SharedFrontierMismatchCategory = "kind" | "preamble" | "outline" | "explicit-ids";
+export interface SharedFrontierMismatchPath {
+  path: string;
+  side: SharedFrontierMismatchSide;
+  categories: SharedFrontierMismatchCategory[];
+}
+/** The bounded, typed detail a clean-join refusal carries so the user who
+ * asked for the join can reconcile it: counts plus at most 32 relative note
+ * paths with their side or changed categories. Never note content. */
+export interface SharedFrontierMismatchDetail {
+  localPages: number;
+  sharedPages: number;
+  localOnly: number;
+  sharedOnly: number;
+  changed: number;
+  paths: SharedFrontierMismatchPath[];
+  omitted: number;
+}
+export const SHARED_FRONTIER_MISMATCH_MAX_PATHS = 32;
+
+export class SharedFrontierMismatchError extends BackendError {
+  constructor(readonly detail: SharedFrontierMismatchDetail | null = null) {
+    super("shared-frontier-mismatch", BACKEND_ERROR_MESSAGES["shared-frontier-mismatch"]);
+    this.name = "SharedFrontierMismatchError";
+  }
+}
+
+export class AdoptionArchivedError extends BackendError {
+  constructor() {
+    super("adoption-archived", BACKEND_ERROR_MESSAGES["adoption-archived"]);
+    this.name = "AdoptionArchivedError";
+  }
+}
+
+export class SparseShutdownRefusedError extends BackendError {
+  constructor() {
+    super("sparse-shutdown-refused", BACKEND_ERROR_MESSAGES["sparse-shutdown-refused"]);
+    this.name = "SparseShutdownRefusedError";
+  }
+}
+
+export class AssetTooLargeError extends BackendError {
+  constructor() {
+    super("asset-too-large", BACKEND_ERROR_MESSAGES["asset-too-large"]);
+    this.name = "AssetTooLargeError";
+  }
+}
+
+export class OperationCancelledError extends BackendError {
+  constructor() {
+    super("operation-cancelled", BACKEND_ERROR_MESSAGES["operation-cancelled"]);
+    this.name = "OperationCancelledError";
+  }
+}
+
+export class ManagedActorRefusalError extends BackendError {
+  constructor(readonly reasonCode: string) {
+    super("managed-actor-refusal", `Managed storage refused the operation (reason code: ${reasonCode}).`);
+    this.name = "ManagedActorRefusalError";
+  }
+}
+
+export class DirectSaveFailureError extends BackendError {
+  constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
+    super("direct-save-failure", `Direct Files could not save (reason code: ${reasonCode}).`);
+    this.name = "DirectSaveFailureError";
+  }
+}
+
+/** A Direct Files revision conflict, classified once at the Tauri wire boundary.
+ * Callers branch on this tag and never inspect arbitrary backend prose. */
+export class SaveConflictError extends BackendError {
+  constructor(
+    readonly epoch: number | null,
+    readonly reasonCode: string = "conflict.base_rev",
+    readonly ioErrorKind: string | null = null,
+  ) {
+    super("save-conflict", "The page changed on disk while it was being edited.");
+    this.name = "SaveConflictError";
+  }
+}
+
+export function isSaveConflictError(error: unknown): error is SaveConflictError {
+  return error instanceof SaveConflictError;
+}
+
+/** The one place a native rejection becomes a typed error. */
+export function classifyNativeCallError(error: unknown): unknown {
+  return classifyTaggedBackendError(error) ?? error;
+}
+
+type TaggedBackendPayload = { kind: string; reason_code?: unknown; detail?: unknown };
+
+const SHARED_FRONTIER_SIDES: readonly SharedFrontierMismatchSide[] = ["local-only", "shared-only", "changed"];
+const SHARED_FRONTIER_CATEGORIES: readonly SharedFrontierMismatchCategory[] = [
+  "kind",
+  "preamble",
+  "outline",
+  "explicit-ids",
+];
+
+function nonNegativeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+const REASON_CODE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/;
+
+function readIoErrorKind(detail: unknown): string | null {
+  if (!detail || typeof detail !== "object") return null;
+  const value = (detail as Record<string, unknown>).io_error_kind;
+  return typeof value === "string" && /^[A-Z][A-Za-z]{0,63}$/.test(value) ? value : null;
+}
+
+/** Validate the native detail object field by field; anything malformed
+ * degrades to a detail-less refusal rather than trusting the payload. */
+function readSharedFrontierMismatchDetail(raw: unknown): SharedFrontierMismatchDetail | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const localPages = nonNegativeCount(record.local_pages);
+  const sharedPages = nonNegativeCount(record.shared_pages);
+  const localOnly = nonNegativeCount(record.local_only);
+  const sharedOnly = nonNegativeCount(record.shared_only);
+  const changed = nonNegativeCount(record.changed);
+  const omitted = nonNegativeCount(record.omitted);
+  if (
+    localPages === null || sharedPages === null || localOnly === null
+    || sharedOnly === null || changed === null || omitted === null
+    || !Array.isArray(record.paths) || record.paths.length > SHARED_FRONTIER_MISMATCH_MAX_PATHS
+  ) {
+    return null;
+  }
+  const paths: SharedFrontierMismatchPath[] = [];
+  for (const entry of record.paths as unknown[]) {
+    if (!entry || typeof entry !== "object") return null;
+    const { path, side, categories } = entry as Record<string, unknown>;
+    if (typeof path !== "string" || path.length === 0) return null;
+    if (!SHARED_FRONTIER_SIDES.includes(side as SharedFrontierMismatchSide)) return null;
+    const known: SharedFrontierMismatchCategory[] = [];
+    if (categories !== undefined) {
+      if (!Array.isArray(categories)) return null;
+      for (const category of categories as unknown[]) {
+        if (!SHARED_FRONTIER_CATEGORIES.includes(category as SharedFrontierMismatchCategory)) return null;
+        known.push(category as SharedFrontierMismatchCategory);
+      }
+    }
+    paths.push({ path, side: side as SharedFrontierMismatchSide, categories: known });
+  }
+  return { localPages, sharedPages, localOnly, sharedOnly, changed, paths, omitted };
+}
+
+function classifyTaggedBackendError(error: unknown): BackendError | null {
+  const message = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : null;
+  if (message === null || message[0] !== "{") return null;
+  let payload: TaggedBackendPayload;
+  try {
+    payload = JSON.parse(message) as TaggedBackendPayload;
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  switch (payload.kind) {
+    case "direct-save-failure": {
+      const ioErrorKind = readIoErrorKind(payload.detail);
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        && ioErrorKind !== null
+        ? new DirectSaveFailureError(payload.reason_code, ioErrorKind)
+        : null;
+    }
+    case "save-conflict": {
+      const ioErrorKind = readIoErrorKind(payload.detail);
+      const epoch = payload.detail && typeof payload.detail === "object"
+        ? (payload.detail as Record<string, unknown>).epoch
+        : undefined;
+      const validEpoch = epoch === null
+        || (typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0);
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        && payload.reason_code.startsWith("conflict.") && ioErrorKind !== null && validEpoch
+        ? new SaveConflictError(epoch as number | null, payload.reason_code, ioErrorKind)
+        : null;
+    }
+    case "sync-data-unavailable":
+      return new SyncDataUnavailableError();
+    case "managed-graph-mismatch":
+      return new ManagedGraphMismatchError();
+    case "shared-frontier-mismatch":
+      return new SharedFrontierMismatchError(
+        payload.detail === undefined ? null : readSharedFrontierMismatchDetail(payload.detail),
+      );
+    case "adoption-archived":
+      return new AdoptionArchivedError();
+    case "sparse-shutdown-refused":
+      return new SparseShutdownRefusedError();
+    case "asset-too-large":
+      return new AssetTooLargeError();
+    case "operation-cancelled":
+      return new OperationCancelledError();
+    case "managed-actor-refusal":
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        ? new ManagedActorRefusalError(payload.reason_code)
+        : null;
+    default:
+      return null;
+  }
 }
 
 export type PluginRegistryCacheLoad =
   | { kind: "absent" }
   | { kind: "envelope"; envelope: PluginRegistryCacheEnvelope }
-  | { kind: "legacy"; indexJson: string; signature: string }
   | { kind: "unsafe"; reason: string };
 
 export type LoadGraphResult =
@@ -252,8 +518,7 @@ export interface Backend {
   loadPluginRegistryCache(): Promise<PluginRegistryCacheLoad>;
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ): Promise<void>;
   /** Keep Android's edge-to-edge status/navigation icon appearance readable
    *  against Tine's explicit in-app theme. Other platforms are a no-op. */
@@ -299,6 +564,16 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
+  /** Publish the durable recovery record for one Direct cross-page move BEFORE
+   *  the first page is written (packet B2, I-3/I-2). `destination` and
+   *  `sources` are the POST-move DTOs, in the exact order the choreography
+   *  saves them. Resolves to the record id, or `null` when no record was
+   *  composed — a degenerate move, or an unavailable app-private root. `null`
+   *  never refuses the move; see `docs/contracts/direct-move-recovery.md` §4. */
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]): Promise<string | null>;
+  /** Retire that record once every participant is durably terminal. Resolves to
+   *  whether it was retired; a record left behind is converged at the next open. */
+  finishDirectCrossPageMove(moveId: string): Promise<boolean>;
   /** X1 native bridge only. Production gesture routing remains disabled until
    * X2 owns quiescence, leases, publication, and semantic history. */
   moveManagedApplicationSubtrees(
@@ -534,7 +809,18 @@ export interface Backend {
     page: PageDto,
     baseRev: string | null,
     conflictEpoch: number,
-  ): Promise<LiveSaveConflictCapture>;
+  ): Promise<LiveSaveConflictCapture | null>;
+  /** App-private, graph-keyed recovery capsules for unresolved live drafts. */
+  loadConflictCapsules?(root: string): Promise<ConflictObject[]>;
+  storeConflictCapsule?(root: string, capsule: ConflictObject): Promise<void>;
+  retireConflictCapsule?(root: string, pageName: string): Promise<void>;
+  conflictCapsuleDiff?(conflict: ConflictObject): Promise<ConflictCapsuleReview>;
+  resolveConflictCapsule?(
+    conflict: ConflictObject,
+    authority: ConflictCapsuleAuthority,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
   durableLiveSaveConflictDiff(page: PageDto, baseText: string | null): Promise<SyncConflictDiff>;
   resolveDurableLiveSaveConflict(
     page: PageDto,
@@ -678,6 +964,8 @@ export interface Backend {
    *  (non-dedup — the filename links the `.edn` `:image <stamp>` to the file).
    *  Returns the assets-relative path. */
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
+  /** Move a just-written area crop to recoverable trash when its sidecar write fails. */
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number): Promise<void>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
@@ -903,8 +1191,13 @@ export function isTauri(): boolean {
  * to a `Graph` that no longer exists once they return.
  *
  * Kept as an explicit list because it is a claim about the backend: each of
- * these was verified to reach `refresh_graph`. Adding a command that reopens the
- * graph without adding it here reintroduces the round-15 blockers.
+ * these reaches `refresh_graph`. Adding a command that reopens the graph without
+ * adding it here reintroduces the round-15 blockers.
+ *
+ * The claim is checked, not asserted: `backend_command_parity.rs`'s
+ * `rebinding_commands_are_exactly_the_commands_that_reopen_the_graph` re-derives
+ * the set by scanning every `#[tauri::command]` in `src-tauri/src` for a
+ * `refresh_graph(` call and fails on any difference in either direction.
  */
 const REBINDING_COMMANDS = new Set([
   "set_default_home",
@@ -976,7 +1269,9 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
-      throw error;
+      // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
+      // save_page and left the resolver recovery branch dead).
+      throw classifyNativeCallError(error);
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
     recordGraphOpenCommand(cmd, started, "completed");
@@ -1065,13 +1360,11 @@ class TauriBackend implements Backend {
   }
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ) {
     return this.call<void>("store_plugin_registry_cache", {
       indexJson,
       signature,
-      expectedLegacy: expectedLegacy ?? null,
     });
   }
   setSystemBarAppearance(dark: boolean) {
@@ -1115,7 +1408,7 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(
+  async savePage(
     page: PageDto,
     baseRev: string | null,
     force = false,
@@ -1131,6 +1424,12 @@ class TauriBackend implements Backend {
         managedConflictObservation,
       })
     );
+  }
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]) {
+    return this.call<string | null>("begin_direct_cross_page_move", { destination, sources });
+  }
+  finishDirectCrossPageMove(moveId: string) {
+    return this.call<boolean>("finish_direct_cross_page_move", { moveId });
   }
   moveManagedApplicationSubtrees(
     bindingGeneration: number,
@@ -1580,10 +1879,46 @@ class TauriBackend implements Backend {
     });
   }
   captureLiveSaveConflict(page: PageDto, baseRev: string | null, conflictEpoch: number) {
-    return this.call<LiveSaveConflictCapture>("capture_live_save_conflict", {
+    return this.call<LiveSaveConflictCapture | null>("capture_live_save_conflict", {
       page,
       baseRev,
       conflictEpoch,
+    });
+  }
+  loadConflictCapsules(root: string) {
+    return this.call<ConflictObject[]>("load_conflict_capsules", { root });
+  }
+  storeConflictCapsule(root: string, capsule: ConflictObject) {
+    return this.call<void>("store_conflict_capsule", { root, capsule });
+  }
+  retireConflictCapsule(root: string, pageName: string) {
+    return this.call<void>("retire_conflict_capsule", { root, pageName });
+  }
+  conflictCapsuleDiff(conflict: ConflictObject) {
+    const live = conflict.live;
+    if (!live) return Promise.reject(new Error("conflict capsule has no retained draft"));
+    return this.call<ConflictCapsuleReview>("conflict_capsule_diff", {
+      page: live.page,
+      baseRev: live.base_rev,
+      conflictEpoch: live.conflict_epoch,
+      baseText: live.base_text,
+      diskRev: live.disk_rev,
+    });
+  }
+  resolveConflictCapsule(
+    conflict: ConflictObject,
+    authority: ConflictCapsuleAuthority,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    const live = conflict.live;
+    if (!live) return Promise.reject(new Error("conflict capsule has no retained draft"));
+    return this.call<PageDto>("resolve_conflict_capsule", {
+      page: live.page,
+      baseRev: live.base_rev,
+      authority,
+      decisions,
+      preChoice,
     });
   }
   durableLiveSaveConflictDiff(page: PageDto, baseText: string | null) {
@@ -1749,6 +2084,9 @@ class TauriBackend implements Backend {
       stamp,
       bytesB64: bytesToBase64(bytes),
     });
+  }
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number) {
+    return this.call<void>("rollback_pdf_area_image", { pdf, page, id, stamp });
   }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
@@ -1931,6 +2269,95 @@ export function backend(): Backend {
     _backend = isTauri() ? new TauriBackend() : mockBackend();
   }
   return _backend;
+}
+
+// Browser/test fallback for the native-only recovery channel. Keeping this
+// adapter beside the Backend boundary avoids teaching the fixture backend about
+// app-data files while preserving the same async contract in UI tests.
+const browserConflictCapsules = new Map<string, Map<string, ConflictObject>>();
+
+export async function loadConflictCapsules(root: string): Promise<ConflictObject[]> {
+  const current = backend();
+  if (current.loadConflictCapsules) return current.loadConflictCapsules(root);
+  return [...(browserConflictCapsules.get(root)?.values() ?? [])]
+    .map((capsule) => structuredClone(capsule));
+}
+
+/** Synchronous browser/test cache view. Native callers return null and must
+ * await the app-private file before graph activation. */
+export function cachedConflictCapsules(root: string): ConflictObject[] | null {
+  if (backend().loadConflictCapsules) return null;
+  return [...(browserConflictCapsules.get(root)?.values() ?? [])]
+    .map((capsule) => structuredClone(capsule));
+}
+
+export async function storeConflictCapsule(root: string, capsule: ConflictObject): Promise<void> {
+  const current = backend();
+  if (current.storeConflictCapsule) return current.storeConflictCapsule(root, capsule);
+  const graph = browserConflictCapsules.get(root) ?? new Map<string, ConflictObject>();
+  graph.set(capsule.page_name, structuredClone(capsule));
+  browserConflictCapsules.set(root, graph);
+}
+
+export async function retireConflictCapsule(root: string, pageName: string): Promise<void> {
+  const current = backend();
+  if (current.retireConflictCapsule) return current.retireConflictCapsule(root, pageName);
+  const graph = browserConflictCapsules.get(root);
+  graph?.delete(pageName);
+  if (graph?.size === 0) browserConflictCapsules.delete(root);
+}
+
+/** One semantic review surface. Native dispatch is storage-mode aware; the
+ * browser fallback models the Direct path for UI tests and demos. */
+export async function reviewConflictCapsule(
+  conflict: ConflictObject,
+): Promise<ConflictCapsuleReview> {
+  const current = backend();
+  if (current.conflictCapsuleDiff) return current.conflictCapsuleDiff(conflict);
+  const live = conflict.live;
+  if (!live) throw new Error("conflict capsule has no retained draft");
+  if (live.disk_rev !== undefined) {
+    return {
+      diff: await current.durableLiveSaveConflictDiff(live.page, live.base_text ?? null),
+      authority: { kind: "direct_durable", expected_disk_rev: live.disk_rev },
+    };
+  }
+  return {
+    diff: await current.liveSaveConflictDiff(live.page, live.base_rev, live.conflict_epoch),
+    authority: { kind: "direct_live", conflict_epoch: live.conflict_epoch },
+  };
+}
+
+export async function resolveConflictCapsule(
+  conflict: ConflictObject,
+  authority: ConflictCapsuleAuthority,
+  decisions: Record<string, MergeDecision>,
+  preChoice: "mine" | "theirs" | "union" = "union",
+): Promise<PageDto> {
+  const current = backend();
+  if (current.resolveConflictCapsule) {
+    return current.resolveConflictCapsule(conflict, authority, decisions, preChoice);
+  }
+  const live = conflict.live;
+  if (!live) throw new Error("conflict capsule has no retained draft");
+  if (authority.kind === "direct_durable") {
+    return current.resolveDurableLiveSaveConflict(
+      live.page,
+      authority.expected_disk_rev,
+      decisions,
+      preChoice,
+    );
+  }
+  if (authority.kind === "direct_live") {
+    return current.resolveLiveSaveConflict(
+      live.page,
+      live.base_rev,
+      authority.conflict_epoch,
+      decisions,
+      preChoice,
+    );
+  }
+  throw new Error("the browser conflict demo has no managed actor");
 }
 
 /** Test-only backend injection for delayed/rejected native-boundary proofs. */

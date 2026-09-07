@@ -41,6 +41,11 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
   backend: () => ({
     savePage: (
       page: { name: string },
@@ -51,17 +56,20 @@ vi.mock("./backend", () => ({
       saved.push({ name: page.name, force: !!force, observation: observation ?? null });
       if (force) {
         if (observation === null || observation !== live) {
-          return Promise.reject(new Error("conflict_authority.superseded: ..."));
+          return Promise.reject({
+            kind: "direct-save-failure",
+            reasonCode: "conflict_authority.superseded",
+          });
         }
         live = null;
-        return Promise.resolve("rev-forced");
+        return Promise.resolve({ revision: "rev-forced" });
       }
       if (refuseGuarded.has(page.name)) {
         live = nextEpoch;
         nextEpoch += 1;
-        return Promise.reject(new Error(`conflict:${live}`));
+        return Promise.reject({ kind: "save-conflict", epoch: live });
       }
-      return Promise.resolve("rev-after");
+      return Promise.resolve({ revision: "rev-after" });
     },
   }),
 }));
@@ -109,10 +117,9 @@ describe("cross-page move barrier vs keep-mine", () => {
     markDirty("Dest");
     await flushPage("Dest");
 
-    // Give the re-issued forced save its microtask.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(saved.map((entry) => entry.name)).toContain("Source");
+    // Wait for the re-issued forced save rather than assuming one microtask
+    // is enough for it; the assertion below is what we are waiting on.
+    await vi.waitFor(() => expect(saved.map((entry) => entry.name)).toContain("Source"));
     expect(saved.find((entry) => entry.name === "Source")?.force).toBe(true);
   });
 

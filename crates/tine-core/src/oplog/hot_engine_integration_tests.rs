@@ -2727,6 +2727,47 @@ fn sparse_archive_open_cost_is_independent_of_unrelated_batch_count() {
 }
 
 #[test]
+fn materialization_block_collection_has_one_owner_and_no_owned_arena() {
+    let source = include_str!("hot_engine.rs");
+    let start = source
+        .find("    fn materialize_page_from_state")
+        .expect("the shared state materializer remains present");
+    let end = source[start..]
+        .find("\n    fn projection_frontier_contains_path_acquisition")
+        .map(|offset| start + offset)
+        .expect("the materialization region remains bounded");
+    let region = &source[start..end];
+
+    assert_eq!(
+        region.matches("let members = read_memberships(").count(),
+        1,
+        "I-12: the from-state and hot paths must share one membership/block collection loop; imitate materialize_page_blocks in oplog/hot_engine.rs"
+    );
+    assert_eq!(
+        region.matches("let mut by_home =").count(),
+        1,
+        "I-12: the home grouping loop must have one owner; imitate materialize_page_blocks in oplog/hot_engine.rs"
+    );
+    assert_eq!(
+        region.matches("self.materialize_page_blocks(").count(),
+        2,
+        "I-12: both materializers must delegate to the one collection helper materialize_page_blocks (oplog/hot_engine.rs)"
+    );
+    assert!(
+        region.contains("MaterializationDocument::Owned(home)"),
+        "I-9: the owned arm must hold at most one hot-document clone at a time (oplog/hot_engine.rs materialize_page_blocks)"
+    );
+    assert!(
+        region.contains(".then(|| document(*home_document_id))"),
+        "I-9: the borrowed arm must resolve documents lazily per home (oplog/hot_engine.rs materialize_page_blocks)"
+    );
+    assert!(
+        !region.contains("BTreeMap<DocumentId, MaterializationDocument"),
+        "I-9: a fold must not retain an all-home owned arena on the hot path; imitate materialize_page_blocks in oplog/hot_engine.rs"
+    );
+}
+
+#[test]
 fn incomplete_store_batch_becomes_ready_without_early_visibility() {
     let ids = Ids::new();
     let dir = TestDir::new("incomplete");
@@ -6463,4 +6504,734 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         .conflict_resolution_intents(suffix.manifest().batch_id())
         .unwrap()
         .is_empty());
+}
+
+fn a3_conflict_history_load_samples(history_size: usize) -> (usize, Vec<usize>) {
+    let ids = Ids::new();
+    let dir = TestDir::new(&format!("a3-conflict-history-{history_size}"));
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let mut author_engine = ids.engine();
+    author_engine.stage_ready(baseline.clone());
+    let mut replay_batches = Vec::with_capacity(history_size);
+
+    for index in 0..history_size {
+        let transaction = tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_c,
+                home_document_id: ids.home_c,
+            },
+            content: format!("unrelated history {index}"),
+        }]);
+        let unique = 0xa3_0000_u64 + index as u64;
+        let prepared = author_engine
+            .prepare_fixture_transaction(author(unique as u128, unique), &transaction)
+            .unwrap();
+        let batch = ready(&archive, &prepared);
+        assert!(matches!(
+            author_engine.stage_ready(batch.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        replay_batches.push(batch);
+    }
+
+    // Rebuild a fresh run-local index while the retained linear history is
+    // delivered newest-first. The ready queue drains it only when the missing
+    // prefix arrives, exercising replay and out-of-order admission together.
+    let mut evaluation_engine = ids.engine();
+    evaluation_engine.stage_ready(baseline.clone());
+    for batch in replay_batches.into_iter().rev() {
+        assert!(!matches!(
+            evaluation_engine.stage_ready(batch).disposition,
+            BatchDisposition::Rejected { .. }
+        ));
+    }
+
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 offline edit".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let unique = 0xa3_f000_u64;
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(unique as u128, unique),
+        edited,
+        author((unique + 1) as u128, unique + 1),
+        deleted,
+    );
+    assert!(matches!(
+        evaluation_engine.stage_ready(edited).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        evaluation_engine.stage_ready(deleted.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    // Model the checkpoint-open boundary before the first evaluation. That
+    // once-per-open O(N) rebuild is deliberately visible in the same counter;
+    // the following steady-state samples remain pair-bounded.
+    evaluation_engine.drop_conflict_history_index_for_test();
+    let rebuild_loads = {
+        assert!(!evaluation_engine
+            .conflict_resolution_intents(deleted.manifest().batch_id())
+            .unwrap()
+            .is_empty());
+        evaluation_engine
+            .instrumentation()
+            .conflict_resolution_history_loads
+    };
+    let steady_state = (0..3)
+        .map(|_| {
+            assert!(!evaluation_engine
+                .conflict_resolution_intents(deleted.manifest().batch_id())
+                .unwrap()
+                .is_empty());
+            evaluation_engine
+                .instrumentation()
+                .conflict_resolution_history_loads
+        })
+        .collect();
+    (rebuild_loads, steady_state)
+}
+
+#[test]
+#[ignore = "harvest A3 scale gate: 50/400/800 replayed histories, medians of three"]
+fn conflict_resolution_history_loads_are_bounded_by_unresolved_pairs() {
+    const UNRESOLVED_PAIRS: usize = 1;
+    const LOAD_BOUND: usize = 8 * UNRESOLVED_PAIRS + 64;
+    let mut medians = Vec::new();
+    for history_size in [50_usize, 400, 800] {
+        let (rebuild_loads, mut samples) = a3_conflict_history_load_samples(history_size);
+        assert!(
+            rebuild_loads >= history_size,
+            "I-15: the once-per-open conflict-index rebuild must remain visible to the A3 counter; imitate conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index"
+        );
+        samples.sort_unstable();
+        let median = samples[1];
+        eprintln!(
+            "A3 history={history_size} unresolved={UNRESOLVED_PAIRS} rebuild_loads={rebuild_loads} steady_samples={samples:?} median={median} bound={LOAD_BOUND}"
+        );
+        medians.push((history_size, median));
+    }
+    for (history_size, median) in medians {
+        assert!(
+            median <= LOAD_BOUND,
+            "I-14: conflict evaluation loaded {median} accepted batches at history {history_size}; bound {LOAD_BOUND}. Evaluation cost must scale with unresolved pairs, not history; imitate oplog/conflict_history.rs"
+        );
+    }
+}
+
+#[test]
+fn conflict_resolution_is_invariant_to_concurrent_batch_delivery_order() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-conflict-permutation");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "permuted concurrent edit".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f300, 0xa3_f300),
+        edited,
+        author(0xa3_f301, 0xa3_f301),
+        deleted,
+    );
+    let child = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(edited.clone());
+        let transaction = tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            content: "causal child of the permuted edit".into(),
+        }]);
+        let prepared = author_engine
+            .prepare_fixture_transaction(author(0xa3_f302, 0xa3_f302), &transaction)
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    let edited_id = edited.manifest().batch_id();
+    let deleted_id = deleted.manifest().batch_id();
+    let child_id = child.manifest().batch_id();
+    let build = |order: [ValidatedBatch; 3]| {
+        let mut engine = ids.engine();
+        engine.stage_ready(baseline.clone());
+        for batch in order {
+            assert!(!matches!(
+                engine.stage_ready(batch).disposition,
+                BatchDisposition::Rejected { .. }
+            ));
+        }
+        engine
+    };
+    let forward = build([edited.clone(), child.clone(), deleted.clone()]);
+    let reverse = build([deleted, child, edited]);
+    let collect = |engine: &ShardedHotEngine| {
+        let mut intents = Vec::new();
+        for batch_id in [edited_id, deleted_id, child_id] {
+            for intent in engine.conflict_resolution_intents(batch_id).unwrap() {
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            }
+        }
+        intents.sort_by_key(|intent| format!("{intent:?}"));
+        intents
+    };
+
+    let forward_intents = collect(&forward);
+    let reverse_intents = collect(&reverse);
+    assert_eq!(
+        forward_intents.len(),
+        2,
+        "the four-batch permutation fixture must retain both real conflict intents"
+    );
+    assert_eq!(
+        forward_intents, reverse_intents,
+        "I-12: four accepted batches delivered in either valid order must derive identical conflict intents; imitate causal_clock_contains_dot"
+    );
+    let forward_pairs = forward.conflict_history_unresolved_pair_count_for_test();
+    let reverse_pairs = reverse.conflict_history_unresolved_pair_count_for_test();
+    assert_eq!(
+        forward_pairs, 2,
+        "the four-batch permutation fixture must retain both unresolved causal pairs"
+    );
+    assert_eq!(
+        forward_pairs, reverse_pairs,
+        "I-12: unresolved-pair accounting must be permutation invariant"
+    );
+}
+
+#[test]
+fn conflict_history_index_rebuild_matches_incremental_resolution_results() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-conflict-index-rebuild");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 rebuilt conflict".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f100, 0xa3_f100),
+        edited,
+        author(0xa3_f101, 0xa3_f101),
+        deleted,
+    );
+    let engine = apply_pair(ids, &baseline, edited, deleted.clone());
+    let before = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    let snapshot = engine.canonical_snapshot().unwrap();
+
+    // A clean checkpoint intentionally carries no copy of this disposable
+    // cache. Dropping it models that open boundary; the next evaluation must
+    // reconstruct the exact candidates from accepted batches.
+    engine.drop_conflict_history_index_for_test();
+    let rebuilt = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    assert_eq!(rebuilt, before);
+    assert_eq!(engine.canonical_snapshot().unwrap(), snapshot);
+}
+
+/// I-14: the once-per-open conflict-backlog reseed classifies linearity from
+/// manifests alone. A checkpoint-restored engine (no disposable index) must
+/// answer `accepted_nonlinear_batch_ids` WITHOUT rebuilding the index, or the
+/// first tick after every open loads and re-derives the entire accepted
+/// history (wave-3 A3 review, required neighbor). The rebuild stays lazy:
+/// it happens on the first evaluation that actually needs the index.
+#[test]
+fn conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-reseed-no-rebuild");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 reseed without rebuild".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f200, 0xa3_f200),
+        edited,
+        author(0xa3_f201, 0xa3_f201),
+        deleted,
+    );
+    let engine = apply_pair(ids, &baseline, edited, deleted.clone());
+    let expected = engine.accepted_nonlinear_batch_ids().unwrap();
+    assert_eq!(expected, vec![deleted.manifest().batch_id()]);
+
+    // Model the checkpoint-open boundary: the disposable index is absent.
+    engine.drop_conflict_history_index_for_test();
+    assert!(!engine.conflict_history_index_is_current_for_test());
+
+    let reseeded = engine.accepted_nonlinear_batch_ids().unwrap();
+    assert_eq!(reseeded, expected);
+    assert!(
+        !engine.conflict_history_index_is_current_for_test(),
+        "I-14: the reopen reseed must classify linearity from manifests, not rebuild the \
+         conflict-history index over every accepted batch; imitate \
+         accepted_batch_is_causally_linear in oplog/hot_engine.rs"
+    );
+
+    // The first real evaluation rebuilds it, once.
+    let intents = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    assert!(!intents.is_empty());
+    assert!(engine.conflict_history_index_is_current_for_test());
+}
+// ---------------------------------------------------------------------------
+// Harvest A4 — run-local identity indexes have NO fixed capacity (FIXED).
+//
+// Four run-local identity maps (page names, portable paths, block claims,
+// Logseq claims) were introduced with a shared fixed capacity of 4,096 and
+// refused when full. The budgets counted lifetime-DISTINCT identities with no
+// removal path, so the refusal was permanent across reopen (I-10), and the
+// block-claim member refused only at ACCEPTANCE — after the drain had
+// published the manifest — turning a reported save into a permanently
+// unopenable store. No refusal in the family ever named an in-scope threat
+// scenario (I-8), so the fix REMOVED all four caps; the maps grow with
+// lifetime-distinct identities, bounded by archive rebaselining (SPEC-A A5
+// decision block). See A4-fix-dossier.md and RECEIPT-repro.md.
+//
+// The tests below guard the FIXED behavior by driving every path past the
+// removed capacity value.
+// ---------------------------------------------------------------------------
+
+/// The removed caps' shared value. Tests drive past it so any reintroduced
+/// fixed capacity at or below this scale fails them.
+const A4_REMOVED_CAP: usize = 4_096;
+
+#[test]
+fn a4_run_local_identity_indexes_have_no_fixed_capacity() {
+    let index_source = include_str!("page_name_index.rs");
+    let engine_source = include_str!("hot_engine.rs");
+    for (name, source) in [
+        ("page_name_index.rs", index_source),
+        ("hot_engine.rs", engine_source),
+    ] {
+        assert!(
+            !source.contains("MAX_EPHEMERAL"),
+            "{name} reintroduced a run-local identity capacity. Run-local identity \
+             indexes must not refuse at a fixed capacity: such a refusal names no \
+             in-scope threat scenario (I-8) and is permanent across reopen because \
+             replay refills the maps to identical occupancy (I-10). See \
+             specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md."
+        );
+        assert!(
+            !source.contains("reached its fixed capacity"),
+            "{name} reintroduced a fixed-capacity refusal (I-8/I-10; see \
+             A4-fix-dossier.md)"
+        );
+    }
+    // There is exactly one page-name transition access implementation, so the
+    // guards above cover the ONLY page-name index Tine has.
+    assert_eq!(
+        index_source
+            .matches("impl PageNameTransitionAccess for")
+            .count(),
+        1,
+        "a second page-name transition access would change what these guards cover"
+    );
+}
+
+fn a4_page_id(index: usize) -> PageId {
+    PageId::from_uuid(uuid(0xa4_0000_0000 + index as u128))
+}
+
+fn a4_home_id(index: usize) -> DocumentId {
+    DocumentId::from_uuid(uuid(0xa4_4000_0000 + index as u128))
+}
+
+fn a4_create_pages(
+    engine: &ShardedHotEngine,
+    batch: u128,
+    range: std::ops::Range<usize>,
+) -> Result<PreparedBatch, EngineError> {
+    engine.prepare_fixture_transaction(
+        author(batch, batch as u64),
+        &tx(range
+            .map(|index| SemanticOperation::CreatePage {
+                page_id: a4_page_id(index),
+                home_document_id: a4_home_id(index),
+                name: crate::oplog::LogicalPageName::parse(&format!("A4 Page {index}")).unwrap(),
+                path: path(&format!("pages/a4-{index}.md")),
+                kind: ManagedTextKind::Page,
+            })
+            .collect()),
+    )
+}
+
+/// Accept `count` distinct page names in chunks and return the number of
+/// accepted batches.
+fn a4_seed_names(
+    engine: &mut ShardedHotEngine,
+    archive: &ObjectStore,
+    batch_base: u128,
+    count: usize,
+    chunk: usize,
+) -> usize {
+    let mut accepted = 0;
+    let mut index = 0;
+    while index < count {
+        let end = (index + chunk).min(count);
+        let prepared = a4_create_pages(engine, batch_base + accepted as u128, index..end)
+            .unwrap_or_else(|error| panic!("seeding names {index}..{end} refused: {error:?}"));
+        let disposition = engine.stage_ready(ready(archive, &prepared)).disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "seeding names {index}..{end} was not accepted: {disposition:?}"
+        );
+        accepted += 1;
+        index = end;
+    }
+    accepted
+}
+
+/// Past the removed cap, every page-level operation keeps working: create,
+/// same-path rename (page-name index only), delete, and rename back. Before
+/// the fix, all of these were refused at 4,096 lifetime-distinct names with
+/// no removal path (see RECEIPT-repro.md).
+#[test]
+#[ignore = "harvest A4 guard: seeds 4,096 real page names (~15s debug)"]
+fn a4_page_operations_continue_past_the_removed_cap() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-wedge");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+
+    let seeded_batches = a4_seed_names(&mut engine, &archive, 0xa4_0000, A4_REMOVED_CAP, 256);
+    eprintln!("a4_cap seeded_names={A4_REMOVED_CAP} seeded_batches={seeded_batches}");
+    assert!(paged_fatal_evidence(&engine).is_none());
+
+    // The 4,097th lifetime-distinct page must draft AND be accepted; this
+    // consumes both a page-name and a portable-path record past the old caps.
+    let past_cap = a4_create_pages(&engine, 0xa4_9000, A4_REMOVED_CAP..A4_REMOVED_CAP + 1)
+        .expect("the 4,097th distinct page must draft (I-8/I-10, A4-fix-dossier.md)");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &past_cap)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Same-path rename to a brand-new NAME touches ONLY the page-name index.
+    let isolated = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9500, 0xa4_9500),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Isolated New Name").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("a same-path rename past the removed page-name cap must draft");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &isolated)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Block-level work keeps working too.
+    let block_edit = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9001, 0xa4_9001),
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: crate::oplog::BlockId::from_uuid(uuid(0xa4_8000)),
+                    home_document_id: a4_home_id(0),
+                },
+                page_id: a4_page_id(0),
+                parent: None,
+                order: "a".into(),
+                content: "past-cap block write".into(),
+            }]),
+        )
+        .expect("block-only work drafts past the removed caps");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &block_edit)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Deleting a page works (the removed portable-path check used to charge
+    // the batch's whole changed set and refused even deletes).
+    let delete = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9002, 0xa4_9002),
+            &tx(vec![SemanticOperation::DeletePage {
+                page_id: a4_page_id(1),
+            }]),
+        )
+        .expect("deleting a page past the removed caps must draft");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &delete)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Renaming back to an already-held name works.
+    let rename_back = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9003, 0xa4_9003),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Page 0").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("renaming back past the removed caps must draft");
+    assert!(matches!(
+        engine
+            .stage_ready(ready(&archive, &rename_back))
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(paged_fatal_evidence(&engine).is_none());
+}
+
+/// Reopen behavior past the removed cap: replaying the accepted tail into a
+/// fresh engine succeeds, post-reopen page work succeeds, and a peer-authored
+/// new name is ACCEPTED by a receiver whose indexes are past the old cap
+/// (before the fix the peer batch was rejected — a sync/portability hazard).
+#[test]
+#[ignore = "harvest A4 guard: seeds 4,097 real page names twice (~30s debug)"]
+fn a4_reopen_replays_past_the_removed_cap_and_accepts_peer_names() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-reopen");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    a4_seed_names(&mut engine, &archive, 0xa4_0000, A4_REMOVED_CAP + 1, 256);
+
+    // Reopen: replay every committed manifest into a fresh sequence-zero
+    // engine, exactly as `replay_clean_committed_tail` does at open.
+    let mut replay = ids.engine();
+    let manifests = archive.committed_manifests().unwrap();
+    let mut replayed = 0;
+    for manifest in &manifests {
+        let disposition = replay
+            .stage_from_store(&archive, manifest.batch_id())
+            .unwrap()
+            .disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "replay of {} was not accepted: {disposition:?}",
+            manifest.batch_id()
+        );
+        replayed += 1;
+    }
+    eprintln!(
+        "a4_reopen replayed_batches={replayed} manifests={}",
+        manifests.len()
+    );
+    assert!(paged_fatal_evidence(&replay).is_none());
+
+    // Post-reopen page-name work succeeds.
+    let after_reopen = replay
+        .prepare_fixture_transaction(
+            author(0xa4_9100, 0xa4_9100),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Post Reopen Name").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("post-reopen rename past the removed cap must draft");
+    assert!(matches!(
+        replay
+            .stage_ready(ready(&archive, &after_reopen))
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A peer legitimately authors a new name; the receiver must accept it.
+    let peer = ids.engine();
+    let peer_batch = a4_create_pages(&peer, 0xa4_9200, 900_000..900_001)
+        .expect("an empty peer engine can acquire a new page name");
+    let peer_dir = TestDir::new("a4-cap-peer");
+    let peer_archive = ObjectStore::open(&peer_dir.path().join("store"), ids.workspace).unwrap();
+    let delivered = replay
+        .stage_ready(ready(&peer_archive, &peer_batch))
+        .disposition;
+    assert!(
+        matches!(delivered, BatchDisposition::Accepted { .. }),
+        "a receiver past the removed cap must accept a peer-authored name: {delivered:?}"
+    );
+}
+
+/// The block-claim member of the removed family: before the fix it had no
+/// authoring-time pre-check, so its refusal landed at ACCEPTANCE — after the
+/// drain had published the manifest — and the store became permanently
+/// unopenable (`OpenRefused`) from ordinary editing. Past the removed cap,
+/// every batch must be accepted and the index simply grows.
+#[test]
+#[ignore = "harvest A4 guard: creates 8,192 real blocks (~30s debug)"]
+fn a4_block_claims_grow_past_the_removed_cap_through_acceptance() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-block-claims");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    let seed = a4_create_pages(&engine, 0xa4_0000, 0..1).unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &seed)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    const CHUNK: usize = 256;
+    let target = A4_REMOVED_CAP * 2;
+    let mut made = 0usize;
+    let mut batch = 0xa4_b000u128;
+    while made < target {
+        let prepared = engine
+            .prepare_fixture_transaction(
+                author(batch, batch as u64),
+                &tx((made..made + CHUNK)
+                    .map(|index| SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: crate::oplog::BlockId::from_uuid(uuid(
+                                0xa4_c000_0000 + index as u128,
+                            )),
+                            home_document_id: a4_home_id(0),
+                        },
+                        page_id: a4_page_id(0),
+                        parent: None,
+                        order: format!("{index:08}").into(),
+                        content: format!("a4 block {index}"),
+                    })
+                    .collect()),
+            )
+            .expect("block creation past the removed cap must draft");
+        let disposition = engine.stage_ready(ready(&archive, &prepared)).disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "block batch at {made} lifetime blocks was not accepted \
+             (I-8/I-10, A4-fix-dossier.md): {disposition:?}"
+        );
+        made += CHUNK;
+        batch += 1;
+    }
+    assert_eq!(
+        engine.instrumentation().block_claim_hot_entries,
+        target,
+        "the run-local block-claim index simply grows with lifetime blocks"
+    );
+}
+
+/// What the run-local page-name index costs on the WAITED OPEN PATH
+/// (measurement, unchanged by the fix): `replay_clean_committed_tail` reruns
+/// every committed manifest through `validate_and_apply` at every open, and
+/// each replayed batch refills the identity indexes. Cost is proportional to
+/// lifetime accepted history (I-14); the stated bound is archive rebaselining
+/// (SPEC-A A5 decision block).
+#[test]
+#[ignore = "harvest A4 measurement: seeds and replays up to 4,096 page names"]
+fn a4_measure_committed_tail_replay_cost_by_lifetime_page_names() {
+    for names in [512usize, 1_024, 2_048, A4_REMOVED_CAP] {
+        let ids = Ids::new();
+        let dir = TestDir::new("a4-replay-cost");
+        let archive = store(&dir, ids);
+        let mut engine = ids.engine();
+        let seed_started = std::time::Instant::now();
+        let batches = a4_seed_names(&mut engine, &archive, 0xa4_0000, names, 256);
+        let seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+
+        let manifests = archive.committed_manifests().unwrap();
+        let mut replay = ids.engine();
+        let replay_started = std::time::Instant::now();
+        for manifest in &manifests {
+            let disposition = replay
+                .stage_from_store(&archive, manifest.batch_id())
+                .unwrap()
+                .disposition;
+            assert!(
+                matches!(disposition, BatchDisposition::Accepted { .. }),
+                "replay of {} was not accepted: {disposition:?}",
+                manifest.batch_id()
+            );
+        }
+        let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "a4_replay names={names} batches={batches} manifests={} seed_ms={seed_ms:.1} \
+             replay_ms={replay_ms:.1} replay_ms_per_name={:.3} block_claim_entries={}",
+            manifests.len(),
+            replay_ms / names as f64,
+            replay.instrumentation().block_claim_hot_entries
+        );
+    }
+}
+
+/// I-12 guard for W4-G1 item 11. The tick's skip cause and the capture's
+/// refusal must come from ONE predicate; the wave-4 manager review found them
+/// forked (`capture_clean_checkpoint` kept its own copy of the eight
+/// eligibility predicates while the scheduler had grown a second answer), so
+/// the engine could have refused a capture the tick reported as eligible.
+#[test]
+fn clean_checkpoint_capture_eligibility_has_one_producer() {
+    let source = include_str!("hot_engine.rs");
+    assert_eq!(
+        source.matches("self.persisted_staged.is_empty()").count(),
+        1,
+        "I-12: clean-checkpoint capture eligibility must have exactly ONE producer, \
+         `clean_checkpoint_capture_skip_reason`. A second copy of these predicates lets \
+         the tick's reported cause and the capture's refusal drift apart. \
+         Imitate `causal_clock_contains_dot` in `oplog/conflict_history.rs`."
+    );
+    assert_eq!(
+        source
+            .matches("clean_checkpoint_capture_skip_reason(durable_sequence)")
+            .count(),
+        2,
+        "I-12: both `schedule_clean_checkpoint` and `capture_clean_checkpoint` must ask \
+         the single eligibility predicate rather than re-deriving it"
+    );
 }

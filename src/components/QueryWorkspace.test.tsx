@@ -15,6 +15,7 @@ import {
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
 import { pageInventoryRev } from "../ui";
+import { SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
@@ -24,7 +25,7 @@ afterEach(() => {
 function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}): MaterializeQueryDependencies {
   return {
     getPage: vi.fn(async () => null),
-    savePage: vi.fn(async () => "rev-new"),
+    savePage: vi.fn(async () => ({ revision: "rev-new" })),
     runGraphSearch: vi.fn(async () => ({ hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false })),
     ...overrides,
   };
@@ -149,7 +150,7 @@ describe("materializeQueryWorkspace", () => {
 
   it("keeps the workspace virtual when a create race reaches the save guard", async () => {
     const deps = materializeDeps({
-      savePage: vi.fn(async () => { throw new Error("conflict:17"); }),
+      savePage: vi.fn(async () => { throw new SaveConflictError(17); }),
     });
     const result = await materializeQueryWorkspace({
       title: "Raced",
@@ -244,7 +245,7 @@ function executionFixture(explained: boolean): QueryExecution {
 function workspaceDeps(): QueryWorkspaceDependencies {
   return {
     getPage: vi.fn(async () => null),
-    savePage: vi.fn(async () => "saved-rev"),
+    savePage: vi.fn(async () => ({ revision: "saved-rev" })),
     runGraphSearch: vi.fn(async (_source, pageLimit, blockLimit, _lane, explain) =>
       pageLimit === 0 && blockLimit === 0
         ? { hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false }
@@ -281,10 +282,18 @@ describe("QueryWorkspace", () => {
 
       root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
       expect(root.querySelector(".qb-menu")).not.toBeNull();
+
+      // Rung one: Escape peels the child popover and leaves the modal standing.
+      expect(dismissTopTransient("escape")).toBe(true);
+      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
+
+      // Same rung by pointer (GH #472): a press on the modal's own header is an
+      // outside press for the clause menu, so the menu closes and only the menu.
+      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
+      expect(root.querySelector(".qb-menu")).not.toBeNull();
       dialog.querySelector(".query-advanced-header")!
         .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-
-      expect(dismissTopTransient("escape")).toBe(true);
       expect(root.querySelector(".qb-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
       expect(root.querySelector<HTMLTextAreaElement>(".query-dsl-editor textarea")?.value).toBe(route.source);

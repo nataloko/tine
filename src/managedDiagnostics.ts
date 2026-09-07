@@ -1,3 +1,9 @@
+import {
+  SharedFrontierMismatchError,
+  type SharedFrontierMismatchCategory,
+  type SharedFrontierMismatchPath,
+} from "./backend";
+
 /**
  * Reduce a native managed-storage failure to one bounded, shareable line.
  *
@@ -5,10 +11,52 @@
  * credentials, or an arbitrarily long debug chain. Recovery UI may preserve
  * the causal class, but must never echo those values to the screen or clipboard.
  */
+/** A closed backend vocabulary token: no spaces, no punctuation graph text can reach. */
+const TAGGED_TOKEN = /^[a-z][a-z0-9_.-]{0,63}$/u;
+/** A refusal scenario id, e.g. `MS-REF-PROTOCOL-INCOMPATIBLE`. */
+const TAGGED_SCENARIO = /^[A-Z][A-Z0-9-]{0,63}$/u;
+
+/**
+ * Render a tagged backend error envelope, or `null` when this is ordinary prose.
+ *
+ * A typed backend failure arrives as `{"kind":…,"reason_code":…}` — every field
+ * a closed vocabulary the backend authored, with nothing left to vouch for. The
+ * prose sanitizer below cannot read it: it collapses any `{…}` group to
+ * `[details]`, which then carries no diagnostic word, so the whole envelope
+ * became "The command failed without a safe diagnostic detail." That is the
+ * exact failure the sanitizer's own comments were written about, and typing the
+ * error was supposed to make the reason MORE legible, not less. Recognize the
+ * envelope by shape and render it from its own vocabulary; anything that is not
+ * this exact shape falls through to the prose path and is sanitized as before.
+ */
+function taggedBackendErrorDetail(firstLine: string): string | null {
+  if (!firstLine.startsWith("{")) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(firstLine);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const { kind, reason_code: reasonCode, detail } = payload as Record<string, unknown>;
+  if (typeof kind !== "string" || !TAGGED_TOKEN.test(kind)) return null;
+  if (typeof reasonCode !== "string" || !TAGGED_TOKEN.test(reasonCode)) return null;
+  let rendered = `${kind} failure: ${reasonCode}`;
+  if (typeof detail === "object" && detail !== null) {
+    const scenario = (detail as Record<string, unknown>).scenario;
+    if (typeof scenario === "string" && TAGGED_SCENARIO.test(scenario)) {
+      rendered = `${rendered} (${scenario})`;
+    }
+  }
+  return rendered;
+}
+
 export function safeManagedErrorDetail(error: unknown): string {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   const firstLine = message.split(/[\r\n]/, 1)[0]?.trim() ?? "";
   if (!firstLine) return "The command did not provide a safe diagnostic detail.";
+  const tagged = taggedBackendErrorDetail(firstLine);
+  if (tagged) return tagged;
   let safe = firstLine
     .replace(/\bfile:\/\/\/[^\s"'<>]+/giu, "[path]")
     // A page path is the one path whose LAST segment routinely contains
@@ -82,59 +130,42 @@ export interface ManagedJoinErrorDetail {
   copy: string;
 }
 
-const CLEAN_JOIN_SUMMARY = "sync join refused: notes not in the shared provider frontier";
-const CLEAN_JOIN_DETAIL = "clean join mismatch detail: ";
-const QUOTED_RUST_PATH = String.raw`("(?:\\.|[^"\\])*")`;
-const SIDE_PATH_RE = new RegExp(
-  String.raw`^(local-only|shared-only) path=${QUOTED_RUST_PATH}$`,
-  "u",
-);
-const CHANGED_PATH_RE = new RegExp(
-  String.raw`^changed path=${QUOTED_RUST_PATH} categories=([a-z-]+(?:,[a-z-]+)*)$`,
-  "u",
-);
-const OMITTED_RE = /^(\d+) additional mismatches omitted$/u;
-
-function readableJoinCategory(category: string): string {
+function readableJoinCategory(category: SharedFrontierMismatchCategory): string {
   return {
     kind: "file format",
     preamble: "text before the first block",
     outline: "blocks, content, or order",
     "explicit-ids": "explicit block IDs",
-  }[category] ?? category;
+  }[category];
+}
+
+function describeJoinPath(entry: SharedFrontierMismatchPath): string {
+  const quoted = JSON.stringify(entry.path);
+  switch (entry.side) {
+    case "local-only":
+      return `Only on this device: ${quoted}`;
+    case "shared-only":
+      return `Only in shared notes: ${quoted}`;
+    case "changed":
+      return `Changed (${entry.categories.map(readableJoinCategory).join(", ")}): ${quoted}`;
+  }
 }
 
 /**
  * Keep the general diagnostic/report boundary path-free, but expose the core's
- * narrowly-authored mismatch records to the user who explicitly attempted the
- * join. Paths are required to reconcile a refusal; Solid renders this as text,
- * and the core already bounds the list to 32 records.
+ * bounded typed mismatch records to the user who explicitly attempted the join.
+ * Paths are required to reconcile a refusal; Solid renders this as text, and
+ * the core already bounds the list to 32 records. Only the typed
+ * `SharedFrontierMismatchError` detail is ever shown; no error prose is parsed.
  */
 export function managedJoinErrorDetail(error: unknown): ManagedJoinErrorDetail {
   const summary = safeManagedErrorDetail(error);
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (!message.split(/[\r\n]/u, 1)[0]?.includes(CLEAN_JOIN_SUMMARY)) {
+  if (!(error instanceof SharedFrontierMismatchError) || !error.detail) {
     return { visible: summary, copy: summary };
   }
-
-  const details: string[] = [];
-  for (const rawLine of message.split(/\r?\n/u).slice(1, 35)) {
-    if (!rawLine.startsWith(CLEAN_JOIN_DETAIL)) continue;
-    const line = rawLine.slice(CLEAN_JOIN_DETAIL.length);
-    const side = SIDE_PATH_RE.exec(line);
-    if (side) {
-      const sideLabel = side[1] === "local-only" ? "Only on this device" : "Only in shared notes";
-      details.push(`${sideLabel}: ${side[2]}`);
-      continue;
-    }
-    const changed = CHANGED_PATH_RE.exec(line);
-    if (changed) {
-      const categories = changed[2]!.split(",").map(readableJoinCategory).join(", ");
-      details.push(`Changed (${categories}): ${changed[1]}`);
-      continue;
-    }
-    const omitted = OMITTED_RE.exec(line);
-    if (omitted) details.push(`${omitted[1]} additional affected notes omitted by the backend.`);
+  const details = error.detail.paths.map(describeJoinPath);
+  if (error.detail.omitted > 0) {
+    details.push(`${error.detail.omitted} additional affected notes omitted by the backend.`);
   }
   if (details.length === 0) return { visible: summary, copy: summary };
 

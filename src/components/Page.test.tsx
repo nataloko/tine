@@ -30,7 +30,8 @@ import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
   await initParser();
@@ -43,6 +44,7 @@ afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  resetSharedQueryResultsForTests();
   endEdit("blur");
   closeContextMenu();
   resetStore();
@@ -104,6 +106,7 @@ function graphMetaWithTemplate(template: string | null): GraphMeta {
     shortcuts: {},
     start_of_week: 6,
     block_hidden_properties: [],
+    linked_references_collapsed_threshold: 100,
     default_journal_template: template,
     favorites: [],
     journal_page_title_format: "MMM do, yyyy",
@@ -146,7 +149,7 @@ describe("Journals feed generation lifecycle", () => {
     };
     vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise(() => {}));
     vi.spyOn(backend(), "getPage").mockResolvedValue(existing);
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("sparse-saved-rev");
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "sparse-saved-rev" });
     const mounted = mount(() => <PageView />);
     try {
       await flushMicrotasks();
@@ -305,7 +308,7 @@ describe("Journals feed generation lifecycle", () => {
     const save = vi.spyOn(backend(), "savePage").mockImplementation(() =>
       new Promise((resolve) => {
         events.push("save");
-        releaseSave = () => resolve("rollover-rev");
+        releaseSave = () => resolve({ revision: "rollover-rev" });
       })
     );
     const mounted = mount(() => <PageView />);
@@ -449,7 +452,7 @@ describe("Journals feed generation lifecycle", () => {
     let saved: Promise<boolean> | null = null;
     let releaseSave: (() => void) | null = null;
     if (gate === "saving") {
-      vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => { releaseSave = () => resolve("rev"); }));
+      vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => { releaseSave = () => resolve({ revision: "rev" }); }));
       saved = flushPage(today);
       await flushMicrotasks();
     }
@@ -463,7 +466,7 @@ describe("Journals feed generation lifecycle", () => {
       if (gate === "dirty") {
         // Saving is the real dirty release and bumps dataRev after the backend
         // accepts it; leave the PageView retry effect to consume that event.
-        vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+        vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev" });
         await flushPage(today);
         await new Promise<void>((resolve) => setTimeout(resolve, 750));
       }
@@ -798,8 +801,8 @@ describe("tag-page table", () => {
         ],
       },
     ];
-    vi.spyOn(backend(), "runQuery").mockResolvedValue(groups);
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev1");
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue(groups);
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev1" });
 
     const tagPage = pageByName("Tag")!;
     const { root, dispose } = mount(() => (
@@ -820,6 +823,11 @@ describe("tag-page table", () => {
     await tick();
     expect(root.textContent).toContain("Tagged row");
     expect(root.textContent).toContain("Martin");
+    expect(runQuery).toHaveBeenCalledTimes(1);
+
+    setDataRev((revision) => revision + 1);
+    await tick();
+    expect(runQuery).toHaveBeenCalledTimes(2);
 
     (root.querySelector(".sheet-add-row-ghost") as HTMLButtonElement).click();
     await flushMicrotasks();
@@ -834,6 +842,87 @@ describe("tag-page table", () => {
     expect(doc.byId[newId].raw).toMatch(/^#Tag\s*$/);
     expect(editingId()).toBe(newId);
 
+    dispose();
+  });
+
+  // Harvest W4-P1 item 4 — MEASUREMENT, not a cut. "Three split panes issue
+  // three runQuery calls" does not by itself prove amplification: three panes
+  // may be asking three real questions. So both controls run. The bound is one
+  // call per DISTINCT (page, dataRev) question, per invalidation.
+  it("issues one tag query per distinct routed page per invalidation, not one per consumer", async () => {
+    const INVALIDATIONS = 5;
+    const names = ["TagA", "TagB", "TagC"];
+    setDoc({
+      byId: {},
+      pages: names.map((name) => page(name, "page", [])),
+      feed: ["TagA"],
+      loaded: true,
+    });
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue([] as RefGroup[]);
+
+    // (a) three consumers, ONE routed page.
+    const same = mount(() => (
+      <>
+        <TagTableToggle page={pageByName("TagA")!} />
+        <TagPageTable pageName="TagA" />
+        <TagPageTable pageName="TagA" />
+      </>
+    ));
+    await tick();
+    await flushMicrotasks();
+    const samePerInvalidation: number[] = [];
+    for (let i = 0; i < INVALIDATIONS; i++) {
+      runQuery.mockClear();
+      setDataRev((revision) => revision + 1);
+      await tick();
+      await flushMicrotasks();
+      samePerInvalidation.push(runQuery.mock.calls.length);
+    }
+    same.dispose();
+    resetSharedQueryResultsForTests();
+
+    // (b) three consumers, THREE distinct routed pages.
+    const distinct = mount(() => (
+      <>
+        <TagPageTable pageName="TagA" />
+        <TagPageTable pageName="TagB" />
+        <TagPageTable pageName="TagC" />
+      </>
+    ));
+    await tick();
+    await flushMicrotasks();
+    const distinctPerInvalidation: number[] = [];
+    const distinctPagesAsked = new Set<string>();
+    for (let i = 0; i < INVALIDATIONS; i++) {
+      runQuery.mockClear();
+      setDataRev((revision) => revision + 1);
+      await tick();
+      await flushMicrotasks();
+      distinctPerInvalidation.push(runQuery.mock.calls.length);
+      for (const [dsl] of runQuery.mock.calls) distinctPagesAsked.add(String(dsl));
+    }
+    distinct.dispose();
+
+    // eslint-disable-next-line no-console -- the measurement IS the receipt.
+    console.log(
+      `w4_p1_tag_query invalidations=${INVALIDATIONS} ` +
+        `samePageConsumers=3 samePageCallsPerInvalidation=${JSON.stringify(samePerInvalidation)} ` +
+        `distinctPageConsumers=3 distinctPageCallsPerInvalidation=${JSON.stringify(distinctPerInvalidation)} ` +
+        `distinctQuestionsAsked=${distinctPagesAsked.size}`
+    );
+
+    expect(samePerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 1));
+    expect(distinctPerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 3));
+    expect(distinctPagesAsked.size).toBe(names.length);
+  });
+
+  it("keeps journal tag-table resources keyed off", async () => {
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue([]);
+    const { dispose } = mount(() => (
+      <TagTableToggle page={page("2030-07-15", "journal", [])} />
+    ));
+    await tick();
+    expect(runQuery).not.toHaveBeenCalled();
     dispose();
   });
 });
@@ -903,7 +992,7 @@ describe("zoomed block view", () => {
     const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     let finishSave = () => {};
     vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => {
-      finishSave = () => resolve("saved-rev");
+      finishSave = () => resolve({ revision: "saved-rev" });
     }));
     mainPaneRouter.openFile(path, dto.name, dto.kind, { inPlace: true });
 

@@ -1,9 +1,25 @@
-//! Exact, read-only external inventory and conservative identity matching.
+//! Exact external inventory and conservative identity matching — and, at the
+//! end of the file, clean activation.
 //!
-//! This module plans reconciliation only. It does not publish semantic
-//! operations, write a graph, or activate managed sync. The clean runtime
-//! reads its disposable SQLite path ownership instead of recreating a native
-//! path index beside SQLite.
+//! Two jobs live here, and only one of them is read-only.
+//!
+//! RECONCILIATION PLANNING is: it drafts `ImportExecutionMaterial` and
+//! candidates that are deliberately non-authoritative — the hot engine must
+//! recapture them before anything is published — so this half publishes no
+//! semantic operation and writes no graph. The clean runtime reads its
+//! disposable SQLite path ownership instead of recreating a native path index
+//! beside SQLite.
+//!
+//! ACTIVATION is not. `prepare_clean_activation` → `commit_clean_activation`
+//! publishes the baseline, publishes the SQLite projection, and writes the
+//! activation marker that `docs/storage-sync-contract.md` calls the sole local
+//! managed-authority selector; `open_clean_activation` reads it back at every
+//! later open. That is the last few hundred lines of this file.
+//!
+//! This header claimed the module "does not publish semantic operations, write
+//! a graph, or activate managed sync" — true of the first half, flatly false of
+//! the second. `the_activation_half_of_this_module_is_not_read_only` keeps both
+//! halves named.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -1482,8 +1498,9 @@ impl CommittedCleanActivation {
 }
 
 /// Publish both completed candidates, compare the live source bytes one final
-/// time without parsing, and write the authority marker last. A failure before
-/// the marker removes the disposable baseline and SQLite file set.
+/// time without parsing, and write the authority marker last. An ordinary
+/// returned failure before the marker removes the disposable baseline and
+/// SQLite file set; the next activation retires either one after a process abort.
 pub(crate) fn commit_clean_activation(
     graph: &Graph,
     preparation: CleanActivationPreparation,
@@ -1493,7 +1510,11 @@ pub(crate) fn commit_clean_activation(
     let (capture, baseline, sqlite, accepted_frontier) = preparation.into_parts();
     let database_path = sqlite.target_path().to_path_buf();
     let (baseline, _) = baseline.publish_durable(baseline_destination)?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-baseline-publication");
     let projection = sqlite.publish()?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-sqlite-publication");
 
     let watcher_fence = graph.cache_generation();
     let final_scan = match capture.verify_before_inactive_bootstrap_authoring(graph) {
@@ -1520,6 +1541,8 @@ pub(crate) fn commit_clean_activation(
         super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?,
         watcher_fence,
     )?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-final-source-verification");
     if let Err(error) = publish_activation_marker(enrollment_root, marker) {
         drop(projection);
         super::sqlite::remove_disposable_projection(&database_path)?;
@@ -1537,6 +1560,13 @@ pub(crate) fn commit_clean_activation(
         marker,
         final_scan,
     })
+}
+
+#[cfg(test)]
+fn abort_at_clean_activation_commit_cut_for_test(cut: &str) {
+    if std::env::var("TINE_TEST_CLEAN_ACTIVATION_ABORT_CUT").as_deref() == Ok(cut) {
+        std::process::abort();
+    }
 }
 
 /// Cold-opened clean baseline and its matching disposable projection. This
@@ -1677,8 +1707,7 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
     let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
     match super::sqlite::open_clean_genesis_projection(database_path, claim, &accepted_frontier) {
         Ok(projection) => {
-            if matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-            {
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: opened-existing");
             }
             super::sqlite::record_projection_open_test_observation(
@@ -1690,8 +1719,7 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
             Ok(projection)
         }
         Err(error) => {
-            if matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-            {
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: rebuilt");
             }
             let reason = error.to_string();
@@ -8646,6 +8674,53 @@ mod tests {
         assert!(
             large.recorded_work_units() <= small.recorded_work_units().saturating_mul(8),
             "structural work did not scale linearly: small={small:?}, large={large:?}"
+        );
+    }
+
+    /// The module doc claimed this file never activates managed sync. It does,
+    /// in `commit_clean_activation`: three publications and the activation
+    /// marker that selects local managed authority. A reader who believed the
+    /// old header would have looked for the write path anywhere but here.
+    #[test]
+    fn the_activation_half_of_this_module_is_not_read_only() {
+        let source = include_str!("import.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        let (_, commit) = production
+            .split_once("pub(crate) fn commit_clean_activation(")
+            .expect("commit_clean_activation is still defined here");
+        let commit = &commit[..commit.find("\npub(crate) fn ").unwrap_or(commit.len())];
+
+        for write in [
+            "baseline.publish_durable(",
+            "sqlite.publish()",
+            "publish_activation_marker(",
+        ] {
+            assert!(
+                commit.contains(write),
+                "commit_clean_activation no longer performs {write}. If activation \
+                 genuinely moved out of this module, rewrite the module doc in the same \
+                 change — it names this function as the reason the file is not read-only \
+                 (invariant I-11)."
+            );
+            // Harvest H 3a: no activation marker and no authoritative baseline
+            // publication happens BEFORE `commit_clean_activation`. Pin the
+            // invariant itself, not its converse: every production occurrence
+            // of each publication token lives inside the commit slice.
+            assert_eq!(
+                production.matches(write).count(),
+                commit.matches(write).count(),
+                "{write} is invoked outside commit_clean_activation; the preparation half \
+                 must stay free of authority-changing publication (Harvest H 3a, I-7)"
+            );
+        }
+
+        assert!(
+            production.contains("pub(crate) fn prepare_clean_activation(")
+                && production.contains("pub(crate) fn open_clean_activation("),
+            "the activation pipeline the module doc describes is no longer here."
         );
     }
 }

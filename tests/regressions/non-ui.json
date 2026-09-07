@@ -2,6 +2,300 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-E-TYPED-ERROR-BOUNDARY-001",
+   "title": "Backend refusal handling branches on typed fixed-shape envelopes instead of prose",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 E"},
+   "platforms": ["all"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/typedErrorRatchet.test.ts",
+     "src-tauri/src/debug.rs::tests::caught_named_thread_panic_records_fixed_shape_location_thread_and_kind",
+     "crates/tine-core/src/oplog/wire.rs::tests::scenario_io_error_keeps_only_the_typed_error_kind"
+    ],
+    "scenario": "backend-errors.typed-fixed-shape-no-prose-classification",
+    "failBefore": "e-typed-branches-fail-before.txt, e-scenario-io-fail-before.txt, and e-panic-fields-fail-before.txt at 74d00d18e292e6bde629b833e832c4bc7a7a7945"
+   },
+   "notes": "The native boundary emits bounded kind and reason-code envelopes, frontend consumers branch on BackendError subclasses, ScenarioError retains ErrorKind instead of prose, and the panic recorder keeps only location, thread, and message kind. The clean-open source taxonomy that completes this family for managed open is REG-W4-E3-CLEAN-OPEN-TAXONOMY-001."
+  },
+  {
+   "id": "REG-W4-E3-CLEAN-OPEN-TAXONOMY-001",
+   "title": "A managed open refusal names its source class instead of the page it choked on, and still tells the user something",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 4 E3; invariants I-5, I-9, I-12"},
+   "platforms": ["all"],
+   "layer": "rust-core-to-frontend-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::clean_open_source_matrix_has_one_conversion_per_source_class",
+     "crates/tine-core/src/sync_runtime_tests.rs::clean_open_projection_emits_only_the_tagged_source_code",
+     "crates/tine-core/src/sync_runtime_tests.rs::shared_inspection_boundaries_emit_the_reachable_scenario_code",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_c_private_store_is_refused_before_any_graph_mutation",
+     "crates/tine-core/src/sync_runtime_tests.rs::raw_colon_path_is_classified_incompatible_before_activation",
+     "crates/tine-core/src/sync_runtime_tests.rs::activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files",
+     "crates/tine-core/src/sync_runtime_tests.rs::projection_recovery_equivalence_oracle_real_store_subset",
+     "crates/tine-core/src/sync_runtime_tests.rs::cold_replay_error_exit_flushes_completion_before_lease_release",
+     "src/typedErrorRatchet.test.ts",
+     "src/managedDiagnostics.test.ts"
+    ],
+    "scenario": "backend-errors.clean-open-source-taxonomy",
+    "failBefore": "proven — tine-agents/evidence/wave4/e3/necessity-typed-error-ratchet-fail-before.log (the re-pinned 0/0 ratchet reports 'expected length 0 but got 89' on the pre-fix tree) and tine-agents/evidence/wave4/e3/necessity-tagged-envelope-fail-before.log (the pre-fix sanitizer answers the tagged envelope with 'The command failed without a safe diagnostic detail.')"
+   },
+   "notes": "Two halves of one user outcome. Failing to open a managed graph used to flatten 16 typed source classes through one `display` helper, so the refusal the user could see and copy carried source prose — a page path, a note name, a changed-content excerpt — and the frontend redactor was the only thing standing between that and the screen. Core now maps each source class once to a stable `clean_open.*` code and projects tagged JSON, so there is nothing private left to redact. The second half is the one a typed wire is easy to lose: `safeManagedErrorDetail` collapses any brace group to `[details]`, which carries no diagnostic word, so a correctly typed envelope reached Settings and the startup recovery pane as \"The command failed without a safe diagnostic detail.\" It now renders the envelope from its own closed vocabulary, and a payload whose fields are not that vocabulary still takes the sanitizing path. A third half arrived from CI: two crash-schedule oracles used to prove replay stopped AT an injected cut by matching the cut's own sentence in the refusal text. Once the refusal became a source-class code shared by every projection failure, that identification was gone — one oracle went red, and its sibling would have silently weakened had the code simply been substituted for the prose. Both now assert two things: the exact envelope, and, through `turn_replay_cut_was_reached_for_test`, that the cut actually fired. Ask the cut whether it was reached; never ask an error to identify itself."
+  },
+  {
+   "id": "REG-W3-I5-CONTENT-OUT-OF-LOGS-001",
+   "title": "Production diagnostics cannot emit graph-authored content",
+   "family": "diagnostics-privacy",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 I5; invariants I-5 and I-11"},
+   "platforms": ["all"],
+   "layer": "rust-and-typescript-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::diag_is_silent_when_debug_is_disabled",
+     "crates/tine-core/tests/content_out_of_logs.rs",
+     "src/contentOutOfLogs.ratchet.test.ts",
+     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_database_open_emits_no_planted_marker",
+     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_apply_failure_emits_no_planted_marker",
+     "src/failureShape.test.ts",
+     "src/pdfRenderCoordinator.test.ts"
+    ],
+    "scenario": "diagnostics.content-out-of-logs",
+    "failBefore": "i5-diag-fail-before.txt and i5-lsdoc-shape-fail-before.txt at 64ed1c21838d4d7e9b75dd9ece90d90787b300fa; class-c retirement: class-c-projection-fail-before.log and frontend-class-c-fail-before.log at 20bb15de"
+   },
+   "notes": "Detailed native diagnostics are opt-in, core print sites are content-free and flag-gated, parser failures cross worker boundaries only as fixed-shape measurements, and equality ratchets freeze the reviewed Rust and TypeScript censuses."
+  },
+  {
+   "id": "REG-W3-R1-JOIN-GENERATION-COMMIT-001",
+   "title": "Shared-join baseline and operation authority commit as one marker-selected generation",
+   "family": "managed-storage-crash-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-1; approved shape A"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::clean_join_generation_crash_cuts_recover_to_the_marker_named_pair"],
+    "scenario": "managed-shared-join.marker-generation-commit",
+    "failBefore": "r1-r1-1-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: the marker had no generation pointer and the four-rename directory swap exposed inter-step crash states"
+   },
+   "notes": "Fresh stores use generation 0. Join publishes the next complete baseline/operations pair, syncs its parent, and atomically replaces the marker. Open follows the marker and reclaims unreferenced generation and candidate directories."
+  },
+  {
+   "id": "REG-W3-R1-PRIVATE-ROOT-RENAME-BARRIERS-001",
+   "title": "Blank-slate private-root archive renames durably synchronize both parents",
+   "family": "managed-storage-crash-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-2"},
+   "platforms": ["all"],
+   "layer": "tauri-storage-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs::tests::blank_slate_private_root_renames_barrier_both_parents"],
+    "scenario": "managed-blank-slate.private-root-rename-barriers",
+    "failBefore": "r1-r1-2-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: both private-root rename helpers returned without the existing two-parent directory barrier"
+   },
+   "notes": "The shared sync_provider_namespace_rename helper flushes the destination parent before the source parent after each cross-directory move."
+  },
+  {
+   "id": "REG-W3-R1-WINDOWS-BACKUP-NOREPLACE-001",
+   "title": "Windows backup recovery cannot clobber a concurrently delivered destination",
+   "family": "backup-restore-publication",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-6"},
+   "platforms": ["windows"],
+   "layer": "tauri-backup",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/backup.rs::tests::restore_stack_keeps_capability_bound_publication_and_orders_crash_barriers",
+     "src-tauri/src/backup.rs::tests::windows_backup_recovery_rejects_a_concurrent_sync_delivery"
+    ],
+    "scenario": "backup-restore.windows-concurrent-sync-delivery",
+    "failBefore": "r1-r1-6-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: Windows fell through a negated four-platform cfg to plain rename after an existence check"
+   },
+   "notes": "Windows uses capability-bound hard-link-create followed by source removal; an occupied destination returns AlreadyExists and neither the delivered destination nor the live source is overwritten. All five Tine targets are explicit cfg arms."
+  },
+  {
+   "id": "REG-W3-CC-PUBLISH-PUBLIC-PROPERTY-001",
+   "title": "Static publication recognizes public pages through the same property-line grammar as Logseq",
+   "family": "static-publication-privacy",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 Cc item C5a; DUP-7"},
+   "platforms": ["all"],
+   "layer": "rust-core-publish",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/publish.rs::tests::publish_macros_never_expand_private_graph_content"],
+    "scenario": "publish.public-property-lsdoc-boundary",
+    "failBefore": "cc-c5a-fail-before-full.txt at ae3d97da170c2aaef41a3cb64b3e574f26a8ca58: a page containing public::true was published even though lsdoc rejects that line as a property; a SUB-indented valid public property was omitted"
+   },
+   "notes": "page_is_public delegates to the shared parse_property_line transcription of lsdoc markdown_property_line and normalizes the key through doc::property_key_norm. The publisher never falls back to its former starts_with/trim recognizer. This is a privacy and interoperability boundary."
+  },
+  {
+   "id": "REG-W3-P0-TERMINAL-BOOTSTRAP-DEAD-ENCODE-001",
+   "title": "Terminal SQLite bootstrap encodes only the exact terminal frontier instead of replay intermediates",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 1"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::terminal_bootstrap_encodes_only_required_frontier_documents"],
+    "scenario": "managed-terminal-bootstrap.exact-terminal-frontier-only",
+    "failBefore": "tine-agents/evidence/wave3/P0/item1-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: six generated accepted events caused 13 frontier-document encodes when only seven accepted-batch and exact-terminal encodes were required"
+   },
+   "notes": "The removed replay-loop BTreeMap was shadowed before its first read; provenance accumulation and exact terminal frontier seeding are unchanged. No contract or format delta."
+  },
+  {
+   "id": "REG-W3-P0-PROJECTION-PLAN-CARRY-001",
+   "title": "An existing-page managed drain plans and parses its base once, then carries that plan through completion",
+   "family": "managed-storage-drain-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 2"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/projection.rs::tests::completion_carries_an_existing_page_plan_without_replanning",
+     "crates/tine-core/src/sync_runtime_tests.rs::projection_recovery_equivalence_oracle_real_store_subset"
+    ],
+    "scenario": "managed-projection-drain.carry-authorized-plan",
+    "failBefore": "tine-agents/evidence/wave3/P0/item2-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: one existing-page completion made two planner invocations and two base parses instead of one of each"
+   },
+   "notes": "Completion compares the carried plan with current accepted workspace/page/path/frontier/claims. Recovery reconstructs and proves one plan against the durable intent before mutation, then carries it. The storage contract records this authority comparison; receipt formats are unchanged."
+  },
+  {
+   "id": "REG-W3-P0-PAGE-TAG-QUERY-DEDUPE-001",
+   "title": "A routed named page shares one tag query per graph revision across its toggle, table, and split panes",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 3"},
+   "platforms": ["all"],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src/components/Page.test.tsx::tag-page table"],
+    "scenario": "page-tag-table.shared-query-per-data-revision",
+    "failBefore": "tine-agents/evidence/wave3/P0/item3-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: the toggle and enabled table made two identical runQuery calls"
+   },
+   "notes": "The existing sharedQueryResult graph scope is reused; journals retain their null resource key and issue no query. No presentation catalog row is required."
+  },
+  {
+   "id": "REG-W3-P0-QUERY-BUILDER-FACETS-DEDUPE-001",
+   "title": "One Query Builder instance fetches facets once per graph revision for all mounted controls",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 4"},
+   "platforms": ["all"],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src/components/QueryBuilder.transient.test.tsx::fetches facets once and refreshes once per data revision"],
+    "scenario": "query-builder.facets-once-per-instance-revision",
+    "failBefore": "tine-agents/evidence/wave3/P0/item4-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: SummarizeControl and PropertyPick made two queryFacets calls in one builder"
+   },
+   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. Harvest W4-P1 then made the REQUEST shared across instances too, through sharedQueryResult under a query-facets key namespace: the scope stays per-builder by decision, so this row's outcome is unchanged and now holds a fortiori. Its proof test lost the words \"per builder\" from its title in that packet, because per-builder fetching is exactly what stopped being true; see REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001's sibling UI row UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING for the cross-instance bound."
+  },
+  {
+   "id": "REG-W3-A3-BOUNDED-CONFLICT-HISTORY-001",
+   "title": "Conflict evaluation loads scale with unresolved pairs instead of retained history",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 A3"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::conflict_resolution_history_loads_are_bounded_by_unresolved_pairs",
+     "crates/tine-core/src/sync_runtime_tests.rs::conflict_history_gate_and_contract_pin_the_same_pair_bound"
+    ],
+    "scenario": "managed-conflict-resolution.unresolved-pair-index",
+    "failBefore": "a3-fail-before-final-curve.txt at 342c86c7f87f4b5818bc5b1fd78c4eecd14cdf22: one unresolved pair loaded medians of 106, 806, and 1606 accepted batches at retained-history sizes 50, 400, and 800; the 8*C+64 bound was 72"
+   },
+   "notes": "A run-local accepted-sequence index records concurrent same-block pairs, exact pure-create projection candidates, descendant settlement, and only the sparse settled ancestry needed by later one-sided convergence. It advances from accepted semantic deltas and rebuilds from immutable accepted history after reopen; it is not persisted and cannot author or suppress a resolution by itself. The explicit harvest scale gate replays history newest-first into a fresh engine and evaluates each size three times without adding seven minutes to every ordinary core test run."
+  },
+  {
+   "id": "REG-MANAGED-CLEAN-OPEN-CHECKPOINT-001",
+   "title": "Clean Managed Storage reopen restores a disposable checkpoint and semantically replays only its uncheckpointed tail",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest A5"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::second_clean_cold_open_restores_checkpoint_instead_of_full_replay",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_authoritative_manifest_immediately",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_never_masks_mutated_authoritative_manifest",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_required_object_immediately",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories",
+     "crates/tine-core/src/sync_runtime_tests.rs::pre_07_shared_descriptor_fixture_routes_to_preserve_and_rebuild",
+     "crates/tine-core/src/sync_runtime_tests.rs::failure_after_clean_activation_retain_completes_on_the_next_open",
+     "crates/tine-core/src/oplog/checkpoint_generation.rs::tests::checkpoint_payload_extends_the_durable_frontier_from_one_row_delta",
+     "crates/tine-core/src/oplog/checkpoint_generation.rs::tests::checkpoint_open_counter_distinguishes_checkpoint_from_full_replay"
+    ],
+    "scenario": "managed-clean-open.disposable-checkpoint-tail-only",
+    "failBefore": "at e19514f98cf1044391f3a3d2f09d2579275353ee, sync_runtime_tests::second_clean_cold_open_restores_checkpoint_instead_of_full_replay fails because the second clean open replays every accepted batch (no checkpoint path exists); the checkpoint_open_counter unit test fails for the same reason"
+   },
+   "notes": "Before Harvest A5 every clean reopen semantically reapplied every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint is disposable, compares its roster/fingerprints against authoritative archive evidence, existence-checks required objects by name, and falls back without a new refusal; a roster-named manifest or object missing from the archive is surfaced as MS-REF-DISK-CORRUPT (archive damage, not checkpoint damage). Wave 3 captures only roster/object deltas after the durable frontier, compares canonical per-block state across checkpoint and full replay, removes the pre-0.7 sharing descriptor decoder, and resumes a failure after authoritative activation retain. Martin accepted option (a) on 2026-09-02: the prior open ratios are accepted with archive rebaselining as the terminal bound, while per-save capture is gated at N=800/N=50 <= 1.25."
+  },
+  {
+   "id": "REG-HARVEST-F-CONTENT-DEPTH-BOUNDS-001",
+   "title": "Crafted deeply nested formulas, queries, previews, and backlink trees stop at their consumption-point bounds",
+   "family": "hostile-content-consumption",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest F depth sweep"},
+   "platforms": ["all"],
+   "layer": "frontend-and-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/sheet/formula/eval.test.ts",
+     "src/editor/queryBuilder.test.ts",
+     "src/render/PeekPopup.test.ts",
+     "crates/tine-core/src/query.rs::tests::application_backlink_filter_truncates_past_the_managed_block_depth"
+    ],
+    "scenario": "content.deep-recursion-consumption-bounds",
+    "failBefore": "proven on e19514f9"
+   },
+   "notes": "Every cap-plus-one fixture is constructed iteratively. Before Harvest F each consumer fully traversed it; afterwards formulas return a named error, the visual query path falls back or truncates, previews count omitted descendants, and both Direct and application backlink filter entries mark truncation while reusing the managed block-depth contract."
+  },
+  {
+   "id": "REG-SESSION-ATOMIC-DURABILITY-001",
+   "title": "App-private session state is published through a named crash-durable atomic replacement protocol",
+   "family": "app-private-data-safety",
+   "sources": { "issues": [], "commits": [], "internal": "2026-09 invariant sweep B5s" },
+   "platforms": ["all"],
+   "layer": "tauri-native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/settings.rs"],
+    "scenario": "settings.session-atomic-durable-publication",
+    "failBefore": "proven on exact base 2dcd01341e6797f1223d35bc2d1fdd7a4f98f910 by app_private_durable_publications_stay_on_named_audited_paths"
+   },
+   "notes": "The pre-fix session saver used a bare whole-file temp write followed by rename, without syncing the file or destination directory, while sibling durable settings writers already used audited protocols. The guard requires named audited publication; behavioral tests cover stale-temp isolation, burst-valid atomic replacement, and temp cleanup. Legacy migration receives the same strict directory-barrier error policy."
+  },
+  {
+   "id": "REG-HARVEST-B3-LIVE-CONFLICT-CAPSULE-001",
+   "title": "Live-save conflict drafts survive restart through one durable app-private capsule protocol on Direct Files and Managed Storage",
+   "family": "live-save-conflict-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest B3"},
+   "platforms": ["all"],
+   "layer": "tauri-native-and-frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/conflict_capsule.rs::tests::replacement_and_retirement_reopen_as_complete_transitions",
+     "src-tauri/src/conflict_capsule.rs::tests::unreadable_envelope_is_set_aside_and_the_queue_keeps_working",
+     "src/liveSaveConflictRetirement.test.tsx",
+     "src/backendCallFunnel.test.ts",
+     "src/components/ConflictResolution.test.tsx",
+     "scripts/e2e-concord-live-save.mjs"
+    ],
+    "scenario": "harvest-b3.live-conflict-capsule-restart-parity",
+    "failBefore": "capsule protocol: b3-conflict-capsule-fail-before.log on 7623fb76's parent (no capsule module; archived under tine-agents/evidence/wave2). Fix-up 2026-09-02 on 7623fb76: liveSaveConflictRetirement (clear path never retired the on-disk capsule, so a resolved draft resurrected after restart) and backendCallFunnel (only savePage classified the conflict wire code; seven resolve commands threw raw strings) fail before, pass after."
+   },
+   "notes": "Before Harvest B3, Direct Files retained the only copy of a refused live draft in localStorage, which WebKitGTK does not persist, while the Managed Storage conflict branch retained no restart capsule at all. The replacement uses a graph-keyed app-private atomic publication and retirement protocol, restores exact draft bytes and binding on both backends, and requires Managed authority to be re-observed after restart. The native restart journey itself is quarantined (stop-loss exhausted); restart restoration, post-restart resolution, and Managed re-observation are proved only at the unit/crate layer until that journey is repaired."
+  },
+  {
    "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
    "title": "Bounded managed block referrers retain the exact Direct Files document-order prefix and result accounting",
    "family": "managed-query-parity",
@@ -251,7 +545,7 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/projection_store.rs::tests::same_byte_rebind_after_handle_capture_never_publishes_cleanup_authority",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store",
      "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_same_byte_replacement",
      "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_state_and_identity_fail_closed",
      "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed"
@@ -259,7 +553,7 @@
     "scenario": "projection.recovery-sidecar-settlement-and-retirement",
     "failBefore": "proven"
    },
-   "notes": "Catalog maintenance 2026-08-28: packet 2b deliberately collapsed the restart/grace cleanup protocol and removed its obsolete tests. The remaining coverage names the retained fail-closed resource-substitution, canonical-v1 compatibility, same-byte replacement, and cleanup-namespace integrity contract; deleted retirement-oracle tests are not release evidence."
+   "notes": "Catalog maintenance 2026-08-28: packet 2b deliberately collapsed the restart/grace cleanup protocol and removed its obsolete tests. Harvest H then removed the schema-1 forensic decoder entirely and moved the containing store claim to TINEPR7; old evidence is preserved only as part of the rejected private-store backup, never interpreted as cleanup authority. The remaining coverage names fail-closed resource substitution, same-byte replacement, and cleanup-namespace integrity; deleted retirement-oracle tests are not release evidence."
   },
   {
    "id": "REG-SYNC-PROVIDER-OBSERVATION-ORDERING-001",
@@ -5436,7 +5730,7 @@
    "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_v4_dual_decode_defaults_to_receiptless_fallback",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_decoder_accepts_only_the_current_receipted_shape",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap",
      "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
      "crates/tine-core/src/outline.rs::tests::exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals",
@@ -5446,7 +5740,7 @@
     ],
     "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
    },
-   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero. Lost all four receipt-reuse proofs (reuse without reparsing, stale-receipt reparse, oversized-receipt omission, schema tripwire) that state this row's outcome; the surviving parser-pass and parse-cache tests are neighbors, not substitutes. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
+   "notes": "Internal MS-08 cost-model correction. Page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Harvest H removed the receiptless capsule-v4 fallback and moved the containing lazy-genesis manifest to schema 5, so an old baseline takes the preserve-and-rebuild lifecycle rather than a dual decoder. Any absent, stale, invalid, or capsule-inconsistent current receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero. Lost all four receipt-reuse proofs (reuse without reparsing, stale-receipt reparse, oversized-receipt omission, schema tripwire) that state this row's outcome; the surviving parser-pass and parse-cache tests are neighbors, not substitutes. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-MS14-R0-CURRENT-HEAD-AND-SPARSE-INTEGRITY",
@@ -5576,10 +5870,10 @@
    "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
    "platforms": ["windows", "linux", "macos", "android"],
    "layer": "rust-core-storage",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
+     "crates/tine-core/src/model.rs::tests::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename",
      "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
      "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts",
      "crates/tine-core/src/model.rs::tests::checked_open_retries_editor_retired_cleanup_without_restoring_it",
@@ -5588,7 +5882,7 @@
     "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
     "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
    },
-   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside carry an exact-byte protocol over the graph tree's own no-clobber rename (on Windows FileRenameInformation with ReplaceIfExists=false plus the required directory barrier); GH #466 moved them off tine-storage's DurableDirectoryPublication, whose Android arm is hard-link based and refused by shared storage, so the Windows write-through evidence below predates that move and this row is needs-revalidation until the Windows physical suite runs on the current primitive. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
   },
   {
    "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",
@@ -5668,6 +5962,415 @@
     "failBefore": "proven"
    },
    "notes": "Fail-before on 3a123bc1 in the RELEASE profile (the shipped configuration): saving and annotating the same hls__ page hung both writers permanently, 0 of 2 finished in 60s; the same tree passes in 0.51s after the fix. The saver holds the graph-global graph-text identity gate while it waits for the page lock the annotator holds, so no later graph-text write in the process can proceed either. Debug builds hit debug_assert at model.rs:1542 instead and never reached the hang, which is why it survived. Six writers took the two locks in the wrong order: resolve_vcs_marker_conflict, resolve_durable_live_save_conflict, resolve_sync_conflict, open_pdf, write_highlights and confirm_removed_page_projection_with_attempts. All six now take the identity gate before any page lock; the order is proved statically over model.rs's call graph; and the epoch read refuses instead of silently reading without authority."
+  },
+  {
+   "id": "REG-HARVEST-H-MANAGED-FORMAT-001",
+   "title": "A pre-0.7 Managed store is preserved as a backup and rebuilt automatically instead of being refused or silently decoded",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-and-tauri-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_decoder_accepts_only_the_current_receipted_shape",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_pack_is_deterministic_bounded_and_point_readable",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::the_previous_claim_family_is_rejected_as_an_upgrade_boundary",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_c_private_store_is_refused_before_any_graph_mutation",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_end",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::previous_schema_sealed_baseline_refuses_with_the_protocol_marker",
+     "src-tauri/src/graph.rs::tests::pre_07_unknown_state_archives_then_rebuilds_without_manual_reactivation",
+     "src-tauri/src/sync_runtime.rs::tests::blank_slate_archive_preserves_every_private_byte"
+    ],
+    "scenario": "managed-storage.pre-0.7-containing-format-blank-slate-rebuild",
+    "failBefore": "proven: schema-4 capsules and schema-1 forensic evidence decoded as current, and a TINEPR6 store reopened normally"
+   },
+   "notes": "The lazy-genesis containing manifest moved from schema 4 to 5, and the projection receipt-store claim moved from TINEPR6/version 6 to TINEPR7/version 7. Prior containing formats are recognized only at the no-mutation precheck. Fix-up 2026-09-02 (review H-1): a sealed schema-4 baseline previously refused WITHOUT the MS-REF-PROTOCOL-INCOMPATIBLE marker, so SparseV2Availability classified it Retryable and the store dead-ended at 'could not serve this workspace' instead of preserve-and-rebuild; the a_pre_h test failed before and passes after. The existing graph-open lifecycle durably archives every private byte, publishes Direct Files as the reconstruction source, and automatically activates the one current Managed format. No migration decoder was added."
+  },
+  {
+   "id": "REG-HARVEST-H-THEME-RMW-001",
+   "title": "Two concurrent theme changes do not lose one another or leave storage different from the UI",
+   "family": "theme-package-persistence",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H"},
+   "platforms": ["all"],
+   "layer": "frontend-persistence",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/themes/manager.test.ts::serializes overlapping mutations of the shared package array"
+    ],
+    "scenario": "themes.concurrent-shared-array-read-modify-write",
+    "failBefore": "proven: two deliberately overlapped installs completed with only the first theme in durable storage and the installedThemes signal"
+   },
+   "notes": "All installs and removals rewrite theme.packages.v1, so one module-wide promise chain serializes them. Each queued mutation recomputes from installedThemes inside the chain, persists that exact array, then publishes the same array to the signal."
+  },
+  {
+   "id": "REG-HARVEST-B5P-PLUGIN-PACKAGE-DURABILITY-001",
+   "title": "A crash during plugin install or uninstall cannot wedge that version until manual filesystem surgery",
+   "family": "plugin-package-durability-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest B5p"
+   },
+   "platforms": ["all", "windows", "android", "ios"],
+   "layer": "tauri-native-and-tine-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/plugins.rs::tests::reopen_reclaims_transient_and_wedged_packages_before_retry",
+     "src-tauri/src/plugins.rs::tests::concurrent_different_installs_leave_one_complete_immutable_winner",
+     "src-tauri/src/plugins.rs::tests::settings_clear_cut_leaves_a_recoverable_package_then_retry_finishes",
+     "src-tauri/src/plugins.rs::tests::production_plugin_writes_stay_on_named_audited_paths"
+    ],
+    "scenario": "APP-REF-PLUGIN-IMMUTABLE-COLLISION plus crash-recovered staging and retirement",
+    "failBefore": "A half-package with plugin.wasm but no manifest was simultaneously not reinstallable and not uninstallable; the production source guard also found bare write, rename, recursive-delete, and directory-delete operations."
+   },
+   "notes": "tine-storage v0.12.0 owns the staged-directory protocol: exact file barriers, a five-target native no-clobber directory move, parent barriers, retire-then-reclaim, and reopen cleanup for .install-/.retired-/incomplete shapes. Tauri keeps manifest and symlink policy, uses the audited settings replacement before retirement, and preserves same-bytes idempotence while refusing different bytes for one immutable id/version. No plugin capability or guest/native authority changes."
+  },
+  {
+   "id": "REG-HARVEST-H2-PDF-AREA-ROLLBACK-001",
+   "title": "A failed PDF highlight sidecar write moves its already-written nested area crop to recoverable asset trash",
+   "family": "pdf-area-highlight-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H2 item 2a"},
+   "platforms": ["all"],
+   "layer": "frontend-and-core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx::rolls a nested area crop back to trash when the sidecar write fails",
+     "src-tauri/src/commands.rs::application_page_authority_tests::pdf_area_rollback_moves_the_real_nested_crop_to_typed_asset_trash"
+    ],
+    "scenario": "pdf-area.crop-written-sidecar-refused-recoverable-rollback",
+    "failBefore": "Before Harvest H2 the PNG was written before the sidecar transaction, but the failure path only reverted the optimistic UI highlight and left the nested crop orphaned."
+   },
+   "notes": "The rollback command accepts only the PDF/page/highlight-id/stamp tuple, derives the same nested OG-compatible source path as the writer, and moves that exact crop into typed asset trash. It is invoked only when highlight persistence returns false before sidecar commit; later reload failures do not erase a committed crop."
+  },
+  {
+   "id": "REG-HARVEST-H2-TYPED-SAVE-CONFLICT-001",
+   "title": "Conflict resolution branches on an exact typed save-conflict tag instead of arbitrary error prose",
+   "family": "save-conflict-classification",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H2 E-1"},
+   "platforms": ["all"],
+   "layer": "frontend-tauri-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/ConflictResolution.test.tsx::routes ordinary prose containing conflict through the generic failure path",
+     "src/components/ConflictResolution.test.tsx::has no message-sniffing conflict branch in the production component",
+     "src/persistence.test.ts::tags only the complete Direct Files conflict payload at the backend boundary",
+     "src/persistence.test.ts::recognizes only bounded content-conflict contracts"
+    ],
+    "scenario": "save-conflict.exact-wire-tag-no-message-sniff",
+    "failBefore": "The conflict resolver used String(error).includes(\"conflict\"), so unrelated prose containing that word was routed into the stale-file re-observation path."
+   },
+   "notes": "The Tauri save_page boundary recognizes only the complete conflict or conflict:<epoch> wire shape and raises SaveConflictError. Persistence and the resolver consume its save-conflict tag; managed actor refusal remains on its separate exact reason-code envelope."
+  },
+  {
+   "id": "REG-W3-B4-DIRECT-SHARED-QUERY-READS-001",
+   "title": "Direct Files property facets and PageRef simple queries use the generation-bound shared SQLite read",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 B4"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection.rs::tests::b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence",
+     "crates/tine-core/tests/query_lowering_guards.rs::simple_query_read_family_census_is_exact"
+    ],
+    "scenario": "direct-query.shared-facet-and-page-ref-candidate-read",
+    "failBefore": "b4-indexed-routes-fail-before.log: PageRef and property-facet calls left the Direct projection indexed-read counter unchanged."
+   },
+   "notes": "One source-to-read-family lowering now serves the existing Managed caller and Direct PageRef narrowing. Exact parser evaluation remains authoritative; stale or unavailable projections count and use the full parser fallback. Both property-facet consumers stream the existing property_facet_rows_after family. No schema, index, or memo was added."
+  },
+  {
+   "id": "REG-GH-466-ANDROID-DIRECT-SAVE-NOREPLACE-001",
+   "title": "Editing a page on Android with Direct Files saves normally instead of failing with a permission-denied error",
+   "family": "direct-files-graph-text-publication",
+   "sources": {
+    "issues": [
+     466
+    ],
+    "commits": [],
+    "internal": "v0.6.981 regression introduced by 65258e7d (Direct Files name transitions moved onto tine-storage's hard-link-based Android move)"
+   },
+   "platforms": ["android"],
+   "layer": "rust-core-direct-files-publication",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename",
+     "crates/tine-core/src/model.rs::graph_text_exact_move_publishes_expected_bytes_and_refuses_a_replaced_source"
+    ],
+    "scenario": "android.direct-files.edit-existing-page-and-create-page-saves",
+    "failBefore": "Structural on the host: the source-scan guard fails on the v0.6.981 code, which routes every Direct Files create, retirement, publication and restore through tine-storage's DurableDirectoryPublication::move_exact_no_replace; its Android arm is hard-link-then-unlink, Android shared storage (FUSE) refuses hard links, and the raw errno surfaced as 'unknown: Permission denied (os error 13)'. Reporter receipt on GH #466: 0.6.98 saves, 0.6.981 fails on every save, Android 16, Direct Files. The host has no Android runtime harness; same-platform confirmation is pending the reporter on the next release, so platform confidence is tentative."
+   },
+   "notes": "Blocking core operation. Fix carries the exact-byte move protocol over the graph tree's own no-clobber rename (renameat2(RENAME_NOREPLACE) through the raw syscall on Linux/Android, renameatx_np on Apple, FileRenameInformation on Windows: the primitive 0.6.98 shipped on every target); tine-storage's typed boundary stays for app-private authorities where hard links exist. A refused call now names itself in the receipt instead of a bare errno."
+  },
+  {
+   "id": "REG-W4-G1-PROJECTION-DRAIN-PLAN-001",
+   "title": "A managed projection drain carries its existing page plan through completion instead of silently replanning",
+   "family": "managed-projection-drain-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 5"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/oplog/projection.rs::tests::projection_drain_completion_passes_the_carried_plan_without_replanning"],
+    "scenario": "managed-save.projection-drain-carries-authorized-plan",
+    "failBefore": "The helper-only oracle stayed green when a drain-level completion was pointed at the old plan-less replay shape."
+   },
+   "notes": "The drain-level counter oracle pins one planner invocation and one base parse for the carried page plan."
+  },
+  {
+   "id": "REG-W4-G1-CONFLICT-REBUILD-COUNTER-001",
+   "title": "The conflict-resolution counter exposes the once-per-open accepted-history rebuild",
+   "family": "managed-conflict-rebuild-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 6"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/oplog/hot_engine_integration_tests.rs::conflict_resolution_history_loads_are_bounded_by_unresolved_pairs"],
+    "scenario": "managed-open.conflict-index-rebuild-visible-to-counter",
+    "failBefore": "The counter reset ran after ensure_conflict_history_index, making every once-per-open O(N) rebuild invisible."
+   },
+   "notes": "The scale gate records rebuild loads separately from steady-state pair-bounded evaluations without changing production work."
+  },
+  {
+   "id": "REG-W4-G1-REFUSAL-SCENARIOS-001",
+   "title": "Clean-generation refusals name an actionable in-scope failure scenario",
+   "family": "managed-refusal-scenario",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 9"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-contract",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios"],
+    "scenario": "managed-open.clean-generation-refusal-is-actionable",
+    "failBefore": "Both production refusal stems were absent from the §3.1 scenario table."
+   },
+   "notes": "Unsafe orphan kinds map to MS-REF-UNSAFE-FS-KIND; a concurrently advanced join generation maps to MS-REF-STALE-GENERATION. The authority-generation overflow guard remains outside I-8."
+  },
+  {
+   "id": "REG-W4-G1-CHECKPOINT-SKIP-TICK-001",
+   "title": "A skipped checkpoint capture reports its own state instead of claiming recovery",
+   "family": "managed-runtime-status",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 10"},
+   "platforms": ["all"],
+   "layer": "tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs::tests::checkpoint_capture_skip_has_its_own_tick_value"],
+    "scenario": "managed-runtime.checkpoint-skip-is-not-recovering",
+    "failBefore": "CheckpointCaptureSkipped mapped to the same recovering tick string as real recovery."
+   },
+   "notes": "checkpoint_capture_skipped is a bounded diagnostics vocabulary value and does not re-arm recovered-state UI behavior."
+  },
+  {
+   "id": "REG-W4-G1-CHECKPOINT-SKIP-CAUSE-001",
+   "title": "A skipped checkpoint capture retains a bounded cause through the core and diagnostics boundary",
+   "family": "managed-checkpoint-diagnostics",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 11"},
+   "platforms": ["all"],
+   "layer": "rust-core-tauri-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::fixed_event_shape_contains_no_free_form_message_fields",
+     "src-tauri/src/sync_runtime.rs::tests::checkpoint_capture_skip_has_its_own_tick_value"
+    ],
+    "scenario": "managed-checkpoint.skipped-capture-cause-retained",
+    "failBefore": "A wildcard Err mapping collapsed every eligibility and capture failure to IneligibleState."
+   },
+   "notes": "Six enum values cover attachment, runtime shape, blocked state, unsettled work, frontier order, and unexpected capture failure; no prose crosses the boundary."
+  },
+  {
+   "id": "REG-W4-R2-ACTIVATION-ABORT-RECOVERY-001",
+   "title": "A process abort during Managed activation does not strand the graph or leak an unmarked baseline generation",
+   "family": "managed-activation-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-R2"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::managed_activation_abort_cuts_retire_unmarked_generation_and_retry"],
+    "scenario": "managed-activation.process-abort-before-marker-recovers",
+    "failBefore": "After baseline publication, the subprocess abort left an unmarked generation and the next activation returned AmbiguousOrForeignResidue instead of becoming active."
+   },
+   "notes": "Availability/recovery, not rank 1: Direct Files bytes remain unchanged. Three subprocess-abort cuts cover baseline publication, SQLite publication, and final source verification before the marker commit."
+  },
+  {
+   "id": "REG-W4-E2-COMMAND-ERROR-PHASE-A-001",
+   "title": "Phase-A backend refusals retain their typed producer while preserving the legacy rejection string",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E2; invariants I-9, I-11, I-12"},
+   "platforms": ["linux", "windows", "macos", "android", "ios"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/command_error.rs::tests::phase_a_production_wire_matches_legacy",
+     "src-tauri/src/backend_command_parity.rs::tests::phase_a_command_error_manifest_is_exact_for_every_target",
+     "src/backendCallFunnel.test.ts",
+     "src/typedErrorRatchet.test.ts"
+    ],
+    "scenario": "backend-errors.phase-a-command-error-keeps-kind-and-wire",
+    "failBefore": "Before W4-E2 every fallible phase-A command returned String, so typed I/O, worker, core, and DirectSaveError sources were flattened before the Tauri boundary and a blanket Prose wrapper could pass every wire-only check."
+   },
+   "notes": "CommandError has one custom string serializer, no From<String>, producer-coupled family goldens, and a per-target registration guard; E2b owns the receipt-listed command remainder."
+  },
+  {
+   "id": "REG-W4-E2B-COMMAND-ERROR-PHASE-B-001",
+   "title": "All native backend refusals retain their production family while preserving the legacy rejection string",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E2b; invariants I-9, I-11, I-12"},
+   "platforms": ["linux", "windows", "macos", "android", "ios"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/command_error.rs::tests::phase_b_production_wire_matches_legacy",
+     "src-tauri/src/backend_command_parity.rs::tests::phase_b_command_error_manifest_is_exact_for_every_target",
+     "src/backendCallFunnel.test.ts",
+     "src/typedErrorRatchet.test.ts"
+    ],
+    "scenario": "backend-errors.phase-b-command-error-keeps-kind-and-wire",
+    "failBefore": "proven — on post-E2 commit 0b5ebd899 the production guard failed on live stringify bridges and the structural guard named every remaining phase-B String-result file"
+   },
+   "notes": "All registered fallible commands and src-tauri helpers share CommandError; JSON, durability, worker, plugin, clipboard, platform, graph-verification and managed-runtime producers remain distinct while Serialize emits the unchanged string rejection."
+  },
+  {
+   "id": "REG-W4-E4-DIRECT-SAVE-TYPED-CODE-001",
+   "title": "Direct save failures retain the producer code when page text resembles a conflict",
+   "family": "direct-save-typed-errors",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E4"},
+   "platforms": ["all"],
+   "layer": "rust-core-tauri-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests.rs::direct_save_failure_code_does_not_inherit_conflict_from_page_text",
+     "crates/tine-core/src/model_tests.rs::direct_save_conflict_sites_produce_their_own_codes",
+     "crates/tine-core/src/model_tests.rs::direct_save_precheck_helpers_produce_their_own_codes",
+     "crates/tine-core/tests/direct_save_code_producers.rs::every_direct_save_failure_code_has_a_production_producer",
+     "src-tauri/src/commands.rs::direct_save_error_tests"
+    ],
+    "scenario": "direct-save.page-text-cannot-mint-conflict",
+    "failBefore": "An unrelated error whose page path contained the pinned-owner sentence classified as conflict.pinned_owner."
+   },
+   "notes": "Exact safety: DirectSaveFailureCode and the conflict epoch cross the command boundary as tagged JSON; error display text is never parsed for control flow."
+  },
+  {
+   "id": "REG-W4-C7A-DUPLICATE-UUID-OWNERSHIP-001",
+   "title": "Duplicate block UUID ownership matches Logseq across Direct and Managed projection states",
+   "family": "managed-read-parity",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-C7a item 4; Logseq c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-read-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::duplicate_logseq_uuid_uses_og_first_claimant_at_four_boundaries"
+    ],
+    "scenario": "managed-read.duplicate-uuid-first-parser-claimant",
+    "failBefore": "tine-agents/evidence/wave4/c7a/uuid-ownership-fail-before.log — the new test run against the pre-fix Managed SQLite branch (`claimants.len() > 1` continues without parser fallback) exits 101 with left None, right Some(\"A first\")"
+   },
+   "notes": "The exact upstream outcome is first claimant in parser order; the test covers Direct-ready, Direct-fallback, Managed-drained, and Managed-pending boundaries."
+  },
+  {
+   "id": "REG-FLAKE-FLIGHT-RECORDER-LOCK-001",
+   "title": "The flight recorder releases its single-writer lock when it is dropped, not when the last forked copy of the descriptor closes",
+   "family": "diagnostics-process-lifecycle",
+   "sources": {"issues": [], "commits": [], "internal": "Flaky first-run census 2026-09-03, finding 2"},
+   "platforms": ["all"],
+   "layer": "rust-tauri-process-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::a_recorder_releases_its_lock_even_while_a_duplicated_descriptor_lives"
+    ],
+    "scenario": "diagnostics.flight-recorder-lock-release",
+    "failBefore": "proven \u2014 with the Drop impl removed the new test fails with the exact signature the census recorded from the real flakes: Os { code: 11, kind: WouldBlock, message: \"Resource temporarily unavailable\" }"
+   },
+   "notes": "FlightRecorder held its process.lock in a `_process_lock: File` field with no Drop and no unlock, so release was a side effect of closing that descriptor. An flock belongs to the open file description, not to the descriptor: every process spawn duplicates the description into a child that holds it until exec, so a recorder dropped inside that window left the lock held and the next open on the same directory got EAGAIN. Observed twice in campaign evidence (wave3 I5, wave4 G1) as a first-run failure of the two session-cleanliness tests that then passed on rerun \u2014 four extra `cargo test -p tine` invocations in the G1 lane alone, on the gate every lane runs. Drop now calls unlock, which acts on the description and so releases every copy at once."
+  },
+  {
+   "id": "REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001",
+   "title": "Direct Files indexed queries evaluate only the shared lowering's candidate pages, and abandon the projection when that candidate set is not selective",
+   "family": "waited-path-query-cost",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest W4-B4b"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection.rs::tests::b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk",
+     "crates/tine-core/src/direct_projection.rs::tests::storage_contract_names_the_generation_bound_cutover",
+     "crates/tine-core/tests/retirement_candidates.rs::retirement_candidate_markers_are_pinned"
+    ],
+    "scenario": "direct-query.selective-indexed-plans-candidate-only",
+    "failBefore": "proven — tine-agents/evidence/wave4/b4b-pass2/. Routing, checked at 9bad907f: every newly routed shape (non-sparse Task, BlockProperty, PageProperty, Page, Namespace, Journal, mixed And, complete Or) left the candidate-read counter unchanged and entered the full-graph evaluator. Hatch, checked at 9bad907f with the cutoff neutralised (hatch-fail-before.log): the unselective plan completed a candidate query instead of abandoning — `an abandoned plan must complete no candidate query, left: 2, right: 1`."
+   },
+   "notes": "The user outcome: a {{query}} block in Direct mode walked the whole graph after every keystroke even though the projection could answer it. Indexed plans now take the shared Managed/Direct lowering; Empty returns without projection or graph access; All keeps the walk. The lowering returns a page SUPERSET rather than the answer, so an unselective plan names most of the graph and materialising it through SQLite is slower than the walk — measured on the 1,045-file anonymized corpus at 1.08 -> 11.19 ms for non-sparse Task and 0.46 -> 3.31 ms for (journal). A candidate-count escape hatch (more than graph_pages/32, floor 32) therefore abandons the projection and reuses the existing parser-fallback path with a second reason. Both routes return identical groups/total/exceeded. The hatch carries the codebase's first `// RETIREMENT-CANDIDATE:` marker, censused by tests/retirement_candidates.rs; the walk is also the differential correctness oracle for the real lowering that would replace it, so it outlives the hatch."
+  },
+  {
+   "id": "REG-W4-I5B-DEBUG-FLAG-FRONT-DOOR-001",
+   "title": "One producer answers \"are debug diagnostics on\", and the fatal app-data refusal names its error kind",
+   "family": "diagnostics-privacy",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest Wave 4 I5b; invariants I-12, I-9, I-5, I-11"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-and-tauri-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/tests/content_out_of_logs.rs::exactly_one_function_reads_the_debug_diagnostics_flag",
+     "crates/tine-core/src/sync_runtime_tests.rs::setting_the_debug_flag_gates_a_core_diagnostic_line",
+     "src-tauri/src/data_home.rs::tests::fatal_data_home_message_keeps_error_kind_without_prose_or_path"
+    ],
+    "scenario": "diagnostics.one-debug-flag-and-identifiable-fatal-refusal",
+    "failBefore": "i12-front-door-fail-before.log, flag-fold-fail-before.log and data-home-kind-fail-before.log at 20bb15de"
+   },
+   "notes": "Four production readers parsed TINE_DEBUG/--debug independently (src-tauri/src/debug.rs, crates/tine-core/src/sync_runtime.rs and twice in crates/tine-core/src/oplog/import.rs), so the host process could not steer core diagnostics and the answer could drift per crate. Separately, the always-on fatal 'nowhere to keep its application data' line carried no error kind: the only diagnosable detail sat on the debug-only channel behind a process::exit the user cannot get past."
+  },
+  {
+    "id": "REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001",
+    "title": "Managed journal-range queries returned nothing when the graph configured a non-default journal page-title format",
+    "family": "managed-direct-query-parity",
+    "sources": {
+      "issues": [],
+      "commits": [],
+      "internal": "Harvest Wave 4 C7b"
+    },
+    "platforms": [
+      "all"
+    ],
+    "layer": "tine-core-query-managed-adapter",
+    "status": "covered",
+    "coverage": {
+      "tests": [
+        "crates/tine-core/src/sync_runtime_tests.rs::c7b_query_driver_parity"
+      ],
+      "scenario": "managed-query.journal-range-predicate-matches-direct",
+      "failBefore": "c7b-managed-journal-ordinal-fail-before.log at 61327be99fbd002f6837b43c027068c24279f10c"
+    },
+    "notes": "Direct Files derives a journal page's ordinal from the graph's configured JournalFormat, the producer that fills PageEntry::date_key. The managed query adapters derived it instead from query.rs journal_ordinal, which called JournalDate::from_title and so hardcoded the DEFAULT title format. On any graph whose :journal/page-title-format differs from the default the managed ordinal was None, so every predicate reading a journal day -- (between START END) and the other journal-day forms -- excluded every journal page and the managed query answered empty while Direct answered normally. ApplicationQueryPage now carries the day from the configured format, so one producer serves both backends. The sparse task-candidate path still reads the default format, but symmetrically for both backends (its ApplicationSparseQueryPage is also built in direct_projection.rs), so it cannot diverge; giving it the configured format is a follow-up."
   }
  ]
 }

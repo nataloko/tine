@@ -4,6 +4,7 @@ import { backend } from "../backend";
 import type { BacklinkFilterContext, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
+import { setGraphMeta } from "../ui";
 
 vi.mock("./LiveRefGroup", () => ({
   LiveRefGroup: (props: { blocks: BlockDto[]; showBreadcrumb?: boolean }) => (
@@ -33,6 +34,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   localStorage.clear();
   resetReferenceSectionState();
+  setGraphMeta(null);
   vi.restoreAllMocks();
 });
 
@@ -598,5 +600,89 @@ describe("Linked References filter summary is honest while indexing (GH #173)", 
     expect(summary).toContain("Indexing");
     expect(summary).not.toContain("2 of 2");
     dispose();
+  });
+});
+
+// GH #475. The copy button sits at the section's right edge, which in a flex row
+// means being the LAST control: Unlinked References has copy alone there, so
+// Linked References must not put its filter after it. This is the ordering half
+// of the fix; the layout itself is measured in a real engine by
+// scripts/shot-reference-header-align.mjs, since jsdom applies no layout.
+describe("Linked References header control order (GH #475)", () => {
+  it("renders the copy button last, on the same edge as Unlinked References", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([
+      { page: "Source", kind: "page", blocks: [block("b1", "[[Target]] one")] },
+    ] as RefGroup[]);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    try {
+      await vi.waitFor(() => {
+        expect(root.querySelector(".references-header .reference-export-toggle")).not.toBeNull();
+      });
+      const controls = [...root.querySelectorAll<HTMLButtonElement>(".references-header > button")]
+        .map((button) => button.className.split(" ")[0]);
+      expect(controls).toEqual(["reference-filter-toggle", "reference-export-toggle"]);
+    } finally {
+      dispose();
+    }
+  });
+});
+
+// GH #479. Tine implemented OG's rule — a page opens its Linked References
+// collapsed once the TOTAL backlink count reaches the threshold — but wired the
+// threshold to a constant 100 and never read
+// `:ref/linked-references-collapsed-threshold` from config.edn. The reporter's
+// case is 0, which the Logseq discussion that produced the key uses to mean
+// "always collapsed"; it must not be mistaken for "unset".
+describe("Linked References honor :ref/linked-references-collapsed-threshold (GH #479)", () => {
+  const backlinks = (count: number): RefGroup[] => [{
+    page: "Source",
+    kind: "page",
+    blocks: Array.from({ length: count }, (_, index) => block(`b${index}`, `[[Target]] ${index}`)),
+  }];
+
+  async function mountWithThreshold(count: number, threshold?: number) {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(backlinks(count));
+    setGraphMeta(
+      threshold === undefined
+        ? ({ root: "/graphs/A" } as never)
+        : ({ root: "/graphs/A", linked_references_collapsed_threshold: threshold } as never),
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    return { root, dispose };
+  }
+
+  it("starts collapsed at a threshold of 0, however few backlinks there are", async () => {
+    const { root, dispose } = await mountWithThreshold(3, 0);
+    expect(root.querySelector(".test-ref-group")).toBeNull();
+    // Still the user's to open — this changes the default, not the control.
+    (root.querySelector(".references-header") as HTMLElement).click();
+    await tick();
+    expect(root.querySelector(".test-ref-group")).not.toBeNull();
+    dispose();
+  });
+
+  it("starts expanded below a configured threshold and collapsed at it", async () => {
+    const below = await mountWithThreshold(4, 5);
+    expect(below.root.querySelector(".test-ref-group")).not.toBeNull();
+    below.dispose();
+
+    const at = await mountWithThreshold(5, 5);
+    expect(at.root.querySelector(".test-ref-group")).toBeNull();
+    at.dispose();
+  });
+
+  it("falls back to OG's 100 when the graph does not set the key", async () => {
+    const under = await mountWithThreshold(99);
+    expect(under.root.querySelector(".test-ref-group")).not.toBeNull();
+    under.dispose();
+
+    const over = await mountWithThreshold(100);
+    expect(over.root.querySelector(".test-ref-group")).toBeNull();
+    over.dispose();
   });
 });

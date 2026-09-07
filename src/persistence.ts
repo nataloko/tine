@@ -4,9 +4,11 @@
 // from being lost, clobbered, or written into the wrong graph.
 //
 // store.ts owns the doc tree and calls markDirty(page) on every mutation; this
-// module decides WHEN and HOW that reaches disk. It depends on store only for a
-// page snapshot (pageToDto) and the loaded flag (doc.loaded) — used at call time,
-// so the store↔persistence import cycle resolves cleanly.
+// module decides WHEN and HOW that reaches disk. Its whole dependency on store is
+// the named import below, and every binding in it is read at call time rather
+// than at module scope, so the store↔persistence import cycle resolves cleanly.
+// `persistence.storeSurface.test.ts` pins that import list: it is the coupling
+// this split exists to bound, so it may not grow unnoticed.
 
 import {
   doc,
@@ -20,7 +22,7 @@ import {
   setEditorActivation,
   sweepReplaceable,
 } from "./store";
-import { backend } from "./backend";
+import { ManagedActorRefusalError, backend } from "./backend";
 import { favoritesPageChanged } from "./favoritesStore";
 import { onGraphRebound } from "./modeHooks";
 import {
@@ -36,6 +38,7 @@ import {
 } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
+import { failureShape } from "./failureShape";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
 
 // ---------------------------------------------------------------------------
@@ -575,48 +578,36 @@ export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
     : "ordinary";
 }
 
-/** Extract a bounded save-failure code from either backend contract.
+/** Extract a bounded save-failure code from the typed backend contracts.
  *
- * Direct saves prefix a bounded code. The managed actor instead returns its
- * bounded reason code in a terminal envelope, for example
- * `sync actor refused application page intent at committing the semantic page
- * transaction (reason code: trusted_local.append_outcome_unknown)`. Both forms
- * are parsed structurally so page text or ordinary error prose cannot change
- * the retry/latch disposition.
- */
+ *  W4-E4 retired the Direct save prefix parser that used to live here. The
+ *  command funnel has already validated the tagged JSON payload, so a Direct
+ *  failure arrives as an object with a closed `reasonCode`; no user-controlled
+ *  path or page text participates in classification, and a page legitimately
+ *  named `conflict_authority.notes` can no longer make an unrelated
+ *  `precheck.symlink` failure look like a spent override. (GH #254 increment 2,
+ *  fourth correction-delta re-verification.)
+ *
+ *  The `managed.conflict` prefix below is a Managed producer's own tagged
+ *  string, not Direct save prose; E2/E2b move it onto the shared typed carrier.
+ *  Returns `""` when nothing typed is present. */
 function saveFailureCode(error: unknown): string {
-  const message = String(error).replace(/^Error: /, "");
-  return directSaveFailureCode(message) || actorReasonCode(message);
-}
-
-/** The bounded failure code the Direct backend prefixes to a save error.
- *
- *  `direct_save_error_message` emits `"{code}: {raw error}"`, and many raw errors
- *  carry a graph-relative PATH. So a family test has to read the code, not search
- *  the whole string: a page legitimately named `conflict_authority.notes` would
- *  otherwise make an unrelated `precheck.symlink` failure look like a spent
- *  override, and its handler would keep re-observing a save that can never
- *  succeed. (GH #254 increment 2, fourth correction-delta re-verification.)
- *
- *  Returns `""` when there is no code separator or the prefix is not code-shaped
- *  — including the banner-class `conflict` / `conflict:<n>` shape, which is
- *  matched by `conflictObservationEpoch` before this is consulted. */
-function directSaveFailureCode(message: string): string {
-  const separator = message.indexOf(": ");
-  if (separator <= 0) return ""; // no code at all — never a family
-  const code = message.slice(0, separator);
-  // A bounded code is dot-separated, lower-case and underscored — usually
-  // `family.condition`, but `unknown` is a genuine single-segment one. Requiring
-  // the SHAPE means an error that merely opens with code-like prose cannot be
-  // read as one: without it, `Error("conflict_authority.spent while reporting
-  // …")` was accepted whole and routed into the authority handler.
-  return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
-}
-
-/** Extract the managed actor's complete terminal reason-code envelope only. */
-function actorReasonCode(message: string): string {
-  const match = /^sync actor refused application page intent(?: at [^(]+)? \(reason code: ([a-z][a-z_]*(?:\.[a-z][a-z_]*)*)\)$/.exec(message);
-  return match?.[1] ?? "";
+  if (error instanceof ManagedActorRefusalError) return error.reasonCode;
+  if (typeof error === "object" && error !== null && "kind" in error && "reasonCode" in error) {
+    const typed = error as { kind: unknown; reasonCode: unknown };
+    if (
+      (typed.kind === "direct-save-failure" || typed.kind === "save-conflict")
+      && typeof typed.reasonCode === "string"
+    ) {
+      return typed.reasonCode;
+    }
+  }
+  // Managed storage still owns this pre-existing tagged string producer; E2/E2b
+  // will move it through the shared typed carrier. It is not Direct save prose.
+  if (typeof error === "string" && error.startsWith("managed.conflict: ")) {
+    return "managed.conflict";
+  }
+  return "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.
@@ -626,10 +617,13 @@ function actorReasonCode(message: string): string {
  *  could not name, so no override may be presented for it. Returns null when the
  *  error is not banner class at all, and -1 for the unnameable legacy shape. */
 function conflictObservationEpoch(error: unknown): number | null {
-  const message = String(error).replace(/^Error: /, "");
-  if (message === "conflict") return -1;
-  const match = /^conflict:(\d+)$/.exec(message);
-  return match ? Number(match[1]) : null;
+  if (typeof error !== "object" || error === null || !("kind" in error) || error.kind !== "save-conflict") {
+    return null;
+  }
+  if (!("epoch" in error) || error.epoch === null) return -1;
+  return typeof error.epoch === "number" && Number.isSafeInteger(error.epoch) && error.epoch >= 0
+    ? error.epoch
+    : null;
 }
 
 /** Whether a save failed because the page revision changed underneath it.
@@ -889,6 +883,52 @@ function enqueueSave(
   return next;
 }
 
+const LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS = 500;
+interface PendingLiveConflictCapsule {
+  timer: ReturnType<typeof setTimeout>;
+  page: NonNullable<ReturnType<typeof pageToDto>>;
+  token: number;
+}
+const liveConflictCapsulePending = new Map<string, PendingLiveConflictCapsule>();
+
+/** Capsule durability has its own debounce: a conflicted page remains dirty,
+ * so ordinary save attempts may recur even though there is no file write to
+ * perform. Coalesce those attempts around the latest draft without coupling
+ * the crash-recovery envelope rewrite to the main save timer. */
+export function scheduleLiveSaveConflictDraftRefresh(
+  page: NonNullable<ReturnType<typeof pageToDto>>,
+): void {
+  const previous = liveConflictCapsulePending.get(page.name);
+  if (previous) clearTimeout(previous.timer);
+  const token = graphToken;
+  const timer = setTimeout(() => {
+    if (liveConflictCapsulePending.get(page.name)?.timer !== timer) return;
+    liveConflictCapsulePending.delete(page.name);
+    // A timer belongs to the graph whose draft scheduled it. Never let an old
+    // graph's delayed refresh attach to a same-named page after a switch.
+    if (graphToken !== token) return;
+    void refreshLiveSaveConflictDraft(page);
+  }, LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS);
+  liveConflictCapsulePending.set(page.name, { timer, page, token });
+}
+
+/** Persist every debounced capsule draft NOW and wait for it. The close /
+ * switch / restore barrier (`flushAll`) drains file saves, but a conflicted
+ * page's latest draft lives only in its capsule — leaving the debounce timer
+ * pending lets the app exit with a crash-recovery envelope that trails the
+ * in-memory draft by up to the debounce window. Stale-graph entries are
+ * dropped rather than written, exactly as their timers would have done. */
+export async function flushLiveSaveConflictDrafts(): Promise<void> {
+  const pending = [...liveConflictCapsulePending.values()];
+  for (const entry of pending) clearTimeout(entry.timer);
+  liveConflictCapsulePending.clear();
+  await Promise.all(
+    pending
+      .filter((entry) => entry.token === graphToken)
+      .map((entry) => refreshLiveSaveConflictDraft(entry.page)),
+  );
+}
+
 /** Write the page's CURRENT state once. No-op success if it isn't dirty and not
  *  forced. Sends `baseRev` (the version the editor loaded) so the backend
  *  conflicts against external changes; updates the baseline on success. On a
@@ -921,7 +961,7 @@ async function doSave(
   if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
   if (intent.kind === "ordinary" && isConflicted(name)) {
     const draft = pageToDto(name);
-    if (draft) refreshLiveSaveConflictDraft(draft);
+    if (draft) scheduleLiveSaveConflictDraftRefresh(draft);
     return false;
   }
   // A cross-page move source: hold its save until the destination is durable (C#1).
@@ -968,12 +1008,12 @@ async function doSave(
     return false;
   }
   if (dto.guide) {
-    console.warn("Refusing to persist ephemeral bundled Guide page", name);
+    console.warn("Refusing to persist ephemeral bundled Guide pages", { count: 1 });
     dirty.delete(name);
     return true;
   }
   if (dto.read_only) {
-    console.error("Refusing to persist read-only page", name);
+    console.error("Refusing to persist read-only pages", { count: 1 });
     dirty.delete(name);
     return false;
   }
@@ -992,7 +1032,7 @@ async function doSave(
         observation?.kind === "managed" ? observation.observation : null,
       )
     );
-    const rev = typeof saved === "string" ? saved : saved.revision;
+    const rev = saved.revision;
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
     // authorize identity reuse or update the replacement instance's baseline.
@@ -1001,7 +1041,7 @@ async function doSave(
       && graphBindingRev === bindingAtStart
       && peekPageInstanceGeneration(name) === issuingInstance
       && editorActivationFor(name) === issuingActivation;
-    if (typeof saved !== "string" && saved.activation) {
+    if (saved.activation) {
       if (exactIssuerStillLive) {
         // A first-create response may resolve/retarget the activation. It belongs
         // only to the exact page instance and graph binding that issued this save;
@@ -1071,11 +1111,12 @@ async function doSave(
         conflictObservation.set(name, { kind: "direct", epoch: observed });
         try {
           const capture = await backend().captureLiveSaveConflict(dto, baseline, observed);
-          registerLiveSaveConflict(dto, baseline, observed, capture);
+          if (!capture) throw new Error("Direct Files capture returned no authority payload");
+          await registerLiveSaveConflict(dto, baseline, observed, capture);
         } catch (captureError) {
           // The draft remains live and close protection stays armed. Surface the
           // missing restart capsule instead of pretending crash recovery exists.
-          registerLiveSaveConflict(dto, baseline, observed);
+          await registerLiveSaveConflict(dto, baseline, observed);
           pushToast(
             `Couldn't preserve “${name}” for restart recovery. Keep Tine open while resolving it. (${String(captureError)})`,
             "error",
@@ -1113,10 +1154,24 @@ async function doSave(
         identity: ++managedConflictObservationClock,
         observation: managedObservation,
       });
+      // Use the same semantic capture boundary as Direct Files. Managed returns
+      // no durable replacement authority: only the retained page and base below
+      // enter the app-private capsule.
+      try {
+        await backend().captureLiveSaveConflict(dto, baseline, 0);
+      } catch (error) {
+        // The capture only enriches the review; the retained draft below is
+        // the recovery material and must still reach the banner and capsule.
+        console.error("[tine] managed conflict capture failed", failureShape(error));
+      }
       // Re-notify an already visible banner so its Keep mine enabled state
-      // reflects this newly observed (or now unobservable) managed owner.
+      // reflects this newly observed (or now unobservable) managed owner. Clear
+      // before replacing the capsule so the newly persisted draft survives.
       if (isConflicted(name)) clearConflict(name);
-      markConflict(name);
+      // Persist only the retained draft and its load baseline while raising the
+      // ordinary banner. The actor's replacement observation above remains
+      // session-scoped and must be minted again after restart.
+      await markConflict(name, { page: dto, baseRev: baseline, storage: "managed" });
     } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the
@@ -1310,6 +1365,9 @@ export async function flushAll(): Promise<boolean> {
     ]);
     if (results.some(Boolean)) landed = true;
   }
+  // A conflicted page's draft is not on disk; its capsule is the only durable
+  // copy. Land the debounced refresh before the caller decides to close.
+  await flushLiveSaveConflictDrafts();
   if (landed) bumpDataRev();
   // Success only if nothing is still pending AND there are no unresolved
   // conflicts (a conflicted page's edit is NOT on disk) — so a destructive

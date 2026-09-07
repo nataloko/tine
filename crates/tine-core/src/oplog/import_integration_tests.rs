@@ -1383,8 +1383,12 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
     }
 
     // A supported path no configured root owns is inventoried at its exact
-    // spelling, and its kind comes from the file-name title exactly as OG's
-    // `convert-page-if-journal` decides it.
+    // spelling, and its kind comes from the file-name title exactly as OG
+    // 6e7afa8eb040686ff057156ee877193b581dd369 decides it in
+    // `deps/graph-parser/src/logseq/graph_parser/extract.cljc`
+    // (`get-page-name`) and
+    // `deps/graph-parser/src/logseq/graph_parser/block.cljs`
+    // (`convert-page-if-journal`).
     let nonstandard = inventory_affected(&graph, &[outside]).unwrap();
     assert_eq!(
         nonstandard
@@ -1418,6 +1422,25 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
             "notes/unrelated.md"
         ]
     );
+}
+
+#[test]
+fn managed_path_identity_matches_graphwide_filename_decoder() {
+    let dir = TestDir::new("managed-path-filename-identity");
+    for path in ["pages/2026_09_01.md", "journals/Foo.md"] {
+        write(dir.path(), path, b"- identity probe\n");
+    }
+    let graph = Graph::open(dir.path());
+
+    for path in ["pages/2026_09_01.md", "journals/Foo.md"] {
+        let managed = graph
+            .managed_entry_for_managed_path(&ManagedPath::parse(path).unwrap())
+            .unwrap();
+        let graphwide = graph.entry_for_path(&dir.path().join(path)).unwrap();
+        assert_eq!(managed.name, graphwide.name, "logical name for {path}");
+        assert_eq!(managed.kind, graphwide.kind, "page kind for {path}");
+        assert_eq!(managed.date_key, graphwide.date_key, "date key for {path}");
+    }
 }
 
 #[test]

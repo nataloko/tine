@@ -58,7 +58,7 @@ use crate::oplog::discovery::{
 use crate::oplog::enrollment::{
     inspect_local_activation_reservation_at, open_existing_enrollment_application_root,
     EnrollmentApplicationRoot, EnrollmentBindingV1, EnrollmentError, LocalActivationIdentityV1,
-    PreparationId, SharedEnrollmentDescriptorV1,
+    PreparationId,
 };
 use crate::oplog::hot_engine::ProjectionEndpointBinding;
 use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
@@ -436,6 +436,10 @@ struct ManagedApplicationQueryInstrumentation {
     projection_cache_misses: usize,
     hydration_cache_hits: usize,
     hydration_cache_misses: usize,
+    /// Pending paths actually LOADED while constructing a navigation overlay.
+    /// One complete pass equals the number of committed-undrained paths; a
+    /// request that rebuilds the overlay per consumer records a multiple of it.
+    navigation_overlay_pending_path_loads: usize,
 }
 
 /// How many distinct simple-query answers one actor retains at a time.
@@ -1037,6 +1041,10 @@ enum SharedJoinTestPausePoint {
     EnrollmentLockContended,
     BeforeCandidateDownload,
     AfterCandidateDownload,
+    AfterBaselineSwap,
+    AfterOperationSwap,
+    AfterAuthorityDirectorySync,
+    AfterMarkerReplacement,
     BeforeEnrollmentPublication,
 }
 
@@ -1110,6 +1118,18 @@ enum ActivationTestCut {
 #[cfg(test)]
 fn fail_once_at_activation_cut(cut: ActivationTestCut) {
     ACTIVATION_TEST_CUT.with(|pending| pending.set(Some(cut)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn fail_once_after_clean_activation_retain() {
+    CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT.with(|pending| pending.set(true));
 }
 
 #[cfg(test)]
@@ -1200,58 +1220,6 @@ pub struct SyncSharedEnrollmentDescriptor {
     pub descriptor_digest: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SharedEnrollmentDescriptor {
-    Legacy(SharedEnrollmentDescriptorV1),
-    Clean(CleanSharedEnrollmentDescriptorV1),
-}
-
-impl SharedEnrollmentDescriptor {
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if let Ok(descriptor) = CleanSharedEnrollmentDescriptorV1::decode(bytes) {
-            return Ok(Self::Clean(descriptor));
-        }
-        SharedEnrollmentDescriptorV1::decode(bytes)
-            .map(Self::Legacy)
-            .map_err(display)
-    }
-
-    const fn workspace_id(&self) -> WorkspaceId {
-        match self {
-            Self::Legacy(descriptor) => descriptor.workspace_id(),
-            Self::Clean(descriptor) => descriptor.workspace_id(),
-        }
-    }
-
-    const fn lineage_digest(&self) -> LineageDigest {
-        match self {
-            Self::Legacy(descriptor) => descriptor.lineage_digest(),
-            Self::Clean(descriptor) => descriptor.lineage_digest(),
-        }
-    }
-
-    const fn catalog_document_id(&self) -> DocumentId {
-        match self {
-            Self::Legacy(descriptor) => descriptor.catalog_document_id(),
-            Self::Clean(descriptor) => descriptor.catalog_document_id(),
-        }
-    }
-
-    fn encode(&self) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Legacy(descriptor) => descriptor.encode().map_err(display),
-            Self::Clean(descriptor) => descriptor.encode().map_err(display),
-        }
-    }
-
-    fn digest(&self) -> Result<ContentDigest, String> {
-        match self {
-            Self::Legacy(descriptor) => descriptor.digest().map_err(display),
-            Self::Clean(descriptor) => descriptor.digest().map_err(display),
-        }
-    }
-}
-
 /// Structural provider-prefix state observed before cold descriptor discovery.
 /// `Partial` is retryable honest file-sync delivery; `Refused` is an unsafe or
 /// ambiguous shape and deliberately carries no storage authority.
@@ -1262,10 +1230,192 @@ pub enum SyncSharedProviderColdPrefix {
     Refused,
 }
 
+/// The bounded source taxonomy for failures encountered while constructing or
+/// recovering a clean managed runtime. Source values stay typed until the
+/// public string boundary; [`fmt::Display`] deliberately exposes only the
+/// stable code, never source prose, paths, or note names.
+#[derive(Debug)]
+pub(crate) enum CleanOpenError {
+    BootstrapStreamingImport(Box<crate::oplog::import::BootstrapStreamingImportError>),
+    Engine(Box<crate::oplog::hot_engine::EngineError>),
+    Enrollment(Box<crate::oplog::enrollment::EnrollmentError>),
+    ManagedLocalRecord(Box<crate::oplog::hot_engine::ManagedLocalRecordError>),
+    ProjectionStore(Box<crate::oplog::projection_store::ProjectionStoreError>),
+    ProjectionTurnJournal(Box<crate::oplog::projection_turn_journal::ProjectionTurnJournalError>),
+    Receipt(Box<crate::oplog::receipt::ReceiptError>),
+    RuntimePromotion(Box<crate::oplog::local_active::RuntimePromotionError>),
+    Scenario(Box<crate::oplog::wire::ScenarioError>),
+    Store(Box<crate::oplog::object_store::StoreError>),
+    Sweep(Box<crate::oplog::absence_sweep::SweepError>),
+    WorkspaceAuthority(Box<crate::oplog::local_active::WorkspaceAuthorityRefusal>),
+    SqliteProjection(Box<crate::oplog::sqlite::ProjectionError>),
+    Projection(Box<crate::oplog::projection::ProjectionError>),
+    Io(std::io::ErrorKind),
+    Batch(Box<tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>>),
+}
+
+impl CleanOpenError {
+    pub(crate) const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::BootstrapStreamingImport(_) => "clean_open.bootstrap_streaming_import",
+            Self::Engine(_) => "clean_open.engine",
+            Self::Enrollment(_) => "clean_open.enrollment",
+            Self::ManagedLocalRecord(_) => "clean_open.managed_local_record",
+            Self::ProjectionStore(_) => "clean_open.projection_store",
+            Self::ProjectionTurnJournal(_) => "clean_open.projection_turn_journal",
+            Self::Receipt(_) => "clean_open.receipt",
+            Self::RuntimePromotion(_) => "clean_open.runtime_promotion",
+            Self::Scenario(_) => "clean_open.scenario",
+            Self::Store(_) => "clean_open.store",
+            Self::Sweep(_) => "clean_open.sweep",
+            Self::WorkspaceAuthority(_) => "clean_open.workspace_authority",
+            Self::SqliteProjection(_) => "clean_open.sqlite_projection",
+            Self::Projection(_) => "clean_open.projection",
+            Self::Io(_) => "clean_open.io",
+            Self::Batch(_) => "clean_open.batch",
+        }
+    }
+
+    fn refusal_scenario(&self) -> Option<ManagedStorageRefusalScenario> {
+        match self {
+            Self::BootstrapStreamingImport(error) => match error.as_ref() {
+                crate::oplog::import::BootstrapStreamingImportError::Io(error)
+                    if crate::oplog::lazy_genesis::is_superseded_containing_format(error) =>
+                {
+                    Some(ManagedStorageRefusalScenario::ProtocolIncompatible)
+                }
+                _ => None,
+            },
+            Self::ProjectionStore(error) => projection_store_refusal_scenario(error),
+            _ => None,
+        }
+    }
+}
+
+fn projection_store_refusal_scenario(
+    error: &crate::oplog::projection_store::ProjectionStoreError,
+) -> Option<ManagedStorageRefusalScenario> {
+    match error {
+        crate::oplog::projection_store::ProjectionStoreError::UnknownStoreVersion(_)
+        | crate::oplog::projection_store::ProjectionStoreError::UpgradeRequired { .. } => {
+            Some(ManagedStorageRefusalScenario::ProtocolIncompatible)
+        }
+        crate::oplog::projection_store::ProjectionStoreError::Operation { source, .. } => {
+            projection_store_refusal_scenario(source)
+        }
+        _ => None,
+    }
+}
+
+impl fmt::Display for CleanOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.reason_code())
+    }
+}
+
+impl std::error::Error for CleanOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BootstrapStreamingImport(error) => Some(error.as_ref()),
+            Self::Engine(error) => Some(error.as_ref()),
+            Self::Enrollment(error) => Some(error.as_ref()),
+            Self::ManagedLocalRecord(error) => Some(error.as_ref()),
+            Self::ProjectionStore(error) => Some(error.as_ref()),
+            Self::ProjectionTurnJournal(error) => Some(error.as_ref()),
+            Self::Receipt(error) => Some(error.as_ref()),
+            Self::RuntimePromotion(error) => Some(error.as_ref()),
+            Self::Scenario(error) => Some(error.as_ref()),
+            Self::Store(error) => Some(error.as_ref()),
+            Self::Sweep(error) => Some(error.as_ref()),
+            Self::WorkspaceAuthority(error) => Some(error.as_ref()),
+            Self::SqliteProjection(error) => Some(error.as_ref()),
+            Self::Projection(error) => Some(error.as_ref()),
+            Self::Batch(error) => Some(error.as_ref()),
+            Self::Io(_) => None,
+        }
+    }
+}
+
+macro_rules! clean_open_from {
+    ($source:ty, $variant:ident) => {
+        impl From<$source> for CleanOpenError {
+            fn from(error: $source) -> Self {
+                Self::$variant(Box::new(error))
+            }
+        }
+    };
+}
+
+clean_open_from!(
+    crate::oplog::import::BootstrapStreamingImportError,
+    BootstrapStreamingImport
+);
+clean_open_from!(crate::oplog::hot_engine::EngineError, Engine);
+clean_open_from!(crate::oplog::enrollment::EnrollmentError, Enrollment);
+clean_open_from!(
+    crate::oplog::hot_engine::ManagedLocalRecordError,
+    ManagedLocalRecord
+);
+clean_open_from!(
+    crate::oplog::projection_store::ProjectionStoreError,
+    ProjectionStore
+);
+clean_open_from!(
+    crate::oplog::projection_turn_journal::ProjectionTurnJournalError,
+    ProjectionTurnJournal
+);
+clean_open_from!(crate::oplog::receipt::ReceiptError, Receipt);
+clean_open_from!(
+    crate::oplog::local_active::RuntimePromotionError,
+    RuntimePromotion
+);
+clean_open_from!(crate::oplog::wire::ScenarioError, Scenario);
+clean_open_from!(crate::oplog::object_store::StoreError, Store);
+clean_open_from!(crate::oplog::absence_sweep::SweepError, Sweep);
+clean_open_from!(
+    crate::oplog::local_active::WorkspaceAuthorityRefusal,
+    WorkspaceAuthority
+);
+clean_open_from!(crate::oplog::sqlite::ProjectionError, SqliteProjection);
+clean_open_from!(crate::oplog::projection::ProjectionError, Projection);
+clean_open_from!(
+    tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>,
+    Batch
+);
+
+impl From<std::io::Error> for CleanOpenError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+/// The single projection from the typed clean-open taxonomy to the existing
+/// string transport. The transport is tagged JSON so callers never need to
+/// recover control flow from source display text.
+fn clean_open_error_detail(error: CleanOpenError) -> String {
+    match error.refusal_scenario() {
+        Some(scenario) => tagged_backend_error_with_reason_and_detail(
+            "clean-open",
+            error.reason_code(),
+            serde_json::json!({ "scenario": scenario.as_str() }),
+        ),
+        None => tagged_backend_error("clean-open", Some(error.reason_code())),
+    }
+}
+
+impl From<CleanOpenError> for String {
+    fn from(error: CleanOpenError) -> Self {
+        clean_open_error_detail(error)
+    }
+}
+
 pub fn inspect_shared_provider_cold_prefix(
     provider_root: &Path,
 ) -> Result<SyncSharedProviderColdPrefix, String> {
-    match inspect_cold_shared_provider_prefix(provider_root).map_err(display)? {
+    match inspect_cold_shared_provider_prefix(provider_root)
+        .map_err(CleanOpenError::from)
+        .map_err(clean_open_error_detail)?
+    {
         ColdSharedProviderPrefix::Partial => Ok(SyncSharedProviderColdPrefix::Partial),
         ColdSharedProviderPrefix::ReadyForDescriptorInspection => {
             Ok(SyncSharedProviderColdPrefix::ReadyForDescriptorInspection)
@@ -1275,44 +1425,38 @@ pub fn inspect_shared_provider_cold_prefix(
 }
 
 impl SyncSharedEnrollmentDescriptor {
-    /// Build the public descriptor from a legacy core descriptor.
-    ///
-    /// Retained for the provider-recovery regressions that construct a
-    /// descriptor straight from decoded provider bytes; production reaches
-    /// the public surface through [`Self::from_descriptor`].
-    #[cfg(test)]
-    fn from_core(descriptor: SharedEnrollmentDescriptorV1) -> Result<Self, String> {
-        Self::from_descriptor(SharedEnrollmentDescriptor::Legacy(descriptor))
-    }
-
-    fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, String> {
-        Self::from_descriptor(SharedEnrollmentDescriptor::Clean(descriptor))
-    }
-
-    fn from_descriptor(descriptor: SharedEnrollmentDescriptor) -> Result<Self, String> {
+    fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, CleanOpenError> {
         Ok(Self {
-            encoded: descriptor.encode()?,
+            encoded: descriptor.encode().map_err(CleanOpenError::from)?,
             workspace_id: descriptor.workspace_id(),
             lineage_digest: descriptor.lineage_digest(),
             catalog_document_id: descriptor.catalog_document_id(),
-            descriptor_digest: descriptor.digest()?.to_string(),
+            descriptor_digest: descriptor
+                .digest()
+                .map_err(CleanOpenError::from)?
+                .to_string(),
         })
     }
 
-    fn decode(&self) -> Result<SharedEnrollmentDescriptor, String> {
-        SharedEnrollmentDescriptor::decode(&self.encoded)
+    fn decode(&self) -> Result<CleanSharedEnrollmentDescriptorV1, CleanOpenError> {
+        CleanSharedEnrollmentDescriptorV1::decode(&self.encoded).map_err(CleanOpenError::from)
     }
 }
 
 pub fn inspect_shared_enrollment(
     provider_root: &Path,
 ) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
-    inspect_shared_provider_descriptor(provider_root)
-        .map_err(display)?
-        .map(|bytes| SharedEnrollmentDescriptor::decode(&bytes))
-        .transpose()?
-        .map(SyncSharedEnrollmentDescriptor::from_descriptor)
-        .transpose()
+    (|| {
+        inspect_shared_provider_descriptor(provider_root)
+            .map_err(CleanOpenError::from)?
+            .map(|bytes| {
+                CleanSharedEnrollmentDescriptorV1::decode(&bytes).map_err(CleanOpenError::from)
+            })
+            .transpose()?
+            .map(SyncSharedEnrollmentDescriptor::from_clean)
+            .transpose()
+    })()
+    .map_err(clean_open_error_detail)
 }
 
 pub fn inspect_shared_enrollment_for_cold_discovery(
@@ -1323,7 +1467,10 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // filesystem sync is settling (temporary files, conflict copies, or newer
     // append-only namespaces), so cold discovery must not require the
     // enrollment directory to contain literally one entry.
-    let Some(bytes) = inspect_shared_provider_descriptor(provider_root).map_err(display)? else {
+    let Some(bytes) = inspect_shared_provider_descriptor(provider_root)
+        .map_err(CleanOpenError::from)
+        .map_err(clean_open_error_detail)?
+    else {
         return Ok(None);
     };
     // File-sync providers may expose the canonical filename before its final
@@ -1331,10 +1478,10 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // retryable partial arrival.  Filesystem validation failures are local
     // platform errors and must remain visible to the caller instead of being
     // mislabeled as an unfinished sync.
-    let Ok(descriptor) = SharedEnrollmentDescriptor::decode(&bytes) else {
+    let Ok(descriptor) = CleanSharedEnrollmentDescriptorV1::decode(&bytes) else {
         return Ok(None);
     };
-    match SyncSharedEnrollmentDescriptor::from_descriptor(descriptor) {
+    match SyncSharedEnrollmentDescriptor::from_clean(descriptor) {
         Ok(descriptor) => Ok(Some(descriptor)),
         Err(_) => Ok(None),
     }
@@ -1629,10 +1776,14 @@ pub enum SyncRuntimeCleanOpenStage {
     GraphOpen,
     EndpointAndReceiptOpen,
     ObjectStoreRepairAndValidation,
+    CleanCheckpointOpen,
+    CleanCheckpointTailDiscovery,
     CommittedTailReplay,
     ProjectionOpen,
     EngineIndexesAndSweepsOpen,
     RetainedJournalsOpen,
+    OwnEndpointRetirementScan,
+    AbsenceDecisionMapOpen,
     RetainedJournalsDrain,
     TerminalProjectionRepair,
     CompletionFlush,
@@ -1646,10 +1797,14 @@ impl SyncRuntimeCleanOpenStage {
             Self::GraphOpen => "graph_open",
             Self::EndpointAndReceiptOpen => "endpoint_and_receipt_open",
             Self::ObjectStoreRepairAndValidation => "object_store_repair_and_validation",
+            Self::CleanCheckpointOpen => "clean_checkpoint_open",
+            Self::CleanCheckpointTailDiscovery => "clean_checkpoint_tail_discovery",
             Self::CommittedTailReplay => "committed_tail_replay",
             Self::ProjectionOpen => "projection_open",
             Self::EngineIndexesAndSweepsOpen => "engine_indexes_and_sweeps_open",
             Self::RetainedJournalsOpen => "retained_journals_open",
+            Self::OwnEndpointRetirementScan => "own_endpoint_retirement_scan",
+            Self::AbsenceDecisionMapOpen => "absence_decision_map_open",
             Self::RetainedJournalsDrain => "retained_journals_drain",
             Self::TerminalProjectionRepair => "terminal_projection_repair",
             Self::CompletionFlush => "completion_flush",
@@ -1703,6 +1858,78 @@ pub struct SyncRuntimeRecoveryDiagnostics {
     pub replayed_generations: u64,
 }
 
+/// Content-free work counters for one clean managed cold open.
+///
+/// Every field counts work the open actually performed — directory names
+/// observed, evidence bodies decoded, history entries replayed. Nothing here
+/// is read back by the open path: these values are produced after the work
+/// they describe and never gate, shorten, or redirect a stage. They exist so
+/// the per-stage wall times reported alongside them can be attributed to a
+/// mechanism instead of guessed at (I-14: a cost that grows with store
+/// lifetime must be visible as a number before it can be bounded).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SyncRuntimeCleanOpenCounters {
+    /// Accepted batches in the engine's history at open — the lifetime axis.
+    pub accepted_batches: usize,
+    /// Committed operation manifests replayed onto the immutable baseline.
+    pub committed_tail_replayed: usize,
+    /// Exactly one when a durable clean checkpoint restored engine state.
+    pub checkpoint_opens: usize,
+    /// Exactly one when open started from the immutable sequence-zero baseline.
+    pub full_replay_opens: usize,
+    /// Accepted roster rows authenticated through the sealed index.
+    pub checkpoint_roster_entries: usize,
+    /// Archive manifest names compared during checkpoint tail discovery.
+    pub checkpoint_manifest_names: usize,
+    /// Required object names compared without opening object bodies.
+    pub checkpoint_required_object_names: usize,
+    /// Semantic items touched by the actor capture which produced the checkpoint.
+    pub checkpoint_capture_work: u64,
+    /// Canonical checkpoint payload bytes opened before the durable tail.
+    pub checkpoint_payload_bytes: usize,
+    /// Published frontier minus durable checkpoint frontier after open.
+    pub checkpoint_durable_lag: u64,
+    /// Sweep chains reconstructed from the private derived root.
+    pub sweep_chains: usize,
+    /// Receipt evidence FILENAMES observed by the names-only horizon scan.
+    pub receipt_evidence_names: usize,
+    /// Receipt evidence BODIES read and decoded (intent + completion rows).
+    pub receipt_content_reads: usize,
+    /// Complete `validated_catalog()` passes over the receipt store.
+    pub receipt_full_catalog_passes: usize,
+    /// Summary objects read while opening the receiver absence summary.
+    pub summary_content_reads: usize,
+    /// The summary was rebuilt from the full catalog rather than delta-read.
+    pub summary_rebuilt: bool,
+    /// Newly completed receiver rows the summary delta-read.
+    pub summary_delta_completions: usize,
+    /// Newly intended (uncompleted) receiver rows the summary delta-read.
+    pub summary_delta_intents: usize,
+    /// Own-endpoint completion-chain object names observed at open.
+    pub local_completion_names: usize,
+    /// Own-endpoint completion-chain objects read and decoded at open.
+    pub local_completion_content_reads: usize,
+    /// The own-endpoint chain was rebuilt rather than resumed from compaction.
+    pub local_completion_rebuilt: bool,
+    /// Own-endpoint completion entries retained after open.
+    pub local_completion_entries: usize,
+    /// Own intent ids probed for retired receipt artifacts.
+    pub retired_own_intent_probes: usize,
+    /// Retired own-endpoint receipt artifacts still present on disk.
+    pub retired_own_receipt_artifacts: usize,
+    /// Archive directory enumerations performed during this open.
+    pub archive_directory_enumerations: usize,
+    /// Archive manifest bodies read during this open.
+    pub archive_manifest_reads: usize,
+    /// Archive object bodies read during this open.
+    pub archive_object_reads: usize,
+    /// Batch manifests INSPECTED (decoded and validated) during this open —
+    /// the per-batch work of committed-tail replay.
+    pub archive_inspected_manifests: usize,
+    /// Immutable objects inspected (decoded) during this open.
+    pub archive_inspected_objects: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeOpenProgress {
     Phase {
@@ -1719,6 +1946,11 @@ pub enum SyncRuntimeOpenProgress {
     },
     RecoveryDiagnostics {
         diagnostics: SyncRuntimeRecoveryDiagnostics,
+    },
+    /// Emitted exactly once when a clean cold open completes, after every
+    /// stage boundary it attributes. Observational only.
+    CleanOpenCounters {
+        counters: SyncRuntimeCleanOpenCounters,
     },
 }
 
@@ -1760,9 +1992,22 @@ pub struct SyncWatcherStatus {
     pub full_scan_documents_read: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncCheckpointCaptureSkip {
+    RuntimeNotAttached,
+    IndexedRuntime,
+    BlockedRuntime,
+    UnsettledRuntime,
+    DurableFrontierAhead,
+    CaptureFailed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeTick {
     Idle,
+    CheckpointCaptureSkipped {
+        reason: SyncCheckpointCaptureSkip,
+    },
     LocalMutation(SyncLocalMutationOutcome),
     /// A provider-authored batch is now reflected in the receiver's SQLite
     /// projection and graph bytes. Unlike traversal-only `Recovering`, this is
@@ -2883,6 +3128,51 @@ impl fmt::Display for SyncEditorRefusalCode {
     }
 }
 
+/// The sole native encoder for app-internal typed rejection payloads. The Tauri
+/// wire remains `String` this release, but its load-bearing kinds are JSON data
+/// rather than prose that frontend components must parse back into control flow.
+pub fn tagged_backend_error(kind: &'static str, reason_code: Option<&str>) -> String {
+    encode_tagged_backend_error(kind, reason_code, None)
+}
+
+/// The same encoder for the one kind whose contract promises bounded typed
+/// data alongside the code: `shared-frontier-mismatch` carries the clean-join
+/// counts and at most [`CLEAN_JOIN_MAX_MISMATCH_DETAILS`] relative note paths
+/// (`docs/storage-sync-contract.md`, "Joining"). Never note content.
+pub fn tagged_backend_error_with_detail(kind: &'static str, detail: serde_json::Value) -> String {
+    encode_tagged_backend_error(kind, None, Some(detail))
+}
+
+/// The same encoder for a closed reason vocabulary plus bounded typed detail.
+/// Direct save failures use this to carry the producer code and filesystem
+/// error kind without reparsing display text at the command boundary.
+pub fn tagged_backend_error_with_reason_and_detail(
+    kind: &'static str,
+    reason_code: &str,
+    detail: serde_json::Value,
+) -> String {
+    encode_tagged_backend_error(kind, Some(reason_code), Some(detail))
+}
+
+fn encode_tagged_backend_error(
+    kind: &'static str,
+    reason_code: Option<&str>,
+    detail: Option<serde_json::Value>,
+) -> String {
+    let mut payload = serde_json::Map::new();
+    payload.insert("kind".into(), serde_json::Value::String(kind.into()));
+    if let Some(reason_code) = reason_code {
+        payload.insert(
+            "reason_code".into(),
+            serde_json::Value::String(reason_code.into()),
+        );
+    }
+    if let Some(detail) = detail {
+        payload.insert("detail".into(), detail);
+    }
+    serde_json::Value::Object(payload).to_string()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
@@ -2949,6 +3239,18 @@ impl fmt::Display for SyncApplicationPageRequestError {
 impl std::error::Error for SyncApplicationPageRequestError {}
 
 impl SyncApplicationPageRequestError {
+    pub fn backend_wire_string(&self) -> String {
+        match self {
+            Self::ActorRefusedWithCode(code)
+            | Self::ActorRefusedAtWithCode { code, .. }
+            | Self::ActorRefusedWithDebugDetail { code, .. }
+            | Self::ActorRefusedAtWithDebugDetail { code, .. } => {
+                tagged_backend_error("managed-actor-refusal", Some(code.as_str()))
+            }
+            _ => self.to_string(),
+        }
+    }
+
     /// Exact inner failure text for a locally enabled diagnostic trace.  This
     /// must never be shown through the normal application-error display path.
     pub fn debug_detail(&self) -> Option<&str> {
@@ -3275,6 +3577,7 @@ pub enum SyncRuntimeRequestError {
         path_bytes: usize,
     },
     ActorRefused(String),
+    TaggedBackend(String),
     ActorUnavailable,
 }
 
@@ -3297,6 +3600,7 @@ impl fmt::Display for SyncRuntimeRequestError {
                 "watcher request exceeds bounds: {observations} observations, {path_bytes} path bytes"
             ),
             Self::ActorRefused(detail) => write!(formatter, "sync actor refused request: {detail}"),
+            Self::TaggedBackend(payload) => formatter.write_str(payload),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -3419,6 +3723,7 @@ impl SyncRuntimeHandle {
                     stage: SyncRuntimeCleanOpenStage,
                     elapsed: Duration,
                 },
+                Counters(SyncRuntimeCleanOpenCounters),
                 Complete(Result<Option<CleanRuntimeResources>, String>),
             }
             let (recovery_sender, recovery_receiver) = mpsc::channel();
@@ -3430,12 +3735,16 @@ impl SyncRuntimeHandle {
                         session.attach();
                     }
                     let stage_sender = recovery_sender.clone();
+                    let counters_sender = recovery_sender.clone();
                     let result = open_clean_runtime_resources_with_progress(
                         &recovery_request,
                         &mut |_| {},
                         &mut |stage, elapsed| {
                             let _ =
                                 stage_sender.send(RecoveryWorkerEvent::Stage { stage, elapsed });
+                        },
+                        &mut |counters| {
+                            let _ = counters_sender.send(RecoveryWorkerEvent::Counters(counters));
                         },
                     );
                     let _ = recovery_sender.send(RecoveryWorkerEvent::Complete(result));
@@ -3451,6 +3760,9 @@ impl SyncRuntimeHandle {
                 match recovery_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
                     Ok(RecoveryWorkerEvent::Stage { stage, elapsed }) => {
                         progress(SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed });
+                    }
+                    Ok(RecoveryWorkerEvent::Counters(counters)) => {
+                        progress(SyncRuntimeOpenProgress::CleanOpenCounters { counters });
                     }
                     Ok(RecoveryWorkerEvent::Complete(result)) => {
                         if recovery_worker.join().is_err() {
@@ -3484,9 +3796,7 @@ impl SyncRuntimeHandle {
                     );
                 }
                 Ok(None) => {}
-                Err(detail) => {
-                    return refused(format!("clean managed runtime open failed: {detail}"))
-                }
+                Err(detail) => return refused(detail),
             }
         }
         progress(SyncRuntimeOpenProgress::Phase {
@@ -3719,6 +4029,7 @@ impl SyncRuntimeHandle {
             &runtime_open_request_from_activation(&request),
             &mut progress,
             &mut |_, _| {},
+            &mut |_| {},
         ) {
             Ok(Some(resources)) => {
                 progress(SyncLocalActivationProgress::Phase {
@@ -3832,7 +4143,16 @@ impl SyncRuntimeHandle {
                 match activate_clean_runtime_resources(&request, clean_graph, &mut progress) {
                     Ok(resources) => resources,
                     Err(detail) => {
-                        return activation_retryable(SyncLocalActivationStage::Absent, detail)
+                        let durable_stage = if request
+                            .enrollment_root
+                            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+                            .is_file()
+                        {
+                            SyncLocalActivationStage::LocalActive
+                        } else {
+                            SyncLocalActivationStage::Absent
+                        };
+                        return activation_retryable(durable_stage, detail);
                     }
                 };
             progress(SyncLocalActivationProgress::Phase {
@@ -3982,9 +4302,9 @@ impl SyncRuntimeHandle {
         descriptor: SyncSharedEnrollmentDescriptor,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         let _enrollment_operation = self.enrollment_operation();
-        let descriptor = descriptor
-            .decode()
-            .map_err(SyncRuntimeRequestError::InvalidRequest)?;
+        let descriptor = descriptor.decode().map_err(|error| {
+            SyncRuntimeRequestError::InvalidRequest(clean_open_error_detail(error))
+        })?;
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::JoinShared {
@@ -4686,6 +5006,23 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ManagedApplicationQueryInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn observable_engine_state(
+        &self,
+    ) -> Result<
+        crate::oplog::hot_engine::validation_tests::ObservableEngineState,
+        SyncRuntimeRequestError,
+    > {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ObservableEngineState {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -6095,12 +6432,127 @@ impl CleanRuntimeActorCore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CleanAuthorityDirectories {
+    baseline: PathBuf,
+    operations: PathBuf,
+}
+
+fn clean_authority_directories(archive_root: &Path, generation: u64) -> CleanAuthorityDirectories {
+    CleanAuthorityDirectories {
+        baseline: archive_root.join(format!(
+            "{}.{generation}",
+            crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY
+        )),
+        operations: archive_root.join(format!("{CLEAN_OPERATION_ARCHIVE_DIRECTORY}.{generation}")),
+    }
+}
+
 fn clean_baseline_directory(archive_root: &Path) -> PathBuf {
-    archive_root.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY)
+    clean_authority_directories(archive_root, 0).baseline
 }
 
 fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
-    archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
+    clean_authority_directories(archive_root, 0).operations
+}
+
+fn clean_authority_generation(name: &str, stem: &str) -> Option<u64> {
+    name.strip_prefix(stem)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .and_then(|suffix| suffix.parse().ok())
+}
+
+/// Resolve the sole authority generation named by the durable marker and
+/// retire incomplete candidates or generations that no marker made
+/// authoritative. The marker publication/replacement is therefore the only
+/// commit point; no directory swap repair state machine exists.
+fn resolve_clean_authority_directories(
+    archive_root: &Path,
+    enrollment_root: &Path,
+    database_path: &Path,
+) -> std::io::Result<Option<CleanAuthorityDirectories>> {
+    let marker = read_activation_marker(enrollment_root)?;
+    let entries = match fs::read_dir(archive_root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(
+                marker.map(|marker| clean_authority_directories(archive_root, marker.generation()))
+            );
+        }
+        Err(error) => return Err(error),
+    };
+
+    if marker.is_none() {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let recognized = clean_authority_generation(
+                &name,
+                crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+            )
+            .or_else(|| clean_authority_generation(&name, CLEAN_OPERATION_ARCHIVE_DIRECTORY))
+            .is_some()
+                || name.starts_with(".clean-join-");
+            if !recognized {
+                // Unknown bytes are not attributed to an interrupted current-
+                // layout activation. Leave them for normal discovery/refusal.
+                return Ok(None);
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("clean authority orphan is not a private directory: {name}"),
+                ));
+            }
+        }
+
+        // Without a marker every generation is inert. SQLite is likewise a
+        // disposable projection, so retire it before the generation slots;
+        // every crash cut through this cleanup remains recognizable on retry.
+        crate::oplog::sqlite::remove_disposable_projection(database_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        remove_disposable_clean_archive(archive_root)?;
+        if let Some(parent) = archive_root.parent() {
+            crate::filesystem_durability::sync_reconstructible_directory_path(parent)?;
+        }
+        return Ok(None);
+    }
+    let marker = marker.expect("the no-marker recovery returned above");
+    let active = clean_authority_directories(archive_root, marker.generation());
+    let mut removed = false;
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let generation = clean_authority_generation(
+            &name,
+            crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+        )
+        .or_else(|| clean_authority_generation(&name, CLEAN_OPERATION_ARCHIVE_DIRECTORY));
+        let orphan = generation.is_some_and(|generation| generation != marker.generation())
+            || name.starts_with(".clean-join-");
+        if !orphan {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            // §3.1 MS-REF-UNSAFE-FS-KIND pins the in-scope substituted-entry
+            // scenario for this exact refusal stem.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("clean authority orphan is not a private directory: {name}"),
+            ));
+        }
+        fs::remove_dir_all(entry.path())?;
+        removed = true;
+    }
+    if removed {
+        crate::filesystem_durability::sync_reconstructible_directory_path(archive_root)?;
+    }
+    Ok(Some(active))
 }
 
 fn retained_local_completion_intents(
@@ -6109,20 +6561,21 @@ fn retained_local_completion_intents(
 ) -> Result<BTreeSet<crate::oplog::ProjectionIntentId>, String> {
     let mut retained = BTreeSet::new();
     for frame in &managed.frames {
-        let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
+        let record =
+            crate::oplog::decode_managed_local_record(frame).map_err(CleanOpenError::from)?;
         for projection in record.projections() {
             retained.insert(
                 projection
                     .completion_intent()
                     .and_then(|intent| intent.id())
-                    .map_err(display)?,
+                    .map_err(CleanOpenError::from)?,
             );
         }
     }
-    for turn in turns.undrained_turns().map_err(display)? {
+    for turn in turns.undrained_turns().map_err(CleanOpenError::from)? {
         retained.extend(
             crate::oplog::projection::local_completion_intent_ids_for_turn(&turn)
-                .map_err(display)?,
+                .map_err(CleanOpenError::from)?,
         );
     }
     Ok(retained)
@@ -6227,12 +6680,17 @@ fn drain_open_managed_local_journal(
         }
     }
 
-    let accepted = runtime.engine().accepted_frontier_root().map_err(display)?;
-    let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-    let (_, engine, _) = session.parts().map_err(display)?;
+    let accepted = runtime
+        .engine()
+        .accepted_frontier_root()
+        .map_err(CleanOpenError::from)?;
+    let mut session = runtime
+        .admit_clean_mutation(graph)
+        .map_err(CleanOpenError::from)?;
+    let (_, engine, _) = session.parts().map_err(CleanOpenError::from)?;
     engine
         .collapse_managed_local_prefix(&accepted)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     Ok(recovered_batches)
 }
 
@@ -6250,14 +6708,16 @@ fn drain_open_projection_turn_journal(
         // that held reservation instead of minting a competing one.
         let handoff = graph
             .reconstruct_published_handoff_safe(runtime.engine().workspace_id(), endpoint)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         handoff
             .verify_binding(graph, runtime.engine().workspace_id(), endpoint)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let published = handoff.into_publisher_guard().into_published_latch();
         {
-            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-            let (_, engine, database) = session.parts().map_err(display)?;
+            let mut session = runtime
+                .admit_clean_mutation(graph)
+                .map_err(CleanOpenError::from)?;
+            let (_, engine, database) = session.parts().map_err(CleanOpenError::from)?;
             crate::oplog::projection::replay_projection_turn(
                 graph,
                 receipts,
@@ -6266,7 +6726,7 @@ fn drain_open_projection_turn_journal(
                 &turn,
                 Some(&published),
             )
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         }
         turns.checkpoint_front()?;
         published.complete();
@@ -6284,16 +6744,18 @@ fn append_and_replay_terminal_projection_turns(
     let terminal_work = runtime
         .engine()
         .clean_terminal_projection_work()
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let mut groups: Vec<(crate::oplog::TurnOrigin, Vec<crate::oplog::ProjectionWork>)> = Vec::new();
     for work in terminal_work {
         let already_exact = {
-            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-            let (_, engine, database) = session.parts().map_err(display)?;
+            let mut session = runtime
+                .admit_clean_mutation(graph)
+                .map_err(CleanOpenError::from)?;
+            let (_, engine, database) = session.parts().map_err(CleanOpenError::from)?;
             crate::oplog::projection::projection_work_is_already_exact(
                 graph, engine, database, &work,
             )
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
         };
         if already_exact {
             continue;
@@ -6320,8 +6782,8 @@ fn append_and_replay_terminal_projection_turns(
     for (origin, work) in groups {
         let pages =
             crate::oplog::projection::projection_turn_pages_for_work(runtime.engine(), &work)
-                .map_err(display)?;
-        turns.append(origin, pages).map_err(display)?;
+                .map_err(CleanOpenError::from)?;
+        turns.append(origin, pages).map_err(CleanOpenError::from)?;
     }
     drain_open_projection_turn_journal(graph, receipts, runtime, turns)
 }
@@ -6351,7 +6813,11 @@ fn activate_clean_runtime_resources(
 ) -> Result<CleanRuntimeResources, String> {
     let archive_predates_this_attempt = request.archive_root.exists();
     let result = activate_clean_runtime_resources_retaining_archive(request, graph, progress);
-    if result.is_err() && !archive_predates_this_attempt {
+    let authority_was_retained = request
+        .enrollment_root
+        .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+        .is_file();
+    if result.is_err() && !archive_predates_this_attempt && !authority_was_retained {
         if let Err(error) = remove_disposable_clean_archive(&request.archive_root) {
             return Err(match result {
                 Err(detail) => format!(
@@ -6403,7 +6869,7 @@ fn activate_clean_runtime_resources_retaining_archive(
     });
     let capture = graph
         .capture_inactive_bootstrap_sources(&request.capture_root)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::BootstrapImportPreparation,
     });
@@ -6417,7 +6883,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         &request.database_path,
         &ReferenceCatalogPolicyV1::default(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::ReadinessSample {
         largest_page_path: preparation.instrumentation().largest_source_path.clone(),
     });
@@ -6434,8 +6900,12 @@ fn activate_clean_runtime_resources_retaining_archive(
         &clean_baseline_directory(&request.archive_root),
         &request.enrollment_root,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     let (baseline, projection, accepted_frontier, marker) = committed.into_parts();
+    #[cfg(test)]
+    if CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT.with(std::cell::Cell::take) {
+        return Err("injected failure after clean activation retained authority".into());
+    }
     if marker.workspace_id() != request.identities.workspace_id
         || marker.lineage_digest() != request.identities.lineage_digest
     {
@@ -6449,23 +6919,23 @@ fn activate_clean_runtime_resources_retaining_archive(
     );
     engine
         .configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default())
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .install_lazy_genesis_baseline(Arc::new(baseline))
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .attach_clean_archive_store(operation_store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::SqliteOpenBuild,
     });
     let store = ObjectStore::open(&operation_archive_path, request.identities.workspace_id)
-        .map_err(display)?;
-    let lease =
-        WorkspaceRuntimeLease::acquire(&store, request.identities.workspace_id).map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, request.identities.workspace_id)
+        .map_err(CleanOpenError::from)?;
     let projection = LeasedWorkspaceProjection::adopt_clean_genesis(
         lease,
         &request.database_path,
@@ -6478,26 +6948,26 @@ fn activate_clean_runtime_resources_retaining_archive(
         &engine,
         projection,
     )
-    .map_err(|(_, error)| display(error))?;
+    .map_err(|(_, error)| CleanOpenError::from(error))?;
     engine
         .open_local_completion_index(&store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let accepted_batch_ids = engine
         .status()
         .accepted_batch_ids()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .into_iter()
         .collect();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
         engine,
         projection,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let binding = ActorRuntimeBinding::from_clean(&request.identities, endpoint, &receipts);
     let managed_local = open_clean_foreground_journal(
         &request.application_runtime_root,
@@ -6512,11 +6982,11 @@ fn activate_clean_runtime_resources_retaining_archive(
         binding.endpoint_id,
         binding.device_id().as_uuid(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     runtime
         .engine()
         .open_absence_decision_map(&receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     Ok(CleanRuntimeResources {
         graph,
         receipts,
@@ -6534,7 +7004,7 @@ fn activate_clean_runtime_resources_retaining_archive(
 fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
-    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {})
+    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {}, &mut |_| {})
 }
 
 /// Own the engine and its lease together throughout cold repair. Drop flushes
@@ -6568,7 +7038,7 @@ impl ColdOpenLocalCompletionGuard {
         let retained = self.retained_intents.clone();
         self.runtime_mut()
             .flush_local_projection_completions(retained)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         Ok(self
             .runtime
             .take()
@@ -6623,14 +7093,71 @@ impl CleanOpenStageTrace {
         }
         self.previous = now;
     }
+
+    /// Publish the completed open's work counters once, after the last stage.
+    fn report_counters(
+        &self,
+        counters: &SyncRuntimeCleanOpenCounters,
+        progress: &mut dyn FnMut(SyncRuntimeCleanOpenCounters),
+    ) {
+        progress(*counters);
+        if self.debug_enabled {
+            eprintln!(
+                "[tine] managed clean open counters: accepted_batches={}; \
+committed_tail_replayed={}; checkpoint_opens={}; full_replay_opens={}; \
+checkpoint_roster_entries={}; checkpoint_manifest_names={}; \
+checkpoint_required_object_names={}; checkpoint_capture_work={}; checkpoint_payload_bytes={}; \
+checkpoint_durable_lag={}; sweep_chains={}; receipt_evidence_names={}; \
+receipt_content_reads={}; receipt_full_catalog_passes={}; \
+summary_content_reads={}; summary_rebuilt={}; summary_delta_completions={}; \
+summary_delta_intents={}; local_completion_names={}; \
+local_completion_content_reads={}; local_completion_rebuilt={}; \
+local_completion_entries={}; retired_own_intent_probes={}; \
+retired_own_receipt_artifacts={}; archive_directory_enumerations={}; \
+archive_manifest_reads={}; archive_object_reads={}; \
+archive_inspected_manifests={}; archive_inspected_objects={}",
+                counters.accepted_batches,
+                counters.committed_tail_replayed,
+                counters.checkpoint_opens,
+                counters.full_replay_opens,
+                counters.checkpoint_roster_entries,
+                counters.checkpoint_manifest_names,
+                counters.checkpoint_required_object_names,
+                counters.checkpoint_capture_work,
+                counters.checkpoint_payload_bytes,
+                counters.checkpoint_durable_lag,
+                counters.sweep_chains,
+                counters.receipt_evidence_names,
+                counters.receipt_content_reads,
+                counters.receipt_full_catalog_passes,
+                counters.summary_content_reads,
+                counters.summary_rebuilt,
+                counters.summary_delta_completions,
+                counters.summary_delta_intents,
+                counters.local_completion_names,
+                counters.local_completion_content_reads,
+                counters.local_completion_rebuilt,
+                counters.local_completion_entries,
+                counters.retired_own_intent_probes,
+                counters.retired_own_receipt_artifacts,
+                counters.archive_directory_enumerations,
+                counters.archive_manifest_reads,
+                counters.archive_object_reads,
+                counters.archive_inspected_manifests,
+                counters.archive_inspected_objects,
+            );
+        }
+    }
 }
 
 fn open_clean_runtime_resources_with_progress(
     request: &SyncRuntimeOpenRequest,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
     stage_progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
+    counters_progress: &mut dyn FnMut(SyncRuntimeCleanOpenCounters),
 ) -> Result<Option<CleanRuntimeResources>, String> {
     let mut trace = CleanOpenStageTrace::new();
+    let mut counters = SyncRuntimeCleanOpenCounters::default();
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
@@ -6645,13 +7172,22 @@ fn open_clean_runtime_resources_with_progress(
             phase: SyncLocalActivationPhase::RetainedRuntimeOpen,
         });
     }
+    let Some(authority_directories) = resolve_clean_authority_directories(
+        &request.archive_root,
+        &request.enrollment_root,
+        &request.database_path,
+    )
+    .map_err(CleanOpenError::from)?
+    else {
+        return Ok(None);
+    };
     let Some(opened) = open_clean_activation_authority(
         &request.enrollment_root,
-        &clean_baseline_directory(&request.archive_root),
+        &authority_directories.baseline,
         identities.catalog_document_id,
         ReferenceCatalogPolicyV1::default(),
     )
-    .map_err(display)?
+    .map_err(CleanOpenError::from)?
     else {
         return Ok(None);
     };
@@ -6666,25 +7202,26 @@ fn open_clean_runtime_resources_with_progress(
     // authoritative and its claim provably predates the authority marker. A
     // fresh store never reaches this line. The full in-place validation inside
     // the receipt-store open below stays as defense in depth.
-    ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
+    ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root)
+        .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
         stage_progress,
     );
-    let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
+    let graph = Graph::open_checked(&request.graph_root).map_err(CleanOpenError::from)?;
     trace.phase(SyncRuntimeCleanOpenStage::GraphOpen, stage_progress);
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         identities.endpoint_id,
         identities.device_id,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     let receipts = ProjectionReceiptStore::open_for_endpoint(
         &request.receipt_root,
         identities.workspace_id,
         endpoint,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
         stage_progress,
@@ -6696,47 +7233,127 @@ fn open_clean_runtime_resources_with_progress(
     }
     let (mut engine, baseline, _) = opened.into_parts();
     let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
-    let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
+    let operation_archive_path = authority_directories.operations;
     let store = ObjectStore::open_structural(&operation_archive_path, identities.workspace_id)
-        .map_err(display)?;
-    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id)
+        .map_err(CleanOpenError::from)?;
     let covered =
         clean_undrained_object_repair_coverage(&request.application_runtime_root, &binding)?;
     store
         .repair_covered_object_mismatches(&covered)
-        .map_err(display)?;
-    store.validate_namespace().map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    store.validate_namespace().map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
         stage_progress,
     );
     engine
-        .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
-        .map_err(display)?;
+        .attach_clean_archive_store(
+            store
+                .duplicate_retained_capability()
+                .map_err(CleanOpenError::from)?,
+        )
+        .map_err(CleanOpenError::from)?;
     let baseline_claim_source = engine
         .clean_transient_projection_claim_snapshot()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .ok_or_else(|| "clean runtime has no immutable baseline claim snapshot".to_owned())?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
     });
-    let replayed = engine
-        .replay_clean_committed_tail(baseline_claim_source.as_ref())
-        .map_err(display)?;
+    let checkpoint_open = crate::oplog::checkpoint_generation::open_checkpoint(&store);
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+        stage_progress,
+    );
+    let mut replayed = 0_usize;
+    let mut restored_checkpoint = false;
+    match checkpoint_open {
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::ArchiveDamage(
+            error,
+        )) => return Err(error),
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::Store(error)) => {
+            eprintln!("clean checkpoint could not be read; using full replay: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Absent) => {}
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Invalid(error)) => {
+            eprintln!("clean checkpoint is disposable and will be rebuilt: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
+            counters.checkpoint_roster_entries = loaded.accepted_rows.len();
+            counters.checkpoint_manifest_names =
+                loaded.accepted_rows.len().saturating_add(loaded.tail.len());
+            counters.checkpoint_required_object_names = loaded.required_objects.len();
+            counters.checkpoint_capture_work = loaded.capture_work;
+            counters.checkpoint_payload_bytes = loaded.payload_bytes;
+            let durable_sequence = loaded.accepted_rows.len() as u64;
+            let tail = loaded.tail.clone();
+            match engine.restore_clean_checkpoint(
+                &loaded.state_bytes,
+                loaded.accepted_rows,
+                loaded.required_objects,
+            ) {
+                Ok(()) => {
+                    engine
+                        .reset_clean_checkpoint_publisher(durable_sequence)
+                        .map_err(CleanOpenError::from)?;
+                    restored_checkpoint = true;
+                    counters.checkpoint_opens = 1;
+                    match engine.replay_clean_checkpoint_tail(&tail, baseline_claim_source.as_ref())
+                    {
+                        Ok(count) => replayed = count,
+                        Err(error) => {
+                            eprintln!(
+                                "clean checkpoint tail admission failed; using sequence-zero replay: {error}"
+                            );
+                            engine
+                                .reset_clean_checkpoint_to_baseline()
+                                .map_err(CleanOpenError::from)?;
+                            restored_checkpoint = false;
+                            counters.checkpoint_opens = 0;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "clean checkpoint state validation failed; using full replay: {error}"
+                    );
+                }
+            }
+        }
+    }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointTailDiscovery,
+        stage_progress,
+    );
+    if !restored_checkpoint {
+        counters.full_replay_opens = 1;
+        replayed = engine
+            .replay_clean_committed_tail(baseline_claim_source.as_ref())
+            .map_err(CleanOpenError::from)?;
+    }
+    counters.committed_tail_replayed = replayed;
+    counters.checkpoint_durable_lag = engine.clean_checkpoint_durable_lag();
     drop(baseline_claim_source);
     trace.phase(
         SyncRuntimeCleanOpenStage::CommittedTailReplay,
         stage_progress,
     );
-    let projection = if replayed == 0 {
-        let expected = engine.accepted_frontier_root().map_err(display)?;
+    let projection = if engine
+        .is_clean_genesis_frontier()
+        .map_err(CleanOpenError::from)?
+    {
+        let expected = engine
+            .accepted_frontier_root()
+            .map_err(CleanOpenError::from)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
             &request.database_path,
             ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
             &baseline,
             ReferenceCatalogPolicyV1::default(),
         )
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -6746,12 +7363,12 @@ fn open_clean_runtime_resources_with_progress(
             &engine,
             baseline_projection,
         )
-        .map_err(|(_, error)| display(error))?
+        .map_err(|(_, error)| CleanOpenError::from(error))?
     } else {
         let application_runtime =
             ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-                .map_err(display)?;
-        let source = RebuildSource::new(&engine, &store).map_err(display)?;
+                .map_err(CleanOpenError::from)?;
+        let source = RebuildSource::new(&engine, &store).map_err(CleanOpenError::from)?;
         LeasedWorkspaceProjection::open_under(lease, |slot| {
             let opened = crate::oplog::SqliteFrontier::open_or_rebuild_with_applier_slot(
                 &request.database_path,
@@ -6763,26 +7380,34 @@ fn open_clean_runtime_resources_with_progress(
             Ok::<_, crate::oplog::SqliteProjectionError>((opened, ()))
         })
         .map(|(projection, ())| projection)
-        .map_err(|(_, error)| display(error))?
+        .map_err(|(_, error)| CleanOpenError::from(error))?
     };
     trace.phase(SyncRuntimeCleanOpenStage::ProjectionOpen, stage_progress);
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .open_local_completion_index(&store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     // Packet C-4 open order: enumerate and reconcile sweep chains under the
     // workspace lease before either journal drain or any actor publication
     // path can run. Open/in-grace records therefore re-establish the barrier
     // before retained outbound work becomes runnable.
-    let accepted_batch_ids = engine
+    let accepted_batch_ids: BTreeSet<_> = engine
         .status()
         .accepted_batch_ids()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .into_iter()
         .collect();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    counters.accepted_batches = accepted_batch_ids.len();
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
+    counters.sweep_chains = sweeps.chain_count();
+    counters.local_completion_entries = engine.local_completion_entry_count();
+    if let Some(stats) = engine.local_completion_open_stats() {
+        counters.local_completion_names = stats.names_observed;
+        counters.local_completion_content_reads = stats.content_reads;
+        counters.local_completion_rebuilt = stats.rebuilt;
+    }
     trace.phase(
         SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
         stage_progress,
@@ -6793,7 +7418,7 @@ fn open_clean_runtime_resources_with_progress(
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
     let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
     let mut completion_guard = ColdOpenLocalCompletionGuard::new(runtime);
     // §4.7 steps 5-6: both journals become available before terminal work can
     // mutate the graph; the semantic managed-local queue drains first.
@@ -6810,7 +7435,7 @@ fn open_clean_runtime_resources_with_progress(
         binding.endpoint_id,
         binding.device_id().as_uuid(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
         stage_progress,
@@ -6818,19 +7443,42 @@ fn open_clean_runtime_resources_with_progress(
     let retained_own_intents =
         retained_local_completion_intents(&managed_local, &projection_turns)?;
     retired_own_intent_ids.extend(retained_own_intents.iter().copied());
+    counters.retired_own_intent_probes = retired_own_intent_ids.len();
     let retired_receipt_artifacts =
         receipts.retired_own_endpoint_artifacts(&retired_own_intent_ids);
-    if !retired_receipt_artifacts.is_empty() {
+    counters.retired_own_receipt_artifacts = retired_receipt_artifacts.len();
+    if !retired_receipt_artifacts.is_empty() && runtime_debug_diagnostics_enabled() {
         eprintln!(
-            "retired own-endpoint receipt artifacts remain inert: {}",
-            retired_receipt_artifacts.join(", ")
+            "retired own-endpoint receipt artifacts remain inert: count={}",
+            retired_receipt_artifacts.len()
         );
     }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::OwnEndpointRetirementScan,
+        stage_progress,
+    );
     completion_guard
         .runtime_mut()
         .engine()
         .open_absence_decision_map(&receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    if let Some(stats) = completion_guard
+        .runtime_mut()
+        .engine()
+        .receiver_absence_summary_open_stats()
+    {
+        counters.receipt_evidence_names = stats.evidence_names_observed;
+        counters.receipt_content_reads = stats.receipt_content_reads;
+        counters.receipt_full_catalog_passes = stats.full_catalog_passes;
+        counters.summary_content_reads = stats.summary_content_reads;
+        counters.summary_rebuilt = stats.rebuilt;
+        counters.summary_delta_completions = stats.delta_completions;
+        counters.summary_delta_intents = stats.delta_intents;
+    }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
+        stage_progress,
+    );
     completion_guard.retain(retained_own_intents);
     let recovered_provider_batches = drain_open_managed_local_journal(
         &graph,
@@ -6865,6 +7513,13 @@ fn open_clean_runtime_resources_with_progress(
     // buffered entries, independent of how long actor construction takes.
     let runtime = completion_guard.finish()?;
     trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
+    let archive = store.instrumentation();
+    counters.archive_directory_enumerations = archive.directory_enumerations;
+    counters.archive_manifest_reads = archive.accepted_manifest_reads + archive.dag_manifest_reads;
+    counters.archive_object_reads = archive.accepted_object_reads;
+    counters.archive_inspected_manifests = archive.inspected_manifest_operations;
+    counters.archive_inspected_objects = archive.inspected_object_operations;
+    trace.report_counters(&counters, counters_progress);
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -8395,6 +9050,70 @@ impl CleanJoinSemanticDiff {
     fn mismatch_count(&self) -> usize {
         self.local_only + self.shared_only + self.changed
     }
+
+    /// The typed payload the join refusal carries across the native boundary
+    /// (`tagged_backend_error_with_detail`). Counts plus the bounded path
+    /// list; the frontend owns every displayed word.
+    fn typed_detail(&self) -> serde_json::Value {
+        let paths = self
+            .details
+            .iter()
+            .map(|detail| match detail {
+                CleanJoinMismatchDetail::LocalOnly(path) => {
+                    serde_json::json!({ "path": path, "side": "local-only" })
+                }
+                CleanJoinMismatchDetail::SharedOnly(path) => {
+                    serde_json::json!({ "path": path, "side": "shared-only" })
+                }
+                CleanJoinMismatchDetail::Changed {
+                    path,
+                    kind,
+                    preamble,
+                    outline,
+                    explicit_ids,
+                } => serde_json::json!({
+                    "path": path,
+                    "side": "changed",
+                    "categories": clean_join_changed_categories(*kind, *preamble, *outline, *explicit_ids),
+                }),
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "local_pages": self.local_pages,
+            "shared_pages": self.shared_pages,
+            "local_only": self.local_only,
+            "shared_only": self.shared_only,
+            "changed": self.changed,
+            "changed_kind": self.changed_kind,
+            "changed_preamble": self.changed_preamble,
+            "changed_outline": self.changed_outline,
+            "changed_explicit_ids": self.changed_explicit_ids,
+            "paths": paths,
+            "omitted": self.mismatch_count().saturating_sub(self.details.len()),
+        })
+    }
+}
+
+fn clean_join_changed_categories(
+    kind: bool,
+    preamble: bool,
+    outline: bool,
+    explicit_ids: bool,
+) -> Vec<&'static str> {
+    let mut categories = Vec::new();
+    if kind {
+        categories.push("kind");
+    }
+    if preamble {
+        categories.push("preamble");
+    }
+    if outline {
+        categories.push("outline");
+    }
+    if explicit_ids {
+        categories.push("explicit-ids");
+    }
+    categories
 }
 
 impl fmt::Display for CleanJoinSemanticDiff {
@@ -8429,19 +9148,8 @@ impl fmt::Display for CleanJoinSemanticDiff {
                     outline,
                     explicit_ids,
                 } => {
-                    let mut categories = Vec::new();
-                    if *kind {
-                        categories.push("kind");
-                    }
-                    if *preamble {
-                        categories.push("preamble");
-                    }
-                    if *outline {
-                        categories.push("outline");
-                    }
-                    if *explicit_ids {
-                        categories.push("explicit-ids");
-                    }
+                    let categories =
+                        clean_join_changed_categories(*kind, *preamble, *outline, *explicit_ids);
                     write!(
                         formatter,
                         "\nclean join mismatch detail: changed path={path:?} categories={}",
@@ -9534,7 +10242,7 @@ enum ActorRequest {
         injected_flagged_rename_errno: Option<i32>,
     },
     JoinShared {
-        descriptor: SharedEnrollmentDescriptor,
+        descriptor: CleanSharedEnrollmentDescriptorV1,
         reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
     },
     Tick {
@@ -9566,6 +10274,10 @@ enum ActorRequest {
     #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
         reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
+    },
+    #[cfg(test)]
+    ObservableEngineState {
+        reply: mpsc::Sender<crate::oplog::hot_engine::validation_tests::ObservableEngineState>,
     },
     #[cfg(test)]
     ManagedTaskQueryOverlaySnapshot {
@@ -9985,6 +10697,17 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::ManagedApplicationQueryInstrumentation { reply } => {
                 let _ = reply.send(actor.managed_application_query_instrumentation());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ObservableEngineState { reply } => {
+                if let Some(clean) = actor.clean.as_ref() {
+                    let _ = reply.send(
+                        crate::oplog::hot_engine::validation_tests::observable_engine_state(
+                            clean.runtime.engine(),
+                        ),
+                    );
+                }
                 false
             }
             #[cfg(test)]
@@ -10648,8 +11371,14 @@ impl ManagedLocalRuntimeState {
                 }
             }
         }
-        let directory = self.directory.try_clone().map_err(display)?.into_std_file();
-        crate::durability_counters::sync_directory(&directory).map_err(display)
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(CleanOpenError::from)?
+            .into_std_file();
+        crate::durability_counters::sync_directory(&directory)
+            .map_err(CleanOpenError::from)
+            .map_err(String::from)
     }
 }
 
@@ -10873,17 +11602,26 @@ fn recover_clean_foreground_journal_only(
     binding: &ActorRuntimeBinding,
     create_if_absent: bool,
 ) -> Result<Option<RecoveredCleanForegroundJournal>, String> {
+    if !application_runtime_root.exists() {
+        if !create_if_absent {
+            return Ok(None);
+        }
+        fs::create_dir_all(application_runtime_root)
+            .map_err(|error| format!("cannot create clean foreground journal root: {error}"))?;
+    }
     let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
         .map_err(|error| format!("cannot retain clean foreground journal root: {error}"))?;
-    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
-    let namespace = open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
+    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE)
+        .map_err(CleanOpenError::from)?;
+    let namespace =
+        open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(CleanOpenError::from)?;
     let workspace_name = format!(
         "{CLEAN_FOREGROUND_JOURNAL_WORKSPACE_PREFIX}-{}-{}",
         binding.workspace_id(),
         binding.lineage_digest()
     );
-    ensure_directory_nofollow(&namespace, &workspace_name).map_err(display)?;
-    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
+    ensure_directory_nofollow(&namespace, &workspace_name).map_err(CleanOpenError::from)?;
+    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(CleanOpenError::from)?;
     let device_id = binding.device_id().as_uuid();
     let names = clean_foreground_journal_names(&directory)?;
     let mut anchors = names
@@ -11006,7 +11744,8 @@ fn recover_clean_foreground_journal_only(
         return Err("clean foreground checkpoint is ahead of its journal generation".into());
     }
     for frame in &recovered_frames[..checkpointed] {
-        let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
+        let record =
+            crate::oplog::decode_managed_local_record(frame).map_err(CleanOpenError::from)?;
         checkpoint_batch_id = Some(record.prepared_batch().manifest().batch_id());
     }
     let recovered_frames = recovered_frames.split_off(checkpointed);
@@ -11040,7 +11779,7 @@ fn clean_undrained_object_repair_coverage(
             )
         })?;
         for object in record.prepared_batch().objects() {
-            let bytes = object.encode().map_err(display)?;
+            let bytes = object.encode().map_err(CleanOpenError::from)?;
             let digest = ContentDigest::of(&bytes);
             match covered.entry(digest) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -11719,56 +12458,28 @@ fn bound_application_reference_sources(
     lower_bound_exceeded: bool,
 ) -> SyncApplicationBoundedRefGroups {
     sources.sort_by(|a, b| a.0.cmp(&b.0));
-    // Same accounting rule as Direct Files and as the managed block-referrer
-    // path: `query::ConstructionBudget`. This loop already charged payload +
-    // page name + 256 per admitted row and latched `exceeded`; naming the rule
-    // once is what keeps the three copies from drifting again.
-    let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
-    let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
-    let mut by_name = HashMap::<String, usize>::new();
-    for (_, date_key, page, matches) in sources {
-        let key = crate::refs::page_key(&page.name);
-        let index = *by_name.entry(key).or_insert_with(|| {
-            let index = grouped.len();
-            grouped.push((
-                date_key,
-                RefGroup {
-                    page: page.name.clone(),
-                    kind: page.kind,
-                    blocks: Vec::new(),
-                    evidence: Vec::new(),
-                },
-            ));
-            index
-        });
-        if let (Some(previous), Some(current)) = (grouped[index].0, date_key) {
-            grouped[index].0 = Some(previous.max(current));
-        } else if grouped[index].0.is_none() {
-            grouped[index].0 = date_key;
-        }
+    // Budget admission, per-page grouping, `total`/`exceeded` and display order
+    // all belong to ONE algorithm shared with Direct Files and with the managed
+    // block-referrer path: `query::BoundedReferenceGroups`. This loop only
+    // declares its pages and offers its rows.
+    let mut accumulator = crate::query::BoundedReferenceGroups::new(max_rows, max_bytes);
+    for (path, date_key, page, matches) in sources {
+        let slot = accumulator.page(&path, &page.name, page.kind, date_key);
         for (block, evidence) in matches {
             let payload = crate::model::block_dto_estimated_bytes(&block)
                 .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence));
-            if budget.admit_estimated(&page.name, payload) {
-                grouped[index].1.blocks.push(block);
-                grouped[index].1.evidence.push(evidence);
-            }
+            accumulator.admit(slot, block, Some(evidence), payload);
         }
     }
-    grouped.retain(|(_, group)| !group.blocks.is_empty());
-    grouped.sort_by(|a, b| {
-        b.0.unwrap_or(i64::MIN)
-            .cmp(&a.0.unwrap_or(i64::MIN))
-            .then_with(|| a.1.page.cmp(&b.1.page))
-    });
-    let mut total = budget.total;
-    let mut exceeded = budget.exceeded;
+    let bounded = accumulator.finish();
+    let mut total = bounded.total;
+    let mut exceeded = bounded.exceeded;
     if lower_bound_exceeded {
         total = total.max(max_rows.saturating_add(1));
         exceeded = true;
     }
     SyncApplicationBoundedRefGroups {
-        groups: grouped.into_iter().map(|(_, group)| group).collect(),
+        groups: bounded.groups,
         total,
         exceeded,
     }
@@ -11777,8 +12488,8 @@ fn bound_application_reference_sources(
 fn find_application_blocks<'a>(
     blocks: &'a [BlockDto],
     wanted: &HashSet<&str>,
-) -> HashMap<String, &'a BlockDto> {
-    let mut found = HashMap::new();
+) -> Vec<(String, &'a BlockDto)> {
+    let mut found = Vec::new();
     let mut stack = blocks.iter().rev().collect::<Vec<_>>();
     while let Some(block) = stack.pop() {
         let explicit_ids = block
@@ -11789,12 +12500,12 @@ fn find_application_blocks<'a>(
             .collect::<Vec<_>>();
         if explicit_ids.is_empty() {
             if wanted.contains(block.id.as_str()) {
-                found.entry(block.id.clone()).or_insert(block);
+                found.push((block.id.clone(), block));
             }
         } else {
             for id in explicit_ids {
                 if wanted.contains(id) {
-                    found.entry(id.to_owned()).or_insert(block);
+                    found.push((id.to_owned(), block));
                 }
             }
         }
@@ -11803,6 +12514,10 @@ fn find_application_blocks<'a>(
     found
 }
 
+/// Measured exception to the DocBlock mapping consolidation: these boundaries
+/// already carry parser-derived facets. Re-parsing `raw` via a temporary
+/// `DocBlock` just to reconstruct the same shallow DTO adds allocation and
+/// parsing work to every reference/resolve/preview result.
 fn shallow_application_block(block: &BlockDto) -> BlockDto {
     BlockDto {
         id: block.id.clone(),
@@ -11851,18 +12566,25 @@ fn application_page_block_reference_counts(
     Ok(counts)
 }
 
-/// The managed path holds raw text rather than a parsed outline, so it builds a
-/// throwaway `DocBlock` to reach the projection -- but the truncation rule
-/// itself is [`crate::doc::crumb_line`], not a third copy of it (DUP-8).
-fn application_crumb_line(raw: &str, is_org: bool) -> String {
-    let block = crate::doc::DocBlock {
-        raw: raw.to_owned(),
-        children: Vec::new(),
-        uuid: String::new(),
-        is_org,
-        proj: std::sync::OnceLock::new(),
-    };
-    crate::doc::crumb_line(&block)
+/// The journal day a managed page evaluates as, for `(between …)` and the other
+/// journal-day predicates.
+///
+/// ONE producer answers this question for both backends: the graph's configured
+/// [`crate::date::JournalFormat`], which is also what fills `PageEntry::date_key`
+/// on the Direct side. Reading the day out of the page title with the DEFAULT
+/// title format instead is what made managed journal-range queries answer empty
+/// on every graph configuring a custom `:journal/page-title-format`
+/// (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001). Prefer the entry's own `date_key`
+/// where the caller holds a `PageEntry`; this is for callers that hold only the
+/// loaded `PageDto`.
+fn application_query_page_journal(
+    journal_format: &crate::date::JournalFormat,
+    page: &PageDto,
+) -> Option<i64> {
+    if page.kind != PageKind::Journal {
+        return None;
+    }
+    crate::date::JournalFormat::parse(journal_format, &page.name).map(|date| date.ordinal_key())
 }
 
 fn application_query_page_recency(
@@ -11879,41 +12601,6 @@ fn application_query_page_recency(
         }
         Err(_) => i64::MIN,
     }
-}
-
-fn application_page_block_referrers(
-    page: &PageDto,
-    target: &str,
-    allowed_indices: Option<&HashSet<usize>>,
-) -> Vec<BlockDto> {
-    let flat = flatten_application_blocks(&page.blocks);
-    let is_org = page.format == Format::Org;
-    let crumbs = flat
-        .iter()
-        .map(|block| application_crumb_line(&block.block.raw, is_org))
-        .collect::<Vec<_>>();
-    let mut output = Vec::new();
-    for (index, block) in flat.iter().enumerate() {
-        if allowed_indices.is_some_and(|allowed| !allowed.contains(&index))
-            || !crate::render::block_refs(&block.block.raw, is_org)
-                .block
-                .iter()
-                .any(|uuid| uuid == target)
-        {
-            continue;
-        }
-        let mut dto = shallow_application_block(block.block);
-        let mut ancestors = Vec::new();
-        let mut parent = block.parent;
-        while let Some(index) = parent {
-            ancestors.push(crumbs[index].clone());
-            parent = flat[index].parent;
-        }
-        ancestors.reverse();
-        dto.breadcrumb = ancestors;
-        output.push(dto);
-    }
-    output
 }
 
 fn clone_application_subtree_bounded(
@@ -12303,7 +12990,7 @@ impl RuntimeActor {
             .runtime
             .database()
             .materialized_read()
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let mut page_count_at_open = || {
             let mut count = 0_usize;
             let mut cursor = None;
@@ -12384,7 +13071,8 @@ impl RuntimeActor {
             .ok_or_else(|| "clean actor has no local runtime".to_owned())?
             .runtime
             .flush_local_projection_completions(retained)
-            .map_err(display)
+            .map_err(CleanOpenError::from)
+            .map_err(String::from)
     }
 
     fn flush_local_completions_if_required(&mut self) -> Result<bool, String> {
@@ -12537,28 +13225,29 @@ impl RuntimeActor {
         let promoted_state_digest = runtime
             .engine()
             .accepted_frontier_root()
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
             .state_digest();
-        let enrollment_root =
-            open_existing_enrollment_application_root(&request.enrollment_root).map_err(display)?;
+        let enrollment_root = open_existing_enrollment_application_root(&request.enrollment_root)
+            .map_err(CleanOpenError::from)?;
         ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let application_runtime_directory =
             Dir::open_ambient_dir(&request.application_runtime_root, ambient_authority())
                 .map_err(|error| format!("cannot retain application runtime root: {error}"))?;
         ensure_directory_nofollow(&application_runtime_directory, "move-episodes")
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let move_episode_directory =
-            open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+            open_dir_nofollow(&application_runtime_directory, "move-episodes")
+                .map_err(CleanOpenError::from)?;
         let move_episode_cold_scan =
             Some(move_episode_directory.entries().map_err(|error| {
                 format!("cannot begin cold move episode cleanup scan: {error}")
             })?);
         let marker = read_activation_marker(enrollment_root.path())
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
             .ok_or_else(|| "clean runtime has no activation marker".to_owned())?;
         let clean_shared_state =
-            read_clean_shared_state(enrollment_root.path()).map_err(display)?;
+            read_clean_shared_state(enrollment_root.path()).map_err(CleanOpenError::from)?;
         if let Some(state) = &clean_shared_state {
             let descriptor = state.descriptor();
             if descriptor.workspace_id() != binding.workspace_id()
@@ -12584,7 +13273,7 @@ impl RuntimeActor {
                     &request.provider_root,
                     &request.provider_journal_root,
                 )
-                .map_err(display)?,
+                .map_err(CleanOpenError::from)?,
             )
         } else {
             None
@@ -12721,6 +13410,15 @@ impl RuntimeActor {
         self.application_hydration_cache
             .borrow_mut()
             .reset_counters();
+    }
+
+    #[cfg(test)]
+    fn note_navigation_overlay_pending_path_load(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.navigation_overlay_pending_path_loads = current
+            .navigation_overlay_pending_path_loads
+            .saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
     }
 
     /// The converted block tree for one exact managed page, reused whenever the
@@ -13375,24 +14073,32 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncApplicationNavigationOutcome::Deferred { state });
         }
+        // ONE pending overlay per navigation request. Building it re-loads every
+        // pending path, and several of the consumers below need it; this local
+        // dies with the request, so it is a request-scoped value, not a cache
+        // (D-10).
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
         let reply = match request {
             SyncApplicationNavigationRequest::ReferencedPageNames { known_digest } => {
-                let names = self.application_navigation_reference_names_ready()?;
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+                let names = self.application_navigation_reference_names_ready(overlay)?;
                 SyncApplicationNavigationReply::ReferencedPageNames(
                     ReferencedPageNames::answer_for(&names, known_digest),
                 )
             }
             SyncApplicationNavigationRequest::PageAliases => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 SyncApplicationNavigationReply::PageAliases(
-                    self.application_navigation_aliases_ready()?
+                    self.application_navigation_aliases_ready(overlay)?
                         .into_iter()
                         .map(|(alias, owner, _)| (alias, owner))
                         .collect(),
                 )
             }
             SyncApplicationNavigationRequest::PageIcons { names } => {
-                let pages = self.application_navigation_pages_ready()?;
-                let aliases = self.application_navigation_aliases_ready()?;
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+                let pages = self.application_navigation_pages_ready(overlay)?;
+                let aliases = self.application_navigation_aliases_ready(overlay)?;
                 let mut real_names = HashSet::new();
                 let mut icons = HashMap::new();
                 for (page, preamble) in pages {
@@ -13425,13 +14131,14 @@ impl RuntimeActor {
                 SyncApplicationNavigationReply::PageIcons(selected)
             }
             SyncApplicationNavigationRequest::ExistingPageNames { names } => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 let mut known = self
-                    .application_navigation_pages_ready()?
+                    .application_navigation_pages_ready(overlay)?
                     .into_iter()
                     .map(|(page, _)| crate::refs::page_key(&page.name))
                     .collect::<HashSet<_>>();
                 known.extend(
-                    self.application_navigation_aliases_ready()?
+                    self.application_navigation_aliases_ready(overlay)?
                         .into_iter()
                         .map(|(alias, _, _)| alias),
                 );
@@ -13443,13 +14150,14 @@ impl RuntimeActor {
                 )
             }
             SyncApplicationNavigationRequest::QuickSwitch { query, limit } => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 let pages = self
-                    .application_navigation_pages_ready()?
+                    .application_navigation_pages_ready(overlay)?
                     .into_iter()
                     .map(|(page, _)| page)
                     .collect();
-                let aliases = self.application_navigation_aliases_ready()?;
-                let referenced = self.application_navigation_reference_names_ready()?;
+                let aliases = self.application_navigation_aliases_ready(overlay)?;
+                let referenced = self.application_navigation_reference_names_ready(overlay)?;
                 SyncApplicationNavigationReply::QuickSwitch(
                     crate::query_plan::legacy_page_search_entries(
                         pages, aliases, referenced, &query, limit,
@@ -13615,51 +14323,49 @@ impl RuntimeActor {
         &self,
         uuids: &[String],
         retain_subtrees: bool,
-    ) -> Result<HashMap<String, (String, PageKind, BlockDto)>, SyncApplicationPageRequestError>
-    {
+    ) -> Result<
+        HashMap<String, (String, PageKind, Format, BlockDto)>,
+        SyncApplicationPageRequestError,
+    > {
         let wanted = uuids.iter().map(String::as_str).collect::<HashSet<_>>();
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let mut resolved = HashMap::new();
+        let mut parser_fallback = HashSet::<String>::new();
 
-        // The committed overlay is the exact current suffix. Search it first,
-        // and mask every affected SQLite page even when the UUID was removed.
+        // Any pending claimant requires parser order across the exact merged
+        // page view: an older SQLite page may own the same UUID and OG keeps
+        // whichever claimant appears first in graph/parser order.
         for current in overlay.values().flatten() {
             let page = &current.1;
             for (uuid, block) in find_application_blocks(&page.blocks, &wanted) {
-                let block = if retain_subtrees {
-                    block.clone()
-                } else {
-                    shallow_application_block(block)
-                };
-                resolved
-                    .entry(uuid)
-                    .or_insert_with(|| (page.name.clone(), page.kind, block));
+                let _ = block;
+                parser_fallback.insert(uuid);
             }
         }
 
         let read = self.application_materialized_read_ready()?;
         let mut candidates: HashMap<PageId, Vec<String>> = HashMap::new();
         for uuid in wanted {
-            if resolved.contains_key(uuid) {
+            if parser_fallback.contains(uuid) {
                 continue;
             }
             let Ok(uuid_value) = Uuid::parse_str(uuid) else {
                 continue;
             };
             let logseq_uuid = LogseqUuid::from_uuid(uuid_value);
-            let mut claimants = read.blocks_by_logseq_uuid(logseq_uuid, 2).map_err(|_| {
+            let claimants = read.blocks_by_logseq_uuid(logseq_uuid, 2).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_block_candidates_by_logseq_uuid",
                 )
             })?;
-            if claimants.len() != 1 {
-                // Zero claims are absent; multiple claims are an explicit
-                // semantic ambiguity. Never let the physical row order choose
-                // an owner for a block reference.
+            if claimants.len() > 1 {
+                parser_fallback.insert(uuid.to_owned());
                 continue;
             }
-            let block = claimants.pop().expect("one Logseq UUID claimant");
+            let Some(block) = crate::query::logseq_uuid_owner(claimants, false) else {
+                continue;
+            };
             let Some(page) = read.page(block.page_id).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_block_candidates_page_lookup",
@@ -13693,7 +14399,46 @@ impl RuntimeActor {
                 } else {
                     shallow_application_block(block)
                 };
-                resolved.insert(uuid, (page.name.clone(), page.kind, block));
+                resolved.insert(uuid, (page.name.clone(), page.kind, page.format, block));
+            }
+        }
+
+        if !parser_fallback.is_empty() {
+            let fallback_wanted = parser_fallback
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut pages = self.application_navigation_pages_ready(&overlay)?;
+            pages.sort_by(|left, right| left.0.rel_path.cmp(&right.0.rel_path));
+            let mut claimants = HashMap::<String, Vec<(String, PageKind, Format, BlockDto)>>::new();
+            for (entry, _) in pages {
+                let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                    ApplicationExactLoad::Loaded(current) => current,
+                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => continue,
+                };
+                let page = current.page;
+                for (uuid, block) in find_application_blocks(&page.blocks, &fallback_wanted) {
+                    let block = if retain_subtrees {
+                        block.clone()
+                    } else {
+                        shallow_application_block(block)
+                    };
+                    claimants.entry(uuid).or_default().push((
+                        page.name.clone(),
+                        page.kind,
+                        page.format,
+                        block,
+                    ));
+                }
+            }
+            for uuid in parser_fallback {
+                resolved.remove(&uuid);
+                if let Some(owner) = crate::query::logseq_uuid_owner(
+                    claimants.remove(&uuid).unwrap_or_default(),
+                    true,
+                ) {
+                    resolved.insert(uuid, owner);
+                }
             }
         }
         Ok(resolved)
@@ -13707,7 +14452,7 @@ impl RuntimeActor {
         Ok(uuids
             .iter()
             .map(|uuid| {
-                candidates.get(uuid).map(|(page, kind, block)| RefGroup {
+                candidates.get(uuid).map(|(page, kind, _, block)| RefGroup {
                     page: page.clone(),
                     kind: *kind,
                     blocks: vec![shallow_application_block(block)],
@@ -13724,7 +14469,7 @@ impl RuntimeActor {
         max_bytes: usize,
     ) -> Result<Option<BlockPreview>, SyncApplicationPageRequestError> {
         let candidates = self.application_block_candidates_ready(&[uuid.to_owned()], true)?;
-        let Some((page, kind, block)) = candidates.get(uuid) else {
+        let Some((page, kind, _, block)) = candidates.get(uuid) else {
             return Ok(None);
         };
         let total = application_subtree_nodes(block);
@@ -13924,7 +14669,8 @@ impl RuntimeActor {
             let Some((_, page)) = current else {
                 continue;
             };
-            let blocks = application_page_block_referrers(page, target, None);
+            let roots = self.application_projection_roots(path.as_str(), page);
+            let blocks = crate::query::application_page_block_referrers(&roots, target, None);
             if blocks.is_empty() {
                 continue;
             }
@@ -13950,7 +14696,10 @@ impl RuntimeActor {
         for (page_id, block_ids) in candidates {
             let current = self.load_application_reference_page_id_ready(page_id)?;
             let allowed = application_parser_indices_for_block_ids(&current, &block_ids)?;
-            let blocks = application_page_block_referrers(&current.page, target, Some(&allowed));
+            let roots =
+                self.application_projection_roots(current.editor.page.path.as_str(), &current.page);
+            let blocks =
+                crate::query::application_page_block_referrers(&roots, target, Some(&allowed));
             if blocks.is_empty() {
                 continue;
             }
@@ -13986,68 +14735,40 @@ impl RuntimeActor {
         // identical content.
         source_groups.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // ONE accounting rule with Direct Files (`query::ConstructionBudget`,
-        // as used by `collect_bounded_candidates`): payload + page name + 256
-        // charged per ADMITTED row, `exceeded` latched once the budget closes.
-        // This used to be open-coded here with a per-group overhead that was
-        // probed per row but accumulated once per emitted group, so identical
-        // content under an identical `max_bytes` admitted a different number of
-        // rows on the two paths.
-        let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
-        let mut groups: Vec<(Option<i64>, String, RefGroup)> = Vec::new();
+        // ONE accounting, grouping and ordering rule with Direct Files and with
+        // managed backlinks: `query::BoundedReferenceGroups`. This loop used to
+        // own private copies of all three, and they had drifted — it grouped by
+        // storage path, so two files whose titles fold to one logical page
+        // produced two reference groups where Direct produced one.
+        let mut accumulator = crate::query::BoundedReferenceGroups::new(max_rows, max_bytes);
         for (date_key, path, group) in source_groups {
-            let mut admitted = Vec::new();
+            let slot = accumulator.page(&path, &group.page, group.kind, date_key);
             for block in group.blocks {
-                if budget.closed() {
-                    budget.deny_match();
+                if accumulator.closed() {
+                    accumulator.deny();
                     continue;
                 }
-                if !budget
-                    .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(&block))
-                {
-                    continue;
-                }
-                admitted.push(block);
-            }
-            if !admitted.is_empty() {
-                groups.push((
-                    date_key,
-                    path,
-                    RefGroup {
-                        page: group.page,
-                        kind: group.kind,
-                        blocks: admitted,
-                        evidence: Vec::new(),
-                    },
-                ));
+                let payload = crate::model::block_dto_estimated_bytes(&block);
+                accumulator.admit(slot, block, None, payload);
             }
         }
-        // OG parity, same rule as Direct `collect_bounded_candidates`: newest
-        // journal day first, non-journal pages last, page name as the
-        // deterministic tie-break (path breaking a name tie).
-        groups.sort_by(|a, b| {
-            b.0.unwrap_or(i64::MIN)
-                .cmp(&a.0.unwrap_or(i64::MIN))
-                .then_with(|| a.2.page.cmp(&b.2.page))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        let groups = groups
-            .into_iter()
-            .map(|(_, _, group)| group)
-            .collect::<Vec<_>>();
+        let bounded = accumulator.finish();
         Ok(SyncApplicationBoundedRefGroups {
-            groups,
-            total: budget.total,
-            exceeded: budget.exceeded,
+            groups: bounded.groups,
+            total: bounded.total,
+            exceeded: bounded.exceeded,
         })
     }
 
+    /// `overlay` is the caller's request-scoped pending overlay (see
+    /// [`Self::navigation_overlay_scoped`]), passed in rather than rebuilt.
     fn application_equivalent_page_names_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
         target: &str,
     ) -> Result<(String, Vec<String>, String), SyncApplicationPageRequestError> {
         let mut real_pages = crate::query::RealPageNames::new();
-        for (page, _) in self.application_navigation_pages_ready()? {
+        for (page, _) in self.application_navigation_pages_ready(overlay)? {
             let key = crate::refs::page_key(&page.name);
             match real_pages.get_mut(&key) {
                 Some((winner_path, winner_name)) if page.path < *winner_path => {
@@ -14061,7 +14782,7 @@ impl RuntimeActor {
             }
         }
         let aliases = self
-            .application_navigation_aliases_ready()?
+            .application_navigation_aliases_ready(overlay)?
             .into_iter()
             .map(|(alias, owner, _)| (alias, owner))
             .collect::<Vec<_>>();
@@ -14078,13 +14799,15 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        // ONE pending overlay for this request: the equivalent-name fold and
+        // the reference walk below both need it.
+        let overlay = self.application_navigation_overlay_ready()?;
         let (canonical, names_norm, self_page) =
-            self.application_equivalent_page_names_ready(target)?;
+            self.application_equivalent_page_names_ready(&overlay, target)?;
         let excluded = crate::refs::ReferenceSourceExclusions::new(
             &self_page,
             self.graph.config.favorites_page.as_deref(),
         );
-        let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let read = self.application_materialized_read_ready()?;
 
@@ -14171,7 +14894,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -14199,7 +14924,10 @@ impl RuntimeActor {
                 continue;
             }
             let allowed = application_parser_indices_for_block_ids(&current, &candidate.blocks)?;
+            let roots =
+                self.application_projection_roots(current.editor.page.path.as_str(), &current.page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &current.page,
                 &canonical,
                 &names_norm,
@@ -14244,8 +14972,13 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
-        let (canonical, names_norm, self_page) =
-            self.application_equivalent_page_names_ready(target)?;
+        // ONE pending overlay for this request, built lazily: the early return
+        // below reaches neither consumer on a search-index-backed run.
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
+        let (canonical, names_norm, self_page) = self.application_equivalent_page_names_ready(
+            self.navigation_overlay_scoped(&mut overlay_memo)?,
+            target,
+        )?;
         let excluded = crate::refs::ReferenceSourceExclusions::new(
             &self_page,
             self.graph.config.favorites_page.as_deref(),
@@ -14263,12 +14996,16 @@ impl RuntimeActor {
             // Preserve correctness through exact application pages, never the
             // broad Direct-Files parsed cache. This exceptional path remains
             // explicit so C3 performance receipts can measure it separately.
-            for (entry, _) in self.application_navigation_pages_ready()? {
+            for (entry, _) in self.application_navigation_pages_ready(
+                self.navigation_overlay_scoped(&mut overlay_memo)?,
+            )? {
                 if excluded.excludes_name(&entry.name) {
                     continue;
                 }
                 let page = self.load_application_reference_source_exact_ready(&entry.rel_path)?;
+                let roots = self.application_projection_roots(&entry.rel_path, &page);
                 let matches = crate::query::application_page_reference_matches(
+                    &roots,
                     &page,
                     &canonical,
                     &names_norm,
@@ -14286,7 +15023,7 @@ impl RuntimeActor {
             ));
         }
 
-        let overlay = self.application_navigation_overlay_ready()?;
+        let overlay = self.navigation_overlay_scoped_owned(&mut overlay_memo)?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
@@ -14343,7 +15080,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -14375,7 +15114,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -14840,21 +15581,16 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
-        use crate::query::{
-            SimpleQueryCandidatePlan as Plan, SimpleQueryCandidateSource as Source,
-        };
+        use crate::query::SimpleQueryCandidatePlan as Plan;
 
-        let (sources, scan_all) = match crate::query::simple_query_candidate_plan(query) {
-            Plan::Empty => {
-                return Ok(SyncApplicationBoundedRefGroups {
-                    groups: Vec::new(),
-                    total: 0,
-                    exceeded: false,
-                })
-            }
-            Plan::Indexed(sources) => (sources, false),
-            Plan::All => (Vec::new(), true),
-        };
+        let plan = crate::query::simple_query_candidate_plan(query);
+        if matches!(plan, Plan::Empty) {
+            return Ok(SyncApplicationBoundedRefGroups {
+                groups: Vec::new(),
+                total: 0,
+                exceeded: false,
+            });
+        }
 
         // Every open of a page carrying this query recomputes an identical
         // answer from identical durable evidence, at one whole-page hydration
@@ -14902,183 +15638,34 @@ impl RuntimeActor {
             masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
         }
 
-        const BATCH: usize = 512;
-        let mut candidate_page_ids = BTreeSet::new();
-        for source in &sources {
-            match source {
-                Source::Task(marker) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .task_candidate_pages_after(marker, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_task_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some(row.page_id);
-                            if !masked_page_ids.contains(&row.page_id) {
-                                candidate_page_ids.insert(row.page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::PageRef(normalized) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .page_referrer_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_page_referrer_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some((row.source_page_id, row.source));
-                            if !masked_page_ids.contains(&row.source_page_id) {
-                                candidate_page_ids.insert(row.source_page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::BlockProperty(normalized) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .block_property_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_block_property_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some((row.page_id, row.block_id));
-                            if !masked_page_ids.contains(&row.page_id) {
-                                candidate_page_ids.insert(row.page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::PageProperty(_)
-                | Source::Page(_)
-                | Source::Namespace(_)
-                | Source::Journal => {}
-            }
-        }
-
-        let page_property_keys = sources
+        let masked_physical_page_ids = masked_page_ids
             .iter()
-            .filter_map(|source| match source {
-                Source::PageProperty(key) => Some(key.as_str()),
-                _ => None,
-            })
+            .map(|page_id| page_id.as_uuid().into_bytes())
             .collect::<HashSet<_>>();
-        if !page_property_keys.is_empty() {
-            let mut cursor = None;
-            loop {
-                let rows = read
-                    .property_facet_rows_after(false, cursor.clone(), BATCH)
-                    .map_err(|_| {
-                        SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_simple_query_property_facet_scan",
-                        )
-                    })?;
-                if rows.is_empty() {
-                    break;
-                }
-                let len = rows.len();
-                for row in rows {
-                    cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
-                    if matches!(row.owner, MaterializedEntityId::Page(_))
-                        && page_property_keys.contains(row.normalized_name.as_str())
-                        && !masked_page_ids.contains(&row.page_id)
-                    {
-                        candidate_page_ids.insert(row.page_id);
-                    }
-                }
-                if len < BATCH {
-                    break;
-                }
-            }
+        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
+            &read,
+            &plan,
+            &masked_physical_page_ids,
+        )
+        .map_err(|error| {
+            use crate::oplog::query_lowering::SimpleQueryLoweringError as Error;
+            SyncApplicationPageRequestError::ActorRefusedAt(match error {
+                Error::Task(_) => "application_simple_query_task_scan",
+                Error::PageRef(_) => "application_simple_query_page_referrer_scan",
+                Error::BlockProperty(_) => "application_simple_query_block_property_scan",
+                Error::PageProperty(_) => "application_simple_query_property_facet_scan",
+                Error::Navigation(_) => "application_simple_query_navigation_scan",
+            })
+        })?;
+        #[cfg(test)]
+        if lowered.inventory_scanned {
+            self.note_managed_application_query_inventory_pass(lowered.inventory_pages);
         }
-
-        let needs_inventory = scan_all
-            || sources.iter().any(|source| {
-                matches!(
-                    source,
-                    Source::PageRef(_) | Source::Page(_) | Source::Namespace(_) | Source::Journal
-                )
-            });
-        if needs_inventory {
-            #[cfg(test)]
-            let mut inventory_pages = 0_usize;
-            let mut cursor: Option<(ManagedPath, PageId)> = None;
-            loop {
-                let rows = read
-                    .navigation_pages_after(
-                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
-                        BATCH,
-                    )
-                    .map_err(|_| {
-                        SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_simple_query_navigation_scan",
-                        )
-                    })?;
-                if rows.is_empty() {
-                    break;
-                }
-                let len = rows.len();
-                for row in rows {
-                    #[cfg(test)]
-                    {
-                        inventory_pages = inventory_pages.saturating_add(1);
-                    }
-                    cursor = Some((row.path.clone(), row.page_id));
-                    if masked_page_ids.contains(&row.page_id) {
-                        continue;
-                    }
-                    let matches = scan_all
-                        || sources.iter().any(|source| match source {
-                            Source::PageRef(name) | Source::Page(name) => row.name_key == *name,
-                            Source::Namespace(namespace) => {
-                                row.name_key.starts_with(&format!("{namespace}/"))
-                            }
-                            Source::Journal => row.kind == ManagedTextKind::Journal,
-                            _ => false,
-                        });
-                    if matches {
-                        candidate_page_ids.insert(row.page_id);
-                    }
-                }
-                if len < BATCH {
-                    break;
-                }
-            }
-            #[cfg(test)]
-            self.note_managed_application_query_inventory_pass(inventory_pages);
-        }
+        let candidate_page_ids = lowered
+            .page_ids
+            .into_iter()
+            .map(|page_id| PageId::from_uuid(Uuid::from_bytes(page_id)))
+            .collect::<BTreeSet<_>>();
         drop(read);
 
         #[cfg(test)]
@@ -15107,6 +15694,7 @@ impl RuntimeActor {
                     &self.graph.journal_format,
                     &page,
                 ),
+                journal: application_query_page_journal(&self.graph.journal_format, &page),
                 roots: self.application_projection_roots(&path, &page),
                 page,
             })
@@ -15129,7 +15717,8 @@ impl RuntimeActor {
     fn application_all_query_pages_ready(
         &self,
     ) -> Result<Vec<crate::query::ApplicationQueryPage>, SyncApplicationPageRequestError> {
-        let entries = self.application_navigation_pages_ready()?;
+        let overlay = self.application_navigation_overlay_ready()?;
+        let entries = self.application_navigation_pages_ready(&overlay)?;
         let mut pages = Vec::with_capacity(entries.len());
         for (entry, _) in entries {
             let current = match self.load_application_exact_ready(&entry.rel_path)? {
@@ -15146,6 +15735,7 @@ impl RuntimeActor {
                     &self.graph.journal_format,
                     &current.page,
                 ),
+                journal: entry.date_key,
                 roots: self.application_projection_roots(&entry.rel_path, &current.page),
                 page: current.page,
             });
@@ -15230,8 +15820,11 @@ impl RuntimeActor {
         cancellation: Option<&ApplicationSearchCancellation>,
     ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
         let cancelled = || cancellation.is_some_and(ApplicationSearchCancellation::cancelled);
+        // ONE pending overlay for this request, built lazily: the cancellation
+        // return below skips the alias and referenced-name consumers.
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
         let entries = self
-            .application_navigation_pages_ready()?
+            .application_navigation_pages_ready(self.navigation_overlay_scoped(&mut overlay_memo)?)?
             .into_iter()
             .map(|(entry, _)| entry)
             .collect::<Vec<_>>();
@@ -15247,8 +15840,9 @@ impl RuntimeActor {
                 explain,
             ));
         }
-        let aliases = self.application_navigation_aliases_ready()?;
-        let referenced = self.application_navigation_reference_names_ready()?;
+        let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+        let aliases = self.application_navigation_aliases_ready(overlay)?;
+        let referenced = self.application_navigation_reference_names_ready(overlay)?;
         let needs_blocks = plan
             .branches
             .iter()
@@ -15350,7 +15944,9 @@ impl RuntimeActor {
         target: &str,
         targets: &[BacklinkFilterTarget],
     ) -> Result<BacklinkFilterContext, SyncApplicationPageRequestError> {
-        let (_, names_norm, _) = self.application_equivalent_page_names_ready(target)?;
+        // ONE pending overlay for this request: both consumers below need it.
+        let overlay = self.application_navigation_overlay_ready()?;
+        let (_, names_norm, _) = self.application_equivalent_page_names_ready(&overlay, target)?;
         let excluded_refs = names_norm.into_iter().collect::<HashSet<_>>();
         let mut requested = HashMap::<(PageKind, String), HashSet<String>>::new();
         for item in targets {
@@ -15362,7 +15958,7 @@ impl RuntimeActor {
         let requested_unique = requested.values().map(HashSet::len).sum::<usize>();
         let mut context = BacklinkFilterContext::default();
         let mut bytes = 0_usize;
-        let pages = self.application_navigation_pages_ready()?;
+        let pages = self.application_navigation_pages_ready(&overlay)?;
         for (entry, _) in pages {
             let key = (entry.kind, crate::refs::page_key(&entry.name));
             let Some(ids) = requested.get(&key) else {
@@ -15375,31 +15971,35 @@ impl RuntimeActor {
                     continue;
                 }
             };
-            let mut roots = Vec::new();
-            if let Some(block) = crate::query::application_page_property_dto(&current.page) {
-                if ids.contains(&block.id) {
-                    roots.push(block);
-                }
-            }
-            fn collect(blocks: &[BlockDto], ids: &HashSet<String>, out: &mut Vec<BlockDto>) {
+            let cached_roots = self.application_projection_roots(&entry.rel_path, &current.page);
+            let page_property = crate::query::application_page_property_dto(&current.page)
+                .filter(|block| ids.contains(&block.id))
+                .map(|block| {
+                    crate::model::dto_block_to_doc_block(&block, current.page.format == Format::Org)
+                });
+            let mut roots = page_property.iter().collect::<Vec<_>>();
+            fn collect<'a>(
+                blocks: &'a [crate::doc::DocBlock],
+                ids: &HashSet<String>,
+                out: &mut Vec<&'a crate::doc::DocBlock>,
+            ) {
                 for block in blocks {
-                    if ids.contains(&block.id) {
-                        out.push(block.clone());
+                    if ids.contains(&block.uuid) {
+                        out.push(block);
                     }
                     collect(&block.children, ids, out);
                 }
             }
-            collect(&current.page.blocks, ids, &mut roots);
+            collect(&cached_roots, ids, &mut roots);
             for block in roots {
                 if bytes >= crate::query::BACKLINK_FILTER_MAX_BYTES {
                     context.truncated = true;
                     break;
                 }
-                let result = crate::query::application_backlink_filter_entry(
+                let result = crate::query::backlink_filter_entry(
                     &current.page.name,
                     current.page.kind,
-                    &block,
-                    current.page.format == Format::Org,
+                    block,
                     &excluded_refs,
                     crate::query::BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
                 );
@@ -15419,10 +16019,14 @@ impl RuntimeActor {
         Ok(context)
     }
 
+    /// `overlay` is the caller's REQUEST-SCOPED pending overlay
+    /// ([`SyncRuntimeActor::application_navigation_overlay_ready`]), passed in
+    /// rather than rebuilt: constructing it re-reads every pending path, and one
+    /// navigation request asks several of these helpers in turn.
     fn application_navigation_pages_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<(PageEntry, Option<String>)>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, PageId)> = None;
@@ -15478,7 +16082,7 @@ impl RuntimeActor {
                         "application_navigation_pages_overlay_inventory_entry",
                     )
                 })?;
-            output.push((page_id, entry, page.pre_block));
+            output.push((*page_id, entry, page.pre_block.clone()));
         }
         output.sort_by(|a, b| a.1.rel_path.cmp(&b.1.rel_path).then_with(|| a.0.cmp(&b.0)));
         Ok(output
@@ -15503,6 +16107,8 @@ impl RuntimeActor {
             .unwrap_or_default();
         let mut overlay = BTreeMap::new();
         for path in paths {
+            #[cfg(test)]
+            self.note_navigation_overlay_pending_path_load();
             let path = ManagedPath::parse(path).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_navigation_overlay_path_parse",
@@ -15528,10 +16134,42 @@ impl RuntimeActor {
         Ok(overlay)
     }
 
+    /// The pending overlay for ONE request, built at most once.
+    ///
+    /// `memo` is a local of the request being served and dies with it, so this
+    /// is a request-scoped value, never a cache across requests (D-10). It
+    /// exists because [`Self::application_navigation_overlay_ready`] re-loads
+    /// every pending path, and a single navigation request asks several
+    /// consumers that each need the same overlay.
+    fn navigation_overlay_scoped<'a>(
+        &self,
+        memo: &'a mut Option<ApplicationNavigationOverlay>,
+    ) -> Result<&'a ApplicationNavigationOverlay, SyncApplicationPageRequestError> {
+        if memo.is_none() {
+            *memo = Some(self.application_navigation_overlay_ready()?);
+        }
+        Ok(memo.as_ref().expect("overlay built immediately above"))
+    }
+
+    /// The request-scoped overlay, handed to a caller that consumes it.
+    ///
+    /// Same request-scoped value as [`Self::navigation_overlay_scoped`]; use
+    /// this only where the caller is the last consumer in the request, because
+    /// it empties `memo`.
+    fn navigation_overlay_scoped_owned(
+        &self,
+        memo: &mut Option<ApplicationNavigationOverlay>,
+    ) -> Result<ApplicationNavigationOverlay, SyncApplicationPageRequestError> {
+        match memo.take() {
+            Some(overlay) => Ok(overlay),
+            None => self.application_navigation_overlay_ready(),
+        }
+    }
+
     fn application_navigation_aliases_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<(String, String, String)>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, PageId)> = None;
@@ -15585,10 +16223,12 @@ impl RuntimeActor {
         Ok(output)
     }
 
+    /// `overlay` is the caller's request-scoped pending overlay; see
+    /// [`SyncRuntimeActor::application_navigation_pages_ready`].
     fn application_navigation_reference_names_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<String>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, String, PageId)> = None;
@@ -15626,7 +16266,7 @@ impl RuntimeActor {
                 break;
             }
         }
-        for current in overlay.into_values().flatten() {
+        for current in overlay.values().flatten() {
             for (raw, normalized) in navigation_page_reference_names(&current.1) {
                 if seen.insert(normalized) {
                     output.push(raw);
@@ -20320,7 +20960,9 @@ impl RuntimeActor {
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
-                eprintln!("[tine] {detail}");
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] foreground projection remains pending");
+                }
                 let managed = self
                     .managed_local
                     .as_mut()
@@ -20579,7 +21221,9 @@ impl RuntimeActor {
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
-                eprintln!("[tine] {detail}");
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] foreground projection remains pending");
+                }
                 let managed = self
                     .managed_local
                     .as_mut()
@@ -21023,6 +21667,34 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        if let Some(reason) = self
+            .clean
+            .as_ref()
+            .and_then(|clean| clean.runtime.engine().take_clean_checkpoint_capture_skip())
+        {
+            return SyncRuntimeTick::CheckpointCaptureSkipped {
+                reason: match reason {
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::RuntimeNotAttached => {
+                        SyncCheckpointCaptureSkip::RuntimeNotAttached
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::IndexedRuntime => {
+                        SyncCheckpointCaptureSkip::IndexedRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::BlockedRuntime => {
+                        SyncCheckpointCaptureSkip::BlockedRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::UnsettledRuntime => {
+                        SyncCheckpointCaptureSkip::UnsettledRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::DurableFrontierAhead => {
+                        SyncCheckpointCaptureSkip::DurableFrontierAhead
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::CaptureFailed => {
+                        SyncCheckpointCaptureSkip::CaptureFailed
+                    }
+                },
+            };
+        }
         match self.cleanup_acknowledged_move_episodes() {
             Ok(true) => return SyncRuntimeTick::Recovering,
             Ok(false) => {}
@@ -21399,10 +22071,11 @@ impl RuntimeActor {
                             // the losing text is retained in immutable local
                             // history (audit 4 follow-up).
                             Err(crate::oplog::EngineError::PageDeleted(_)) => {
-                                eprintln!(
-                                    "[tine] conflict resolution skipped: page {page_id} was deleted as a whole, block-level restore of {} does not apply",
-                                    block.block_id
-                                );
+                                if runtime_debug_diagnostics_enabled() {
+                                    eprintln!(
+                                        "[tine] conflict resolution skipped after whole-page deletion"
+                                    );
+                                }
                                 continue;
                             }
                             Err(_) => {
@@ -21438,10 +22111,11 @@ impl RuntimeActor {
                             // deletion leaves nothing for keep-both to land on
                             // and never heals on its own; requeueing would spin.
                             Err(crate::oplog::EngineError::PageDeleted(_)) => {
-                                eprintln!(
-                                    "[tine] keep-both resolution skipped: page {page_id} was deleted as a whole for block {}",
-                                    block.block_id
-                                );
+                                if runtime_debug_diagnostics_enabled() {
+                                    eprintln!(
+                                        "[tine] keep-both resolution skipped after whole-page deletion"
+                                    );
+                                }
                                 continue;
                             }
                             Err(_) => {
@@ -21469,10 +22143,11 @@ impl RuntimeActor {
                         // loudly rather than author an invalid claim or
                         // retry forever (audit 4, finding 3).
                         if original.order.len() >= 512 {
-                            eprintln!(
-                                "[tine] keep-both resolution skipped: order key at maximum length for block {}",
-                                block.block_id
-                            );
+                            if runtime_debug_diagnostics_enabled() {
+                                eprintln!(
+                                    "[tine] keep-both resolution skipped at maximum order-key length"
+                                );
+                            }
                             continue;
                         }
                         // "-" sorts before every digit, so this key lands
@@ -21712,9 +22387,9 @@ impl RuntimeActor {
             return Ok(());
         };
         if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
-            if SharedEnrollmentDescriptor::decode(&bytes)
-                .map_err(SyncRuntimeRequestError::ActorRefused)?
-                != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+            if CleanSharedEnrollmentDescriptorV1::decode(&bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                != *descriptor
             {
                 return Err(SyncRuntimeRequestError::ActorRefused(
                     "clean provider descriptor changed".into(),
@@ -22682,8 +23357,9 @@ impl RuntimeActor {
         }
         self.clean_shutdown()?;
         if let Some(descriptor) = self.clean_shared_descriptor.clone() {
-            return SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-                .map_err(SyncRuntimeRequestError::ActorRefused);
+            return SyncSharedEnrollmentDescriptor::from_clean(descriptor).map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error))
+            });
         }
         let marker = read_activation_marker(self.enrollment_root.path())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -22731,23 +23407,14 @@ impl RuntimeActor {
         self.shared_role = Some(SyncSharedRole::Initiator);
         self.shared_phase = Some(SyncSharedPhase::Active);
         SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-            .map_err(SyncRuntimeRequestError::ActorRefused)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error)))
     }
 
     fn join_shared(
         &mut self,
-        descriptor: SharedEnrollmentDescriptor,
+        descriptor: CleanSharedEnrollmentDescriptorV1,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
-        match descriptor {
-            SharedEnrollmentDescriptor::Legacy(descriptor) => {
-                let _ = descriptor;
-                Err(SyncRuntimeRequestError::ActorRefused(
-                    "pre-0.7 shared enrollment is no longer supported; Return to Direct Files and share the graph again"
-                        .into(),
-                ))
-            }
-            SharedEnrollmentDescriptor::Clean(descriptor) => self.join_shared_clean(descriptor),
-        }
+        self.join_shared_clean(descriptor)
     }
 
     fn install_clean_join_candidate(
@@ -22769,18 +23436,34 @@ impl RuntimeActor {
         let baseline_directory = candidate.baseline_directory.clone();
         let operation_archive_directory = candidate.operation_archive_directory.clone();
         let baseline_frontier_digest = candidate.baseline_frontier_digest;
-        let canonical_baseline = clean_baseline_directory(&request.archive_root);
-        let canonical_operations = clean_operation_archive_directory(&request.archive_root);
-        let nonce = Uuid::new_v4().simple().to_string();
-        let prior_baseline = request
-            .archive_root
-            .join(format!(".lazy-genesis.{nonce}.prior"));
-        let prior_operations = request
-            .archive_root
-            .join(format!(".operations.{nonce}.prior"));
-        let replacement_marker = LazyGenesisActivationMarkerV1::new(
+        let next_generation = prior_marker.generation().checked_add(1).ok_or_else(|| {
+            SyncRuntimeRequestError::ActorRefused(
+                "clean shared join exhausted authority generations".into(),
+            )
+        })?;
+        let replacement_directories =
+            clean_authority_directories(&request.archive_root, next_generation);
+        for destination in [
+            &replacement_directories.baseline,
+            &replacement_directories.operations,
+        ] {
+            match fs::symlink_metadata(destination) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    // §3.1 MS-REF-STALE-GENERATION pins the honest concurrent
+                    // generation-advance scenario for this exact refusal stem.
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean shared join generation destination already exists: {}",
+                        destination.display()
+                    )));
+                }
+                Err(error) => return Err(SyncRuntimeRequestError::ActorRefused(error.to_string())),
+            }
+        }
+        let replacement_marker = LazyGenesisActivationMarkerV1::new_for_generation(
             descriptor.workspace_id(),
             descriptor.lineage_digest(),
+            next_generation,
             descriptor.baseline_root(),
             descriptor.source_capture(),
             baseline_frontier_digest,
@@ -22789,37 +23472,50 @@ impl RuntimeActor {
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
 
         // The graph is already semantically equal to the provider frontier.
-        // Drop only the old managed runtime, retain the graph itself, then
-        // install both immutable authorities before replacing the marker.
+        // Drop only the old managed runtime and publish the replacement under
+        // a fresh generation. The old generation stays untouched until the
+        // marker replacement commits; open reclaims whichever generation the
+        // marker does not name.
         self.clean.take();
         let installation = (|| {
-            fs::rename(&canonical_baseline, &prior_baseline)
+            fs::rename(&baseline_directory, &replacement_directories.baseline)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            if let Err(error) = fs::rename(&baseline_directory, &canonical_baseline) {
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
-            if let Err(error) = fs::rename(&canonical_operations, &prior_operations) {
-                let _ = fs::rename(&canonical_baseline, &baseline_directory);
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
-            if let Err(error) = fs::rename(&operation_archive_directory, &canonical_operations) {
-                let _ = fs::rename(&prior_operations, &canonical_operations);
-                let _ = fs::rename(&canonical_baseline, &baseline_directory);
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterBaselineSwap,
+            );
+            fs::rename(
+                &operation_archive_directory,
+                &replacement_directories.operations,
+            )
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterOperationSwap,
+            );
             crate::filesystem_durability::sync_reconstructible_directory_path(
                 &request.archive_root,
             )
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterAuthorityDirectorySync,
+            );
             replace_activation_marker_for_join(
                 &request.enrollment_root,
                 prior_marker,
                 replacement_marker,
             )
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterMarkerReplacement,
+            );
+            Ok(())
         })();
         if let Err(error) = installation {
             self.terminal = Some(format!(
@@ -22880,12 +23576,7 @@ impl RuntimeActor {
         self.recovery = SyncRuntimeRecovery::CleanManifestReplay;
         self.stopped_safe = false;
         self.terminal = None;
-        fs::remove_dir_all(&prior_baseline)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        fs::remove_dir_all(&prior_operations)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        crate::filesystem_durability::sync_reconstructible_directory_path(&request.archive_root)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+        Ok(())
     }
 
     fn join_shared_clean(
@@ -22902,8 +23593,8 @@ impl RuntimeActor {
             || descriptor.lineage_digest() != self.binding.lineage_digest()
             || descriptor.catalog_document_id() != self.binding.catalog_document_id()
         {
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                "clean shared descriptor names another managed graph".into(),
+            return Err(SyncRuntimeRequestError::TaggedBackend(
+                tagged_backend_error("managed-graph-mismatch", None),
             ));
         }
         let expected = inspect_shared_provider_descriptor(&self.provider_root)
@@ -22913,9 +23604,9 @@ impl RuntimeActor {
                     "clean shared enrollment descriptor is not provider-visible".into(),
                 )
             })?;
-        if SharedEnrollmentDescriptor::decode(&expected)
-            .map_err(SyncRuntimeRequestError::ActorRefused)?
-            != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+        if CleanSharedEnrollmentDescriptorV1::decode(&expected)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            != descriptor
         {
             return Err(SyncRuntimeRequestError::ActorRefused(
                 "provider descriptor changed before clean join".into(),
@@ -22992,7 +23683,12 @@ impl RuntimeActor {
                     &provider_semantics,
                     local_is_activation_baseline,
                 )? {
-                    return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                    return Err(SyncRuntimeRequestError::TaggedBackend(
+                        tagged_backend_error_with_detail(
+                            "shared-frontier-mismatch",
+                            diff.typed_detail(),
+                        ),
+                    ));
                 }
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;
@@ -23018,7 +23714,9 @@ impl RuntimeActor {
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         let public_descriptor = SyncSharedEnrollmentDescriptor::from_clean(descriptor.clone())
-            .map_err(SyncRuntimeRequestError::ActorRefused)?;
+            .map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error))
+            })?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         self.clean_shared_descriptor = Some(descriptor.clone());
@@ -23268,9 +23966,29 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
     SyncEditorRequestError::ActorRefusedWithCode(code)
 }
 
-fn runtime_debug_diagnostics_enabled() -> bool {
-    matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-        || std::env::args().any(|argument| argument == "--debug")
+/// The process-wide answer to "are runtime debug diagnostics on?".
+///
+/// Core cannot call src-tauri, so the flag lives here and the host process
+/// pushes its answer down: `debug_init` parses `TINE_DEBUG=1` / `--debug` once
+/// at startup and calls [`set_runtime_debug_diagnostics`]. Default `false`, so
+/// tests, benches, CLI tools and any other non-Tauri consumer get diagnostics
+/// off unless they opt in deliberately.
+static RUNTIME_DEBUG_DIAGNOSTICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the process-wide debug-diagnostics flag. Plain and idempotent: calling
+/// it twice is a second answer to the same question, not an error, and a test
+/// must be able to turn the flag back off — which is why this is not an
+/// init-once cell that would silently ignore the second call (I-11).
+pub fn set_runtime_debug_diagnostics(enabled: bool) {
+    RUNTIME_DEBUG_DIAGNOSTICS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ONE producer of "are runtime debug diagnostics on?" (I-12). Every
+/// diagnostic in `tine-core` and in `src-tauri` — where `debug_enabled()` is a
+/// thin delegate to this function — asks here.
+pub fn runtime_debug_diagnostics_enabled() -> bool {
+    RUNTIME_DEBUG_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {
@@ -23542,7 +24260,14 @@ fn application_editor_blocks_existing(
         };
         keys.push(key);
     }
-    Ok(requested
+    Ok(application_editor_blocks(&requested, &keys))
+}
+
+fn application_editor_blocks(
+    requested: &[ApplicationBlockRef<'_>],
+    keys: &[SyncEditorBlockKey],
+) -> Vec<SyncEditorBlockDto> {
+    requested
         .iter()
         .enumerate()
         .map(|(index, block)| SyncEditorBlockDto {
@@ -23550,7 +24275,7 @@ fn application_editor_blocks_existing(
             parent: block.parent.map(|parent| keys[parent].clone()),
             content: block.block.raw.clone(),
         })
-        .collect())
+        .collect()
 }
 
 fn application_page_identity_map(
@@ -23661,15 +24386,7 @@ fn application_editor_blocks_new(
     let keys = (0..requested.len())
         .map(|index| SyncEditorBlockKey::Temporary(format!("gateway-{index}")))
         .collect::<Vec<_>>();
-    Ok(requested
-        .iter()
-        .enumerate()
-        .map(|(index, block)| SyncEditorBlockDto {
-            key: keys[index].clone(),
-            parent: block.parent.map(|parent| keys[parent].clone()),
-            content: block.block.raw.clone(),
-        })
-        .collect())
+    Ok(application_editor_blocks(&requested, &keys))
 }
 
 fn merge_markdown_page_properties(
@@ -25117,10 +25834,6 @@ fn sync_reference_hit(hit: FrontierReferenceHit) -> SyncReferenceHitDto {
         resolved_page_id: hit.resolved_page_id.map(|id| id.to_string()),
         resolved_block_id: hit.resolved_block_id.map(|id| id.to_string()),
     }
-}
-
-fn display(error: impl fmt::Display) -> String {
-    error.to_string()
 }
 
 fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {

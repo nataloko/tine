@@ -898,6 +898,9 @@ mod tests {
             .expect("capture-and-plan workflow was copied");
         assert!(copied_markdown.contains("{{query (task TODO DOING NOW LATER)}}"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Quick capture]]"));
+        // The page teaches both routes to a bullet ABOVE an existing one, because
+        // Enter-at-the-start does not exist inside a code block (GH #480).
+        assert!(copied_markdown.contains("**Insert block above**"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1027,6 +1030,11 @@ mod tests {
             .markdown
             .contains("- # Pages, links, references, and search"));
         assert!(page.markdown.contains("Unlinked References"));
+        // The graph, not a constant, decides when Linked References open folded
+        // (GH #479), so the key the user has to set is named here.
+        assert!(page
+            .markdown
+            .contains(":ref/linked-references-collapsed-threshold"));
         assert!(page.markdown.contains("available page/tag chips"));
         assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));

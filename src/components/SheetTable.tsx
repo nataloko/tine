@@ -17,8 +17,8 @@ import {
   withUndoUnit,
   type PageMutationAuthority,
 } from "../store";
-import { facetsFromDto, facetsOf, type Facets } from "../render/facets";
-import { pageProperties, visibleBody, isRenderHiddenProp } from "../render/block";
+import { facetsOf } from "../render/facets";
+import { pageProperties } from "../render/block";
 import { InlineText } from "../render/inline";
 import { observeNear, unobserveNear } from "../lazyObserve";
 import { editorOffsetFromRenderedRange } from "../render/spans";
@@ -46,10 +46,15 @@ import {
 import { beginCellPointerSelection, isSheetPointerInteractive, sheetGridIdFromEventTarget } from "../sheet/pointerSelection";
 import {
   cycleField,
+  fieldIdsForRecords,
   fieldIdsForBlocks,
   fieldLabel,
+  formulaReferenceName,
   isFormulaField,
   readField,
+  recordFacets,
+  rowRaw,
+  rowTitle,
   toggleStateMarkerLabel,
   writeField,
   type FieldId,
@@ -99,7 +104,13 @@ import { hydrateVisibleQueryPages, SHEET_RENDER_PAGE } from "../sheet/queryHydra
 
 interface RowRecord extends FormulaEvalRow {}
 
-export const __sheetTableTestHooks: { onIndexRow?: (rowId: string) => void } = {};
+export const __sheetTableTestHooks: {
+  onIndexRow?: (rowId: string) => void;
+  /** Fires once per EFFECTIVE sort-key derivation, whichever branch (title /
+   *  formula / ordinary property) produced it. One seam, so a test counting it
+   *  cannot be satisfied by moving an equivalent derivation elsewhere. */
+  onSortKey?: (rowId: string) => void;
+} = {};
 
 type SortState = { col: number; dir: 1 | -1 } | null;
 type SortKey = { kind: "number"; value: number; text: string } | { kind: "text"; text: string };
@@ -502,18 +513,29 @@ export function SheetTable(props: {
     const rs = rows();
     if (!s) return rs;
     const col = columns()[s.col];
+    const types = fieldTypes();
+    // The ONE seam that derives a row's effective sort key, whichever branch
+    // answers. Deriving it inside the comparator cost ~2·(R log R) derivations
+    // per sort — each one a `visibleBody(rowRaw(row))` parse, a formula-result
+    // lookup, or a property read. Harvest W4-P1 item 1.
     const value = (r: RowRecord): SortKey => {
-      if (col === "title") return { kind: "text", text: rowTitle(r) };
+      __sheetTableTestHooks.onSortKey?.(r.id);
+      if (col === "title") return { kind: "text", text: rowTitle(r, "joined-with-placeholder") };
       const formula = formulaValue(r, col);
       if (formula?.kind === "number") return { kind: "number", value: formula.value, text: String(formula.value) };
       const field = rowFieldValue(r, col);
       const text = field?.raw ?? field?.text ?? "";
-      if (fieldTypes().get(col) === "number" && isPlainDecimalNumber(text.trim())) {
+      if (types.get(col) === "number" && isPlainDecimalNumber(text.trim())) {
         return { kind: "number", value: Number(text.trim()), text };
       }
       return { kind: "text", text };
     };
-    return [...rs].sort((a, b) => compareSortKeys(value(a), value(b)) * s.dir);
+    // Decorate–sort–undecorate: exactly R derivations, then a comparator that
+    // only compares. `Array.prototype.sort` is stable, so equal keys keep their
+    // document order exactly as they did when the comparator derived in place.
+    const decorated = rs.map((row) => ({ row, key: value(row) }));
+    decorated.sort((a, b) => compareSortKeys(a.key, b.key) * s.dir);
+    return decorated.map((entry) => entry.row);
   });
   const [renderLimit, setRenderLimit] = createSignal(SHEET_RENDER_PAGE);
   createEffect(() => {
@@ -1312,63 +1334,6 @@ export function SheetTable(props: {
   );
 }
 
-function recordFacets(row: RowRecord): Facets | null {
-  const n = liveFormulaRowNode(row);
-  if (n) return facetsOf(n.raw, formatForBlock(row.id));
-  return row.dto ? facetsFromDto(row.dto) : null;
-}
-
-function fieldIdsForRecords(rows: readonly RowRecord[], includePage: boolean): FieldId[] {
-  const out: FieldId[] = [];
-  const props: FieldId[] = [];
-  const seenProps = new Set<string>();
-  let hasState = false;
-  let hasPriority = false;
-  let hasScheduled = false;
-  let hasDeadline = false;
-  let hasTags = false;
-  for (const r of rows) {
-    const f = recordFacets(r);
-    if (!f) continue;
-    hasState ||= !!f.marker;
-    hasPriority ||= !!f.priority;
-    hasScheduled ||= !!f.scheduled;
-    hasDeadline ||= !!f.deadline;
-    hasTags ||= f.tags.length > 0;
-    for (const [key] of f.properties) {
-      if (isRenderHiddenProp(key)) continue;
-      const field: FieldId = `prop:${key}`;
-      if (!seenProps.has(field)) {
-        seenProps.add(field);
-        props.push(field);
-      }
-    }
-  }
-  if (hasState) out.push("state");
-  if (hasPriority) out.push("priority");
-  if (hasScheduled) out.push("scheduled");
-  if (hasDeadline) out.push("deadline");
-  if (hasTags) out.push("tags");
-  out.push(...props);
-  if (includePage) out.push("page");
-  return out;
-}
-
-function formulaReferenceName(field: FieldId): string | null {
-  if (isFormulaField(field)) return null;
-  if (field.startsWith("prop:")) return field.slice(5);
-  return field;
-}
-
-function rowRaw(row: RowRecord): string {
-  return liveFormulaRowNode(row)?.raw ?? row.dto?.raw ?? "";
-}
-
-function rowTitle(row: RowRecord): string {
-  const title = visibleBody(rowRaw(row)).join(" ");
-  return title.trim() === "" && (liveFormulaRowNode(row)?.children.length ?? row.dto?.children.length ?? 0) > 0 ? "—" : title;
-}
-
 function clickOffset(e: MouseEvent, contentRef: HTMLDivElement | undefined, raw: string): number | null {
   if (!contentRef) return null;
   const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
@@ -1493,9 +1458,9 @@ function TitleCell(props: {
           fallback={
             <Show
               when={props.near}
-              fallback={<span class="sheet-cell-defer">{rowTitle(props.row)}</span>}
+              fallback={<span class="sheet-cell-defer">{rowTitle(props.row, "joined-with-placeholder")}</span>}
             >
-              <InlineText text={rowTitle(props.row)} format={fmt()} />
+              <InlineText text={rowTitle(props.row, "joined-with-placeholder")} format={fmt()} />
             </Show>
           }
         >

@@ -8,6 +8,688 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+fn production_function_and_constructor_census() -> (
+    Vec<(String, String)>,
+    Vec<(String, String, String)>,
+    Vec<(String, String, String)>,
+) {
+    use syn::visit::{self, Visit};
+
+    fn test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("test")
+                || (attribute.path().is_ident("cfg")
+                    && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test")))
+        })
+    }
+
+    #[derive(Default)]
+    struct Census {
+        file: String,
+        owner: Option<String>,
+        functions: Vec<(String, String)>,
+        constructors: Vec<(String, String, String)>,
+        calls: Vec<(String, String, String)>,
+    }
+    impl Census {
+        fn visit_function<'ast>(&mut self, name: String, visit_body: impl FnOnce(&mut Self)) {
+            self.functions.push((self.file.clone(), name.clone()));
+            let previous = self.owner.replace(name);
+            visit_body(self);
+            self.owner = previous;
+        }
+    }
+    impl<'ast> Visit<'ast> for Census {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                self.visit_function(item.sig.ident.to_string(), |this| {
+                    visit::visit_item_fn(this, item)
+                });
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                self.visit_function(item.sig.ident.to_string(), |this| {
+                    visit::visit_impl_item_fn(this, item)
+                });
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if let (Some(owner), Some(kind)) = (
+                self.owner.as_ref(),
+                expression
+                    .path
+                    .segments
+                    .last()
+                    .map(|part| part.ident.to_string()),
+            ) {
+                self.constructors
+                    .push((self.file.clone(), owner.clone(), kind));
+            }
+            visit::visit_expr_struct(self, expression);
+        }
+
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if let (Some(owner), syn::Expr::Path(path)) = (self.owner.as_ref(), &*expression.func) {
+                if let Some(callee) = path.path.segments.last() {
+                    self.calls
+                        .push((self.file.clone(), owner.clone(), callee.ident.to_string()));
+                }
+            }
+            visit::visit_expr_call(self, expression);
+        }
+    }
+
+    let mut census = Census::default();
+    for file in crate::projection_producer_census::production_rust() {
+        census.file.clone_from(&file.relative);
+        let syntax = syn::parse_file(&file.raw)
+            .unwrap_or_else(|error| panic!("{} is valid Rust: {error}", file.relative));
+        census.visit_file(&syntax);
+    }
+    census.functions.sort();
+    census.constructors.sort();
+    census.calls.sort();
+    (census.functions, census.constructors, census.calls)
+}
+
+#[test]
+fn managed_backlink_boundary_uses_one_docblock_producer() {
+    let (functions, constructors, calls) = production_function_and_constructor_census();
+    let producers = constructors
+        .iter()
+        .filter(|(_, _, kind)| kind == "BacklinkFilterEntry")
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        producers,
+        [("crates/tine-core/src/query.rs", "backlink_filter_entry")],
+        "I-12: BacklinkFilterEntry has one DocBlock producer; a BlockDto twin is forbidden"
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|(_, name)| name == "application_backlink_filter_entry"),
+        "the BlockDto backlink twin must be retired"
+    );
+    assert!(
+        calls.iter().any(
+            |(file, owner, callee)| file == "crates/tine-core/src/sync_runtime.rs"
+                && owner == "application_backlink_filter_context_ready"
+                && callee == "backlink_filter_entry"
+        ),
+        "the managed backlink boundary must call the canonical DocBlock producer"
+    );
+}
+
+#[test]
+fn managed_editor_dto_has_one_canonical_builder() {
+    let (_, constructors, calls) = production_function_and_constructor_census();
+    let builders = constructors
+        .iter()
+        .filter(|(_, _, kind)| kind == "SyncEditorBlockDto")
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        builders,
+        [
+            (
+                "crates/tine-core/src/sync_runtime.rs",
+                "application_editor_blocks"
+            ),
+            (
+                "crates/tine-core/src/sync_runtime.rs",
+                "ordered_editor_blocks"
+            ),
+        ],
+        "Existing and New save arms must delegate to one SyncEditorBlockDto builder"
+    );
+    for wrapper in [
+        "application_editor_blocks_existing",
+        "application_editor_blocks_new",
+    ] {
+        assert!(
+            calls.iter().any(|(file, owner, callee)| file
+                == "crates/tine-core/src/sync_runtime.rs"
+                && owner == wrapper
+                && callee == "application_editor_blocks"),
+            "{wrapper} must delegate to the shared builder"
+        );
+    }
+}
+
+#[test]
+fn managed_template_dto_has_one_canonical_leaf() {
+    let (_, constructors, calls) = production_function_and_constructor_census();
+    let leaves = constructors
+        .iter()
+        .filter(|(_, owner, kind)| kind == "BlockDto" && owner.contains("template"))
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        leaves,
+        [("crates/tine-core/src/query.rs", "template_dto")],
+        "template DTO construction must have one parser-owned leaf"
+    );
+    assert!(
+        calls.iter().any(|(file, owner, callee)| file == "crates/tine-core/src/query.rs"
+            && owner == "application_page_templates"
+            && callee == "visit_template_blocks")
+            && calls.iter().any(|(file, owner, callee)| file == "crates/tine-core/src/query.rs"
+                && owner == "visit_template_blocks"
+                && callee == "template_dto"),
+        "the managed template boundary must reach the canonical DocBlock leaf through its syntax walker"
+    );
+}
+
+#[test]
+fn duplicate_uuid_policy_owner_is_shared_by_every_producer() {
+    let (_, _, calls) = production_function_and_constructor_census();
+    for (file, owner) in [
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "block_page_hint",
+        ),
+        ("crates/tine-core/src/query.rs", "resolve_ids_in_page"),
+        (
+            "crates/tine-core/src/sync_runtime.rs",
+            "application_block_candidates_ready",
+        ),
+    ] {
+        assert!(
+            calls
+                .iter()
+                .any(|(call_file, caller, callee)| call_file == file
+                    && caller == owner
+                    && callee == "logseq_uuid_owner"),
+            "{file}::{owner} must delegate claimant choice to logseq_uuid_owner"
+        );
+    }
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync_runtime.rs"),
+    )
+    .unwrap();
+    let body = source
+        .split_once("fn find_application_blocks")
+        .and_then(|(_, tail)| tail.split_once("fn shallow_application_block"))
+        .map(|(body, _)| body)
+        .expect("find_application_blocks remains a narrow leaf");
+    assert!(
+        body.contains("Vec<(String, &'a BlockDto)>") && !body.contains("or_insert"),
+        "find_application_blocks must retain every claimant until policy runs"
+    );
+}
+
+#[test]
+fn shallow_application_block_measured_exception_is_bounded() {
+    let (functions, _, calls) = production_function_and_constructor_census();
+    assert!(
+        functions
+            .iter()
+            .any(|(_, name)| name == "shallow_application_block"),
+        "the measured parsing/allocation exception remains explicit"
+    );
+    let shallow_calls = calls
+        .iter()
+        .filter(|(_, _, callee)| callee == "shallow_application_block")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shallow_calls.len(),
+        3,
+        "AST-visible calls stay in the reviewed owners (the fourth is inside the resolve closure): {shallow_calls:#?}"
+    );
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync_runtime.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        source.match_indices("shallow_application_block(").count(),
+        5,
+        "one definition plus exactly four reviewed production calls"
+    );
+}
+
+#[test]
+#[ignore = "manual advisory timing; the structural test pins all five callers"]
+fn managed_shallow_application_block_manual_probe() {
+    let mut parsed = crate::doc::DocBlock::new(
+        "TODO representative [[Page]] #tag\npriority:: A\nscheduled:: <2026-09-03 Thu>",
+    );
+    parsed.uuid = "3a2a1f90-bc3d-4e55-8f66-123456789abc".into();
+    let block = crate::model::block_to_shallow_dto(&parsed);
+    const ITERATIONS: usize = 100_000;
+    let started = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        std::hint::black_box(shallow_application_block(std::hint::black_box(&block)));
+    }
+    let retained = started.elapsed();
+    let started = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        let parsed = crate::model::dto_block_to_doc_block(std::hint::black_box(&block), false);
+        std::hint::black_box(crate::model::block_to_shallow_dto(&parsed));
+    }
+    let canonical = started.elapsed();
+    assert_eq!(
+        serde_json::to_value(shallow_application_block(&block)).unwrap(),
+        serde_json::to_value(crate::model::block_to_shallow_dto(
+            &crate::model::dto_block_to_doc_block(&block, false),
+        ))
+        .unwrap()
+    );
+    eprintln!(
+        "c7a shallow probe iterations={ITERATIONS} retained_ns={} canonical_ns={} temporary_docblocks_retained=0 temporary_docblocks_canonical={ITERATIONS}",
+        retained.as_nanos(),
+        canonical.as_nanos()
+    );
+}
+
+#[test]
+fn application_family_is_pinned_by_name() {
+    let contract = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/contracts/managed-read-surface.md"),
+    )
+    .expect("docs/contracts/managed-read-surface.md must exist");
+    let expected = contract
+        .lines()
+        .filter_map(|line| {
+            let columns = line
+                .split('|')
+                .map(str::trim)
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>();
+            (columns.len() == 5
+                && columns[0].starts_with("application_")
+                && matches!(columns[2], "necessary" | "adapter"))
+            .then(|| {
+                (
+                    columns[1].trim_matches('`').to_owned(),
+                    columns[0].to_owned(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let (functions, _, calls) = production_function_and_constructor_census();
+    let actual = functions
+        .into_iter()
+        .filter(|(_, name)| name.starts_with("application_"))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "a new application_* function must be a thin mode adapter over a shared core (I-12/D-4); exemplars application_equivalent_page_names_ready + equivalent_page_names and journal_feed.rs; a twin body is forbidden — see docs/contracts/managed-read-surface.md");
+
+    for line in contract.lines() {
+        let columns = line
+            .split('|')
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.len() == 5 && columns[2] == "adapter" {
+            let symbol = columns[0];
+            let file = columns[1].trim_matches('`');
+            let owner = columns[3].trim_matches('`');
+            assert!(
+                owner != "—" && !owner.is_empty(),
+                "adapter {symbol} names its canonical owner"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|(call_file, caller, callee)| call_file == file
+                        && caller == symbol
+                        && callee == owner),
+                "adapter {symbol} must call canonical owner {owner}"
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_read_surface_contract_and_changelog_are_pinned() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let contract = std::fs::read_to_string(repo.join("docs/contracts/managed-read-surface.md"))
+        .expect("managed read contract exists");
+    for required in [
+        "| symbol | file | class | canonical owner | justification/evidence |",
+        "| symbol | former file | canonical replacement | packet item |",
+        "| boundary | exact outcome/rule | OG commit | OG path |",
+        "c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968",
+        "deps/graph-parser/src/logseq/graph_parser/block.cljs",
+        "src/main/frontend/db/model.cljs",
+        "Direct-ready",
+        "Direct-fallback",
+        "Managed-pending",
+        "Managed-drained",
+        "Property extraction",
+        "Template discovery",
+    ] {
+        assert!(contract.contains(required), "contract missing {required}");
+    }
+    let retired = contract
+        .split_once("## Retired producers")
+        .and_then(|(_, tail)| tail.split_once("## UUID ownership policy"))
+        .map(|(table, _)| table)
+        .expect("retired table is bounded by the UUID policy section");
+    let (functions, _, _) = production_function_and_constructor_census();
+    for line in retired.lines().filter(|line| line.starts_with('|')) {
+        let columns = line
+            .split('|')
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.len() == 4 && columns[0] != "symbol" && columns[0] != "---" {
+            assert!(
+                !functions.iter().any(|(_, name)| name == columns[0]),
+                "retired producer {} must be absent from production",
+                columns[0]
+            );
+        }
+    }
+    let changelog = std::fs::read_to_string(repo.join("CHANGELOG.md")).unwrap();
+    // Pin the NOTE, not the heading it happens to sit under today. Cutting a
+    // release moves every bullet out of `[Unreleased]` into a dated section, so
+    // anchoring this pin to `[Unreleased]` broke it by construction on the first
+    // release after it was written (v0.6.982: "Unreleased has a Changed
+    // section"). What the pin actually owes is that these notes were published
+    // under a `### Changed` heading — `[Unreleased]` while unreleased, the dated
+    // section once shipped — so search every section for the one that carries
+    // them rather than assuming which one that is.
+    let required_changed = [
+        "share one evaluator per
+  question",
+        "loads its pending overlay at most
+  once",
+    ];
+    let changed_sections = changelog
+        .split("\n## ")
+        .filter_map(|section| {
+            section
+                .split_once("### Changed")
+                .map(|(_, tail)| (section, tail.split("\n### ").next().unwrap_or(tail)))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        changed_sections
+            .iter()
+            .any(|(section, changed)| changed.contains("Direct")
+                && changed.contains("Managed")
+                && section.contains("ownership")),
+        "a Changed section must name Direct/Managed parity and shared ownership"
+    );
+    // W4-C7b extends this ONE changelog pin rather than adding a second
+    // changelog-pinning test (I-12: one producer per question).
+    for required in required_changed {
+        assert!(
+            changed_sections
+                .iter()
+                .any(|(_, changed)| changed.contains(required)),
+            "a Changed section must state the W4-C7b outcome: {required}"
+        );
+    }
+    application_family_is_pinned_by_name();
+}
+
+fn resolved_block_page(handle: &SyncRuntimeHandle, uuid: &str) -> Option<(String, String)> {
+    let outcome = handle
+        .application_navigation(SyncApplicationNavigationRequest::ResolveBlocks {
+            uuids: vec![uuid.to_owned()],
+        })
+        .unwrap();
+    let SyncApplicationNavigationOutcome::Loaded {
+        reply: SyncApplicationNavigationReply::ResolveBlocks(mut groups),
+    } = outcome
+    else {
+        panic!("resolve-blocks returned the wrong outcome: {outcome:?}")
+    };
+    groups
+        .pop()
+        .flatten()
+        .map(|group| (group.page, group.blocks[0].raw.clone()))
+}
+
+#[test]
+fn duplicate_logseq_uuid_uses_og_first_claimant_at_four_boundaries() {
+    const UUID: &str = "3a2a1f90-bc3d-4e55-8f66-123456789abc";
+    let fixture = ActivationFixture::empty("c7a-duplicate-uuid", 0xc7a4);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/A first.md"),
+        format!("- OG first claimant\n  id:: {UUID}\n"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/B second.md"),
+        format!("- later duplicate claimant\n  id:: {UUID}\n"),
+    )
+    .unwrap();
+
+    let direct = Graph::open(&fixture.graph_root);
+    let direct_projection = fixture.root.join("direct-projection.sqlite");
+    direct.attach_direct_projection(direct_projection).unwrap();
+    direct.warm_cache();
+    let started = std::time::Instant::now();
+    while !direct.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "Direct projection did not converge for duplicate-uuid parity"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(direct.direct_projection_ready_test());
+    let ready = direct.resolve_blocks(&[UUID.to_owned()]);
+    assert_eq!(ready[0].as_ref().unwrap().page, "A first");
+    direct.direct_projection_mark_stale_test();
+    let fallback = direct.resolve_blocks(&[UUID.to_owned()]);
+    assert_eq!(fallback[0].as_ref().unwrap().page, "A first");
+
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("duplicate fixture activates");
+    drive_initial_feed(&handle);
+    assert_eq!(
+        resolved_block_page(&handle, UUID),
+        Some((
+            "A first".into(),
+            "OG first claimant\nid:: 3a2a1f90-bc3d-4e55-8f66-123456789abc".into()
+        ))
+    );
+
+    let (mut second, revision) = load_application_exact(&handle, "pages/B second.md");
+    second.blocks[0].raw.push_str("\nchanged while pending");
+    let pending = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: second.path.clone(),
+                revision,
+            },
+            page: second,
+        })
+        .unwrap();
+    assert!(matches!(
+        pending,
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+    assert!(handle.status().unwrap().managed_local_pending > 0);
+    assert_eq!(resolved_block_page(&handle, UUID).unwrap().0, "A first");
+}
+
+#[test]
+fn managed_new_then_existing_save_preserves_nested_editor_identity() {
+    let fixture = ActivationFixture::empty("c7a-editor-builder", 0xc7a2);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/C7a seed.md"),
+        b"- seed before managed activation\n",
+    )
+    .unwrap();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("editor fixture activates");
+    drive_initial_feed(&handle);
+    let page = new_application_page(
+        "C7a nested editor",
+        SyncPageKind::Page,
+        None,
+        vec![BlockDto {
+            id: "temporary-parent".into(),
+            raw: "parent content".into(),
+            children: vec![BlockDto {
+                id: "temporary-child".into(),
+                raw: "child content".into(),
+                ..BlockDto::default()
+            }],
+            ..BlockDto::default()
+        }],
+    );
+    let created = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: "C7a nested editor".into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page,
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved {
+        page, revision: _, ..
+    } = created
+    else {
+        panic!("new save did not succeed: {created:?}")
+    };
+    let parent_id = page.blocks[0].id.clone();
+    let child_id = page.blocks[0].children[0].id.clone();
+    assert_ne!(parent_id, "temporary-parent");
+    assert_ne!(child_id, "temporary-child");
+    let path = page.path.clone();
+    drain_managed_local(&handle);
+    let (mut page, revision) = load_application_exact(&handle, &path);
+    assert_eq!(page.blocks[0].id, parent_id);
+    assert_eq!(page.blocks[0].children[0].id, child_id);
+    page.blocks[0].children[0].raw = "child content after existing save".into();
+    let saved = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("existing save did not succeed: {saved:?}")
+    };
+    assert_eq!(page.blocks[0].id, parent_id);
+    assert_eq!(page.blocks[0].children[0].id, child_id);
+    assert_eq!(
+        page.blocks[0].children[0].raw,
+        "child content after existing save"
+    );
+}
+
+#[test]
+fn template_extraction_matches_og_property_rule_in_md_and_org() {
+    fn signature(templates: Vec<TemplateDto>) -> Vec<(String, String, Vec<String>)> {
+        let mut rows = templates
+            .into_iter()
+            .map(|template| {
+                (
+                    template.name,
+                    template.page,
+                    template.blocks.into_iter().map(|block| block.raw).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    let fixture = ActivationFixture::empty("c7a-template-og-rule", 0xc7a3);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/Template MD.md"),
+        "template:: page pre-block is not a block template\n\n- md parent\n  TeMPLate:: Md odd\n  template_including_parent:: false\n  - md child\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/Template Org.org"),
+        "* org parent\n:PROPERTIES:\n:TeMPLate: Org odd\n:template_including_parent: true\n:END:\n** org child\n",
+    )
+    .unwrap();
+    let direct = Graph::open(&fixture.graph_root);
+    let expected = vec![
+        ("Md odd".into(), "Template MD".into(), vec!["md child".into()]),
+        (
+            "Org odd".into(),
+            "Template Org".into(),
+            vec!["org parent\n:PROPERTIES:\n:TeMPLate: Org odd\n:template_including_parent: true\n:END:".into()],
+        ),
+    ];
+    assert_eq!(signature(direct.templates()), expected);
+
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("template fixture activates");
+    drive_initial_feed(&handle);
+    let SyncApplicationNavigationOutcome::Loaded {
+        reply: SyncApplicationNavigationReply::Templates(templates),
+    } = handle
+        .application_navigation(SyncApplicationNavigationRequest::ListTemplates)
+        .unwrap()
+    else {
+        panic!("managed templates did not load")
+    };
+    assert_eq!(signature(templates), expected);
+}
+
+#[test]
+fn clean_open_source_matrix_has_one_conversion_per_source_class() {
+    fn assert_from<T>()
+    where
+        CleanOpenError: From<T>,
+    {
+    }
+
+    assert_from::<crate::oplog::import::BootstrapStreamingImportError>();
+    assert_from::<crate::oplog::hot_engine::EngineError>();
+    assert_from::<crate::oplog::enrollment::EnrollmentError>();
+    assert_from::<crate::oplog::hot_engine::ManagedLocalRecordError>();
+    assert_from::<crate::oplog::projection_store::ProjectionStoreError>();
+    assert_from::<crate::oplog::projection_turn_journal::ProjectionTurnJournalError>();
+    assert_from::<crate::oplog::receipt::ReceiptError>();
+    assert_from::<crate::oplog::local_active::RuntimePromotionError>();
+    assert_from::<crate::oplog::wire::ScenarioError>();
+    assert_from::<crate::oplog::object_store::StoreError>();
+    assert_from::<crate::oplog::absence_sweep::SweepError>();
+    assert_from::<crate::oplog::local_active::WorkspaceAuthorityRefusal>();
+    assert_from::<crate::oplog::sqlite::ProjectionError>();
+    assert_from::<crate::oplog::projection::ProjectionError>();
+    assert_from::<std::io::Error>();
+    assert_from::<tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>>();
+}
+
+#[test]
+fn clean_open_projection_emits_only_the_tagged_source_code() {
+    let error = CleanOpenError::from(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "source prose and /private/path must not cross the boundary",
+    ));
+    assert_eq!(error.to_string(), "clean_open.io");
+    let payload: serde_json::Value = serde_json::from_str(&clean_open_error_detail(error)).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.io",
+        })
+    );
+}
+
 fn clean_join_page(
     path: &str,
     kind: ManagedTextKind,
@@ -268,11 +950,11 @@ fn a_pre_c_private_store_is_refused_before_any_graph_mutation() {
         SyncShutdownOutcome::Safe(_)
     ));
 
-    // A pre-(c) claim: the prior magic family, recognized and refused.
+    // The immediately previous claim family must be recognized and refused.
     let claim_path = store_claim_path(&fixture.request);
     let mut claim = Vec::new();
-    claim.extend_from_slice(b"TINEPR5\0");
-    claim.extend_from_slice(&5_u32.to_be_bytes());
+    claim.extend_from_slice(b"TINEPR6\0");
+    claim.extend_from_slice(&6_u32.to_be_bytes());
     claim.extend_from_slice(&[0_u8; 32]);
     claim.extend_from_slice(fixture.request.identities.workspace_id.as_uuid().as_bytes());
     claim.extend_from_slice(&[0_u8; 1 + 16 + 16 + 32 + 5 * 32]);
@@ -286,13 +968,14 @@ fn a_pre_c_private_store_is_refused_before_any_graph_mutation() {
     let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
         panic!("a pre-(c) store must surface a managed-open refusal: {result:?}");
     };
-    assert!(
-        !detail.is_empty(),
-        "the typed refusal must retain diagnostics"
-    );
-    assert!(
-        !detail.contains("re-activate"),
-        "the low-level refusal must not prescribe retired manual re-activation: {detail}"
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection_store",
+            "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
+        }),
+        "the low-level refusal carries only its typed source and scenario codes"
     );
     assert_eq!(
         result.status.durable_refusal_scenario(),
@@ -407,7 +1090,7 @@ fn the_claim_precheck_leaves_fresh_activation_and_ordinary_reopen_unaffected() {
 
     let claim = fs::read(store_claim_path(&fixture.request)).unwrap();
     assert!(
-        claim.starts_with(b"TINEPR6\0"),
+        claim.starts_with(b"TINEPR7\0"),
         "a freshly initialized store carries the current claim magic"
     );
 
@@ -486,6 +1169,33 @@ fn pre_07_activation_oracle_is_absent_from_the_source() {
     }
 }
 
+/// H2 1b: the retired JSON shared-enrollment lifecycle is no longer decoded.
+/// Its raw fixture is classified as protocol-incompatible, the one refusal the
+/// application layer answers by preserving the private root and rebuilding
+/// from Direct Files.
+#[test]
+fn pre_07_shared_descriptor_fixture_routes_to_preserve_and_rebuild() {
+    let fixture = br#"{"schema_version":6,"lifecycle":{"state":"shared_active","descriptor":{"schema_version":1}}}"#;
+    let error = crate::oplog::enrollment::decode_enrollment_record_for_test(fixture)
+        .expect_err("the retired shared descriptor lifecycle must not decode");
+    assert!(matches!(
+        error,
+        EnrollmentError::FutureUnsupportedLifecycle(ref state) if state == "shared_active"
+    ));
+    assert!(matches!(
+        classify_enrollment_error(error),
+        DiscoveryClassification::UnsupportedOrIncompatible(
+            DiscoveryComponent::Enrollment,
+            ManagedStorageRefusalScenario::ProtocolIncompatible,
+        )
+    ));
+
+    let enrollment = include_str!("oplog/enrollment.rs");
+    let runtime = include_str!("sync_runtime.rs");
+    assert!(!enrollment.contains(&["struct SharedEnrollmentDescriptor", "V1",].concat()));
+    assert!(!runtime.contains(&["Legacy", "(SharedEnrollmentDescriptor", "V1)"].concat()));
+}
+
 #[test]
 fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {
     let contract = include_str!("../../../docs/storage-sync-contract.md");
@@ -505,6 +1215,35 @@ fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {
         runtime_ids, table_ids,
         "the public refusal vocabulary and contract table must change together"
     );
+}
+
+#[test]
+fn clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios() {
+    let runtime = include_str!("sync_runtime.rs");
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    for (stem, scenario) in [
+        (
+            "clean authority orphan is not a private directory",
+            "MS-REF-UNSAFE-FS-KIND",
+        ),
+        (
+            "clean shared join generation destination already exists",
+            "MS-REF-STALE-GENERATION",
+        ),
+    ] {
+        assert!(
+            runtime.contains(stem),
+            "production refusal stem drifted: {stem}"
+        );
+        let row = contract
+            .lines()
+            .find(|line| line.contains(stem))
+            .unwrap_or_else(|| panic!("I-8: refusal '{stem}' has no §3.1 scenario row"));
+        assert!(
+            row.contains(scenario),
+            "I-8: refusal '{stem}' must name its in-scope {scenario} scenario"
+        );
+    }
 }
 
 #[test]
@@ -621,6 +1360,169 @@ fn install_shared_join_pause(
         "shared join test pause was already installed"
     );
     (entered_receiver, resume_sender)
+}
+
+#[test]
+fn clean_join_generation_crash_cuts_recover_to_the_marker_named_pair() {
+    for (index, (point, marker_committed, baseline_published, operations_published)) in [
+        (
+            SharedJoinTestPausePoint::AfterBaselineSwap,
+            false,
+            true,
+            false,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterOperationSwap,
+            false,
+            true,
+            true,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterAuthorityDirectorySync,
+            false,
+            true,
+            true,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterMarkerReplacement,
+            true,
+            true,
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_initiator, joiner, handle, descriptor) = pending_generation_join_fixture(
+            &format!("join-generation-cut-{point:?}"),
+            0xc100_0000 + index as u128 * 0x100,
+        );
+        let workspace_id = joiner.request.identities.workspace_id;
+        let (entered, resume) = install_shared_join_pause(workspace_id, point);
+        let joining_handle = handle.clone();
+        let joining = std::thread::spawn(move || joining_handle.join_shared(descriptor));
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("clean join did not reach {point:?}"));
+
+        let observed_marker = read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .expect("the join cut retains an authority marker");
+        assert_eq!(
+            observed_marker.generation(),
+            u64::from(marker_committed),
+            "{point:?}"
+        );
+        let prior_observed = clean_authority_directories(&joiner.request.archive_root, 0);
+        let candidate_observed = clean_authority_directories(&joiner.request.archive_root, 1);
+        assert!(prior_observed.baseline.is_dir(), "{point:?}");
+        assert!(prior_observed.operations.is_dir(), "{point:?}");
+        assert_eq!(
+            candidate_observed.baseline.is_dir(),
+            baseline_published,
+            "{point:?}"
+        );
+        assert_eq!(
+            candidate_observed.operations.is_dir(),
+            operations_published,
+            "{point:?}"
+        );
+        resume.send(()).unwrap();
+        assert!(
+            joining.join().unwrap().is_ok(),
+            "the real join did not resume after {point:?}"
+        );
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        // Apply the same next-open resolver to an exact filesystem shape for
+        // the interrupted cut. The live join above proves the cut mapping;
+        // this isolated shape proves recovery without disturbing its actor.
+        let root = std::env::temp_dir().join(format!(
+            "tine-clean-join-generation-cut-{point:?}-{}",
+            Uuid::new_v4().simple()
+        ));
+        let archive = root.join("archive");
+        let enrollment = root.join("enrollment");
+        fs::create_dir_all(&archive).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xc101));
+        let lineage = LineageDigest::of(b"clean-join-generation-cut");
+        let marker = |generation| {
+            LazyGenesisActivationMarkerV1::new_for_generation(
+                workspace,
+                lineage,
+                generation,
+                ContentDigest::of(format!("baseline-{generation}").as_bytes()),
+                BlobDescription::of(b"source-capture"),
+                ContentDigest::of(format!("frontier-{generation}").as_bytes()),
+                generation,
+            )
+            .unwrap()
+        };
+        let prior = marker(0);
+        let prior_directories = clean_authority_directories(&archive, 0);
+        fs::create_dir_all(&prior_directories.baseline).unwrap();
+        fs::create_dir_all(&prior_directories.operations).unwrap();
+        crate::oplog::lazy_genesis::publish_activation_marker(&enrollment, prior).unwrap();
+
+        let candidate_directories = clean_authority_directories(&archive, 1);
+        if baseline_published {
+            fs::create_dir_all(&candidate_directories.baseline).unwrap();
+        }
+        if operations_published {
+            fs::create_dir_all(&candidate_directories.operations).unwrap();
+        }
+        fs::create_dir_all(archive.join(".clean-join-uncommitted")).unwrap();
+        if marker_committed {
+            replace_activation_marker_for_join(&enrollment, prior, marker(1)).unwrap();
+        }
+
+        let resolved = resolve_clean_authority_directories(
+            &archive,
+            &enrollment,
+            &root.join("projection.sqlite"),
+        )
+        .unwrap()
+        .expect("the marker retains one authority generation");
+        let expected = if marker_committed {
+            &candidate_directories
+        } else {
+            &prior_directories
+        };
+        let orphan = if marker_committed {
+            &prior_directories
+        } else {
+            &candidate_directories
+        };
+        assert_eq!(resolved.baseline, expected.baseline, "{point:?}");
+        assert_eq!(resolved.operations, expected.operations, "{point:?}");
+        assert!(expected.baseline.is_dir(), "{point:?}");
+        assert!(expected.operations.is_dir(), "{point:?}");
+        assert!(!orphan.baseline.exists(), "{point:?}");
+        assert!(!orphan.operations.exists(), "{point:?}");
+        assert!(!archive.join(".clean-join-uncommitted").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let source = include_str!("sync_runtime.rs");
+    let start = source
+        .find("    fn install_clean_join_candidate(")
+        .expect("join installation remains present");
+    let end = source[start..]
+        .find("\n    fn join_shared_clean(")
+        .map(|offset| start + offset)
+        .expect("join installation remains bounded");
+    let install = &source[start..end];
+    assert_eq!(
+        install
+            .matches("replace_activation_marker_for_join(")
+            .count(),
+        1
+    );
+    assert!(!install.contains(".prior"));
+    assert!(!install.contains("canonical_baseline"));
 }
 
 fn empty_request(profile: SyncStorageProfile) -> (PathBuf, SyncRuntimeOpenRequest) {
@@ -3178,14 +4080,23 @@ fn raw_colon_path_is_classified_incompatible_before_activation() {
         "managed_raw_colon_preactivation status={:?} graph_bytes={bytes_before:?}",
         activation.status
     );
-    assert!(matches!(
-        activation.status,
-        SyncLocalActivationStatus::Retryable {
-            durable_stage: SyncLocalActivationStage::Absent,
-            ref detail,
-        } if detail.contains("source path is not portable")
-            && detail.contains(RAW_COLON_PATH)
-    ));
+    let SyncLocalActivationStatus::Retryable {
+        durable_stage: SyncLocalActivationStage::Absent,
+        detail,
+    } = &activation.status
+    else {
+        panic!(
+            "raw-colon source must refuse before activation: {:?}",
+            activation.status
+        );
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.io",
+        })
+    );
     assert!(activation.handle.is_none());
     assert_eq!(user_graph_bytes(&fixture.graph_root), bytes_before);
 }
@@ -3552,6 +4463,10 @@ impl ActivationFixture {
             "tine-sync-local-activation-{label}-{}",
             Uuid::new_v4()
         ));
+        Self::nested_unicode_at(root, seed)
+    }
+
+    fn nested_unicode_at(root: PathBuf, seed: u128) -> Self {
         let graph_root = root.join("graph");
         fs::create_dir_all(graph_root.join("logseq")).unwrap();
         fs::write(
@@ -3584,6 +4499,37 @@ impl ActivationFixture {
         )
         .unwrap();
 
+        let private = root.join("private");
+        let request = SyncLocalActivationRequest {
+            archive_root: private.join("archive"),
+            graph_root: graph_root.clone(),
+            enrollment_root: private.join("enrollment"),
+            receipt_root: private.join("receipts"),
+            database_path: private.join("projection/bootstrap.sqlite"),
+            application_runtime_root: private.join("runtime"),
+            capture_root: private.join("capture"),
+            preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
+            identities: SyncLocalActivationIdentities {
+                workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                preparation_id: Uuid::from_u128(seed + 4),
+                session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+            },
+        };
+        Self {
+            root,
+            graph_root,
+            request,
+        }
+    }
+
+    fn reopen_at(root: PathBuf, seed: u128) -> Self {
+        let graph_root = root.join("graph");
         let private = root.join("private");
         let request = SyncLocalActivationRequest {
             archive_root: private.join("archive"),
@@ -4603,8 +5549,12 @@ fn a_journal_that_cannot_open_refuses_activation_before_any_graph_mutation() {
         Err(error) => error,
         Ok(_) => panic!("projection-turn journal unexpectedly opened twice"),
     };
-    assert!(
-        error.contains("projection turn") || error.contains("already open"),
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection_turn_journal",
+        }),
         "unexpected refusal: {error}"
     );
     assert_eq!(user_graph_bytes(&fixture.graph_root), before);
@@ -5100,6 +6050,8 @@ fn run_real_store_recovery_equivalence_oracle(schedules_per_feature: usize) {
                     schedule.completed_pages,
                 );
                 let interrupted = open_clean_runtime_resources(&reopen_request(&fixture.request));
+                let cut_was_reached =
+                    crate::oplog::projection::turn_replay_cut_was_reached_for_test();
                 drop(cut);
                 let error = match interrupted {
                     Err(error) => error,
@@ -5108,9 +6060,22 @@ fn run_real_store_recovery_equivalence_oracle(schedules_per_feature: usize) {
                         feature.label()
                     ),
                 };
-                assert!(
-                    error.contains("deterministic cut during production turn replay"),
+                // Two halves, because neither alone says "it stopped at the
+                // cut" any more: the refusal is a source-class code that every
+                // projection failure shares, and the cut's own counter is what
+                // distinguishes reaching it from failing on the way there.
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+                    serde_json::json!({
+                        "kind": "clean-open",
+                        "reason_code": "clean_open.projection",
+                    }),
                     "{} schedule {ordinal} stopped elsewhere: {error}",
+                    feature.label()
+                );
+                assert!(
+                    cut_was_reached,
+                    "{} schedule {ordinal} refused before reaching the injected cut at {schedule:?}",
                     feature.label()
                 );
             } else {
@@ -5792,7 +6757,14 @@ fn cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record() {
         Err(error) => error,
         Ok(_) => panic!("a torn object without an undrained record must stay a refusal"),
     };
-    assert!(refused.contains("do not match path"), "{refused}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&refused).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.store",
+        }),
+        "{refused}"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7228,12 +8200,25 @@ fn cold_replay_error_exit_flushes_completion_before_lease_release() {
 
     let cut = crate::oplog::projection::cut_turn_replay_after_pages_for_test(1);
     let interrupted = open_clean_runtime_resources(&reopen_request(&fixture.request));
+    let cut_was_reached = crate::oplog::projection::turn_replay_cut_was_reached_for_test();
     drop(cut);
     let error = match interrupted {
         Err(error) => error,
         Ok(_) => panic!("cold replay did not stop after executing its page"),
     };
-    assert!(error.contains("deterministic cut during production turn replay"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection",
+        })
+    );
+    // The code alone is shared by every projection failure; the cut's counter
+    // is what says replay got as far as the injected cut.
+    assert!(
+        cut_was_reached,
+        "cold replay refused before reaching the injected cut"
+    );
     assert!(fixture.graph_root.join(path.as_str()).is_file());
 
     assert_eq!(
@@ -8628,11 +9613,18 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
 
     let mut phases = Vec::new();
     let mut recovery_stages = Vec::new();
+    let mut open_counters = None;
     let opened =
         SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
             match progress {
                 SyncRuntimeOpenProgress::Phase { phase, .. } => phases.push(phase),
                 SyncRuntimeOpenProgress::RecoveryStage { stage, .. } => recovery_stages.push(stage),
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters } => {
+                    assert!(
+                        open_counters.replace(counters).is_none(),
+                        "clean open reports its work counters exactly once"
+                    );
+                }
                 SyncRuntimeOpenProgress::Waiting { .. }
                 | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
             }
@@ -8656,20 +9648,476 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
             SyncRuntimeCleanOpenStage::GraphOpen,
             SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
             SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+            SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+            SyncRuntimeCleanOpenStage::CleanCheckpointTailDiscovery,
             SyncRuntimeCleanOpenStage::CommittedTailReplay,
             SyncRuntimeCleanOpenStage::ProjectionOpen,
             SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+            SyncRuntimeCleanOpenStage::OwnEndpointRetirementScan,
+            SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
             SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
             SyncRuntimeCleanOpenStage::CompletionFlush,
         ],
         "clean cold-open diagnostics must identify every bounded recovery boundary"
     );
+    // The counters exist so a stage time can be attributed to a mechanism.
+    // Instrumentation that is never emitted attributes nothing, so the
+    // emission itself is the architectural fact this asserts.
+    let open_counters = open_counters.expect("a clean cold open reports its work counters");
+    assert!(
+        open_counters.archive_directory_enumerations > 0,
+        "the counters must describe work this open actually performed, not a default value: \
+{open_counters:?}"
+    );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn second_clean_cold_open_restores_checkpoint_instead_of_full_replay() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-second-open", 0xa178_5000);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    drop(resources);
+
+    let mut first_counters = None;
+    let first =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_counters = Some(counters);
+            }
+        });
+    assert_eq!(first.status, SyncRuntimeOpenStatus::Active);
+    let first_handle = first.handle.expect("first clean cold open succeeds");
+    let first_counters = first_counters.expect("first clean open reports counters");
+    assert_eq!(first_counters.full_replay_opens, 1);
+    assert_eq!(first_counters.checkpoint_opens, 0);
+    drive_initial_feed(&first_handle);
+    let (page, revision) = load_application_exact(&first_handle, "Root.md");
+    let _ = save_application_block_text(
+        &first_handle,
+        page,
+        revision,
+        "checkpointed accepted mutation",
+    );
+    drain_managed_local(&first_handle);
+    // Dropping the actor waits only for its already-backgrounded checkpoint
+    // writer; the next process can never race an unleased writer.
+    drop(first_handle);
+
+    let mut second_counters = None;
+    let second =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_counters = Some(counters);
+            }
+        });
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second_handle = second
+        .handle
+        .expect("checkpointed clean cold open succeeds");
+    let second_counters = second_counters.expect("second clean open reports counters");
+    assert_eq!(second_counters.checkpoint_opens, 1);
+    assert_eq!(second_counters.full_replay_opens, 0);
+    assert_eq!(second_counters.committed_tail_replayed, 0);
+    assert_eq!(second_counters.checkpoint_roster_entries, 1);
+    assert!(second_counters.checkpoint_payload_bytes > 0);
+    assert_eq!(second_counters.archive_manifest_reads, 0);
+    assert_eq!(second_counters.archive_object_reads, 0);
+    let (restored, _) = load_application_exact(&second_handle, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "checkpointed accepted mutation");
+    assert!(matches!(
+        second_handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories() {
+    for (case, mutation_count) in [1_usize, 2, 4].into_iter().enumerate() {
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("clean-checkpoint-equivalence-{case}"),
+            0xa178_a000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let mut handle = activated.handle.expect("equivalence fixture activates");
+        drive_initial_feed(&handle);
+
+        for mutation in 0..mutation_count {
+            let (page, revision) = load_application_exact(&handle, "Root.md");
+            let expected = format!("generated checkpoint history {case}/{mutation}");
+            let _ = save_application_block_text(&handle, page, revision, &expected);
+            drain_managed_local(&handle);
+            if mutation + 1 < mutation_count {
+                // Each prefix is a crash-reopen cut. The prior actor drop waits
+                // only for its disposable writer and never performs Safe.
+                drop(handle);
+                let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+                assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+                handle = reopened.handle.expect("generated crash cut reopens");
+            }
+        }
+        drop(handle);
+
+        let mut checkpoint_counters = None;
+        let checkpoint_open =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    checkpoint_counters = Some(counters);
+                }
+            });
+        assert_eq!(checkpoint_open.status, SyncRuntimeOpenStatus::Active);
+        let checkpoint_open = checkpoint_open.handle.expect("checkpoint path opens");
+        assert_eq!(
+            checkpoint_counters
+                .expect("checkpoint counters")
+                .checkpoint_opens,
+            1
+        );
+        let checkpoint_state = checkpoint_open.observable_engine_state().unwrap();
+        drop(checkpoint_open);
+
+        let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
+            .join("clean-open-checkpoint-v1");
+        fs::remove_dir_all(checkpoint_directory).unwrap();
+        let mut replay_counters = None;
+        let replay_open =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    replay_counters = Some(counters);
+                }
+            });
+        assert_eq!(replay_open.status, SyncRuntimeOpenStatus::Active);
+        let replay_open = replay_open.handle.expect("sequence-zero replay opens");
+        assert_eq!(
+            replay_counters
+                .expect("full replay counters")
+                .full_replay_opens,
+            1
+        );
+        let replay_state = replay_open.observable_engine_state().unwrap();
+        assert_eq!(
+            checkpoint_state, replay_state,
+            "generated history case {case}"
+        );
+        drop(replay_open);
+    }
+}
+
+#[test]
+fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
+    struct ResetCheckpointFailure(std::path::PathBuf);
+    impl Drop for ResetCheckpointFailure {
+        fn drop(&mut self) {
+            crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&self.0, false);
+        }
+    }
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-tail", 0xa178_6000);
+    let checkpoint_store = clean_operation_archive_directory(&fixture.request.archive_root);
+    let _reset = ResetCheckpointFailure(checkpoint_store.clone());
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let first = activated.handle.expect("checkpoint tail fixture activates");
+    drive_initial_feed(&first);
+    let (page, revision) = load_application_exact(&first, "Root.md");
+    let _ = save_application_block_text(&first, page, revision, "checkpoint frontier one");
+    drain_managed_local(&first);
+    drop(first);
+
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&checkpoint_store, true);
+    let second = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second = second.handle.expect("frontier-one checkpoint opens");
+    let (page, revision) = load_application_exact(&second, "Root.md");
+    let _ = save_application_block_text(&second, page, revision, "uncheckpointed frontier two");
+    drain_managed_local(&second);
+    drop(second);
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&checkpoint_store, false);
+
+    let mut counters = None;
+    let third =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress {
+                counters = Some(observed);
+            }
+        });
+    assert_eq!(third.status, SyncRuntimeOpenStatus::Active);
+    let third = third.handle.expect("checkpoint plus durable tail opens");
+    let counters = counters.expect("tail reopen reports counters");
+    assert_eq!(counters.checkpoint_opens, 1);
+    assert_eq!(counters.full_replay_opens, 0);
+    assert_eq!(counters.checkpoint_roster_entries, 1);
+    assert_eq!(counters.committed_tail_replayed, 1);
+    let (restored, _) = load_application_exact(&third, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "uncheckpointed frontier two");
+    assert!(matches!(
+        third.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn corrupt_checkpoint_payload_is_discarded_for_total_full_replay() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-corrupt", 0xa178_7000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("checkpoint corruption fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "survives checkpoint damage");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
+        .join("clean-open-checkpoint-v1");
+    for payload in ["payload-a", "payload-b"] {
+        let path = checkpoint.join(payload);
+        if path.exists() {
+            fs::write(path, b"torn checkpoint payload").unwrap();
+        }
+    }
+    let mut counters = None;
+    let reopened =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress {
+                counters = Some(observed);
+            }
+        });
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let reopened = reopened.handle.expect("checkpoint damage falls back");
+    let counters = counters.expect("fallback open reports counters");
+    assert_eq!(counters.checkpoint_opens, 0);
+    assert_eq!(counters.full_replay_opens, 1);
+    assert_eq!(counters.committed_tail_replayed, 1);
+    let (page, _) = load_application_exact(&reopened, "Root.md");
+    assert_eq!(page.blocks[0].raw, "survives checkpoint damage");
+    assert!(matches!(
+        reopened.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn corrupt_checkpoint_pointer_and_generation_each_force_total_full_replay() {
+    for (case, damage) in ["pointer", "generation"].into_iter().enumerate() {
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("clean-checkpoint-corrupt-{damage}"),
+            0xa178_b000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("checkpoint damage fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let expected = format!("survives {damage} damage");
+        let _ = save_application_block_text(&handle, page, revision, &expected);
+        drain_managed_local(&handle);
+        drop(handle);
+
+        let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
+            .join("clean-open-checkpoint-v1");
+        match damage {
+            "pointer" => fs::write(checkpoint.join("current"), b"bit-flipped pointer").unwrap(),
+            "generation" => {
+                for generation in ["generation-a", "generation-b"] {
+                    let path = checkpoint.join(generation);
+                    if path.exists() {
+                        fs::write(path, b"truncated generation").unwrap();
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let mut counters = None;
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress
+                {
+                    counters = Some(observed);
+                }
+            });
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened
+            .handle
+            .expect("private checkpoint damage falls back");
+        let counters = counters.expect("fallback reports counters");
+        assert_eq!(counters.checkpoint_opens, 0);
+        assert_eq!(counters.full_replay_opens, 1);
+        assert_eq!(counters.committed_tail_replayed, 1);
+        let (page, _) = load_application_exact(&reopened, "Root.md");
+        assert_eq!(page.blocks[0].raw, expected);
+        drop(reopened);
+    }
+}
+
+#[test]
+fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
+    let fixture =
+        ActivationFixture::nested_unicode("clean-checkpoint-missing-manifest", 0xa178_8000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("missing-manifest fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "manifest roster authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let batches = clean_operation_archive_directory(&fixture.request.archive_root).join("batches");
+    let manifest = fs::read_dir(&batches)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.')
+        })
+        .expect("accepted archive has a manifest");
+    fs::remove_file(manifest).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
+            if detail.contains("checkpoint roster manifest") && detail.contains("missing")),
+        "missing roster authority must surface immediately: {:?}",
+        reopened.status
+    );
+    assert_eq!(
+        reopened.status.durable_refusal_scenario(),
+        Some(ManagedStorageRefusalScenario::DiskCorrupt),
+        "archive damage is a durable disk-corrupt refusal, never an unmarked retryable one"
+    );
+}
+
+/// Wave-2 review H-1: a store whose sealed lazy-genesis baseline was written
+/// by an earlier build (schema 4) must classify as the durable
+/// `MS-REF-PROTOCOL-INCOMPATIBLE` refusal, because that scenario is the ONLY
+/// one the Tauri graph-open lifecycle answers with preserve-and-rebuild (D-1).
+/// Before the marker was stamped the same store surfaced as an unmarked
+/// retryable open failure: no backup, no rebuild, "could not serve".
+#[test]
+fn a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_end() {
+    let fixture = ActivationFixture::nested_unicode("pre-h-lazy-genesis-schema", 0x5c4e_a004);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("schema fixture activates");
+    drive_initial_feed(&handle);
+    drain_managed_local(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+
+    crate::oplog::lazy_genesis::rewrite_sealed_baseline_schema_for_test(
+        &fixture.request.enrollment_root,
+        &clean_baseline_directory(&fixture.request.archive_root),
+        4,
+    )
+    .unwrap();
+    let before = user_graph_bytes(&fixture.graph_root);
+
+    let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(result.handle.is_none());
+    let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
+        panic!("a pre-H sealed baseline must surface a managed-open refusal: {result:?}");
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.bootstrap_streaming_import",
+            "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
+        }),
+        "the refusal names its source class and protocol scenario without source prose"
+    );
+    assert_eq!(
+        result.status.durable_refusal_scenario(),
+        Some(ManagedStorageRefusalScenario::ProtocolIncompatible),
+        "only this scenario reaches the blank-slate preserve-and-rebuild lifecycle"
+    );
+    assert_eq!(
+        user_graph_bytes(&fixture.graph_root),
+        before,
+        "a refused open must not change one byte of the user's graph"
+    );
+}
+
+#[test]
+fn checkpoint_roster_never_masks_mutated_authoritative_manifest() {
+    let fixture =
+        ActivationFixture::nested_unicode("clean-checkpoint-mutated-manifest", 0xa178_c000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("mutated-manifest fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "manifest mutation authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let batches = clean_operation_archive_directory(&fixture.request.archive_root).join("batches");
+    let manifest = fs::read_dir(&batches)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.')
+        })
+        .expect("accepted archive has a manifest");
+    let mut bytes = fs::read(&manifest).unwrap();
+    bytes[0] ^= 0x80;
+    fs::write(manifest, bytes).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { .. }),
+        "mutated archive authority must retain the pre-existing refusal path: {:?}",
+        reopened.status
+    );
+}
+
+#[test]
+fn checkpoint_roster_surfaces_missing_required_object_immediately() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-missing-object", 0xa178_9000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("missing-object fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "object roster authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let objects = clean_operation_archive_directory(&fixture.request.archive_root).join("objects");
+    let object = fs::read_dir(&objects)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.')
+        })
+        .expect("accepted archive has an object");
+    fs::remove_file(object).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
+            if detail.contains("checkpoint roster object") && detail.contains("missing")),
+        "missing required object must surface immediately: {:?}",
+        reopened.status
+    );
 }
 
 #[test]
@@ -9289,19 +10737,8 @@ fn android_managed_storage_journey_converges_when_a_graph_file_changes_during_ac
         "the receipt must say the journey needed a second attempt: {receipt}"
     );
     assert!(
-        receipt.contains("source capture changed before final inventory proof"),
-        "a retried-past refusal must stay in the receipt verbatim, or a device that \
-             refuses on every attempt looks the same as one that never refused: {receipt}"
-    );
-    assert!(
-        receipt.contains("u{17d} pilot notes #pilot.md"),
-        "the refusal must name the moved row in a spelling its normalization twin \
-             cannot be confused with: {receipt}"
-    );
-    assert!(
-        !receipt.contains("pages/\u{17d} pilot notes #pilot.md"),
-        "the raw glyph spelling reads exactly like its decomposed twin, so it must not \
-             be what the refusal reports: {receipt}"
+        receipt.contains("clean_open.bootstrap_streaming_import"),
+        "a retried-past refusal must retain its typed source code: {receipt}"
     );
     // Write-shyness: the retry rebuilt from the OTHER writer's bytes and
     // rewrote nothing of its own, here or on the twin that differs from it
@@ -10447,9 +11884,8 @@ fn clean_share_preparation_survives_a_shared_provider_rename_capability_refusal(
 
 /// The other half of the capability policy. `EIO` is a disk error, not a
 /// filesystem saying "I do not implement that flag", so share preparation
-/// still fails closed — and the refusal names the primitive and both names
-/// rather than reporting a bare `os error 5`, because a device receipt that
-/// carries only an errno costs a ~20-minute CI round trip to localise.
+/// still fails closed. Packet E deliberately retains only ErrorKind at the
+/// ScenarioError boundary; source prose and path names do not cross it.
 #[cfg(unix)]
 #[test]
 fn a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation() {
@@ -10458,12 +11894,9 @@ fn a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_prep
     let refusal =
         prepared.expect_err("a real I/O error during share preparation must not be tolerated");
     let detail = refusal.to_string();
-    assert!(
-        detail
-            .contains("renameat2(RENAME_NOREPLACE) quarantining abandoned shared provider staging")
-            && detail.contains("->"),
-        "the refusal must name the operation and both names: {detail}"
-    );
+    let kind = std::io::Error::from_raw_os_error(libc::EIO).kind();
+    assert!(detail.contains(&format!("{kind:?}")), "{detail}");
+    assert!(!detail.contains("renameat2") && !detail.contains("->"));
 }
 
 #[test]
@@ -10585,10 +12018,7 @@ fn shared_provider_clean_late_join_installs_provider_history_without_rewriting_g
     let descriptor = initiator_handle
         .prepare_shared()
         .expect("late-share descriptor publication");
-    let clean_descriptor = match SharedEnrollmentDescriptor::decode(&descriptor.encoded).unwrap() {
-        SharedEnrollmentDescriptor::Clean(descriptor) => descriptor,
-        SharedEnrollmentDescriptor::Legacy(_) => panic!("clean runtime emitted legacy share"),
-    };
+    let clean_descriptor = descriptor.decode().unwrap();
     copy_provider_tree(
         &initiator.request.provider_root,
         &joiner.request.provider_root,
@@ -10758,32 +12188,23 @@ fn shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changin
         .unwrap();
     let graph_before = user_graph_bytes(&joiner.graph_root);
     let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
-    // `da0390b9 fix(sync): explain clean join semantic mismatches` replaced
-    // the single "contains semantic changes" sentence with a counted,
-    // content-free first line plus local-only detail lines, so a user can
-    // see WHICH note blocks the join. The user-visible outcome asserted
-    // here is unchanged: the join is refused, it names the unmatched local
-    // note, and it never prints that note's content.
-    assert!(
-        refusal
-            .to_string()
-            .contains("not in the shared provider frontier"),
-        "{refusal}"
+    // The typed payload keeps the bounded affected-path detail the contract
+    // promises (storage-sync-contract §"Joining"): counts plus at most 32
+    // relative paths with a side/category, never note content.
+    let payload: serde_json::Value = serde_json::from_str(&refusal.to_string()).unwrap();
+    assert_eq!(payload["kind"], "shared-frontier-mismatch");
+    assert_eq!(payload["detail"]["local_only"], 1, "{payload}");
+    assert_eq!(payload["detail"]["shared_only"], 0, "{payload}");
+    assert_eq!(
+        payload["detail"]["paths"][0]["path"], "notes/local-only.md",
+        "{payload}"
     );
-    assert!(
-        refusal.to_string().contains("local-only=1 shared-only=0"),
-        "{refusal}"
+    assert_eq!(
+        payload["detail"]["paths"][0]["side"], "local-only",
+        "{payload}"
     );
-    assert!(
-        refusal
-            .to_string()
-            .contains("clean join mismatch detail: local-only path=\"notes/local-only.md\""),
-        "{refusal}"
-    );
-    assert!(
-        !refusal.to_string().contains("unmatched local work"),
-        "{refusal}"
-    );
+    assert_eq!(payload["detail"]["omitted"], 0, "{payload}");
+    assert!(!refusal.to_string().contains("unmatched local work"));
     assert_eq!(
         read_activation_marker(&joiner.request.enrollment_root)
             .unwrap()
@@ -11677,6 +13098,52 @@ fn pending_shared_join_fixture(
     (initiator, joiner, handle, descriptor)
 }
 
+fn pending_generation_join_fixture(
+    label: &str,
+    seed: u128,
+) -> (
+    ActivationFixture,
+    ActivationFixture,
+    SyncRuntimeHandle,
+    SyncSharedEnrollmentDescriptor,
+) {
+    let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
+    let mut joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    joiner.request.identities.endpoint_id =
+        ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
+    joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
+    joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
+
+    let initiator_handle = SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+        .handle
+        .expect("generation-cut initiator LocalActive");
+    drive_initial_feed(&initiator_handle);
+    let _ = submit_shared_page(
+        &initiator_handle,
+        seed + 0x20,
+        "Generation Cut",
+        "notes/generation-cut.md",
+        "history existed before sharing",
+    );
+    let shared_graph = user_graph_bytes(&initiator.graph_root);
+    let descriptor = initiator_handle
+        .prepare_shared()
+        .expect("generation-cut descriptor publication");
+    copy_provider_tree(
+        &initiator.request.provider_root,
+        &joiner.request.provider_root,
+    );
+    for (relative, bytes) in &shared_graph {
+        let destination = joiner.graph_root.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+    let active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
+    let handle = active.handle.expect("generation-cut joiner LocalActive");
+    drive_initial_feed(&handle);
+    (initiator, joiner, handle, descriptor)
+}
+
 #[test]
 fn shared_join_owns_enrollment_transition_against_a_conflicting_join() {
     let (_initiator, joiner, handle, descriptor) =
@@ -12219,6 +13686,24 @@ fn cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file() 
     }
 }
 
+#[test]
+fn shared_inspection_boundaries_emit_the_reachable_scenario_code() {
+    let provider_root = std::env::temp_dir().join("x".repeat(4096));
+
+    let assert_scenario = |detail: String| {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+            serde_json::json!({
+                "kind": "clean-open",
+                "reason_code": "clean_open.scenario",
+            })
+        );
+    };
+    assert_scenario(inspect_shared_provider_cold_prefix(&provider_root).unwrap_err());
+    assert_scenario(inspect_shared_enrollment(&provider_root).unwrap_err());
+    assert_scenario(inspect_shared_enrollment_for_cold_discovery(&provider_root).unwrap_err());
+}
+
 fn settle_shared_provider(handle: &SyncRuntimeHandle) {
     for _ in 0..1_024 {
         let tick = handle.tick().unwrap();
@@ -12579,6 +14064,26 @@ fn genuinely_different_concurrent_same_position_creates_keep_both_blocks() {
             contents.contains(&"right-only task"),
             "{label}: {contents:?}"
         );
+    }
+
+    // The two actors admitted the independent provider histories in opposite
+    // orders. Each actor is the sequence-zero execution for that permutation;
+    // its checkpoint restore must reproduce the complete observable projection,
+    // including that accepted sequence (which the archive itself does not name).
+    for (label, fixture, handle) in [
+        ("left", &left, left_handle),
+        ("right", &right, right_handle),
+    ] {
+        let sequence_zero_state = handle.observable_engine_state().unwrap();
+        drop(handle);
+        let checkpoint_open =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let checkpoint_state = checkpoint_open.observable_engine_state().unwrap();
+        assert_eq!(
+            checkpoint_state, sequence_zero_state,
+            "{label} provider-admission permutation"
+        );
+        drop(checkpoint_open);
     }
 }
 
@@ -13024,10 +14529,7 @@ fn an_independently_activated_device_cannot_join_another_devices_managed_graph()
 
     let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
 
-    assert_eq!(
-        refusal.to_string(),
-        "sync actor refused request: clean shared descriptor names another managed graph"
-    );
+    assert_eq!(refusal.to_string(), r#"{"kind":"managed-graph-mismatch"}"#);
     assert_eq!(
         read_activation_marker(&adopter.request.enrollment_root)
             .unwrap()
@@ -13070,10 +14572,7 @@ fn a_partially_matching_lineage_is_refused_by_the_same_identity_check() {
 
     let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
 
-    assert_eq!(
-        refusal.to_string(),
-        "sync actor refused request: clean shared descriptor names another managed graph"
-    );
+    assert_eq!(refusal.to_string(), r#"{"kind":"managed-graph-mismatch"}"#);
     assert_eq!(user_graph_bytes(&adopter.graph_root), graph_before);
     assert!(matches!(
         adopter_handle.clean_shutdown(),
@@ -13240,21 +14739,16 @@ fn adoption_stops_on_unconverged_files_and_leaves_the_archive_readable() {
 
     let refusal = adopted_handle.join_shared(descriptor).unwrap_err();
 
-    assert!(
-        refusal
-            .to_string()
-            .contains("not in the shared provider frontier"),
-        "{refusal}"
+    let payload: serde_json::Value = serde_json::from_str(&refusal.to_string()).unwrap();
+    assert_eq!(payload["kind"], "shared-frontier-mismatch");
+    assert_eq!(payload["detail"]["local_only"], 1, "{payload}");
+    assert_eq!(
+        payload["detail"]["paths"][0]["path"], "notes/unconverged local page.md",
+        "{payload}"
     );
-    assert!(
-        refusal.to_string().contains("local-only=1 shared-only=0"),
-        "{refusal}"
-    );
-    assert!(
-        refusal.to_string().contains(
-            "clean join mismatch detail: local-only path=\"notes/unconverged local page.md\""
-        ),
-        "{refusal}"
+    assert_eq!(
+        payload["detail"]["paths"][0]["side"], "local-only",
+        "{payload}"
     );
     assert!(!refusal.to_string().contains("still only on this device"));
     assert_eq!(
@@ -15870,8 +17364,8 @@ fn reordered_remote_acceptance_cannot_reuse_stale_recovery_coverage() {
     let descriptor_bytes = inspect_shared_provider_descriptor(&receiver.request.provider_root)
         .unwrap()
         .expect("covered receiver retained a provider descriptor");
-    let descriptor = SyncSharedEnrollmentDescriptor::from_core(
-        SharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap(),
+    let descriptor = SyncSharedEnrollmentDescriptor::from_clean(
+        CleanSharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap(),
     )
     .unwrap();
     let stale_active = SyncRuntimeHandle::activate_or_resume_local(stale.request.clone());
@@ -21866,8 +23360,128 @@ fn managed_parse_receipt_real_graph_census() {
 }
 
 #[test]
+fn terminal_bootstrap_encodes_only_required_frontier_documents() {
+    const EVENTS: usize = 6;
+    let fixture = ActivationFixture::nested_unicode("terminal-bootstrap-encode-budget", 0xa0da);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("the terminal-bootstrap fixture activates");
+    drive_initial_feed(&handle);
+    for index in 0..EVENTS {
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            &format!("terminal bootstrap history event {index}"),
+        );
+        drain_managed_local(&handle);
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+
+    let workspace_id = fixture.request.identities.workspace_id;
+    crate::oplog::sqlite::remove_disposable_projection(&fixture.request.database_path).unwrap();
+    crate::oplog::sqlite::reset_terminal_bootstrap_encode_accounting_for_test(workspace_id);
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let accounting =
+        crate::oplog::sqlite::terminal_bootstrap_encode_accounting_for_test(workspace_id);
+    assert!(
+        accounting.required >= EVENTS,
+        "the generated accepted history did not reach terminal replay: {accounting:?}",
+    );
+    assert_eq!(
+        accounting.actual, accounting.required,
+        "terminal bootstrap encoded replay intermediates beyond its required accepted-batch and exact-terminal documents",
+    );
+    let handle = reopened.handle.expect("the rebuilt fixture reopens");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
 fn managed_one_block_save_stays_within_two_parser_passes() {
     let fixture = ActivationFixture::nested_unicode("managed-save-parse-budget", 0xa0d9);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("the parse-budget fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+
+    let _ = save_application_block_text(
+        &handle,
+        page,
+        revision,
+        "managed one-block two-parser-pass budget",
+    );
+    let stages = handle
+        .managed_application_save_instrumentation()
+        .expect("the actor reports foreground parse accounting")
+        .application_stages;
+    assert_eq!(stages.editor_accepted_parses, 1);
+    assert_eq!(stages.editor_target_parses, 1);
+    assert_eq!(
+        stages
+            .editor_accepted_parses
+            .saturating_add(stages.editor_target_parses),
+        2,
+        "one-block foreground save must not regain render/response reparses"
+    );
+    assert_eq!(stages.response_target_exact_dto_reparses, 0);
+
+    drain_managed_local(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(
+        &handle,
+        page,
+        revision,
+        "managed one-block second parser-pass budget",
+    );
+    let steady = handle
+        .managed_application_save_instrumentation()
+        .expect("the actor reports foreground parse accounting")
+        .application_stages;
+    assert_eq!(steady.editor_accepted_parses, 1);
+    assert_eq!(steady.editor_target_parses, 1);
+    assert_eq!(steady.response_target_exact_dto_reparses, 0);
+
+    drain_managed_local(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The same budget, counted at the parser primitive instead of the save stage.
+///
+/// This one CANNOT run in the parallel suite, and it is `#[ignore]`d for a
+/// reason worth stating: the census arms a process-global counter, and the save
+/// it measures does not run on the calling thread — a probe on 2026-09-03 read
+/// `global = 1, caller_thread_local = 0`, so the work happens on the runtime
+/// actor. A thread-local counter would therefore always read zero and pass
+/// vacuously, while the global one counts every OTHER test parsing
+/// concurrently. Run alone it reported 2; run inside
+/// `cargo test -p tine-core --lib` it reported **34**, and it had been sitting
+/// in master's red baseline as noise ever since.
+///
+/// The sibling test above keeps the live gate, because
+/// `managed_application_save_instrumentation` is scoped to one handle and no
+/// other test can contribute to it. This test adds what that one cannot see:
+/// parser primitives entered below the named stages.
+#[test]
+#[ignore = "process-global parse census: run with --test-threads=1"]
+fn managed_one_block_save_parser_primitive_budget_census() {
+    let fixture = ActivationFixture::nested_unicode("managed-save-parse-census", 0xa0d9);
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
     let handle = activated
@@ -21888,20 +23502,6 @@ fn managed_one_block_save_stays_within_two_parser_passes() {
         primitive_parses <= 2,
         "one-block foreground save exceeded its two-parser-primitive budget: {primitive_parses}"
     );
-    let stages = handle
-        .managed_application_save_instrumentation()
-        .expect("the actor reports foreground parse accounting")
-        .application_stages;
-    assert_eq!(stages.editor_accepted_parses, 1);
-    assert_eq!(stages.editor_target_parses, 1);
-    assert_eq!(
-        stages
-            .editor_accepted_parses
-            .saturating_add(stages.editor_target_parses),
-        2,
-        "one-block foreground save must not regain render/response reparses"
-    );
-    assert_eq!(stages.response_target_exact_dto_reparses, 0);
 
     drain_managed_local(&handle);
     let (page, revision) = load_application_exact(&handle, "Root.md");
@@ -21914,14 +23514,76 @@ fn managed_one_block_save_stays_within_two_parser_passes() {
     );
     let second_primitive_parses = crate::outline::finish_managed_parse_census();
     assert!(
-            second_primitive_parses <= 2,
-            "steady one-block foreground save exceeded its two-parser-primitive budget: {second_primitive_parses}"
-        );
+        second_primitive_parses <= 2,
+        "steady one-block foreground save exceeded its two-parser-primitive budget: {second_primitive_parses}"
+    );
     drain_managed_local(&handle);
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+/// A process-global counter cannot be read from a parallel test runner.
+///
+/// The managed parse census arms one `AtomicUsize` for the whole process, so
+/// any test that reads it also counts every unrelated test parsing at the same
+/// moment. `managed_one_block_save_stays_within_two_parser_passes` used to do
+/// exactly that and reported 2 alone but **34** inside
+/// `cargo test -p tine-core --lib` — it lived in master's red baseline as noise
+/// until 2026-09-03. The counter is not broken; reading it from a parallel test
+/// is.
+///
+/// So: every consumer of the census is `#[ignore]`d and run with
+/// `--test-threads=1`. If you need a budget assertion in the ordinary suite,
+/// use `managed_application_save_instrumentation()` instead — it is scoped to
+/// one handle, so no other test can contribute to it. The exemplar pair is
+/// `managed_one_block_save_stays_within_two_parser_passes` (live, per-handle)
+/// and `managed_one_block_save_parser_primitive_budget_census` (ignored,
+/// process-global).
+#[test]
+fn every_managed_parse_census_consumer_is_ignored_from_the_parallel_suite() {
+    let source = include_str!("sync_runtime_tests.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut offenders = Vec::new();
+
+    // Split so this scanner's own source does not match itself.
+    let census_call = concat!("start_managed", "_parse_census()");
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains(census_call) {
+            continue;
+        }
+        // Walk back to the enclosing `fn`, then over its attributes.
+        let Some(signature) = (0..index)
+            .rev()
+            .find(|candidate| lines[*candidate].starts_with("fn "))
+        else {
+            continue;
+        };
+        let mut attribute = signature;
+        let mut ignored = false;
+        while attribute > 0 && lines[attribute - 1].starts_with("#[") {
+            attribute -= 1;
+            ignored |= lines[attribute].starts_with("#[ignore");
+        }
+        if !ignored {
+            offenders.push(format!(
+                "{} (census read at line {})",
+                lines[signature].trim(),
+                index + 1
+            ));
+        }
+    }
+
+    offenders.dedup();
+    assert!(
+        offenders.is_empty(),
+        "the managed parse census is a PROCESS-GLOBAL counter and these tests read it \
+         from the parallel suite, so they also count unrelated tests' parses: {offenders:#?}. \
+         Add #[ignore = \"process-global parse census: run with --test-threads=1\"], or assert \
+         on managed_application_save_instrumentation() instead — it is scoped to one handle. \
+         Imitate managed_one_block_save_stays_within_two_parser_passes."
+    );
 }
 
 fn assert_search_index_matches_materialized_sources(database_path: &Path) {
@@ -22133,6 +23795,247 @@ fn managed_twenty_page_history_curve_manual_benchmark() {
     ));
 }
 
+/// Reproduce the managed crash-reopen aging curve and attribute it to a stage.
+///
+/// The graph stays exactly 20 pages; only accepted history grows, so every
+/// difference between checkpoints is lifetime cost (I-14). One process
+/// invocation walks all checkpoints so per-stage SHARES and growth factors are
+/// comparable even on a machine running other work; absolute milliseconds
+/// across separate runs are not.
+///
+/// `TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS` (default `50,200,400,800`) sets the
+/// accepted-batch checkpoints. Output lines are prefixed `attribution*` and
+/// are machine-readable for `scripts/harvest-a1-open-attribution.mjs`.
+///
+/// Martin accepted option (a) on 2026-09-02: checkpoint capture itself remains
+/// a hard per-save delta bound even though the older open ratios were accepted
+/// with archive rebaselining as their terminal bound.
+const A5_ACCEPTED_CAPTURE_RATIO: f64 = 1.25;
+
+const A3_CONFLICT_LOAD_SLOPE: usize = 8;
+const A3_CONFLICT_LOAD_INTERCEPT: usize = 64;
+
+#[test]
+fn accepted_capture_ratio_and_contract_are_pinned_to_the_same_value() {
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    let pinned = format!("A5_ACCEPTED_CAPTURE_RATIO = {A5_ACCEPTED_CAPTURE_RATIO}");
+    assert!(
+        contract.contains(&pinned),
+        "I-11: the accepted-history capture-ratio gate and storage contract must pin the same constant and value"
+    );
+}
+
+#[test]
+fn og_journal_identity_provenance_is_revision_and_path_pinned() {
+    const OG_REVISION: &str = "6e7afa8eb040686ff057156ee877193b581dd369";
+    const EXTRACT_PATH: &str = "deps/graph-parser/src/logseq/graph_parser/extract.cljc";
+    const BLOCK_PATH: &str = "deps/graph-parser/src/logseq/graph_parser/block.cljs";
+    for (label, source) in [
+        ("model", include_str!("model.rs")),
+        (
+            "import integration",
+            include_str!("oplog/import_integration_tests.rs"),
+        ),
+        (
+            "storage contract",
+            include_str!("../../../docs/storage-sync-contract.md"),
+        ),
+    ] {
+        assert!(
+            source.contains(OG_REVISION)
+                && source.contains(EXTRACT_PATH)
+                && source.contains(BLOCK_PATH),
+            "I-11/D-9: {label} must pin the OG journal-identity rule to one revision and both exact source paths"
+        );
+    }
+}
+
+#[test]
+fn conflict_history_gate_and_contract_pin_the_same_pair_bound() {
+    let gate = include_str!("oplog/hot_engine_integration_tests.rs");
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    assert!(
+        gate.contains(&format!(
+            "const LOAD_BOUND: usize = {A3_CONFLICT_LOAD_SLOPE} * UNRESOLVED_PAIRS + {A3_CONFLICT_LOAD_INTERCEPT};"
+        )),
+        "I-14/I-13: the A3 scale gate and this contract pin must state the same pair bound; imitate oplog/conflict_history.rs"
+    );
+    for sentence in [
+        "currently unresolved pairs",
+        "only the currently unresolved pairs",
+        "full retained history",
+        "The index is neither resolution evidence",
+        "nor persisted authority",
+    ] {
+        assert!(
+            contract.contains(sentence),
+            "I-13: docs/storage-sync-contract.md must keep the conflict-history contract sentence {sentence:?}; the index it describes is oplog/conflict_history.rs"
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release benchmark: per-stage attribution of the managed crash-reopen curve"]
+fn managed_checkpoint_capture_stays_within_accepted_ratio_manual_benchmark() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib managed_open_stage_attribution_manual_benchmark -- --ignored --nocapture"
+    );
+    let checkpoints = std::env::var("TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS")
+        .unwrap_or_else(|_| "50,200,400,800".to_owned())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    assert!(
+        !checkpoints.is_empty() && checkpoints.windows(2).all(|pair| pair[0] < pair[1]),
+        "checkpoints must be a strictly increasing non-empty list"
+    );
+
+    // nested_unicode contributes exactly three page files; add seventeen more
+    // so graph size stays fixed while only accepted history grows.
+    let fixture = ActivationFixture::scaled("managed-open-attribution-20", 0xa0e8, 17);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let mut handle = activated.handle.expect("20-page graph activates");
+    drive_initial_feed(&handle);
+
+    let pages = match handle.application_page_inventory().unwrap() {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        other => panic!("managed page inventory did not load: {other:?}"),
+    };
+    assert_eq!(pages.len(), 20, "fixture must remain exactly 20 pages");
+    let mut editable = pages
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+        .collect::<Vec<_>>();
+    editable.sort();
+    assert!(!editable.is_empty(), "20-page fixture has no editable page");
+
+    let mut accepted_rounds = 0_usize;
+    let mut capture_work = Vec::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        while accepted_rounds < checkpoint {
+            let path = &editable[accepted_rounds % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("open attribution edit {accepted_rounds}"),
+            );
+            drain_managed_local(&handle);
+            accepted_rounds += 1;
+        }
+
+        // One undrained frame, then a crash: this is the reopen the debt audit
+        // measured, not a clean shutdown.
+        let pending_path = editable[accepted_rounds % editable.len()].clone();
+        let (page, revision) = load_application_exact(&handle, &pending_path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            &format!("open attribution pending edit {accepted_rounds}"),
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        let mut stages: Vec<(SyncRuntimeCleanOpenStage, Duration)> = Vec::new();
+        let mut counters = None;
+        let started = Instant::now();
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                match progress {
+                    SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                        stages.push((stage, elapsed));
+                    }
+                    SyncRuntimeOpenProgress::CleanOpenCounters { counters: reported } => {
+                        counters = Some(reported);
+                    }
+                    SyncRuntimeOpenProgress::Phase { .. }
+                    | SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
+                }
+            });
+        let reopen_ms = startup_ms(started.elapsed());
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        handle = reopened.handle.expect("the aged managed history reopens");
+        let (page, _) = load_application_exact(&handle, &pending_path);
+        assert_eq!(
+            page.blocks[0].raw,
+            format!("open attribution pending edit {accepted_rounds}"),
+            "the undrained frame must survive the crash reopen"
+        );
+        // The pending frame drained during the reopen just measured.
+        accepted_rounds += 1;
+
+        let counters = counters.expect("a clean crash reopen reports its work counters");
+        capture_work.push((checkpoint, counters.checkpoint_capture_work));
+        let recovery_ms = stages
+            .last()
+            .map_or(0.0, |(_, elapsed)| startup_ms(*elapsed));
+        eprintln!(
+            "attribution checkpoint={checkpoint} reopen_ms={reopen_ms:.3} clean_recovery_ms={recovery_ms:.3} stages={}",
+            stages.len()
+        );
+        let mut previous = Duration::ZERO;
+        for (stage, elapsed) in &stages {
+            eprintln!(
+                "attribution_stage checkpoint={checkpoint} stage={} stage_ms={:.3} cumulative_ms={:.3}",
+                stage.diagnostic_name(),
+                startup_ms(elapsed.saturating_sub(previous)),
+                startup_ms(*elapsed),
+            );
+            previous = *elapsed;
+        }
+        eprintln!(
+            "attribution_counters checkpoint={checkpoint} accepted_batches={} committed_tail_replayed={} checkpoint_opens={} full_replay_opens={} checkpoint_roster_entries={} checkpoint_manifest_names={} checkpoint_required_object_names={} checkpoint_capture_work={} checkpoint_payload_bytes={} checkpoint_durable_lag={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+            counters.accepted_batches,
+            counters.committed_tail_replayed,
+            counters.checkpoint_opens,
+            counters.full_replay_opens,
+            counters.checkpoint_roster_entries,
+            counters.checkpoint_manifest_names,
+            counters.checkpoint_required_object_names,
+            counters.checkpoint_capture_work,
+            counters.checkpoint_payload_bytes,
+            counters.checkpoint_durable_lag,
+            counters.sweep_chains,
+            counters.receipt_evidence_names,
+            counters.receipt_content_reads,
+            counters.receipt_full_catalog_passes,
+            counters.summary_content_reads,
+            counters.summary_rebuilt,
+            counters.summary_delta_completions,
+            counters.summary_delta_intents,
+            counters.local_completion_names,
+            counters.local_completion_content_reads,
+            counters.local_completion_rebuilt,
+            counters.local_completion_entries,
+            counters.retired_own_intent_probes,
+            counters.retired_own_receipt_artifacts,
+            counters.archive_directory_enumerations,
+            counters.archive_manifest_reads,
+            counters.archive_object_reads,
+            counters.archive_inspected_manifests,
+            counters.archive_inspected_objects,
+        );
+    }
+    let (base_checkpoint, base_capture) = capture_work[0];
+    let (final_checkpoint, final_capture) = capture_work[capture_work.len() - 1];
+    let capture_ratio = final_capture as f64 / base_capture.max(1) as f64;
+    assert!(
+        capture_ratio <= A5_ACCEPTED_CAPTURE_RATIO,
+        "per-save checkpoint capture exceeded the accepted ratio: N={final_checkpoint} work={final_capture}, N={base_checkpoint} work={base_capture}, ratio={capture_ratio:.3}"
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
 const MANAGED_CRASH_REOPEN_GATE_ROUNDS: usize = 800;
 const MANAGED_CRASH_REOPEN_BUDGET_SECONDS: u64 = 5;
 
@@ -22244,6 +24147,277 @@ fn managed_crash_reopen_aged_history_manual_benchmark() {
         reopened.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+/// Harvest W4-P1 item 5 (B052). Managed reopen cycles measured by the probe
+/// below, pinned here and in `docs/storage-sync-contract.md`; the schema test
+/// keeps the two in step.
+const W4_P1_RECEIVER_SUMMARY_CYCLES: usize = 20;
+/// Accepted application saves performed per cycle before the clean shutdown.
+const W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE: usize = 1;
+
+fn w4_p1_count_files(directory: &Path) -> usize {
+    let mut files = 0;
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            files += w4_p1_count_files(&entry.path());
+        } else if kind.is_file() {
+            files += 1;
+        }
+    }
+    files
+}
+
+/// Harvest W4-P1 item 5 — B052 receiver-absence-summary open attribution.
+///
+/// MEASUREMENT ONLY: it changes no production code and asserts no budget. It
+/// answers one question the debug-gated one-shot open line could not: across
+/// `W4_P1_RECEIVER_SUMMARY_CYCLES` ordinary desktop Managed cycles on a real
+/// graph copy — each `W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE` accepted save, a
+/// clean shutdown, and one cold `open_with_progress` — how many opens read the
+/// receiver summary's delta path and how many took a full validated-catalog
+/// pass.
+///
+/// It reports only the observable binary categories the production counters
+/// actually distinguish. It deliberately does NOT attribute a rebuild to a
+/// missing cache, an invalid cache, or a coverage mismatch:
+/// `ReceiverAbsenceSummary::open` collapses `Ok(None)` with every `Err` through
+/// `open_cache(..).ok().flatten()`, a coverage mismatch reaches the same
+/// `rebuilt`/`full_catalog_passes` values, and `HotEngine::open_absence_decision_map`'s
+/// no-archive-store fallback synthesizes those same values. Separating the
+/// three needs a dedicated producer reason counter, which is a separate packet.
+///
+/// That last fallback is a generic/offline-engine path, not a normal-session
+/// fork: `w4_p1_storage_contract_pins_receiver_summary_frequency_schema` pins
+/// the production call ordering that attaches the clean archive store before
+/// the absence map is opened, so these cycles measure attached opens.
+///
+/// Emits counts and fixed labels only — never a path, page name or block text
+/// from the corpus. Nothing mechanical enforces that here: the I-5 print-site
+/// census skips `#[path]`-included test files, so it is met by construction.
+#[test]
+#[ignore = "manual release benchmark: receiver absence summary open attribution across managed reopen cycles"]
+fn w4_p1_receiver_summary_reopen_frequency_probe() {
+    assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release --lib sync_runtime::tests::w4_p1_receiver_summary_reopen_frequency_probe -- --ignored --exact --nocapture"
+        );
+    let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+    let fixture = ActivationFixture::copied_graph("w4-p1-receiver-summary-reopen", 0xa0f5, &source);
+    let corpus_files = w4_p1_count_files(&fixture.graph_root);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let mut handle = activated.handle.expect("real graph copy activates");
+    drive_initial_feed(&handle);
+
+    let pages = match handle.application_page_inventory().unwrap() {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        other => panic!("managed page inventory did not load: {other:?}"),
+    };
+    let corpus_pages = pages.len();
+    let mut paths = pages
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut corpus_blocks = 0usize;
+    let mut editable: Option<String> = None;
+    for path in &paths {
+        let page = load_application_exact(&handle, path).0;
+        corpus_blocks += page.blocks.len();
+        if editable.is_some() {
+            continue;
+        }
+        // Replacing a first block that carries an externally imported `id::`
+        // is a separate identity case the trusted-local save vocabulary
+        // declines; this probe wants an ordinary accepted save.
+        let ordinary = page.blocks.first().is_some_and(|first| {
+            !first.raw.lines().any(|line| {
+                line.split_once("::")
+                    .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("id"))
+            })
+        });
+        if ordinary {
+            editable = Some(path.clone());
+        }
+    }
+    let target = editable.expect("real graph copy has an editable page");
+
+    let mut full_catalog_pass_0 = 0usize;
+    let mut full_catalog_pass_1 = 0usize;
+    let mut summary_rebuilt_false = 0usize;
+    let mut summary_rebuilt_true = 0usize;
+    let mut receipt_content_reads = 0usize;
+    let mut summary_content_reads = 0usize;
+    let mut delta_completions = 0usize;
+    let mut delta_intents = 0usize;
+    let mut receipt_evidence_names = 0usize;
+
+    for cycle in 0..W4_P1_RECEIVER_SUMMARY_CYCLES {
+        for save in 0..W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE {
+            let (page, revision) = load_application_exact(&handle, &target);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("w4-p1 receiver summary probe cycle {cycle} save {save}"),
+            );
+            drain_managed_local(&handle);
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let mut observed = None;
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    observed = Some(counters);
+                }
+            });
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        handle = reopened.handle.expect("clean managed cycle reopens");
+        let counters = observed.expect("clean cold open reports counters");
+        match counters.receipt_full_catalog_passes {
+            0 => full_catalog_pass_0 += 1,
+            1 => full_catalog_pass_1 += 1,
+            other => panic!("cycle {cycle} reported {other} full-catalog passes; the categories this probe reports assume at most one per open"),
+        }
+        if counters.summary_rebuilt {
+            summary_rebuilt_true += 1;
+        } else {
+            summary_rebuilt_false += 1;
+        }
+        receipt_content_reads += counters.receipt_content_reads;
+        summary_content_reads += counters.summary_content_reads;
+        delta_completions += counters.summary_delta_completions;
+        delta_intents += counters.summary_delta_intents;
+        receipt_evidence_names += counters.receipt_evidence_names;
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+
+    assert_eq!(
+        full_catalog_pass_0 + full_catalog_pass_1,
+        W4_P1_RECEIVER_SUMMARY_CYCLES
+    );
+    assert_eq!(
+        summary_rebuilt_false + summary_rebuilt_true,
+        W4_P1_RECEIVER_SUMMARY_CYCLES
+    );
+    // Content-read and delta counters are TOTALS across the cycles.
+    eprintln!(
+        "w4_p1_receiver_summary_reopen corpusFiles={corpus_files} corpusPages={corpus_pages} \
+         corpusBlocks={corpus_blocks} cycles={} savesPerCycle={} shutdownKind=clean-safe \
+         archiveStoreAttached=yes-by-production-call-order fullCatalogPass0={full_catalog_pass_0} \
+         fullCatalogPass1={full_catalog_pass_1} summaryRebuiltFalse={summary_rebuilt_false} \
+         summaryRebuiltTrue={summary_rebuilt_true} receiptContentReads={receipt_content_reads} \
+         summaryContentReads={summary_content_reads} deltaCompletions={delta_completions} \
+         deltaIntents={delta_intents} receiptEvidenceNames={receipt_evidence_names}",
+        W4_P1_RECEIVER_SUMMARY_CYCLES, W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE,
+    );
+}
+
+/// Harvest W4-P1 item 5. Two facts the measurement above depends on, and which
+/// prose alone would let drift (I-11: the code does not lie about itself).
+#[test]
+fn w4_p1_storage_contract_pins_receiver_summary_frequency_schema() {
+    // 1. Normal Managed opens attach the clean archive store BEFORE opening the
+    //    absence-decision map, so `archive_store == None` is the generic/offline
+    //    engine fallback rather than a normal-session fork. Without this, the
+    //    frequency table's `archiveStoreAttached=yes` would be an unchecked claim.
+    let runtime = include_str!("sync_runtime.rs");
+    let attaches = runtime
+        .match_indices(".attach_clean_archive_store(")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    let opens = runtime
+        .match_indices(".open_absence_decision_map(")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert!(
+        opens.len() >= 2,
+        "sync_runtime.rs must still open the absence-decision map on both the activation and clean-reopen paths; found {} call sites",
+        opens.len()
+    );
+    assert!(
+        attaches.len() >= opens.len(),
+        "every sync_runtime.rs open_absence_decision_map call must be preceded by its own attach_clean_archive_store call, or the receiver-summary delta path silently becomes the no-archive full-catalog fallback (I-11). attaches={} opens={}",
+        attaches.len(),
+        opens.len()
+    );
+    for (nth, open) in opens.iter().enumerate() {
+        assert!(
+            attaches[nth] < *open,
+            "sync_runtime.rs open_absence_decision_map call {nth} is not preceded by an attach_clean_archive_store call; a normal Managed open would then take the no-archive full-catalog fallback and w4_p1_receiver_summary_reopen_frequency_probe's archiveStoreAttached column would be false (I-11)"
+        );
+    }
+
+    // 2. The published frequency table still describes the run that produced it.
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    let row = |name: &str| -> String {
+        let needle = format!("| `{name}` |");
+        let line = contract
+            .lines()
+            .find(|line| line.starts_with(&needle))
+            .unwrap_or_else(|| {
+                panic!("docs/storage-sync-contract.md must carry the Harvest W4-P1 receiver-summary frequency row `{name}`")
+            });
+        line.split('|')
+            .nth(2)
+            .unwrap_or_else(|| panic!("frequency row `{name}` has no value cell"))
+            .trim()
+            .trim_matches('`')
+            .to_string()
+    };
+    let count = |name: &str| -> usize {
+        row(name).parse::<usize>().unwrap_or_else(|error| {
+            panic!("frequency row `{name}` must hold a plain count: {error}")
+        })
+    };
+    for name in [
+        "checkedHead",
+        "corpusFiles",
+        "corpusPages",
+        "corpusBlocks",
+        "shutdownKind",
+        "archiveStoreAttached",
+        "receiptContentReads",
+        "summaryContentReads",
+        "deltaCompletions",
+        "deltaIntents",
+    ] {
+        assert!(
+            !row(name).is_empty(),
+            "frequency row `{name}` must record what was measured"
+        );
+    }
+    assert_eq!(
+        count("cycles"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "the published table must describe the cycle count the probe runs"
+    );
+    assert_eq!(
+        count("savesPerCycle"),
+        W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE,
+        "the published table must describe the saves per cycle the probe runs"
+    );
+    assert_eq!(
+        count("fullCatalogPass0") + count("fullCatalogPass1"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "every measured open is one full-catalog-pass category or the other"
+    );
+    assert_eq!(
+        count("summaryRebuiltFalse") + count("summaryRebuiltTrue"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "every measured open is one summary-rebuilt category or the other"
+    );
 }
 
 #[test]
@@ -26561,6 +28735,259 @@ fn managed_application_read_real_graph_copy_manual_gate() {
     ));
 }
 
+/// Strip session-local block identities from a resolve/backlink reply.
+///
+/// Two fields carry one: `BlockDto::id` and the `block_id` locator inside a
+/// backlink `evidence` row (Managed namespaces the latter `sparse-v2:`, which
+/// is itself the tell that it is an internal handle, not a durable identity).
+///
+/// `BlockDto::id` is minted per mode: Managed adopts the durable `id::` uuid,
+/// Direct synthesizes a session uuid even for a block that already carries
+/// `id::`. Neither identity is written to disk and the user never types one —
+/// a `((ref))` carries the durable `id::`, which stays in `properties` and is
+/// still compared. Two modes numbering the same block differently, while
+/// returning identical content, page, breadcrumb and `id::`, is a
+/// representation difference a user would regard as equivalent, so the parity
+/// oracle compares everything else.
+///
+/// This is safe, not merely tolerated: every user-facing reference path goes
+/// through `ensureBlockId` (`src/store.ts`), which reads the durable `id::`
+/// out of the block's raw text and never writes a second one, so a runtime id
+/// cannot reach a `((ref))`. What this field must NOT become is an identity a
+/// consumer treats as durable; see `docs/contracts/managed-read-surface.md`.
+fn without_session_block_ids(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "id" | "block_id"))
+                .map(|(key, nested)| (key.clone(), without_session_block_ids(nested)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(without_session_block_ids).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[test]
+#[ignore = "manual release gate: C7a regression on an explicitly supplied disposable graph copy"]
+fn managed_c7a_real_graph_copy_manual_gate() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this C7a graph-copy gate is release-only"
+    );
+    let source_root = real_graph_copy_source_from_env("TINE_MANAGED_READ_REAL_GRAPH_COPY");
+    let fixture = ActivationFixture::copied_graph("managed-c7a-real-copy", 0xc7a0, &source_root);
+    let original_bytes = user_graph_bytes(&fixture.graph_root);
+    let direct = Graph::open(&fixture.graph_root);
+    let mut pages = direct.list_pages();
+    pages.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    assert!(
+        !pages.is_empty(),
+        "the supplied disposable graph copy has pages"
+    );
+
+    // Resolve the DURABLE `id::` uuids, not `BlockDto::id`. A DTO id is a
+    // session-local identity that Direct synthesizes for every block; Managed
+    // mints its own and cannot know Direct's, so comparing DTO ids across modes
+    // asserts something no user can observe and fails for every block. What a
+    // user actually writes in a `((uuid))` ref is the durable `id::` property,
+    // so that is the identity both read surfaces must resolve identically.
+    fn ids(blocks: &[BlockDto], out: &mut Vec<String>) {
+        for block in blocks {
+            for (key, value) in &block.properties {
+                if key == "id" {
+                    out.push(value.clone());
+                }
+            }
+            ids(&block.children, out);
+        }
+    }
+    let mut block_ids = Vec::new();
+    for entry in &pages {
+        ids(&direct.load_page(entry).unwrap().blocks, &mut block_ids);
+    }
+    block_ids.sort();
+    block_ids.dedup();
+    assert!(
+        !block_ids.is_empty(),
+        "the supplied disposable graph copy carries durable `id::` block refs"
+    );
+    let direct_templates = serde_json::to_value(direct.templates()).unwrap();
+    // `ResolveBlocks` is validated against MAX_SYNC_APPLICATION_PAGE_BLOCKS
+    // (= MAX_MATERIALIZATION_QUERY_ROWS - 1), not the raw row cap, so a full
+    // 10_000-uuid chunk is rejected as RequestTooLarge. Both sides chunk by the
+    // request cap so the flattened comparison stays element-for-element equal.
+    let direct_resolved = block_ids
+        .chunks(MAX_SYNC_APPLICATION_PAGE_BLOCKS)
+        .flat_map(|chunk| direct.resolve_blocks(chunk))
+        .collect::<Vec<_>>();
+    let direct_resolved = serde_json::to_value(direct_resolved).unwrap();
+    let direct_backlinks = pages
+        .iter()
+        .map(|entry| {
+            let result = direct.backlinks_bounded(
+                &entry.name,
+                MAX_SYNC_APPLICATION_RESULT_ROWS,
+                MAX_SYNC_APPLICATION_RESULT_BYTES,
+            );
+            (
+                entry.name.clone(),
+                serde_json::to_value((&*result.groups, result.total, result.exceeded)).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let started = Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("C7a graph copy activates");
+    drive_initial_feed(&handle);
+    let activation = started.elapsed();
+
+    let managed_snapshot = || {
+        let templates = match handle
+            .application_navigation(SyncApplicationNavigationRequest::ListTemplates)
+            .unwrap()
+        {
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::Templates(templates),
+            } => serde_json::to_value(templates).unwrap(),
+            other => panic!("managed templates did not load: {other:?}"),
+        };
+        let mut resolved = Vec::new();
+        for chunk in block_ids.chunks(MAX_SYNC_APPLICATION_PAGE_BLOCKS) {
+            match handle
+                .application_navigation(SyncApplicationNavigationRequest::ResolveBlocks {
+                    uuids: chunk.to_vec(),
+                })
+                .unwrap()
+            {
+                SyncApplicationNavigationOutcome::Loaded {
+                    reply: SyncApplicationNavigationReply::ResolveBlocks(rows),
+                } => resolved.extend(rows),
+                other => panic!("managed UUID batch did not load: {other:?}"),
+            }
+        }
+        let backlinks = pages
+            .iter()
+            .map(|entry| {
+                let result = match handle
+                    .application_navigation(SyncApplicationNavigationRequest::Backlinks {
+                        name: entry.name.clone(),
+                        max_rows: MAX_SYNC_APPLICATION_RESULT_ROWS,
+                        max_bytes: MAX_SYNC_APPLICATION_RESULT_BYTES,
+                    })
+                    .unwrap()
+                {
+                    SyncApplicationNavigationOutcome::Loaded {
+                        reply: SyncApplicationNavigationReply::Backlinks(result),
+                    } => result,
+                    other => panic!("managed backlinks did not load: {other:?}"),
+                };
+                (
+                    entry.name.clone(),
+                    serde_json::to_value((result.groups, result.total, result.exceeded)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            templates,
+            serde_json::to_value(resolved).unwrap(),
+            backlinks,
+        )
+    };
+    let before_save = managed_snapshot();
+    // Non-vacuity: a gate that resolves nothing on either side would compare
+    // two empty results and pass while proving nothing.
+    let resolved_groups = before_save
+        .1
+        .as_array()
+        .expect("resolved reply is an array")
+        .iter()
+        .filter(|group| !group.is_null())
+        .count();
+    assert_eq!(
+        resolved_groups,
+        block_ids.len(),
+        "every durable `id::` ref resolves in Managed mode"
+    );
+    assert_eq!(before_save.0, direct_templates);
+    assert_eq!(
+        without_session_block_ids(&before_save.1),
+        without_session_block_ids(&direct_resolved)
+    );
+    assert_eq!(
+        without_session_block_ids(&serde_json::to_value(&before_save.2).unwrap()),
+        without_session_block_ids(&serde_json::to_value(&direct_backlinks).unwrap())
+    );
+
+    fn count_blocks(blocks: &[BlockDto]) -> usize {
+        blocks
+            .iter()
+            .map(|block| 1 + count_blocks(&block.children))
+            .sum()
+    }
+
+    // A whole-page Managed save is bounded by MAX_SYNC_EDITOR_BLOCKS (= 511:
+    // two operations per retained block plus a preamble, inside
+    // MAX_LOCAL_MUTATION_ROWS = 1024), while a Managed LOAD is bounded by
+    // MAX_SYNC_APPLICATION_PAGE_BLOCKS (= 9_999). A page between the two
+    // ceilings therefore opens and cannot be saved. That asymmetry is a real
+    // pre-existing defect, not something C7a introduced — this corpus contains
+    // exactly one such page — so the gate PINS it rather than crashing on it.
+    // When the ceiling is raised or the save is chunked, this expectation flips,
+    // and that flip must be a deliberate edit.
+    let mut unchanged_saves = 0_usize;
+    let mut refused_oversized_saves = 0_usize;
+    for entry in &pages {
+        let (page, revision) = load_application_exact(&handle, &entry.rel_path);
+        if page.read_only || page.guide {
+            continue;
+        }
+        let blocks = count_blocks(&page.blocks);
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        });
+        if blocks > MAX_SYNC_EDITOR_BLOCKS {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+                ),
+                "a {blocks}-block page is above the {MAX_SYNC_EDITOR_BLOCKS} whole-page save ceiling \
+                 and must be refused as RequestTooLarge, not saved: {outcome:?}"
+            );
+            refused_oversized_saves += 1;
+            continue;
+        }
+        assert!(matches!(
+            outcome.unwrap(),
+            SyncApplicationPageSaveOutcome::Unchanged { .. }
+        ));
+        unchanged_saves += 1;
+    }
+    drain_managed_local(&handle);
+    assert_eq!(user_graph_bytes(&fixture.graph_root), original_bytes);
+    assert_eq!(managed_snapshot(), before_save);
+    eprintln!(
+        "c7a_real_graph pages={} block_ids={} templates={} backlink_queries={} unchanged_saves={} refused_oversized_saves={} activation_ms={:.3}",
+        pages.len(),
+        block_ids.len(),
+        direct_templates.as_array().map_or(0, Vec::len),
+        direct_backlinks.len(),
+        unchanged_saves,
+        refused_oversized_saves,
+        startup_ms(activation),
+    );
+}
+
 /// A graph whose journals exercise every feed selection rule at once: a
 /// run of ordinary days, a day owning two files, a nested journal, a
 /// journal-kind file whose stem is not a date, a future day, and an
@@ -27558,6 +29985,138 @@ fn assert_public_activation_cut_resumes(
     drop(handle);
 }
 
+/// H2 2c: once the marker has transferred authority to the sealed baseline,
+/// a later activation failure must retain that complete state for the next
+/// open. Reclaiming the archive at this point strands the marker and turns a
+/// one-shot runtime-open failure into a permanent half-live store.
+#[test]
+fn failure_after_clean_activation_retain_completes_on_the_next_open() {
+    let fixture = ActivationFixture::nested_unicode("post-retain-resume", 0xa1f5_c200);
+    let before = user_graph_bytes(&fixture.graph_root);
+    fail_once_after_clean_activation_retain();
+
+    let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert!(interrupted.handle.is_none());
+    assert!(matches!(
+        interrupted.status,
+        SyncLocalActivationStatus::Retryable {
+            durable_stage: SyncLocalActivationStage::LocalActive,
+            ..
+        }
+    ));
+    assert!(fixture
+        .request
+        .enrollment_root
+        .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+        .is_file());
+    assert!(clean_baseline_directory(&fixture.request.archive_root).is_dir());
+    assert!(clean_operation_archive_directory(&fixture.request.archive_root).is_dir());
+    assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+    let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+    let handle = resumed
+        .handle
+        .expect("the retained marker, baseline, and archive resume");
+    drive_initial_feed(&handle);
+    assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn managed_activation_abort_cuts_retire_unmarked_generation_and_retry() {
+    const CUT_ENV: &str = "TINE_TEST_CLEAN_ACTIVATION_ABORT_CUT";
+    const ROOT_ENV: &str = "TINE_TEST_CLEAN_ACTIVATION_ABORT_ROOT";
+    const SEED: u128 = 0xa1f5_c2f0;
+
+    if let (Ok(cut), Ok(root)) = (std::env::var(CUT_ENV), std::env::var(ROOT_ENV)) {
+        let fixture = ActivationFixture::nested_unicode_at(PathBuf::from(root), SEED);
+        let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        panic!("activation did not abort at {cut}: {:?}", result.status);
+    }
+
+    for cut in [
+        "after-baseline-publication",
+        "after-sqlite-publication",
+        "after-final-source-verification",
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "tine-managed-activation-abort-{cut}-{}",
+            Uuid::new_v4()
+        ));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("sync_runtime::tests::managed_activation_abort_cuts_retire_unmarked_generation_and_retry")
+            .arg("--nocapture")
+            .env(CUT_ENV, cut)
+            .env(ROOT_ENV, &root)
+            .status()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(status.signal(), Some(libc::SIGABRT), "{cut}");
+        }
+        #[cfg(not(unix))]
+        assert!(
+            !status.success(),
+            "the activation child must abort at {cut}"
+        );
+
+        let fixture = ActivationFixture::reopen_at(root, SEED);
+        let before = user_graph_bytes(&fixture.graph_root);
+        assert!(
+            clean_baseline_directory(&fixture.request.archive_root).is_dir(),
+            "{cut} must retain the unmarked baseline generation"
+        );
+        assert_eq!(
+            fixture.request.database_path.is_file(),
+            cut != "after-baseline-publication",
+            "{cut} SQLite publication state"
+        );
+        assert!(
+            read_activation_marker(&fixture.request.enrollment_root)
+                .unwrap()
+                .is_none(),
+            "{cut} must precede the marker commit"
+        );
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active, "{cut}");
+        let handle = resumed.handle.expect("the crash retry must become active");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before, "{cut}");
+        let marker = read_activation_marker(&fixture.request.enrollment_root)
+            .unwrap()
+            .expect("the retry publishes one authority marker");
+        let active =
+            clean_authority_directories(&fixture.request.archive_root, marker.generation());
+        assert!(active.baseline.is_dir(), "{cut}");
+        assert!(active.operations.is_dir(), "{cut}");
+        let authority_directories = fs::read_dir(&fixture.request.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                clean_authority_generation(
+                    name,
+                    crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+                )
+                .is_some()
+                    || clean_authority_generation(name, CLEAN_OPERATION_ARCHIVE_DIRECTORY).is_some()
+                    || name.starts_with(".clean-join-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authority_directories.len(),
+            2,
+            "{cut}: {authority_directories:?}"
+        );
+        drop(handle);
+    }
+}
+
 #[test]
 fn public_activation_cut_before_archive_creation_resumes_exact_identities_without_graph_rewrites() {
     assert_public_activation_cut_resumes(
@@ -27629,9 +30188,13 @@ fn activation_external_edit_before_promotion_refuses_then_retries_from_current_d
             interrupted.status
         );
     };
-    assert!(detail.contains("Root.md"), "{detail}");
-    assert!(detail.contains("changed:"), "{detail}");
-    assert!(detail.contains("content:"), "{detail}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.bootstrap_streaming_import",
+        })
+    );
     assert!(interrupted.handle.is_none());
     // The third half, and the one that makes `Retryable` true. This lane
     // records no private activation reservation, so an archive left behind
@@ -28255,4 +30818,1865 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
                  across Graph, authoritative oplog replay, SQLite, and restart"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Harvest A4 — run-local identity indexes at the real application boundary.
+// These are observational RECEIPTS (release-only, env-bounded, `#[ignore]`d),
+// written for the repro phase and kept as probes. The capacity they originally
+// demonstrated was REMOVED by the A4 fix (see A4-fix-dossier.md and
+// RECEIPT-repro.md): the four run-local identity maps (page names, portable
+// paths, block claims, Logseq claims) now simply grow with lifetime-distinct
+// identities, bounded by archive rebaselining (SPEC-A A5 decision block). The
+// fast guards for the fixed behavior live in
+// `crates/tine-core/src/oplog/hot_engine_integration_tests.rs`.
+// ---------------------------------------------------------------------------
+
+fn emit_a4_save_attribution_checkpoint(
+    cadence: &str,
+    checkpoint: usize,
+    save: Duration,
+    cumulative_save: Duration,
+    cumulative_drain: Duration,
+    elapsed: Duration,
+    pending: usize,
+    stages: ManagedApplicationSaveStageTimings,
+    drain_stages: Option<crate::oplog::local_journal_drain::ManagedLocalDrainStageTimings>,
+) {
+    eprintln!(
+        "a4_save_checkpoint cadence={cadence} checkpoint={checkpoint} save_ms={:.6} cumulative_save_ms={:.6} cumulative_drain_ms={:.6} elapsed_ms={:.6} pending={pending}",
+        startup_ms(save),
+        startup_ms(cumulative_save),
+        startup_ms(cumulative_drain),
+        startup_ms(elapsed),
+    );
+    macro_rules! stage_rows {
+        ($($field:ident),+ $(,)?) => {
+            $(eprintln!(
+                "a4_save_stage cadence={cadence} checkpoint={checkpoint} stage={} stage_ms={:.6}",
+                stringify!($field),
+                startup_ms(stages.$field),
+            );)+
+        };
+    }
+    stage_rows!(
+        actor_total,
+        application_prepare_turn,
+        application_request_build,
+        exact_page_load,
+        editor_prepare_turn,
+        editor_total,
+        editor_transaction_build,
+        editor_current_page_admission,
+        editor_page_id_and_block_id_resolution,
+        editor_requested_page_build,
+        editor_exact_base_read,
+        editor_projection_preparation,
+        editor_accepted_projection_render,
+        editor_target_projection_render,
+        editor_target_byte_clone,
+        editor_accepted_baseline_parse,
+        editor_requested_target_parse,
+        editor_identity_and_rename_kind_checks,
+        editor_target_dto_and_response_evidence,
+        editor_affine_artifact_and_reply_assembly,
+        transaction_current_map_and_existing_validation,
+        transaction_desired_memberships,
+        transaction_outline_depths,
+        transaction_create_scan_sort_emit,
+        transaction_edit_scan_emit,
+        transaction_reorder_scan_sort_emit,
+        transaction_preamble_check_emit,
+        transaction_delete_sets_scan_sort_emit,
+        transaction_inner_finish_validate,
+        transaction_outer_merge_finish_validate,
+        editor_request_remainder,
+        promoted_mutation_admission,
+        application_outcome,
+    );
+    macro_rules! counter_rows {
+        ($($field:ident),+ $(,)?) => {
+            $(eprintln!(
+                "a4_save_counter cadence={cadence} checkpoint={checkpoint} counter={} value={}",
+                stringify!($field),
+                stages.$field,
+            );)+
+        };
+    }
+    counter_rows!(
+        hot_application_save_attempts,
+        hot_application_save_reuses,
+        response_target_parses,
+        response_target_dto_conversions,
+        response_target_exact_dto_reparses,
+        editor_block_id_resolution_passes,
+        editor_block_ids_visited,
+        editor_requested_current_map_builds,
+        editor_requested_current_map_entries,
+        editor_requested_membership_derivations,
+        editor_requested_membership_entries,
+        editor_accepted_renders,
+        editor_accepted_rendered_blocks,
+        editor_target_renders,
+        editor_target_rendered_blocks,
+        editor_accepted_parses,
+        editor_accepted_parse_bytes,
+        editor_target_parses,
+        editor_target_parse_bytes,
+        editor_target_dto_converted_blocks,
+        transaction_current_map_builds,
+        transaction_current_map_entries,
+        transaction_membership_derivations,
+        transaction_membership_entries,
+        transaction_outline_depth_derivations,
+        transaction_outline_depth_entries,
+        transaction_create_scan_passes,
+        transaction_create_scan_entries,
+        transaction_edit_scan_passes,
+        transaction_edit_scan_entries,
+        transaction_reorder_scan_passes,
+        transaction_reorder_scan_entries,
+        transaction_delete_desired_set_scans,
+        transaction_delete_desired_set_entries,
+        transaction_delete_current_set_scans,
+        transaction_delete_current_set_entries,
+        transaction_delete_root_scans,
+        transaction_delete_root_entries,
+        transaction_emitted_create,
+        transaction_emitted_edit,
+        transaction_emitted_reorder,
+        transaction_emitted_delete,
+        transaction_emitted_preamble,
+        transaction_emitted_rename,
+        transaction_emitted_kind,
+        transaction_inner_validations,
+        transaction_inner_validation_operations,
+        transaction_outer_validations,
+        transaction_outer_validation_operations,
+    );
+    if let Some(drain) = drain_stages {
+        macro_rules! drain_rows {
+            ($($field:ident),+ $(,)?) => {
+                $(eprintln!(
+                    "a4_drain_stage cadence={cadence} checkpoint={checkpoint} stage={} stage_ms={:.6}",
+                    stringify!($field),
+                    startup_ms(drain.$field),
+                );)+
+            };
+        }
+        drain_rows!(
+            authenticate,
+            archive_publication,
+            engine_acceptance,
+            tail_and_sqlite,
+            projection_adoption,
+            authorship_receipt,
+            provider_publication,
+            checkpoint,
+            total,
+        );
+    }
+}
+
+/// Q1/Q2 at the application boundary: create new pages through the ordinary
+/// managed application save path until the run-local budget refuses, then
+/// reopen and observe whether the refusal survives.
+///
+/// `TINE_A4_MAX_PAGES` (default 4_400) bounds the loop.
+/// `TINE_A4_DRAIN_CADENCE` is `never`, `every`, or a positive page count and
+/// defaults to `every`, preserving the original repro. Attribution rows are
+/// emitted at `TINE_A4_ATTRIBUTION_CHECKPOINTS` (default 50,200,400).
+#[test]
+#[ignore = "harvest A4 repro: thousands of real application page creations (release only)"]
+fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_managed_page_creation_wedges_at_the_run_local_budget -- --ignored --nocapture"
+    );
+    let limit = std::env::var("TINE_A4_MAX_PAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4_400);
+    let drain_cadence = std::env::var("TINE_A4_DRAIN_CADENCE").unwrap_or_else(|_| "every".into());
+    let drain_every = match drain_cadence.as_str() {
+        "never" | "0" => None,
+        "every" | "every_page" | "1" => Some(1),
+        value => Some(
+            value
+                .parse::<usize>()
+                .expect("TINE_A4_DRAIN_CADENCE must be never, every, or a positive integer")
+                .max(1),
+        ),
+    };
+    let cadence_label = match drain_every {
+        None => "never".to_owned(),
+        Some(1) => "every_page".to_owned(),
+        Some(value) => format!("every_{value}_pages"),
+    };
+    let checkpoints = std::env::var("TINE_A4_ATTRIBUTION_CHECKPOINTS")
+        .unwrap_or_else(|_| "50,200,400".into())
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .expect("A4 attribution checkpoints must be positive integers")
+        })
+        .collect::<Vec<_>>();
+    let fixture = ActivationFixture::nested_unicode("a4-page-budget", 0xa4f1);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("A4 budget fixture activates");
+    drive_initial_feed(&handle);
+
+    let started = Instant::now();
+    let mut created = 0usize;
+    let mut refusal = None;
+    let mut cumulative_save = Duration::ZERO;
+    let mut cumulative_drain = Duration::ZERO;
+    while created < limit {
+        let name = format!("A4 Budget Page {created}");
+        let blocks = vec![BlockDto {
+            id: format!("temporary-a4-{created}"),
+            raw: format!("a4 budget block {created}"),
+            ..BlockDto::default()
+        }];
+        let save_started = Instant::now();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.clone(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(&name, SyncPageKind::Page, None, blocks),
+        });
+        let save_elapsed = save_started.elapsed();
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
+                created += 1;
+                cumulative_save += save_elapsed;
+                let drained = drain_every.is_some_and(|cadence| created % cadence == 0);
+                if drained {
+                    let drain_started = Instant::now();
+                    drain_managed_local(&handle);
+                    cumulative_drain += drain_started.elapsed();
+                }
+                if checkpoints.contains(&created) {
+                    let instrumentation = handle
+                        .managed_application_save_instrumentation()
+                        .expect("A4 attribution reads save-stage instrumentation");
+                    emit_a4_save_attribution_checkpoint(
+                        &cadence_label,
+                        created,
+                        save_elapsed,
+                        cumulative_save,
+                        cumulative_drain,
+                        started.elapsed(),
+                        instrumentation.managed_local_pending,
+                        instrumentation.application_stages,
+                        drained.then_some(instrumentation.derivative_stages),
+                    );
+                }
+            }
+            other => {
+                refusal = Some(format!("{other:?}"));
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "a4_budget cadence={cadence_label} created_pages={created} elapsed_ms={:.1} cumulative_save_ms={:.6} cumulative_drain_ms={:.6} refusal={refusal:?}",
+        startup_ms(started.elapsed()),
+        startup_ms(cumulative_save),
+        startup_ms(cumulative_drain),
+    );
+    if drain_every.is_none() && handle.status().unwrap().managed_local_pending > 0 {
+        let final_settle_started = Instant::now();
+        drain_managed_local(&handle);
+        eprintln!(
+            "a4_final_settle cadence={cadence_label} drain_ms={:.6}",
+            startup_ms(final_settle_started.elapsed()),
+        );
+    }
+    let status = handle.status().unwrap();
+    eprintln!("a4_budget status_after_refusal={status:?}");
+
+    // Reopen and report whether the store still opens and whether the refusal
+    // survived the restart. This is the I-10 question: is the state permanent?
+    drop(handle);
+    let mut stages: Vec<(SyncRuntimeCleanOpenStage, Duration)> = Vec::new();
+    let mut counters = None;
+    let reopen_started = Instant::now();
+    let reopened =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            match progress {
+                SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                    stages.push((stage, elapsed));
+                }
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters: reported } => {
+                    counters = Some(reported);
+                }
+                SyncRuntimeOpenProgress::Phase { .. }
+                | SyncRuntimeOpenProgress::Waiting { .. }
+                | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
+            }
+        });
+    eprintln!(
+        "a4_budget reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+    let mut previous = Duration::ZERO;
+    for (stage, elapsed) in &stages {
+        eprintln!(
+            "a4_budget_stage stage={} stage_ms={:.3} cumulative_ms={:.3}",
+            stage.diagnostic_name(),
+            startup_ms(elapsed.saturating_sub(previous)),
+            startup_ms(*elapsed),
+        );
+        previous = *elapsed;
+    }
+    if let Some(counters) = counters {
+        eprintln!(
+            "a4_budget_counters created_pages={created} accepted_batches={} committed_tail_replayed={} archive_manifest_reads={} archive_object_reads={}",
+            counters.accepted_batches,
+            counters.committed_tail_replayed,
+            counters.archive_manifest_reads,
+            counters.archive_object_reads,
+        );
+    }
+    let Some(reopened) = reopened.handle else {
+        panic!("A4 budget store no longer opens: {:?}", reopened.status);
+    };
+    let name = format!("A4 Budget Page {created}");
+    let after_reopen = reopened.save_application_page(SyncApplicationPageSaveRequest {
+        target: SyncApplicationPageSaveTarget::New {
+            name: name.clone(),
+            page_kind: SyncPageKind::Page,
+        },
+        page: new_application_page(
+            &name,
+            SyncPageKind::Page,
+            None,
+            vec![BlockDto {
+                id: "temporary-a4-after-reopen".into(),
+                raw: "a4 post-reopen block".into(),
+                ..BlockDto::default()
+            }],
+        ),
+    });
+    eprintln!("a4_budget after_reopen_save={after_reopen:?}");
+}
+
+/// Q3 — import reachability. Activate a synthetic graph that is larger than
+/// every run-local index cap and record whether activation succeeds and
+/// whether the store reopens afterwards.
+///
+/// The fixture is SYNTHETIC (generated below); no real graph is read.
+/// `TINE_A4_IMPORT_PAGES` (default 5_000) sets the page count.
+#[test]
+#[ignore = "harvest A4 repro: activates a synthetic >4,096-page graph (release only)"]
+fn a4_repro_import_of_a_graph_larger_than_every_run_local_cap() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_import_of_a_graph_larger_than_every_run_local_cap -- --ignored --nocapture"
+    );
+    let pages = std::env::var("TINE_A4_IMPORT_PAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5_000);
+    let fixture = ActivationFixture::empty("a4-large-import", 0xa4f2);
+    for page in 0..pages {
+        let directory = fixture.graph_root.join(format!("notes/a4/{}", page % 32));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("A4-Import-{page}.md")),
+            format!("title:: A4 Import {page}\n\n- a4 import block {page}\n"),
+        )
+        .unwrap();
+    }
+    let started = Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    eprintln!(
+        "a4_import pages={pages} activation_ms={:.1} status={:?}",
+        startup_ms(started.elapsed()),
+        activated.status
+    );
+    let Some(handle) = activated.handle else {
+        eprintln!("a4_import activation produced no handle");
+        return;
+    };
+    drive_initial_feed(&handle);
+    let inventory = handle.application_page_inventory().unwrap();
+    let imported = match &inventory {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages.len(),
+        other => panic!("a4 import inventory did not load: {other:?}"),
+    };
+    eprintln!("a4_import imported_pages={imported}");
+
+    // One ordinary post-import page creation: does a >4,096-page graph still
+    // accept new work, or is the run-local budget already exhausted?
+    let save = handle.save_application_page(SyncApplicationPageSaveRequest {
+        target: SyncApplicationPageSaveTarget::New {
+            name: "A4 Import Post Page".into(),
+            page_kind: SyncPageKind::Page,
+        },
+        page: new_application_page(
+            "A4 Import Post Page",
+            SyncPageKind::Page,
+            None,
+            vec![BlockDto {
+                id: "temporary-a4-import-post".into(),
+                raw: "a4 post-import block".into(),
+                ..BlockDto::default()
+            }],
+        ),
+    });
+    eprintln!("a4_import post_import_save={save:?}");
+    if matches!(save, Ok(SyncApplicationPageSaveOutcome::Saved { .. })) {
+        drain_managed_local(&handle);
+    }
+
+    // Reopen: does replaying the accepted tail over a >4,096-page graph
+    // succeed, or does the run-local refill refuse and strand the store?
+    drop(handle);
+    let reopen_started = Instant::now();
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    eprintln!(
+        "a4_import reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+}
+
+/// The decisive data-safety probe for the A4 cap family: reach the run-local
+/// BLOCK-claim budget through ordinary application saves and observe what the
+/// store does afterwards.
+///
+/// The block-claim cap is the only member of the family with no
+/// authoring-time pre-check, so its refusal necessarily lands at acceptance —
+/// after `local_journal_drain` has already published the manifest. This test
+/// records, at the real application boundary, whether the save is refused,
+/// whether the graph keeps working, and whether the store still opens.
+#[test]
+#[ignore = "harvest A4 repro: creates >4,096 real blocks through the app (release only)"]
+fn a4_repro_managed_block_budget_and_what_it_does_to_the_next_open() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_managed_block_budget_and_what_it_does_to_the_next_open -- --ignored --nocapture"
+    );
+    let fixture = ActivationFixture::nested_unicode("a4-block-budget", 0xa4f3);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("A4 block-budget fixture activates");
+    drive_initial_feed(&handle);
+
+    const PER_PAGE: usize = 500;
+    let mut blocks_written = 0usize;
+    let mut refusal = None;
+    for page in 0..12usize {
+        let name = format!("A4 Block Budget Page {page}");
+        let blocks: Vec<BlockDto> = (0..PER_PAGE)
+            .map(|index| BlockDto {
+                id: format!("temporary-a4b-{page}-{index}"),
+                raw: format!("a4 block budget {page}-{index}"),
+                ..BlockDto::default()
+            })
+            .collect();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.clone(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(&name, SyncPageKind::Page, None, blocks),
+        });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
+                blocks_written += PER_PAGE;
+                let mut drained = false;
+                for _ in 0..4096 {
+                    let status = handle.status().unwrap();
+                    if status.managed_local_pending == 0 {
+                        drained = true;
+                        break;
+                    }
+                    handle.tick().unwrap();
+                }
+                let status = handle.status().unwrap();
+                eprintln!(
+                    "a4_blocks page={page} blocks={blocks_written} drained={drained} pending={} status={status:?}",
+                    status.managed_local_pending
+                );
+                if !drained {
+                    refusal = Some(format!("drain never settled: {status:?}"));
+                    break;
+                }
+            }
+            other => {
+                refusal = Some(format!("{other:?}"));
+                eprintln!("a4_blocks page={page} blocks={blocks_written} refusal={other:?}");
+                break;
+            }
+        }
+    }
+    eprintln!("a4_blocks final_blocks={blocks_written} refusal={refusal:?}");
+    eprintln!("a4_blocks status_before_reopen={:?}", handle.status());
+
+    drop(handle);
+    let reopen_started = Instant::now();
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    eprintln!(
+        "a4_blocks reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+}
+
+/// Child half of `setting_the_debug_flag_gates_a_core_diagnostic_line`. Runs in
+/// its own process so the process-wide flag cannot leak into sibling tests.
+#[test]
+#[ignore = "child process for the debug-flag gate probe"]
+fn w4_i5b_debug_flag_gate_child() {
+    if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
+        set_runtime_debug_diagnostics(true);
+    }
+    let mut trace = CleanOpenStageTrace::new();
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+        &mut |_, _| {},
+    );
+}
+
+/// I-12: the host process, not the environment, decides whether core emits its
+/// debug diagnostics. Both children run with `TINE_DEBUG=1` set; only the one
+/// that went through the setter may print.
+#[test]
+fn setting_the_debug_flag_gates_a_core_diagnostic_line() {
+    let marker = "managed clean open stage";
+    let run = |set_flag: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sync_runtime::tests::w4_i5b_debug_flag_gate_child",
+                "--nocapture",
+            ])
+            .env("TINE_DEBUG", "1")
+            .env("TINE_I5B_SET_FLAG", set_flag)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "debug-flag gate child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(
+        !run("0").contains(marker),
+        "I-12: a bare TINE_DEBUG in the environment still switched a core diagnostic on. \
+         Core owns the flag and src-tauri's `debug_init` pushes the parsed opt-in into it \
+         through `set_runtime_debug_diagnostics`; nothing in core may re-read the environment."
+    );
+    assert!(
+        run("1").contains(marker),
+        "I-11: `set_runtime_debug_diagnostics(true)` did not switch the core diagnostic on, \
+         so the flag's name and its gate disagree. The setter is plain and idempotent over an \
+         AtomicBool; `runtime_debug_diagnostics_enabled()` is the only reader."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W4-C7b — one query driver per question, one bounded-reference loop, one
+// reference visitor, one navigation overlay per request.
+//
+// The structural tests below pin EXCLUSIVE OWNERSHIP of an algorithm plus
+// delegation from every named producer. They deliberately do not count family
+// membership: renaming a twin, or wrapping two retained copies in a common
+// function, lowers a count while shipping the whole defect.
+// ---------------------------------------------------------------------------
+
+fn c7b_repository_source(relative: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative),
+    )
+    .unwrap_or_else(|error| panic!("{relative} is readable: {error}"))
+}
+
+/// The exact production body of `fn <name>` in `relative`, sliced by the
+/// parsed brace span so a marker inside a comment or a string still belongs to
+/// the function that contains it, and a nested `fn` cannot be mistaken for the
+/// outer one.
+fn c7b_fn_body(relative: &str, name: &str) -> String {
+    use syn::visit::{self, Visit};
+
+    struct Finder<'a> {
+        name: &'a str,
+        spans: Vec<(usize, usize)>,
+    }
+    impl<'a> Finder<'a> {
+        fn record(&mut self, ident: &syn::Ident, block: &syn::Block) {
+            if ident == self.name {
+                let span = block.brace_token.span.join();
+                self.spans.push((span.start().line, span.end().line));
+            }
+        }
+    }
+    impl<'ast, 'a> Visit<'ast> for Finder<'a> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            self.record(&item.sig.ident, &item.block);
+            visit::visit_item_fn(self, item);
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.record(&item.sig.ident, &item.block);
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    let source = c7b_repository_source(relative);
+    let file = syn::parse_file(&source).expect("production source parses");
+    let mut finder = Finder {
+        name,
+        spans: Vec::new(),
+    };
+    finder.visit_file(&file);
+    assert_eq!(
+        finder.spans.len(),
+        1,
+        "{relative} must define exactly one `{name}`; found {}",
+        finder.spans.len()
+    );
+    let (start, end) = finder.spans[0];
+    source
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const C7B_QUERY_RS: &str = "crates/tine-core/src/query.rs";
+const C7B_SYNC_RUNTIME_RS: &str = "crates/tine-core/src/sync_runtime.rs";
+
+#[test]
+fn c7b_query_driver_producers_share_one_page_source() {
+    // (named production producer, the shared driver it must delegate to)
+    let pairs = [
+        ("run_query_bounded", "run_query_bounded_over"),
+        (
+            "run_application_query_pages_bounded",
+            "run_query_bounded_over",
+        ),
+        ("run_pred_bounded", "run_pred_bounded_over"),
+        (
+            "run_advanced_query_bounded",
+            "run_advanced_query_bounded_over",
+        ),
+        (
+            "run_application_advanced_query_pages_bounded",
+            "run_advanced_query_bounded_over",
+        ),
+        ("export_query_subtrees", "export_query_subtrees_over"),
+        (
+            "export_application_query_subtrees",
+            "export_query_subtrees_over",
+        ),
+    ];
+    // The algorithm itself: budget, page loop, OG root filter, export selection
+    // ceiling, and the hydration-page construction.
+    let algorithm = [
+        "ConstructionBudget::new(",
+        "collect_og_query_roots(",
+        "for_each_page(",
+        "with_hydration_pages(",
+        "select_export_queries(",
+        "QUERY_EXPORT_CONSTRUCTION_ROWS",
+        "Pred::parse(",
+    ];
+    // The subset the shared drivers themselves must still contain; the rest
+    // (hydration-page construction) lives in a driver-private helper.
+    let owned_by_drivers = [
+        "ConstructionBudget::new(",
+        "collect_og_query_roots(",
+        "for_each_page(",
+        "select_export_queries(",
+        "QUERY_EXPORT_CONSTRUCTION_ROWS",
+        "Pred::parse(",
+    ];
+
+    for (producer, driver) in pairs {
+        let body = c7b_fn_body(C7B_QUERY_RS, producer);
+        assert!(
+            body.contains(&format!("{driver}(")),
+            "{producer} must delegate to the shared driver {driver}"
+        );
+        for marker in algorithm {
+            assert!(
+                !body.contains(marker),
+                "{producer} still owns `{marker}`; the mode adapters may only build a \
+                 QueryPageSource and call {driver} (I-12, D-4)"
+            );
+        }
+    }
+
+    // Exclusive ownership: inside the driver family, only the shared `*_over`
+    // drivers may contain the algorithm markers at all.
+    let mut family = pairs.iter().map(|(p, _)| *p).collect::<Vec<_>>();
+    family.extend(pairs.iter().map(|(_, d)| *d));
+    family.sort();
+    family.dedup();
+    for marker in owned_by_drivers {
+        let owners = family
+            .iter()
+            .filter(|name| c7b_fn_body(C7B_QUERY_RS, name).contains(marker))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            !owners.is_empty(),
+            "`{marker}` disappeared from the query-driver family; the marker is stale"
+        );
+        assert!(
+            owners.iter().all(|owner| owner.ends_with("_over")),
+            "`{marker}` is owned outside the shared drivers: {owners:?}"
+        );
+    }
+
+    // A driver that merely dispatches on the storage mode is the wrong
+    // implementation this obligation exists to reject: it satisfies the counts
+    // while retaining two copies. The shared drivers therefore may not name
+    // either concrete page source.
+    for (_, driver) in pairs {
+        let body = c7b_fn_body(C7B_QUERY_RS, driver);
+        for mode in ["GraphQueryPages(", "ApplicationQueryPages(", "with_pages("] {
+            assert!(
+                !body.contains(mode),
+                "{driver} must stay generic over QueryPageSource; it names `{mode}`"
+            );
+        }
+    }
+
+    // The retired managed evaluator must be gone from production, not renamed.
+    let files = crate::projection_producer_census::production_rust();
+    for retired in [
+        "run_application_pred_pages_bounded",
+        "application_page_block_referrers_dto",
+    ] {
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.code.contains(&format!("fn {retired}("))),
+            "{retired} must not exist in production"
+        );
+    }
+}
+
+#[test]
+fn c7b_reference_grouping_has_one_algorithm_owner() {
+    // Budget admission, per-page grouping, total/exceeded and display order all
+    // belong to `query::BoundedReferenceGroups`; these three are call sites.
+    for (file, producer) in [
+        (C7B_QUERY_RS, "collect_reference_occurrences_bounded"),
+        (C7B_SYNC_RUNTIME_RS, "bound_application_reference_sources"),
+        (C7B_SYNC_RUNTIME_RS, "application_block_referrers_ready"),
+    ] {
+        let body = c7b_fn_body(file, producer);
+        for required in ["BoundedReferenceGroups::new(", ".page(", ".finish()"] {
+            assert!(
+                body.contains(required),
+                "{producer} must reach grouping through the shared accumulator ({required})"
+            );
+        }
+        assert!(
+            !body.contains("ConstructionBudget"),
+            "{producer} must not own budget admission; BoundedReferenceGroups does"
+        );
+    }
+
+    // Exclusive ownership of the display order. One production call site means
+    // one producer of the answer "in what order are reference groups shown".
+    let files = crate::projection_producer_census::production_rust();
+    assert_eq!(
+        crate::projection_producer_census::call_count(files, "reference_group_display_order"),
+        1,
+        "reference group display order has exactly one production call site \
+         (BoundedReferenceGroups::finish)"
+    );
+    let accumulator = c7b_repository_source(C7B_QUERY_RS);
+    let accumulator = accumulator
+        .split_once("impl BoundedReferenceGroups {")
+        .and_then(|(_, tail)| tail.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("BoundedReferenceGroups has a bounded impl block");
+    assert!(
+        accumulator.contains("reference_group_display_order("),
+        "that call site is inside BoundedReferenceGroups (its finish)"
+    );
+    // And exactly one accumulator type exists.
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file.code.contains("impl BoundedReferenceGroups"))
+            .count(),
+        1,
+        "BoundedReferenceGroups has one implementation"
+    );
+}
+
+#[test]
+fn c7b_managed_reference_reads_use_shared_docblock_visitors() {
+    // Every Managed reference read obtains the page forest from the retained
+    // projection and delegates the walk; none of them may carry a private
+    // BlockDto visitor, a DTO conversion, or its own reference match loop.
+    for producer in [
+        "application_backlinks_ready",
+        "application_unlinked_references_ready",
+        "application_block_referrers_ready",
+    ] {
+        let body = c7b_fn_body(C7B_SYNC_RUNTIME_RS, producer);
+        assert!(
+            body.contains("application_projection_roots("),
+            "{producer} must take the page forest from the retained projection"
+        );
+        for forbidden in [
+            "dto_block_to_doc_block",
+            "flatten_application_blocks",
+            "application_query_doc_block",
+            "render::block_refs",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{producer} must not rebuild or re-walk a BlockDto tree (`{forbidden}`)"
+            );
+        }
+    }
+
+    // The two shared visitors are exactly that: they walk a DocBlock forest
+    // through the ONE traversal primitive and own no recursion of their own.
+    for visitor in [
+        "application_page_reference_matches",
+        "application_page_block_referrers",
+    ] {
+        let body = c7b_fn_body(C7B_QUERY_RS, visitor);
+        assert!(
+            body.contains("collect_reference_matches("),
+            "{visitor} must walk through the shared reference visitor"
+        );
+        for forbidden in ["fn visit(", "dto_block_to_doc_block", "block.children"] {
+            assert!(
+                !body.contains(forbidden),
+                "{visitor} must not carry its own tree walk (`{forbidden}`)"
+            );
+        }
+    }
+
+    // The managed twin must be gone from sync_runtime.rs, not renamed there.
+    let files = crate::projection_producer_census::production_rust();
+    let sync_runtime = files
+        .iter()
+        .find(|file| file.relative == C7B_SYNC_RUNTIME_RS)
+        .expect("sync_runtime.rs is production source");
+    assert!(
+        !sync_runtime
+            .code
+            .contains("fn application_page_block_referrers("),
+        "the managed block-referrer twin lives in query.rs beside the shared visitor"
+    );
+    assert!(
+        !sync_runtime.code.contains("fn application_crumb_line("),
+        "the managed per-block crumb producer is retired; crumbs come from the forest"
+    );
+}
+
+/// A graph with the shapes the reference and query surfaces actually fork on:
+/// journals and ordinary pages, an alias, a page-property (preamble) reference,
+/// nested blocks with breadcrumbs, Org beside Markdown, and a durable `id::`
+/// with a block reference to it.
+///
+/// It deliberately does NOT contain two files whose titles fold to one logical
+/// page. That shape cannot be used as a parity oracle: Managed activation
+/// ingests at most one document per canonical page key, so a second such file
+/// loads as `Missing` and the two backends differ for a reason that lives in
+/// ingestion, not in any evaluator this fixture exercises. See `RECEIPT.md`
+/// (Forks) for the measurement that established it.
+fn c7b_parity_fixture(label: &str, seed: u128) -> ActivationFixture {
+    let fixture = ActivationFixture::nested_unicode(label, seed);
+    let notes = fixture.graph_root.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(
+        notes.join("Topic.md"),
+        "alias:: Subject\n\n- the topic page's own block\n",
+    )
+    .unwrap();
+    fs::write(
+        notes.join("Ref One.md"),
+        "tags:: Topic\n\n- parent block\n\t- child mentions [[Topic]] here\n\t\t- grandchild plain Topic mention\n- anchor block\n  id:: 11111111-1111-4111-8111-111111111111\n- refers to ((11111111-1111-4111-8111-111111111111))\n",
+    )
+    .unwrap();
+    fs::write(
+        notes.join("Ref Two.org"),
+        "* org block referencing [[Topic]]\n** nested org child mentioning Subject\n",
+    )
+    .unwrap();
+    fs::write(notes.join("Third Ref.md"), "- third file [[Topic]]\n").unwrap();
+    // THREE journals, deliberately: with one, a backend that loses the journal
+    // ordinal entirely still produces the right answer, and the oracle proves
+    // nothing about journal ordering. Their filename order and their date order
+    // disagree, so ordering by name cannot masquerade as ordering by date.
+    for (file, body) in [
+        (
+            "01-09-2026.md",
+            "- journal mentions [[Topic]] and TODO topic work\n",
+        ),
+        ("30-08-2026.md", "- older journal mentions [[Topic]]\n"),
+        ("02-09-2026.md", "- newest journal mentions [[Topic]]\n"),
+    ] {
+        fs::write(fixture.graph_root.join("diary").join(file), body).unwrap();
+    }
+    fixture
+}
+
+/// `BlockDto::id` is a session-local handle whose value differs by mode (see
+/// `docs/contracts/managed-read-surface.md`), so it is normalized out before
+/// comparison. Everything else — raw text, breadcrumbs, facets, evidence
+/// occurrences, group order, `total`, `exceeded` — is compared literally.
+fn c7b_normalize_ids(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["id", "block_id"] {
+                if let Some(slot) = map.get_mut(key) {
+                    *slot = serde_json::Value::Null;
+                }
+            }
+            for (_, nested) in map.iter_mut() {
+                c7b_normalize_ids(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                c7b_normalize_ids(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn c7b_comparable<T: serde::Serialize>(value: T) -> serde_json::Value {
+    let mut json = serde_json::to_value(value).unwrap();
+    c7b_normalize_ids(&mut json);
+    json
+}
+
+fn c7b_navigation(
+    handle: &SyncRuntimeHandle,
+    request: SyncApplicationNavigationRequest,
+) -> SyncApplicationNavigationReply {
+    match handle.application_navigation(request).unwrap() {
+        SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+        other => panic!("managed navigation deferred instead of loading: {other:?}"),
+    }
+}
+
+const C7B_TARGET: &str = "Topic";
+const C7B_ANCHOR: &str = "11111111-1111-4111-8111-111111111111";
+
+fn c7b_activated(fixture: &ActivationFixture) -> SyncRuntimeHandle {
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("the parity fixture activates");
+    drive_initial_feed(&handle);
+    handle
+}
+
+#[test]
+fn c7b_query_driver_parity() {
+    let fixture = c7b_parity_fixture("c7b-query-parity", 0xc7b2);
+    let direct = Graph::open(&fixture.graph_root);
+
+    const ROWS: usize = 64;
+    const BYTES: usize = 1 << 20;
+    // A generous run and a deliberately truncating run: the bounds are where
+    // two evaluators most easily disagree about WHICH rows survive.
+    let bounds = [(ROWS, BYTES), (2, 512)];
+    // The third query reads the page's journal ordinal, which nothing else here
+    // does: journal page NAMES are ISO, so their lexical order already agrees
+    // with their date order, and a backend that supplied no ordinal at all would
+    // still order every other answer correctly.
+    let simple_queries = [
+        "[[Topic]]",
+        "(and [[Topic]] (not (page \"Topic\")))",
+        "(and [[Topic]] (between [[Jan 1st, 2026]] [[Dec 31st, 2026]]))",
+    ];
+    let advanced_query =
+        "{:query [:find (pull ?b [*]) :where [?b :block/refs ?p] [?p :block/name \"topic\"]]}";
+
+    let mut direct_simple = Vec::new();
+    for query in simple_queries {
+        for (rows, bytes) in bounds {
+            let result = direct.run_query_bounded(query, rows, bytes);
+            direct_simple.push(c7b_comparable((
+                &*result.groups,
+                result.total,
+                result.exceeded,
+            )));
+        }
+    }
+    let direct_advanced = bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let (result, exceeded, total) = crate::query::run_advanced_query_bounded(
+                &direct,
+                advanced_query,
+                None,
+                *rows,
+                *bytes,
+            );
+            c7b_comparable((result, exceeded, total))
+        })
+        .collect::<Vec<_>>();
+    let specs = vec![
+        crate::query::QueryExportSpec {
+            key: "simple".into(),
+            query: "[[Topic]]".into(),
+            advanced: false,
+        },
+        crate::query::QueryExportSpec {
+            key: "advanced".into(),
+            query: advanced_query.into(),
+            advanced: true,
+        },
+    ];
+    let direct_export = c7b_comparable(crate::query::export_query_subtrees(
+        &direct, &specs, 8, 32, 512, BYTES,
+    ));
+
+    // Non-vacuity: a parity oracle over two empty answers proves nothing.
+    let simple_rows = direct
+        .run_query_bounded("[[Topic]]", ROWS, BYTES)
+        .groups
+        .iter()
+        .map(|group| group.blocks.len())
+        .sum::<usize>();
+    assert!(
+        simple_rows >= 4,
+        "the fixture must produce a non-trivial simple-query answer, got {simple_rows}"
+    );
+
+    let handle = c7b_activated(&fixture);
+
+    let mut managed_simple = Vec::new();
+    for query in simple_queries {
+        for (rows, bytes) in bounds {
+            let row = match c7b_navigation(
+                &handle,
+                SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.to_owned(),
+                    max_rows: rows,
+                    max_bytes: bytes,
+                },
+            ) {
+                SyncApplicationNavigationReply::SimpleQuery(result) => {
+                    c7b_comparable((result.groups, result.total, result.exceeded))
+                }
+                other => panic!("unexpected simple-query reply: {other:?}"),
+            };
+            managed_simple.push(row);
+        }
+    }
+    let managed_advanced = bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            match c7b_navigation(
+                &handle,
+                SyncApplicationNavigationRequest::AdvancedQuery {
+                    query: advanced_query.to_owned(),
+                    current_page: None,
+                    max_rows: *rows,
+                    max_bytes: *bytes,
+                },
+            ) {
+                SyncApplicationNavigationReply::AdvancedQuery(result) => {
+                    c7b_comparable((result.result, result.exceeded, result.total))
+                }
+                other => panic!("unexpected advanced-query reply: {other:?}"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let managed_export = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::ExportQuerySubtrees {
+            specs,
+            max_queries: 8,
+            max_roots: 32,
+            max_nodes: 512,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::ExportQuerySubtrees(batch) => c7b_comparable(batch),
+        other => panic!("unexpected export reply: {other:?}"),
+    };
+
+    assert_eq!(managed_simple, direct_simple, "simple-query parity");
+    assert_eq!(managed_advanced, direct_advanced, "advanced-query parity");
+    assert_eq!(managed_export, direct_export, "query-export parity");
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_bounded_reference_grouping_parity() {
+    let fixture = c7b_parity_fixture("c7b-reference-parity", 0xc7b3);
+    let direct = Graph::open(&fixture.graph_root);
+
+    const BYTES: usize = 1 << 20;
+    // Bounds where BOTH backends answer exactly: the generous one, and a byte
+    // bound, which every backend applies against the same construction budget.
+    let exact_bounds = [(64_usize, BYTES), (64, 400)];
+
+    let direct_reference = exact_bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let backlinks = direct.backlinks_bounded(C7B_TARGET, *rows, *bytes);
+            let unlinked = direct.unlinked_refs_bounded(C7B_TARGET, *rows, *bytes);
+            let referrers = direct.block_referrers_bounded(C7B_ANCHOR, *rows, *bytes);
+            c7b_comparable((
+                (&*backlinks.groups, backlinks.total, backlinks.exceeded),
+                (&*unlinked.groups, unlinked.total, unlinked.exceeded),
+                (&*referrers.groups, referrers.total, referrers.exceeded),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // Non-vacuity: the generous bound must retain rows from several pages and
+    // the tight bounds must actually truncate, or the oracle compares three
+    // copies of the same answer.
+    let full = direct.backlinks_bounded(C7B_TARGET, 64, BYTES);
+    assert!(
+        full.groups.len() >= 3 && full.total >= 4,
+        "the fixture must produce a multi-page backlink answer, got {} groups / {} rows",
+        full.groups.len(),
+        full.total
+    );
+    assert!(
+        direct.backlinks_bounded(C7B_TARGET, 2, BYTES).exceeded
+            && direct.backlinks_bounded(C7B_TARGET, 64, 400).exceeded,
+        "both tight bounds must truncate, or the bounded oracle proves nothing"
+    );
+    assert!(
+        direct.block_referrers_bounded(C7B_ANCHOR, 64, BYTES).total >= 1,
+        "the fixture must produce a real block referrer"
+    );
+
+    let handle = c7b_activated(&fixture);
+    let managed_backlinks = |rows: usize, bytes: usize| match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::Backlinks {
+            name: C7B_TARGET.to_owned(),
+            max_rows: rows,
+            max_bytes: bytes,
+        },
+    ) {
+        SyncApplicationNavigationReply::Backlinks(result) => result,
+        other => panic!("unexpected backlinks reply: {other:?}"),
+    };
+    let managed_reference = exact_bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let groups = |request| match c7b_navigation(&handle, request) {
+                SyncApplicationNavigationReply::UnlinkedReferences(result)
+                | SyncApplicationNavigationReply::BlockReferrers(result) => result,
+                other => panic!("unexpected reference reply: {other:?}"),
+            };
+            let backlinks = managed_backlinks(*rows, *bytes);
+            let unlinked = groups(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: C7B_TARGET.to_owned(),
+                max_rows: *rows,
+                max_bytes: *bytes,
+            });
+            let referrers = groups(SyncApplicationNavigationRequest::BlockReferrers {
+                uuid: C7B_ANCHOR.to_owned(),
+                max_rows: *rows,
+                max_bytes: *bytes,
+            });
+            c7b_comparable((
+                (backlinks.groups, backlinks.total, backlinks.exceeded),
+                (unlinked.groups, unlinked.total, unlinked.exceeded),
+                (referrers.groups, referrers.total, referrers.exceeded),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        managed_reference, direct_reference,
+        "bounded reference grouping parity (retained rows, order, evidence, total, exceeded)"
+    );
+
+    // Row-truncated backlinks are NOT an exact-parity case, and deliberately so.
+    // `bound_application_reference_sources` takes a `lower_bound_exceeded` flag
+    // because the Managed backlink path stops enumerating candidate source pages
+    // once the row bound is already blown, and then reports `total` as a lower
+    // bound. That pre-bound predates this packet and is untouched by it (the
+    // flag and its `total.max(max_rows + 1)` latch are unchanged context in the
+    // diff), so a different retained subset here is a candidate-selection
+    // difference, not a grouping-algorithm difference.
+    //
+    // What the SHARED accumulator does own under truncation is asserted here:
+    // it never admits more than the row bound, it latches `exceeded`, it emits
+    // no empty group, it never invents a row, and it keeps the untruncated
+    // display order. A private grouping copy that admitted an extra row, kept an
+    // emptied group, or re-sorted its groups fails on both backends.
+    let untruncated = c7b_comparable(&*full.groups);
+    let untruncated_groups = untruncated.as_array().unwrap();
+    for (label, truncated) in [
+        (
+            "direct",
+            c7b_comparable(&*direct.backlinks_bounded(C7B_TARGET, 2, BYTES).groups),
+        ),
+        (
+            "managed",
+            c7b_comparable(managed_backlinks(2, BYTES).groups),
+        ),
+    ] {
+        let groups = truncated.as_array().unwrap();
+        let rows: usize = groups
+            .iter()
+            .map(|group| group["blocks"].as_array().unwrap().len())
+            .sum();
+        assert!(
+            rows <= 2 && rows > 0,
+            "{label}: the row bound admits between one and max_rows rows, got {rows}"
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|group| !group["blocks"].as_array().unwrap().is_empty()),
+            "{label}: a group emptied by truncation must not survive: {groups:?}"
+        );
+        // Every retained group is one of the untruncated groups, its rows are a
+        // prefix-free subset of that group's rows, and the groups appear in the
+        // untruncated order.
+        let mut cursor = 0usize;
+        for group in groups {
+            let position = untruncated_groups
+                .iter()
+                .position(|full_group| full_group["page"] == group["page"])
+                .unwrap_or_else(|| {
+                    panic!("{label}: truncation invented a group: {:?}", group["page"])
+                });
+            assert!(
+                position >= cursor,
+                "{label}: truncation re-ordered groups at {:?}",
+                group["page"]
+            );
+            cursor = position;
+            let full_rows = untruncated_groups[position]["blocks"].as_array().unwrap();
+            for block in group["blocks"].as_array().unwrap() {
+                assert!(
+                    full_rows.contains(block),
+                    "{label}: truncation invented a row: {:?}",
+                    block["raw"]
+                );
+            }
+        }
+    }
+    assert!(
+        managed_backlinks(2, BYTES).exceeded
+            && direct.backlinks_bounded(C7B_TARGET, 2, BYTES).exceeded,
+        "both backends latch `exceeded` when the row bound truncates"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_reference_visitor_parity() {
+    // The per-page visitor's own dimensions: page preamble, nested breadcrumbs,
+    // Org beside Markdown, alias-equivalent names, and plain vs explicit
+    // occurrence evidence.
+    let fixture = c7b_parity_fixture("c7b-visitor-parity", 0xc7b4);
+    let direct = Graph::open(&fixture.graph_root);
+    const ROWS: usize = 64;
+    const BYTES: usize = 1 << 20;
+
+    let direct_backlinks = direct.backlinks_bounded(C7B_TARGET, ROWS, BYTES);
+    let direct_unlinked = direct.unlinked_refs_bounded(C7B_TARGET, ROWS, BYTES);
+
+    // Non-vacuity for the visitor's own dimensions.
+    let all_blocks = direct_backlinks
+        .groups
+        .iter()
+        .flat_map(|group| group.blocks.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        all_blocks.iter().any(|block| block.page_property),
+        "a page-property (preamble) reference must be in the backlink answer"
+    );
+    assert!(
+        all_blocks.iter().any(|block| !block.breadcrumb.is_empty()),
+        "a nested reference must carry a breadcrumb"
+    );
+    assert!(
+        direct_backlinks
+            .groups
+            .iter()
+            .any(|group| group.page.contains("Ref Two")),
+        "the Org page must contribute a reference"
+    );
+    assert!(
+        direct_unlinked.total > 0,
+        "the fixture must produce plain (unlinked) occurrences too"
+    );
+
+    let handle = c7b_activated(&fixture);
+    let managed_backlinks = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::Backlinks {
+            name: C7B_TARGET.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::Backlinks(result) => result,
+        other => panic!("unexpected backlinks reply: {other:?}"),
+    };
+    let managed_unlinked = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::UnlinkedReferences {
+            name: C7B_TARGET.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::UnlinkedReferences(result) => result,
+        other => panic!("unexpected unlinked reply: {other:?}"),
+    };
+    let managed_referrers = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::BlockReferrers {
+            uuid: C7B_ANCHOR.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::BlockReferrers(result) => result,
+        other => panic!("unexpected referrers reply: {other:?}"),
+    };
+    let direct_referrers = direct.block_referrers_bounded(C7B_ANCHOR, ROWS, BYTES);
+
+    assert_eq!(
+        c7b_comparable((
+            managed_backlinks.groups,
+            managed_backlinks.total,
+            managed_backlinks.exceeded
+        )),
+        c7b_comparable((
+            &*direct_backlinks.groups,
+            direct_backlinks.total,
+            direct_backlinks.exceeded
+        )),
+        "per-page backlink visitor parity"
+    );
+    assert_eq!(
+        c7b_comparable((
+            managed_unlinked.groups,
+            managed_unlinked.total,
+            managed_unlinked.exceeded
+        )),
+        c7b_comparable((
+            &*direct_unlinked.groups,
+            direct_unlinked.total,
+            direct_unlinked.exceeded
+        )),
+        "per-page unlinked visitor parity"
+    );
+    assert_eq!(
+        c7b_comparable((
+            managed_referrers.groups,
+            managed_referrers.total,
+            managed_referrers.exceeded
+        )),
+        c7b_comparable((
+            &*direct_referrers.groups,
+            direct_referrers.total,
+            direct_referrers.exceeded
+        )),
+        "per-page block-referrer visitor parity"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_navigation_overlay_pending_paths_load_at_most_once_per_request() {
+    let fixture = c7b_parity_fixture("c7b-overlay-once", 0xc7b5);
+    let overlay_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+
+    let activation_handle = c7b_activated(&fixture);
+    assert!(matches!(
+        activation_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(activation_handle);
+
+    let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+    let handle = opened.handle.expect("managed reopen retains its actor");
+
+    // A committed-undrained local suffix: this is the only state in which the
+    // overlay actually loads anything, so it is the only state in which
+    // rebuilding it per consumer costs work.
+    let (mut page, revision) = load_application_exact(&handle, &overlay_path);
+    let edited = format!("{} overlay-edit", page.blocks[0].raw);
+    page.blocks[0].raw = edited.clone();
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "the overlay fixture edit must be accepted: {save:?}"
+    );
+    assert_eq!(
+        handle.status().unwrap().managed_local_pending,
+        1,
+        "the request must run with a real, undrained pending suffix"
+    );
+
+    // QuickSwitch asks pages, aliases AND referenced names: three consumers of
+    // the same overlay in one request.
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let reply = c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::QuickSwitch {
+            query: "o".into(),
+            limit: 16,
+        },
+    );
+    assert!(
+        matches!(reply, SyncApplicationNavigationReply::QuickSwitch(ref hits) if !hits.is_empty()),
+        "the QuickSwitch request must actually answer: {reply:?}"
+    );
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        counters.navigation_overlay_pending_path_loads, 1,
+        "one navigation request loads its one pending path exactly once, not once \
+         per consumer: {counters:?}"
+    );
+
+    // Drained: nothing pending, so nothing is loaded — the request-scoped value
+    // is lazy, not eager, and is not retained across requests.
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    for _ in 0..2 {
+        match c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::SimpleQuery {
+                query: "[[Topic]]".into(),
+                max_rows: 64,
+                max_bytes: 1 << 20,
+            },
+        ) {
+            SyncApplicationNavigationReply::SimpleQuery(_) => {}
+            other => panic!("unexpected simple-query reply: {other:?}"),
+        }
+    }
+    let drained = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        drained.navigation_overlay_pending_path_loads, 0,
+        "a simple query on a drained actor loads no pending path: {drained:?}"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// W4-C7b obligation 9: measurement harness.
+//
+// Structural counters gate the cuts; timing is advisory (this machine builds
+// other worktrees concurrently). The allocation counters below are defined here
+// because none exist anywhere under `crates/` -- `rg 'allocation_calls|allocated_bytes|GlobalAlloc|global_allocator' crates/`
+// returns nothing outside this block -- so there is no existing primitive to
+// reuse (D-14). They are `#[cfg(test)]` only and never enter a shipped binary.
+// ---------------------------------------------------------------------------
+
+pub(crate) mod c7b_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize) {
+        (CALLS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+    }
+}
+
+#[global_allocator]
+static C7B_ALLOCATOR: c7b_alloc::Counting = c7b_alloc::Counting;
+
+/// `pages` ordinary pages plus five journals, every one of them referencing the
+/// measured page, so a reference read and a query read both touch all of them.
+fn c7b_measurement_fixture(label: &str, pages: usize) -> ActivationFixture {
+    let fixture = ActivationFixture::nested_unicode(label, 0xc7b_0000);
+    let notes = fixture.graph_root.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("Topic.md"), "- the measured page\n").unwrap();
+    for index in 0..pages {
+        let body = (0..12)
+            .map(|block| {
+                format!(
+                    "- block {block} on page {index} mentions [[Topic]] and some ordinary prose\n\t- a nested child with **inline** markup and a [link](https://example.invalid/{block})\n"
+                )
+            })
+            .collect::<String>();
+        fs::write(notes.join(format!("Measured {index:03}.md")), body).unwrap();
+    }
+    for day in 1..=5 {
+        fs::write(
+            fixture.graph_root.join(format!("diary/0{day}-09-2026.md")),
+            "- journal block mentioning [[Topic]]\n",
+        )
+        .unwrap();
+    }
+    fixture
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct C7bSample {
+    allocation_calls: usize,
+    allocated_bytes: usize,
+    projection_cache_hits: usize,
+    projection_cache_misses: usize,
+    result_page_hydrations: usize,
+    micros: u128,
+}
+
+fn c7b_percentile(mut values: Vec<u128>, percentile: f64) -> u128 {
+    values.sort_unstable();
+    if values.is_empty() {
+        return 0;
+    }
+    let index = ((values.len() as f64 - 1.0) * percentile).round() as usize;
+    values[index]
+}
+
+fn c7b_report(label: &str, samples: &[C7bSample]) {
+    let cold = samples[0];
+    let warm = &samples[1..];
+    let micros = warm.iter().map(|sample| sample.micros).collect::<Vec<_>>();
+    let median = c7b_percentile(micros.clone(), 0.5);
+    let p95 = c7b_percentile(micros, 0.95);
+    let warm_first = warm.first().copied().unwrap_or_default();
+    println!(
+        "C7BMEASURE\t{label}\tcold_alloc_calls={}\tcold_alloc_bytes={}\tcold_hits={}\tcold_misses={}\tcold_hydrations={}\tcold_micros={}\twarm_alloc_calls={}\twarm_alloc_bytes={}\twarm_hits={}\twarm_misses={}\twarm_hydrations={}\twarm_median_micros={median}\twarm_p95_micros={p95}\trounds={}",
+        cold.allocation_calls,
+        cold.allocated_bytes,
+        cold.projection_cache_hits,
+        cold.projection_cache_misses,
+        cold.result_page_hydrations,
+        cold.micros,
+        warm_first.allocation_calls,
+        warm_first.allocated_bytes,
+        warm_first.projection_cache_hits,
+        warm_first.projection_cache_misses,
+        warm_first.result_page_hydrations,
+        warm.len(),
+    );
+}
+
+#[test]
+#[ignore = "W4-C7b measurement harness; run explicitly with --ignored"]
+fn c7b_measure_managed_and_direct_reads() {
+    const PAGES: usize = 30;
+    const ROUNDS: usize = 9;
+    const ROWS: usize = 4096;
+    const BYTES: usize = 8 << 20;
+
+    let fixture = c7b_measurement_fixture("c7b-measure", PAGES);
+
+    // Direct Files: the same workload against `Graph`, which holds an
+    // `Arc<Document>` per page and must never build a page forest for a query.
+    let direct = Graph::open(&fixture.graph_root);
+    let mut direct_reference = Vec::new();
+    let mut direct_query = Vec::new();
+    for round in 0..=ROUNDS {
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let groups = direct.backlinks_bounded("Topic", ROWS, BYTES);
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        assert!(groups.total >= PAGES, "the measured workload must be real");
+        direct_reference.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            micros,
+            ..Default::default()
+        });
+
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let result = direct.run_query_bounded("[[Topic]]", ROWS, BYTES);
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        assert!(result.total >= PAGES, "the measured workload must be real");
+        direct_query.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            micros,
+            ..Default::default()
+        });
+        let _ = round;
+    }
+    c7b_report("direct.backlinks", &direct_reference);
+    c7b_report("direct.simple_query", &direct_query);
+
+    let handle = c7b_activated(&fixture);
+    let mut managed_reference = Vec::new();
+    let mut managed_query = Vec::new();
+    for _ in 0..=ROUNDS {
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::Backlinks {
+                name: "Topic".to_owned(),
+                max_rows: ROWS,
+                max_bytes: BYTES,
+            },
+        );
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        match reply {
+            SyncApplicationNavigationReply::Backlinks(result) => {
+                assert!(result.total >= PAGES, "the measured workload must be real")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        managed_reference.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            projection_cache_hits: counters.projection_cache_hits,
+            projection_cache_misses: counters.projection_cache_misses,
+            result_page_hydrations: counters.result_page_hydrations,
+            micros,
+        });
+
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::SimpleQuery {
+                query: "[[Topic]]".to_owned(),
+                max_rows: ROWS,
+                max_bytes: BYTES,
+            },
+        );
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        match reply {
+            SyncApplicationNavigationReply::SimpleQuery(result) => {
+                assert!(result.total >= PAGES, "the measured workload must be real")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        managed_query.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            projection_cache_hits: counters.projection_cache_hits,
+            projection_cache_misses: counters.projection_cache_misses,
+            result_page_hydrations: counters.result_page_hydrations,
+            micros,
+        });
+    }
+    c7b_report("managed.backlinks", &managed_reference);
+    c7b_report("managed.simple_query", &managed_query);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Obligation 9's real-graph regression run. Reads a COPY of the anonymized
+/// corpus named by `C7B_CORPUS`; it copies first because managed activation
+/// writes provider state into the graph root. Reports counts and timings only.
+#[test]
+#[ignore = "W4-C7b corpus measurement; run explicitly with C7B_CORPUS=<path> --ignored"]
+fn c7b_measure_anonymized_corpus() {
+    let Ok(corpus) = std::env::var("C7B_CORPUS") else {
+        panic!("set C7B_CORPUS to the corpus path");
+    };
+    let root = std::env::temp_dir().join(format!("tine-c7b-corpus-{}", Uuid::new_v4()));
+    let graph_root = root.join("graph");
+    fs::create_dir_all(&graph_root).unwrap();
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{corpus}/."))
+        .arg(&graph_root)
+        .status()
+        .unwrap();
+    assert!(status.success(), "corpus copy failed");
+
+    let direct = Graph::open(&graph_root);
+    let pages = direct.list_pages().len();
+    assert!(pages > 500, "the corpus must be the real one, got {pages}");
+    let target = direct
+        .list_pages()
+        .into_iter()
+        .filter(|entry| entry.kind == PageKind::Page)
+        .map(|entry| entry.name)
+        .max_by_key(|name| direct.backlinks_bounded(name, 4096, 8 << 20).total)
+        .expect("the corpus has pages");
+    let referenced = direct.backlinks_bounded(&target, 4096, 8 << 20).total;
+
+    let mut direct_micros = Vec::new();
+    let mut direct_calls = Vec::new();
+    for _ in 0..5 {
+        let (calls, _) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let groups = direct.backlinks_bounded(&target, 4096, 8 << 20);
+        direct_micros.push(started.elapsed().as_micros());
+        let (calls_after, _) = c7b_alloc::snapshot();
+        direct_calls.push(calls_after - calls);
+        assert_eq!(groups.total, referenced);
+    }
+
+    let request = SyncLocalActivationRequest {
+        archive_root: root.join("private/archive"),
+        graph_root: graph_root.clone(),
+        enrollment_root: root.join("private/enrollment"),
+        receipt_root: root.join("private/receipts"),
+        database_path: root.join("private/projection/bootstrap.sqlite"),
+        application_runtime_root: root.join("private/runtime"),
+        capture_root: root.join("private/capture"),
+        preparation_root: root.join("private/preparation"),
+        provider_root: graph_root.join(".tine-sync/v2/shared"),
+        provider_journal_root: root.join("private/provider/device/journal"),
+        identities: {
+            let seed: u128 = 0xc7b_c0d5;
+            SyncLocalActivationIdentities {
+                workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                preparation_id: Uuid::from_u128(seed + 4),
+                session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+            }
+        },
+    };
+    let activation_started = std::time::Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(request);
+    let activation_micros = activation_started.elapsed().as_micros();
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("the corpus activates");
+    drive_initial_feed(&handle);
+
+    let mut managed_micros = Vec::new();
+    let mut managed_calls = Vec::new();
+    let mut last = (0usize, 0usize, 0usize);
+    for _ in 0..5 {
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, _) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::Backlinks {
+                name: target.clone(),
+                max_rows: 4096,
+                max_bytes: 8 << 20,
+            },
+        );
+        managed_micros.push(started.elapsed().as_micros());
+        let (calls_after, _) = c7b_alloc::snapshot();
+        managed_calls.push(calls_after - calls);
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        last = (
+            counters.projection_cache_hits,
+            counters.projection_cache_misses,
+            counters.result_page_hydrations,
+        );
+        match reply {
+            SyncApplicationNavigationReply::Backlinks(result) => {
+                assert_eq!(
+                    result.total, referenced,
+                    "managed and direct agree on the corpus"
+                )
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+    println!(
+        "C7BCORPUS\tpages={pages}\treferencing_rows={referenced}\tactivation_micros={activation_micros}\tdirect_cold_micros={}\tdirect_warm_median_micros={}\tdirect_warm_alloc_calls={}\tmanaged_cold_micros={}\tmanaged_warm_median_micros={}\tmanaged_warm_alloc_calls={}\twarm_hits={}\twarm_misses={}\twarm_hydrations={}",
+        direct_micros[0],
+        c7b_percentile(direct_micros[1..].to_vec(), 0.5),
+        direct_calls[1],
+        managed_micros[0],
+        c7b_percentile(managed_micros[1..].to_vec(), 0.5),
+        managed_calls[1],
+        last.0,
+        last.1,
+        last.2,
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    let _ = fs::remove_dir_all(&root);
 }

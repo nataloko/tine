@@ -20,8 +20,13 @@ const BACKUP_KEEP_DEFAULT: usize = 12;
 const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) -> Result<(), String> {
-    let graph = slot.legacy_graph()?;
+pub(crate) fn backup_async(
+    app: tauri::AppHandle,
+    slot: Arc<GraphSlot>,
+) -> Result<(), crate::command_error::CommandError> {
+    let graph = slot
+        .legacy_graph()
+        .map_err(crate::command_error::CommandError::from)?;
     let source = BackupSource::from_graph(&graph);
     drop(graph);
     std::thread::spawn(move || {
@@ -131,12 +136,12 @@ struct SnapshotGraphTextPolicy {
 }
 
 impl SnapshotGraphTextPolicy {
-    fn scope(&self) -> Result<GraphTextScope, String> {
+    fn scope(&self) -> Result<GraphTextScope, crate::command_error::CommandError> {
         if self.version != GRAPH_TEXT_SCOPE_VERSION {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::backup(format!(
                 "backup uses unsupported graph-text policy version {}",
                 self.version
-            ));
+            )));
         }
         Ok(GraphTextScope::new(
             &self.hidden,
@@ -414,14 +419,16 @@ pub(crate) fn set_backup_keep(
     keep: usize,
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let keep = keep.clamp(1, 1000);
     update_settings(&app, |json| {
         json["backup_keep"] = serde_json::json!(keep);
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
-    let slot = slot_for_context(&state)?;
-    let graph = slot.legacy_graph()?;
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let graph = slot
+        .legacy_graph()
+        .map_err(crate::command_error::CommandError::from)?;
     if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
@@ -449,12 +456,37 @@ pub(crate) fn concord_ledger_dir(
     Some(data_dir.join("concord-ledger").join(root_backup_id(root)))
 }
 
+/// The Direct-move recovery store for a graph root
+/// (`<app-data>/direct-move-recovery/<id>`, the same root-id convention as
+/// backups and the Concord ledger).
+///
+/// App-private and graph-keyed, deliberately OUTSIDE the graph tree: the graph
+/// directory is Logseq-shared surface and a sync transport carries it, so a
+/// device's in-flight move record must never travel with it
+/// (`docs/contracts/direct-move-recovery.md` §2).
+pub(crate) fn direct_move_recovery_dir(
+    app: &tauri::AppHandle,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    let data_dir = app.path().app_data_dir().ok()?;
+    Some(
+        data_dir
+            .join("direct-move-recovery")
+            .join(root_backup_id(root)),
+    )
+}
+
 #[tauri::command]
 pub(crate) async fn list_backups(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<Vec<BackupInfo>, String> {
-    let root = slot_for_context(&state)?.legacy_graph()?.root.clone();
+) -> Result<Vec<BackupInfo>, crate::command_error::CommandError> {
+    let root = slot_for_context(&state)
+        .map_err(crate::command_error::CommandError::from)?
+        .legacy_graph()
+        .map_err(crate::command_error::CommandError::from)?
+        .root
+        .clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(base) = backup_base_for_root(&app, &root) else {
             return Vec::new();
@@ -462,7 +494,7 @@ pub(crate) async fn list_backups(
         list_backups_from_base(&base, &root)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(crate::command_error::CommandError::worker)
 }
 
 fn list_backups_from_base(base: &std::path::Path, root: &std::path::Path) -> Vec<BackupInfo> {
@@ -505,28 +537,33 @@ pub(crate) async fn restore_backup(
     stamp: String,
     app: tauri::AppHandle,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     // Guard against path traversal — a stamp is only ever `YYYY-MM-DD_HH-MM-SS`.
     if stamp.is_empty()
         || !stamp
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err("invalid backup id".into());
+        return Err(crate::command_error::CommandError::prose(
+            "invalid backup id",
+        ));
     }
-    let slot = slot_for_context(&state)?;
-    let graph = slot.legacy_graph_cloned()?;
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let graph = slot
+        .legacy_graph_cloned()
+        .map_err(crate::command_error::CommandError::from)?;
     let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let base = backup_base_for_root(&restore_app, &source.root).ok_or("no app-data dir")?;
+        let base = backup_base_for_root(&restore_app, &source.root)
+            .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
         restore_from_backup_source(&stamp, &base, source, |source| {
             do_backup_source(&restore_app, source.clone(), "pre-restore")
         })
     })
     .await
-    .map_err(|error| error.to_string())??;
-    crate::state::refresh_graph(&state)
+    .map_err(crate::command_error::CommandError::worker)??;
+    crate::state::refresh_graph(&state).map_err(crate::command_error::CommandError::from)
 }
 
 fn restore_from_backup_source(
@@ -534,22 +571,30 @@ fn restore_from_backup_source(
     base: &std::path::Path,
     source: BackupSource,
     snapshot_current: impl FnOnce(&BackupSource) -> (usize, bool),
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let assets = source.assets.clone();
     let cfg_dest = source.cfg.clone();
     let src = base.join(&stamp);
     if !src.is_dir() {
-        return Err("backup not found".into());
+        return Err(crate::command_error::CommandError::prose(
+            "backup not found",
+        ));
     }
-    let manifest = read_manifest(&src).ok_or("backup is incomplete or unverified")?;
+    let manifest = read_manifest(&src).ok_or_else(|| {
+        crate::command_error::CommandError::prose("backup is incomplete or unverified")
+    })?;
     let current_root = std::fs::canonicalize(&source.root).unwrap_or_else(|_| source.root.clone());
     if manifest.root != current_root.display().to_string() {
-        return Err("backup belongs to a different graph".into());
+        return Err(crate::command_error::CommandError::prose(
+            "backup belongs to a different graph",
+        ));
     }
     if !verify_snapshot(&src, &manifest) {
-        return Err("backup contents do not match the verified manifest".into());
+        return Err(crate::command_error::CommandError::prose(
+            "backup contents do not match the verified manifest",
+        ));
     }
-    let safe_dir = |raw: &str| -> Result<PathBuf, String> {
+    let safe_dir = |raw: &str| -> Result<PathBuf, crate::command_error::CommandError> {
         let rel = std::path::Path::new(raw);
         if raw.is_empty()
             || raw.contains('\\')
@@ -558,32 +603,39 @@ fn restore_from_backup_source(
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
         {
-            return Err("backup contains an unsafe graph directory".into());
+            return Err(crate::command_error::CommandError::prose(
+                "backup contains an unsafe graph directory",
+            ));
         }
         Ok(current_root.join(rel))
     };
     let legacy_restore_roots = (manifest.schema == LEGACY_SNAPSHOT_SCHEMA)
         .then(|| {
-            Ok::<_, String>((
+            Ok::<_, crate::command_error::CommandError>((
                 safe_dir(&manifest.journals_dir)?,
                 safe_dir(&manifest.pages_dir)?,
             ))
         })
         .transpose()?;
-    let validate_live_layout = || -> Result<(), String> {
-        ensure_target_within_root(&current_root, &cfg_dest)
-            .map_err(|e| format!("unsafe live config path: {e}"))?;
+    let validate_live_layout = || -> Result<(), crate::command_error::CommandError> {
+        ensure_target_within_root(&current_root, &cfg_dest).map_err(|e| {
+            crate::command_error::CommandError::backup(format!("unsafe live config path: {e}"))
+        })?;
         if let Some((journals, pages)) = &legacy_restore_roots {
             for (label, path) in [("journals", journals), ("pages", pages)] {
-                ensure_target_within_root(&current_root, path)
-                    .map_err(|e| format!("unsafe live {label} path: {e}"))?;
+                ensure_target_within_root(&current_root, path).map_err(|e| {
+                    crate::command_error::CommandError::backup(format!(
+                        "unsafe live {label} path: {e}"
+                    ))
+                })?;
             }
         }
         // Assets have a separate, explicitly-approved capability and therefore
         // validate against their own canonical root. For ordinary graphs this is
         // still `<graph>/assets`; for GH #127 it is the approved external target.
-        ensure_target_within_root(&assets, &assets)
-            .map_err(|e| format!("unsafe live assets path: {e}"))?;
+        ensure_target_within_root(&assets, &assets).map_err(|e| {
+            crate::command_error::CommandError::backup(format!("unsafe live assets path: {e}"))
+        })?;
         Ok(())
     };
     validate_live_layout()?;
@@ -598,13 +650,21 @@ fn restore_from_backup_source(
         std::path::Path::new("logseq/.tine-trash"),
         &recovery_id,
     )
-    .map_err(|e| format!("couldn't create restore recovery area: {e}"))?;
+    .map_err(|e| {
+        crate::command_error::CommandError::backup(format!(
+            "couldn't create restore recovery area: {e}"
+        ))
+    })?;
     let asset_recovery = reserve_restore_recovery(
         &assets,
         std::path::Path::new(ASSET_RESTORE_RECOVERY_DIR),
         &recovery_id,
     )
-    .map_err(|e| format!("couldn't create asset restore recovery area: {e}"))?;
+    .map_err(|e| {
+        crate::command_error::CommandError::backup(format!(
+            "couldn't create asset restore recovery area: {e}"
+        ))
+    })?;
     // Safety net: snapshot the current (pre-restore) state first, under a distinct
     // name so it can't collide with (or be pruned by) the launch snapshot the
     // post-restore reload will take. Abort if the snapshot fails while the live
@@ -613,9 +673,9 @@ fn restore_from_backup_source(
     // A destructive restore must be fully reversible. A successful empty
     // snapshot is valid; any failed copy or traversal aborts the restore.
     if !complete {
-        return Err(
-            "couldn't create a complete pre-restore safety snapshot — restore aborted".into(),
-        );
+        return Err(crate::command_error::CommandError::backup(
+            "couldn't create a complete pre-restore safety snapshot — restore aborted",
+        ));
     }
     // The safety snapshot can take time. Revalidate after it so a symlink swap
     // cannot redirect the destructive copy/delete phase outside the graph.
@@ -625,9 +685,17 @@ fn restore_from_backup_source(
         SNAPSHOT_SCHEMA => manifest
             .graph_text_policy
             .as_ref()
-            .ok_or("backup does not record its graph-text policy")?
+            .ok_or_else(|| {
+                crate::command_error::CommandError::prose(
+                    "backup does not record its graph-text policy",
+                )
+            })?
             .scope()?,
-        _ => return Err("backup uses an unsupported snapshot schema".into()),
+        _ => {
+            return Err(crate::command_error::CommandError::prose(
+                "backup uses an unsupported snapshot schema",
+            ))
+        }
     };
     // Copies happen before extras are moved to recovery, so failure leaves
     // either the original or a recoverable copy.
@@ -642,14 +710,18 @@ fn restore_from_backup_source(
                 &graph_recovery,
                 std::path::Path::new("journals"),
             )
-            .map_err(|e| format!("restore journals failed: {e}"))?;
+            .map_err(|e| {
+                crate::command_error::CommandError::backup(format!("restore journals failed: {e}"))
+            })?;
             restore_md_dir(
                 &src.join("pages"),
                 restore_pages,
                 &graph_recovery,
                 std::path::Path::new("pages"),
             )
-            .map_err(|e| format!("restore pages failed: {e}"))?;
+            .map_err(|e| {
+                crate::command_error::CommandError::backup(format!("restore pages failed: {e}"))
+            })?;
         }
         SNAPSHOT_SCHEMA => restore_graph_text_tree(
             &src.join("graph"),
@@ -657,8 +729,14 @@ fn restore_from_backup_source(
             &snapshot_scope,
             &graph_recovery,
         )
-        .map_err(|e| format!("restore graph text failed: {e}"))?,
-        _ => return Err("backup uses an unsupported snapshot schema".into()),
+        .map_err(|e| {
+            crate::command_error::CommandError::backup(format!("restore graph text failed: {e}"))
+        })?,
+        _ => {
+            return Err(crate::command_error::CommandError::prose(
+                "backup uses an unsupported snapshot schema",
+            ))
+        }
     }
     restore_asset_sidecars_dir(
         &src.join(dir_name(&assets)),
@@ -666,11 +744,14 @@ fn restore_from_backup_source(
         &asset_recovery,
         std::path::Path::new(""),
     )
-    .map_err(|e| format!("restore asset sidecars failed: {e}"))?;
+    .map_err(|e| {
+        crate::command_error::CommandError::backup(format!("restore asset sidecars failed: {e}"))
+    })?;
     let src_cfg = src.join("logseq").join("config.edn");
     if src_cfg.exists() {
-        let cfg_relative = live_relative(&graph_recovery, &cfg_dest)
-            .map_err(|e| format!("unsafe live config path: {e}"))?;
+        let cfg_relative = live_relative(&graph_recovery, &cfg_dest).map_err(|e| {
+            crate::command_error::CommandError::backup(format!("unsafe live config path: {e}"))
+        })?;
         open_or_create_real_parent(
             &graph_recovery.root,
             cfg_relative
@@ -680,17 +761,26 @@ fn restore_from_backup_source(
             RestoreDirectoryRoot::Live,
             false,
         )
-        .map_err(|e| format!("couldn't prepare live config directory: {e}"))?;
+        .map_err(|e| {
+            crate::command_error::CommandError::backup(format!(
+                "couldn't prepare live config directory: {e}"
+            ))
+        })?;
         if cfg_dest.exists() {
             move_live_to_recovery(
                 &graph_recovery,
                 &cfg_dest,
                 std::path::Path::new("logseq/config.edn"),
             )
-            .map_err(|e| format!("recover current config failed: {e}"))?;
+            .map_err(|e| {
+                crate::command_error::CommandError::backup(format!(
+                    "recover current config failed: {e}"
+                ))
+            })?;
         }
-        atomic_copy_new_into_live(&graph_recovery, &src_cfg, &cfg_dest)
-            .map_err(|e| format!("restore config failed: {e}"))?;
+        atomic_copy_new_into_live(&graph_recovery, &src_cfg, &cfg_dest).map_err(|e| {
+            crate::command_error::CommandError::backup(format!("restore config failed: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -700,37 +790,54 @@ fn collect_legacy_restore_graph_text(
     snapshot: &Path,
     journals_dir: &str,
     pages_dir: &str,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, crate::command_error::CommandError> {
     fn collect(
         source: &Path,
         graph_dir: &str,
         relative: &Path,
         output: &mut Vec<(String, String)>,
-    ) -> Result<(), String> {
-        let entries = std::fs::read_dir(source)
-            .map_err(|error| format!("cannot read verified backup directory: {error}"))?;
+    ) -> Result<(), crate::command_error::CommandError> {
+        let entries = std::fs::read_dir(source).map_err(|error| {
+            crate::command_error::CommandError::backup(format!(
+                "cannot read verified backup directory: {error}"
+            ))
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|error| format!("cannot read verified backup: {error}"))?;
+            let entry = entry.map_err(|error| {
+                crate::command_error::CommandError::backup(format!(
+                    "cannot read verified backup: {error}"
+                ))
+            })?;
             let path = entry.path();
             let child = relative.join(entry.file_name());
             if is_graph_text(&path) {
                 let tail = child
                     .components()
                     .map(|component| match component {
-                        std::path::Component::Normal(value) => value
-                            .to_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| "backup contains a non-UTF-8 graph path".to_string()),
-                        _ => Err("backup contains an unsafe graph path".to_string()),
+                        std::path::Component::Normal(value) => {
+                            value.to_str().map(str::to_string).ok_or_else(|| {
+                                crate::command_error::CommandError::prose(
+                                    "backup contains a non-UTF-8 graph path",
+                                )
+                            })
+                        }
+                        _ => Err(crate::command_error::CommandError::prose(
+                            "backup contains an unsafe graph path",
+                        )),
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .join("/");
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|error| format!("cannot read verified backup page: {error}"))?;
+                let content = std::fs::read_to_string(&path).map_err(|error| {
+                    crate::command_error::CommandError::backup(format!(
+                        "cannot read verified backup page: {error}"
+                    ))
+                })?;
                 output.push((format!("{graph_dir}/{tail}"), content));
-            } else if is_visible_real_dir(&entry)
-                .map_err(|error| format!("cannot inspect verified backup: {error}"))?
-            {
+            } else if is_visible_real_dir(&entry).map_err(|error| {
+                crate::command_error::CommandError::backup(format!(
+                    "cannot inspect verified backup: {error}"
+                ))
+            })? {
                 collect(&path, graph_dir, &child, output)?;
             }
         }
@@ -758,31 +865,46 @@ fn collect_legacy_restore_graph_text(
 fn collect_scoped_restore_graph_text(
     source: &Path,
     scope: &GraphTextScope,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, crate::command_error::CommandError> {
     let mut files = Vec::new();
     if !source.is_dir() {
         return Ok(files);
     }
     let mut stack = vec![(source.to_path_buf(), PathBuf::new())];
     while let Some((directory, relative)) = stack.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("cannot read verified backup directory: {error}"))?;
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            crate::command_error::CommandError::backup(format!(
+                "cannot read verified backup directory: {error}"
+            ))
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|error| format!("cannot read verified backup: {error}"))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("cannot inspect verified backup: {error}"))?;
+            let entry = entry.map_err(|error| {
+                crate::command_error::CommandError::backup(format!(
+                    "cannot read verified backup: {error}"
+                ))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                crate::command_error::CommandError::backup(format!(
+                    "cannot inspect verified backup: {error}"
+                ))
+            })?;
             let child = relative.join(entry.file_name());
-            let child_text = graph_relative_text(&child)
-                .ok_or_else(|| "backup contains an unsafe graph path".to_string())?;
+            let child_text = graph_relative_text(&child).ok_or_else(|| {
+                crate::command_error::CommandError::prose("backup contains an unsafe graph path")
+            })?;
             if file_type.is_file() && scope.is_eligible(&child_text) {
-                let content = std::fs::read_to_string(entry.path())
-                    .map_err(|error| format!("cannot read verified backup page: {error}"))?;
+                let content = std::fs::read_to_string(entry.path()).map_err(|error| {
+                    crate::command_error::CommandError::backup(format!(
+                        "cannot read verified backup page: {error}"
+                    ))
+                })?;
                 files.push((child_text, content));
             } else if file_type.is_dir() && scope.should_descend(&child_text) {
                 stack.push((entry.path(), child));
             } else if file_type.is_symlink() {
-                return Err("backup contains a symbolic link".into());
+                return Err(crate::command_error::CommandError::prose(
+                    "backup contains a symbolic link",
+                ));
             }
         }
     }
@@ -1032,8 +1154,8 @@ fn live_relative(area: &RestoreRecovery, live: &std::path::Path) -> std::io::Res
 
 /// Rename relative to two already-bound directory handles and fail if the
 /// destination exists. Linux/Android and Apple expose native no-replace
-/// rename-at syscalls. Windows remains capability-bound and is protected by the
-/// caller's existence check; the private recovery directory prevents an escape.
+/// rename-at syscalls. Windows uses a capability-bound hard link followed by
+/// source removal, so a concurrent sync-service delivery cannot be replaced.
 fn rename_noreplace_between(
     from_dir: &Dir,
     from: &std::path::Path,
@@ -1084,14 +1206,20 @@ fn rename_noreplace_between(
             .then_some(())
             .ok_or_else(std::io::Error::last_os_error);
     }
+    #[cfg(target_os = "windows")]
+    {
+        from_dir.hard_link(from, to_dir, std::path::Path::new(to))?;
+        from_dir.remove_file(from)
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "windows"
     )))]
     {
-        from_dir.rename(from, to_dir, std::path::Path::new(to))
+        compile_error!("backup restore publication requires an audited Tine platform arm");
     }
 }
 
@@ -1113,15 +1241,20 @@ fn publish_temp_noreplace(
     {
         rename_noreplace_between(parent, temp, parent, name)
     }
+    #[cfg(target_os = "windows")]
+    {
+        parent.hard_link(temp, parent, std::path::Path::new(name))?;
+        parent.remove_file(temp)
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "windows"
     )))]
     {
-        parent.hard_link(temp, parent, std::path::Path::new(name))?;
-        parent.remove_file(temp)
+        compile_error!("backup temp publication requires an audited Tine platform arm");
     }
 }
 
@@ -2139,6 +2272,16 @@ mod tests {
 
         let retire = function_source(source, "fn move_live_to_recovery(");
         assert!(retire.contains("sync_restore_rename_parents(&recovery_parent, &live_parent)?"));
+
+        let no_replace = function_source(source, "fn rename_noreplace_between(");
+        assert!(no_replace.contains("#[cfg(target_os = \"windows\")]"));
+        assert!(no_replace.contains("from_dir.hard_link("));
+        assert!(no_replace.contains("target_os = \"windows\""));
+        assert!(no_replace.contains("compile_error!"));
+        assert!(
+            !no_replace.contains("#[cfg(not(any(\n        target_os = \"linux\",\n        target_os = \"android\",\n        target_os = \"macos\",\n        target_os = \"ios\"\n    )))]"),
+            "the fallback must not silently mean Windows"
+        );
     }
 
     fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -2297,6 +2440,37 @@ mod tests {
         assert_eq!(
             std::fs::read(recovery.path.join("pages/secret.md")).unwrap(),
             b"recovery sentinel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backup_recovery_rejects_a_concurrent_sync_delivery() {
+        let root = scratch("windows-restore-concurrent-delivery");
+        let live_path = root.join("live");
+        let recovery_path = root.join("recovery");
+        std::fs::create_dir_all(&live_path).unwrap();
+        std::fs::create_dir_all(&recovery_path).unwrap();
+        std::fs::write(live_path.join("page.md"), b"live source").unwrap();
+        std::fs::write(recovery_path.join("page.md"), b"sync delivery").unwrap();
+        let live = Dir::open_ambient_dir(&live_path, cap_std::ambient_authority()).unwrap();
+        let recovery = Dir::open_ambient_dir(&recovery_path, cap_std::ambient_authority()).unwrap();
+
+        assert!(rename_noreplace_between(
+            &live,
+            std::path::Path::new("page.md"),
+            &recovery,
+            std::ffi::OsStr::new("page.md"),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(live_path.join("page.md")).unwrap(),
+            b"live source"
+        );
+        assert_eq!(
+            std::fs::read(recovery_path.join("page.md")).unwrap(),
+            b"sync delivery"
         );
         let _ = std::fs::remove_dir_all(root);
     }
