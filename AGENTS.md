@@ -31,7 +31,7 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
 ## Fork feature surfaces
 
 - Bullet threading: `src/bulletThreading.ts`,
-  `src/components/block/bulletThread.tsx`, and three call sites in
+  `src/components/block/bulletThread.tsx`, and a few call sites in
   `src/components/Block.tsx`. Since v0.6.984 the presentation lives in that
   block module rather than inline, because upstream's budget B1
   (`src/fileSizeRatchet.test.ts`) caps a production file at 4,000 lines and
