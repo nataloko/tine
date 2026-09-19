@@ -23,17 +23,16 @@ function escapeHtml(code: string): string {
   return code.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
-// highlight.js (the FULL build — all ~190 languages, so the code-fence language
-// picker's whole list actually highlights) is large, so load it lazily on the
-// first code block and cache the promise. Exported so the editor's live-highlight
-// overlay shares this one cached instance.
+// FORK: the FULL highlight.js build, not upstream's `highlight.js/lib/common`,
+// so a fence tagged with any of the ~190 languages highlights rather than only
+// the common set. Still large and still lazy: loaded on the first code block,
+// promise cached. (The export this once carried belonged to the fork's retired
+// live-highlight overlay and went with it.)
 let hljsMod: Promise<typeof import("highlight.js").default> | null = null;
-export function loadHljs() {
+function loadHljs() {
   if (!hljsMod) hljsMod = import("highlight.js").then((m) => m.default);
   return hljsMod;
 }
-export type HljsInstance = Awaited<ReturnType<typeof loadHljs>>;
-
 
 // A fenced code block: renders escaped (plain) immediately, then upgrades to
 // syntax-highlighted once highlight.js loads. The highlight result is memoized

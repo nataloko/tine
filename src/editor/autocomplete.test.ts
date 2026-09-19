@@ -565,4 +565,3 @@ describe("withRefCompletionSpace (GH #35)", () => {
     expect(r.caret).toBe(11);
   });
 });
-

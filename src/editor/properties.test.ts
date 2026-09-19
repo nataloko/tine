@@ -316,4 +316,3 @@ describe("org caret mapping across a hidden drawer", () => {
     expect(visOff).toBe("Title".length);
   });
 });
-

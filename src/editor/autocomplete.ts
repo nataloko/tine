@@ -411,7 +411,6 @@ export function orderAcItems<T>(
 /** Action commands need runtime behaviour (date stamps, file picker) rather
  *  than a fixed insertion; the editor resolves these when chosen. */
 export type CommandAction =
-  | "code-block"
   | "calc-block"
   | "task-marker"
   | "scheduled"
@@ -424,6 +423,7 @@ export type CommandAction =
   | "thatday"
   | "query-builder"
   | "page-props"
+  | "code-block"
   | "sheet-grid"
   | "sheet-table"
   | "sheet-board"

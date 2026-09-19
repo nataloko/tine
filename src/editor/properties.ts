@@ -187,6 +187,7 @@ export function multilineExitTrim(
   if (afterClosing.trim() !== "") return null;
   return text.slice(0, lineStart - 1) + text.slice(lineEnd);
 }
+
 /** Whether a textarea caret offset is inside a fenced code region. The fence
  *  delimiter lines themselves are outside; the content lines between them are
  *  inside, including an unterminated fence while the user is editing. */
