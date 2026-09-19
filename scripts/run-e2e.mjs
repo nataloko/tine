@@ -6,10 +6,6 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  ONE_RELEASE_CI_EXCEPTION_VERSION,
-  releaseE2eScenarioIsNonblocking,
-} from "./release-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";
@@ -20,15 +16,8 @@ const suiteName = process.argv[2] ?? "linux-smoke";
 const only = process.argv.find((arg) => arg.startsWith("--scenario="))?.slice("--scenario=".length);
 const app = path.resolve(process.env.TINE_APP || path.join(root, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine"));
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
-const longFocusedWindows = suiteName === "windows-smoke"
-  && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (
-  only === "windows-managed-storage"
-    ? 35 * 60_000
-    : longFocusedWindows
-      ? 15 * 60_000
-      : 180_000
-));
+const longFocusedWindows = suiteName === "windows-smoke" && only === "windows-direct-large-open";
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -97,42 +86,6 @@ const suites = {
   "og-parity-pilot": [
     ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
   ],
-  // Experimental candidate gate: intentionally separate from broad release
-  // coverage so it is run only with the exact sparse-v2 candidate receipt.
-  "sparse-v2-recovery": [
-    ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
-    // Direct Files and Tine-managed storage are peers, so BOTH joining-device
-    // starting states are first-class legs of this gate. Neither is a smoke
-    // test of the other and neither may be dropped to save wall clock.
-    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
-    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_E2E_JOIN_ORDERING: "join-from-managed",
-      // This leg deliberately exercises three partial provider deliveries,
-      // declines adoption, and proves the original managed history again after
-      // a clean reopen. It takes ~177s locally, so the ordinary 180s scenario
-      // ceiling is not a meaningful product gate on slower hosted runners.
-      E2E_SCENARIO_TIMEOUT_MS: "240000",
-    }],
-  ],
-  "managed-journal-feed": [
-    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
-  ],
-  "absence-sweeps": [
-    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
-  ],
-  // Release-only local proof on a copied private corpus. This suite is kept
-  // separate from hosted coverage so neither the source graph nor a derivative
-  // can enter GitHub Actions artifacts.
-  "linux-managed-real-release": [
-    ["managed-force-close-recovery", "scripts/e2e-managed-force-close-recovery.mjs", {
-      TINE_MANAGED_RECOVERY_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
-      TINE_MANAGED_RECOVERY_SETTLE_MS: "10000",
-      TINE_MANAGED_RECOVERY_KILL_CYCLES: "2",
-    }],
-    ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
-    }],
-  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
@@ -153,8 +106,6 @@ const suites = {
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
     ["journal-future-feed", "scripts/e2e-journal-future-feed.mjs", {}],
-    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
-    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["formula-builder", "scripts/probe-formula-builder.mjs", {}],
@@ -164,16 +115,11 @@ const suites = {
     ["media", "scripts/e2e-media.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["pdf-routes", "scripts/e2e-pdf-routes.mjs", {}],
-    ["pdf-scroll-resources", "scripts/e2e-pdf-scroll-resources.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
+    ["pdf-scroll-resources", "scripts/e2e-pdf-scroll-resources.mjs"],
     ["pdf-ownership", "scripts/e2e-pdf-ownership.mjs", {}],
     ["plugin-revocation", "scripts/e2e-plugin-revocation.mjs", {}],
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
     ["external-assets", "scripts/e2e-external-assets.mjs", {}],
-    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
-    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_E2E_JOIN_ORDERING: "join-from-managed",
-      E2E_SCENARIO_TIMEOUT_MS: "240000",
-    }],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
@@ -186,6 +132,9 @@ const suites = {
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
     ["outline-guide", "scripts/e2e-outline-guide.mjs", {}],
     ["query-workspace", "scripts/e2e-query-workspace.mjs", {}],
+    ["query-sheet", "scripts/e2e-query-sheet.mjs", {}],
+    ["query-vocabulary", "scripts/e2e-query-vocabulary.mjs", {}],
+    ["query-display", "scripts/e2e-query-display.mjs", {}],
     ["empty-query-workspace", "scripts/e2e-empty-query-workspace.mjs", {}],
     ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
@@ -194,10 +143,17 @@ const suites = {
     // security boundary. The catalog checker now enforces both directions, so a
     // journey can no longer sit in the contract without a runner.
     ["publish-security", "scripts/e2e-publish-security.mjs", {}],
+    // Publish a query (static site + the read-only app over a baked snapshot).
+    // e2e-published-app spawns e2e-publish-query as its producer, but the
+    // catalog checker follows imports, not children, and the export journey
+    // has its own contract — so both are selected here.
+    ["publish-query", "scripts/e2e-publish-query.mjs", {}],
+    ["published-app", "scripts/e2e-published-app.mjs", {}],
     ["page-identity-links", "scripts/e2e-page-identity-links.mjs", {}],
     ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
     ["concord-focus-freshness", "scripts/e2e-concord-focus-freshness.mjs", {}],
     ["concord-live-save", "scripts/e2e-concord-live-save.mjs", {}],
+    ["concord-missing-target", "scripts/e2e-concord-live-save.mjs", { TINE_E2E_MISSING_TARGET: "1" }],
     ["concord-sync-copy-native", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify" }],
     ["concord-sync-copy-poll", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll" }],
     ["concord-sync-copy-native-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify", TINE_E2E_CONCORD_DECISION: "mine" }],
@@ -221,9 +177,33 @@ const suites = {
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
+    // selection-actions (GH #240) is QUARANTINED from Windows, 2026-09-05, with
+    // the §2b E2E stop-loss exhausted after three dispatches. It stays a live,
+    // stable, blocking journey on Linux; only Windows membership is withdrawn,
+    // because e2e-contracts.json carries one stability per journey and
+    // quarantining there would disable the only #240 evidence we have.
+    //
+    // What the three runs bought, so the next attempt does not re-buy it:
+    //   33959023127 - EdgeDriver launch mode, "DevToolsActivePort file doesn't
+    //     exist". Fixed in 94ffcfec: the journey now starts the app through
+    //     startWebdriverApplication and attaches.
+    //   33960379224 - ECONNREFUSED after 4.5s; msedgedriver had not bound its
+    //     port and webdriverio does not retry a refused connection. Fixed in
+    //     cb5307e2 by the same 2500ms wait e2e-page-properties.mjs uses.
+    //   33961433495 - reached 20.0s, exactly openSession's 20s wait for
+    //     ".page-title, .ls-block". The app is FINE: its tine-debug.log shows
+    //     Direct Files publish succeeding at 3683ms on the seeded graph. So the
+    //     remaining defect is between a healthy WebView2 attach and the first
+    //     DOM query - a wrong DevTools target, or a first-run surface Linux
+    //     does not show. That is where attempt four should start.
+    //
+    // Harness debt: the journey writes its rich failure capsule (step, expected,
+    // observed roots, screenshot, webview errors) into its own TMP, which on
+    // Windows is under the runner profile and is NOT uploaded - the workflow only
+    // collects test-results/. Three runs produced no journey-level diagnostics.
+    // Fixing that is a precondition for attempt four being cheaper than these.
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
     ["windows-direct-large-open", "scripts/e2e-windows-direct-large-open.mjs", {}],
-    ["windows-managed-storage", "scripts/e2e-windows-managed-storage.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
   ],
@@ -232,14 +212,6 @@ const suites = {
 if (!suites[suiteName]) {
   console.error(`unknown suite ${suiteName}; choose ${Object.keys(suites).join(", ")}`);
   process.exit(2);
-}
-if (suiteName === "linux-managed-real-release") {
-  if (e2eMode !== "release") {
-    throw new Error("linux-managed-real-release must run with TINE_E2E_MODE=release");
-  }
-  if (!process.env.TINE_MANAGED_REAL_GRAPH) {
-    throw new Error("linux-managed-real-release requires TINE_MANAGED_REAL_GRAPH pointing at a read-only local corpus");
-  }
 }
 
 function loadSelectedContracts(scenarios) {
@@ -432,7 +404,6 @@ function failureIsBlocking(status, contractEntry, scenarioId) {
   // deterministic semantic readiness predicate again.
   if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
-    if (releaseE2eScenarioIsNonblocking(suiteName, scenarioId)) return false;
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
   return contractEntry.contracts.some((contract) => contract.blocking);
@@ -442,8 +413,21 @@ function xmlEscape(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
 }
 
+function hasRecordedSemanticFailure(output, errors) {
+  // Scenarios may finish their assertions, then lose the driver during cleanup.
+  // Positive failure evidence takes precedence over any later transport error;
+  // successful checks alone do not rule out an infrastructure retry.
+  const combined = `${output}\n${errors}`.replace(/\u001b\[[0-9;]*m/g, "");
+  return /^\s*(?:FAIL:|[1-9]\d* FAILURES\b)/m.test(combined)
+    || /\bAssertionError(?: \[[^\]]+\])?:/.test(combined)
+    // A scenario's explicit expected/actual observation is an assertion even
+    // when it uses Error rather than AssertionError. Anchor to the emitted
+    // error line, not a source excerpt printed with an uncaught stack trace.
+    || /^\s*Error: [^\r\n]*; expected=.+ actual=.+$/m.test(combined);
+}
+
 function isRetryableDriverTransportFailure(output, errors, timedOut) {
-  if (timedOut) return false;
+  if (timedOut || hasRecordedSemanticFailure(output, errors)) return false;
   const combined = `${output}\n${errors}`;
   const webDriverError = /WebDriverError/.test(combined);
   const invalidSession = /WebDriverError:\s*invalid session id\b/.test(combined);
@@ -453,7 +437,7 @@ function isRetryableDriverTransportFailure(output, errors, timedOut) {
 }
 
 function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
-  if (timedOut) return false;
+  if (timedOut || hasRecordedSemanticFailure(output, errors)) return false;
   const combined = `${output}\n${errors}`;
   // Page-properties proves the target editor and document focus before sending
   // ArrowDown, then records the capture-phase key event. Only a missing event is
@@ -594,9 +578,6 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       archiveInfrastructureAttempt(dir, attempt);
       continue;
     }
-    const releaseException = status === "failed"
-      && e2eMode === "release"
-      && releaseE2eScenarioIsNonblocking(suiteName, id);
     const record = {
       id,
       script,
@@ -611,12 +592,6 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       infrastructureRetries: attempt - 1,
       durationMs: Date.now() - started,
       blocking: failureIsBlocking(status, contractEntry, id),
-      ...(releaseException ? {
-        releaseException: {
-          version: ONE_RELEASE_CI_EXCEPTION_VERSION,
-          scenarioKey: `${suiteName}:${id}`,
-        },
-      } : {}),
     };
     if (status === "failed") {
       const failurePath = path.join(dir, "failure.json");

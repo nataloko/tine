@@ -2,14 +2,28 @@
 // browser (Vite dev / Playwright screenshots) we fall back to an in-memory mock
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
+import { createSignal } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
+import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
+import type { GraphSearchDisplayOptions } from "./editor/queryIr";
+import type {
+  Diagnostic,
+  DiagnosticKind,
+  ExecutionContext,
+  ExplainEmptyResult,
+  ParsedQuery,
+  Query,
+  QueryPrintDialect,
+  QueryTextDialect,
+  QueryResult,
+  RegistrySnapshot,
+  Span,
+  ViewSettings,
+} from "./editor/queryIr";
 import type {
   ActivationExpectedRevision,
   ActivationIntent,
   ApplicationPageAdmission,
-  ManagedApplicationMoveSubtreesRecoveryResult,
-  ManagedApplicationMoveSubtreesRequest,
-  ManagedApplicationMoveSubtreesResult,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
@@ -37,41 +51,26 @@ import type {
   LiveSaveConflictCapture,
   MarkerConflictDiff,
   MergeDecision,
-  ManagedPageMutationPreflightResult,
   PrintOpts,
-  SparseV2Status,
-  SparseV2CancelResult,
-  SparseV2AdoptionResult,
-  SparseV2ActivationProgressEvent,
-  SparseV2Tick,
-  SparseV2RuntimeStatusEvent,
-  SparseV2TickEvent,
-  SparseV2ErrorEvent,
-  SyncAbsenceSweepEvent,
-  SyncAbsenceSweepChangedEvent,
-  SyncAbsenceSweepActionOutcome,
-  SyncAbsenceSweepRestoreOutcome,
-  SparseV2QueryRequest,
-  SparseV2QueryReply,
-  SparseV2EditorLoadRequest,
-  SparseV2EditorSaveRequest,
-  SparseV2EditorOutcome,
   StorageTransitionEvent,
   PdfState,
   QueryExecution,
   QueryPageScope,
   QueryExportBatch,
   QueryExportSpec,
+  PublishOutcome,
+  QueryPublicationPlan,
+  QueryPublicationRequest,
 } from "./types";
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
+import { isPublishedExport, publishedBackend } from "./publishedBackend";
 import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 export type ConflictCapsuleAuthority =
   | { kind: "direct_durable"; expected_disk_rev: string }
-  | { kind: "direct_live"; conflict_epoch: number }
-  | { kind: "managed"; path: string; revision: string };
+  | { kind: "direct_live"; conflict_epoch: number };
 
 export interface ConflictCapsuleReview {
   diff: SyncConflictDiff;
@@ -173,14 +172,6 @@ export interface MediaCaptureResult {
   ext?: string | null;
 }
 
-/** Result of the process-wide native shutdown preparation. Android may request
- * an Activity exit only after `safe`; partial native progress must remain
- * shielded so retrying does not replay the frontend persistence transaction. */
-export type TineQuitPreparation =
-  | { status: "safe" }
-  | { status: "refused"; detail: string }
-  | { status: "partial"; safe_slots: string[]; detail: string };
-
 export interface KnownGraph {
   path: string;
   name: string;
@@ -204,24 +195,20 @@ export interface PluginRegistryCacheEnvelope {
 export type BackendErrorKind =
   | "save-conflict"
   | "direct-save-failure"
-  | "sync-data-unavailable"
-  | "managed-graph-mismatch"
-  | "shared-frontier-mismatch"
-  | "adoption-archived"
-  | "sparse-shutdown-refused"
   | "asset-too-large"
   | "operation-cancelled"
-  | "managed-actor-refusal";
+  | "query-not-ready"
+  | "query-unavailable"
+  | "query-print-refused"
+  | "published-export-read-only";
 
 const BACKEND_ERROR_MESSAGES: Record<
-  Exclude<BackendErrorKind, "save-conflict" | "direct-save-failure" | "managed-actor-refusal">,
+  Exclude<
+    BackendErrorKind,
+    "save-conflict" | "direct-save-failure" | "query-print-refused" | "query-not-ready" | "query-unavailable" | "published-export-read-only"
+  >,
   string
 > = {
-  "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
-  "managed-graph-mismatch": "The shared descriptor names another managed graph.",
-  "shared-frontier-mismatch": "This device's notes are not in the shared provider frontier.",
-  "adoption-archived": "Adoption stopped after this device's own history was archived.",
-  "sparse-shutdown-refused": "Tine-managed storage could not verify a clean stop.",
   "asset-too-large": "The asset exceeds the safe size limit.",
   "operation-cancelled": "The operation was cancelled.",
 };
@@ -239,66 +226,44 @@ export class BackendError extends Error {
   }
 }
 
-export class SyncDataUnavailableError extends BackendError {
-  constructor() {
-    super("sync-data-unavailable", BACKEND_ERROR_MESSAGES["sync-data-unavailable"]);
-    this.name = "SyncDataUnavailableError";
-  }
-}
-
-export class ManagedGraphMismatchError extends BackendError {
-  constructor() {
-    super("managed-graph-mismatch", BACKEND_ERROR_MESSAGES["managed-graph-mismatch"]);
-    this.name = "ManagedGraphMismatchError";
-  }
-}
-
-export type SharedFrontierMismatchSide = "local-only" | "shared-only" | "changed";
-export type SharedFrontierMismatchCategory = "kind" | "preamble" | "outline" | "explicit-ids";
-export interface SharedFrontierMismatchPath {
-  path: string;
-  side: SharedFrontierMismatchSide;
-  categories: SharedFrontierMismatchCategory[];
-}
-/** The bounded, typed detail a clean-join refusal carries so the user who
- * asked for the join can reconcile it: counts plus at most 32 relative note
- * paths with their side or changed categories. Never note content. */
-export interface SharedFrontierMismatchDetail {
-  localPages: number;
-  sharedPages: number;
-  localOnly: number;
-  sharedOnly: number;
-  changed: number;
-  paths: SharedFrontierMismatchPath[];
-  omitted: number;
-}
-export const SHARED_FRONTIER_MISMATCH_MAX_PATHS = 32;
-
-export class SharedFrontierMismatchError extends BackendError {
-  constructor(readonly detail: SharedFrontierMismatchDetail | null = null) {
-    super("shared-frontier-mismatch", BACKEND_ERROR_MESSAGES["shared-frontier-mismatch"]);
-    this.name = "SharedFrontierMismatchError";
-  }
-}
-
-export class AdoptionArchivedError extends BackendError {
-  constructor() {
-    super("adoption-archived", BACKEND_ERROR_MESSAGES["adoption-archived"]);
-    this.name = "AdoptionArchivedError";
-  }
-}
-
-export class SparseShutdownRefusedError extends BackendError {
-  constructor() {
-    super("sparse-shutdown-refused", BACKEND_ERROR_MESSAGES["sparse-shutdown-refused"]);
-    this.name = "SparseShutdownRefusedError";
-  }
-}
 
 export class AssetTooLargeError extends BackendError {
   constructor() {
     super("asset-too-large", BACKEND_ERROR_MESSAGES["asset-too-large"]);
     this.name = "AssetTooLargeError";
+  }
+}
+
+/** `query_print` refused to print this IR in the requested dialect (§7.1, A4).
+ *
+ *  `NotApplicable` means the OG printer cannot express the query — the OG DSL is
+ *  a partial language, so this is an ordinary, expected answer, not a fault.
+ *  **Exactly one caller is entitled to see it: the save path**, which responds by
+ *  switching to the `{{tine-query}}` dialect. Any other caller reaching here
+ *  asked the OG printer without first calling `queryOgExpressible`, and that is a
+ *  bug in that caller — which is why this rejects instead of returning `""`. A
+ *  catch-all that turned a refusal into a silent no-op is how an unsaved edit
+ *  comes to look saved.
+ *
+ *  `diagnostic` is the structured `Diagnostic` the printer produced, carried in
+ *  the envelope's `detail` so callers read `kind`/`message`/`suggestions` as
+ *  objects rather than parsing prose (I-9). */
+export class QueryPrintRefusedError extends BackendError {
+  constructor(
+    readonly reasonCode: string,
+    readonly diagnostic: Diagnostic | null,
+  ) {
+    super(
+      "query-print-refused",
+      diagnostic?.message ?? `The query could not be printed (reason code: ${reasonCode}).`,
+    );
+    this.name = "QueryPrintRefusedError";
+  }
+
+  /** Whether this refusal is the expected "OG cannot say this" answer, as
+   *  opposed to a malformed-input refusal the caller must surface. */
+  get isNotApplicable(): boolean {
+    return this.reasonCode === "not_applicable";
   }
 }
 
@@ -309,10 +274,31 @@ export class OperationCancelledError extends BackendError {
   }
 }
 
-export class ManagedActorRefusalError extends BackendError {
-  constructor(readonly reasonCode: string) {
-    super("managed-actor-refusal", `Managed storage refused the operation (reason code: ${reasonCode}).`);
-    this.name = "ManagedActorRefusalError";
+export type QueryReadinessReason = "indexing" | "recovering" | "pending_edits" | "busy";
+
+export class QueryNotReadyError extends BackendError {
+  constructor(readonly reasonCode: QueryReadinessReason) {
+    super("query-not-ready", reasonCode === "recovering" ? "Rebuilding the query index…" : "Updating query results…");
+    this.name = "QueryNotReadyError";
+  }
+}
+
+export class QueryUnavailableError extends BackendError {
+  constructor(readonly reasonCode: string, message: string) {
+    super("query-unavailable", message);
+    this.name = "QueryUnavailableError";
+  }
+}
+
+/** A published query export (Stage 2) answers reads from its baked snapshot
+ *  and refuses everything that would write, sync, install, or reach the OS.
+ *  Defined here, not in `publishedBackend.ts`, because that module is imported
+ *  by this one: a class it exported would sit in the ES-module cycle's
+ *  temporal dead zone at the moment `backend()` first selects it. */
+export class PublishedExportReadOnlyError extends BackendError {
+  constructor() {
+    super("published-export-read-only", "This is a read-only published export.");
+    this.name = "PublishedExportReadOnlyError";
   }
 }
 
@@ -347,18 +333,6 @@ export function classifyNativeCallError(error: unknown): unknown {
 
 type TaggedBackendPayload = { kind: string; reason_code?: unknown; detail?: unknown };
 
-const SHARED_FRONTIER_SIDES: readonly SharedFrontierMismatchSide[] = ["local-only", "shared-only", "changed"];
-const SHARED_FRONTIER_CATEGORIES: readonly SharedFrontierMismatchCategory[] = [
-  "kind",
-  "preamble",
-  "outline",
-  "explicit-ids",
-];
-
-function nonNegativeCount(value: unknown): number | null {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
 const REASON_CODE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/;
 
 function readIoErrorKind(detail: unknown): string | null {
@@ -367,41 +341,37 @@ function readIoErrorKind(detail: unknown): string | null {
   return typeof value === "string" && /^[A-Z][A-Za-z]{0,63}$/.test(value) ? value : null;
 }
 
-/** Validate the native detail object field by field; anything malformed
- * degrades to a detail-less refusal rather than trusting the payload. */
-function readSharedFrontierMismatchDetail(raw: unknown): SharedFrontierMismatchDetail | null {
-  if (!raw || typeof raw !== "object") return null;
-  const record = raw as Record<string, unknown>;
-  const localPages = nonNegativeCount(record.local_pages);
-  const sharedPages = nonNegativeCount(record.shared_pages);
-  const localOnly = nonNegativeCount(record.local_only);
-  const sharedOnly = nonNegativeCount(record.shared_only);
-  const changed = nonNegativeCount(record.changed);
-  const omitted = nonNegativeCount(record.omitted);
-  if (
-    localPages === null || sharedPages === null || localOnly === null
-    || sharedOnly === null || changed === null || omitted === null
-    || !Array.isArray(record.paths) || record.paths.length > SHARED_FRONTIER_MISMATCH_MAX_PATHS
-  ) {
-    return null;
-  }
-  const paths: SharedFrontierMismatchPath[] = [];
-  for (const entry of record.paths as unknown[]) {
-    if (!entry || typeof entry !== "object") return null;
-    const { path, side, categories } = entry as Record<string, unknown>;
-    if (typeof path !== "string" || path.length === 0) return null;
-    if (!SHARED_FRONTIER_SIDES.includes(side as SharedFrontierMismatchSide)) return null;
-    const known: SharedFrontierMismatchCategory[] = [];
-    if (categories !== undefined) {
-      if (!Array.isArray(categories)) return null;
-      for (const category of categories as unknown[]) {
-        if (!SHARED_FRONTIER_CATEGORIES.includes(category as SharedFrontierMismatchCategory)) return null;
-        known.push(category as SharedFrontierMismatchCategory);
-      }
-    }
-    paths.push({ path, side: side as SharedFrontierMismatchSide, categories: known });
-  }
-  return { localPages, sharedPages, localOnly, sharedOnly, changed, paths, omitted };
+
+/** Read the structured `Diagnostic` a `query-print-refused` envelope carries.
+ *
+ *  Validated field by field: a malformed payload degrades to a detail-less
+ *  refusal (the caller still learns the print was REFUSED, which is the part that
+ *  must never be lost) rather than being trusted into the UI.
+ *  `DIAGNOSTIC_KINDS` is the mirror's own list, so a kind Rust adds and the
+ *  mirror has not learned reads as malformed instead of flowing through
+ *  mistyped. */
+function readPrintDiagnostic(detail: unknown): Diagnostic | null {
+  if (!detail || typeof detail !== "object") return null;
+  const value = detail as Record<string, unknown>;
+  if (typeof value.message !== "string") return null;
+  if (typeof value.kind !== "string") return null;
+  if (!(DIAGNOSTIC_KINDS as readonly string[]).includes(value.kind)) return null;
+  const suggestions = Array.isArray(value.suggestions)
+    && value.suggestions.every((s) => typeof s === "string")
+    ? (value.suggestions as string[])
+    : [];
+  const span = value.span && typeof value.span === "object"
+    && typeof (value.span as Record<string, unknown>).start === "number"
+    && typeof (value.span as Record<string, unknown>).end === "number"
+    ? (value.span as unknown as Span)
+    : undefined;
+  return {
+    kind: value.kind as DiagnosticKind,
+    message: value.message,
+    suggestions,
+    disabled: value.disabled === true,
+    span,
+  };
 }
 
 function classifyTaggedBackendError(error: unknown): BackendError | null {
@@ -438,25 +408,26 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
         ? new SaveConflictError(epoch as number | null, payload.reason_code, ioErrorKind)
         : null;
     }
-    case "sync-data-unavailable":
-      return new SyncDataUnavailableError();
-    case "managed-graph-mismatch":
-      return new ManagedGraphMismatchError();
-    case "shared-frontier-mismatch":
-      return new SharedFrontierMismatchError(
-        payload.detail === undefined ? null : readSharedFrontierMismatchDetail(payload.detail),
-      );
-    case "adoption-archived":
-      return new AdoptionArchivedError();
-    case "sparse-shutdown-refused":
-      return new SparseShutdownRefusedError();
     case "asset-too-large":
       return new AssetTooLargeError();
     case "operation-cancelled":
       return new OperationCancelledError();
-    case "managed-actor-refusal":
+    case "query-not-ready":
+      return payload.reason_code === "indexing" || payload.reason_code === "recovering"
+        || payload.reason_code === "pending_edits" || payload.reason_code === "busy"
+        ? new QueryNotReadyError(payload.reason_code)
+        : null;
+    case "query-unavailable": {
+      const detail = payload.detail && typeof payload.detail === "object"
+        ? (payload.detail as Record<string, unknown>).message : undefined;
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
-        ? new ManagedActorRefusalError(payload.reason_code)
+        && typeof detail === "string" && detail.trim().length > 0
+        ? new QueryUnavailableError(payload.reason_code, detail)
+        : null;
+    }
+    case "query-print-refused":
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        ? new QueryPrintRefusedError(payload.reason_code, readPrintDiagnostic(payload.detail))
         : null;
     default:
       return null;
@@ -529,9 +500,6 @@ export interface Backend {
    *  the caller MUST have flushed pending edits first. Does not resolve — the
    *  process exits. */
   quit(): Promise<void>;
-  /** Verify every managed runtime can stop cleanly without exiting the app.
-   * Android calls this before handing the final activity exit to SafeBack. */
-  prepareQuit(): Promise<TineQuitPreparation>;
   closeGraphWindow(): Promise<void>;
   /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
    *  debugging. No-op on a build without devtools compiled in. */
@@ -554,15 +522,13 @@ export interface Backend {
   /** Raw source text of every md/org file in the open graph (+journals when
    *  asked), for the "Help improve Tine" diff panel. Read-only, local. */
   graphSourceFiles(includeJournals: boolean): Promise<GraphSourceFile[]>;
-  /** Save a page. `baseRev` is the revision the editor loaded. Direct Files
-   *  binds `force` to `conflictEpoch`; managed storage binds it to the exact
-   *  managed path and revision observed after refusal. */
+  /** Save a page. `baseRev` is the revision the editor loaded; `force` is
+   *  bound to `conflictEpoch`, the live conflict the user chose to overwrite. */
   savePage(
     page: PageDto,
     baseRev: string | null,
     force?: boolean,
     conflictEpoch?: number | null,
-    managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
   /** Publish the durable recovery record for one Direct cross-page move BEFORE
    *  the first page is written (packet B2, I-3/I-2). `destination` and
@@ -574,58 +540,6 @@ export interface Backend {
   /** Retire that record once every participant is durably terminal. Resolves to
    *  whether it was retired; a record left behind is converged at the next open. */
   finishDirectCrossPageMove(moveId: string): Promise<boolean>;
-  /** X1 native bridge only. Production gesture routing remains disabled until
-   * X2 owns quiescence, leases, publication, and semantic history. */
-  moveManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ): Promise<ManagedApplicationMoveSubtreesResult>;
-  /** Retire response-replay evidence after the committed page pair is installed. */
-  acknowledgeManagedApplicationMove(
-    bindingGeneration: number,
-    episodeId: string,
-    batchId: string,
-  ): Promise<void>;
-  /** Resolve one exact deferred move episode without routing a new gesture. */
-  recoverManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ): Promise<ManagedApplicationMoveSubtreesRecoveryResult>;
-  preflightManagedPageMutation(
-    page: PageDto,
-    baseRevision: string | null,
-    bindingGeneration: number,
-  ): Promise<ManagedPageMutationPreflightResult>;
-  sparseV2Status(): Promise<SparseV2Status>;
-  onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
-  onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
-  onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void>;
-  onSparseV2ActivationProgress(
-    bindingGeneration: number,
-    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
-  ): Promise<() => void>;
-  activateSparseV2(): Promise<SparseV2Status>;
-  cancelSparseV2(): Promise<SparseV2CancelResult>;
-  cancelSparseV2Cold(path: string): Promise<SparseV2CancelResult>;
-  prepareSparseV2Share(): Promise<SparseV2Status>;
-  joinSparseV2Shared(): Promise<SparseV2Status>;
-  /** Adopt another device's shared graph, archiving this device's own managed history. */
-  adoptSparseV2Shared(): Promise<SparseV2AdoptionResult>;
-  /** Where a set-aside managed history is archived, knowable before adoption runs. */
-  sparseV2RecoveryLocation(): Promise<string>;
-  sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
-  sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
-  sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
-  sparseV2Tick(): Promise<SparseV2Tick>;
-  listAbsenceSweeps(): Promise<SyncAbsenceSweepEvent[]>;
-  onAbsenceSweepChanged(
-    bindingGeneration: number,
-    cb: (sweep: SyncAbsenceSweepEvent) => void,
-  ): Promise<() => void>;
-  reapplyAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepActionOutcome>;
-  restoreAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepRestoreOutcome>;
-  keepAbsenceSweepDeletion(sweepId: string): Promise<void>;
-  sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
   /** Copy the bundled Guide into the real graph under `tine-guide/`. */
@@ -647,10 +561,73 @@ export interface Backend {
   /** Rename a page and update all [[refs]]/#tags across the graph. */
   renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
+  /** Plan a query export: the pages that own the query's results, plus the
+   *  fingerprint the confirm step echoes back. Writes nothing. */
+  publishQueryPlan(request: QueryPublicationRequest): Promise<QueryPublicationPlan>;
+  /** Commit a reviewed query export; refused if the reviewed set moved. */
+  publishQuery(request: QueryPublicationRequest, fingerprint: string): Promise<PublishOutcome>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
    *  the page doesn't exist. */
   pagePrintHtml(name: string, opts: PrintOpts): Promise<string>;
+  // ---- The six query commands (SPEC §7.1, N23) --------------------------
+  //
+  // ONE engine, in Rust. `parseQuery` and `printQuery` are the only producers
+  // and consumers of query TEXT in the app: the frontend holds the IR and the
+  // view, never a DSL string it parsed itself.
+
+  /** Text → `{query, view}` (§7.1).
+   *
+   *  `macroQuery` / `macroTql` take the COMPLETE raw macro argument, WITHOUT the
+   *  outer `{{`/`}}`, and are the only inputs that split a trailing options map —
+   *  once, in Rust. `macroQuery` also picks OG vs advanced with the one Rust
+   *  discriminator, so a `:find` inside a string literal is text on both sides.
+   *  `og` / `tql` / `advanced` are explicit form inputs.
+   *
+   *  `blockProperties` are the host block's `tine.*` properties, which take
+   *  precedence over directives lifted from the query text (§4.1). Passing them
+   *  is `Macro.tsx`'s job and is merged here and nowhere else. */
+  parseQuery(
+    text: string,
+    dialect: QueryTextDialect,
+    blockProperties?: [string, string][],
+  ): Promise<ParsedQuery>;
+  /** IR → text (§4.3, §7.1).
+   *
+   *  Rejects with {@link QueryPrintRefusedError} when `dialect` is `og` and the IR
+   *  is not OG-expressible; the save path is the ONE caller entitled to see that
+   *  and answers by switching dialect. Everyone else must call
+   *  {@link Backend.queryOgExpressible} first.
+   *
+   *  `preserveForm` re-emits `source.original` plus the changed options map once,
+   *  WITHOUT re-lowering the IR (§4.3.1) — the source-preserving title edit. It
+   *  requires a source-backed query and its matching macro dialect; a builder
+   *  query is refused. Title editing is not a filter conversion. */
+  printQuery(
+    query: Query,
+    view: ViewSettings,
+    dialect: QueryPrintDialect,
+    preserveForm?: boolean,
+  ): Promise<string>;
+  /** Whether the OG DSL can say this query, so the save path can choose the
+   *  macro name (Q3) without provoking a rejection. */
+  queryOgExpressible(query: Query, view: ViewSettings): Promise<boolean>;
+  /** The observed property registry (§6.1), with the generation that invalidates
+   *  a cached parse's suggestions. */
+  queryRegistry(): Promise<RegistrySnapshot>;
+  /** Run an already-parsed IR through the one walk. `context.current_page` binds
+   *  `?current-page`; an absent one leaves it UNBOUND rather than guessing (§4.4). */
+  queryRun(query: Query, view: ViewSettings, context?: ExecutionContext): Promise<QueryResult>;
+  /** Why the query returned nothing (Q14, N19): for a root `and`, one row per
+   *  top-level conjunct with the count matching it alone and the count matching
+   *  all the others without it. Carries the diagnostics and the support report,
+   *  because "never bound" and "nothing matched" are different answers. */
+  queryExplainEmpty(
+    query: Query,
+    view: ViewSettings,
+    context?: ExecutionContext,
+  ): Promise<ExplainEmptyResult>;
+
   runQuery(query: string): Promise<RefGroup[]>;
   /** Resolve all Copy / Export query macros under one cumulative native budget. */
   exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch>;
@@ -875,14 +852,23 @@ export interface Backend {
    *  appeared or vanished). Returns an unlisten fn. */
   onConflictsChanged(cb: () => void): Promise<() => void>;
   search(query: string, limit: number, lane?: string): Promise<RefGroup[]>;
-  /** One Rust-authoritative graph selection plan for page and block hits. */
+  /** One Rust-authoritative graph selection plan for page and block hits.
+   *
+   *  `scope` is the PHYSICAL routed page a block search is confined to.
+   *  `options` is the Display half — page membership scope and the two already
+   *  resolved per-kind views (§7.6, Q3). They are separate members because they
+   *  answer different questions, and overloading the physical one to carry
+   *  membership would make "search inside this page" and "match pages by their
+   *  content" the same request. Omitting `options` is exactly the request every
+   *  caller sent before Display existed. */
   runGraphSearch(
     source: string,
     pageLimit: number,
     blockLimit: number,
     lane?: string,
     explain?: boolean,
-    scope?: QueryPageScope
+    scope?: QueryPageScope,
+    options?: GraphSearchDisplayOptions
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   /** Capture-only page/tag completion capability. It is intentionally not the
@@ -972,19 +958,15 @@ export interface Backend {
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
   /** Subscribe to externally changed graph assets. This is cache observation,
-   *  not managed-storage or oplog admission. */
+   *  not save admission. */
   onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void>;
   /** Subscribe to `logseq/config.edn` being re-read after an outside change.
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
   onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
-  /** Subscribe to an admitted aggregate managed-storage change. */
-  onSparseV2Changed(cb: () => void): Promise<() => void>;
-  /** Subscribe to deduplicated managed-sync reconciliation failures. */
-  onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
-  /** Direct Markdown folder-watch reconcile failure. Distinct from
-   *  onManagedSyncError: managed graphs never emit it, so its copy must not
-   *  talk about managed storage. */
+  /** A committed query image changed; does not reload or replace live editors. */
+  onQueryProjectionChanged(cb: () => void): Promise<() => void>;
+  /** Direct Markdown folder-watch reconcile failure. */
   onGraphWatchError(cb: (message: string) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
@@ -1015,6 +997,14 @@ export interface Backend {
   loadWorkspaces(): Promise<string>;
   /** Atomically persist the current graph's complete named-workspace registry. */
   saveWorkspaces(data: string): Promise<void>;
+  /** The one-time notices this DEVICE has been told not to show again for the
+   *  current graph, as `{"dismissed": string[]}` (§4.3 "Notice", D-11, I-18).
+   *  Never travels with the graph: it says something about this device's user,
+   *  not about the graph's content. A missing or damaged record reads as
+   *  "nothing dismissed" rather than failing (D-3/G2). */
+  loadNotices(): Promise<string>;
+  /** Persist the complete dismissed-notice set for the current graph. */
+  saveNotices(data: string): Promise<void>;
   /** True exactly ONCE if this launch migrated the app-data dir left by the
    *  desktop identifier rename chain dev.tine.app / page.tine.app ->
    *  page.tine.Tine (so the UI can explain that some app-level prefs may need
@@ -1226,6 +1216,44 @@ const DIAGNOSTIC_COMMANDS = new Set([
 ]);
 const SLOW_IPC_MS = 500;
 
+/**
+ * Commands that passed SLOW_IPC_MS and have not settled, with the moment each
+ * started.
+ *
+ * Tine already RECORDED that it was being slow — GH #332's diagnostics show
+ * `runtime.started` at 37s with a wall of `slow` phases — and told the user
+ * nothing, so a blank window was indistinguishable from lost notes. A failure
+ * surface that can say "the backend has been busy for 37 seconds" turns that
+ * into a diagnosis the reporter can act on. Module-level rather than per-call
+ * because the reader is a different component entirely.
+ */
+const slowCommandsInFlight = new Map<number, { command: string; startedAt: number }>();
+let slowCommandSeq = 0;
+const [slowCommandRevision, bumpSlowCommandRevision] = createSignal(0, { equals: false });
+
+export interface SlowBackendState {
+  /** Commands over SLOW_IPC_MS that have not returned. */
+  count: number;
+  /** Milliseconds the longest-running of them has been waiting. */
+  longestMs: number;
+}
+
+/** Reactive: re-reads whenever a command crosses or leaves the slow threshold. */
+export function slowBackendState(): SlowBackendState {
+  slowCommandRevision();
+  let longestMs = 0;
+  const now = performance.now();
+  for (const entry of slowCommandsInFlight.values()) {
+    longestMs = Math.max(longestMs, now - entry.startedAt);
+  }
+  return { count: slowCommandsInFlight.size, longestMs: Math.round(longestMs) };
+}
+
+export function resetSlowBackendStateForTests() {
+  slowCommandsInFlight.clear();
+  bumpSlowCommandRevision(0);
+}
+
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   private convertFileSrc!: (path: string, protocol?: string) => string;
@@ -1259,9 +1287,19 @@ class TauriBackend implements Backend {
         elapsedMs: Math.max(0, Math.round(elapsedMs)),
       }).catch(() => {});
     };
+    let slowTicket: number | undefined;
+    const releaseSlowTicket = () => {
+      if (slowTicket === undefined) return;
+      slowCommandsInFlight.delete(slowTicket);
+      slowTicket = undefined;
+      bumpSlowCommandRevision(0);
+    };
     if (!DIAGNOSTIC_COMMANDS.has(cmd)) {
       slowTimer = setTimeout(() => {
         slow = true;
+        slowTicket = ++slowCommandSeq;
+        slowCommandsInFlight.set(slowTicket, { command: cmd, startedAt: started });
+        bumpSlowCommandRevision(0);
         reportPhase("slow", performance.now() - started);
       }, SLOW_IPC_MS);
     }
@@ -1270,6 +1308,7 @@ class TauriBackend implements Backend {
       result = await this.invoke<T>(cmd, leasedArgs);
     } catch (error) {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
+      releaseSlowTicket();
       recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
       // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
@@ -1277,6 +1316,7 @@ class TauriBackend implements Backend {
       throw classifyNativeCallError(error);
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
+    releaseSlowTicket();
     recordGraphOpenCommand(cmd, started, "completed");
     if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh
@@ -1376,9 +1416,6 @@ class TauriBackend implements Backend {
   quit() {
     return this.call<void>("tine_quit");
   }
-  prepareQuit() {
-    return this.call<TineQuitPreparation>("prepare_tine_quit");
-  }
   closeGraphWindow() {
     return this.call<void>("close_graph_window");
   }
@@ -1416,7 +1453,6 @@ class TauriBackend implements Backend {
     baseRev: string | null,
     force = false,
     conflictEpoch: number | null = null,
-    managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
       this.call<SavePageResult>("save_page", {
@@ -1424,7 +1460,6 @@ class TauriBackend implements Backend {
         baseRev,
         force,
         conflictEpoch,
-        managedConflictObservation,
       })
     );
   }
@@ -1433,139 +1468,6 @@ class TauriBackend implements Backend {
   }
   finishDirectCrossPageMove(moveId: string) {
     return this.call<boolean>("finish_direct_cross_page_move", { moveId });
-  }
-  moveManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ) {
-    return this.call<ManagedApplicationMoveSubtreesResult>("move_managed_application_subtrees", {
-      bindingGeneration,
-      request,
-    });
-  }
-  acknowledgeManagedApplicationMove(
-    bindingGeneration: number,
-    episodeId: string,
-    batchId: string,
-  ) {
-    return this.call<void>("acknowledge_managed_application_move", {
-      bindingGeneration,
-      episodeId,
-      batchId,
-    });
-  }
-  recoverManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ) {
-    return this.call<ManagedApplicationMoveSubtreesRecoveryResult>(
-      "recover_managed_application_subtrees",
-      { bindingGeneration, request },
-    );
-  }
-  preflightManagedPageMutation(
-    page: PageDto,
-    baseRevision: string | null,
-    bindingGeneration: number,
-  ) {
-    return this.call<ManagedPageMutationPreflightResult>("preflight_managed_page_mutation", {
-      page,
-      baseRevision,
-      bindingGeneration,
-    });
-  }
-  sparseV2Status() {
-    return this.call<SparseV2Status>("sparse_v2_status");
-  }
-  async onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2RuntimeStatusEvent>("sparse-v2-status", (event) => cb(event.payload));
-  }
-  async onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2TickEvent>("sparse-v2-tick", (event) => cb(event.payload));
-  }
-  async onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2ErrorEvent>("sparse-v2-error", (event) => cb(event.payload));
-  }
-  async onSparseV2ActivationProgress(
-    bindingGeneration: number,
-    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
-  ): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2ActivationProgressEvent>("sparse-v2-activation-progress", (event) => {
-      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.progress);
-    });
-  }
-  async activateSparseV2() {
-    const result = await this.call<SparseV2Status>("activate_sparse_v2");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async cancelSparseV2() {
-    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async cancelSparseV2Cold(path: string) {
-    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path });
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async prepareSparseV2Share() {
-    const result = await this.call<SparseV2Status>("prepare_sparse_v2_share");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async joinSparseV2Shared() {
-    const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async adoptSparseV2Shared() {
-    const result = await this.call<SparseV2AdoptionResult>("adopt_sparse_v2_shared");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  sparseV2RecoveryLocation() {
-    return this.call<string>("sparse_v2_recovery_location");
-  }
-  sparseV2Query(request: SparseV2QueryRequest) {
-    return this.call<SparseV2QueryReply>("sparse_v2_query", { request });
-  }
-  sparseV2EditorLoad(request: SparseV2EditorLoadRequest) {
-    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_load", { request });
-  }
-  sparseV2EditorSave(request: SparseV2EditorSaveRequest) {
-    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_save", { request });
-  }
-  sparseV2Tick() {
-    return this.call<SparseV2Tick>("sparse_v2_tick");
-  }
-  listAbsenceSweeps() {
-    return this.call<SyncAbsenceSweepEvent[]>("list_absence_sweeps");
-  }
-  async onAbsenceSweepChanged(
-    bindingGeneration: number,
-    cb: (sweep: SyncAbsenceSweepEvent) => void,
-  ): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SyncAbsenceSweepChangedEvent>("absence-sweep-changed", (event) => {
-      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.sweep);
-    });
-  }
-  reapplyAbsenceSweep(sweepId: string) {
-    return this.call<SyncAbsenceSweepActionOutcome>("reapply_absence_sweep", { sweepId });
-  }
-  restoreAbsenceSweep(sweepId: string) {
-    return this.call<SyncAbsenceSweepRestoreOutcome>("restore_absence_sweep", { sweepId });
-  }
-  keepAbsenceSweepDeletion(sweepId: string) {
-    return this.call<void>("keep_absence_sweep_deletion", { sweepId });
-  }
-  sparseV2CleanShutdown() {
-    return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");
   }
   guidePages() {
     return this.call<GuidePage[]>("guide_pages");
@@ -1603,8 +1505,37 @@ class TauriBackend implements Backend {
   publishHtml() {
     return this.call<[string, number]>("publish_html");
   }
+  publishQueryPlan(request: QueryPublicationRequest) {
+    return this.call<QueryPublicationPlan>("publish_query_plan", { request });
+  }
+  publishQuery(request: QueryPublicationRequest, fingerprint: string) {
+    return this.call<PublishOutcome>("publish_query", { request, fingerprint });
+  }
   pagePrintHtml(name: string, opts: PrintOpts) {
     return this.call<string>("page_print_html", { name, opts });
+  }
+  parseQuery(text: string, dialect: QueryTextDialect, blockProperties?: [string, string][]) {
+    return this.call<ParsedQuery>("query_parse", { text, dialect, blockProperties });
+  }
+  printQuery(
+    query: Query,
+    view: ViewSettings,
+    dialect: QueryPrintDialect,
+    preserveForm = false,
+  ) {
+    return this.call<string>("query_print", { query, view, dialect, preserveForm });
+  }
+  queryOgExpressible(query: Query, view: ViewSettings) {
+    return this.call<boolean>("query_og_expressible", { query, view });
+  }
+  queryRegistry() {
+    return this.call<RegistrySnapshot>("query_registry");
+  }
+  queryRun(query: Query, view: ViewSettings, context?: ExecutionContext) {
+    return this.call<QueryResult>("query_run", { query, view, context });
+  }
+  queryExplainEmpty(query: Query, view: ViewSettings, context?: ExecutionContext) {
+    return this.call<ExplainEmptyResult>("query_explain_empty", { query, view, context });
   }
   runQuery(query: string) {
     return this.call<RefGroup[]>("run_query", { query });
@@ -1696,8 +1627,21 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope) {
-    const execution = await this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain, scope: scope ?? null });
+  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions) {
+    const execution = await this.call<QueryExecution>("run_graph_search", {
+      source, pageLimit, blockLimit, lane, explain,
+      scope: scope ?? null,
+      // Members are serialized EXPLICITLY rather than spread: an options object
+      // carrying a key this build does not know would otherwise cross the
+      // bridge and be refused by the command's `deny_unknown_fields`.
+      options: options
+        ? {
+          pageMatchScope: options.pageMatchScope ?? null,
+          pageView: options.pageView ?? null,
+          blockView: options.blockView ?? null,
+        }
+        : null,
+    });
     return {
       ...execution,
       has_more: execution.has_more ?? { pages: false, blocks: false },
@@ -2107,13 +2051,11 @@ class TauriBackend implements Backend {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
   }
-  async onSparseV2Changed(cb: () => void): Promise<() => void> {
+  async onQueryProjectionChanged(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
-    return listen("sparse-v2-changed", () => cb());
-  }
-  async onManagedSyncError(cb: (message: string) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<string>("managed-sync-error", (e) => cb(e.payload));
+    return listen<number>("query-projection-changed", (event) => {
+      if (event.payload === this.bindingGeneration) cb();
+    });
   }
   async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
@@ -2160,6 +2102,12 @@ class TauriBackend implements Backend {
   }
   saveWorkspaces(data: string) {
     return this.call<void>("save_workspaces", { data });
+  }
+  loadNotices() {
+    return this.call<string>("load_notices");
+  }
+  saveNotices(data: string) {
+    return this.call<void>("save_notices", { data });
   }
   takeIdentifierMigrationNotice() {
     return this.call<boolean>("take_identifier_migration_notice");
@@ -2269,7 +2217,7 @@ let _backend: Backend | null = null;
 
 export function backend(): Backend {
   if (!_backend) {
-    _backend = isTauri() ? new TauriBackend() : mockBackend();
+    _backend = isTauri() ? new TauriBackend() : isPublishedExport() ? publishedBackend() : mockBackend();
   }
   return _backend;
 }
@@ -2320,9 +2268,10 @@ export async function reviewConflictCapsule(
   const live = conflict.live;
   if (!live) throw new Error("conflict capsule has no retained draft");
   if (live.disk_rev !== undefined) {
+    const diff = await current.durableLiveSaveConflictDiff(live.page, live.base_text ?? null);
     return {
-      diff: await current.durableLiveSaveConflictDiff(live.page, live.base_text ?? null),
-      authority: { kind: "direct_durable", expected_disk_rev: live.disk_rev },
+      diff,
+      authority: { kind: "direct_durable", expected_disk_rev: diff.conflict_rev },
     };
   }
   return {
@@ -2360,7 +2309,7 @@ export async function resolveConflictCapsule(
       preChoice,
     );
   }
-  throw new Error("the browser conflict demo has no managed actor");
+  throw new Error("the browser conflict demo has no durable capsule authority");
 }
 
 /** Test-only backend injection for delayed/rejected native-boundary proofs. */

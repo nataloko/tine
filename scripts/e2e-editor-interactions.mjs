@@ -47,6 +47,7 @@ fs.writeFileSync(PAGE_FILE, [
   "  echo hello",
   "  ```",
   "- Scaffold target",
+  "- " + "Multiline drag probe has ordinary words which wrap naturally across several visual lines. ".repeat(12),
   "",
 ].join("\n"));
 const now = new Date();
@@ -181,10 +182,18 @@ async function proveBacktickScaffold() {
   await browser.keys(["`"]);
   await browser.keys(["`"]);
   await browser.keys(["`"]);
+  // GH #507: the scaffold offers the language picker on its opener line, which
+  // stays visible so a language can be typed at all. Declining it with Escape
+  // is what lands the caret inside the body-only view (the GH #413 outcome).
+  await browser.waitUntil(async () => {
+    const receipt = await activeEditorReceipt("507-fence-language-picker");
+    return receipt.active && receipt.value.includes("```") && receipt.selectionStart === 3;
+  }, { timeout: 5_000, timeoutMsg: "third backtick did not offer the fence language picker on the opener line" });
+  await browser.keys(["Escape"]);
   await browser.waitUntil(async () => {
     const receipt = await activeEditorReceipt("413-backtick-scaffold");
     return receipt.active && !receipt.value.includes("```") && receipt.selectionStart === 0 && receipt.selectionEnd === 0;
-  }, { timeout: 5_000, timeoutMsg: "third backtick did not enter the body-only scaffold interior" });
+  }, { timeout: 5_000, timeoutMsg: "declining the language picker did not enter the body-only scaffold interior" });
   await browser.keys(["Escape"]);
   await browser.waitUntil(() => (fs.readFileSync(PAGE_FILE, "utf8").match(/```/g) ?? []).length === 4, {
     timeout: 10_000,
@@ -193,6 +202,35 @@ async function proveBacktickScaffold() {
   const bytes = fs.readFileSync(PAGE_FILE, "utf8");
   if (bytes.includes("Scaffold target") || bytes.includes("````")) {
     throw new Error(`scaffold persisted stale text or a four-backtick run: ${JSON.stringify(bytes)}`);
+  }
+}
+
+
+async function proveMultilineDrag() {
+  for (const row of [4, 6]) {
+    const content = await blockContentWithText("Multiline drag probe");
+    await content.scrollIntoView({ block: "start" });
+    const rect = await browser.execute((element) => {
+      const r = element.getBoundingClientRect(); return {x:r.x,y:r.y};
+    }, content);
+    const pointer = (actions) => browser.performActions([{type:"pointer",id:"drag-proof",parameters:{pointerType:"mouse"},actions}]);
+    await pointer([{type:"pointerMove",origin:"viewport",x:Math.round(rect.x+60),y:Math.round(rect.y+12),duration:0},{type:"pointerDown",button:0}]);
+    await browser.$("textarea.block-editor").waitForExist({timeout:5000});
+    const target = await browser.execute((row) => {
+      const ta = document.querySelector("textarea.block-editor");
+      const r = ta.getBoundingClientRect(), cs = getComputedStyle(ta);
+      return {x:Math.round(r.left+70),y:Math.round(r.top+parseFloat(cs.paddingTop)+parseFloat(cs.borderTopWidth)+parseFloat(cs.lineHeight)*(row+.5)),anchor:ta.selectionStart};
+    }, row);
+    await pointer([{type:"pointerMove",origin:"viewport",x:target.x,y:target.y,duration:250},{type:"pointerUp",button:0}]);
+    const drag = await activeEditorReceipt(`drag-row-${row}`);
+    // Independent oracle: a real native click in the now-active textarea at
+    // the same pixel. No copied mirror algorithm or synthetic event dispatch.
+    await pointer([{type:"pointerDown",button:0},{type:"pointerUp",button:0}]);
+    const native = await activeEditorReceipt(`native-caret-row-${row}`);
+    if (!drag.active || drag.selectionStart !== target.anchor || drag.selectionEnd !== native.selectionStart) {
+      throw new Error(`wrapped drag row ${row} diverged from native pointer: ${JSON.stringify({target,drag,native})}`);
+    }
+    await browser.keys(["Escape"]);
   }
 }
 
@@ -211,9 +249,10 @@ try {
   await proveEmbedExit();
   await provePayloadOnlySelection();
   await proveBacktickScaffold();
+  await proveMultilineDrag();
   await browser.saveScreenshot(path.join(ARTIFACTS, "final.png"));
   fs.writeFileSync(path.join(ARTIFACTS, "persisted-page.md"), fs.readFileSync(PAGE_FILE, "utf8"));
-  console.log("PASS: native code payload selection, three-backtick scaffold, and embed-root ArrowUp exit all held in the real app");
+  console.log("PASS: native code payload selection, three-backtick scaffold, embed-root ArrowUp exit, and wrapped drag endpoints all held in the real app");
 } catch (error) {
   try { await browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")); } catch {}
   try { fs.writeFileSync(path.join(ARTIFACTS, "persisted-page.md"), fs.readFileSync(PAGE_FILE, "utf8")); } catch {}

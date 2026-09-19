@@ -76,13 +76,6 @@ fn response(status: StatusCode, body: Vec<u8>) -> Response<Vec<u8>> {
     Response::builder().status(status).body(body).unwrap()
 }
 
-fn authority_name(authority: crate::state::AssetStreamAuthority) -> &'static str {
-    match authority {
-        crate::state::AssetStreamAuthority::Direct => "direct",
-        crate::state::AssetStreamAuthority::Managed => "managed",
-    }
-}
-
 fn diagnose_status(status: StatusCode, authority: &str) {
     if crate::debug::debug_enabled() {
         crate::debug::diag(format!(
@@ -125,21 +118,13 @@ fn respond_for_slot(
     }
     let resolved = match slot.asset_stream_path(name) {
         Ok(resolved) => resolved,
-        Err(crate::state::AssetStreamError::AuthorityUnavailable(unavailable)) => {
-            let authority = match unavailable {
-                crate::state::AssetStreamUnavailable::DirectRetiring => "direct_retiring",
-                crate::state::AssetStreamUnavailable::ManagedUnavailable => "managed_unavailable",
-            };
-            diagnose_status(StatusCode::FORBIDDEN, authority);
-            return response(StatusCode::FORBIDDEN, Vec::new());
-        }
-        Err(crate::state::AssetStreamError::InvalidAsset { authority }) => {
-            diagnose_status(StatusCode::NOT_FOUND, authority_name(authority));
+        Err(crate::state::AssetStreamError::InvalidAsset) => {
+            diagnose_status(StatusCode::NOT_FOUND, "direct");
             return response(StatusCode::NOT_FOUND, Vec::new());
         }
     };
-    let authority = authority_name(resolved.authority);
-    let Ok(mut file) = File::open(resolved.path) else {
+    let authority = "direct";
+    let Ok(mut file) = File::open(resolved) else {
         diagnose_status(StatusCode::NOT_FOUND, authority);
         return response(StatusCode::NOT_FOUND, Vec::new());
     };

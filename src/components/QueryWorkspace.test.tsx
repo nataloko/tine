@@ -3,6 +3,7 @@ import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import type { PaneRouter, QueryRoute } from "../router";
 import type { PageDto, QueryExecution } from "../types";
+import type { QueryResult } from "../editor/queryIr";
 import {
   clearTransientLayersForTest,
   dismissTopTransient,
@@ -14,13 +15,22 @@ import {
   type MaterializeQueryDependencies,
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
-import { pageInventoryRev } from "../ui";
-import { SaveConflictError } from "../backend";
+import { pageInventoryRev, setGraphMeta } from "../ui";
+import { backend, QueryNotReadyError, QueryUnavailableError, SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
+  setGraphMeta(null);
   document.body.innerHTML = "";
 });
+
+/** A promise the test releases by hand, so a real await can be held open across
+ *  a user edit instead of being simulated by a callback. */
+function gate(): { wait: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const wait = new Promise<void>((resolve) => { open = resolve; });
+  return { wait, open };
+}
 
 function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}): MaterializeQueryDependencies {
   return {
@@ -32,6 +42,57 @@ function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}):
 }
 
 describe("materializeQueryWorkspace", () => {
+  it("waits for query readiness before validating and saving", async () => {
+    const deps = materializeDeps();
+    vi.mocked(deps.runGraphSearch).mockRejectedValueOnce(new QueryNotReadyError("indexing"));
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.runGraphSearch).toHaveBeenCalledTimes(2);
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry or save a changed input while validation is pending", async () => {
+    let current = true;
+    const deps = materializeDeps({ runGraphSearch: vi.fn(async () => { current = false; throw new QueryNotReadyError("indexing"); }) });
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    expect(result).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.runGraphSearch).toHaveBeenCalledTimes(1);
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
+  it.each(["diagnostic", "existing", "lookup-error"])("discards a stale %s response", async (stage) => {
+    let current = true;
+    const deps = materializeDeps({
+      runGraphSearch: vi.fn(async () => {
+        if (stage === "diagnostic") current = false;
+        return { hits: [], diagnostics: stage === "diagnostic" ? [{ code: "invalid_regex", message: "old diagnostic" }] : [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false };
+      }),
+      getPage: vi.fn(async () => {
+        current = false;
+        if (stage === "lookup-error") throw new Error("old lookup error");
+        return { name: "Saved", title: "Saved", kind: "page", pre_block: null, blocks: [] } satisfies PageDto;
+      }),
+    });
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    expect(result).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
+  it.each(["validation", "lookup"])("refuses stale input after %s", async (stage) => {
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let current = true;
+    const deps = materializeDeps(stage === "validation" ? {
+      runGraphSearch: vi.fn(async () => { await barrier; return { hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false }; }),
+    } : { getPage: vi.fn(async () => { await barrier; return null; }) });
+    const pending = materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    await Promise.resolve();
+    current = false;
+    release();
+    expect(await pending).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
   it("rejects empty, exclusion-only, and Rust-diagnostic friendly searches before any graph write", async () => {
     for (const source of ["   ", "-draft", "/(a)\\1/"]) {
       const deps = materializeDeps({ runGraphSearch: vi.fn(async () => source === "-draft"
@@ -90,6 +151,7 @@ describe("materializeQueryWorkspace", () => {
       kind: "page",
       title: "Project dashboard",
       pre_block: null,
+      format: "md",
       blocks: [{
         id: "",
         raw: '{{query (search "alpha -draft")}}\ntine.view:: search',
@@ -125,6 +187,48 @@ describe("materializeQueryWorkspace", () => {
     }, tableDeps);
     expect(table.ok && table.page.blocks).toHaveLength(1);
     expect(table.ok && table.page.blocks[0].raw).toBe("{{query (todo TODO)}}\ntine.view:: table");
+  });
+
+  it("places the view property where the captured graph format reads it back", async () => {
+    const orgDeps = materializeDeps();
+    const org = await materializeQueryWorkspace({
+      title: "Org board",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "board",
+      routeId: "query-org-board",
+      format: "org",
+    }, orgDeps);
+    expect(org.ok).toBe(true);
+    if (!org.ok) throw new Error(org.message);
+    // An org block carries properties in a drawer; a markdown `key:: value` line
+    // here would render as body text and never read back as a property.
+    expect(org.page.blocks[0].raw).toBe("{{query (todo TODO)}}\n:PROPERTIES:\n:tine.view: board\n:END:");
+    expect(org.page.format).toBe("org");
+    expect(orgDeps.savePage).toHaveBeenCalledWith(org.page, null, false);
+
+    // The default list view is spelled as an ABSENT property in both formats,
+    // so an org list workspace materializes a bare query block with no drawer.
+    const orgList = await materializeQueryWorkspace({
+      title: "Org list",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "list",
+      routeId: "query-org-list",
+      format: "org",
+    }, materializeDeps());
+    expect(orgList.ok && orgList.page.blocks[0].raw).toBe("{{query (todo TODO)}}");
+
+    // An absent format keeps every dependency-injected caller on markdown.
+    const md = await materializeQueryWorkspace({
+      title: "Md board",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "board",
+      routeId: "query-md-board",
+    }, materializeDeps());
+    expect(md.ok && md.page.blocks[0].raw).toBe("{{query (todo TODO)}}\ntine.view:: board");
+    expect(md.ok && md.page.format).toBe("md");
   });
 
   it("refuses an existing page without attempting a write", async () => {
@@ -259,7 +363,120 @@ async function waitFor(check: () => void): Promise<void> {
   await vi.waitFor(check, { timeout: 1_000, interval: 5 });
 }
 
+/** A workspace only ever exists with a graph open, and the graph is what says
+ *  which on-disk format a new page is written in. */
+function openGraph(root: string, format: "md" | "org" = "md"): void {
+  setGraphMeta({ root, preferred_format: format } as never);
+}
+
+/** Hold ONE real await of the save lifecycle open, so the fixture races the
+ *  component's own routing rather than a stand-in callback. */
+function gatedDeps(stage: "validation" | "lookup" | "save"): {
+  deps: QueryWorkspaceDependencies;
+  open: () => void;
+} {
+  const { wait, open } = gate();
+  const deps = workspaceDeps();
+  if (stage === "validation") {
+    const live = deps.runGraphSearch;
+    // Only the zero-limit materialize lane waits: the pane's own live search
+    // has to keep answering, or the workspace under test would never render.
+    deps.runGraphSearch = vi.fn(async (source, pageLimit, blockLimit, lane, explain) => {
+      if (pageLimit === 0 && blockLimit === 0) await wait;
+      return live(source, pageLimit, blockLimit, lane, explain);
+    });
+  } else if (stage === "lookup") {
+    deps.getPage = vi.fn(async () => { await wait; return null; });
+  } else {
+    const live = deps.savePage;
+    deps.savePage = vi.fn(async (page, baseRev, force) => { await wait; return live(page, baseRev, force); });
+  }
+  return { deps, open };
+}
+
+function typeInto(input: HTMLInputElement, value: string): void {
+  input.value = value;
+  input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+}
+
+function submitSave(root: HTMLElement, name: string): void {
+  typeInto(root.querySelector<HTMLInputElement>(".query-workspace-save input")!, name);
+  (root.querySelector(".query-workspace-save") as HTMLFormElement)
+    .dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+}
+
+function clickPresentation(root: HTMLElement, label: string): void {
+  [...root.querySelectorAll<HTMLButtonElement>(".query-presentations button")]
+    .find((candidate) => candidate.textContent === label)!.click();
+}
+
+function saveButton(root: HTMLElement): HTMLButtonElement {
+  return root.querySelector<HTMLButtonElement>(".query-workspace-save button")!;
+}
+
+function text(root: HTMLElement, selector: string): string {
+  return root.querySelector(selector)?.textContent ?? "";
+}
+
 describe("QueryWorkspace", () => {
+  it("q4_query_summary_and_footer_use_returned_statistics_rejects_stale_workspace_completion", async () => {
+    const route: QueryRoute = { kind: "query", id: "statistics-race", sourceKind: "dsl", source: "old", presentation: "list" };
+    const deps = workspaceDeps();
+    const answers = new Map<string, (result: QueryResult) => void>();
+    vi.mocked(deps.runQuery).mockImplementation((source) => new Promise((resolve) => answers.set(source, resolve)));
+    const result = (name: string, value: number): QueryResult => ({
+      anchor: "page", pages: [{ name, path: `pages/${name}.md`, kind: "page", properties: [] }],
+      diagnostics: [], report: { ran: [], ignored: [], supported: true }, total: 1, exceeded: false,
+      statistics: { count: 1, aggregates: [["cost", "sum"]], group_by: "formula:cost",
+        overall: [{ kind: "number", value, skipped: 0 }], groups: null, grouping_status: "unsupported_formula" },
+    });
+    const root = document.createElement("div"); document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(answers.has("old")).toBe(true));
+      typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "new");
+      await vi.waitFor(() => expect(answers.has("new")).toBe(true));
+      answers.get("new")!(result("Current page", 2468));
+      await vi.waitFor(() => expect(text(root, "section[aria-label='Query statistics']")).toContain("2468"));
+      answers.get("old")!(result("Obsolete page", 9999));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(root.textContent).not.toContain("9999");
+      expect(root.textContent).not.toContain("Obsolete page");
+      expect(root.textContent).toContain("Exact statistics by formula are not supported yet. Overall statistics are shown.");
+      expect(root.querySelector("[aria-label='Grouped query statistics']")).toBeNull();
+    } finally { dispose(); }
+  });
+
+  it("q4_statistics_resource_limit_is_visible_not_zero", async () => {
+    const route: QueryRoute = { kind: "query", id: "statistics-limit", sourceKind: "dsl", source: "(task TODO)", presentation: "list" };
+    const deps = workspaceDeps();
+    const message = "Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.";
+    vi.mocked(deps.runQuery).mockRejectedValue(new QueryUnavailableError("statistics_resource_limit", message));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(text(root, ".query-workspace-status")).toContain(message));
+      expect(root.querySelector(".query-workspace-empty, section[aria-label='Query statistics']")).toBeNull();
+      expect(deps.runQuery).toHaveBeenCalledTimes(1);
+    } finally { dispose(); }
+  });
+
+  it("retries pending DSL queries automatically and surfaces permanent errors", async () => {
+    const route: QueryRoute = { kind: "query", id: "readiness", sourceKind: "dsl", source: "(task TODO)", presentation: "list" };
+    const deps = workspaceDeps();
+    vi.mocked(deps.runQuery).mockRejectedValueOnce(new QueryNotReadyError("indexing"))
+      .mockRejectedValue(new QueryUnavailableError("projection.failed", "The index could not be rebuilt."));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("Updating"));
+      await vi.waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("could not be rebuilt"));
+      expect(deps.runQuery).toHaveBeenCalledTimes(2);
+    } finally { dispose(); }
+  });
+
   it("peels a QueryBuilder child before its Advanced parent and preserves the draft", async () => {
     const route: QueryRoute = {
       kind: "query",
@@ -268,6 +485,9 @@ describe("QueryWorkspace", () => {
       source: "(and (task TODO))",
       presentation: "list",
     };
+    // The pane shows what the PRINTER returned (I-12); the dev-preview backend
+    // has no printer, so this test says what Rust would answer.
+    vi.spyOn(backend(), "printQuery").mockResolvedValue(route.source);
     const lower = vi.fn(() => true);
     const unregisterLower = registerTransientLayer({ id: "query-workspace-lower", dismiss: lower });
     const root = document.createElement("div");
@@ -280,23 +500,33 @@ describe("QueryWorkspace", () => {
       const dialog = root.querySelector<HTMLElement>(".query-advanced-modal")!;
       expect(dialog).not.toBeNull();
 
-      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
-      expect(root.querySelector(".qb-menu")).not.toBeNull();
+      // The sheet is over the IR now, so its rows appear once the ENGINE has
+      // read the route's text — there is no frontend parser left to do it
+      // synchronously. In the workspace the sheet is always open and NOT
+      // portalled: it is inside the Advanced modal, so the modal's Tab trap
+      // keeps containing it.
+      // The dev-preview backend has no parser, so this route's text comes back
+      // as ONE retained row — which still has its own ⋮ popover to peel.
+      await waitFor(() => expect(root.querySelector(".qs-row .qs-row-menu")).not.toBeNull());
+      root.querySelector<HTMLButtonElement>(".qs-row .qs-row-menu")!.click();
+      expect(root.querySelector(".qs-menu")).not.toBeNull();
 
       // Rung one: Escape peels the child popover and leaves the modal standing.
       expect(dismissTopTransient("escape")).toBe(true);
-      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".qs-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
 
       // Same rung by pointer (GH #472): a press on the modal's own header is an
-      // outside press for the clause menu, so the menu closes and only the menu.
-      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
-      expect(root.querySelector(".qb-menu")).not.toBeNull();
+      // outside press for the row menu, so the menu closes and only the menu.
+      root.querySelector<HTMLButtonElement>(".qs-row .qs-row-menu")!.click();
+      expect(root.querySelector(".qs-menu")).not.toBeNull();
       dialog.querySelector(".query-advanced-header")!
         .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".qs-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
-      expect(root.querySelector<HTMLTextAreaElement>(".query-dsl-editor textarea")?.value).toBe(route.source);
+      await waitFor(() =>
+        expect(root.querySelector<HTMLTextAreaElement>(".query-text-pane-input")?.value).toBe(route.source),
+      );
       expect(lower).not.toHaveBeenCalled();
 
       expect(dismissTopTransient("back")).toBe(true);
@@ -392,14 +622,24 @@ describe("QueryWorkspace", () => {
     await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
     expect(root.querySelector(".query-workspace-diagnostics")?.textContent).toContain("Results are limited");
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["Alpha", "alpha"]);
-    expect(root.querySelector(".search-result-context")?.textContent).toContain("Page");
-    expect(root.querySelectorAll(".query-result-row")).toHaveLength(2);
-    const resultRows = [...root.querySelectorAll<HTMLButtonElement>(".query-result-row")];
-    resultRows[0].click();
+    // **Two families, not one list** (§7.6, Q3): the page hit lives in the Pages
+    // section and the block hit in the Blocks section, and each is reached
+    // through its own section rather than by index into a combined list.
+    const pageSection = root.querySelector('[data-query-result-kind="page"]')!;
+    const blockSection = root.querySelector('[data-query-result-kind="block"]')!;
+    expect(pageSection.querySelector("h3")?.textContent).toBe("Pages");
+    expect(blockSection.querySelector("h3")?.textContent).toBe("Blocks");
+    expect(pageSection.querySelector(".switcher-kind")?.textContent).toContain("page");
+    expect(blockSection.querySelector(".search-result-context")?.textContent).toContain("Research");
+    const pageRows = [...pageSection.querySelectorAll<HTMLButtonElement>(".query-page-link")];
+    const blockRows = [...blockSection.querySelectorAll<HTMLButtonElement>(".query-result-row")];
+    expect(pageRows).toHaveLength(1);
+    expect(blockRows).toHaveLength(1);
+    pageRows[0].click();
     expect(router.openPageTarget).toHaveBeenCalledWith({
       name: "Alpha notes", pageKind: "page", path: "pages/alpha.md",
     });
-    resultRows[1].click();
+    blockRows[0].click();
     expect(router.openPageAtBlock).toHaveBeenCalledWith({
       name: "Research", pageKind: "page", path: "pages/client-b/Research.md", block: "authored-block-1",
     });
@@ -420,12 +660,19 @@ describe("QueryWorkspace", () => {
     const explain = root.querySelector(".query-explain-toggle") as HTMLButtonElement;
     explain.click();
     await waitFor(() => expect(root.querySelector(".query-workspace-explanation")?.textContent).toContain("contains alpha"));
-    expect(deps.runGraphSearch).toHaveBeenLastCalledWith("alpha", 40, 100, "query-workspace:query-test", true);
+    // The Display options ride the SAME request (§7.6, Q3): the two families'
+    // resolved views are part of what this search asks for, not a separate
+    // question asked afterwards.
+    expect(deps.runGraphSearch).toHaveBeenLastCalledWith(
+      "alpha", 40, 100, "query-workspace:query-test", true,
+      { pageView: { view: "board" }, blockView: { view: "board" } },
+    );
 
     dispose();
   });
 
   it("saves by naming and replaces the virtual route only after the guarded write succeeds", async () => {
+    openGraph("/graphs/A");
     const route: QueryRoute = {
       kind: "query",
       id: "query-save",
@@ -433,18 +680,17 @@ describe("QueryWorkspace", () => {
       source: "alpha OR beta",
       presentation: "board",
     };
-    const router = routerMock();
+    // The ACTIVE route is this workspace's own route: the save guard compares
+    // route identity, so a mock that claims some other tab is active would be
+    // testing a refusal, not a save.
+    const router = routerMock(route);
     const deps = workspaceDeps();
     const root = document.createElement("div");
     document.body.append(root);
     const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
     await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
 
-    const title = root.querySelector<HTMLInputElement>('.query-workspace-save input')!;
-    title.value = "Saved search";
-    title.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    (root.querySelector(".query-workspace-save") as HTMLFormElement)
-      .dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+    submitSave(root, "Saved search");
 
     await waitFor(() => expect(router.replaceActiveRoute).toHaveBeenCalledWith({
       kind: "page",
@@ -454,9 +700,207 @@ describe("QueryWorkspace", () => {
     const saved = vi.mocked(deps.savePage).mock.calls[0][0];
     expect(saved.blocks).toHaveLength(1);
     expect(saved.blocks[0].raw).toBe('{{query (search "alpha OR beta")}}\ntine.view:: board');
+    expect(saved.format).toBe("md");
     expect(deps.savePage).toHaveBeenCalledWith(saved, null, false);
+    expect(text(root, ".query-workspace-save-error")).toBe("");
+    expect(text(root, ".query-workspace-save-notice")).toBe("");
 
     dispose();
+  });
+
+  it("writes the org drawer form when the open graph prefers org", async () => {
+    openGraph("/graphs/Org", "org");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-org-save",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "table",
+    };
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Org search");
+    await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(deps.savePage).mock.calls[0][0];
+    expect(saved.format).toBe("org");
+    expect(saved.blocks[0].raw).toBe('{{query (search "alpha")}}\n:PROPERTIES:\n:tine.view: table\n:END:');
+
+    dispose();
+  });
+
+  it("refuses a save whose collision the backend reports, without ever forcing it", async () => {
+    openGraph("/graphs/A");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-collision",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+    };
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    vi.mocked(deps.savePage).mockRejectedValue(new SaveConflictError(9));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Raced");
+    await waitFor(() => expect(text(root, ".query-workspace-save-error")).toContain("has not been overwritten"));
+    expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.savePage).mock.calls[0].slice(1)).toEqual([null, false]);
+    expect(saveButton(root).disabled).toBe(false);
+
+    dispose();
+  });
+
+  const staleEdits = [
+    { edit: "source", local: true },
+    { edit: "display", local: true },
+    { edit: "display-draft", local: true },
+    { edit: "source-reverted", local: true },
+    { edit: "title", local: true },
+    { edit: "format", local: true },
+    { edit: "graph", local: false },
+    { edit: "route", local: false },
+  ] as const;
+  const staleCases = staleEdits.flatMap((entry) =>
+    (["validation", "lookup"] as const).map((stage) => ({ ...entry, stage })));
+
+  it.each(staleCases)(
+    "writes no page when the $edit changes while the $stage is still in flight",
+    async ({ edit, local, stage }) => {
+      openGraph("/graphs/A");
+      const route: QueryRoute = {
+        kind: "query",
+        id: "query-stale",
+        sourceKind: "search",
+        source: "alpha",
+        presentation: "board",
+      };
+      const [activeRoute, setActiveRoute] = createSignal<QueryRoute>(route);
+      const { deps, open } = gatedDeps(stage);
+      const router = routerMock(route);
+      vi.mocked(router.route).mockImplementation(activeRoute);
+      const root = document.createElement("div");
+      document.body.append(root);
+      const dispose = render(
+        () => <QueryWorkspace route={activeRoute()} router={router} deps={deps} />, root);
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+      submitSave(root, "Saved search");
+      await waitFor(() => expect(saveButton(root).disabled).toBe(true));
+
+      // The user moves on while the attempt is parked on its await.
+      if (edit === "source") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+      else if (edit === "display") clickPresentation(root, "Table");
+      else if (edit === "display-draft") setActiveRoute({ ...route, display: { sample: 0 } });
+      else if (edit === "source-reverted") {
+        typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+        typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "alpha");
+      }
+      else if (edit === "title") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-save input")!, "Renamed");
+      else if (edit === "format") openGraph("/graphs/A", "org");
+      else if (edit === "graph") openGraph("/graphs/B");
+      else setActiveRoute({ ...route, id: "query-other-tab" });
+      open();
+
+      await waitFor(() => expect(saveButton(root).disabled).toBe(false));
+      expect(deps.savePage).not.toHaveBeenCalled();
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+      expect(text(root, ".query-workspace-save-notice")).toBe("");
+      if (local) {
+        // Still this workspace, so it says — truthfully — that nothing was
+        // written and the remedy is to save again.
+        expect(text(root, ".query-workspace-save-error")).toContain("Try saving again");
+      } else {
+        // A different tab or a different graph: a refusal of THIS attempt has
+        // no business appearing there.
+        expect(text(root, ".query-workspace-save-error")).toBe("");
+      }
+
+      dispose();
+    });
+
+  it.each(["source", "route"] as const)(
+    "keeps a page that committed before the $0 changed, without hijacking the route",
+    async (edit) => {
+      openGraph("/graphs/A");
+      const route: QueryRoute = {
+        kind: "query",
+        id: "query-committed",
+        sourceKind: "search",
+        source: "alpha",
+        presentation: "board",
+      };
+      const [activeRoute, setActiveRoute] = createSignal<QueryRoute>(route);
+      const { deps, open } = gatedDeps("save");
+      const router = routerMock(route);
+      vi.mocked(router.route).mockImplementation(activeRoute);
+      const root = document.createElement("div");
+      document.body.append(root);
+      const dispose = render(
+        () => <QueryWorkspace route={activeRoute()} router={router} deps={deps} />, root);
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+      const beforeInventory = pageInventoryRev();
+      submitSave(root, "Saved search");
+      // `savePage` has already begun: from here the page may legitimately land.
+      await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+      if (edit === "source") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+      else setActiveRoute({ ...route, id: "query-other-tab" });
+      open();
+
+      await waitFor(() => expect(saveButton(root).disabled).toBe(false));
+      // The write landed under the input it captured, was never retried under
+      // the new one, and the page inventory knows about it.
+      expect(deps.savePage).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw)
+        .toBe('{{query (search "alpha")}}\ntine.view:: board');
+      expect(pageInventoryRev()).toBeGreaterThan(beforeInventory);
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+      expect(text(root, ".query-workspace-save-error")).toBe("");
+      if (edit === "source") {
+        // Same workspace: acknowledge the page rather than claim it was undone.
+        expect(text(root, ".query-workspace-save-notice")).toContain("Saved search");
+        expect(text(root, ".query-workspace-save-notice")).toContain("was saved");
+      } else {
+        expect(text(root, ".query-workspace-save-notice")).toBe("");
+      }
+
+      dispose();
+    });
+
+  it("lets a save land after the workspace is unmounted without routing anything", async () => {
+    openGraph("/graphs/A");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-unmounted",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+    };
+    const { deps, open } = gatedDeps("save");
+    const router = routerMock(route);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Saved search");
+    await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+    dispose();
+    open();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+    expect(router.replaceActiveRoute).not.toHaveBeenCalled();
   });
 
   it("opens a focus-managed modal and preserves an untouched OR search exactly", async () => {
@@ -494,5 +938,185 @@ describe("QueryWorkspace", () => {
     expect(document.activeElement).toBe(toggle);
 
     dispose();
+  });
+});
+
+// **Scoped Display settings in the workspace** (SPEC §7.6, Q3).
+//
+// The workspace's route carries the whole envelope: the singular compatibility
+// view, a scoped draft and presentation per family, and the Friendly membership
+// scope. These cases are the evidence that all of it reaches execution, all of
+// it reaches disk, and that a save publishes the state it CAPTURED rather than
+// whatever the user has typed since.
+describe("q3: scoped display settings in the workspace", () => {
+  const scopedRoute = (overrides: Partial<QueryRoute> = {}): QueryRoute => ({
+    kind: "query",
+    id: "query-scoped",
+    sourceKind: "search",
+    source: "alpha",
+    presentation: "list",
+    ...overrides,
+  });
+
+  it("q3_workspace_executes_page_anchor_and_both_displays", async () => {
+    // FAIL-BEFORE: resource identity omitted Display entirely and the explicit
+    // route ran through a groups-only adapter, so a page-anchored query lost
+    // its rows and every query ran under whatever the singular view said.
+    const route = scopedRoute({
+      sourceKind: "dsl",
+      source: "(page-property status open)",
+      pagePresentation: "table",
+      pageDisplay: { columns: ["status"] },
+      blockDisplay: {},
+    });
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    deps.runQuery = vi.fn(async () => ({
+      anchor: "page" as const,
+      pages: [{
+        name: "Alpha notes", kind: "page" as const, path: "pages/alpha.md",
+        properties: [["status", "open"]] as [string, string][],
+      }],
+      diagnostics: [],
+      report: { ran: [], ignored: [], supported: true },
+      total: 1,
+      exceeded: false,
+    }));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(root.querySelector('[data-query-result-kind="page"] table')).not.toBeNull());
+      // BOTH views travel, because only the parse knows which anchor the query
+      // declares. The page half carries the scoped draft; the block half is a
+      // present EMPTY draft, which clears rather than inherits.
+      expect(deps.runQuery).toHaveBeenCalledWith("(page-property status open)", {
+        page: { view: "table", columns: ["status"] },
+        block: { view: "list" },
+      });
+      // The page rows survive the adapter WHOLE: the column reads the page's own
+      // authored property, which a groups-only conversion had thrown away.
+      const table = root.querySelector('[data-query-result-kind="page"] table')!;
+      expect([...table.querySelectorAll("thead th")].map((th) => th.textContent)).toEqual(["Page", "status"]);
+      expect(table.querySelector("tbody tr")?.textContent).toContain("open");
+      // An explicit query renders the section its anchor declares — and the
+      // other family still says so rather than disappearing (I-10).
+      expect(root.querySelector('[data-query-result-kind="block"]')?.textContent)
+        .toContain("No matching blocks.");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("q3_scoped_save_reopen_md_org", async () => {
+    // FAIL-BEFORE: `savedQueryRaw` filtered its writes to `tine.view`, so every
+    // other setting the workspace was showing was dropped and the saved query
+    // reopened as a different query than the one that was saved.
+    const input = {
+      title: "Saved scoped",
+      sourceKind: "search" as const,
+      source: "alpha",
+      presentation: "list" as const,
+      display: { sort: [["page", "asc"]] as [string, "asc" | "desc"][] },
+      pagePresentation: "table" as const,
+      pageDisplay: { columns: ["status"] },
+      // Present and EMPTY: the Blocks section clears rather than inherits.
+      blockDisplay: {},
+      pageMatchScope: "both" as const,
+      routeId: "q",
+    };
+    for (const format of ["md", "org"] as const) {
+      const deps = materializeDeps();
+      const result = await materializeQueryWorkspace({ ...input, format }, deps);
+      expect(result.ok).toBe(true);
+      const saved = vi.mocked(deps.savePage).mock.calls[0][0];
+      const raw = saved.blocks[0].raw;
+
+      // The whole envelope reached disk, in the spelling the reader reads back.
+      const property = (key: string) => new RegExp(
+        format === "org" ? `^:${key}:\\s*(.*)$` : `^${key}::\\s*(.*)$`,
+        "m",
+      ).exec(raw)?.[1];
+      expect(raw.startsWith('{{query (search "alpha")}}')).toBe(true);
+      expect(property("tine.sort")).toBe("page asc");
+      expect(property("tine.page-view")).toBe("table");
+      expect(property("tine.page-display")).toBe("1");
+      expect(property("tine.page-columns")).toBe("status");
+      // The marker with NO members is the present-empty draft: it clears.
+      expect(property("tine.block-display")).toBe("1");
+      expect(raw).not.toMatch(/tine\.block-columns/);
+      expect(raw).not.toMatch(/tine\.block-sort/);
+      expect(property("tine.page-match-scope")).toBe("both");
+      // A list workspace still writes no `tine.view`: absence IS the default.
+      expect(raw).not.toMatch(/tine\.view/);
+      // And the property lines go where THIS format reads them back from:
+      // markdown `key:: value` inside an org file is visible body text that is
+      // never read back as a property (GH #25).
+      if (format === "org") {
+        expect(raw).toContain(":PROPERTIES:");
+        expect(raw).not.toMatch(/tine\.sort::/);
+      } else {
+        expect(raw).not.toContain(":PROPERTIES:");
+      }
+    }
+  });
+
+  it("q3_scoped_save_omits_a_namespace_that_has_no_draft", async () => {
+    // Absence is a value here too: a workspace with no page draft must not
+    // write a page marker, or reopening it would CLEAR settings it inherits.
+    const deps = materializeDeps();
+    const result = await materializeQueryWorkspace({
+      title: "Saved plain",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+      routeId: "q",
+    }, deps);
+    expect(result.ok).toBe(true);
+    const raw = vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw;
+    expect(raw).toBe('{{query (search "alpha")}}');
+  });
+
+  it("q3_materialize_scoped_capture_is_revision_safe", async () => {
+    // FAIL-BEFORE (I-20): the attempt read the route's live drafts, so a draft
+    // the user kept editing during the await reached back into the write that
+    // was already publishing.
+    openGraph("/graphs/A");
+    const [route, setRoute] = createSignal<QueryRoute>(scopedRoute({
+      id: "query-capture",
+      pageDisplay: { columns: ["status"] },
+      pageMatchScope: "names",
+    }));
+    const router = routerMock(route());
+    router.route = route;
+    const { deps, open } = gatedDeps("save");
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route()} router={router} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+      submitSave(root, "Captured");
+      await waitFor(() => expect(deps.savePage).toHaveBeenCalled());
+
+      // The user keeps editing while the write is in flight.
+      setRoute(scopedRoute({
+        id: "query-capture",
+        pageDisplay: { columns: ["owner", "status"] },
+        pageMatchScope: "both",
+      }));
+      open();
+      // The write had already begun, so it lands — and the workspace says so
+      // rather than hijacking the route the user has since changed.
+      await waitFor(() => expect(text(root, ".query-workspace-save-notice")).not.toBe(""));
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+
+      // What landed is what was CAPTURED, deep-copied at submit.
+      const raw = vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw;
+      expect(raw).toMatch(/^tine\.page-columns:: status$/m);
+      expect(raw).not.toMatch(/owner/);
+      expect(raw).toMatch(/^tine\.page-match-scope:: names$/m);
+    } finally {
+      dispose();
+    }
   });
 });

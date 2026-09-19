@@ -92,7 +92,6 @@ const receipt = {
   storageMode: "direct-files",
   companionRoute: {},
   persistedRoute: {},
-  legacyMigration: {},
 };
 let driver;
 let browser;
@@ -215,6 +214,22 @@ try {
   assert(panes.length === 2 && pdfPane?.tabs.length === 1 && pdfPane.tabs[0].title === "First PDF",
     `toolbar Close did not terminally close only the active second PDF tab: ${JSON.stringify(panes)}`);
 
+  // The reader keeps settling after data-pdf-ready: an initial fit-width scale
+  // change runs a zoom settle that re-asserts the scroll position and the page
+  // field. Typing into that window races it. Wait for the viewer to be quiet --
+  // scroll position and zoom unchanged across two samples -- before acting.
+  await browser.waitUntil(async () => {
+    const sample = () => browser.execute(() => ({
+      top: document.querySelector(".pdf-scroll")?.scrollTop ?? null,
+      zoom: document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? null,
+      field: document.querySelector(".pdf-page-input")?.value ?? null,
+    }));
+    const first = await sample();
+    await sleep(250);
+    const second = await sample();
+    return first.top !== null && JSON.stringify(first) === JSON.stringify(second);
+  }, { timeout: 20_000, timeoutMsg: "the PDF reader never settled after load" });
+
   const pageInput = await browser.$(".pdf-page-input");
   await pageInput.setValue("2");
   await browser.keys("Enter");
@@ -222,8 +237,60 @@ try {
     timeout: 10_000,
     timeoutMsg: "PDF page control did not settle on page 2",
   });
+  // Zooming must not lose the reader's place. The scroll rAF derives the page
+  // from scrollTop against each wrapper's offsetTop, and a zoom resizes only the
+  // VISIBLE wrappers before applying its transform -- so mid-zoom that probe
+  // reports page 1, and the view state is published before settleZoom repairs
+  // the scroll 120ms later. User-visible harm: zoom, quit, reopen, and you are
+  // on page 1 instead of where you were. Asserted on the persisted bytes,
+  // because those are exactly the state the relaunch below consumes.
+  //
+  // Order matters. Wait for the ZOOM to reach disk first, then read the page:
+  // waiting for page 2 instead would tolerate a transient 1 that settles later,
+  // and the value that decides the user outcome is the one on disk when the
+  // process dies.
+  const session = () => {
+    if (!fs.existsSync(sessionPath)) return null;
+    try { return JSON.parse(fs.readFileSync(sessionPath, "utf8")); } catch { return null; }
+  };
+  const persistedPdf = () => {
+    let found = null;
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.kind === "pdf" && node.filename === "first.pdf") found = node;
+      for (const value of Object.values(node)) walk(value);
+    };
+    walk(session());
+    return found;
+  };
+  const persistedPaneIds = () => {
+    const ids = [];
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.kind === "pane" && node.paneId) ids.push(node.paneId);
+      for (const value of Object.values(node)) walk(value);
+    };
+    walk(session()?.layout);
+    return ids.sort();
+  };
+  const persistedNotesTab = () => {
+    let found = false;
+    const walk = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (node.kind === "page" && node.name === "hls__first") found = true;
+      for (const value of Object.values(node)) walk(value);
+    };
+    walk(session()?.layout);
+    return found;
+  };
+
+  await browser.waitUntil(() => persistedPdf()?.page === 2, {
+    timeout: 10_000,
+    timeoutMsg: "typing page 2 never reached the route session",
+  });
   await browser.$('button[title="Zoom in"]').click();
   const savedZoom = await browser.$(".pdf-zoom-level").getText();
+  const wantedScale = Number.parseFloat(savedZoom) / 100;
 
   await openPdfNotes();
   await browser.waitUntil(() => browser.execute(() =>
@@ -246,11 +313,22 @@ try {
     notesOpenedInStructuralCompanion: true,
   };
 
-  // Each tab's page/zoom and pane layout are stored by the explicit route
-  // session; the reader sidecar remains only the default for a newly opened
-  // view. Wait for both persistence debounces before a clean relaunch.
-  await sleep(4500);
-  assert(fs.existsSync(sessionPath), `route session was not persisted at ${sessionPath}`);
+  // Both persistence debounces, as predicates rather than one fixed sleep: the
+  // reader view state AND the pane layout the relaunch restores.
+  await browser.waitUntil(() => {
+    const pdf = persistedPdf();
+    return !!pdf && Math.abs(pdf.scale - wantedScale) < 0.001
+      && persistedPaneIds().length === 2 && persistedNotesTab();
+  }, {
+    timeout: 30_000,
+    timeoutMsg: "the reader view state, the 2-pane layout and the Notes tab never all reached the route session",
+  }).catch((error) => {
+    throw new Error(`${error.message}: wantedScale=${wantedScale} pdf=${JSON.stringify(persistedPdf())} `
+      + `panes=${JSON.stringify(persistedPaneIds())} notesTab=${persistedNotesTab()}`);
+  });
+  assert(persistedPdf()?.page === 2,
+    `zooming reset the persisted reader page to ${persistedPdf()?.page}; it must stay on 2`);
+
   await stop();
 
   await start("route-restore");
@@ -260,7 +338,15 @@ try {
   const restoredNotesPane = panes.find((pane) => pane.page === "hls__first");
   assert(panes.length === 2 && restoredPdfPane && restoredNotesPane,
     `saved PDF/Notes pane routes were not restored: ${JSON.stringify(panes)}`);
-  const restoredPage = await browser.$(".pdf-page-input").getValue();
+  // The viewer reports ready before the saved page is applied, so read the
+  // control only once it has settled; a genuine failure to restore still
+  // times out here and reports the value it settled on.
+  const pageControl = await browser.$(".pdf-page-input");
+  await browser.waitUntil(async () => (await pageControl.getValue()) === "2", {
+    timeout: 15_000,
+    timeoutMsg: "restored PDF page never settled on 2",
+  }).catch(() => {});
+  const restoredPage = await pageControl.getValue();
   const restoredZoom = await browser.$(".pdf-zoom-level").getText();
   assert(restoredPage === "2", `restored PDF page was ${restoredPage}, expected 2`);
   assert(restoredZoom === savedZoom, `restored PDF zoom was ${restoredZoom}, expected ${savedZoom}`);
@@ -271,43 +357,8 @@ try {
   };
   await stop();
 
-  const pageSnapshot = (name) => ({
-    tabs: [{ history: [{ kind: "page", name, pageKind: "page" }], pos: 0, pinned: false }],
-    activeIndex: 0,
-    scrolls: [null],
-  });
-  const legacy = {
-    ...pageSnapshot("Source"),
-    layout: {
-      kind: "split",
-      dir: "row",
-      ratio: 0.42,
-      children: [
-        { kind: "pane", paneId: "main", ...pageSnapshot("Source") },
-        { kind: "pane", paneId: "kept-pane", ...pageSnapshot("Other") },
-      ],
-    },
-    focusedPaneId: "main",
-    pdfTarget: { filename: "first.pdf", label: "First PDF" },
-  };
-  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
-  fs.writeFileSync(sessionPath, `${JSON.stringify(legacy, null, 2)}\n`);
-
-  await start("legacy-migration");
-  await waitForPdf("first.pdf");
-  panes = await paneState();
-  const pages = panes.map((pane) => pane.page).filter(Boolean).sort();
-  assert(panes.length === 3 && pages.includes("Source") && pages.includes("Other") && panes.some((pane) => pane.pdf === "first.pdf"),
-    `legacy PDF migration lost an existing pane or failed to add a route pane: ${JSON.stringify(panes)}`);
-  receipt.legacyMigration = {
-    preexistingPaneCount: 2,
-    migratedPaneCount: panes.length,
-    preservedPages: pages,
-    pdfRouteAdded: true,
-  };
-
   fs.writeFileSync(path.join(ARTIFACTS, "pdf-routes-native-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  console.log(`PASS: Direct Files PDF pane routes, restore, and legacy migration are stable: ${JSON.stringify(receipt)}`);
+  console.log(`PASS: Direct Files PDF pane routes and reader restore are stable: ${JSON.stringify(receipt)}`);
 } finally {
   await stop();
   try { fs.closeSync(driverLog); } catch {}

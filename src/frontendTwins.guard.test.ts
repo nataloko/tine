@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { serializedWrites } from "./serializedWrites";
+import { readStoreModuleSource } from "./testSource";
 
 /** Every non-test frontend source under `src/`, so an ownership rule cannot be
  *  escaped by putting the offending copy in a directory the scan forgot. */
@@ -91,15 +92,13 @@ describe("frontend twin ownership guards", () => {
     expect(writes.scope).toBe("guard-fixture");
   });
 
-  it("pins the two specialized tails and the PDF tracking non-fit", () => {
+  it("pins the one specialized tail and the PDF tracking non-fit", () => {
     const pluginManager = readFileSync("src/plugins/manager.ts", "utf8");
-    const store = readFileSync("src/store.ts", "utf8");
     const pdfOwnership = readFileSync("src/pdfOwnership.ts", "utf8");
 
-    const rule = "I-12: promise-tail serialization has one owner, src/serializedWrites.ts; the two specialized "
-      + "tails and the PDF mutation set are the pinned exceptions (see the exception comments in each file)";
+    const rule = "I-12: promise-tail serialization has one owner, src/serializedWrites.ts; the plugin "
+      + "persistence tail and the PDF mutation set are the pinned exceptions (see the exception comments in each file)";
     expect(pluginManager, rule).toContain("persistenceChains = new Map<string, Promise<void>>()");
-    expect(store, rule).toContain("let managedMoveQueue: Promise<void> = Promise.resolve()");
     expect(pdfOwnership, rule).toContain("const mutations = new Map<number, Set<Promise<boolean>>>()");
     expect(pdfOwnership, rule).not.toContain("serializedWrites");
   });
@@ -127,16 +126,16 @@ describe("frontend twin ownership guards", () => {
     // the same block further down the page. Every `startEditing` call in the
     // store therefore passes a surface (usually a forwarded `editingSurface`
     // parameter); `indentBlock` is the exemplar to imitate.
-    const lines = readFileSync("src/store.ts", "utf8").split("\n");
+    const lines = readStoreModuleSource().split("\n");
     const calls = lines
       .map((line, index) => ({ line: line.trim(), number: index + 1 }))
       .filter((entry) => entry.line.startsWith("startEditing("));
     // Non-vacuity: this guard is worthless if the scan stops finding the calls.
-    expect(calls.length, "I-12: the startEditing scan of src/store.ts found nothing").toBeGreaterThanOrEqual(6);
+    expect(calls.length, "I-11/I-12: the startEditing scan of the store layer found nothing").toBeGreaterThanOrEqual(6);
     for (const call of calls) {
       expect(
         call.line.split(",").length,
-        `I-12: src/store.ts:${call.number} reopens the editor without naming a surface, so the caret `
+        `I-11/I-12: store-layer source line ${call.number} reopens the editor without naming a surface, so the caret `
           + `leaves a block embed for the source copy (GH #477). Take an \`editingSurface\` parameter and `
           + `forward it as the 4th argument, like indentBlock does.`,
       ).toBeGreaterThanOrEqual(4);

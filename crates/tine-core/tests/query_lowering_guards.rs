@@ -1,11 +1,14 @@
 #[path = "support/production_source.rs"]
 mod production_source;
 
-use production_source::{compiled_source, production_source_files, relative_path, repo_root};
+use production_source::{
+    collect_rs_files, compiled_source, line_of, production_source_files, relative_path, repo_root,
+    source_without_test_regions,
+};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 
-const LOWERING: &str = "crates/tine-core/src/oplog/query_lowering.rs";
+const CURSOR: &str = "crates/tine-core/src/query_cursor.rs";
 const DIRECT: &str = "crates/tine-core/src/direct_projection.rs";
 
 fn sources() -> BTreeMap<String, String> {
@@ -38,147 +41,22 @@ fn function_body<'a>(source: &'a str, symbol: &str) -> &'a str {
     panic!("unterminated production symbol {symbol}")
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DrainOwner {
-    file: &'static str,
-    enclosing_symbol: &'static str,
-    read_family: &'static str,
-    question: &'static str,
-    retirement_owner: &'static str,
-}
-
-const NON_OWNED_DRAINS: &[DrainOwner] = &[
-    DrainOwner {
-        file: "crates/tine-core/src/oplog/operational_coordinator.rs",
-        enclosing_symbol: "execute_clean_external",
-        read_family: "page_inventory_after",
-        question: "record_prepared_absence_batch page count",
-        retirement_owner: "follow-up after W4-B4b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_block_reference_counts_ready",
-        read_family: "block_reference_counts_after",
-        question: "managed block reference counts",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_block_reference_counts_ready",
-        read_family: "block_reference_counts_for_source_page_after",
-        question: "managed source-page block reference counts",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_block_referrers_ready",
-        read_family: "block_referrer_candidates_after",
-        question: "managed block referrers",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_backlinks_ready",
-        read_family: "page_referrer_candidates_after",
-        question: "managed backlinks",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_unlinked_references_ready",
-        read_family: "plain_text_candidate_pages_after",
-        question: "managed unlinked references",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_templates_ready",
-        read_family: "block_property_candidates_after",
-        question: "managed templates",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_property_facets_ready",
-        read_family: "property_facet_rows_after",
-        question: "managed property facets",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_sparse_task_query_ready",
-        read_family: "task_candidate_blocks_after",
-        question: "managed sparse task blocks",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_fuzzy_candidate_paths_ready",
-        read_family: "fuzzy_subsequence_candidate_pages_after",
-        question: "managed fuzzy candidates",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_navigation_pages_ready",
-        read_family: "navigation_pages_after",
-        question: "managed navigation pages",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_navigation_aliases_ready",
-        read_family: "navigation_aliases_after",
-        question: "managed navigation aliases",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_navigation_reference_names_ready",
-        read_family: "navigation_reference_names_after",
-        question: "managed referenced-name inventory",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_inventory_of_kind_ready",
-        read_family: "page_inventory_after",
-        question: "managed inventory by kind",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_page_namespace_ready",
-        read_family: "navigation_pages_by_name_key_namespace_after",
-        question: "managed page namespace",
-        retirement_owner: "W4-C7b",
-    },
-];
-
 #[test]
 fn hand_written_cursor_drains_are_pinned() {
     let source = sources();
-    let lowering = &source[LOWERING];
     assert_eq!(
-        lowering.matches("drain_after(").count(),
-        10,
-        "I-12: the ten SimpleQuerySqlRead consumers must delegate cursor advancement and termination to drain_after; exemplar {LOWERING}"
-    );
-    assert_eq!(
-        lowering.matches("loop {").count(),
+        source[CURSOR].matches("loop {").count(),
         1,
-        "I-12: only drain_after itself may own a cursor loop in {LOWERING}"
+        "I-12: the shared production cursor owner contains the drain loop"
     );
 
     let direct = &source[DIRECT];
     for symbol in [
-        "sparse_task_query",
         "property_facets",
         "referenced_page_names",
-        "fuzzy_candidate_paths",
         "page_aliases_with_owners",
         "real_page_names",
-        "reference_candidate_paths",
+        "reference_candidates",
         "block_ref_counts",
         "block_referrer_candidate_paths",
     ] {
@@ -188,20 +66,29 @@ fn hand_written_cursor_drains_are_pinned() {
             "I-12: {DIRECT}::{symbol} retains caller-owned cursor advancement, termination, or adaptive retry; call drain_after"
         );
     }
+    // 10 → 12: P0-rust Wave D's `property_owner_rows` (§6.2's Direct Files
+    // registry row source) drains the page map and the property rows. Both
+    // DELEGATE to `drain_after` — which is what this guard is for — so the pin
+    // moves; it would be a violation only if the new consumer owned its own
+    // `loop {}`, which the per-symbol assertions above still forbid.
+    // 12 → 13: R6's `page_inventory` (the warm-session `list_pages` source)
+    // drains the page map through `drain_after` like the twelve before it.
+    // 13 → 12: RET2 deleted `sparse_task_query` — the Direct sparse-task
+    // candidate route — along with the query walk it handed its candidates to.
+    // Its `task_candidate_locators_after` drain went with it, and so did its
+    // row in the per-symbol list above. No surviving consumer changed.
+    // 12 → 11: Q1 deleted `fuzzy_candidate_paths` — the Direct Friendly
+    // candidate route — along with parsed-page ranking. Its
+    // `fuzzy_subsequence_candidate_pages_after` drain went with it, and so did
+    // its row above. No surviving consumer changed.
+    // 11 → 9: K2 made `property_owner_rows` test-only. It fed the editor
+    // registry, whose only reader was the query walk; the walk is the test-only
+    // oracle now and the product reads the projection's committed registry.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        10,
-        "I-12: the ten owned Direct cursor consumers must each delegate to drain_after"
+        9,
+        "I-12: the nine owned Direct cursor consumers must each delegate to drain_after"
     );
-
-    for allowed in NON_OWNED_DRAINS {
-        let body = function_body(&source[allowed.file], allowed.enclosing_symbol);
-        assert!(
-            body.contains(allowed.read_family),
-            "missing allowlisted drain {allowed:?}"
-        );
-        assert!(!allowed.question.is_empty() && !allowed.retirement_owner.is_empty());
-    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -216,41 +103,15 @@ struct CensusRecord {
 
 fn containing_symbol(source: &str, offset: usize) -> String {
     let before = &source[..offset];
-    let function = Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)")
+    Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)")
         .unwrap()
         .captures_iter(before)
         .last()
         .map(|capture| capture[1].to_string())
-        .expect("read-family call must be inside a named function");
-    if before
-        .rfind("impl SimpleQuerySqlRead for ")
-        .is_some_and(|implementation| before[implementation..].rfind("fn ").is_some())
-    {
-        let implementation = before.rfind("impl SimpleQuerySqlRead for ").unwrap();
-        let rest = &before[implementation + "impl SimpleQuerySqlRead for ".len()..];
-        let owner = rest
-            .split(|character: char| character.is_whitespace() || character == '{')
-            .next()
-            .unwrap();
-        format!("{owner}::{function}")
-    } else {
-        function
-    }
+        .expect("read-family call must be inside a named function")
 }
 
 fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static str) {
-    if file == LOWERING {
-        return (
-            "shared-lowering-adapter",
-            "SimpleQueryCandidatePlan page candidates",
-        );
-    }
-    if file == "crates/tine-core/src/oplog/sqlite_materialization.rs" {
-        return (
-            "facade-forwarder",
-            "managed-to-physical read facade conversion",
-        );
-    }
     match (file, symbol, family) {
         (DIRECT, "property_facets", "property_facet_rows_after") => {
             ("other-question", "Direct property facets")
@@ -258,29 +119,14 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         (DIRECT, "real_page_names", "navigation_pages_after_with_header_validation") => {
             ("other-question", "Direct real page ownership")
         }
-        (DIRECT, "reference_candidate_paths", "page_referrer_candidates_after") => {
+        (DIRECT, "reference_candidates", "page_referrer_candidates_after") => {
             ("other-question", "Direct explicit reference candidates")
         }
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_backlinks_ready",
-            "page_referrer_candidates_after",
-        ) => ("other-question", "managed backlinks"),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_templates_ready",
-            "block_property_candidates_after",
-        ) => ("other-question", "managed templates"),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_property_facets_ready",
-            "property_facet_rows_after",
-        ) => ("other-question", "managed property facets"),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_navigation_pages_ready",
-            "navigation_pages_after",
-        ) => ("other-question", "managed navigation pages"),
+        // R6: `list_pages` in a warm session (no parsed cache) is served from
+        // the ready projection's page inventory instead of a whole-graph parse.
+        (DIRECT, "page_inventory", "navigation_pages_after_with_header_validation") => {
+            ("other-question", "Direct page inventory for list_pages")
+        }
         _ => panic!("unclassified SQL read-family call: {file}::{symbol} {family}"),
     }
 }
@@ -319,7 +165,7 @@ fn census(source: &BTreeMap<String, String>) -> BTreeSet<CensusRecord> {
 }
 
 fn assert_exact_census(source: &BTreeMap<String, String>, expected: &BTreeSet<CensusRecord>) {
-    assert_eq!(census(source), *expected, "I-12: the shared SQL read-family producer/consumer census changed; classify the exact enclosing production symbol and question; exemplar {LOWERING}");
+    assert_eq!(census(source), *expected, "I-12: the shared SQL read-family producer/consumer census changed; classify the exact enclosing production symbol and question; exemplar {DIRECT}");
 }
 
 fn expected_census() -> BTreeSet<CensusRecord> {
@@ -334,55 +180,6 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             question: question.into(),
         }));
     };
-    for owner in [
-        "SqliteMaterializedRead<'_>",
-        "SqliteGraphProjectionRead<'_>",
-    ] {
-        for (symbol, family) in [
-            ("task_candidate_pages", "task_candidate_pages_after"),
-            ("page_referrer_candidates", "page_referrer_candidates_after"),
-            (
-                "block_property_candidates",
-                "block_property_candidates_after",
-            ),
-            ("page_property_candidates", "property_facet_rows_after"),
-            (
-                "navigation_pages",
-                if owner.starts_with("SqliteMaterialized") {
-                    "navigation_pages_after"
-                } else {
-                    "navigation_pages_after_with_header_validation"
-                },
-            ),
-        ] {
-            add(
-                family,
-                LOWERING,
-                &format!("{owner}::{symbol}"),
-                "shared-lowering-adapter",
-                "SimpleQueryCandidatePlan page candidates",
-            );
-        }
-    }
-    for family in [
-        "navigation_pages_after_with_header_validation",
-        "page_referrer_candidates_after",
-        "block_property_candidates_after",
-        "property_facet_rows_after",
-        "task_candidate_pages_after",
-    ] {
-        let symbol = match family {
-            "navigation_pages_after_with_header_validation" => "navigation_pages_after",
-            other => other,
-        };
-        add(
-            family,
-            "crates/tine-core/src/oplog/sqlite_materialization.rs",
-            symbol,
-            "facade-forwarder",
-            "managed-to-physical read facade conversion",
-        );
-    }
     for (family, file, symbol, question) in [
         (
             "property_facet_rows_after",
@@ -397,34 +194,16 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             "Direct real page ownership",
         ),
         (
+            "navigation_pages_after_with_header_validation",
+            DIRECT,
+            "page_inventory",
+            "Direct page inventory for list_pages",
+        ),
+        (
             "page_referrer_candidates_after",
             DIRECT,
-            "reference_candidate_paths",
+            "reference_candidates",
             "Direct explicit reference candidates",
-        ),
-        (
-            "page_referrer_candidates_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_backlinks_ready",
-            "managed backlinks",
-        ),
-        (
-            "block_property_candidates_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_templates_ready",
-            "managed templates",
-        ),
-        (
-            "property_facet_rows_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_property_facets_ready",
-            "managed property facets",
-        ),
-        (
-            "navigation_pages_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "application_navigation_pages_ready",
-            "managed navigation pages",
         ),
     ] {
         add(family, file, symbol, "other-question", question);
@@ -435,27 +214,12 @@ fn expected_census() -> BTreeSet<CensusRecord> {
 #[test]
 fn simple_query_read_family_census_is_exact() {
     let source = sources();
-    let raw_lowering = std::fs::read_to_string(repo_root().join(LOWERING)).unwrap();
-    assert!(
-        !raw_lowering.contains("source_to_sql_read_family_has_one_producer_file"),
-        "I-11/I-12: remove the vacuous five-file co-occurrence guard and keep this whole-production-tree exact census"
-    );
-    assert_eq!(
-        source[LOWERING]
-            .matches("impl SimpleQuerySqlRead for ")
-            .count(),
-        2,
-        "I-12: exactly the Managed and Direct adapters implement SimpleQuerySqlRead"
-    );
     let expected = expected_census();
     assert_exact_census(&source, &expected);
 
     let representative = [
-        ("task_candidate_pages_after", "Source::Task"),
         ("page_referrer_candidates_after", "Source::PageRef"),
-        ("block_property_candidates_after", "Source::BlockProperty"),
         ("property_facet_rows_after", "Source::PageProperty"),
-        ("navigation_pages_after", "Source::Page"),
         (
             "navigation_pages_after_with_header_validation",
             "Source::Journal",
@@ -496,5 +260,114 @@ fn simple_query_read_family_census_is_exact() {
                 "\nfn swapped_{family}(read: &Read) {{ read.{family}(None, 1); }}\n"
             ));
         assert!(std::panic::catch_unwind(|| assert_exact_census(&swapped, &expected)).is_err());
+    }
+}
+
+/// The query engines as a test build compiles them: the SQL lowering and the
+/// TQL front end ship, and the walk (`eval.rs`) is their test-only oracle, so it
+/// is held to the same rule. `*_tests.rs` files are not decisions.
+fn query_engine_sources() -> BTreeMap<String, String> {
+    let root = repo_root();
+    let mut files = vec![root.join("crates/tine-core/src/query.rs")];
+    collect_rs_files(&root, &root.join("crates/tine-core/src/query"), &mut files);
+    files
+        .into_iter()
+        .filter(|path| !path.to_string_lossy().ends_with("_tests.rs"))
+        .map(|path| {
+            (
+                relative_path(&root, &path),
+                source_without_test_regions(&path),
+            )
+        })
+        .collect()
+}
+
+/// Every place an operator decision in `sources` answers the operators it
+/// does not name with one rest arm: a `match (op, ..)`, or a `match op` whose
+/// top-level arms include `_ =>` or a lowercase binding.
+fn operator_rest_arms(sources: &BTreeMap<String, String>) -> Vec<String> {
+    let tuple = Regex::new(r"match\s*\(\s*\*?op\s*,").unwrap();
+    let single = Regex::new(r"match\s+\*?op\s*\{").unwrap();
+    let rest_arm = Regex::new(r"^\s*(?:_|[a-z][a-z0-9_]*)\s*(?:if\b[^\n]*)?=>").unwrap();
+    let mut found = Vec::new();
+    for (file, text) in sources {
+        for decision in tuple.find_iter(text) {
+            let line = line_of(text, decision.start());
+            found.push(format!("{file}:{line}: `match (op, ..)`"));
+        }
+        for decision in single.find_iter(text) {
+            let bytes = text.as_bytes();
+            let mut depth = 0_usize;
+            let mut cursor = decision.end() - 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => {
+                        cursor += 1;
+                        while cursor < bytes.len() && bytes[cursor] != b'"' {
+                            cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'{' | b'(' | b'[' => depth += 1,
+                    b'}' | b')' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                // An arm starts after the opening brace, a newline or a comma
+                // at the match's own depth.
+                if depth == 1 && matches!(bytes[cursor], b'{' | b'\n' | b',') {
+                    let rest = &text[cursor + 1..];
+                    let arm = &rest[..rest.find('\n').unwrap_or(rest.len())];
+                    if rest_arm.is_match(arm) {
+                        let line = line_of(text, cursor + 1);
+                        found.push(format!("{file}:{line}: `{}`", arm.trim()));
+                    }
+                }
+                cursor += 1;
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_operator_decision_in_the_query_engines_names_every_operator() {
+    let sources = query_engine_sources();
+    assert!(
+        sources.contains_key("crates/tine-core/src/query/sql.rs")
+            && sources.contains_key("crates/tine-core/src/query/eval.rs"),
+        "the query engine scan lost its two engines"
+    );
+    let found = operator_rest_arms(&sources);
+    assert!(
+        found.is_empty(),
+        "I-11: an operator decision in the query engines lists every CmpOp it does \
+         not answer instead of one rest arm, so a new operator is a compile error at \
+         each decision rather than a silent `false` in one engine only (K4 found five \
+         such wrong answers). Match on the operator first, then read the value's shape \
+         with `Value::as_text` / `as_list` / `as_bool`; a one-operator test is \
+         `if op == CmpOp::In`. Imitate `op_applies` in crates/tine-core/src/query/tql.rs.\n{}",
+        found.join("\n")
+    );
+
+    for rogue in [
+        "fn rogue(op: CmpOp) -> bool {\n    match op {\n        CmpOp::Eq => true,\n        _ => false,\n    }\n}\n",
+        "fn rogue(op: CmpOp) -> bool {\n    match op {\n        CmpOp::Eq => true,\n        other => other == CmpOp::NotEq,\n    }\n}\n",
+        "fn rogue(op: CmpOp) -> bool { match op { CmpOp::Eq => \"{\".is_empty(), _ => false } }\n",
+        "fn rogue(op: &CmpOp, value: &Value) -> bool {\n    match (*op, value) {\n        (CmpOp::Eq, Value::Bool { value }) => *value,\n    }\n}\n",
+    ] {
+        let mut planted = sources.clone();
+        planted
+            .get_mut("crates/tine-core/src/query/sql.rs")
+            .unwrap()
+            .push_str(rogue);
+        assert_eq!(
+            operator_rest_arms(&planted).len(),
+            found.len() + 1,
+            "the guard missed a planted rest arm:\n{rogue}"
+        );
     }
 }

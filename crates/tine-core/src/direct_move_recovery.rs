@@ -50,8 +50,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The record schema. Managed Storage is blank-slate until 0.7 and so is this:
-/// there is exactly ONE current format, no dual readers and no migration. A
+/// The record schema. There is exactly ONE current format, no dual readers and
+/// no migration. A
 /// record whose schema is not this one is unrecognized private state — it is
 /// preserved as quarantine and the graph is rebuilt from the files (I-7).
 pub const RECORD_SCHEMA: u32 = 1;
@@ -346,7 +346,7 @@ impl RecoveryStore {
         // a crash right after an un-barriered unlink can resurrect the record,
         // and recovery would then re-apply a move whose participants have since
         // moved on.
-        crate::filesystem_durability::sync_reconstructible_directory_path(&self.records_dir())
+        crate::filesystem_durability::sync_move_recovery_directory(&self.records_dir())
     }
 
     pub fn read_blob(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -792,7 +792,7 @@ fn apply_image(path: &Path, bytes: Option<&[u8]>) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            crate::filesystem_durability::sync_reconstructible_directory_path(parent)
+            crate::filesystem_durability::sync_move_recovery_directory(parent)
         }
     }
 }

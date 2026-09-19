@@ -1,11 +1,17 @@
 import { backend } from "./backend";
 import { isSinglePaneShell } from "./nativeChrome";
 import {
+  normalizeFriendlyPageMatchScope,
+  normalizeQueryDisplayDraft,
+} from "./editor/queryDisplayDraft";
+import {
   installSessionPersistence,
   mintPdfViewId,
+  normalizeQueryPresentation,
   sameRoute,
   type PaneSnapshot,
   type PdfRoute,
+  type QueryRoute,
   type Route,
   type SerializedTab,
 } from "./router";
@@ -69,17 +75,67 @@ function invalidPersistedPdf(message: string): Route {
   return { kind: "invalid", title: "Unavailable PDF", message };
 }
 
+/** The display draft of a query route, in the ONE form both directions of the
+ *  session agree on (P5C).
+ *
+ *  Read and write share this helper deliberately. Restoring runs it over
+ *  whatever the session document happened to contain, and serializing runs it
+ *  again over the live route — so a draft that cannot be read back is dropped
+ *  before it is ever written, and the fresh copy `normalizeQueryDisplayDraft`
+ *  returns also means a persisted snapshot never aliases a live route's arrays.
+ *
+ *  An unreadable draft costs ONLY the draft. The workspace is still a valid
+ *  route with a valid source and presentation, and losing a tab (or a whole
+ *  pane's layout) over a display choice would be the disproportionate refusal
+ *  D-3 rules out — a draft is disposable, the route is not. */
+type QueryDisplayRouteKey = "display" | "pageDisplay" | "blockDisplay";
+
+function persistableQueryDisplay<K extends QueryDisplayRouteKey>(
+  key: K,
+  display: unknown,
+): Partial<Pick<QueryRoute, K>> {
+  if (display === undefined) return {};
+  const normalized = normalizeQueryDisplayDraft(display);
+  return normalized ? { [key]: normalized } as Pick<QueryRoute, K> : {};
+}
+
+type QueryPresentationRouteKey = "pagePresentation" | "blockPresentation";
+
+function persistableQueryPresentation<K extends QueryPresentationRouteKey>(
+  key: K,
+  value: unknown,
+): Partial<Pick<QueryRoute, K>> {
+  if (value === undefined) return {};
+  const normalized = normalizeQueryPresentation(value);
+  return normalized ? { [key]: normalized } as Pick<QueryRoute, K> : {};
+}
+
+function persistablePageMatchScope(value: unknown): Pick<QueryRoute, "pageMatchScope"> | {} {
+  if (value === undefined) return {};
+  const normalized = normalizeFriendlyPageMatchScope(value);
+  return normalized ? { pageMatchScope: normalized } : {};
+}
+
 function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
   if (!r || typeof r !== "object") return null;
   const o = r as Record<string, unknown>;
   if (o.kind === "journals") return { kind: "journals" };
   if (o.kind === "query") {
+    const presentation = normalizeQueryPresentation(o.presentation);
     if (!(typeof o.id === "string" && o.id.length > 0 && o.id.length <= 128
       && (o.sourceKind === "search" || o.sourceKind === "dsl")
       && typeof o.source === "string" && o.source.length <= 65_536
-      && (o.presentation === "search" || o.presentation === "list"
-        || o.presentation === "table" || o.presentation === "board"))) return null;
-    return { kind: "query", id: o.id, sourceKind: o.sourceKind, source: o.source, presentation: o.presentation };
+      && presentation)) return null;
+    return {
+      kind: "query", id: o.id, sourceKind: o.sourceKind,
+      source: o.source, presentation,
+      ...persistableQueryDisplay("display", o.display),
+      ...persistableQueryPresentation("pagePresentation", o.pagePresentation),
+      ...persistableQueryDisplay("pageDisplay", o.pageDisplay),
+      ...persistableQueryPresentation("blockPresentation", o.blockPresentation),
+      ...persistableQueryDisplay("blockDisplay", o.blockDisplay),
+      ...persistablePageMatchScope(o.pageMatchScope),
+    };
   }
   if (o.kind === "invalid") {
     if (typeof o.title !== "string" || !o.title || o.title.length > 256
@@ -220,6 +276,12 @@ function serializeRoute(route: Route): Route {
     return {
       kind: "query", id: route.id, sourceKind: route.sourceKind,
       source: route.source, presentation: route.presentation,
+      ...persistableQueryDisplay("display", route.display),
+      ...persistableQueryPresentation("pagePresentation", route.pagePresentation),
+      ...persistableQueryDisplay("pageDisplay", route.pageDisplay),
+      ...persistableQueryPresentation("blockPresentation", route.blockPresentation),
+      ...persistableQueryDisplay("blockDisplay", route.blockDisplay),
+      ...persistablePageMatchScope(route.pageMatchScope),
     };
   }
   if (route.kind === "pdf") {

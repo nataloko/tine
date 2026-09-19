@@ -1,6 +1,8 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createMemo, createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
+import { isPublishedExport } from "./publishedBackend";
+import { graphBinding } from "./persistence";
 import type {
   ConflictObject,
   GraphMeta,
@@ -32,6 +34,7 @@ import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawer
 import type { PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 import type { ExportNode } from "./editor/exportText";
+import type { QueryGroupingControl } from "./sheet/fields";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -129,7 +132,7 @@ export const [workflow, setWorkflow] = createSignal<"now" | "todo">("now");
 /** Set the workflow and persist it to config.edn (graph-portable, like Logseq).
  *  The signal is the runtime source of truth; the file is re-read on next open. */
 export function changeWorkflow(wf: "now" | "todo") {
-  if (wf === workflow()) return;
+  if (wf === workflow() || isPublishedExport()) return;
   setWorkflow(wf);
   void backend().setPreferredWorkflow(wf).catch(() => {});
 }
@@ -143,6 +146,7 @@ export function logbookWithSecondSupport(): boolean {
 }
 
 export function changeTimetrackingEnabled(enabled: boolean) {
+  if (isPublishedExport()) return;
   const m = graphMeta();
   if (m && m.enable_timetracking === enabled) return;
   if (m) setGraphMeta({ ...m, enable_timetracking: enabled });
@@ -154,6 +158,7 @@ export function showBrackets(): boolean {
 }
 
 export function changeShowBrackets(on: boolean) {
+  if (isPublishedExport()) return;
   const m = graphMeta();
   if (m && m.show_brackets === on) return;
   if (m) setGraphMeta({ ...m, show_brackets: on });
@@ -455,13 +460,10 @@ export function registerLiveSaveConflict(
   baseRev: string | null,
   conflictEpoch: number,
   recovery?: { base_text: string | null; disk_rev: string },
-  storage: "direct" | "managed" = "direct",
 ): Promise<void> {
   const previous = liveSaveConflicts.get(page.name)?.live?.draft_version ?? 0;
   const conflict: ConflictObject = {
-    id: storage === "managed"
-      ? `live-managed:${page.path || page.name}`
-      : `live:${page.path || page.name}`,
+    id: `live:${page.path || page.name}`,
     source: "live-save",
     page_name: page.name,
     page_path: page.path ?? page.name,
@@ -558,8 +560,15 @@ export function clearLiveSaveConflict(name: string): void {
  * in-memory entry stays until the on-disk capsule is gone, so a failed
  * retirement leaves the conflict visible instead of silently dropping it. */
 export async function retireLiveSaveConflict(name: string): Promise<void> {
-  if (!liveSaveConflicts.has(name)) return;
+  const conflict = liveSaveConflicts.get(name);
+  if (!conflict) return;
+  const binding = graphBinding();
+  const root = graphMeta()?.root;
   await retireCapsuleOnDisk(name);
+  if (graphBinding() !== binding || graphMeta()?.root !== root) return;
+  if (liveSaveConflicts.get(name) !== conflict) {
+    throw new Error("The retained draft changed during retirement; review the current draft again.");
+  }
   liveSaveConflicts.delete(name);
   publishConflictQueue();
 }
@@ -884,16 +893,24 @@ export function agendaQuery(): string {
   return `query (and ${window} (not (task DONE CANCELED CANCELLED)))`;
 }
 
-// When a query block is created via the "/Query (visual builder)" command, hold
-// its block id so the freshly-rendered QueryBuilder opens its add-filter picker
-// immediately (the block id, consumed once on mount, then cleared).
+// When a query block is created via `/query` — one command since SPEC §7.3 —
+// hold its block id so the freshly-rendered QueryBuilder opens its SHEET with
+// the field chooser focused (the block id, consumed once on mount, then
+// cleared).
 export const [queryBuilderAutoOpen, setQueryBuilderAutoOpen] = createSignal<string | null>(null);
 
 // Page-properties panel (alias / public / tags / icon / title), opened from the
 // page-title gear or the "/Page properties" command. Anchored at x,y.
-export const [pagePropsPanel, setPagePropsPanel] = createSignal<{ name: string; x: number; y: number } | null>(null);
+// One panel, two scopes (GH #164): a page's pre-block properties, or one
+// block's. The scope picks the reader/writer pair; the transient-layer id stays
+// "page-properties" for both, because that id is a pinned contract.
+export type PropsPanelScope = { kind: "page"; name: string } | { kind: "block"; id: string };
+export const [pagePropsPanel, setPagePropsPanel] = createSignal<{ scope: PropsPanelScope; x: number; y: number } | null>(null);
 export function openPageProps(name: string, x: number, y: number) {
-  setPagePropsPanel({ name, x, y });
+  setPagePropsPanel({ scope: { kind: "page", name }, x, y });
+}
+export function openBlockProps(id: string, x: number, y: number) {
+  setPagePropsPanel({ scope: { kind: "block", id }, x, y });
 }
 export function closePageProps() {
   setPagePropsPanel(null);
@@ -983,6 +1000,82 @@ export function setJournalTemplate(name: string | null) {
 export const [graphEpoch, setGraphEpoch] = createSignal(0);
 export function bumpGraphEpoch() {
   setGraphEpoch((n) => n + 1);
+}
+
+// --------------------------------------------------------------------------
+// One-time notices, dismissed per DEVICE and per graph (§4.3 "Notice", I-18)
+// --------------------------------------------------------------------------
+
+/** The §7.5 crossing notice — the only key today. */
+export const CROSSING_NOTICE = "query-crossing";
+
+/** Read ONCE per graph open, not per block render.
+ *
+ *  A `{{query}}` block that crossed to `{{tine-query}}` asks "has this device
+ *  been told not to show this?" while it is rendering, and a page can hold many
+ *  query blocks. Answering that with an IPC per block per render would put a
+ *  graph-scoped question on a render path (I-13), so the answer is one shared
+ *  read per `graphEpoch`. `undefined` until it resolves — a notice waits for the
+ *  answer rather than flashing and retracting.
+ *
+ *  The store is device-local by decision (D-11): "don't show me this again" is a
+ *  statement about this device's user, so it never enters the graph. */
+const [dismissedNotices, setDismissedNotices] = createSignal<Set<string> | null>(null);
+let dismissedNoticesEpoch = -1;
+
+/** Start the one read for the open graph, if it has not started already.
+ *
+ *  Kept separate from {@link noticeDismissed} so the READ is a plain read: a
+ *  component may ask "is this dismissed?" from inside a tracked computation
+ *  without that question writing a signal underneath it. */
+export function primeNoticeDismissals(): void {
+  const epoch = graphEpoch();
+  if (dismissedNoticesEpoch === epoch) return;
+  dismissedNoticesEpoch = epoch;
+  setDismissedNotices(null);
+  void backend()
+    .loadNotices()
+    .then((raw) => {
+      if (dismissedNoticesEpoch !== epoch) return; // a later graph won the race
+      const parsed: unknown = JSON.parse(raw);
+      const raw_list = (parsed as { dismissed?: unknown } | null)?.dismissed;
+      const list: string[] = Array.isArray(raw_list)
+        ? raw_list.filter((key): key is string => typeof key === "string")
+        : [];
+      setDismissedNotices(new Set(list));
+    })
+    .catch(() => {
+      // Recovery over refusal (D-3/G2): an unreadable record costs one extra
+      // notice, never the graph.
+      if (dismissedNoticesEpoch === epoch) setDismissedNotices(new Set<string>());
+    });
+}
+
+/** Whether `key` has been dismissed on this device for the open graph.
+ *  `undefined` while the answer is still loading. */
+export function noticeDismissed(key: string): boolean | undefined {
+  const set = dismissedNotices();
+  return set ? set.has(key) : undefined;
+}
+
+/** Record "don't show this again" for the open graph, on this device only. */
+export function dismissNotice(key: string): void {
+  const next = new Set<string>(dismissedNotices() ?? []);
+  if (next.has(key)) return;
+  next.add(key);
+  setDismissedNotices(next);
+  void backend()
+    .saveNotices(JSON.stringify({ dismissed: [...next] }))
+    .catch(() => {
+      // The checkbox is a preference, not content: a failed write means the
+      // notice appears once more, which is not worth a toast.
+    });
+}
+
+/** Tests open several graphs in one process; the read is module state. */
+export function resetDismissedNoticesForTests(): void {
+  dismissedNoticesEpoch = -1;
+  setDismissedNotices(null);
 }
 
 // Bumped after a save batch lands (the Rust cache now reflects the edit), so
@@ -1185,6 +1278,9 @@ export const favoritesLayout = createMemo(() =>
   reconcileLayout(storedFavoritesLayout(), favorites().map((f) => f.name))
 );
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
+  // A published export has no favorites to keep: the star is not rendered
+  // and a shortcut must not change the sidebar away from the snapshot.
+  if (isPublishedExport()) return;
   const f = favorites();
   const target = favoriteKey(name, kind);
   const matches = (item: FavItem) => favoriteKey(item.name, item.kind) === target;
@@ -1416,21 +1512,7 @@ export function resetShortcutOverride(id: string) {
 // Pages that failed to save because the file changed on disk (external edit /
 // Syncthing). Surfaced as a banner; the user resolves with reload or overwrite.
 export const [conflicts, setConflicts] = createSignal<string[]>([]);
-export function markConflict(
-  name: string,
-  capsule?: { page: PageDto; baseRev: string | null; storage: "managed" },
-): void | Promise<void> {
-  if (capsule) {
-    return registerLiveSaveConflict(
-      capsule.page,
-      capsule.baseRev,
-      -1,
-      undefined,
-      capsule.storage,
-    ).then(() => {
-      if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
-    });
-  }
+export function markConflict(name: string): void {
   if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
 }
 export function clearConflict(name: string) {
@@ -1471,10 +1553,6 @@ export interface FormulaEditorTarget {
   formulas: readonly [string, string][];
   fields: readonly string[];
   home?: FormulaEditorHome | null;
-  /** For `mode:"filter"`, the block-property key the filter saves under. Defaults
-   *  to `"tine.filter"` (sheet views); query blocks pass `"tine.query-filter"` so
-   *  a query can carry both a sheet filter and a result-refining query filter. */
-  filterKey?: string;
 }
 export const [formulaEditor, setFormulaEditor] = createSignal<FormulaEditorTarget | null>(null);
 export function openFormulaEditor(target: FormulaEditorTarget) {
@@ -1872,6 +1950,9 @@ export type CtxTarget =
       fields?: readonly string[];
       formulas?: readonly [string, string][];
       filter?: string | null;
+      /** A query board's own grouping writer, so the menu and the board toolbar
+       *  share ONE path instead of each writing a property. */
+      queryGrouping?: QueryGroupingControl;
     }
   | { kind: "action-menu"; items: readonly ContextMenuAction[] };
 export interface ContextMenuAction {
@@ -1946,6 +2027,7 @@ export function openSheetContextMenu(
     fields?: readonly string[];
     formulas?: readonly [string, string][];
     filter?: string | null;
+    queryGrouping?: QueryGroupingControl;
   } = {}
 ) {
   setContextMenu({ x, y, kind: "sheet", ownerId, surface, rowSource, groupBy, ...opts });
@@ -1979,6 +2061,9 @@ export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [graphTransitioning, setGraphTransitioning] = createSignal(false);
 export const [settingsTabRequest, setSettingsTabRequest] = createSignal<SettingsTabId | null>(null);
 export function openSettings(tab?: SettingsTabId) {
+  // Settings is where the graph, storage, plugins and preferences are
+  // changed; a published export changes none of them (spec §5).
+  if (isPublishedExport()) return;
   if (tab) setSettingsTabRequest(tab);
   setSettingsOpen(true);
 }
@@ -2105,6 +2190,17 @@ export function openPdfExport(name: string) {
 }
 export function closePdfExport() {
   setPdfExportPage(null);
+}
+
+// "Export query results…": the query surface hands over exactly what it
+// executed; the dialog plans, shows the page set, and confirms. One at a time.
+export const [queryExportRequest, setQueryExportRequest] =
+  createSignal<import("./types").QueryPublicationRequest | null>(null);
+export function openQueryExport(request: import("./types").QueryPublicationRequest) {
+  setQueryExportRequest(request);
+}
+export function closeQueryExport() {
+  setQueryExportRequest(null);
 }
 
 // The PDF currently open in the side pane. `filename` is the stable resource

@@ -3,105 +3,36 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  ONE_RELEASE_CI_EXCEPTION,
-  PROJECT_VERSION,
-  linuxReleaseExcludedTestNames,
-  oneReleaseCiExceptionActive,
-  windowsRequiredTestNames,
-} from "./release-ci-exception.mjs";
 
 export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 
-// Linux runs the complete current tine-core inventory by default. An honest
-// unfiltered run on 2026-08-25 proved that the residual known-red corpus is the
-// exact set below: 45 tests fail normally, while no test hangs or times out.
-// These are legacy-oracle scenarios whose fixtures, cuts, or instrumentation
-// still assert retired actor mechanics. They are not evidence of a current
-// production defect without a separate current-runtime fail-before.
-//
-// Keep the exclusions exact, name-level, and behavior-family classified. The
-// complete measured set is release-excluded only for v0.6.981; from the next
-// version onward the filter is all(), so every tine-core test must pass.
-export const KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES = Object.freeze({
-  activationAndEnrollment: Object.freeze([
-    "sync_runtime::tests::activation_retires_older_shadow_import_when_direct_files_changed_before_retry",
-    "sync_runtime::tests::cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file",
-    "sync_runtime::tests::pre_enrollment_archive_residue_refuses_mismatched_identities_but_exact_resume_reaches_active",
-    "sync_runtime::tests::public_activation_cut_after_archive_claim_before_enrollment_head_resumes_exact_identities",
-    "sync_runtime::tests::public_activation_cut_after_shadow_import_publication_resumes_without_graph_rewrites",
-    "sync_runtime::tests::public_activation_cut_after_verified_local_publication_resumes_without_graph_rewrites",
-    "sync_runtime::tests::public_activation_cut_before_archive_creation_resumes_exact_identities_without_graph_rewrites",
-    "sync_runtime::tests::share_prepared_crash_resumes_descriptor_publication",
-    "sync_runtime::tests::shared_join_recovery_without_canonical_manifest_is_retryable",
-  ]),
-  applicationAndSemanticConvergence: Object.freeze([
-    "sync_runtime::tests::concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions",
-    "sync_runtime::tests::concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantics",
-    "sync_runtime::tests::managed_application_conflict_resolution_reauthors_retained_outline_at_one_observed_revision",
-    "sync_runtime::tests::managed_graph_search_accounts_for_pending_overlay_metadata_separately",
-    "sync_runtime::tests::managed_new_page_conflict_resolution_uses_the_identifiable_winner_path_and_revision",
-    "sync_runtime::tests::new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path",
-    "sync_runtime::tests::observed_receiver_external_edit_precedes_remote_delete_in_both_callback_orders",
-    "sync_runtime::tests::two_offline_authors_union_frontier_heads_converge_without_return_first",
-  ]),
-  providerRecoveryAndPublication: Object.freeze([
-    "sync_runtime::tests::accepted_ordinary_manifest_loss_without_local_archive_blocks",
-    "sync_runtime::tests::absent_superseded_head_settles_and_reappeared_head_retires_again",
-    "sync_runtime::tests::clean_shutdown_waits_for_imprecise_discovery_before_publishing_own_head",
-    "sync_runtime::tests::deleted_own_frontier_head_is_republished_from_local_authority",
-    "sync_runtime::tests::durable_shared_publication_survives_crash_before_provider_tick",
-    "sync_runtime::tests::exact_deletion_of_an_accepted_manifest_republishes_from_local_archive",
-    "sync_runtime::tests::foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement",
-    "sync_runtime::tests::frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes",
-    "sync_runtime::tests::frontier_head_crash_cuts_repair_before_safe_handoff",
-    "sync_runtime::tests::locally_admitted_shared_object_precedes_own_frontier_publication",
-    "sync_runtime::tests::manifest_recovery_publication_crash_cuts_resume_before_canonical_visibility",
-    "sync_runtime::tests::manifestless_no_op_partial_direct_dependency_blocks",
-    "sync_runtime::tests::outbound_child_blocks_when_ordinary_parent_is_lost",
-    "sync_runtime::tests::provider_object_physical_write_cut_requires_exact_journal_completion_before_manifest_and_head",
-    "sync_runtime::tests::provider_staging_siblings_are_non_authoritative_for_exact_and_full_ingress",
-    "sync_runtime::tests::removing_rejected_exact_provider_residue_unblocks_queued_work",
-    "sync_runtime::tests::reordered_remote_acceptance_cannot_reuse_stale_recovery_coverage",
-    "sync_runtime::tests::restarted_provider_child_accepts_manifestless_no_op_dependency_after_duplicate_reordering",
-    "sync_runtime::tests::unsafe_reopen_repairs_accepted_batch_after_pending_marker_creation_failure",
-  ]),
-  boundedDiscoveryAndTraversal: Object.freeze([
-    "sync_runtime::tests::closed_device_walks_only_an_unseen_linear_tail_from_latest_head",
-    "sync_runtime::tests::complete_namespace_loss_repair_above_head_scan_cap_is_chunked",
-    "sync_runtime::tests::exact_object_progress_rechecks_every_incomplete_manifest_once_per_wave",
-    "sync_runtime::tests::headless_legacy_namespace_falls_back_once_then_reopens_from_frontier_head",
-    "sync_runtime::tests::oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it",
-    "sync_runtime::tests::reverse_delivered_provider_chain_has_linear_readiness_work",
-    "sync_runtime::tests::shared_provider_archive_beyond_entry_and_byte_scan_caps_joins_incrementally",
-    "sync_runtime::tests::startup_discovers_manifest_stranded_beyond_an_older_valid_frontier_head",
-    "sync_runtime::tests::uncovered_legacy_head_backfills_recovery_in_bounded_chunks_before_safe",
-  ]),
-});
+// Linux runs the complete current tine-core inventory. Every test the release
+// gate drops must be a NAMED, deliberately dropped test listed here, with a
+// named cause and a fix that lands outside a test file. The list is empty: the
+// 2026-09-07 W6-red-corpus ledger named only Managed Storage runtime defects,
+// and Managed Storage was removed from Tine on 2026-09-15. Adding a name here
+// is an open-bug declaration, not a waiver; shrinking it means fixing the
+// product, not renaming the test.
+export const KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES = Object.freeze([]);
 
-export const KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES = Object.freeze(
-  Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat().sort()
-);
-
-export function linuxCoreReleaseFilterset(version = PROJECT_VERSION) {
-  const excluded = linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version);
+export function linuxCoreReleaseFilterset(excluded = KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES) {
   return excluded.length === 0
     ? "all()"
-    : "not (" + excluded
+    : "not (" + [...excluded]
+      .sort()
       .map((testName) => "test(=" + testName + ")")
       .join(" | ") + ")";
 }
 
 export const LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES = Object.freeze(
-  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)
+  [...KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES].sort()
 );
 export const LINUX_CORE_RELEASE_FILTERSET = linuxCoreReleaseFilterset();
 // Windows is deliberately not a second complete tine-core behavior matrix.
 // Linux carries that full inventory in four isolated shards. This exact list is
-// the Windows release contract: every explicitly Windows-named core test, plus
-// the bootstrap/durability/lifecycle witnesses that exercised the Windows
-// failures fixed for v0.6.90. Keep the names explicit so a rename, removal, or
-// newly added Windows test cannot silently shrink the release gate.
+// the Windows release contract: every explicitly Windows-named core test. Keep
+// names explicit so a rename, removal, or newly added Windows test cannot
+// silently shrink the release gate.
 export const WINDOWS_CORE_EXACT_TEST_NAMES = Object.freeze([
   "model::tests::page_name_encoding_is_injective_reversible_and_windows_safe",
   "model::tests::windows_handle_relative_noreplace_renames_the_exact_source",
@@ -115,42 +46,10 @@ export const WINDOWS_CORE_EXACT_TEST_NAMES = Object.freeze([
   "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
   "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
   "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
-  "oplog::sqlite::tests::windows_entry_file_identity_classifies_reparse_lease_as_replaced",
-  "windows_no_follow_publication_read_and_directory_flush_succeed",
-  "windows_reparse_files_and_directories_are_rejected",
 ]);
 
-export const WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES = Object.freeze([
-  "oplog::local_active::bounded_admission::clean_admissions_are_bounded_at_one_one_thousand_and_ten_thousand",
-  "model::tests::bootstrap_source_regular_file_sync_uses_supported_handle_access",
-  "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
-  "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
-  "oplog::import::tests::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
-  "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
-  "oplog::sqlite::tests::separate_process_workspace_lease_contends_and_crash_releases",
-]);
-
-export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
-  "model::tests::inactive_bootstrap_capture_exact_64_mib_sparse_file_is_accepted",
-  "model::tests::inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files",
-  "model::tests::inactive_bootstrap_capture_ignores_residue_is_idempotent_and_rejects_conflicting_seal",
-  "model::tests::inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files",
-  "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",
-  "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
-  "model::tests::inactive_bootstrap_capture_seals_one_pass_and_final_proof_rejects_later_mutations",
-  "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
-]);
-
-const WINDOWS_CORE_ORDINARY_SMOKE_TEST_NAMES = Object.freeze([
-  ...new Set([
-    ...WINDOWS_CORE_EXACT_TEST_NAMES,
-    ...WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
-    ...WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
-  ]),
-]);
-
-export function windowsCoreSmokeTestNames(version = PROJECT_VERSION) {
-  return windowsRequiredTestNames(WINDOWS_CORE_ORDINARY_SMOKE_TEST_NAMES, version);
+export function windowsCoreSmokeTestNames() {
+  return [...WINDOWS_CORE_EXACT_TEST_NAMES];
 }
 
 export const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze(windowsCoreSmokeTestNames());
@@ -225,7 +124,11 @@ export function verifyLinuxShardCoverage(fullInventory, shardInventories) {
   return { testCount: fullInventory.tests.size, shardCounts: shardInventories.map((shard) => shard.tests.size) };
 }
 
-export function verifyLinuxReleaseSelection(coreInventory, releaseInventory, version = PROJECT_VERSION) {
+export function verifyLinuxReleaseSelection(
+  coreInventory,
+  releaseInventory,
+  excludedTestNames = KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES
+) {
   if (coreInventory?.packageName !== "tine-core") fail("Linux core inventory is not tine-core");
   if (releaseInventory?.packageName !== "tine-core") fail("Linux release inventory is not tine-core");
 
@@ -246,7 +149,7 @@ export function verifyLinuxReleaseSelection(coreInventory, releaseInventory, ver
   // rotted. Names, never counts.
   requireExactNameSet(
     excluded.map((test) => test.testName),
-    linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version),
+    excludedTestNames,
     "Linux release exclusion contract"
   );
 
@@ -290,7 +193,7 @@ function requireExactNameSet(actualNames, expectedNames, label) {
   }
 }
 
-export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, version = PROJECT_VERSION) {
+export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory) {
   if (coreInventory?.packageName !== "tine-core") fail("Windows core inventory is not tine-core");
   if (smokeInventory?.packageName !== "tine-core") fail("Windows core smoke inventory is not tine-core");
 
@@ -298,7 +201,7 @@ export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, v
     .filter((test) => test.testName.toLowerCase().includes("windows"))
     .map((test) => test.testName);
   requireExactNameSet(windowsNamed, WINDOWS_CORE_EXACT_TEST_NAMES, "Windows-named tine-core test inventory");
-  const requiredSmokeNames = windowsCoreSmokeTestNames(version);
+  const requiredSmokeNames = windowsCoreSmokeTestNames();
   requireNamesSelected(coreInventory, smokeInventory, requiredSmokeNames, "Windows core smoke selection");
   requireExactNameSet(testNames(smokeInventory), requiredSmokeNames, "Windows core smoke selection");
 
@@ -306,7 +209,6 @@ export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, v
     coreTestCount: coreInventory.tests.size,
     coreSmokeTestCount: smokeInventory.tests.size,
     windowsNamedCount: windowsNamed.length,
-    bootstrapWitnessCount: WINDOWS_CORE_CAPTURE_WITNESS_NAMES.length,
   };
 }
 
@@ -374,10 +276,7 @@ function main() {
     );
     const result = verifyLinuxShardCoverage(full, shards);
     console.log(
-      `Linux nextest contract OK: ${result.testCount} release tests exactly once across ${LINUX_TINE_CORE_SHARD_COUNT} hash shards (${result.shardCounts.join(", ")}); every current tine-core test is selected except exactly the ${selection.knownRedTestCount} named, behavior-family-classified known-red legacy-oracle tests.`
-      + (oneReleaseCiExceptionActive()
-        ? ` All ${selection.knownRedTestCount} name exclusions expire automatically after v0.6.981; ${ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames.length} were added from this release's exact baseline.`
-        : "")
+      `Linux nextest contract OK: ${result.testCount} release tests exactly once across ${LINUX_TINE_CORE_SHARD_COUNT} hash shards (${result.shardCounts.join(", ")}); every current tine-core test is selected except exactly the ${selection.knownRedTestCount} named known-red tests.`
     );
     const runShard = option("--run-shard");
     if (runShard !== undefined) {
@@ -397,18 +296,15 @@ function main() {
     const smoke = nextestList("ci-windows", "tine-core", { filterset: WINDOWS_CORE_SMOKE_FILTERSET });
     const result = verifyWindowsCoreSmokeSelection(core, smoke);
     console.log(
-      `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected cross-layer smokes, ${result.windowsNamedCount} Windows-named core tests, and ${result.bootstrapWitnessCount} bootstrap capture witnesses.`
-      + (oneReleaseCiExceptionActive()
-        ? ` The ${ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames.length} missing-witness exception expires automatically after v0.6.981.`
-        : "")
+      `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected smokes, ${result.windowsNamedCount} Windows-named core tests.`
     );
     if (process.argv.includes("--run-smoke")) {
-      runWindowsSmoke("tine-core", WINDOWS_CORE_SMOKE_FILTERSET, "Windows core/storage integration smoke");
+      runWindowsSmoke("tine-core", WINDOWS_CORE_SMOKE_FILTERSET, "Windows core integration smoke");
     }
     return;
   }
   fail(
-    "pass --mode linux (add --run-shard N for one release shard, or --run-selection for the whole verified release selection) or --mode windows (add --run-smoke to execute the verified Windows core/storage integration selection)"
+    "pass --mode linux (add --run-shard N for one release shard, or --run-selection for the whole verified release selection) or --mode windows (add --run-smoke to execute the verified Windows core integration selection)"
   );
 }
 

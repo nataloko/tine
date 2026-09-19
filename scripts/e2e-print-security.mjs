@@ -8,6 +8,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { clickWhenReachable } from "./lib/e2e-click.mjs";
+import { createHash } from "node:crypto";
 import {
   startWebdriverApplication,
   stopWebdriverApplication,
@@ -23,9 +25,11 @@ const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32"
 const TD = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4510);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4511);
-const TMP = path.join(os.tmpdir(), "tine-print-security-e2e");
+const TMP = path.join(os.tmpdir(), "tine-print-security-e2e-direct");
 const GRAPH = path.join(TMP, "graph");
 
+// One fixed directory, cleared on entry, so the last run's driver log survives
+// for post-mortem.
 fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
@@ -39,8 +43,14 @@ fs.writeFileSync(path.join(GRAPH, "pages", "Print proof.md"), [
   "  fn main() {}",
   "  ```",
   "- ![large](../assets/oversized.png)",
+  "- {{query (task TODO)}}",
+  "- {{tine-query @block and [[PrintMatches]]}}",
+  "- {{query (task TODO)}}",
+  "  tine.view:: table",
   "",
 ].join("\n"));
+fs.writeFileSync(path.join(GRAPH, "pages", "Private matches.md"),
+  "public:: false\n- TODO print-selected-private-root [[PrintMatches]]\n\t- print-required-child\n\t\t- print-required-grandchild\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), "- Open [[Print proof]]\n");
@@ -80,9 +90,12 @@ try {
   // The contract starts at the named page's menu, not at today's journal.
   // Route through the visible application search control so a different valid
   // startup surface cannot fail the safety journey before it begins.
-  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-  await search.waitForClickable({ timeout: 20_000 });
-  await search.click();
+  // "still not clickable after 20000ms" on the Windows runner (release run
+  // 35158841575) named the button, never what was covering it.
+  await clickWhenReachable(browser, 'button[title^="Search (Ctrl+K)"]', {
+    timeout: 20_000,
+    what: "the application search control",
+  });
   const input = await browser.$(".switcher-input");
   await input.waitForExist({ timeout: 10_000 });
   await input.setValue("Print proof");
@@ -142,9 +155,17 @@ try {
     timeout: 15_000, timeoutMsg: "PDF export did not create its print frame",
   });
   const proof = await browser.execute(() => window.__tinePrintSecurityProof);
+  console.log(JSON.stringify({ binary: APP,
+    binarySha256: createHash("sha256").update(fs.readFileSync(APP)).digest("hex"), ...proof }));
   const sandbox = new Set((proof.sandbox ?? "").split(/\s+/).filter(Boolean));
   if (sandbox.has("allow-scripts") || !sandbox.has("allow-same-origin") || !sandbox.has("allow-modals")) {
     throw new Error(`unsafe print sandbox: ${JSON.stringify(proof.sandbox)}`);
+  }
+  for (const expected of ["print-selected-private-root", "print-required-child", "print-required-grandchild", '<table class="sheet-table">']) {
+    if (!proof.srcdoc.includes(expected)) throw new Error(`Print omitted ${expected}`);
+  }
+  if (proof.srcdoc.includes("Query results are unavailable for this render.") || proof.srcdoc.includes("non-public pages omitted")) {
+    throw new Error("Print lost its personal query scope or operation reader");
   }
   if (/<script\b/i.test(proof.srcdoc) || /cdn\.jsdelivr\.net/i.test(proof.srcdoc)
     || !/script-src 'none'/.test(proof.srcdoc) || !/class="katex/.test(proof.srcdoc)

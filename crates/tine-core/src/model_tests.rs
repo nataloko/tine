@@ -5,69 +5,6 @@ use std::time::{Duration, Instant};
 // delegate every block to the one shared field mapping, so identical DTO
 // input must produce identical parseable trees (identity, format flag,
 // fresh lazy projection included).
-#[test]
-fn blockdto_walkers_agree_on_the_shared_field_mapping() {
-    let leaf = BlockDto {
-        id: "u-leaf".into(),
-        raw: "TODO leaf\nkey:: value".into(),
-        ..Default::default()
-    };
-    let root = BlockDto {
-        id: "u-root".into(),
-        raw: "DONE [#B] root".into(),
-        children: vec![leaf],
-        ..Default::default()
-    };
-
-    fn shape(
-        blocks: &[DocBlock],
-    ) -> Vec<(String, String, bool, Vec<(String, String, bool, usize)>)> {
-        blocks
-            .iter()
-            .map(|b| {
-                (
-                    b.raw.clone(),
-                    b.uuid.clone(),
-                    b.is_org,
-                    b.children
-                        .iter()
-                        .map(|c| (c.raw.clone(), c.uuid.clone(), c.is_org, c.children.len()))
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
-    for is_org in [false, true] {
-        let via_query_walk = crate::query::application_query_doc_block(&root, is_org);
-        let via_checked_walk = dto_blocks_to_doc_checked(std::slice::from_ref(&root), is_org)
-            .unwrap()
-            .remove(0);
-        assert_eq!(
-            shape(std::slice::from_ref(&via_query_walk)),
-            shape(std::slice::from_ref(&via_checked_walk)),
-            "is_org={is_org}: every walker must run the same per-block mapping"
-        );
-        // The mapping hands out a fresh projection memo: the first access
-        // parses `raw` (facets visible), it is not inherited from anywhere.
-        assert_eq!(
-            via_checked_walk.projection().marker.as_deref(),
-            Some("DONE")
-        );
-        assert_eq!(
-            via_checked_walk.children[0].projection().marker.as_deref(),
-            Some("TODO")
-        );
-        if !is_org {
-            // Org takes properties from a :PROPERTIES: drawer, not `key::`.
-            assert_eq!(
-                via_checked_walk.children[0].projection().properties,
-                vec![("key".to_string(), "value".to_string())]
-            );
-        }
-        assert_eq!(via_checked_walk.projection().priority.as_deref(), Some("B"));
-    }
-}
 
 // DUP-7 (2026-08-25 duplication audit): the block-level property recognizer
 // (`doc::parse_property_line`, an lsdoc transcription) and this page-HEADER
@@ -108,7 +45,7 @@ fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
 
 // I-12: every production `DocBlock` literal is a reviewed constructor boundary.
 // This is syntax-aware so a renamed `uuid: dto.id.clone()` mapping cannot evade
-// the old substring check. Managed DTO conversions use
+// the old substring check. Wire DTO conversions use
 // `dto_block_to_doc_block`; cheap raw-only leaves use `DocBlock::new`.
 #[test]
 fn production_docblock_struct_literals_are_reviewed() {
@@ -180,7 +117,7 @@ fn production_docblock_struct_literals_are_reviewed() {
             "DocBlock::new is the raw-only canonical constructor",
         ),
         (
-            "crates/tine-core/src/model.rs",
+            "crates/tine-core/src/vocab/block_dto.rs",
             "dto_block_to_doc_block",
             "the one BlockDto field mapping",
         ),
@@ -221,7 +158,7 @@ fn production_docblock_struct_literals_are_reviewed() {
     expected.sort();
     assert_eq!(
         actual, expected,
-        "I-12: every production DocBlock literal is reviewed; managed DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
+        "I-12: every production DocBlock literal is reviewed; wire DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
     );
 }
 
@@ -277,1072 +214,6 @@ fn a_caller_holding_the_current_reference_set_is_not_sent_it_again() {
         Some(&names[..]),
         "a caller naming any other set must be sent the current one"
     );
-}
-
-#[cfg(any(unix, windows))]
-fn handoff_binding(graph: &Graph, seed: u128) -> (WorkspaceId, ProjectionEndpointBinding) {
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(seed));
-    let endpoint = ProjectionEndpointBinding::enroll_graph(
-        graph,
-        crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 1)),
-        crate::oplog::DeviceId::from_uuid(Uuid::from_u128(seed + 2)),
-    )
-    .unwrap();
-    (workspace_id, endpoint)
-}
-
-#[cfg(any(unix, windows))]
-fn managed_write_gate(graph: &Graph) -> &Arc<ManagedTextWriteGate> {
-    &graph.managed_write_binding().unwrap().gate
-}
-
-#[cfg(any(unix, windows))]
-fn hold_replacement_handoff(root: &Path, seed: u128) -> io::Result<()> {
-    let replacement = Graph::open(root);
-    let (workspace_id, endpoint) = handoff_binding(&replacement, seed);
-    let handoff = replacement.mint_handoff_safe(workspace_id, endpoint)?;
-    MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| {
-        *held.borrow_mut() = Some(handoff);
-    });
-    Ok(())
-}
-
-#[cfg(any(unix, windows))]
-fn release_replacement_handoff() {
-    MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| drop(held.borrow_mut().take()));
-}
-
-#[cfg(any(unix, windows))]
-fn assert_handoff_blocked<T>(result: io::Result<T>) {
-    match result {
-        Ok(_) => panic!("managed text writer entered during external handoff"),
-        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn assert_handoff_release_admits_waiting_writer(
-    graph: Arc<Graph>,
-    handoff: HandoffSafe,
-    label: &str,
-    release: impl FnOnce(HandoffSafe),
-) {
-    let entered = Arc::new(std::sync::Barrier::new(2));
-    let released = Arc::new(std::sync::Barrier::new(2));
-    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
-    let before_name = format!("{label}-blocked");
-    let after_name = format!("{label}-released");
-    let worker = std::thread::spawn({
-        let entered = Arc::clone(&entered);
-        let released = Arc::clone(&released);
-        move || {
-            entered.wait();
-            attempt_tx
-                .send(
-                    graph
-                        .create_markdown_page_if_absent(&before_name, "- blocked\n")
-                        .map(|_| ())
-                        .map_err(|error| error.kind()),
-                )
-                .unwrap();
-            released.wait();
-            graph.create_markdown_page_if_absent(&after_name, "- admitted\n")
-        }
-    });
-
-    entered.wait();
-    assert_eq!(attempt_rx.recv().unwrap(), Err(io::ErrorKind::WouldBlock));
-    release(handoff);
-    released.wait();
-    assert!(worker.join().unwrap().unwrap());
-}
-
-struct JournalProjectionFixture {
-    root: PathBuf,
-    graph: Graph,
-    path: PathBuf,
-    base: String,
-    base_rev: String,
-    page: PageDto,
-    target: String,
-    cleanup_root: bool,
-}
-
-impl JournalProjectionFixture {
-    fn new(tag: &str, relative_path: &str, base: &str, edited: &str) -> Self {
-        let root = scratch(tag);
-        Self::from_root(root, relative_path, base, edited)
-    }
-
-    fn from_root(root: PathBuf, relative_path: &str, base: &str, edited: &str) -> Self {
-        let path = root.join(relative_path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, base).unwrap();
-        let graph = Graph::open(&root);
-        let mut page = graph.load_by_path(relative_path).unwrap().unwrap();
-        graph.warm_cache();
-        let base_rev = page.rev.clone().unwrap();
-        page.blocks[0].raw = edited.to_owned();
-        let (_, target) = graph
-            .serialize_page_dto_for_path(&page, &path, Some(base))
-            .unwrap();
-        Self {
-            root,
-            graph,
-            path,
-            base: base.to_owned(),
-            base_rev,
-            page,
-            target,
-            cleanup_root: true,
-        }
-    }
-
-    fn commit<A>(
-        &self,
-        append: impl FnOnce() -> io::Result<A>,
-    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<io::Error>> {
-        self.commit_with_error(append)
-    }
-
-    fn commit_with_error<A, E>(
-        &self,
-        append: impl FnOnce() -> Result<A, E>,
-    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
-        self.graph.commit_existing_page_with_journal(
-            &self.page,
-            &self.base_rev,
-            self.base.as_bytes(),
-            self.target.as_bytes(),
-            append,
-        )
-    }
-
-    fn close_for_restart(mut self) {
-        self.cleanup_root = false;
-    }
-}
-
-impl Drop for JournalProjectionFixture {
-    fn drop(&mut self) {
-        if self.cleanup_root {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn prime_journal_projection_restart_graph(graph: &Graph) {
-    graph.warm_cache();
-    let _write = graph.admit_managed_text_writer().unwrap();
-    let _identity = graph.lock_graph_text_identity_mutation().unwrap();
-    graph.guarded_graph_text_identity_index().unwrap();
-}
-
-#[cfg(any(unix, windows))]
-struct JournalProjectionRestartTestRecord {
-    root: PathBuf,
-    path: PathBuf,
-    relative_path: String,
-    base: String,
-    base_revision: String,
-    target: String,
-    revision: String,
-    proof: (String, u64),
-    append_calls: Rc<Cell<usize>>,
-}
-
-#[cfg(any(unix, windows))]
-impl Drop for JournalProjectionRestartTestRecord {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn journal_projection_restart_record(
-    tag: &str,
-    relative_path: &str,
-    base: &str,
-    edited: &str,
-) -> JournalProjectionRestartTestRecord {
-    let fixture = JournalProjectionFixture::new(tag, relative_path, base, edited);
-    JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(injected_journal_projection_cut(
-                "after append before publication",
-            ))
-        }));
-    });
-    let proof = (format!("authenticated:{relative_path}"), 73_u64);
-    let append_calls = Rc::new(Cell::new(0_usize));
-    let outcome = fixture
-        .commit(|| {
-            append_calls.set(append_calls.get() + 1);
-            Ok(proof.clone())
-        })
-        .unwrap();
-    let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
-        panic!("synthetic append-before-publication cut was not retained")
-    };
-    assert_eq!(append_calls.get(), 1);
-    assert_eq!(pending.append_proof(), &proof);
-    assert_eq!(pending.target(), fixture.target.as_bytes());
-    assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
-    drop(pending);
-
-    let record = JournalProjectionRestartTestRecord {
-        root: fixture.root.clone(),
-        path: fixture.path.clone(),
-        relative_path: relative_path.to_owned(),
-        base: fixture.base.clone(),
-        base_revision: fixture.base_rev.clone(),
-        target: fixture.target.clone(),
-        revision: content_rev(&fixture.target),
-        proof,
-        append_calls,
-    };
-    fixture.close_for_restart();
-    record
-}
-
-fn injected_journal_projection_cut(label: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, label)
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_exact_base_appends_once_then_publishes_markdown_and_org() {
-    for (tag, path, base, edited) in [
-        (
-            "journal-projection-success-md",
-            "pages/nested/Exact.md",
-            "- base markdown\n",
-            "target markdown",
-        ),
-        (
-            "journal-projection-success-org",
-            "journals/archive/2026_08_03.org",
-            "* base org\n",
-            "target org",
-        ),
-    ] {
-        let fixture = JournalProjectionFixture::new(tag, path, base, edited);
-        let calls = Cell::new(0_usize);
-        let outcome = fixture
-            .commit(|| {
-                assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
-                calls.set(calls.get() + 1);
-                Ok(format!("proof:{path}"))
-            })
-            .unwrap();
-        let JournalPageProjectionOutcome::Durable(durable) = outcome else {
-            panic!("successful journal projection remained pending")
-        };
-        assert_eq!(calls.get(), 1);
-        assert_eq!(durable.append_proof(), &format!("proof:{path}"));
-        assert_eq!(durable.target().relative_path(), path);
-        assert_eq!(durable.target().target(), fixture.target.as_bytes());
-        assert_eq!(durable.target().revision(), content_rev(&fixture.target));
-        assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
-    }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_accepts_only_semantically_equal_markdown_layout_trivia() {
-    let fixture = JournalProjectionFixture::new(
-        "journal-projection-authenticated-layout",
-        "pages/Authenticated Layout.md",
-        "- first\n\n- second\n",
-        "edited",
-    );
-    // The serializer preserves the fixture's one blank separator. Supply
-    // a genuinely byte-distinct authenticated layout with one additional
-    // separator while keeping every parsed block and its raw body equal.
-    let exact_target = "- edited\n\n\n- second\n";
-    assert_ne!(fixture.target, exact_target);
-    assert!(guarded_markdown_documents_match(
-        &fixture.target,
-        exact_target
-    ));
-    let calls = Cell::new(0_usize);
-    let outcome = fixture
-        .graph
-        .commit_existing_page_with_journal(
-            &fixture.page,
-            &fixture.base_rev,
-            fixture.base.as_bytes(),
-            exact_target.as_bytes(),
-            || {
-                calls.set(calls.get() + 1);
-                Ok::<_, ()>("authenticated-layout-proof")
-            },
-        )
-        .unwrap();
-    assert!(matches!(outcome, JournalPageProjectionOutcome::Durable(_)));
-    assert_eq!(calls.get(), 1);
-    assert_eq!(fs::read(&fixture.path).unwrap(), exact_target.as_bytes());
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_refuses_semantically_different_markdown_layout_targets_before_append() {
-    fn assert_refused(label: &str, mut fixture: JournalProjectionFixture, exact_target: &str) {
-        let before = regular_file_tree(&fixture.root);
-        let calls = Cell::new(0_usize);
-        let error = fixture
-            .graph
-            .commit_existing_page_with_journal(
-                &fixture.page,
-                &fixture.base_rev,
-                fixture.base.as_bytes(),
-                exact_target.as_bytes(),
-                || {
-                    calls.set(calls.get() + 1);
-                    Ok::<(), ()>(())
-                },
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{label} semantic mismatch committed"));
-        let precommit = error
-            .precommit()
-            .unwrap_or_else(|| panic!("{label} semantic mismatch was not precommit"));
-        assert_eq!(precommit.kind(), io::ErrorKind::InvalidData, "{label}");
-        assert_eq!(calls.get(), 0, "{label}");
-        assert_eq!(regular_file_tree(&fixture.root), before, "{label}");
-        fixture.cleanup_root = false;
-        let _ = fs::remove_dir_all(&fixture.root);
-    }
-
-    assert_refused(
-        "content",
-        JournalProjectionFixture::new(
-            "journal-projection-mismatch-content",
-            "pages/Content.md",
-            "- first\n\n- second\n",
-            "edited",
-        ),
-        "- different\n\n- second\n",
-    );
-    assert_refused(
-        "order-and-ancestry",
-        JournalProjectionFixture::new(
-            "journal-projection-mismatch-order",
-            "pages/Order.md",
-            "- first\n  - child\n- second\n",
-            "edited",
-        ),
-        "- second\n\n- edited\n  - child\n",
-    );
-    assert_refused(
-        "page-property",
-        JournalProjectionFixture::new(
-            "journal-projection-mismatch-property",
-            "pages/Property.md",
-            "status:: accepted\n\n- first\n",
-            "edited",
-        ),
-        "status:: changed\n\n- edited\n",
-    );
-
-    let original_id = "11111111-1111-1111-1111-111111111111";
-    let replacement_id = "22222222-2222-2222-2222-222222222222";
-    let base = format!("- first\n  id:: {original_id}\n");
-    let fixture = JournalProjectionFixture::new(
-        "journal-projection-mismatch-explicit-id",
-        "pages/Explicit Id.md",
-        &base,
-        &format!("edited\nid:: {original_id}"),
-    );
-    let exact_target = format!("- edited\n  id:: {replacement_id}\n");
-    assert_refused("explicit-id", fixture, &exact_target);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_keeps_org_byte_exact_when_layout_only_target_differs() {
-    let fixture = JournalProjectionFixture::new(
-        "journal-projection-org-layout",
-        "journals/2026_08_05.org",
-        "* first\n* second\n",
-        "edited",
-    );
-    let exact_target = "* edited\n\n* second\n";
-    let calls = Cell::new(0_usize);
-    let error = fixture
-        .graph
-        .commit_existing_page_with_journal(
-            &fixture.page,
-            &fixture.base_rev,
-            fixture.base.as_bytes(),
-            exact_target.as_bytes(),
-            || {
-                calls.set(calls.get() + 1);
-                Ok::<(), ()>(())
-            },
-        )
-        .err()
-        .expect("Org layout-only difference must remain refused before append");
-    assert_eq!(
-        error.precommit().map(io::Error::kind),
-        Some(io::ErrorKind::InvalidData)
-    );
-    assert_eq!(calls.get(), 0);
-    assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_precommit_conflicts_append_zero_and_change_zero_bytes() {
-    fn refused(label: &str, fixture: &JournalProjectionFixture, base_rev: &str) {
-        let before = regular_file_tree(&fixture.root);
-        let calls = Cell::new(0_usize);
-        let error = fixture
-            .graph
-            .commit_existing_page_with_journal(
-                &fixture.page,
-                base_rev,
-                fixture.base.as_bytes(),
-                fixture.target.as_bytes(),
-                || {
-                    calls.set(calls.get() + 1);
-                    Ok::<(), ()>(())
-                },
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{label} precommit conflict produced an outcome"));
-        let precommit = error
-            .precommit()
-            .unwrap_or_else(|| panic!("{label} error was not precommit"));
-        assert!(matches!(
-            precommit.kind(),
-            io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
-        ));
-        assert_eq!(calls.get(), 0);
-        assert_eq!(regular_file_tree(&fixture.root), before);
-    }
-
-    let stale = JournalProjectionFixture::new(
-        "journal-projection-stale",
-        "pages/Stale.md",
-        "- base\n",
-        "target",
-    );
-    refused("stale", &stale, &"0".repeat(64));
-
-    let resource = JournalProjectionFixture::new(
-        "journal-projection-resource",
-        "pages/Resource.md",
-        "- base\n",
-        "target",
-    );
-    fs::rename(
-        &resource.path,
-        resource.root.join("pages/.Resource.retained-old"),
-    )
-    .unwrap();
-    fs::write(&resource.path, resource.base.as_bytes()).unwrap();
-    refused("resource", &resource, &resource.base_rev);
-
-    let portable = JournalProjectionFixture::new(
-        "journal-projection-portable",
-        "pages/Portable.md",
-        "- base\n",
-        "target",
-    );
-    fs::write(portable.root.join("pages/portable.md"), "- alias\n").unwrap();
-    refused("portable", &portable, &portable.base_rev);
-
-    #[cfg(unix)]
-    {
-        let hardlink = JournalProjectionFixture::new(
-            "journal-projection-hardlink",
-            "pages/Hardlink.md",
-            "- base\n",
-            "target",
-        );
-        fs::hard_link(&hardlink.path, hardlink.root.join("pages/Alias.md")).unwrap();
-        refused("hardlink", &hardlink, &hardlink.base_rev);
-    }
-
-    let semantic = JournalProjectionFixture::new(
-        "journal-projection-semantic",
-        "pages/One.md",
-        "title:: Shared\n\n- base\n",
-        "target",
-    );
-    fs::create_dir_all(semantic.root.join("other")).unwrap();
-    fs::write(
-        semantic.root.join("other/Two.org"),
-        "#+title: Shared\n* other owner\n",
-    )
-    .unwrap();
-    semantic.graph.invalidate_cache();
-    semantic.graph.warm_cache();
-    {
-        let _identity = semantic.graph.lock_graph_text_identity_mutation().unwrap();
-        let index = semantic.graph.guarded_graph_text_identity_index().unwrap();
-        assert_eq!(
-            index
-                .paths_by_semantic_key
-                .get(&(0, crate::refs::page_key("Shared")))
-                .map(std::collections::BTreeSet::len),
-            Some(2),
-            "page name {:?}, semantics {:?}",
-            semantic.page.name,
-            index
-                .files_by_exact_path
-                .iter()
-                .map(|(path, record)| (
-                    path.as_str(),
-                    record.semantic.name.as_str(),
-                    record.semantic.kind
-                ))
-                .collect::<Vec<_>>()
-        );
-    }
-    refused("semantic", &semantic, &semantic.base_rev);
-
-    #[cfg(unix)]
-    {
-        let parent = JournalProjectionFixture::new(
-            "journal-projection-parent",
-            "pages/Parent.md",
-            "- base\n",
-            "target",
-        );
-        {
-            let _identity = parent.graph.lock_graph_text_identity_mutation().unwrap();
-            parent.graph.guarded_graph_text_identity_index().unwrap();
-        }
-        let old_parent = parent.root.join("pages-old");
-        fs::rename(parent.root.join("pages"), &old_parent).unwrap();
-        fs::create_dir(parent.root.join("pages")).unwrap();
-        fs::hard_link(old_parent.join("Parent.md"), &parent.path).unwrap();
-        refused("parent", &parent, &parent.base_rev);
-    }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_append_error_preserves_non_io_type_and_changes_no_graph_bytes_or_cache() {
-    #[derive(Debug, Eq, PartialEq)]
-    enum AppendSentinel {
-        DurableAppendRejected,
-    }
-
-    let fixture = JournalProjectionFixture::new(
-        "journal-projection-append-error",
-        "pages/Append.md",
-        "- base\n",
-        "target",
-    );
-    let before = regular_file_tree(&fixture.root);
-    let cache_before = fixture.graph.cache.read().unwrap().clone();
-    let calls = Cell::new(0_usize);
-    let error = fixture
-        .commit_with_error(|| {
-            calls.set(calls.get() + 1);
-            Err::<(), _>(AppendSentinel::DurableAppendRejected)
-        })
-        .err()
-        .expect("append error must cross the graph boundary");
-    assert_eq!(error.append(), Some(&AppendSentinel::DurableAppendRejected));
-    assert!(matches!(
-        error,
-        JournalPageCommitError::Append(AppendSentinel::DurableAppendRejected)
-    ));
-    assert_eq!(calls.get(), 1);
-    assert_eq!(regular_file_tree(&fixture.root), before);
-    assert_exact_budget_cache_unchanged(&fixture.graph, &cache_before);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_failure_cuts_are_committed_pending_and_retry_without_append() {
-    for cut in 0..5 {
-        let fixture = JournalProjectionFixture::new(
-            &format!("journal-projection-cut-{cut}"),
-            "pages/Cut.md",
-            "- base\n",
-            "target",
-        );
-        match cut {
-            0 => MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| {
-                    Err(injected_journal_projection_cut("after retire"))
-                }));
-            }),
-            1 => JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| {
-                    Err(injected_journal_projection_cut("after publish"))
-                }));
-            }),
-            2 => JOURNAL_PROJECTION_AFTER_TARGET_REREAD.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| {
-                    Err(injected_journal_projection_cut("after target reread"))
-                }));
-            }),
-            3 => FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true)),
-            4 => JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| {
-                    Err(injected_journal_projection_cut("before cache publication"))
-                }));
-            }),
-            _ => unreachable!(),
-        }
-        let calls = Cell::new(0_usize);
-        let outcome = fixture
-            .commit(|| {
-                calls.set(calls.get() + 1);
-                Ok((cut, "opaque-proof"))
-            })
-            .unwrap();
-        let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
-            panic!("cut {cut} did not report committed-pending")
-        };
-        assert_eq!(calls.get(), 1);
-        assert_eq!(pending.append_proof(), &(cut, "opaque-proof"));
-        assert_eq!(pending.relative_path(), "pages/Cut.md");
-        assert_eq!(pending.target(), fixture.target.as_bytes());
-        assert!(!pending.last_error().to_string().is_empty());
-
-        let retried = fixture
-            .graph
-            .retry_committed_journal_page_projection(pending);
-        let JournalPageProjectionOutcome::Durable(durable) = retried else {
-            panic!("cut {cut} did not recover on exact retry")
-        };
-        assert_eq!(calls.get(), 1, "retry must not append again");
-        assert_eq!(durable.append_proof(), &(cut, "opaque-proof"));
-        assert_eq!(durable.target().target(), fixture.target.as_bytes());
-        assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
-    }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_restart_reconstructs_record_only_and_publishes_markdown_and_org() {
-    for (tag, path, base, edited) in [
-        (
-            "journal-projection-restart-md",
-            "notes/nonstandard/deep/Restart.markdown",
-            "- base markdown\n",
-            "restart markdown target",
-        ),
-        (
-            "journal-projection-restart-org",
-            "archive/nonstandard/deep/Restart.org",
-            "* base org\n",
-            "restart org target",
-        ),
-    ] {
-        let record = journal_projection_restart_record(tag, path, base, edited);
-        let graph = Graph::open(&record.root);
-        prime_journal_projection_restart_graph(&graph);
-        let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-        let forbidden_before = crate::fast_commit::forbidden_commit_work();
-        let mutations = Rc::new(Cell::new(0_usize));
-        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
-            let mutations = Rc::clone(&mutations);
-            *hook.borrow_mut() = Some(Box::new(move || {
-                mutations.set(mutations.get() + 1);
-                Ok(())
-            }));
-        });
-
-        let outcome = graph.recover_committed_journal_page_projection(
-            record.proof.clone(),
-            &record.relative_path,
-            &record.base_revision,
-            record.base.as_bytes(),
-            record.target.as_bytes(),
-            &record.revision,
-        );
-        let JournalPageProjectionOutcome::Durable(durable) = outcome else {
-            panic!("restart recovery did not publish {path}")
-        };
-        assert_eq!(durable.append_proof(), &record.proof);
-        assert_eq!(durable.target().relative_path(), path);
-        assert_eq!(durable.target().target(), record.target.as_bytes());
-        assert_eq!(durable.target().revision(), record.revision);
-        assert_eq!(fs::read(&record.path).unwrap(), record.target.as_bytes());
-        assert_eq!(mutations.get(), 1);
-
-        let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
-        assert_eq!(graph_work.text_inventory_scans, 0);
-        assert_eq!(graph_work.text_inventory_entries, 0);
-        assert!(crate::fast_commit::forbidden_commit_work()
-            .since(forbidden_before)
-            .is_none());
-    }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_restart_already_target_reproves_durable_state() {
-    let record = journal_projection_restart_record(
-        "journal-projection-restart-already-target",
-        "elsewhere/nested/Already.md",
-        "- base\n",
-        "already target",
-    );
-    fs::write(&record.path, record.target.as_bytes()).unwrap();
-    let graph = Graph::open(&record.root);
-    prime_journal_projection_restart_graph(&graph);
-    let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-    let forbidden_before = crate::fast_commit::forbidden_commit_work();
-    let mutations = Rc::new(Cell::new(0_usize));
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
-        let mutations = Rc::clone(&mutations);
-        *hook.borrow_mut() = Some(Box::new(move || {
-            mutations.set(mutations.get() + 1);
-            Ok(())
-        }));
-    });
-
-    let outcome = graph.recover_committed_journal_page_projection(
-        record.proof.clone(),
-        &record.relative_path,
-        &record.base_revision,
-        record.base.as_bytes(),
-        record.target.as_bytes(),
-        &record.revision,
-    );
-    let JournalPageProjectionOutcome::Durable(durable) = outcome else {
-        panic!("already exact restart target was not reproved")
-    };
-    assert_eq!(durable.append_proof(), &record.proof);
-    assert_eq!(durable.target().target(), record.target.as_bytes());
-    assert_eq!(fs::read(&record.path).unwrap(), record.target.as_bytes());
-    assert_eq!(
-        mutations.get(),
-        0,
-        "already-target recovery rewrote the file"
-    );
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
-    let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
-    assert_eq!(graph_work.text_inventory_scans, 0);
-    assert_eq!(graph_work.text_inventory_entries, 0);
-    assert!(crate::fast_commit::forbidden_commit_work()
-        .since(forbidden_before)
-        .is_none());
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_restart_preserves_divergent_external_winner() {
-    let record = journal_projection_restart_record(
-        "journal-projection-restart-divergent",
-        "elsewhere/nested/Divergent.org",
-        "* base\n",
-        "restart target",
-    );
-    let external = b"* external winner\n";
-    fs::write(&record.path, external).unwrap();
-    let graph = Graph::open(&record.root);
-    prime_journal_projection_restart_graph(&graph);
-    let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-    let forbidden_before = crate::fast_commit::forbidden_commit_work();
-    let mutations = Rc::new(Cell::new(0_usize));
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
-        let mutations = Rc::clone(&mutations);
-        *hook.borrow_mut() = Some(Box::new(move || {
-            mutations.set(mutations.get() + 1);
-            Ok(())
-        }));
-    });
-
-    let outcome = graph.recover_committed_journal_page_projection(
-        record.proof.clone(),
-        &record.relative_path,
-        &record.base_revision,
-        record.base.as_bytes(),
-        record.target.as_bytes(),
-        &record.revision,
-    );
-    let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
-        panic!("divergent external winner was silently replaced")
-    };
-    assert_eq!(pending.append_proof(), &record.proof);
-    assert_eq!(pending.relative_path(), record.relative_path);
-    assert_eq!(pending.target(), record.target.as_bytes());
-    assert_eq!(pending.last_error().kind(), io::ErrorKind::AlreadyExists);
-    assert_eq!(fs::read(&record.path).unwrap(), external);
-    assert!(matches!(
-        graph.retry_committed_journal_page_projection(pending),
-        JournalPageProjectionOutcome::CommittedPending(_)
-    ));
-    assert_eq!(fs::read(&record.path).unwrap(), external);
-    assert_eq!(mutations.get(), 0, "divergent winner was rewritten");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
-    let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
-    assert_eq!(graph_work.text_inventory_scans, 0);
-    assert_eq!(graph_work.text_inventory_entries, 0);
-    assert!(crate::fast_commit::forbidden_commit_work()
-        .since(forbidden_before)
-        .is_none());
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_external_writer_is_precommit_winner_or_preserved_after_commit() {
-    let before = JournalProjectionFixture::new(
-        "journal-projection-external-before",
-        "pages/Race.md",
-        "- base\n",
-        "target",
-    );
-    fs::write(&before.path, "- external before\n").unwrap();
-    let calls = Cell::new(0_usize);
-    assert!(before
-        .commit(|| {
-            calls.set(calls.get() + 1);
-            Ok(())
-        })
-        .is_err());
-    assert_eq!(calls.get(), 0);
-    assert_eq!(fs::read(&before.path).unwrap(), b"- external before\n");
-
-    let after = JournalProjectionFixture::new(
-        "journal-projection-external-after",
-        "pages/Race.md",
-        "- base\n",
-        "target",
-    );
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
-        let path = after.path.clone();
-        *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- external after\n")));
-    });
-    let calls = Cell::new(0_usize);
-    let outcome = after
-        .commit(|| {
-            calls.set(calls.get() + 1);
-            Ok("journal-won")
-        })
-        .unwrap();
-    let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
-        panic!("post-append external winner must remain committed-pending")
-    };
-    assert_eq!(calls.get(), 1);
-    assert_eq!(pending.append_proof(), &"journal-won");
-    assert_eq!(fs::read(&after.path).unwrap(), b"- external after\n");
-    assert!(matches!(
-        after.graph.retry_committed_journal_page_projection(pending),
-        JournalPageProjectionOutcome::CommittedPending(_)
-    ));
-    assert_eq!(fs::read(&after.path).unwrap(), b"- external after\n");
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_nested_configured_paths_work_and_private_paths_are_refused() {
-    for (tag, path, base, edited) in [
-        (
-            "journal-projection-nested-config-md",
-            "content/wiki/deep/Topic.md",
-            "- base md\n",
-            "target md",
-        ),
-        (
-            "journal-projection-nested-config-org",
-            "diary/archive/2026_08_03.org",
-            "* base org\n",
-            "target org",
-        ),
-    ] {
-        let root = scratch(tag);
-        fs::create_dir_all(root.join("logseq")).unwrap();
-        fs::write(
-            root.join("logseq/config.edn"),
-            "{:pages-directory \"content/wiki/deep\"\n :journals-directory \"diary/archive\"}\n",
-        )
-        .unwrap();
-        let fixture = JournalProjectionFixture::from_root(root, path, base, edited);
-        let outcome = fixture.commit(|| Ok("proof")).unwrap();
-        assert!(matches!(outcome, JournalPageProjectionOutcome::Durable(_)));
-        assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
-    }
-
-    let root = scratch("journal-projection-private-refusal");
-    let path = root.join(".private/Secret.md");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, "- secret\n").unwrap();
-    let graph = Graph::open(&root);
-    let mut page = markdown_page_dto("Secret", "Secret", "- changed\n").unwrap();
-    page.path = ".private/Secret.md".to_owned();
-    page.rev = Some(content_rev("- secret\n"));
-    let calls = Cell::new(0_usize);
-    assert!(graph
-        .commit_existing_page_with_journal(
-            &page,
-            page.rev.as_deref().unwrap(),
-            b"- secret\n",
-            b"- changed\n",
-            || {
-                calls.set(calls.get() + 1);
-                Ok::<(), ()>(())
-            },
-        )
-        .is_err());
-    assert_eq!(calls.get(), 0);
-    assert_eq!(fs::read(&path).unwrap(), b"- secret\n");
-    let restart = graph.recover_committed_journal_page_projection(
-        "authenticated-private-record",
-        ".private/Secret.md",
-        &content_rev("- secret\n"),
-        b"- secret\n",
-        b"- changed\n",
-        &content_rev("- changed\n"),
-    );
-    let JournalPageProjectionOutcome::CommittedPending(pending) = restart else {
-        panic!("restart recovery admitted a private graph path")
-    };
-    assert_eq!(pending.append_proof(), &"authenticated-private-record");
-    assert_eq!(pending.target(), b"- changed\n");
-    assert_eq!(pending.last_error().kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(fs::read(&path).unwrap(), b"- secret\n");
-    let _ = fs::remove_dir_all(root);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_warm_repeats_have_zero_inventory_and_forbidden_work() {
-    let mut fixture = JournalProjectionFixture::new(
-        "journal-projection-warm-work",
-        "pages/Warm.md",
-        "- base\n",
-        "target 0",
-    );
-    let first = fixture.commit(|| Ok(0_u64)).unwrap();
-    let JournalPageProjectionOutcome::Durable(first) = first else {
-        panic!("warmup commit remained pending")
-    };
-    let mut base = fixture.target.clone();
-    let mut revision = first.target().revision().to_owned();
-    fixture.page.rev = Some(revision.clone());
-    let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-    let forbidden_before = crate::fast_commit::forbidden_commit_work();
-    for index in 1..=8_u64 {
-        fixture.page.blocks[0].raw = format!("target {index}");
-        let (_, target) = fixture
-            .graph
-            .serialize_page_dto_for_path(&fixture.page, &fixture.path, Some(&base))
-            .unwrap();
-        let outcome = fixture
-            .graph
-            .commit_existing_page_with_journal(
-                &fixture.page,
-                &revision,
-                base.as_bytes(),
-                target.as_bytes(),
-                || Ok::<_, ()>(index),
-            )
-            .unwrap();
-        let JournalPageProjectionOutcome::Durable(durable) = outcome else {
-            panic!("warm commit {index} remained pending")
-        };
-        assert_eq!(durable.append_proof(), &index);
-        base = target;
-        revision = durable.target().revision().to_owned();
-        fixture.page.rev = Some(revision.clone());
-    }
-    let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
-    assert_eq!(graph_work.text_inventory_scans, 0);
-    assert_eq!(graph_work.text_inventory_entries, 0);
-    assert!(crate::fast_commit::forbidden_commit_work()
-        .since(forbidden_before)
-        .is_none());
-    assert_eq!(fs::read(&fixture.path).unwrap(), base.as_bytes());
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn journal_projection_source_keeps_append_and_retry_authority_structural() {
-    let fixture = JournalProjectionFixture::new(
-        "journal-projection-append-authority-retry",
-        "pages/Authority.md",
-        "- base\n",
-        "target",
-    );
-    prime_journal_projection_restart_graph(&fixture.graph);
-    JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(injected_journal_projection_cut(
-                "after append before publication",
-            ))
-        }));
-    });
-    let append_calls = Cell::new(0_usize);
-    let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-    let forbidden_before = crate::fast_commit::forbidden_commit_work();
-    let outcome = fixture
-        .commit(|| {
-            append_calls.set(append_calls.get() + 1);
-            Ok("opaque-retry-proof")
-        })
-        .unwrap();
-    let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
-        panic!("append-before-publication cut was not retained for retry")
-    };
-    assert_eq!(append_calls.get(), 1);
-    let retried = fixture
-        .graph
-        .retry_committed_journal_page_projection(pending);
-    let JournalPageProjectionOutcome::Durable(durable) = retried else {
-        panic!("retry did not publish the authenticated record")
-    };
-    assert_eq!(
-        append_calls.get(),
-        1,
-        "retry appended a second journal record"
-    );
-    assert_eq!(durable.append_proof(), &"opaque-retry-proof");
-    assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
-    assert_eq!(
-        crate::fast_commit::graph_wide_commit_work().since(graph_work_before),
-        crate::fast_commit::GraphWideCommitWork::default()
-    );
-    assert!(crate::fast_commit::forbidden_commit_work()
-        .since(forbidden_before)
-        .is_none());
-
-    let record = journal_projection_restart_record(
-        "journal-projection-append-authority-restart",
-        "pages/Restart Authority.md",
-        "- base\n",
-        "target",
-    );
-    let graph = Graph::open(&record.root);
-    prime_journal_projection_restart_graph(&graph);
-    let graph_work_before = crate::fast_commit::graph_wide_commit_work();
-    let forbidden_before = crate::fast_commit::forbidden_commit_work();
-    let outcome = graph.recover_committed_journal_page_projection(
-        record.proof.clone(),
-        &record.relative_path,
-        &record.base_revision,
-        record.base.as_bytes(),
-        record.target.as_bytes(),
-        &record.revision,
-    );
-    let JournalPageProjectionOutcome::Durable(durable) = outcome else {
-        panic!("restart did not publish the authenticated record")
-    };
-    assert_eq!(
-        record.append_calls.get(),
-        1,
-        "restart appended a second journal record"
-    );
-    assert_eq!(durable.append_proof(), &record.proof);
-    assert_eq!(fs::read(&record.path).unwrap(), record.target.as_bytes());
-    assert_eq!(
-        crate::fast_commit::graph_wide_commit_work().since(graph_work_before),
-        crate::fast_commit::GraphWideCommitWork::default()
-    );
-    assert!(crate::fast_commit::forbidden_commit_work()
-        .since(forbidden_before)
-        .is_none());
 }
 
 #[test]
@@ -1493,45 +364,6 @@ fn page_name_encoding_is_injective_reversible_and_windows_safe() {
                 "distinct titles collided at {stem:?} under {format:?}"
             );
         }
-    }
-}
-
-#[test]
-fn direct_managed_and_sparse_new_page_paths_share_the_safe_codec() {
-    for (label, config, format) in [
-        ("legacy", "", FileNameFormat::Legacy),
-        (
-            "triple-lowbar",
-            "{:file/name-format :triple-lowbar}\n",
-            FileNameFormat::TripleLowbar,
-        ),
-    ] {
-        let dir = scratch(&format!("filename-paths-{label}"));
-        if !config.is_empty() {
-            fs::create_dir_all(dir.join("logseq")).unwrap();
-            fs::write(dir.join("logseq/config.edn"), config).unwrap();
-        }
-        let graph = Graph::open(&dir);
-        let permit = graph.admit_managed_text_writer().unwrap();
-        for title in ["2026-07-23_18:01:20", "%2F", "CON", "Release 1.0"] {
-            let stem = encode_page_name(title, format);
-            let relative = format!("pages/{stem}.md");
-            assert_eq!(graph.path_for(title, PageKind::Page), dir.join(&relative));
-            assert_eq!(
-                graph
-                    .managed_path_for(&permit, title, PageKind::Page)
-                    .unwrap(),
-                dir.join(&relative)
-            );
-            assert_eq!(
-                graph
-                    .new_sparse_page_path(title, PageKind::Page)
-                    .unwrap()
-                    .as_str(),
-                relative
-            );
-        }
-        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -1730,6 +562,88 @@ fn runtime_ids_are_owner_structural_and_separate_from_explicit_ids() {
     assert_ne!(parent.uuid, parent.children[0].uuid);
     assert_ne!(parent.uuid, "x");
     assert_ne!(parent.children[0].uuid, "x");
+}
+
+#[test]
+fn projected_order_reproduces_reopened_runtime_ids_after_live_structural_edits() {
+    for owner in ["pages/Case.md", "pages/é/日本.org", "pages\\é\\日本.org"] {
+        let mut roots = vec![DocBlock::new("same\nid:: external"), DocBlock::new("same")];
+        roots[0].children.push(DocBlock::new("child"));
+        assign_doc_runtime_ids(&mut roots, owner);
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000000")
+                .unwrap()
+                .to_string(),
+            roots[0].uuid
+        );
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000000/00000000")
+                .unwrap()
+                .to_string(),
+            roots[0].children[0].uuid
+        );
+        let old_id = roots[0].uuid.clone();
+        roots.insert(0, DocBlock::new("inserted"));
+        roots[1].children.push(DocBlock::new("new child"));
+        assign_doc_runtime_ids(&mut roots, owner);
+        assert_eq!(roots[1].uuid, old_id, "live identity survives insertion");
+        let mut reopened = roots.clone();
+        for root in &mut reopened {
+            root.uuid.clear();
+            for child in &mut root.children {
+                child.uuid.clear();
+            }
+        }
+        assign_doc_runtime_ids(&mut reopened, owner);
+        assert_ne!(reopened[1].uuid, old_id);
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000001")
+                .unwrap()
+                .to_string(),
+            reopened[1].uuid
+        );
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000001/00000001")
+                .unwrap()
+                .to_string(),
+            reopened[1].children[1].uuid
+        );
+        assert_eq!(
+            roots[1].children[1].uuid, reopened[1].children[1].uuid,
+            "new children use structural namespace even when parent keeps live ID"
+        );
+    }
+    assert_eq!(
+        doc_runtime_id_for_order("pages/é/日本.org", "00000000").unwrap(),
+        doc_runtime_id_for_order("pages\\é\\日本.org", "00000000").unwrap()
+    );
+    assert_ne!(
+        doc_runtime_id_for_order("pages/Case.md", "00000000").unwrap(),
+        doc_runtime_id_for_order("pages/case.md", "00000000").unwrap()
+    );
+}
+
+#[test]
+fn projected_order_rejects_invalid_identity_metadata() {
+    for order in [
+        "",
+        "0",
+        "0000000g",
+        "0000000A",
+        "00000000/",
+        "/00000000",
+        "000000000",
+    ] {
+        assert!(
+            doc_runtime_id_for_order("pages/a.md", order).is_err(),
+            "{order:?}"
+        );
+    }
+    let deepest = vec!["00000000"; MAX_BLOCK_DEPTH].join("/");
+    assert!(doc_runtime_id_for_order("pages/a.md", &deepest).is_ok());
+    assert!(doc_runtime_id_for_order("pages/a.md", &format!("{deepest}/00000000")).is_err());
+    assert!(doc_runtime_id_for_order("../a.md", "00000000").is_err());
+    assert!(doc_runtime_id_for_order("", "00000000").is_err());
 }
 
 #[test]
@@ -2089,638 +1003,83 @@ fn quick_switch_includes_referenced_pages() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Open a fixture graph the way the app opens a Direct graph: with its
+/// disposable SQLite projection attached and initialized.
+///
+/// RET2 retired the parsed-graph walk from every public Direct query, so a
+/// fixture that only called `Graph::open` would now ask a question the
+/// projection cannot answer and get a typed `Unavailable` rather than a walked
+/// answer. Fixtures that deliberately test the walk call the oracle free
+/// functions in `crate::query` directly instead.
+fn ready_graph(dir: &Path) -> Graph {
+    let graph = Graph::open(dir);
+    // The parsed cache FIRST, then the projection. `warm_cache` prefers the
+    // projection when one is attached and then retains no parsed graph at all
+    // (R6), and a session with no parsed cache has no per-page derived
+    // retention to speak of — so a fixture about the memo scope has to be the
+    // ordinary open-parse-project session, not the warm-reopen one.
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .expect("the disposable projection attaches");
+    graph.warm_cache();
+    wait_for_direct_query_projection(&graph);
+    graph
+}
+
+/// Run `attempt` until it answers, retrying ONLY typed readiness.
+///
+/// `Unavailable` and `Cancelled` fail the fixture immediately: a fixture that
+/// slept through them would hide exactly the regression RET2's typed
+/// vocabulary exists to expose.
+/// Wait until the projection has moved PAST `generation` and is ready there.
+///
+/// `when_ready` returns the first `Ok`, and readiness is not freshness: right
+/// after a save the projection can still be ready AT THE PRE-SAVE GENERATION,
+/// so the answer comes back well-formed, prompt, and stale. Waiting for the
+/// generation to transition is the only signal that the edit is in the answer.
+///
+/// Without this, `advanced_query_reexecutes_and_observes_every_edit` failed
+/// about one run in four on this machine while passing in CI, and the failure
+/// reads as a product defect ("the DONE edit was not observed") rather than as
+/// the fixture sampling too early.
+fn when_current(graph: &Graph, generation: u64) {
+    let started = Instant::now();
+    while graph.cache_generation() <= generation || !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the projection never advanced past generation {generation} (now {}, ready={})",
+            graph.cache_generation(),
+            graph.direct_projection_ready_test()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn when_ready<T>(mut attempt: impl FnMut() -> Result<T, crate::query::QueryExecutionError>) -> T {
+    let started = Instant::now();
+    loop {
+        match attempt() {
+            Ok(answer) => return answer,
+            Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "the query index never became ready ({})",
+                    reason.as_str()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(other) => panic!("the public query route refused: {other}"),
+        }
+    }
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tine-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("journals")).unwrap();
     fs::create_dir_all(dir.join("pages")).unwrap();
     dir
-}
-
-/// The artifact-class split, proved at the primitive itself: both barriers
-/// call the same syscall on the same directory, and only the reconstructible
-/// projection class degrades when Android refuses it.
-#[cfg(unix)]
-#[test]
-fn only_the_reconstructible_projection_barrier_degrades_on_android() {
-    use crate::filesystem_durability::DurabilityArtifactClass;
-
-    let dir = scratch("projection-barrier-artifact-class");
-    let chain = vec![Dir::open_ambient_dir(&dir, ambient_authority()).unwrap()];
-
-    {
-        let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EINVAL,
-            true,
-            &dir,
-        )
-        .unwrap();
-        sync_reconstructible_projection_chain(&chain)
-            .expect("Android cannot provide this barrier for reconstructible bytes");
-        preflight_reconstructible_projection_chain(&chain).unwrap();
-    }
-
-    {
-        // The graph tree also holds artifacts it is the SOLE authority for —
-        // conflict copies, trash, withdrawn bytes. Those keep the strict
-        // barrier on every platform, Android included.
-        let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
-            DurabilityArtifactClass::PrivateDurableAuthority,
-            libc::EINVAL,
-            true,
-            &dir,
-        )
-        .unwrap();
-        let error = sync_projection_chain_required(&chain).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            error
-                .to_string()
-                .contains("fsync of the projection parent directory"),
-            "a bare errno is not diagnosable from a device receipt: {error}"
-        );
-        assert_eq!(
-            preflight_projection_chain(&chain).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
-
-    {
-        // Off Android the reconstructible barrier is strict too.
-        let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EINVAL,
-            false,
-            &dir,
-        )
-        .unwrap();
-        assert_eq!(
-            sync_reconstructible_projection_chain(&chain)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
-
-    {
-        // A real I/O failure is not a capability refusal and stays fatal
-        // even on Android.
-        let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EIO,
-            true,
-            &dir,
-        )
-        .unwrap();
-        let error = sync_reconstructible_projection_chain(&chain).unwrap_err();
-        assert!(
-            error.to_string().contains("Input/output error"),
-            "a real I/O failure must stay fatal even on Android: {error}"
-        );
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The same split at the *rename* primitive, which is what Android CI run
-/// 32091898520 actually caught: `renameat2(RENAME_NOREPLACE) publishing the
-/// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` with `EINVAL`.
-/// The reconstructible projection publishes through an exclusive
-/// reservation instead; the sole-authority class keeps the atomic primitive
-/// and fails.
-#[cfg(unix)]
-#[test]
-fn only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported() {
-    use crate::filesystem_durability::DurabilityArtifactClass;
-
-    let dir = scratch("projection-noreplace-artifact-class");
-    let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
-
-    for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP, libc::ENOTSUP] {
-        fs::write(dir.join("source"), b"staged projection bytes").unwrap();
-        let staged =
-            canonical_projection_file_resource_id(&fs::File::open(dir.join("source")).unwrap())
-                .unwrap();
-
-        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            errno,
-            &dir,
-        )
-        .unwrap();
-        rename_reconstructible_projection_noreplace(&capability, "source", "destination")
-            .expect("a filesystem without rename2 flags must still publish");
-
-        assert!(!dir.join("source").exists());
-        assert_eq!(
-            fs::read(dir.join("destination")).unwrap(),
-            b"staged projection bytes"
-        );
-        // The published name must be the staged INODE, not a copy of its
-        // bytes into the reservation placeholder.
-        assert_eq!(
-            canonical_projection_file_resource_id(
-                &fs::File::open(dir.join("destination")).unwrap()
-            )
-            .unwrap(),
-            staged,
-            "the fallback must publish the exact staged inode ({errno})"
-        );
-        fs::remove_file(dir.join("destination")).unwrap();
-    }
-
-    {
-        // The sole-authority class never degrades: no second copy exists to
-        // rebuild these bytes from, so the atomic primitive is the contract.
-        fs::write(dir.join("source"), b"sole authority bytes").unwrap();
-        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-            DurabilityArtifactClass::PrivateDurableAuthority,
-            libc::EINVAL,
-            &dir,
-        )
-        .unwrap();
-        let error = rename_projection_noreplace(&capability, "source", "destination").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            error
-                .to_string()
-                .contains("renameat2(RENAME_NOREPLACE) publishing the projection"),
-            "the enriched detail is what made this diagnosable: {error}"
-        );
-        assert!(!dir.join("destination").exists());
-        assert_eq!(
-            fs::read(dir.join("source")).unwrap(),
-            b"sole authority bytes"
-        );
-        fs::remove_file(dir.join("source")).unwrap();
-    }
-
-    {
-        // A real I/O failure is not a capability answer. It stays fatal for
-        // the reconstructible class too, and nothing is reserved.
-        fs::write(dir.join("source"), b"unmoved bytes").unwrap();
-        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EIO,
-            &dir,
-        )
-        .unwrap();
-        let error =
-            rename_reconstructible_projection_noreplace(&capability, "source", "destination")
-                .unwrap_err();
-        assert!(
-            error.to_string().contains("Input/output error"),
-            "a real I/O failure must stay fatal: {error}"
-        );
-        assert!(
-            !dir.join("destination").exists(),
-            "a fatal errno must not reserve the destination name"
-        );
-        assert_eq!(fs::read(dir.join("source")).unwrap(), b"unmoved bytes");
-        fs::remove_file(dir.join("source")).unwrap();
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The artifact classification must cover the whole guarded replacement,
-/// not only standalone projection publication. Android refused the first
-/// target-retirement rename in this transaction before the staged bytes
-/// could be published.
-#[cfg(unix)]
-#[test]
-fn managed_projection_replacement_falls_back_but_direct_files_stays_strict() {
-    use crate::filesystem_durability::DurabilityArtifactClass;
-
-    let dir = scratch("managed-replacement-artifact-class");
-    let path = dir.join("pages/Target.md");
-    fs::write(&path, b"- original\n").unwrap();
-    let graph = Graph::open(&dir);
-    let write = graph.admit_managed_text_writer().unwrap();
-    let identity = canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
-
-    {
-        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EINVAL,
-            &dir.join("pages"),
-        )
-        .unwrap();
-        graph
-            .managed_atomic_replace_bound(
-                &write,
-                &path,
-                b"- managed replacement\n",
-                identity,
-                Some(b"- original\n"),
-                None,
-                EditorPublicationAuthority::ReconstructibleManagedProjection,
-                Some([0x12, 0x34, 0x56, 0x78]),
-            )
-            .expect("a reconstructible managed projection must use the capability fallback");
-    }
-    assert_eq!(fs::read(&path).unwrap(), b"- managed replacement\n");
-
-    let managed_identity =
-        canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
-    {
-        let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
-            DurabilityArtifactClass::SharedReconstructibleProjection,
-            libc::EINVAL,
-            true,
-            &dir.join("pages"),
-        )
-        .unwrap();
-        graph
-            .managed_atomic_replace_bound(
-                &write,
-                &path,
-                b"- managed barrier replacement\n",
-                managed_identity,
-                Some(b"- managed replacement\n"),
-                None,
-                EditorPublicationAuthority::ReconstructibleManagedProjection,
-                Some([0x12, 0x34, 0x56, 0x78]),
-            )
-            .expect("a reconstructible managed projection may degrade an Android barrier");
-    }
-    assert_eq!(fs::read(&path).unwrap(), b"- managed barrier replacement\n");
-
-    let managed_identity =
-        canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
-    {
-        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-            DurabilityArtifactClass::PrivateDurableAuthority,
-            libc::EINVAL,
-            &dir.join("pages"),
-        )
-        .unwrap();
-        let error = graph
-            .managed_atomic_replace_bound(
-                &write,
-                &path,
-                b"- direct replacement\n",
-                managed_identity,
-                Some(b"- managed barrier replacement\n"),
-                None,
-                EditorPublicationAuthority::DirectFile,
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
-    }
-    assert_eq!(
-        fs::read(&path).unwrap(),
-        b"- managed barrier replacement\n",
-        "Direct Files must not weaken the sole-authority publication contract"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn managed_barrier_collapse_does_not_change_direct_files_retire_publish_barriers() {
-    use crate::durability_counters::{Barrier, BarrierSession};
-
-    let dir = scratch("direct-retire-publish-barrier-guard");
-    let path = dir.join("pages/Target.md");
-    fs::write(&path, b"- original\n").unwrap();
-    let graph = Graph::open(&dir);
-    let write = graph.admit_managed_text_writer().unwrap();
-
-    let measure = |before: &[u8], after: &[u8], authority, turn| {
-        let identity =
-            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
-        let session = BarrierSession::begin();
-        graph
-            .managed_atomic_replace_bound(
-                &write,
-                &path,
-                after,
-                identity,
-                Some(before),
-                None,
-                authority,
-                turn,
-            )
-            .unwrap();
-        let directories = session.counts().get(Barrier::Directory);
-        BarrierSession::detach_current_thread();
-        directories
-    };
-
-    let managed = measure(
-        b"- original\n",
-        b"- managed\n",
-        EditorPublicationAuthority::ReconstructibleManagedProjection,
-        Some([0x12, 0x34, 0x56, 0x78]),
-    );
-    let direct = measure(
-        b"- managed\n",
-        b"- direct\n",
-        EditorPublicationAuthority::DirectFile,
-        None,
-    );
-
-    assert_eq!(managed, 1, "managed W1 closes with one leaf barrier");
-    assert_eq!(
-            direct, 4,
-            "Direct Files must retain strict preflight, retire, publish, and recovery-name removal barriers"
-        );
-    assert_eq!(fs::read(&path).unwrap(), b"- direct\n");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer() {
-    let permission = io::Error::from_raw_os_error(libc::EACCES);
-    assert!(reconstructible_flagged_rename_capability_refusal(
-        &permission,
-        true
-    ));
-    assert!(
-        !reconstructible_flagged_rename_capability_refusal(&permission, false),
-        "desktop EACCES remains a real permission failure"
-    );
-
-    let io_failure = io::Error::from_raw_os_error(libc::EIO);
-    assert!(
-        !reconstructible_flagged_rename_capability_refusal(&io_failure, true),
-        "Android may degrade only the shared-filesystem capability refusal"
-    );
-}
-
-/// The guarantee the flag was there to provide, kept by the fallback: an
-/// occupied destination is refused, never overwritten, and it is refused
-/// with the same `AlreadyExists` the flagged rename raises so every guarded
-/// conflict caller above is unchanged.
-#[cfg(unix)]
-#[test]
-fn the_projection_rename_fallback_refuses_an_occupied_destination_rather_than_clobbering_it() {
-    use crate::filesystem_durability::DurabilityArtifactClass;
-
-    let dir = scratch("projection-noreplace-fallback-occupied");
-    fs::write(dir.join("source"), b"staged projection bytes").unwrap();
-    fs::write(dir.join("destination"), b"live bytes that must survive").unwrap();
-    let live =
-        canonical_projection_file_resource_id(&fs::File::open(dir.join("destination")).unwrap())
-            .unwrap();
-    let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
-
-    let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-        DurabilityArtifactClass::SharedReconstructibleProjection,
-        libc::EINVAL,
-        &dir,
-    )
-    .unwrap();
-    let error = rename_reconstructible_projection_noreplace(&capability, "source", "destination")
-        .unwrap_err();
-
-    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-    assert_eq!(
-        fs::read(dir.join("destination")).unwrap(),
-        b"live bytes that must survive"
-    );
-    assert_eq!(
-        canonical_projection_file_resource_id(&fs::File::open(dir.join("destination")).unwrap())
-            .unwrap(),
-        live,
-        "the occupied destination must keep its exact inode"
-    );
-    assert_eq!(
-        fs::read(dir.join("source")).unwrap(),
-        b"staged projection bytes"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A reservation that cannot be completed is rolled back. Otherwise a failed
-/// publication would leave a zero-length file at a live page name — which is
-/// worse than the refusal it replaced.
-#[cfg(unix)]
-#[test]
-fn a_projection_rename_fallback_that_cannot_complete_leaves_no_empty_destination() {
-    use crate::filesystem_durability::DurabilityArtifactClass;
-
-    let dir = scratch("projection-noreplace-fallback-rollback");
-    let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
-
-    let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
-        DurabilityArtifactClass::SharedReconstructibleProjection,
-        libc::EINVAL,
-        &dir,
-    )
-    .unwrap();
-    // The source never existed, so the plain rename fails after the
-    // destination has already been reserved.
-    let error = rename_reconstructible_projection_noreplace(&capability, "absent", "Live Page.md")
-        .unwrap_err();
-
-    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-    assert!(
-        !dir.join("Live Page.md").exists(),
-        "a failed publication must not leave the reservation behind"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn consumed_external_document_dto_matches_exact_parse_across_formats_and_identity() {
-    let dir = scratch("consumed-exact-page-dto");
-    fs::create_dir_all(dir.join("logseq")).unwrap();
-    fs::write(
-        dir.join("logseq/config.edn"),
-        br#"{:journal/file-name-format "dd-MM-yyyy"
-            :journal/page-title-format "yyyy-MM-dd"}"#,
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    let cases = [
-            (
-                "markdown",
-                "pages/Plain.md",
-                "- ordinary markdown\n",
-                "Plain",
-                PageKind::Page,
-                false,
-            ),
-            (
-                "markdown-read-only",
-                "pages/Read Only.md",
-                "- root\r  ```\r  - fake\r  ```",
-                "Read Only",
-                PageKind::Page,
-                true,
-            ),
-            (
-                "org-editable-properties",
-                "pages/Editable Org.org",
-                "#+TITLE: Editable Org\n\n* TODO Buy milk\nSCHEDULED: <2026-06-25 Thu>\n:PROPERTIES:\n:id: 6679-abc\n:END:\n",
-                "Editable Org",
-                PageKind::Page,
-                false,
-            ),
-            (
-                "org-read-only",
-                "pages/Read Only.org",
-                "* root\n*** child\n",
-                "Read Only",
-                PageKind::Page,
-                true,
-            ),
-            (
-                "explicit-title",
-                "pages/Physical title.md",
-                "title:: Explicit title\n\n- titled body\n",
-                "Explicit title",
-                PageKind::Page,
-                false,
-            ),
-            (
-                "journal-title",
-                "pages/Physical journal.md",
-                "title:: 25-07-2026\n\n- journal body\n",
-                "2026-07-25",
-                PageKind::Journal,
-                false,
-            ),
-        ];
-
-    for (label, relative, source, expected_name, expected_kind, expected_read_only) in cases {
-        let path = ManagedPath::parse(relative.to_owned()).unwrap();
-        let consumed = graph
-            .parse_external_document(&path, source.as_bytes(), false)
-            .unwrap()
-            .into_exact_page_dto(&path, source)
-            .unwrap();
-        let exact = graph
-            .parse_exact_page_dto(&path, source.as_bytes())
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(&consumed).unwrap(),
-            serde_json::to_value(&exact).unwrap(),
-            "{label}: consumed parser result must preserve exact DTO semantics"
-        );
-        assert_eq!(consumed.name, expected_name, "{label}");
-        assert_eq!(consumed.kind, expected_kind, "{label}");
-        assert_eq!(consumed.read_only, expected_read_only, "{label}");
-        if label == "org-editable-properties" {
-            assert_eq!(consumed.format, Format::Org);
-            assert_eq!(consumed.path, relative);
-            assert!(consumed.rev.is_some());
-            assert_eq!(
-                consumed.pre_block.as_deref(),
-                Some("#+TITLE: Editable Org\n")
-            );
-            assert!(!consumed.blocks[0].id.is_empty());
-            assert!(consumed.blocks[0]
-                .properties
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("id") && value == "6679-abc"));
-        }
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn managed_projection_trash_publication_walks_the_typed_nofollow_chain() {
-    let root = scratch("managed-projection-trash-capability");
-    let relative = "pages/Typed Recovery.org";
-    let expected = b"#+TITLE: Typed Recovery\r\n\r\n* exact bytes\r\n";
-    fs::write(root.join(relative), expected).unwrap();
-    let graph = Graph::open(&root);
-    let path = ManagedPath::parse(relative.to_owned()).unwrap();
-
-    assert!(
-        !root.join("logseq/.tine-trash/journals").exists(),
-        "the recovery chain begins absent"
-    );
-    let destination = graph
-        .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
-        .unwrap();
-    assert_eq!(
-        destination.parent(),
-        Some(root.join("logseq/.tine-trash/journals").as_path())
-    );
-    assert_eq!(
-        destination
-            .extension()
-            .and_then(|extension| extension.to_str()),
-        Some("org")
-    );
-    assert_eq!(fs::read(&destination).unwrap(), expected);
-
-    // Exact retries retain one immutable recovery leaf, while a divergent
-    // occupant is a refusal rather than an overwrite.
-    assert_eq!(
-        graph
-            .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
-            .unwrap(),
-        destination
-    );
-    fs::write(&destination, b"foreign recovery bytes").unwrap();
-    assert_eq!(
-        graph
-            .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::AlreadyExists
-    );
-
-    // A malformed intermediate component is rejected through the same
-    // no-follow chain, before it can authorize a semantic deletion.
-    let malformed_root = scratch("managed-projection-trash-malformed-chain");
-    fs::write(malformed_root.join(relative), expected).unwrap();
-    fs::create_dir_all(malformed_root.join("logseq")).unwrap();
-    fs::write(
-        malformed_root.join("logseq/.tine-trash"),
-        b"not a recovery directory",
-    )
-    .unwrap();
-    let malformed = Graph::open(&malformed_root);
-    let error = malformed
-        .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(fs::read(malformed_root.join(relative)).unwrap(), expected);
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&malformed_root);
-}
-
-#[cfg(unix)]
-#[test]
-fn managed_projection_trash_refuses_a_missing_typed_kind_that_cannot_be_created() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let root = scratch("managed-projection-trash-kind-create-refusal");
-    let relative = "pages/Kind Creation Refusal.md";
-    let expected = b"- source survives an unavailable recovery kind\n";
-    fs::write(root.join(relative), expected).unwrap();
-    let trash_root = root.join("logseq/.tine-trash");
-    fs::create_dir_all(&trash_root).unwrap();
-    let original_permissions = fs::metadata(&trash_root).unwrap().permissions();
-    let mut no_create_permissions = original_permissions.clone();
-    no_create_permissions.set_mode(0o555);
-    fs::set_permissions(&trash_root, no_create_permissions).unwrap();
-
-    let graph = Graph::open(&root);
-    let path = ManagedPath::parse(relative.to_owned()).unwrap();
-    let result = graph.preserve_projection_in_trash(&path, ManagedTextKind::Page, expected);
-    fs::set_permissions(&trash_root, original_permissions).unwrap();
-
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(fs::read(root.join(relative)).unwrap(), expected);
-    assert!(
-        !trash_root.join("pages").exists(),
-        "a failed typed-kind creation must not leave a partial namespace"
-    );
-    let _ = fs::remove_dir_all(&root);
 }
 
 fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) -> ConflictOverride {
@@ -2745,200 +1104,6 @@ fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) ->
     ConflictOverride { observation_epoch }
 }
 
-/// The read-only view exists so managed storage can answer whole-graph
-/// questions from its own projected tree. It must answer them -- and it must
-/// not be able to write that tree back, because the oplog owns it.
-#[test]
-fn a_derived_read_only_graph_reads_the_tree_but_cannot_write_it() {
-    let dir = scratch("derived-read-only-graph");
-    fs::write(
-        dir.join("pages/Alpha.md"),
-        "- alpha mentions [[Target]]\n- and again [[Target]]\n",
-    )
-    .unwrap();
-    fs::write(dir.join("pages/Target.md"), "- the target page\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-
-    // Reads: the whole point. Backlinks are the query that was dead in
-    // managed mode, so assert that one specifically.
-    let groups = view.backlinks("Target");
-    assert_eq!(
-        groups
-            .iter()
-            .map(|group| group.page.as_str())
-            .collect::<Vec<_>>(),
-        vec!["Alpha"],
-        "the read-only view must resolve backlinks from the projected tree"
-    );
-    assert!(
-        view.list_pages().iter().any(|entry| entry.name == "Alpha"),
-        "the read-only view must enumerate pages"
-    );
-
-    // Writes: refused at the single graph-text admission, whatever the
-    // caller. A command routed here by mistake fails loudly rather than
-    // leaving a file behind the oplog's back.
-    let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited behind the oplog".into();
-    let refused = view.save_page(&page, base_rev.as_deref()).unwrap_err();
-    assert_eq!(
-        refused.kind(),
-        io::ErrorKind::PermissionDenied,
-        "a graph-text write through the read-only view must be refused: {refused}"
-    );
-    assert_eq!(
-        fs::read_to_string(dir.join("pages/Alpha.md")).unwrap(),
-        "- alpha mentions [[Target]]\n- and again [[Target]]\n",
-        "the refused save must not have touched the file"
-    );
-
-    // Control: the same directory opened normally still saves, so the test
-    // proves the flag and not some unrelated breakage in the fixture.
-    let writable = Graph::open(&dir);
-    let mut page = writable.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited by the owner".into();
-    writable
-        .save_page(&page, base_rev.as_deref())
-        .expect("an ordinary graph still writes");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// `assets/` is outside the oplog's document domain, so importing an image
-/// while managed storage owns graph text must keep working.
-#[test]
-fn a_derived_read_only_graph_still_accepts_asset_writes() {
-    let dir = scratch("derived-read-only-assets");
-    let source = dir.join("incoming.png");
-    fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-    let stored = view
-        .import_asset(&source, Some("picture.png"))
-        .expect("asset writes are outside the graph-text boundary");
-    assert!(
-        dir.join("assets").join(&stored).exists(),
-        "the imported asset must land in assets/"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Every Settings toggle writes `logseq/config.edn`, and configuration is
-/// **not** oplog-owned: the managed scanner classifies it
-/// `GraphTextScanPathClass::Configuration` and the baseline adapter drops
-/// those rows as "not managed content", so no managed path, import or
-/// projection ever covers it. Persisting a setting must therefore keep
-/// working while managed storage owns graph text.
-#[test]
-fn a_derived_read_only_graph_still_writes_graph_configuration() {
-    let dir = scratch("derived-read-only-config");
-    let view = Graph::open_derived_read_only(&dir);
-
-    view.set_favorites(&["Alpha".to_owned(), "Beta".to_owned()])
-        .expect("configuration is outside the graph-text boundary");
-    view.set_start_of_week(3)
-        .expect("configuration is outside the graph-text boundary");
-
-    let written = fs::read_to_string(dir.join("logseq/config.edn"))
-        .expect("the setting must have been persisted");
-    assert!(
-        written.contains(":favorites [\"Alpha\" \"Beta\"]"),
-        "favorites must round-trip into config.edn: {written}"
-    );
-    assert!(
-        written.contains(":start-of-week 3"),
-        "start of week must round-trip into config.edn: {written}"
-    );
-
-    // The same view still cannot touch graph text, so the config capability
-    // did not widen into the oplog's domain.
-    fs::write(dir.join("pages/Alpha.md"), "- alpha\n").unwrap();
-    let view = Graph::open_derived_read_only(&dir);
-    let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited behind the oplog".into();
-    assert_eq!(
-        view.save_page(&page, base_rev.as_deref())
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied,
-        "a config write must not have widened the graph-text boundary"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// `logseq/.tine-trash` sits next to `assets`, `publish` and `.tine-sync` in
-/// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
-/// imported or projected. Trashing an orphaned asset is an asset-side write
-/// into that tree and must stay available under managed storage; trashing a
-/// recognized sync-conflict copy is likewise outside graph discovery and can
-/// be discarded into that tree; trashing a journal file is a graph-text
-/// deletion and must not.
-#[test]
-fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
-    let dir = scratch("derived-read-only-trash");
-    fs::create_dir_all(dir.join("assets")).unwrap();
-    fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-    fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
-    let conflict = "Alpha.sync-conflict-20260810-120000-DEVICE.md";
-    fs::write(dir.join("pages").join(conflict), "- conflict evidence\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-
-    view.trash_asset("orphan.png")
-        .expect("the trash tree is outside the graph-text boundary");
-    assert!(
-        !dir.join("assets/orphan.png").exists(),
-        "the orphaned asset must have left assets/"
-    );
-    assert_eq!(
-        view.asset_trash_stats().count,
-        1,
-        "the orphaned asset must be recoverable from the trash"
-    );
-
-    let removed = view
-        .empty_asset_trash()
-        .expect("emptying the asset trash is an asset-side write");
-    assert_eq!(removed, 1, "the emptied entry must be counted");
-
-    let conflict_path = format!("pages/{conflict}");
-    let staged = view
-        .stage_sync_conflict_trash(&conflict_path, b"- conflict evidence\n")
-        .expect("excluded conflict evidence can be staged recoverably");
-    assert!(!dir.join("pages").join(conflict).exists());
-    view.rollback_sync_conflict_trash(&staged)
-        .expect("a definitely unauthored operation can restore its staged evidence");
-    assert_eq!(
-        fs::read_to_string(dir.join("pages").join(conflict)).unwrap(),
-        "- conflict evidence\n"
-    );
-    view.trash_sync_conflict(&conflict_path)
-        .expect("a conflict copy is excluded from the graph-text domain");
-    assert!(!dir.join("pages").join(conflict).exists());
-    assert_eq!(view.asset_trash_stats().conflicts, 1);
-
-    // A journal file is graph text. Its deletion belongs to the oplog and
-    // stays refused at the single graph-text admission.
-    let refused = view.trash_journal_file("2026_08_07.md").unwrap_err();
-    assert_eq!(
-        refused.kind(),
-        io::ErrorKind::PermissionDenied,
-        "a journal deletion must stay refused under managed storage: {refused}"
-    );
-    assert!(
-        dir.join("journals/2026_08_07.md").exists(),
-        "the refused journal deletion must not have touched the file"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn external_document_admission_reuses_the_retained_parse() {
     let dir = scratch("external-admission-parse-count");
@@ -2958,8 +1123,7 @@ fn external_document_admission_reuses_the_retained_parse() {
             path: dir.join(relative),
         };
         crate::outline::reset_parse_attempts();
-        let parsed = parse_external_document(&graph, entry, content, true).unwrap();
-        assert_eq!(parsed.source_round_trips, Some(true));
+        let _parsed = parse_external_document(&graph, entry, content).unwrap();
         assert_eq!(
             crate::outline::parse_attempts(),
             expected_attempts,
@@ -2967,16 +1131,6 @@ fn external_document_admission_reuses_the_retained_parse() {
         );
     }
     let _ = fs::remove_dir_all(&dir);
-}
-
-fn bootstrap_capture_scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tine-bootstrap-capture-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn regular_file_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
@@ -3008,76 +1162,76 @@ fn regular_file_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>
     out
 }
 
-fn set_managed_content_budget_limit(limit: u64) {
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+fn set_graph_text_content_budget_limit(limit: u64) {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             retained_content_bytes: limit,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
 }
 
-fn clear_managed_content_budget_limit() {
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+fn clear_graph_text_content_budget_limit() {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
 }
 
-fn last_managed_content_budget_peak() -> u64 {
-    MANAGED_TEXT_BUDGET_LAST_PEAK.with(Cell::get)
+fn last_graph_text_content_budget_peak() -> u64 {
+    GRAPH_TEXT_BUDGET_LAST_PEAK.with(Cell::get)
 }
 
 #[test]
-fn publisher_p1_managed_text_classifier_uses_longest_component_root_and_preserves_exact_path() {
-    let dir = scratch("managed-text-classifier-longest-root");
+fn publisher_p1_graph_text_classifier_uses_longest_component_root_and_preserves_exact_path() {
+    let dir = scratch("graph-text-classifier-longest-root");
     let mut graph = Graph::open(&dir);
-    graph.config.pages_dir = "managed/text".to_owned();
-    graph.config.journals_dir = "managed/text/daily".to_owned();
+    graph.config.pages_dir = "graph/text".to_owned();
+    graph.config.journals_dir = "graph/text/daily".to_owned();
 
-    let nested = ManagedPath::parse("managed/text/daily/2026/07/naïve.md").unwrap();
+    let nested = GraphTextPath::parse("graph/text/daily/2026/07/naïve.md").unwrap();
     assert_eq!(
-        graph.classify_managed_text_path(&nested),
-        Ok(ManagedTextKind::Journal)
+        graph.classify_graph_text_path(&nested),
+        Ok(GraphTextKind::Journal)
     );
-    assert_eq!(nested.as_str(), "managed/text/daily/2026/07/naïve.md");
+    assert_eq!(nested.as_str(), "graph/text/daily/2026/07/naïve.md");
     assert_eq!(
-        graph.classify_managed_text_path(
-            &ManagedPath::parse("managed/text/projects/2026/roadmap.md").unwrap()
+        graph.classify_graph_text_path(
+            &GraphTextPath::parse("graph/text/projects/2026/roadmap.md").unwrap()
         ),
-        Ok(ManagedTextKind::Page)
+        Ok(GraphTextKind::Page)
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn publisher_p1_managed_text_classifier_rejects_boundary_misses_outside_paths_and_equal_roots() {
-    let dir = scratch("managed-text-classifier-rejections");
+fn publisher_p1_graph_text_classifier_rejects_boundary_misses_outside_paths_and_equal_roots() {
+    let dir = scratch("graph-text-classifier-rejections");
     let mut graph = Graph::open(&dir);
     graph.config.pages_dir = "pages".to_owned();
     graph.config.journals_dir = "pages-journal".to_owned();
     for path in ["pages-old/file.md", "outside/file.md"] {
         assert!(
             graph
-                .classify_managed_text_path(&ManagedPath::parse(path).unwrap())
+                .classify_graph_text_path(&GraphTextPath::parse(path).unwrap())
                 .is_err(),
             "accepted {path}"
         );
     }
     assert_eq!(
-        graph.classify_managed_text_path(&ManagedPath::parse("pages-journal/a.md").unwrap()),
-        Ok(ManagedTextKind::Journal)
+        graph.classify_graph_text_path(&GraphTextPath::parse("pages-journal/a.md").unwrap()),
+        Ok(GraphTextKind::Journal)
     );
 
     graph.config.journals_dir = "pages".to_owned();
     assert!(graph
-        .classify_managed_text_path(&ManagedPath::parse("pages/a.md").unwrap())
+        .classify_graph_text_path(&GraphTextPath::parse("pages/a.md").unwrap())
         .is_err());
 
     for malformed_pages_root in ["bad*", "COM¹"] {
         graph.config.pages_dir = malformed_pages_root.to_owned();
         graph.config.journals_dir = "journals".to_owned();
         assert!(graph
-            .classify_managed_text_path(&ManagedPath::parse("journals/2026/07/24.md").unwrap())
+            .classify_graph_text_path(&GraphTextPath::parse("journals/2026/07/24.md").unwrap())
             .is_err());
     }
     let _ = fs::remove_dir_all(&dir);
@@ -3124,8 +1278,18 @@ fn search_cache_isolates_one_page_projection_panic() {
     fs::write(&sibling.path, format!("- {needle}\n")).unwrap();
     let sibling_path = sibling.rel_path.clone();
     let bad_path = bad.rel_path.clone();
+    // Both files were rewritten behind the graph's back, which in the product
+    // is a watcher event. `list_pages` above now joins the shared page-build
+    // flight (GH #550), so without that event the query below would be served
+    // the parse from before these writes and never reach the panic isolation
+    // this test is about. The build is still cold afterwards.
+    g.invalidate_cache();
 
-    let execution = g.run_graph_search(needle, 0, 8, false);
+    let execution = crate::query_plan::QueryPlan::friendly(needle, 0, 8).execute_with_explain(
+        &g,
+        || false,
+        false,
+    );
     assert!(
         execution.hits.iter().any(|hit| matches!(
             hit,
@@ -3140,8 +1304,8 @@ fn search_cache_isolates_one_page_projection_panic() {
     g.invalidate_cache();
     assert!(g.page_index_failures().is_empty());
     g.warm_cache();
-    assert!(g
-        .run_graph_search(needle, 0, 8, false)
+    assert!(crate::query_plan::QueryPlan::friendly(needle, 0, 8)
+        .execute_with_explain(&g, || false, false)
         .hits
         .iter()
         .any(|hit| matches!(
@@ -3180,7 +1344,7 @@ fn assert_editor_save_identity_race(force: bool) {
     } else {
         None
     };
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         let replacement = replacement.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -3275,7 +1439,7 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
         canonical_projection_file_resource_id(&fs::File::open(&replacement).unwrap()).unwrap();
 
     if restoration_branch {
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -3283,13 +1447,13 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
                 ))
             }));
         });
-        MANAGED_WRITE_BEFORE_RESTORE.with(|hook| {
+        GRAPH_TEXT_WRITE_BEFORE_RESTORE.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, path)));
         });
     } else {
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, path)));
@@ -3592,7 +1756,7 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
         fs::write(directory.join(format!("P{index:02}.md")), "- page\n").unwrap();
     }
     let graph = Graph::open(&dir);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
     GRAPH_TEXT_INVENTORY_ENTRY_VISITS.with(|visits| visits.set(0));
     let entries = graph.graph_text_entries(&permit).unwrap();
     let visits = GRAPH_TEXT_INVENTORY_ENTRY_VISITS.with(Cell::get);
@@ -3604,29 +1768,29 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
     );
 
     for limits in [
-        ManagedTextInventoryLimits {
-            managed_files: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+        GraphTextInventoryLimits {
+            graph_text_files: 1,
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             directory_depth: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             all_entries: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             directories: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             pending_directories: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             path_bytes: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
     ] {
         assert!(graph
@@ -3634,10 +1798,10 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
             .is_err());
     }
     drop(permit);
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             retained_content_bytes: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
     assert_eq!(
@@ -3647,7 +1811,7 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
             .kind(),
         io::ErrorKind::InvalidData
     );
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
     let _ = fs::remove_dir_all(&dir);
@@ -3830,16 +1994,15 @@ fn find_entry_cache_rebuilds_after_file_rescue_generation_bump() {
 #[test]
 fn find_entry_cache_invalidated_by_cold_sync_file() {
     // Regression: the gen-keyed find_entry index must not go stale on
-    // sync_file's cold-cache branch (the parsed-doc cache not yet built), which
-    // drops the page-list memo WITHOUT bumping cache_gen. Before the fix,
-    // find_entry kept serving the pre-create index here (missing the new file)
-    // until some other op happened to bump the generation.
+    // sync_file with the parsed-doc cache absent. The ordinary page upsert now
+    // advances the generation and enqueues the projection delta in this case;
+    // find_entry must not keep serving the pre-create index.
     let dir = scratch("find-entry-cache-cold-sync");
     fs::write(dir.join("pages").join("Existing.md"), "- body\n").unwrap();
     let g = Graph::open(&dir);
 
     // Do NOT warm the doc cache: find_entry builds only its own index, so
-    // self.cache stays cold and sync_file below takes the else-branch.
+    // self.cache stays cold throughout reconciliation.
     assert!(g.find_entry("New", PageKind::Page).is_none());
 
     // A brand-new external file appears (as Logseq/Syncthing would create it),
@@ -5128,7 +3291,7 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     fs::write(&future, future_bytes).unwrap();
     fs::write(dir.join("journals/15-07-2030.md"), "- today sentinel\n").unwrap();
     fs::write(dir.join("journals/14-07-2030.md"), "- past sentinel\n").unwrap();
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     let future_title = "Wednesday, 17-07-2030";
     assert_eq!(
         g.journals_desc().len(),
@@ -5172,12 +3335,13 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     // deliberately separate from the filtered Journals feed.
     assert!(g
         .run_graph_search_latest("future-feed-test", future_title, 8, 8, false)
+        .unwrap()
         .hits
         .iter()
         .any(|hit| matches!(hit,
             crate::query_plan::QueryHit::Page { page, .. } if page.path == future
         )));
-    assert!(!g.search("future-search-sentinel", 8).is_empty());
+    assert!(!g.search("future-search-sentinel", 8).unwrap().is_empty());
     assert_eq!(g.path_for(future_title, PageKind::Journal), future);
     assert_eq!(
         g.page_source_file(future_title, PageKind::Journal, None)
@@ -5206,6 +3370,7 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     );
     assert!(g
         .run_graph_search_latest("future-feed-test", future_title, 8, 8, false)
+        .unwrap()
         .hits
         .iter()
         .any(|hit| matches!(hit,
@@ -5306,7 +3471,7 @@ fn rename_transaction_does_not_build_the_guarded_graph_index() {
 
     let before = graph.guarded_graph_text_identity_report();
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     graph
         .rename_page("Alpha", "Beta")
         .expect("bounded rename must not enter retained-shadow construction");
@@ -5315,8 +3480,8 @@ fn rename_transaction_does_not_build_the_guarded_graph_index() {
     assert_eq!(after.complete_builds, before.complete_builds);
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "rename consumed the retained-shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "rename consumed the retained capture hook"
     );
     assert!(!dir.join("pages/Alpha.md").exists());
     assert_eq!(
@@ -5764,10 +3929,16 @@ fn warm_page_inventory_survives_rename_without_graph_reread_or_reparse() {
         .iter()
         .any(|entry| entry.rel_path == "pages/Original.md"));
     assert!(after_rename.iter().any(|entry| {
-        // An explicit title remains the effective identity; the physical
-        // move must not silently reinterpret it from the new filename.
-        entry.name == "Original" && entry.rel_path == "pages/Renamed.md"
+        // A `title::` that named the page being renamed is rebound by the
+        // rename itself (GH #451), so the effective identity moves with the
+        // file instead of stranding the page under its old name. A title that
+        // named something else is user content and is left alone; that is
+        // `gh451_research.rs`.
+        entry.name == "Renamed" && entry.rel_path == "pages/Renamed.md"
     }));
+    assert!(fs::read_to_string(dir.join("pages/Renamed.md"))
+        .unwrap()
+        .starts_with("title:: Renamed\n"));
     assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
     assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
     let _ = fs::remove_dir_all(&dir);
@@ -5861,14 +4032,14 @@ fn portable_prefix_branching_limit_fails_before_mutation() {
     let mut page = graph.load_by_path("External/Target.md").unwrap().unwrap();
     page.blocks[0].raw = "must not publish".into();
 
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             directories: 2,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
     let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
 
@@ -5923,8 +4094,8 @@ fn wait_for_page_build_join(graph: &Graph) {
 fn wait_for_identity_mutation_waiter(graph: &Graph) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let gate = &graph
-        .managed_write_binding()
-        .expect("test graph has managed writer binding")
+        .graph_text_write_binding()
+        .expect("test graph has graph writer binding")
         .gate;
     let mut state = gate.identity_mutation.lock().unwrap();
     while state.waiters == 0 {
@@ -6086,7 +4257,7 @@ fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
 
     let first_graph = Arc::clone(&graph);
     let first = std::thread::spawn(move || {
-        let permit = first_graph.admit_retained_managed_text_writer()?;
+        let permit = first_graph.admit_retained_graph_text_writer()?;
         first_graph.direct_creation_proof(
             &permit,
             &first_graph.root.join("pages/First Proof.md"),
@@ -6097,7 +4268,7 @@ fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
     pause.reached.wait();
     let second_graph = Arc::clone(&graph);
     let second = std::thread::spawn(move || {
-        let permit = second_graph.admit_retained_managed_text_writer()?;
+        let permit = second_graph.admit_retained_graph_text_writer()?;
         second_graph.direct_creation_proof(
             &permit,
             &second_graph.root.join("pages/Second Proof.md"),
@@ -6236,7 +4407,7 @@ fn late_page_build_claim_after_completed_install_is_non_owner() {
         DirectCreationEvidence::Cold
     ));
     let expected_generation = graph.cache_generation();
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
 
     assert_eq!(
         graph.repair_page_cache_once(&permit),
@@ -6413,7 +4584,7 @@ fn install_built_publishes_only_at_its_exact_generation() {
         });
         fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
         let graph = Graph::open(&dir);
-        let permit = graph.admit_retained_managed_text_writer().unwrap();
+        let permit = graph.admit_retained_graph_text_writer().unwrap();
         let expected = graph.cache_generation();
         let built = graph.load_all_pages_with_permit(&permit);
         if drift {
@@ -7183,7 +5354,7 @@ fn windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation() {
 
     let writer_graph = Arc::clone(&graph);
     let writer = std::thread::spawn(move || {
-        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+        GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 paused_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -7391,57 +5562,6 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-/// Falsification probe for the 2026-08-07 invariant inventory, which
-/// concluded that a warm Direct save of an existing page does no O(graph)
-/// work. That verdict rests on reading the code, not on running it against a
-/// graph with real scale and shape. If `complete_builds` climbs while
-/// repeatedly saving one page, the verdict is wrong and the whole-graph
-/// identity rebuild returns to the top of the cut-list.
-///
-/// Opt-in, because it needs a corpus this repository does not ship:
-/// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
-/// Wave 3 Cc C6 acceptance gate over the anonymized corpus, through the
-/// MANAGED constructor (`managed_entry_for_managed_path`), not the graph-wide
-/// converter that `crates/tine-core/tests/graph.rs::managed_inventory_kind_census`
-/// exercises. Prints aggregate kind counts only; corpus content is never
-/// printed. Before C6 every eligible file under `journals/` was a Journal
-/// regardless of its stem; after C6 identity follows the journal-title parse,
-/// so a `journals/<non-date>.md` file is a Page, as in OG and Direct mode.
-#[test]
-#[ignore = "manual Wave 3 Cc gate: managed-constructor inventory kinds; set TINE_MANAGED_INVENTORY_CENSUS_GRAPH"]
-fn managed_constructor_inventory_kind_census() {
-    let Some(source) = std::env::var_os("TINE_MANAGED_INVENTORY_CENSUS_GRAPH") else {
-        eprintln!("skipped: set TINE_MANAGED_INVENTORY_CENSUS_GRAPH to a corpus directory");
-        return;
-    };
-    let graph = Graph::open(PathBuf::from(source));
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let (mut pages, mut journals, mut journal_dir_pages, mut rejected) =
-        (0usize, 0usize, 0usize, 0usize);
-    for (path, _bytes) in &inventory {
-        match graph.managed_entry_for_managed_path(path) {
-            Ok(entry) => match entry.kind {
-                PageKind::Journal => journals += 1,
-                PageKind::Page => {
-                    pages += 1;
-                    if entry.rel_path.starts_with("journals/") {
-                        journal_dir_pages += 1;
-                    }
-                }
-            },
-            Err(_) => rejected += 1,
-        }
-    }
-    eprintln!(
-        "managed_constructor_inventory_kind_census total={} pages={} journals={} journal_dir_pages={} rejected={}",
-        inventory.len(),
-        pages,
-        journals,
-        journal_dir_pages,
-        rejected
-    );
-}
-
 /// the source is never mutated.
 #[test]
 #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]
@@ -7597,45 +5717,6 @@ fn resource_epoch_uses_local_existing_proofs_and_cached_creation_proof() {
         1,
         "creation must not rebuild the retained complete index"
     );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn resource_epoch_does_not_make_existing_sibling_saves_rebuild() {
-    let dir = scratch("guarded-resource-epoch-warm");
-    fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
-    fs::write(dir.join("pages/B.md"), "- b\n").unwrap();
-    let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
-    let mut page_a = graph_a.load_by_path("pages/A.md").unwrap().unwrap();
-    let mut page_b = graph_b.load_by_path("pages/B.md").unwrap().unwrap();
-
-    guarded_test_resave(&graph_a, &mut page_a, "a transition").unwrap();
-    guarded_test_resave(&graph_b, &mut page_b, "b local save").unwrap();
-    assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
-    let epochs = graph_b.guarded_graph_text_identity_epochs();
-    assert_ne!(epochs.0, Some(epochs.1));
-    assert!(graph_b.guarded_graph_text_identity_stats().2);
-
-    let before_warm = crate::fast_commit::graph_wide_commit_work();
-    guarded_test_resave(&graph_b, &mut page_b, "b warm one").unwrap();
-    let after_warm_one = graph_b.guarded_graph_text_identity_epochs();
-    assert_ne!(after_warm_one.0, Some(after_warm_one.1));
-    assert!(
-        after_warm_one.1 > epochs.1,
-        "an ordinary save must still advance the shared resource epoch"
-    );
-    guarded_test_resave(&graph_b, &mut page_b, "b warm two").unwrap();
-    let after_warm_two = graph_b.guarded_graph_text_identity_epochs();
-    assert_ne!(after_warm_two.0, Some(after_warm_two.1));
-    assert!(
-        after_warm_two.1 > after_warm_one.1,
-        "each ordinary save must advance the shared resource epoch once"
-    );
-    assert_eq!(
-        crate::fast_commit::graph_wide_commit_work().since(before_warm),
-        crate::fast_commit::GraphWideCommitWork::default()
-    );
-    assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -8028,12 +6109,12 @@ fn direct_trash_move_does_not_capture_unrelated_graph_text_bytes() {
     graph
         .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
         .unwrap();
-    let before_reads = managed_text_capture_reads();
+    let before_reads = graph_text_capture_reads();
     let before_builds = graph.guarded_graph_text_identity_report().complete_builds;
 
     graph.trash_journal_file("2026_08_25.md").unwrap();
 
-    assert_eq!(managed_text_capture_reads(), before_reads);
+    assert_eq!(graph_text_capture_reads(), before_reads);
     assert_eq!(
         graph.guarded_graph_text_identity_report().complete_builds,
         before_builds
@@ -9865,16 +7946,17 @@ fn advanced_query_runs_supported_subset_flags_rest() {
     )
     .unwrap();
     fs::write(dir.join("pages").join("Note.md"), "- TODO not a journal\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     // (task ?b #{"TODO"}) maps to the existing Task predicate.
-    let r = g.run_advanced_query(r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#, None);
+    let r = when_ready(|| {
+        g.run_advanced_query(r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#, None)
+    });
     assert!(r.supported);
     assert!(r.ran.contains(&"task".to_string()));
     let total: usize = r.groups.iter().map(|grp| grp.blocks.len()).sum();
     assert_eq!(total, 2, "both TODO blocks match");
     // A clause outside the subset (a raw [?e :a ?v] join) → nothing supported.
-    let u = g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None);
+    let u = when_ready(|| g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None));
     assert!(!u.supported);
     assert!(u.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -9890,8 +7972,7 @@ fn advanced_current_page_input_filters_real_graph_blocks() {
         "- TODO pinned [[Focus A]]\n- TODO pinned [[Focus B]]\n- DONE [[Focus A]]\n",
     )
     .unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
+    let graph = ready_graph(&dir);
     let query = r#"[:find (pull ?b [*])
                         :in $ ?current-page
                         :where
@@ -9900,7 +7981,7 @@ fn advanced_current_page_input_filters_real_graph_blocks() {
                         (task ?b #{"TODO"})]
                        :inputs [:current-page]"#;
 
-    let result = graph.run_advanced_query(query, Some("Focus A"));
+    let result = when_ready(|| graph.run_advanced_query(query, Some("Focus A")));
     assert!(result.supported, "ignored={:?}", result.ignored);
     assert!(result.ignored.is_empty(), "{:?}", result.ignored);
     assert_eq!(result.ran, vec!["current-page-ref", "task"]);
@@ -9932,11 +8013,10 @@ fn advanced_query_covers_widened_clause_subset() {
     .unwrap();
     // Default file-name format is Legacy (`%2F`), so encode the namespace slash.
     fs::write(dir.join("pages").join("Proj%2FSub.md"), "- nested note\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
     let count = |src: &str| -> usize {
-        let r = g.run_advanced_query(src, None);
+        let r = when_ready(|| g.run_advanced_query(src, None));
         assert!(r.supported, "expected supported: {src} (ran={:?})", r.ran);
         r.groups.iter().map(|grp| grp.blocks.len()).sum()
     };
@@ -9965,7 +8045,7 @@ fn advanced_query_covers_widened_clause_subset() {
     );
 
     // Unknown heads still land in `ignored`, never guessed.
-    let r = g.run_advanced_query("[:find ?b :where (bogus ?b)]", None);
+    let r = when_ready(|| g.run_advanced_query("[:find ?b :where (bogus ?b)]", None));
     assert!(r.ignored.contains(&"bogus".to_string()));
     let _ = fs::remove_dir_all(&dir);
 }
@@ -9981,14 +8061,13 @@ fn advanced_query_skeleton_ignores_comment_hints() {
         "- TODO ship it\n- DOING wire it\n- DONE done\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let skeleton = "[:find (pull ?b [*])\n \
              :where\n \
              ;; supported: (priority ?b \"A\") (page-ref ?b \"Nope\") (property ?b :k \"v\")\n \
              ;; (scheduled ?b) (deadline ?b) (page ?b \"Nowhere\")\n \
              (task ?b #{\"TODO\" \"DOING\"})]";
-    let r = g.run_advanced_query(skeleton, None);
+    let r = when_ready(|| g.run_advanced_query(skeleton, None));
     assert!(r.supported, "ran: {:?} ignored: {:?}", r.ran, r.ignored);
     // Only the task clause ran — the commented priority/page-ref/etc. did not.
     assert_eq!(r.ran, vec!["task".to_string()]);
@@ -10006,11 +8085,11 @@ fn advanced_query_skeleton_ignores_comment_hints() {
 }
 
 #[test]
-fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion() {
+fn persisted_query_sources_are_refused_before_projection_or_parser_recursion() {
     let dir = scratch("query-source-recursion-bound");
     fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
+    let reads_before = g.direct_projection_statement_reads_test();
 
     // This is the graph-authored shape that previously overflowed the Rust
     // stack when a persisted query macro rendered. Keep it below the byte
@@ -10018,109 +8097,195 @@ fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion
     let nested = format!("{}(task TODO){}", "(and ".repeat(1_000), ")".repeat(1_000));
     assert!(crate::query::query_source_within_limit(&nested));
     assert!(!crate::query::query_nesting_within_limit(&nested));
-    let simple = g.run_query_bounded(&nested, 20_000, 32 * 1024 * 1024);
+    let simple = g
+        .run_query_bounded(&nested, 20_000, 32 * 1024 * 1024)
+        .expect("a refused query source is answered before any dispatch");
     assert!(simple.groups.is_empty());
-    assert!(g.derived_cache.read().unwrap().is_none());
 
     let advanced = format!("[:find (pull ?b [*]) :where {nested}]");
-    let result = g.run_advanced_query(&advanced, None);
+    let result = g
+        .run_advanced_query(&advanced, None)
+        .expect("a refused query source is answered before any dispatch");
     assert!(!result.supported);
     assert_eq!(result.ignored, vec!["query-nesting-too-deep"]);
-    assert!(g.advanced_cache.read().unwrap().is_none());
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        reads_before,
+        "refused simple and advanced sources must not execute a projection statement"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Ask the production advanced route for its acquired pre-view rows. The source
+/// report remains outside this shared value and is checked through the public
+/// route by the caller.
+fn advanced_query_pre_view_rows(
+    graph: &Graph,
+    query_src: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Vec<RefGroup> {
+    let crate::query::ResolvedAdvanced::Executable { query, today, .. } =
+        crate::query::resolve_advanced_source(query_src, None)
+    else {
+        panic!("the fixture advanced query resolves");
+    };
+    let query = crate::query::block_anchored_query(&query);
+    when_ready(|| {
+        graph.direct_simple_query_pre_view(
+            &query,
+            today,
+            max_rows,
+            max_bytes,
+            crate::query::ConstructionProfile::default(),
+            None,
+        )
+    })
+    .groups
+}
+
+fn simple_query_pre_view_rows_at(
+    graph: &Graph,
+    query_src: &str,
+    today: crate::date::JournalDate,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Vec<RefGroup> {
+    let (query, view) = crate::query::parse_query_source(query_src, today);
+    let query = crate::query::block_anchored_query(&query);
+    let profile = crate::query::ConstructionProfile::from_view(&view);
+    when_ready(|| {
+        graph.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile, None)
+    })
+    .groups
+}
+
+#[test]
+fn repeated_query_executes_again_at_the_same_or_a_later_day() {
+    let dir = scratch("query-repeat-execution-day");
+    fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
+    let graph = ready_graph(&dir);
+    let today = crate::date::JournalDate::today();
+    let first = simple_query_pre_view_rows_at(&graph, "(task TODO)", today, usize::MAX, usize::MAX);
+    let after_first = graph.direct_projection_statement_reads_test();
+    let same_day =
+        simple_query_pre_view_rows_at(&graph, "(task TODO)", today, usize::MAX, usize::MAX);
+    assert_eq!(
+        graph.direct_projection_statement_reads_test(),
+        after_first + 1,
+        "the repeated valid query executes SQL again"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&same_day).unwrap(),
+        "the repeated read returns the same ordered rows"
+    );
+
+    let next_day = simple_query_pre_view_rows_at(
+        &graph,
+        "(task TODO)",
+        today.add_days(1),
+        usize::MAX,
+        usize::MAX,
+    );
+    assert_eq!(
+        graph.direct_projection_statement_reads_test(),
+        after_first + 2,
+        "the later-day request also executes SQL"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&next_day).unwrap(),
+        "a day-insensitive query keeps the same answer"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn advanced_query_reuses_cached_result_until_graph_changes() {
-    let dir = scratch("adv-memo");
+fn advanced_query_reexecutes_and_observes_every_edit() {
+    let dir = scratch("adv-repeat");
     fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
     fs::write(
         dir.join("pages").join("Notes.md"),
         "alias:: Scratch\n- ordinary note\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
 
-    let first = g.run_advanced_query_cached(q, None);
-    let second = g.run_advanced_query_cached(q, None);
-    assert!(
-        Arc::ptr_eq(&first, &second),
-        "identical advanced query should be served from the memo cache"
+    let first_result = when_ready(|| g.run_advanced_query_cached(q, None));
+    let first = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let after_first = g.direct_projection_statement_reads_test();
+    let second = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    assert_eq!(g.direct_projection_statement_reads_test(), after_first + 1);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&second).unwrap(),
+        "repeated SQL reads return the same ordered rows"
     );
-    assert_eq!(first.groups.len(), 1);
-    let bounded_key = format!("AQ\0{}\0{}\0n:\0{q}", 20_000, 32 * 1024 * 1024);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_first = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
+    let simple = when_ready(|| g.run_query_bounded("(task TODO)", usize::MAX, usize::MAX));
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(simple.groups.as_ref()).unwrap()
+    );
+    assert_eq!(first_result.groups.len(), 1);
+    assert!(first_result.supported);
+    assert_eq!(first_result.ran, vec!["task".to_string()]);
+    assert!(first_result.ignored.is_empty());
+    assert_eq!(
+        serde_json::to_vec(&first_result.groups).unwrap(),
+        serde_json::to_vec(&first).unwrap(),
+        "the public route attaches its source report to the shared rows"
+    );
+    let bounded_first = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    let after_bounded_first = g.direct_projection_statement_reads_test();
+    let bounded_second = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        after_bounded_first + 1
+    );
+    assert_eq!(
+        serde_json::to_vec(&bounded_first).unwrap(),
+        serde_json::to_vec(&bounded_second).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_advanced_query_cached(q, None);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_after_unrelated = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
-    assert!(
-        Arc::ptr_eq(&first, &after_unrelated),
-        "an unrelated edit must retain the advanced-query memo"
+    let after_unrelated = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let bounded_after_unrelated = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&after_unrelated).unwrap(),
+        "the unrelated edit leaves the ordered answer unchanged"
     );
-    assert!(Arc::ptr_eq(&bounded_first, &bounded_after_unrelated));
+    assert_eq!(
+        serde_json::to_vec(&bounded_first).unwrap(),
+        serde_json::to_vec(&bounded_after_unrelated).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.pre_block = Some("alias:: Renamed Scratch\n".into());
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_alias_change = g.run_advanced_query_cached(q, None);
-    assert!(
-        !Arc::ptr_eq(&first, &after_alias_change),
-        "a semantic alias change must invalidate graph-wide derived results"
+    let after_alias_change = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&after_alias_change).unwrap(),
+        "the task answer is unchanged by an alias on an unrelated page"
     );
 
     let mut dto = g.load_named("P", PageKind::Page).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
+    let before_affected_edit = g.cache_generation();
     g.save_page(&dto, dto.rev.as_deref()).unwrap();
+    when_current(&g, before_affected_edit);
 
-    let third = g.run_advanced_query_cached(q, None);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_after_affected = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
-    assert!(
-        !Arc::ptr_eq(&first, &third),
-        "graph mutation must invalidate the advanced-query memo"
-    );
-    assert!(!Arc::ptr_eq(&bounded_first, &bounded_after_affected));
-    assert!(third.groups.is_empty());
+    let third_result = when_ready(|| g.run_advanced_query_cached(q, None));
+    let third = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let bounded_after_affected = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert!(third.is_empty());
+    assert!(bounded_after_affected.is_empty());
+    assert!(third_result.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -10178,36 +8343,103 @@ fn windows_directory_durability_limit_does_not_block_save_or_rename() {
 }
 
 #[test]
-fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
-    let dir = scratch("bounded-query-scoped-memo");
+fn bounded_query_reexecutes_and_observes_every_edit() {
+    let dir = scratch("bounded-query-repeat");
     fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
     fs::write(
         dir.join("pages").join("Notes.md"),
         "alias:: Scratch\n- ordinary note\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
-    let first = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
-    let second = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
-    assert!(Arc::ptr_eq(&first.groups, &second.groups));
+    let todo_tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024));
+    let first = todo_tasks();
+    let after_first = g.direct_projection_statement_reads_test();
+    let second = todo_tasks();
+    assert_eq!(g.direct_projection_statement_reads_test(), after_first + 1);
+    assert_eq!(first.total, second.total);
+    assert_eq!(first.exceeded, second.exceeded);
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(second.groups.as_ref()).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still an ordinary note".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
-    assert!(
-        Arc::ptr_eq(&first.groups, &after_unrelated.groups),
-        "an unrelated edit must retain the scoped bounded-query memo"
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
+    let after_unrelated = todo_tasks();
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(after_unrelated.groups.as_ref()).unwrap(),
+        "the unrelated edit leaves the meaningful answer unchanged"
     );
+    assert_eq!(first.total, after_unrelated.total);
+    assert_eq!(first.exceeded, after_unrelated.exceeded);
 
     let mut tasks = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     tasks.blocks[0].raw = "DONE ship".into();
     g.save_page(&tasks, tasks.rev.as_deref()).unwrap();
-    let after_affected = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
-    assert!(!Arc::ptr_eq(&first.groups, &after_affected.groups));
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
+    let after_affected = todo_tasks();
     assert!(after_affected.groups.is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_query_request_executes_again_and_reads_the_current_sql_image() {
+    let dir = scratch("repeat-two-queries");
+    fs::write(
+        dir.join("pages").join("Roadmap.md"),
+        "tags:: work\n- TODO ship\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages").join("Errand.md"), "- TODO buy milk\n").unwrap();
+    let g = ready_graph(&dir);
+
+    let tagged =
+        || when_ready(|| g.run_query_bounded("(page-tags work)", 20_000, 32 * 1024 * 1024));
+    let tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024));
+
+    let tagged_first = tagged();
+    let tasks_first = tasks();
+    assert_eq!(tagged_first.groups.len(), 1, "one tagged page");
+    assert_eq!(tasks_first.groups.len(), 2, "both pages carry a TODO");
+    let before_repeats = g.direct_projection_statement_reads_test();
+    let tagged_repeat = tagged();
+    let tasks_repeat = tasks();
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        before_repeats + 2
+    );
+    assert_eq!(
+        serde_json::to_vec(tagged_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tagged_repeat.groups.as_ref()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(tasks_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tasks_repeat.groups.as_ref()).unwrap()
+    );
+
+    let mut errand = g.load_named("Errand", PageKind::Page).unwrap().unwrap();
+    errand.blocks[0].raw = "DONE buy milk".into();
+    g.save_page(&errand, errand.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
+
+    let tagged_after = tagged();
+    let tasks_after = tasks();
+    assert_eq!(
+        serde_json::to_vec(tagged_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tagged_after.groups.as_ref()).unwrap(),
+        "the page-tags answer remains meaningful-equal across the irrelevant edit"
+    );
+    assert_eq!(tagged_first.total, tagged_after.total);
+    assert_eq!(tagged_first.exceeded, tagged_after.exceeded);
+    assert_eq!(tasks_after.groups.len(), 1, "one TODO survives the edit");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -10334,81 +8566,79 @@ fn nfd_alias_resolves_and_canonical_equivalent_alias_cannot_shadow_real_page() {
 }
 
 #[test]
-fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
+fn overflowed_bounded_query_reexecutes_when_an_omitted_match_stops_matching() {
     let dir = scratch("bounded-overflow-negative-transition");
     fs::write(dir.join("pages").join("A.md"), "- TODO first\n").unwrap();
     fs::write(dir.join("pages").join("B.md"), "- TODO second\n").unwrap();
     fs::write(dir.join("pages").join("Notes.md"), "- unrelated\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
-    let first = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
+    let tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024));
+    let first = tasks();
     assert!(first.exceeded);
     assert_eq!(first.total, 2);
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
-    assert!(Arc::ptr_eq(&first.groups, &after_unrelated.groups));
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
+    let after_unrelated = tasks();
     assert!(after_unrelated.exceeded);
     assert_eq!(after_unrelated.total, 2);
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(after_unrelated.groups.as_ref()).unwrap(),
+        "the new SQL image has the same bounded answer after an irrelevant edit"
+    );
 
     let admitted = first.groups[0].page.clone();
     let omitted = if admitted == "A" { "B" } else { "A" };
     let mut page = g.load_named(omitted, PageKind::Page).unwrap().unwrap();
     page.blocks[0].raw = "DONE no longer matches".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
 
-    let after = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
-    assert!(!Arc::ptr_eq(&first.groups, &after.groups));
+    let after = tasks();
     assert!(!after.exceeded);
     assert_eq!(after.total, 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn advanced_cache_invalidation_preserves_nul_inside_opaque_query_source() {
+fn advanced_query_recomputes_opaque_nul_source_after_sql_revision_change() {
     let dir = scratch("advanced-cache-nul-query");
     fs::write(dir.join("pages").join("P.md"), "- DONE ship\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let query = "[:find (pull ?b [*]) :where \0 (task ?b #{\"TODO\"})]";
-    let first = g.run_advanced_query_cached(query, None);
+    let first = when_ready(|| g.run_advanced_query_cached(query, None));
     assert!(first.groups.is_empty());
 
     let mut page = g.load_named("P", PageKind::Page).unwrap().unwrap();
     page.blocks[0].raw = "TODO ship".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
-    let warm = g.run_advanced_query_cached(query, None);
-    let fresh = Graph::open(&dir).run_advanced_query(query, None);
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
+    let warm = when_ready(|| g.run_advanced_query_cached(query, None));
+    // The independent oracle: a fresh walk of the same graph, from the free
+    // function, with no memo and no projection of its own to agree with.
+    let fresh = crate::query::run_advanced_query(&Graph::open(&dir), query, None);
     assert_eq!(warm.groups.len(), 1);
     assert_eq!(warm.groups.len(), fresh.groups.len());
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn derived_and_advanced_memos_are_lru_bounded() {
+fn derived_reference_memo_is_lru_bounded() {
     let dir = scratch("memo-lru-bound");
     let g = Graph::open(&dir);
+    // This is the independent reference-cache bound; query answers are not retained.
     for i in 0..(DERIVED_CACHE_MAX_ENTRIES + 20) {
         let _ = g.derived_memo(format!("test\0{i}"), Vec::new);
-        let _ = g.advanced_memo(format!("test\0{i}"), || crate::query::AdvancedResult {
-            groups: Vec::new(),
-            ran: Vec::new(),
-            ignored: Vec::new(),
-            supported: true,
-        });
     }
     let oversized_key = "x".repeat(DERIVED_CACHE_MAX_ENTRY_BYTES / 2 + 1);
     let _ = g.derived_memo(oversized_key.clone(), Vec::new);
-    let _ = g.advanced_memo(oversized_key.clone(), || crate::query::AdvancedResult {
-        groups: Vec::new(),
-        ran: Vec::new(),
-        ignored: Vec::new(),
-        supported: true,
-    });
     let derived = g.derived_cache.read().unwrap();
-    let advanced = g.advanced_cache.read().unwrap();
     assert_eq!(
         derived.as_ref().unwrap().results.len(),
         DERIVED_CACHE_MAX_ENTRIES
@@ -10418,1107 +8648,12 @@ fn derived_and_advanced_memos_are_lru_bounded() {
         .unwrap()
         .results
         .contains_key(&oversized_key));
-    assert!(!advanced
-        .as_ref()
-        .unwrap()
-        .results
-        .contains_key(&oversized_key));
-    assert_eq!(
-        advanced.as_ref().unwrap().results.len(),
-        DERIVED_CACHE_MAX_ENTRIES
-    );
     let oldest = format!("test\0{}", 0);
     assert!(!derived.as_ref().unwrap().results.contains_key(&oldest));
-    assert!(!advanced.as_ref().unwrap().results.contains_key(&oldest));
     let _ = fs::remove_dir_all(&dir);
 }
 
 // ---- sparse projection exact-write bridge ----
-
-fn projection_recovery_bytes(parent: &Path) -> Vec<Vec<u8>> {
-    fs::read_dir(parent)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(".projection.recovery"))
-        })
-        .map(|entry| fs::read(entry.path()).unwrap())
-        .collect()
-}
-
-fn projection_recovery_paths(parent: &Path) -> Vec<PathBuf> {
-    fs::read_dir(parent)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_name().to_str().is_some_and(|name| {
-                name.ends_with(".projection.recovery")
-                    || name.ends_with(".projection.staged")
-                    || name.ends_with(".projection.withdrawn")
-                    || name.ends_with(".projection-staged-recovery")
-            })
-        })
-        .map(|entry| entry.path())
-        .collect()
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_late_write_remove_and_restore_collisions_preserve_every_version() {
-    // A portable loser introduced after the previous scan cannot redirect
-    // exact projection authority or block the accepted target.
-    let dir = scratch("projection-controllable-write-window");
-    let target = dir.join("pages/LateWrite.md");
-    let alias = dir.join("pages/latewrite.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    PROJECTION_LATE_COLLISION.with(|hook| {
-        let alias = alias.clone();
-        *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"- alias\n")));
-    });
-    graph
-        .write_projection_exact("pages/LateWrite.md", Some(b"- base\n"), b"- target\n")
-        .unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"- target\n");
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    assert!(projection_recovery_bytes(target.parent().unwrap())
-        .iter()
-        .any(|bytes| bytes == b"- base\n"));
-    let _ = fs::remove_dir_all(&dir);
-
-    // A same-inode alias introduced in the corresponding removal window
-    // does not expand exact-path authority into a directory-wide inode
-    // search. Retire the accepted target, preserve its bytes as recovery
-    // evidence, and leave the independently named alias untouched.
-    let dir = scratch("projection-controllable-remove-window");
-    let target = dir.join("pages/LateRemove.md");
-    let alias = dir.join("pages/LateRemoveAlias.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let identity =
-        canonical_projection_file_resource_id(&fs::File::open(&target).unwrap()).unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    PROJECTION_LATE_COLLISION.with(|hook| {
-        let target = target.clone();
-        let alias = alias.clone();
-        *hook.borrow_mut() = Some(Box::new(move || fs::hard_link(target, alias)));
-    });
-    graph
-        .remove_projection_exact("pages/LateRemove.md", b"- base\n")
-        .unwrap();
-    assert!(!target.exists());
-    assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-    assert_eq!(
-        canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
-        identity
-    );
-    assert!(projection_recovery_bytes(alias.parent().unwrap())
-        .iter()
-        .any(|bytes| bytes == b"- base\n"));
-    assert!(graph.cache_generation() > generation);
-    fs::remove_file(&alias).unwrap();
-    let _ = fs::remove_dir_all(&dir);
-
-    // Force an unwind after retirement, then introduce a hard-link alias
-    // only in the restoration window. Exact-path authority restores the
-    // accepted target without treating the independently named alias as a
-    // graph-wide collision.
-    let dir = scratch("projection-controllable-restore-window");
-    let target = dir.join("pages/LateRestore.md");
-    let alias = dir.join("pages/LateRestoreAlias.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let original_identity =
-        canonical_projection_file_resource_id(&fs::File::open(&target).unwrap()).unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected post-retirement unwind",
-            ))
-        }));
-    });
-    PROJECTION_BEFORE_RESTORE.with(|hook| {
-        let parent = target.parent().unwrap().to_path_buf();
-        let alias = alias.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            let recovery = fs::read_dir(&parent)?
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .find(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.ends_with(".projection.recovery"))
-                })
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            fs::hard_link(recovery, alias)
-        }));
-    });
-    let error = graph
-        .remove_projection_exact("pages/LateRestore.md", b"- base\n")
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert_eq!(error.to_string(), "injected post-retirement unwind");
-    assert_eq!(fs::read(&target).unwrap(), b"- base\n");
-    assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-    assert_eq!(
-        canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
-        original_identity
-    );
-    assert!(projection_recovery_bytes(target.parent().unwrap())
-        .iter()
-        .any(|bytes| bytes == b"- base\n"));
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    fs::remove_file(&alias).unwrap();
-    graph
-        .recover_projection_exact("pages/LateRestore.md", b"- base\n")
-        .unwrap();
-    let _ = fs::remove_dir_all(&dir);
-
-    // A portable loser appearing after publication remains untouched while
-    // the exact accepted target completes normally.
-    let dir = scratch("projection-controllable-post-publish-window");
-    let target = dir.join("pages/LatePublished.md");
-    let alias = dir.join("pages/latepublished.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        let alias = alias.clone();
-        *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"- alias\n")));
-    });
-    graph
-        .write_projection_exact("pages/LatePublished.md", Some(b"- base\n"), b"- target\n")
-        .unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"- target\n");
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    let retained = projection_recovery_paths(target.parent().unwrap())
-        .into_iter()
-        .map(|path| fs::read(path).unwrap())
-        .collect::<Vec<_>>();
-    assert!(retained.iter().any(|bytes| bytes == b"- base\n"));
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_mutating_hook_errors_never_restore_unvalidated_bytes() {
-    let base = b"- base\n";
-    let projected = b"- target\n";
-    let unknown = b"- unknown hook bytes\n";
-
-    // A post-publish hook can change the exact live file without creating
-    // a graph collision. The changed object must be withdrawn under the
-    // attempt-derived published-evidence name before the hook error returns.
-    let dir = scratch("projection-post-publish-byte-error");
-    let target = dir.join("pages/PostPublishBytes.md");
-    fs::write(&target, base).unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        let target = target.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::write(&target, unknown)?;
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected post-publish byte rewrite failure",
-            ))
-        }));
-    });
-    let error = graph
-        .write_projection_exact("pages/PostPublishBytes.md", Some(base), projected)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-    if target.exists() {
-        assert_eq!(fs::read(&target).unwrap(), base);
-    }
-    let evidence = projection_recovery_paths(target.parent().unwrap());
-    assert!(evidence.iter().any(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".projection.withdrawn"))
-            && fs::read(path).unwrap() == unknown
-    }));
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    let _ = fs::remove_dir_all(&dir);
-
-    // Mutating the retired object and then returning a hook error must not
-    // make those changed bytes eligible for restoration to the live name.
-    let dir = scratch("projection-post-retire-byte-error");
-    let target = dir.join("pages/PostRetireBytes.md");
-    fs::write(&target, base).unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| {
-        let parent = target.parent().unwrap().to_path_buf();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            let recovery = projection_recovery_paths(&parent)
-                .into_iter()
-                .find(|path| fs::read(path).unwrap() == base)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            fs::write(recovery, unknown)?;
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected post-retire byte rewrite failure",
-            ))
-        }));
-    });
-    let error = graph
-        .write_projection_exact("pages/PostRetireBytes.md", Some(base), projected)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-    assert!(!target.exists());
-    let retained = projection_recovery_paths(target.parent().unwrap())
-        .into_iter()
-        .map(|path| fs::read(path).unwrap())
-        .collect::<Vec<_>>();
-    assert!(retained.iter().any(|bytes| bytes == unknown));
-    assert!(retained.iter().any(|bytes| bytes == projected));
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    let _ = fs::remove_dir_all(&dir);
-
-    // Replacing the recovery name in the restoration hook must still run
-    // exact recovery-object validation even though that hook itself errors.
-    let dir = scratch("projection-before-restore-replacement-error");
-    let target = dir.join("pages/BeforeRestoreBytes.md");
-    fs::write(&target, base).unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected post-retire restoration trigger",
-            ))
-        }));
-    });
-    PROJECTION_BEFORE_RESTORE.with(|hook| {
-        let parent = target.parent().unwrap().to_path_buf();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            let recovery = projection_recovery_paths(&parent)
-                .into_iter()
-                .find(|path| fs::read(path).unwrap() == base)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            fs::remove_file(&recovery)?;
-            fs::write(&recovery, unknown)?;
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected before-restore replacement failure",
-            ))
-        }));
-    });
-    let error = graph
-        .write_projection_exact("pages/BeforeRestoreBytes.md", Some(base), projected)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert!(
-        error
-            .to_string()
-            .contains("post-hook projection validation also failed"),
-        "{error}"
-    );
-    assert!(!target.exists());
-    let retained = projection_recovery_paths(target.parent().unwrap())
-        .into_iter()
-        .map(|path| fs::read(path).unwrap())
-        .collect::<Vec<_>>();
-    assert!(retained.iter().any(|bytes| bytes == unknown));
-    assert!(retained.iter().any(|bytes| bytes == projected));
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_pre_retirement_published_recovery_collision_preserves_authority() {
-    use crate::oplog::projection_store::ProjectionReceiptStore;
-
-    let dir = scratch("projection-remove-pre-retirement-published-collision");
-    let receipts = dir.with_file_name(format!(
-        "tine-projection-remove-pre-retirement-published-collision-receipts-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let path = "pages/PreRetirementCollision.md";
-    let target = dir.join(path);
-    let base = b"- exact base\n";
-    let unknown = b"- unknown published-name collision\n";
-    fs::write(&target, base).unwrap();
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_046_080));
-    let intent = crate::oplog::ProjectionIntent::new(
-        workspace_id,
-        crate::oplog::PageId::from_uuid(Uuid::from_u128(91_046_081)),
-        ManagedPath::parse(path).unwrap(),
-        crate::oplog::FrontierV2::default(),
-        Vec::new(),
-        crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(base)),
-        crate::oplog::ProjectionTargetKind::Absent,
-        BlobDescription::of(&[]),
-        Vec::new(),
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    store.publish_intent(&intent, Some(base)).unwrap();
-    let reservation = store.reserve_attempt(&intent).unwrap();
-    let target_path = graph.projection_page_target(path).unwrap();
-    let retired_path = dir.join("pages").join(reservation.recovery_filename());
-    let published_path = dir
-        .join("pages")
-        .join(projection_attempt_published_recovery_filename(&target_path, &reservation).unwrap());
-    assert!(!retired_path.exists());
-    assert!(!published_path.exists());
-    assert!(store.load_completion(&intent).unwrap().is_none());
-
-    PROJECTION_LATE_COLLISION.with(|hook| {
-        let published_path = published_path.clone();
-        *hook.borrow_mut() = Some(Box::new(move || fs::write(published_path, unknown)));
-    });
-    let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-    let error = graph
-        .remove_page_projection(path, base, &mut authority)
-        .unwrap_err();
-
-    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-    assert_eq!(fs::read(&target).unwrap(), base);
-    assert_eq!(fs::read(&published_path).unwrap(), unknown);
-    assert!(!retired_path.exists());
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&target));
-    assert!(store.load_completion(&intent).unwrap().is_none());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_hook_errors_revalidate_and_retain_attempt_bound_recovery() {
-    use crate::oplog::projection_store::ProjectionReceiptStore;
-
-    fn projection_intent(
-        workspace_id: WorkspaceId,
-        page_seed: u128,
-        path: &str,
-        base: &[u8],
-        target: &[u8],
-    ) -> crate::oplog::ProjectionIntent {
-        crate::oplog::ProjectionIntent::new(
-            workspace_id,
-            crate::oplog::PageId::from_uuid(Uuid::from_u128(page_seed)),
-            ManagedPath::parse(path).unwrap(),
-            crate::oplog::FrontierV2::default(),
-            Vec::new(),
-            crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(base)),
-            crate::oplog::ProjectionTargetKind::Present,
-            BlobDescription::of(target),
-            Vec::new(),
-        )
-        .unwrap()
-    }
-
-    let base = b"- base\n";
-    let projected = b"- target\n";
-
-    // A removal hook can recreate the retired live name with unrelated
-    // regular bytes and then fail. Those bytes belong to the failed
-    // attempt, not to the graph, so they must be withdrawn under that
-    // attempt's exact published-evidence name before restoration.
-    let dir = scratch("projection-remove-post-publish-byte-error-authority");
-    let receipts = dir.with_file_name(format!(
-        "tine-projection-remove-post-publish-byte-error-authority-receipts-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let path = "pages/RemoveHookError.md";
-    let target = dir.join(path);
-    let unknown = b"- unknown removal hook bytes\n";
-    fs::write(&target, base).unwrap();
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_046_090));
-    let intent = projection_intent(workspace_id, 91_046_091, path, base, &[]);
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    store.publish_intent(&intent, Some(base)).unwrap();
-    let reservation = store.reserve_attempt(&intent).unwrap();
-    let target_path = graph.projection_page_target(path).unwrap();
-    let retired_path = dir.join("pages").join(reservation.recovery_filename());
-    let published_path = dir
-        .join("pages")
-        .join(projection_attempt_published_recovery_filename(&target_path, &reservation).unwrap());
-    let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        let target = target.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::write(&target, unknown)?;
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected removal post-publication byte rewrite failure",
-            ))
-        }));
-    });
-    let error = graph
-        .remove_page_projection(path, base, &mut authority)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-    assert_eq!(fs::read(&published_path).unwrap(), unknown);
-    assert_eq!(fs::read(&retired_path).unwrap(), base);
-    if target.exists() {
-        assert_eq!(fs::read(&target).unwrap(), base);
-    }
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&target));
-    assert!(store.load_completion(&intent).unwrap().is_none());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-
-    // A clean post-publication hook error leaves an exact live target but
-    // no completion. Reopening both durable authorities must reconstruct
-    // completion without the process-local test attempt catalog.
-    let dir = scratch("projection-post-publish-hook-error-clean-authority");
-    let receipts = dir.with_file_name(format!(
-        "tine-projection-post-publish-hook-error-clean-authority-receipts-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let path = "pages/HookErrorClean.md";
-    let target = dir.join(path);
-    fs::write(&target, base).unwrap();
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_046_100));
-    let intent = projection_intent(workspace_id, 91_046_101, path, base, projected);
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    store.publish_intent(&intent, Some(base)).unwrap();
-    let reservation = store.reserve_attempt(&intent).unwrap();
-    let target_path = graph.projection_page_target(path).unwrap();
-    let attempted_name =
-        projection_attempt_target_recovery_filename(&target_path, &reservation).unwrap();
-    let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected clean post-publication hook failure",
-            ))
-        }));
-    });
-    let error = graph
-        .write_page_projection(path, Some(base), projected, &mut authority)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert_eq!(fs::read(&target).unwrap(), projected);
-    assert!(!dir.join("pages").join(&attempted_name).exists());
-    drop(authority);
-    drop(store);
-    drop(graph);
-
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    let mut recovery = store.begin_mutation(&intent, None).unwrap();
-    let proof = graph
-        .recover_page_projection(path, Some(base), projected, &mut recovery)
-        .unwrap();
-    store
-        .reconstruct_completion(recovery, &intent, projected, &proof)
-        .unwrap();
-    assert!(store.load_completion(&intent).unwrap().is_some());
-    assert_eq!(fs::read(&target).unwrap(), projected);
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-
-    // Exact durable projection authority retains a portable sibling
-    // without letting it redirect the operation or hide the injected hook
-    // error. Reopened recovery uses the attempt-bound evidence while both
-    // exact spellings remain visible.
-    let dir = scratch("projection-post-publish-hook-error-collision-authority");
-    let receipts = dir.with_file_name(format!(
-        "tine-projection-post-publish-hook-error-collision-authority-receipts-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let path = "pages/HookError.md";
-    let target = dir.join(path);
-    let alias = dir.join("pages/hookerror.md");
-    fs::write(&target, base).unwrap();
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_046_110));
-    let intent = projection_intent(workspace_id, 91_046_111, path, base, projected);
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    store.publish_intent(&intent, Some(base)).unwrap();
-    let reservation = store.reserve_attempt(&intent).unwrap();
-    let target_path = graph.projection_page_target(path).unwrap();
-    let attempted_name =
-        projection_attempt_target_recovery_filename(&target_path, &reservation).unwrap();
-    let published_name =
-        projection_attempt_published_recovery_filename(&target_path, &reservation).unwrap();
-    let retired_name = reservation.recovery_filename().to_owned();
-    let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        let alias = alias.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::write(alias, b"- alias\n")?;
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected post-publication hook failure",
-            ))
-        }));
-    });
-    let error = graph
-        .write_page_projection(path, Some(base), projected, &mut authority)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-    assert_eq!(fs::read(&target).unwrap(), projected);
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    assert!(!dir.join("pages").join(&attempted_name).exists());
-    assert!(!dir.join("pages").join(&published_name).exists());
-    assert_eq!(
-        fs::read(dir.join("pages").join(&retired_name)).unwrap(),
-        base
-    );
-    drop(authority);
-    drop(store);
-    drop(graph);
-
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    let mut recovery = store.begin_mutation(&intent, None).unwrap();
-    let proof = graph
-        .recover_page_projection(path, Some(base), projected, &mut recovery)
-        .unwrap();
-    store
-        .reconstruct_completion(recovery, &intent, projected, &proof)
-        .unwrap();
-    assert!(store.load_completion(&intent).unwrap().is_some());
-    assert_eq!(fs::read(&target).unwrap(), projected);
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-
-    // Replacing one exact attempt-derived object with mismatching bytes
-    // must block reopened recovery before completion or fallback mutation.
-    let dir = scratch("projection-post-publish-hook-error-tamper-authority");
-    let receipts = dir.with_file_name(format!(
-        "tine-projection-post-publish-hook-error-tamper-authority-receipts-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let path = "pages/HookErrorTamper.md";
-    let target = dir.join(path);
-    fs::write(&target, base).unwrap();
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_046_120));
-    let intent = projection_intent(workspace_id, 91_046_121, path, base, projected);
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    store.publish_intent(&intent, Some(base)).unwrap();
-    let reservation = store.reserve_attempt(&intent).unwrap();
-    let target_path = graph.projection_page_target(path).unwrap();
-    let attempted_name =
-        projection_attempt_target_recovery_filename(&target_path, &reservation).unwrap();
-    let attempted_path = dir.join("pages").join(attempted_name);
-    let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected tamper post-publication hook failure",
-            ))
-        }));
-    });
-    assert_eq!(
-        graph
-            .write_page_projection(path, Some(base), projected, &mut authority)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::Interrupted
-    );
-    fs::write(&attempted_path, b"- replaced evidence\n").unwrap();
-    drop(authority);
-    drop(store);
-    drop(graph);
-
-    let before = regular_file_tree(&dir);
-    let graph = Graph::open(&dir);
-    let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-    let mut recovery = store.begin_mutation(&intent, None).unwrap();
-    let error = graph
-        .recover_page_projection(path, Some(base), projected, &mut recovery)
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
-    assert_eq!(regular_file_tree(&dir), before);
-    assert!(store.load_completion(&intent).unwrap().is_none());
-    assert!(store.reserve_fallback_attempt(&intent).is_err());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-}
-
-#[cfg(unix)]
-#[test]
-fn exact_projection_authority_ignores_portable_losers_and_resource_aliases() {
-    // Exact creation grants no authority over the portable loser.
-    let dir = scratch("projection-late-collision-write");
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let target = dir.join("pages/nested/ProjectionWrite.md");
-    let alias = dir.join("pages/nested/projectionwrite.md");
-    fs::create_dir_all(alias.parent().unwrap()).unwrap();
-    fs::write(&alias, b"- alias\n").unwrap();
-    graph
-        .write_projection_exact("pages/nested/ProjectionWrite.md", None, b"- projected\n")
-        .unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"- projected\n");
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    assert!(projection_recovery_bytes(alias.parent().unwrap()).is_empty());
-    let _ = fs::remove_dir_all(&dir);
-
-    // Removal owns the exact accepted path. A newly-created hard link is a
-    // separately named survivor, not a reason to scan every graph sibling.
-    let dir = scratch("projection-late-collision-remove");
-    let target = dir.join("pages/ProjectionRemove.md");
-    let alias = dir.join("pages/ProjectionRemoveAlias.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    fs::hard_link(&target, &alias).unwrap();
-    let generation = graph.cache_generation();
-    graph
-        .remove_projection_exact("pages/ProjectionRemove.md", b"- base\n")
-        .unwrap();
-    assert!(!target.exists());
-    assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-    assert!(projection_recovery_bytes(alias.parent().unwrap())
-        .iter()
-        .any(|bytes| bytes == b"- base\n"));
-    assert!(graph.cache_generation() > generation);
-    fs::remove_file(&alias).unwrap();
-    let _ = fs::remove_dir_all(&dir);
-
-    // Present-target recovery proves only the accepted exact path.
-    let dir = scratch("projection-late-collision-recovery");
-    let graph = Graph::open(&dir);
-    graph
-        .write_projection_exact("pages/ProjectionRecover.md", None, b"- target\n")
-        .unwrap();
-    let target = dir.join("pages/ProjectionRecover.md");
-    let alias = dir.join("pages/projectionrecover.md");
-    fs::write(&alias, b"- alias\n").unwrap();
-    graph
-        .recover_projection_exact("pages/ProjectionRecover.md", b"- target\n")
-        .unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"- target\n");
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    let _ = fs::remove_dir_all(&dir);
-
-    // Recovered removal proves exact absence without deleting the loser.
-    let dir = scratch("projection-late-collision-removed-recovery");
-    let target = dir.join("pages/ProjectionRemoved.md");
-    fs::write(&target, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph
-        .remove_projection_exact("pages/ProjectionRemoved.md", b"- base\n")
-        .unwrap();
-    let alias = dir.join("pages/projectionremoved.md");
-    fs::write(&alias, b"- alias\n").unwrap();
-    let evidence = projection_recovery_bytes(target.parent().unwrap());
-    graph
-        .recover_removed_projection_exact("pages/ProjectionRemoved.md", b"- base\n")
-        .unwrap();
-    assert!(!target.exists());
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    assert_eq!(
-        projection_recovery_bytes(target.parent().unwrap()),
-        evidence
-    );
-    let _ = fs::remove_dir_all(&dir);
-
-    // Removal confirmation likewise cannot delete a portable loser.
-    let dir = scratch("projection-late-collision-confirmation");
-    let graph = Graph::open(&dir);
-    let alias = dir.join("pages/projectionconfirm.md");
-    fs::write(&alias, b"- alias\n").unwrap();
-    graph
-        .confirm_removed_projection_exact("pages/ProjectionConfirm.md")
-        .unwrap();
-    assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_exact_proof_binds_path_bytes_digest_and_exact_preconditions() {
-    let dir = scratch("projection-exact-base");
-    let path = dir.join("pages/Projection.md");
-    let graph = Graph::open(&dir);
-
-    let proof = graph
-        .write_projection_exact("pages/Projection.md", None, b"- first\n")
-        .unwrap();
-    assert_eq!(proof.path(), "pages/Projection.md");
-    assert_eq!(proof.bytes(), b"- first\n");
-    let expected_digest: [u8; 32] = Sha256::digest(b"- first\n").into();
-    assert_eq!(proof.digest(), &expected_digest);
-    assert!(proof.recovery_evidence().is_empty());
-
-    let proof = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- first\n"), b"- second\n")
-        .unwrap();
-    assert_eq!(proof.path(), "pages/Projection.md");
-    assert_eq!(proof.bytes(), b"- second\n");
-    let evidence = proof
-        .recovery_evidence()
-        .first()
-        .expect("replacement must bind retained displacement");
-    assert_eq!(evidence.len(), b"- first\n".len() as u64);
-    assert_eq!(
-        evidence.digest(),
-        &<[u8; 32]>::from(Sha256::digest(b"- first\n"))
-    );
-    assert!(evidence.path().starts_with("pages/.Projection.md."));
-    assert!(evidence.filename().ends_with(".projection.recovery"));
-    assert_eq!(
-        graph
-            .read_projection_recovery_evidence("pages/Projection.md", evidence)
-            .unwrap(),
-        b"- first\n"
-    );
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- stale\n"), b"- clobber\n")
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- second\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn root_projection_admission_writes_the_exact_root_path_without_panicking() {
-    let dir = scratch("projection-root-admission");
-    let graph = Graph::open(&dir);
-
-    // OG's recursive `get-files` walk starts at the graph root itself, so a
-    // graph-root page is ordinary graph text. Its projection target has no
-    // parent components at all; admitting it must neither panic nor move it
-    // into `pages/`.
-    let projected = graph
-        .write_projection_exact("Root.md", None, b"- target\n")
-        .unwrap();
-    assert_eq!(projected.path(), "Root.md");
-    assert_eq!(fs::read(dir.join("Root.md")).unwrap(), b"- target\n");
-    assert!(!dir.join("pages/Root.md").exists());
-
-    // A root-level name outside the graph-text scope still fails closed.
-    let error = graph
-        .write_projection_exact(".Hidden.md", None, b"- target\n")
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(!dir.join(".Hidden.md").exists());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_recovery_evidence_paths_are_root_safe_and_forgery_fails_closed() {
-    let root_filename = ".Root.md.00000000000000000000000000000001.projection.recovery".to_owned();
-    let root = ProjectionRecoveryEvidence::new(
-        "Root.md",
-        root_filename.clone(),
-        Some(ContentDigest::from_bytes([1; 32])),
-        b"- root\n",
-    )
-    .unwrap();
-    assert_eq!(root.path(), root_filename);
-
-    let nested_filename =
-        ".Target.md.00000000000000000000000000000002.projection.recovery".to_owned();
-    let nested = ProjectionRecoveryEvidence::new(
-        "pages/deep/Target.md",
-        nested_filename.clone(),
-        Some(ContentDigest::from_bytes([2; 32])),
-        b"- nested\n",
-    )
-    .unwrap();
-    assert_eq!(nested.path(), format!("pages/deep/{nested_filename}"));
-
-    for invalid_target in ["/Root.md", "pages//Target.md", "Target.txt"] {
-        let error = ProjectionRecoveryEvidence::new(
-            invalid_target,
-            ".Target.md.00000000000000000000000000000003.projection.recovery".to_owned(),
-            Some(ContentDigest::from_bytes([3; 32])),
-            b"- invalid\n",
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    let dir = scratch("projection-recovery-evidence-forgery");
-    let graph = Graph::open(&dir);
-    let valid_filename =
-        ".Target.md.00000000000000000000000000000004.projection.recovery".to_owned();
-    let forgeries = [
-        ProjectionRecoveryEvidence {
-            relative_path: format!("/pages/{valid_filename}"),
-            filename: valid_filename.clone(),
-            resource_id: Some(ContentDigest::from_bytes([4; 32])),
-            digest: [0; 32],
-            len: 0,
-        },
-        ProjectionRecoveryEvidence {
-            relative_path: format!("journals/{valid_filename}"),
-            filename: valid_filename.clone(),
-            resource_id: Some(ContentDigest::from_bytes([4; 32])),
-            digest: [0; 32],
-            len: 0,
-        },
-        ProjectionRecoveryEvidence {
-            relative_path: "pages/.Wrong.md.00000000000000000000000000000004.projection.recovery"
-                .to_owned(),
-            filename: ".Wrong.md.00000000000000000000000000000004.projection.recovery".to_owned(),
-            resource_id: Some(ContentDigest::from_bytes([4; 32])),
-            digest: [0; 32],
-            len: 0,
-        },
-    ];
-    for evidence in &forgeries {
-        let error = graph
-            .read_projection_recovery_evidence("pages/Target.md", evidence)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_replacement_binds_original_identity_and_rediscovers_late_stale_writes() {
-    let dir = scratch("projection-stale-handle-evidence");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let stale_handle = fs::OpenOptions::new().write(true).open(&path).unwrap();
-    let graph = Graph::open(&dir);
-
-    PROJECTION_STALE_RECOVERY_WRITE.with(|write| {
-        *write.borrow_mut() = Some((stale_handle, b"- late stale handle\n".to_vec()));
-    });
-    let proof = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .unwrap();
-    let evidence = proof
-        .recovery_evidence()
-        .first()
-        .expect("replacement must retain its displaced inode");
-
-    assert_eq!(fs::read(&path).unwrap(), b"- target\n");
-    assert_eq!(evidence.len(), b"- base\n".len() as u64);
-    assert_eq!(
-        evidence.digest(),
-        &<[u8; 32]>::from(Sha256::digest(b"- base\n"))
-    );
-    assert_eq!(
-        graph
-            .read_projection_recovery_evidence("pages/Projection.md", evidence)
-            .unwrap(),
-        b"- late stale handle\n"
-    );
-    let enumerated = graph
-        .projection_recovery_evidence("pages/Projection.md")
-        .unwrap();
-    let rediscovered = enumerated
-        .iter()
-        .find(|candidate| candidate.filename() == evidence.filename())
-        .expect("retained evidence must be discoverable after proof");
-    assert_eq!(
-        rediscovered.digest(),
-        &<[u8; 32]>::from(Sha256::digest(b"- late stale handle\n"))
-    );
-    assert_eq!(rediscovered.len(), b"- late stale handle\n".len() as u64);
-    assert!(dir.join(evidence.path()).exists());
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_write_proof_catalogs_all_retained_displacements_canonically() {
-    let dir = scratch("projection-multiple-retained-evidence");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    let first = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- first\n")
-        .unwrap();
-    assert_eq!(first.recovery_evidence().len(), 1);
-    let second = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- first\n"), b"- second\n")
-        .unwrap();
-    assert_eq!(second.recovery_evidence().len(), 2);
-    assert!(second
-        .recovery_evidence()
-        .windows(2)
-        .all(|pair| pair[0].filename() < pair[1].filename()));
-    assert!(second
-        .recovery_evidence()
-        .iter()
-        .any(|evidence| evidence.digest() == &<[u8; 32]>::from(Sha256::digest(b"- base\n"))));
-    assert!(second
-        .recovery_evidence()
-        .iter()
-        .any(|evidence| evidence.digest() == &<[u8; 32]>::from(Sha256::digest(b"- first\n"))));
-    assert_eq!(fs::read(&path).unwrap(), b"- second\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn retained_displacement_digest_drift_is_rediscovered_without_deletion() {
-    let dir = scratch("projection-late-post-proof-write");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let mut stale_handle = fs::OpenOptions::new().write(true).open(&path).unwrap();
-    let graph = Graph::open(&dir);
-
-    let proof = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .unwrap();
-    let first = proof
-        .recovery_evidence()
-        .first()
-        .expect("replacement must retain evidence");
-    assert_eq!(
-        first.digest(),
-        &<[u8; 32]>::from(Sha256::digest(b"- base\n"))
-    );
-
-    stale_handle.set_len(0).unwrap();
-    stale_handle.rewind().unwrap();
-    stale_handle.write_all(b"- late after proof\n").unwrap();
-    stale_handle.sync_all().unwrap();
-    let later = graph
-        .projection_recovery_evidence("pages/Projection.md")
-        .unwrap();
-    let rediscovered = later
-        .iter()
-        .find(|evidence| evidence.filename() == first.filename())
-        .expect("retained inode must remain discoverable");
-    assert_eq!(
-        rediscovered.digest(),
-        &<[u8; 32]>::from(Sha256::digest(b"- late after proof\n"))
-    );
-    assert_ne!(rediscovered.digest(), first.digest());
-    assert!(dir.join(rediscovered.path()).is_file());
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_exact_never_clobbers_pre_publish_or_proves_post_publish_changes() {
-    let dir = scratch("projection-exact-reread");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    PROJECTION_PUBLICATION_RACE_REPLACEMENT.with(|replacement| {
-        *replacement.borrow_mut() = Some(b"- external race\n".to_vec());
-    });
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- external race\n");
-    assert!(
-        projection_recovery_bytes(&dir.join("pages")).is_empty(),
-        "pre-displacement race created recovery authority for an uncaptured inode"
-    );
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
-
-    fs::write(&path, b"- base again\n").unwrap();
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    PROJECTION_POST_PUBLISH_REPLACEMENT.with(|replacement| {
-        *replacement.borrow_mut() = Some(b"- changed after publish\n".to_vec());
-    });
-    assert!(graph
-        .write_projection_exact(
-            "pages/Projection.md",
-            Some(b"- base again\n"),
-            b"- target again\n",
-        )
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- base again\n");
-    assert!(projection_recovery_paths(&dir.join("pages"))
-        .iter()
-        .any(|evidence| {
-            evidence
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".projection.withdrawn"))
-                && fs::read(evidence).unwrap() == b"- changed after publish\n"
-        }));
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(
-        graph.disk_revs.read().unwrap().get(&path).cloned(),
-        Some(content_rev("- base again\n"))
-    );
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
-    assert!(graph.sync_file(&path).is_none());
-    assert_eq!(graph.cache_generation(), generation);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_boundary_race_is_rejected_before_displacement() {
-    let dir = scratch("projection-boundary-race-evidence");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    PROJECTION_PUBLICATION_RACE_REPLACEMENT.with(|replacement| {
-        *replacement.borrow_mut() = Some(b"- displaced external\n".to_vec());
-    });
-    PROJECTION_AFTER_RETIRE_REPLACEMENT.with(|replacement| {
-        *replacement.borrow_mut() = Some(b"- newer external\n".to_vec());
-    });
-    let result =
-        graph.write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n");
-
-    assert!(result.is_err(), "a raced publication returned write proof");
-    assert_eq!(fs::read(&path).unwrap(), b"- displaced external\n");
-    assert!(projection_recovery_bytes(&dir.join("pages")).is_empty());
-    PROJECTION_AFTER_RETIRE_REPLACEMENT.with(|replacement| {
-        assert_eq!(
-            replacement.borrow_mut().take(),
-            Some(b"- newer external\n".to_vec())
-        );
-    });
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
-
-    let _ = fs::remove_dir_all(&dir);
-}
 
 /// Pins every bounded save-failure string to the typed code assigned at its
 /// production site. Rewording the display source cannot reclassify the error.
@@ -11533,12 +8668,12 @@ fn direct_save_failure_codes_are_stable() {
         DirectSaveError::into_io(code, source)
     };
     for (code, error) in [
-        // model.rs `capture_managed_text_entries` symlink arm.
+        // model.rs `capture_graph_text_entries` symlink arm.
         (
             "precheck.symlink",
             Error::new(
                 ErrorKind::InvalidInput,
-                "managed text entry is a symlink or reparse point: pages/Note.md",
+                "graph text entry is a symlink or reparse point: pages/Note.md",
             ),
         ),
         // `capture_retained_graph_text_identity_with_limits` two-pass equality.
@@ -11546,7 +8681,7 @@ fn direct_save_failure_codes_are_stable() {
             "precheck.interrupted",
             Error::new(
                 ErrorKind::Interrupted,
-                "managed inventory changed during retained identity capture",
+                "graph inventory changed during retained identity capture",
             ),
         ),
         // `validate_current_graph_text_collision_strict`, portable-key arm.
@@ -11581,15 +8716,7 @@ fn direct_save_failure_codes_are_stable() {
         ),
         (
             "precheck.limit",
-            initial_shadow_limit_error("peak build memory"),
-        ),
-        // `save_page`, retained-identity arm -- the F4 class.
-        (
-            "identity.changed_since_load",
-            Error::new(
-                ErrorKind::AlreadyExists,
-                "existing page identity changed since load",
-            ),
+            graph_text_capture_limit_error("peak build memory"),
         ),
         (
             "identity.owned_elsewhere",
@@ -11754,15 +8881,15 @@ fn direct_save_conflict_sites_produce_their_own_codes() {
 }
 
 /// The same binding for the precheck helpers, which are free functions and so
-/// can be driven directly. `initial_shadow_limit_error` and
-/// `managed_text_inventory_limit_error` are the two the save path calls when a
+/// can be driven directly. `graph_text_capture_limit_error` and
+/// `graph_text_inventory_limit_error` are the two the save path calls when a
 /// bound is exceeded; both are `precheck.limit`, and neither may become a
 /// conflict.
 #[test]
 fn direct_save_precheck_helpers_produce_their_own_codes() {
     for error in [
-        initial_shadow_limit_error("entries"),
-        managed_text_inventory_limit_error("bytes"),
+        graph_text_capture_limit_error("entries"),
+        graph_text_inventory_limit_error("bytes"),
     ] {
         assert_eq!(direct_save_failure_code(&error), "precheck.limit");
         assert_eq!(direct_save_conflict_epoch(&error), None);
@@ -11826,32 +8953,6 @@ fn unrelated_symlinks_do_not_expand_an_existing_save() {
         });
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-/// The symlink skip is scoped to the save-time admission capture. Importing
-/// a graph into managed storage still refuses, because an import that
-/// silently leaves out a file the user considers part of their graph is a
-/// different and worse failure than a refused import.
-#[cfg(unix)]
-#[test]
-fn the_shadow_import_capture_still_refuses_a_symlink() {
-    use std::os::unix::fs::symlink;
-
-    let dir = scratch("symlink-import-refuses");
-    fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
-    symlink(dir.join("pages/Target.md"), dir.join("pages/Alias.md")).unwrap();
-    let graph = Graph::open(&dir);
-    let permit = graph.admit_managed_text_writer().unwrap();
-    let error = match collect_initial_shadow_managed_inventory(&graph, &permit, true) {
-        Ok(_) => panic!("the import capture must still refuse a symlink in scope"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
-    assert!(
-        error.to_string().contains("symlink or reparse point"),
-        "{error}"
-    );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Build a Direct-mode graph of `pages` ordinary pages plus one target.
@@ -11986,7 +9087,7 @@ fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
     reset_graph_text_admission_test_counters();
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     graph
         .save_page(
             &direct_save_bench_new_page("Fresh After Existing Save"),
@@ -12003,8 +9104,8 @@ fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
     assert_eq!(after.complete_builds, before.complete_builds);
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "creation must not consume the retained shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "creation must not consume the retained capture hook"
     );
     assert_eq!(
         fs::read(dir.join("pages/Existing.md")).unwrap(),
@@ -12166,65 +9267,34 @@ fn steady_state_direct_saves_never_build_the_graph_index() {
 /// parent behavior, ordinary missing-target creation entered the retained
 /// shadow-import builder and surfaced the exact v0.6.92 reporter suffix.
 #[test]
-fn missing_target_creation_ignores_the_retained_shadow_peak_limit() {
+fn missing_target_creation_ignores_the_retained_capture_peak_limit() {
     let dir = scratch("missing-target-retained-shadow-limit");
     fs::write(dir.join("pages/Existing.md"), b"- existing\n").unwrap();
     let graph = Graph::open(&dir);
     graph.warm_cache();
 
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     let target = dir.join("pages/Noncolliding Missing Target.md");
     graph
         .save_page(
             &direct_save_bench_new_page("Noncolliding Missing Target"),
             None,
         )
-        .expect("ordinary creation must not consult the retained shadow peak bound");
+        .expect("ordinary creation must not consult the retained capture peak bound");
     assert!(target.is_file(), "the admitted creation must publish bytes");
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "ordinary creation consumed the retained shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "ordinary creation consumed the retained capture hook"
     );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The retained-shadow raw-byte ceiling remains a sensible per-file stream
-/// bound, but is not a cumulative graph-size cap. Exercise the production
-/// census decision with tiny real files instead of a 512 MiB allocation.
-#[test]
-fn direct_creation_census_accepts_aggregate_above_retained_byte_limit() {
-    let dir = scratch("creation-census-aggregate-stream-bound");
-    fs::write(dir.join("pages/First.md"), b"123456").unwrap();
-    fs::write(dir.join("pages/Second.md"), b"abcdef").unwrap();
-    let graph = Graph::open(&dir);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    let limits = InitialShadowLimits {
-        raw_bytes: 6,
-        ..INITIAL_SHADOW_LIMITS
-    };
-
-    let files = graph
-        .capture_direct_creation_census_with_limits(&permit, limits)
-        .expect("aggregate streamed bytes may exceed the retained-byte ceiling");
-    assert_eq!(files.len(), 2);
-    let aggregate = fs::metadata(dir.join("pages/First.md")).unwrap().len()
-        + fs::metadata(dir.join("pages/Second.md")).unwrap().len();
-    assert!(aggregate > limits.raw_bytes);
-
-    fs::write(dir.join("pages/Oversized.md"), b"1234567").unwrap();
-    let error = graph
-        .capture_direct_creation_census_with_limits(&permit, limits)
-        .expect_err("the per-file streamed resource bound must remain enforced");
-    assert!(error.to_string().contains("file raw bytes"), "{error}");
     let _ = fs::remove_dir_all(&dir);
 }
 
 /// The whole validation/publication path is target-local: no graph census,
 /// retained capture, complete-index build, or parse work.
 #[test]
-fn missing_target_creation_has_zero_graph_census_shadow_or_parse_work() {
+fn missing_target_creation_has_zero_graph_census_capture_or_parse_work() {
     let dir = scratch("missing-target-one-streaming-census");
     for index in 0..24 {
         fs::write(
@@ -12506,7 +9576,7 @@ fn external_exact_target_creator_wins_without_byte_change() {
     let graph = Graph::open(&dir);
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let target = target.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(target, b"external winner\n")));
     });
@@ -12530,7 +9600,7 @@ fn external_portable_alias_creator_wins_before_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
     let alias = dir.join("pages/raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let alias = alias.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"external winner\n")));
     });
@@ -12553,7 +9623,7 @@ fn external_semantic_owner_creator_wins_before_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced Semantic.md");
     let owner = dir.join("pages/External.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let owner = owner.clone();
         let graph = Arc::clone(&graph);
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -12587,7 +9657,7 @@ fn external_portable_symlink_alias_refuses_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
     let alias = dir.join("pages/raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let alias = alias.clone();
         let outside = outside.clone();
         *hook.borrow_mut() = Some(Box::new(move || std::os::unix::fs::symlink(outside, alias)));
@@ -12622,7 +9692,7 @@ fn an_existing_save_never_enters_the_graph_capture_race() {
     graph.warm_cache();
 
     // This hook runs only between the old capture's two graph-wide passes.
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+    GRAPH_TEXT_CAPTURE_REVALIDATION_RACE.with(|hook| {
         let other = dir.join("pages/Other.md");
         *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- other, pulled in\n")));
     });
@@ -12633,7 +9703,7 @@ fn an_existing_save_never_enters_the_graph_capture_race() {
     graph
         .save_page(&page, Some(&base))
         .expect("a sync client touching an unrelated file must not fail this save");
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+    GRAPH_TEXT_CAPTURE_REVALIDATION_RACE.with(|hook| {
         assert!(
             hook.borrow_mut().take().is_some(),
             "existing save must not enter whole-graph capture"
@@ -12962,7 +10032,7 @@ fn wait_for_direct_query_projection(graph: &Graph) {
     while !graph.direct_projection_ready_test() {
         assert!(
             started.elapsed() < Duration::from_secs(60),
-            "Direct query benchmark projection did not converge"
+            "Direct query test projection did not converge"
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -12982,8 +10052,20 @@ fn direct_query_bench_edit(graph: &Graph, serial: usize) {
 
 fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
     let started = Instant::now();
+    // RET2: an unready projection refuses with a typed error instead of
+    // walking, so an immediate-after-edit sample measures the refusal — which
+    // is exactly what the app measures at that instant too.
     let result = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
-    std::hint::black_box((result.total, result.exceeded));
+    std::hint::black_box(result.map(|answer| (answer.total, answer.exceeded)).ok());
+    started.elapsed()
+}
+
+fn direct_query_bench_ready_sample(graph: &Graph, query: &str) -> Duration {
+    let started = Instant::now();
+    let answer = graph
+        .run_query_bounded(query, 20_000, 32 * 1024 * 1024)
+        .expect("a ready Direct projection must answer the benchmark query");
+    std::hint::black_box((answer.total, answer.exceeded));
     started.elapsed()
 }
 
@@ -12993,12 +10075,12 @@ fn direct_query_bench_report(
     samples: &mut [Duration],
     pages: usize,
     blocks: usize,
-    indexed_reads: u64,
+    statement_reads: u64,
 ) {
     samples.sort();
     let ms = |duration: Duration| duration.as_secs_f64() * 1_000.0;
     println!(
-        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} indexed_reads={indexed_reads}",
+        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} statement_reads={statement_reads}",
         ms(samples[samples.len() / 2]),
         ms(samples[samples.len() * 95 / 100]),
         ms(samples[samples.len() - 1]),
@@ -13006,50 +10088,10 @@ fn direct_query_bench_report(
     );
 }
 
-fn direct_query_bench_cache_keys(graph: &Graph) -> std::collections::BTreeSet<String> {
-    graph
-        .derived_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .map(|cache| cache.results.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
-fn direct_query_bench_prime_invalidation(graph: &Graph) -> std::collections::BTreeSet<String> {
-    *graph.derived_cache.write().unwrap() = None;
-    for query in [
-        "(task TODO)",
-        "\"b4-unrelated-before\"",
-        "\"b4-never-present\"",
-        "(page-ref \"B4 Measurement Target\")",
-    ] {
-        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
-    }
-    let keys = direct_query_bench_cache_keys(graph);
-    assert_eq!(keys.len(), 4, "the invalidation probe must seed four memos");
-    keys
-}
-
-fn direct_query_bench_report_invalidation(
-    edit: &str,
-    before: &std::collections::BTreeSet<String>,
-    after: &std::collections::BTreeSet<String>,
-    generation_before: u64,
-    generation_after: u64,
-) {
-    let retained = before.intersection(after).count();
-    let evicted = before.difference(after).count();
-    println!(
-        "b4_invalidation edit={edit} before={} retained={retained} evicted={evicted} cache_gen_before={generation_before} cache_gen_after={generation_after}",
-        before.len(),
-    );
-}
-
-/// B4 step 0 measurement. This release-only ignored benchmark compares memo
-/// hits with invalidated evaluation for one representative of each sequencing
-/// class, measures projection readiness immediately after a Direct delta, and
-/// records scoped memo retention. Point it at a copied graph with
+/// B4 step 0 measurement. This release-only ignored benchmark compares
+/// repeated evaluation before and after edits for each sequencing class,
+/// measures projection readiness immediately after a Direct delta, and
+/// records acquired-image execution. Point it at a copied graph with
 /// TINE_DIRECT_QUERY_BENCH_GRAPH_COPY; graph content is never printed.
 #[test]
 #[ignore = "manual benchmark: Direct query classes, facets, and invalidation"]
@@ -13094,57 +10136,68 @@ fn direct_query_latency_manual_benchmark() {
     ];
     let mut serial = 0;
     for (class, query) in classes {
-        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
-        let mut memo = (0..rounds)
-            .map(|_| direct_query_bench_sample(&graph, query))
+        direct_query_bench_ready_sample(&graph, query);
+        let repeated_statements_before = graph.direct_projection_statement_reads_test();
+        let mut repeated = (0..rounds)
+            .map(|_| direct_query_bench_ready_sample(&graph, query))
             .collect::<Vec<_>>();
-        direct_query_bench_report(class, "memo", &mut memo, pages, blocks, 0);
+        let repeated_statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(repeated_statements_before);
+        direct_query_bench_report(
+            class,
+            "repeat",
+            &mut repeated,
+            pages,
+            blocks,
+            repeated_statement_reads,
+        );
 
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let mut invalidated = Vec::with_capacity(rounds);
         for sample in 0..rounds {
             serial += 1;
             direct_query_bench_edit(&graph, serial);
             wait_for_direct_query_projection(&graph);
-            *graph.derived_cache.write().unwrap() = None;
             graph.reset_direct_projection_candidate_probe_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
-            let candidate_before = graph.direct_projection_indexed_reads_test();
-            let elapsed = direct_query_bench_sample(&graph, query);
-            let candidate_queries_completed = graph
-                .direct_projection_indexed_reads_test()
-                .saturating_sub(candidate_before);
+            let statement_before = graph.direct_projection_statement_reads_test();
+            let elapsed = direct_query_bench_ready_sample(&graph, query);
+            let statement_queries_completed = graph
+                .direct_projection_statement_reads_test()
+                .saturating_sub(statement_before);
             let fallback_reads = graph
                 .direct_projection_fallback_reads_test()
                 .saturating_sub(fallback_before);
             let full_graph_evaluations = crate::query::full_graph_query_evaluations();
-            let evaluated_pages = graph
-                .direct_projection_candidate_evaluated_paths_test()
-                .len();
+            // RET2 retired the candidate route, so there is no candidate page
+            // set left to report; the hydration census is what the dispatched
+            // query still materializes.
+            let evaluated_pages = graph.direct_projection_hydrated_pages_test().len();
             println!(
-                "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
+                "b4_query_sample class={class} run={} sample={} statementQueriesCompleted={statement_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
                 std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
                 sample + 1,
                 elapsed.as_secs_f64() * 1_000.0,
             );
             invalidated.push(elapsed);
         }
-        let indexed_reads = graph
-            .direct_projection_indexed_reads_test()
-            .saturating_sub(indexed_before);
+        let statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(statements_before);
         direct_query_bench_report(
             class,
             "invalidated_ready",
             &mut invalidated,
             pages,
             blocks,
-            indexed_reads,
+            statement_reads,
         );
     }
 
     let mut ready_hits = 0_usize;
     let mut ready_misses = 0_usize;
-    let indexed_before = graph.direct_projection_indexed_reads_test();
+    let statements_before = graph.direct_projection_statement_reads_test();
     let mut immediate = Vec::with_capacity(rounds);
     for save in 0..rounds {
         serial += 1;
@@ -13162,37 +10215,76 @@ fn direct_query_latency_manual_benchmark() {
         let ready_latency_ms = readiness_started.elapsed().as_secs_f64() * 1_000.0;
         let oracle =
             crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
-        let candidate_before = graph.direct_projection_indexed_reads_test();
+        let statement_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
-        let actual = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        let actual = graph
+            .run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024)
+            .expect("the converged projection answers the public bounded route");
         let oracle_equal = (actual.total, actual.exceeded) == (oracle.total, oracle.exceeded)
             && serde_json::to_vec(actual.groups.as_ref()).unwrap()
                 == serde_json::to_vec(&oracle.groups).unwrap();
         println!(
-            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete candidate_reads={} fallback_reads={} oracle_equal={oracle_equal}",
+            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete statement_reads={} fallback_reads={} oracle_equal={oracle_equal}",
             std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
             save + 1,
-            graph.direct_projection_indexed_reads_test().saturating_sub(candidate_before),
+            graph.direct_projection_statement_reads_test().saturating_sub(statement_before),
             graph.direct_projection_fallback_reads_test().saturating_sub(fallback_before),
         );
     }
-    let indexed_reads = graph
-        .direct_projection_indexed_reads_test()
-        .saturating_sub(indexed_before);
+    let statement_reads = graph
+        .direct_projection_statement_reads_test()
+        .saturating_sub(statements_before);
     direct_query_bench_report(
         "sparse_task",
         "data_rev_immediate",
         &mut immediate,
         pages,
         blocks,
-        indexed_reads,
+        statement_reads,
     );
     println!(
-        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} indexed_reads={indexed_reads}",
+        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} statement_reads={statement_reads}",
         ready_hits + ready_misses,
     );
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let today = crate::date::JournalDate::today();
+    let queries = [
+        "(task TODO)",
+        "\"needle\"",
+        "\"b4-never-present\"",
+        "(page-ref \"B4 Measurement Target\")",
+    ];
+    let acquire_rows = |day| {
+        queries
+            .iter()
+            .map(|query| {
+                simple_query_pre_view_rows_at(&graph, query, day, 20_000, 32 * 1024 * 1024)
+            })
+            .collect::<Vec<_>>()
+    };
+    let report_new_image = |edit: &str,
+                            before: &[Vec<RefGroup>],
+                            after: &[Vec<RefGroup>],
+                            generation_before: u64| {
+        let outputs_equal = before.iter().zip(after).all(|(before, after)| {
+            serde_json::to_vec(before).unwrap() == serde_json::to_vec(after).unwrap()
+        });
+        println!(
+            "b4_acquired_image edit={edit} queries={} executions={} outputs_equal={outputs_equal} cache_gen_before={generation_before} cache_gen_after={}",
+            before.len(),
+            after.len(),
+            graph.cache_generation(),
+        );
+        assert!(outputs_equal);
+    };
+
+    let before = acquire_rows(today);
+    let same_image = acquire_rows(today);
+    assert_eq!(
+        serde_json::to_vec(&before).unwrap(),
+        serde_json::to_vec(&same_image).unwrap(),
+        "same-image executions must agree"
+    );
     let generation_before = graph.cache_generation();
     let mut unrelated = graph
         .load_by_path("pages/B4 Measurement Unrelated.md")
@@ -13202,18 +10294,11 @@ fn direct_query_latency_manual_benchmark() {
     graph
         .save_page(&unrelated, unrelated.rev.as_deref())
         .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "content_only",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert_eq!((after.len(), before.difference(&after).count()), (2, 2));
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("content_only", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let before = acquire_rows(today);
     let generation_before = graph.cache_generation();
     let mut unrelated = graph
         .load_by_path("pages/B4 Measurement Unrelated.md")
@@ -13223,54 +10308,28 @@ fn direct_query_latency_manual_benchmark() {
     graph
         .save_page(&unrelated, unrelated.rev.as_deref())
         .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "alias_change",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert!(after.is_empty());
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("alias_change", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let before = acquire_rows(today);
     let generation_before = graph.cache_generation();
     let mut new_page = direct_save_bench_new_page("B4 Measurement New Page");
     new_page.blocks[0].id = Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
     graph.save_page(&new_page, None).unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "page_set_change",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert!(after.is_empty());
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("page_set_change", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
-    graph.derived_cache.write().unwrap().as_mut().unwrap().today -= 1;
-    let generation_before = graph.cache_generation();
-    let mut unrelated = graph
-        .load_by_path("pages/B4 Measurement Unrelated.md")
-        .unwrap()
-        .unwrap();
-    unrelated.blocks[0].raw = "b4-unrelated-day-rollover".into();
-    graph
-        .save_page(&unrelated, unrelated.rev.as_deref())
-        .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "day_rollover_simulated",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
+    let before = acquire_rows(today);
+    let same_day = acquire_rows(today);
+    assert_eq!(
+        serde_json::to_vec(&before).unwrap(),
+        serde_json::to_vec(&same_day).unwrap()
     );
-    assert!(after.is_empty());
-    wait_for_direct_query_projection(&graph);
+    let generation_before = graph.cache_generation();
+    let after = acquire_rows(today.add_days(1));
+    report_new_image("explicit_day_change", &before, &after, generation_before);
 
     let facet_sizes = std::env::var("TINE_DIRECT_QUERY_BENCH_FACET_SIZES")
         .unwrap_or_else(|_| "1000,4000".into())
@@ -13398,186 +10457,6 @@ fn watch_predicates_track_the_same_scope_discovery_walks() {
 }
 
 #[test]
-fn projection_exact_updates_warm_cache_once_and_suppresses_watcher_echo() {
-    let dir = scratch("projection-exact-cache");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- before\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-
-    let proof = graph
-        .write_projection_exact("pages/Projection.md", Some(b"- before\n"), b"- after\n")
-        .unwrap();
-    assert_eq!(proof.bytes(), b"- after\n");
-    assert_eq!(graph.cache_generation(), generation + 1);
-    assert_eq!(
-        graph
-            .load_by_path("pages/Projection.md")
-            .unwrap()
-            .unwrap()
-            .blocks[0]
-            .raw,
-        "after"
-    );
-    assert_eq!(
-        graph.disk_revs.read().unwrap().get(&path).cloned(),
-        Some(content_rev("- after\n"))
-    );
-    assert!(graph.sync_file(&path).is_none());
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_sync_failure_requires_recovery_and_stale_write_remains_conflict() {
-    let dir = scratch("projection-exact-durability");
-    let path = dir.join("pages/Projection.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let generation = graph.cache_generation();
-    let revisions = graph.disk_revs.read().unwrap().clone();
-
-    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true));
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- target\n");
-    assert_eq!(graph.cache_generation(), generation);
-    assert_eq!(
-        *graph.disk_revs.read().unwrap(),
-        revisions,
-        "failed publication must not install baseline authority"
-    );
-    assert_eq!(
-        graph
-            .load_by_path("pages/Projection.md")
-            .unwrap()
-            .unwrap()
-            .blocks[0]
-            .raw,
-        "target"
-    );
-    assert_eq!(graph.cache_generation(), generation);
-    assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
-
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .is_err());
-    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true));
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- target\n"), b"- target\n")
-        .is_err());
-    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| {
-        assert!(
-            fail.replace(false),
-            "an already-visible target must not be synced or accepted by ordinary write"
-        );
-    });
-
-    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true));
-    assert!(graph
-        .recover_projection_exact("pages/Projection.md", b"- target\n")
-        .is_err());
-    let proof = graph
-        .recover_projection_exact("pages/Projection.md", b"- target\n")
-        .unwrap();
-    assert_eq!(proof.path(), "pages/Projection.md");
-    assert_eq!(proof.bytes(), b"- target\n");
-    assert_eq!(
-        graph.cache_generation(),
-        generation + 1,
-        "only successful exact recovery may publish cache authority"
-    );
-    assert!(graph.sync_file(&path).is_none());
-    assert!(graph
-        .recover_projection_exact("pages/Projection.md", b"- wrong\n")
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- target\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_exact_creates_and_recovers_nested_parent_chain() {
-    let dir = scratch("projection-exact-nested-parent");
-    let path = dir.join("pages/nested/deeper/Projection.md");
-    let graph = Graph::open(&dir);
-
-    let proof = graph
-        .write_projection_exact("pages/nested/deeper/Projection.md", None, b"- nested\n")
-        .unwrap();
-    assert_eq!(proof.bytes(), b"- nested\n");
-    assert_eq!(fs::read(&path).unwrap(), b"- nested\n");
-    assert_eq!(
-        graph
-            .recover_projection_exact("pages/nested/deeper/Projection.md", b"- nested\n")
-            .unwrap()
-            .bytes(),
-        b"- nested\n"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_input_absence_and_publication_cover_nested_unicode_layouts() {
-    let dir = scratch("projection-input-nested-unicode");
-    fs::create_dir_all(dir.join("logseq")).unwrap();
-    fs::write(
-        dir.join("logseq/config.edn"),
-        "{:pages-directory \"archive/pages\"\n\
-              :journals-directory \"archive/journals\"}\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    let cases = [
-        (
-            "archive/pages/題材/深い/ノート.md",
-            b"- configured Unicode page\n".as_slice(),
-        ),
-        (
-            "archive/pagesish/自由/Elsewhere.md",
-            b"- graph-wide nonstandard page\n".as_slice(),
-        ),
-    ];
-
-    for (relative, expected) in cases {
-        let path = ManagedPath::parse(relative).unwrap();
-        assert_eq!(graph.read_projection_input(&path).unwrap(), None);
-        assert!(
-            !dir.join(relative).parent().unwrap().exists(),
-            "input capture synthesized missing parents for {relative}"
-        );
-
-        let proof = graph
-            .write_projection_exact(relative, None, expected)
-            .unwrap();
-        assert_eq!(proof.path(), relative);
-        assert_eq!(fs::read(dir.join(relative)).unwrap(), expected);
-        assert_eq!(
-            graph.read_projection_input(&path).unwrap().as_deref(),
-            Some(expected)
-        );
-    }
-
-    let independent = Graph::open(&dir);
-    for relative in cases.map(|(relative, _)| relative) {
-        assert!(
-            independent
-                .list_pages()
-                .iter()
-                .any(|entry| entry.rel_path == relative),
-            "independent graph scan did not observe {relative}"
-        );
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
     let dir = scratch("graph-text-byte-verification");
     fs::create_dir_all(dir.join("pages/nested")).unwrap();
@@ -13617,278 +10496,13 @@ fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn projection_retry_resumes_after_synced_partial_parent_chain() {
-    let dir = scratch("projection-partial-parent-retry");
-    let relative = "pages/created/synced/deep/Projection.md";
-    let path = dir.join(relative);
-    let graph = Graph::open(&dir);
-
-    FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| fail.set(true));
-    assert!(graph
-        .write_projection_exact(relative, None, b"- retry target\n")
-        .is_err());
-    assert!(dir.join("pages/created").is_dir());
-    assert!(!dir.join("pages/created/synced").exists());
-    assert!(!path.exists());
-
-    let proof = graph
-        .write_projection_exact(relative, None, b"- retry target\n")
-        .unwrap();
-    assert_eq!(proof.bytes(), b"- retry target\n");
-    assert_eq!(fs::read(&path).unwrap(), b"- retry target\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Count the directory barriers one projection write initiates.
-///
-/// `BarrierSession` is a per-thread attribution channel, and
-/// `write_projection_exact` runs entirely on the calling thread, so this
-/// sees exactly this write's barriers even while other tests run.
-fn projection_write_directory_barriers(graph: &Graph, relative: &str, bytes: &[u8]) -> u64 {
-    let session = crate::durability_counters::BarrierSession::begin();
-    graph
-        .write_projection_exact(relative, None, bytes)
-        .expect("the projection write under measurement must succeed");
-    let counted = session
-        .counts()
-        .get(crate::durability_counters::Barrier::Directory);
-    crate::durability_counters::BarrierSession::detach_current_thread();
-    counted
-}
-
-#[test]
-fn a_same_directory_move_takes_one_directory_barrier() {
-    use crate::durability_counters::{Barrier, BarrierSession};
-
-    let dir = scratch("same-leaf-move-barrier");
-    let graph = Graph::open(&dir);
-    graph
-        .write_projection_exact("pages/Before.md", None, b"- moving\n")
-        .unwrap();
-
-    let turn = ProjectionTurnBarrierScope::begin().unwrap();
-    let session = BarrierSession::begin();
-    graph
-        .remove_projection_exact("pages/Before.md", b"- moving\n")
-        .unwrap();
-    graph
-        .write_projection_exact("pages/After.md", None, b"- moving\n")
-        .unwrap();
-    let before_finish = session.counts().get(Barrier::Directory);
-    turn.finish().unwrap();
-    let directories = session.counts().get(Barrier::Directory);
-    BarrierSession::detach_current_thread();
-
-    assert_eq!(
-        before_finish, 0,
-        "managed reconstructible leaf barriers must remain deferred until turn finish"
-    );
-    assert_eq!(
-        directories.saturating_sub(before_finish),
-        1,
-        "the remove and create must close with one shared reconstructible leaf barrier"
-    );
-    assert!(!dir.join("pages/Before.md").exists());
-    assert_eq!(fs::read(dir.join("pages/After.md")).unwrap(), b"- moving\n");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// **The chain-flush invariant** (`docs/storage-sync-contract.md` §2.10a-i).
-///
-/// A projection operation changes the entry list of exactly one directory —
-/// the chain leaf — so it takes its directory barrier there and nowhere
-/// else. Path depth is therefore free. Before the 2026-08-26 cut the write
-/// path walked the chain leaf-to-root on every write, rename and preflight,
-/// so a namespaced page silently paid a device round trip per path
-/// component; this assertion fails on that code.
-#[test]
-fn a_projection_operation_flushes_one_directory_whatever_its_depth() {
-    let dir = scratch("projection-chain-flush-depth");
-    fs::create_dir_all(dir.join("pages/one/two/three")).unwrap();
-    let graph = Graph::open(&dir);
-
-    let shallow = projection_write_directory_barriers(&graph, "pages/Shallow.md", b"- shallow\n");
-    let deep =
-        projection_write_directory_barriers(&graph, "pages/one/two/three/Deep.md", b"- deep\n");
-
-    assert!(
-        shallow > 0,
-        "a projection write must still take its own directory barrier"
-    );
-    assert_eq!(
-            deep, shallow,
-            "chain depth must not cost directory barriers: the three-deep page took {deep}              and the one-deep page took {shallow}. Only the leaf's entry list changed, and              an ancestor entry that is already durable cannot be un-durabled by any in-scope              failure."
-        );
-    assert_eq!(
-        fs::read(dir.join("pages/one/two/three/Deep.md")).unwrap(),
-        b"- deep\n"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The other half of the invariant: an ancestor Tine *creates* still gets a
-/// barrier — exactly one, in the parent that now holds its name, taken by
-/// `create_projection_chain_component` at the moment of creation rather
-/// than by a chain walk afterwards.
-#[test]
-fn a_created_projection_ancestor_costs_exactly_one_extra_barrier() {
-    let dir = scratch("projection-created-ancestor-barrier");
-    let graph = Graph::open(&dir);
-
-    let existing =
-        projection_write_directory_barriers(&graph, "pages/Existing.md", b"- existing\n");
-    let one_new = projection_write_directory_barriers(&graph, "pages/alpha/One.md", b"- one\n");
-    let two_new =
-        projection_write_directory_barriers(&graph, "pages/beta/gamma/Two.md", b"- two\n");
-
-    assert_eq!(
-            one_new,
-            existing + 1,
-            "creating one ancestor must cost exactly one barrier more than writing into an              existing chain ({one_new} vs {existing})"
-        );
-    assert_eq!(
-            two_new,
-            existing + 2,
-            "creating two ancestors must cost exactly two barriers more ({two_new} vs              {existing})"
-        );
-    assert_eq!(
-        fs::read(dir.join("pages/beta/gamma/Two.md")).unwrap(),
-        b"- two\n"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The second reachable post-crash state of the same crash point that
-/// `projection_retry_resumes_after_synced_partial_parent_chain` covers.
-///
-/// `mkdir` and its parent's barrier are not atomic, so a crash between them
-/// leaves the ancestor either absent (that test) or present — which on the
-/// next boot is indistinguishable from an ancestor that was always there.
-/// Retry must converge from this state too, and must not re-flush the
-/// surviving ancestor to do it.
-#[test]
-fn projection_retry_converges_when_a_created_ancestor_survived_the_crash() {
-    let dir = scratch("projection-surviving-ancestor-retry");
-    let relative = "pages/created/synced/deep/Projection.md";
-    let path = dir.join(relative);
-    let graph = Graph::open(&dir);
-
-    // The state a crash between `mkdir` and its barrier can leave behind.
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-    let barriers = projection_write_directory_barriers(&graph, relative, b"- retry target\n");
-    assert_eq!(fs::read(&path).unwrap(), b"- retry target\n");
-
-    let flat = scratch("projection-surviving-ancestor-baseline");
-    let baseline = projection_write_directory_barriers(
-        &Graph::open(&flat),
-        "pages/Projection.md",
-        b"- retry target\n",
-    );
-    assert_eq!(
-            barriers, baseline,
-            "a surviving ancestor is an ordinary existing directory and must cost nothing              ({barriers} vs {baseline})"
-        );
-
-    let _ = fs::remove_dir_all(&flat);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The chain-*creation* half of the anonymized-corpus acceptance gate for
-/// the 2026-08-26 chain-flush cut. Its sibling,
-/// `sync_runtime::tests::managed_nested_projection_lands_on_a_real_graph_copy`,
-/// drives the managed save and cross-page move on the same corpus.
-///
-/// Synthetic fixtures are generated from our own model of a graph, so this
-/// runs the case the model keeps getting wrong at real scale: a page whose
-/// projection path needs a directory that does not exist yet — the first
-/// journal of a month, or a namespace page creating `pages/foo/`.
-///
-/// ```text
-/// TINE_MS_AUDIT_GRAPH_COPY=/path/to/graph/copy \
-///   cargo test -p tine-core --lib \
-///   projection_creates_a_nested_parent_on_a_real_graph_copy -- --ignored --nocapture
-/// ```
-#[test]
-#[ignore = "manual acceptance gate: chain creation on a real graph copy"]
-fn projection_creates_a_nested_parent_on_a_real_graph_copy() {
-    let source = PathBuf::from(
-        std::env::var("TINE_MS_AUDIT_GRAPH_COPY")
-            .expect("set TINE_MS_AUDIT_GRAPH_COPY to a disposable graph copy"),
-    );
-    assert!(
-        fs::symlink_metadata(&source)
-            .expect("the graph copy must be readable")
-            .file_type()
-            .is_dir(),
-        "the graph copy must name a real directory, not a symlink"
-    );
-
-    let dir = scratch("projection-real-graph-chain-creation");
-    let _ = fs::remove_dir_all(&dir);
-    copy_real_graph_tree(&source, &dir);
-    assert!(dir.join("pages").is_dir() && dir.join("journals").is_dir());
-    let graph = Graph::open(&dir);
-
-    let flat = projection_write_directory_barriers(
-        &graph,
-        "pages/Chain Flush Gate.md",
-        b"- flat acceptance\n",
-    );
-    let created = projection_write_directory_barriers(
-        &graph,
-        "pages/Chain Flush Gate/Nested.md",
-        b"- created acceptance\n",
-    );
-
-    assert_eq!(
-        created,
-        flat + 1,
-        "creating one parent on the real corpus must cost exactly one barrier more \
-             ({created} vs {flat})"
-    );
-    assert_eq!(
-        fs::read(dir.join("pages/Chain Flush Gate/Nested.md")).unwrap(),
-        b"- created acceptance\n"
-    );
-    eprintln!(
-        "real-graph projection: flat={flat} dir_fsync, creating-one-parent={created} dir_fsync"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Copy a disposable real-graph tree without following symlinks.
-fn copy_real_graph_tree(from: &Path, to: &Path) {
-    fs::create_dir_all(to).unwrap();
-    let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
-    while let Some((source, destination)) = pending.pop() {
-        for entry in fs::read_dir(&source).unwrap() {
-            let entry = entry.unwrap();
-            let kind = entry.file_type().unwrap();
-            let target = destination.join(entry.file_name());
-            if kind.is_dir() {
-                fs::create_dir_all(&target).unwrap();
-                pending.push((entry.path(), target));
-            } else if kind.is_file() {
-                fs::copy(entry.path(), &target).unwrap();
-            }
-        }
-    }
-}
-
 /// A cross-directory move syncs BOTH the source and the destination chain
-/// (`managed_move_noreplace_validated`). Each of those is one barrier on
+/// (`graph_text_move_noreplace_validated`). Each of those is one barrier on
 /// the directory whose entry list actually changed — the source loses a
 /// name, the destination gains one — so the depth of either chain is free.
 ///
 /// This drives the Direct Files path deliberately: `rename_file_to_page`
-/// is a real user operation on a Direct graph, and the chain helpers are
-/// shared by both storage modes.
+/// is a real user operation on a Direct graph.
 #[test]
 fn a_cross_directory_move_flushes_one_directory_per_side() {
     fn move_barriers(tag: &str, source_rel: &str, new_name: &str) -> u64 {
@@ -13926,87 +10540,6 @@ fn a_cross_directory_move_flushes_one_directory_per_side() {
         );
 }
 
-#[test]
-fn missing_nested_tombstone_completes_without_creating_parents() {
-    let dir = scratch("projection-missing-nested-tombstone");
-    let relative = "pages/deleted/deep/Gone.md";
-    let path = ManagedPath::parse(relative).unwrap();
-    let graph = Graph::open(&dir);
-
-    assert_eq!(graph.read_projection_input(&path).unwrap(), None);
-    let proof = graph.confirm_removed_projection_exact(relative).unwrap();
-    assert_eq!(proof.path(), relative);
-    assert!(proof.bytes().is_empty());
-    assert!(!dir.join(relative).parent().unwrap().exists());
-    assert!(!dir.join(relative).exists());
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn missing_nested_tombstone_refuses_parent_and_target_appearance_before_proof() {
-    let dir = scratch("projection-missing-tombstone-race");
-    let relative = "pages/deleted/deep/Gone.md";
-    let target = dir.join(relative);
-    let graph = Graph::open(&dir);
-
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
-        let target = target.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::create_dir_all(target.parent().unwrap())?;
-            fs::write(target, b"- appeared externally\n")
-        }));
-    });
-    assert!(graph.confirm_removed_projection_exact(relative).is_err());
-    assert_eq!(fs::read(&target).unwrap(), b"- appeared externally\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_missing_capture_rejects_regular_file_intermediate() {
-    let dir = scratch("projection-regular-intermediate");
-    let blocker = dir.join("pages/blocker");
-    fs::write(&blocker, b"retained ordinary file").unwrap();
-    let relative = "pages/blocker/deep/Projection.md";
-    let graph = Graph::open(&dir);
-
-    assert!(graph
-        .read_projection_input(&ManagedPath::parse(relative).unwrap())
-        .is_err());
-    assert!(graph
-        .write_projection_exact(relative, None, b"- target\n")
-        .is_err());
-    assert_eq!(fs::read(&blocker).unwrap(), b"retained ordinary file");
-    assert!(!dir.join(relative).exists());
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_missing_capture_rejects_symlink_intermediate_without_escape() {
-    use std::os::unix::fs::symlink;
-
-    let dir = scratch("projection-symlink-intermediate");
-    let outside = scratch("projection-symlink-intermediate-outside");
-    symlink(&outside, dir.join("pages/linked")).unwrap();
-    let relative = "pages/linked/deep/Projection.md";
-    let graph = Graph::open(&dir);
-
-    assert!(graph
-        .read_projection_input(&ManagedPath::parse(relative).unwrap())
-        .is_err());
-    assert!(graph
-        .write_projection_exact(relative, None, b"- target\n")
-        .is_err());
-    assert!(!outside.join("deep/Projection.md").exists());
-    assert!(dir.join("pages/linked").symlink_metadata().is_ok());
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&outside);
-}
-
 #[cfg(windows)]
 #[test]
 fn projection_missing_capture_rejects_reparse_intermediate_without_escape() {
@@ -14019,291 +10552,27 @@ fn projection_missing_capture_rejects_reparse_intermediate_without_escape() {
     let graph = Graph::open(&dir);
 
     assert!(graph
-        .read_projection_input(&ManagedPath::parse(relative).unwrap())
+        .read_projection_input(&GraphTextPath::parse(relative).unwrap())
         .is_err());
-    assert!(graph
-        .write_projection_exact(relative, None, b"- target\n")
-        .is_err());
+    // The write side refuses at the same admission boundary. Its exact-byte
+    // writer went with Managed Storage (ADR 0066), so the assertion names what
+    // that writer called first: resolving a target through the reparse
+    // intermediate must fail before any byte is published.
+    let refused = match graph.admit_retained_graph_text_writer() {
+        Ok(permit) => graph
+            .graph_text_target(&permit, &dir.join(relative), false)
+            .is_err(),
+        Err(_) => true,
+    };
+    assert!(
+        refused,
+        "a reparse intermediate must not resolve to a writable graph-text target"
+    );
     assert!(!outside.join("deep/Projection.md").exists());
     assert!(dir.join("pages/linked").symlink_metadata().is_ok());
 
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&outside);
-}
-
-#[test]
-fn projection_exact_accepts_nested_configured_pages_and_journals_roots() {
-    let dir = scratch("projection-configured-nested-roots");
-    fs::create_dir_all(dir.join("logseq")).unwrap();
-    fs::write(
-        dir.join("logseq/config.edn"),
-        "{:pages-directory \"archive/pages\"\n\
-              :journals-directory \"archive/journals\"}\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-
-    let page = graph
-        .write_projection_exact(
-            "archive/pages/topic/Projection.md",
-            None,
-            b"- nested page\n",
-        )
-        .unwrap();
-    let journal = graph
-        .write_projection_exact(
-            "archive/journals/2026/07/23.org",
-            None,
-            b"* nested journal\n",
-        )
-        .unwrap();
-    assert_eq!(page.path(), "archive/pages/topic/Projection.md");
-    assert_eq!(journal.path(), "archive/journals/2026/07/23.org");
-    assert_eq!(
-        fs::read(dir.join("archive/pages/topic/Projection.md")).unwrap(),
-        b"- nested page\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("archive/journals/2026/07/23.org")).unwrap(),
-        b"* nested journal\n"
-    );
-    // No configured root owns these, but OG walks the whole graph directory
-    // and rewrites a page wherever it already lives, so they are ordinary
-    // graph text addressed at their exact spelling — never relocated under
-    // `archive/pages`.
-    for outside in ["archive/pagesish/Sibling.md", "pages/Default named.md"] {
-        let projected = graph
-            .write_projection_exact(outside, None, b"- outside\n")
-            .unwrap();
-        assert_eq!(projected.path(), outside);
-        assert_eq!(fs::read(dir.join(outside)).unwrap(), b"- outside\n");
-    }
-    assert!(!dir.join("archive/pages/Sibling.md").exists());
-    assert!(!dir.join("archive/pages/Default named.md").exists());
-
-    // Containers outside the graph-text scope stay unaddressable.
-    for refused in [
-        "assets/Wrong.md",
-        "logseq/bak/pages/Wrong.md",
-        ".hidden/Wrong.md",
-    ] {
-        assert!(
-            graph
-                .write_projection_exact(refused, None, b"- wrong\n")
-                .is_err(),
-            "accepted {refused}"
-        );
-        assert!(!dir.join(refused).exists());
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn raw_managed_read_rejects_parent_retarget_and_file_replacement_after_open() {
-    use std::os::unix::fs::symlink;
-
-    let replacement_root = scratch("raw-managed-file-replacement");
-    let replacement_path = replacement_root.join("pages/page.md");
-    fs::write(&replacement_path, b"- original\n").unwrap();
-    let replacement_graph = Graph::open(&replacement_root);
-    let retired = replacement_root.join("pages/page.retired.md");
-    MANAGED_INVENTORY_READ_RACE.with(|hook| {
-        let replacement_path = replacement_path.clone();
-        let retired = retired.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&replacement_path, &retired)?;
-            fs::write(&replacement_path, b"- replacement\n")
-        }));
-    });
-    assert!(replacement_graph
-        .read_raw_managed_text(&ManagedPath::parse("pages/page.md").unwrap())
-        .is_err());
-    assert_eq!(fs::read(&replacement_path).unwrap(), b"- replacement\n");
-
-    let retarget_root = scratch("raw-managed-parent-retarget");
-    let outside = scratch("raw-managed-parent-retarget-outside");
-    fs::write(retarget_root.join("pages/page.md"), b"- retained\n").unwrap();
-    fs::write(outside.join("page.md"), b"- outside\n").unwrap();
-    let retarget_graph = Graph::open(&retarget_root);
-    let moved = retarget_root.join("pages-retained");
-    MANAGED_INVENTORY_READ_RACE.with(|hook| {
-        let parent = retarget_root.join("pages");
-        let outside = outside.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&parent, &moved)?;
-            symlink(&outside, &parent)
-        }));
-    });
-    assert!(retarget_graph
-        .read_raw_managed_text(&ManagedPath::parse("pages/page.md").unwrap())
-        .is_err());
-    assert_eq!(fs::read(outside.join("page.md")).unwrap(), b"- outside\n");
-
-    let _ = fs::remove_dir_all(&replacement_root);
-    let _ = fs::remove_file(retarget_root.join("pages"));
-    let _ = fs::remove_dir_all(&retarget_root);
-    let _ = fs::remove_dir_all(&outside);
-}
-
-#[test]
-fn live_admission_snapshot_defers_late_enumeration_changes_to_the_fenced_feed() {
-    let root = scratch("initial-shadow-race");
-    fs::create_dir_all(root.join("pages/nested")).unwrap();
-    fs::write(root.join("pages/nested/a.md"), b"- first\n").unwrap();
-    let graph = Graph::open(&root);
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-        let nested = root.join("pages/nested");
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::remove_file(nested.join("a.md"))?;
-            fs::write(nested.join("a.md"), b"- replaced\n")?;
-            fs::write(nested.join("inserted.md"), b"- inserted\n")
-        }));
-    });
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(
-        inventory,
-        vec![(
-            ManagedPath::parse("pages/nested/a.md").unwrap(),
-            b"- first\n".to_vec(),
-        )]
-    );
-    assert_eq!(
-        fs::read(root.join("pages/nested/a.md")).unwrap(),
-        b"- replaced\n"
-    );
-    assert_eq!(
-        fs::read(root.join("pages/nested/inserted.md")).unwrap(),
-        b"- inserted\n"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn initial_shadow_rejects_ambient_root_identity_replacement() {
-    let root = scratch("initial-shadow-root-replacement");
-    fs::write(root.join("Root.md"), b"- retained\n").unwrap();
-    let retired = root.with_file_name(format!(
-        "{}-retired",
-        root.file_name().unwrap().to_string_lossy()
-    ));
-    let _ = fs::remove_dir_all(&retired);
-    let graph = Graph::open(&root);
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-        let root = root.clone();
-        let retired = retired.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&root, &retired)?;
-            fs::create_dir_all(root.join("pages"))?;
-            fs::create_dir_all(root.join("journals"))?;
-            fs::write(root.join("Root.md"), b"- retained\n")
-        }));
-    });
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&retired);
-}
-
-#[test]
-fn initial_shadow_discovers_graph_wide_mixed_case_text_paths() {
-    let root = scratch("initial-shadow-graph-wide");
-    fs::create_dir_all(root.join("archive/client/deep")).unwrap();
-    fs::write(root.join("Root.MD"), b"- root\n").unwrap();
-    fs::write(
-        root.join("archive/client/deep/Plan.Markdown"),
-        b"- markdown\n",
-    )
-    .unwrap();
-    fs::write(root.join("archive/client/deep/25-07-2026.ORG"), b"* org\n").unwrap();
-
-    let graph = Graph::open(&root);
-    reset_graph_text_admission_test_counters();
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(
-        inventory
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "Root.MD",
-            "archive/client/deep/25-07-2026.ORG",
-            "archive/client/deep/Plan.Markdown",
-        ]
-    );
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(counters.builder_enumerations, 6);
-    assert_eq!(counters.point_query_attempts, 0);
-    assert_eq!(counters.parser_invocations, 3);
-    assert_eq!(counters.index_map_insertions, 15);
-    assert_eq!(counters.event_map_key_reads, 0);
-    assert_eq!(counters.event_map_key_writes, 0);
-    assert_eq!(counters.event_reverse_members, 0);
-    assert!(counters.persistent_node_allocations > 0);
-    assert_eq!(counters.persistent_payload_members, 6);
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_snapshot_uses_parser_owned_semantics_and_preserves_creation_roots() {
-    let root = scratch("admission-semantic");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        "{:pages-directory \"create/pages\"\n\
-              :journals-directory \"create/journals\"\n\
-              :journal/file-name-format \"dd-MM-yyyy\"\n\
-              :journal/page-title-format \"yyyy-MM-dd\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(root.join("archive")).unwrap();
-    fs::create_dir_all(root.join("journals")).unwrap();
-    fs::write(
-        root.join("archive/Not-A-Date.Markdown"),
-        b"title:: 25-07-2026\n\n- journal by title\n",
-    )
-    .unwrap();
-    fs::write(root.join("journals/Plan.ORG"), b"* ordinary page\n").unwrap();
-
-    let graph = Graph::open(&root);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let journal = index
-        .files_by_exact_path
-        .get(&ManagedPath::parse("archive/Not-A-Date.Markdown").unwrap())
-        .unwrap();
-    assert_eq!(journal.semantic.name, "2026-07-25");
-    assert_eq!(journal.semantic.kind, PageKind::Journal);
-    assert_eq!(journal.format, Format::Md);
-    let page = index
-        .files_by_exact_path
-        .get(&ManagedPath::parse("journals/Plan.ORG").unwrap())
-        .unwrap();
-    assert_eq!(page.semantic.name, "Plan");
-    assert_eq!(page.semantic.kind, PageKind::Page);
-    assert_eq!(page.format, Format::Org);
-
-    fs::create_dir_all(root.join("create/pages")).unwrap();
-    fs::create_dir_all(root.join("create/journals")).unwrap();
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    assert_eq!(
-        graph
-            .managed_path_for(&permit, "New Page", PageKind::Page)
-            .unwrap(),
-        root.join("create/pages/New Page.md")
-    );
-    assert_eq!(
-        graph
-            .managed_path_for(&permit, "2026-07-25", PageKind::Journal)
-            .unwrap(),
-        root.join("create/journals/25-07-2026.md")
-    );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -14319,9 +10588,9 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
     )
     .unwrap();
     let graph = Graph::open(&root);
-    let path = ManagedPath::parse("content/pages/25-07-2026.md").unwrap();
+    let path = GraphTextPath::parse("content/pages/25-07-2026.md").unwrap();
 
-    let configured = graph.managed_entry_for_managed_path(&path).unwrap();
+    let configured = graph.graph_text_entry_for_graph_text_path(&path).unwrap();
     assert_eq!(configured.kind, PageKind::Journal);
     assert_eq!(configured.name, "2026-07-25");
     assert!(configured.date_key.is_some());
@@ -14341,8 +10610,8 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
 }
 
 #[test]
-fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
-    let root = scratch("managed-entry-nonstandard-layout");
+fn graph_text_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
+    let root = scratch("graph-entry-nonstandard-layout");
     fs::create_dir_all(root.join("logseq")).unwrap();
     fs::write(
         root.join("logseq/config.edn"),
@@ -14355,8 +10624,8 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     // OG walks the whole graph directory and derives the page title from the
     // last path component only, so a nested page outside the configured
     // roots keeps its exact nested spelling and its file-name title.
-    let nested = ManagedPath::parse("archive/2024/client notes/Ünicode Page.md").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&nested).unwrap();
+    let nested = GraphTextPath::parse("archive/2024/client notes/Ünicode Page.md").unwrap();
+    let entry = graph.graph_text_entry_for_graph_text_path(&nested).unwrap();
     assert_eq!(entry.kind, PageKind::Page);
     assert_eq!(entry.name, "Ünicode Page");
     assert_eq!(entry.date_key, None);
@@ -14368,16 +10637,18 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
 
     // OG decides journal-ness by parsing that title as a date, never by the
     // containing directory.
-    let journal = ManagedPath::parse("archive/2024/25-07-2026.org").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&journal).unwrap();
+    let journal = GraphTextPath::parse("archive/2024/25-07-2026.org").unwrap();
+    let entry = graph
+        .graph_text_entry_for_graph_text_path(&journal)
+        .unwrap();
     assert_eq!(entry.kind, PageKind::Journal);
     assert_eq!(entry.name, "2026-07-25");
     assert!(entry.date_key.is_some());
     assert_eq!(entry.rel_path, "archive/2024/25-07-2026.org");
 
     // A graph-root file is equally ordinary graph text for OG.
-    let top = ManagedPath::parse("Top Level.md").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&top).unwrap();
+    let top = GraphTextPath::parse("Top Level.md").unwrap();
+    let entry = graph.graph_text_entry_for_graph_text_path(&top).unwrap();
     assert_eq!(entry.kind, PageKind::Page);
     assert_eq!(entry.name, "Top Level");
 
@@ -14391,8 +10662,8 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
         ("archive/Upper Markdown.MARKDOWN", "Upper Markdown"),
         ("archive/Upper Org.ORG", "Upper Org"),
     ] {
-        let path = ManagedPath::parse(relative).unwrap();
-        let entry = graph.managed_entry_for_managed_path(&path).unwrap();
+        let path = GraphTextPath::parse(relative).unwrap();
+        let entry = graph.graph_text_entry_for_graph_text_path(&path).unwrap();
         assert_eq!(entry.kind, PageKind::Page, "{relative}");
         assert_eq!(entry.name, expected_name, "{relative}");
         assert_eq!(entry.rel_path, relative, "{relative}");
@@ -14403,6 +10674,7 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/bak/pages/note.md",
         "logseq/version-files/note.md",
@@ -14413,111 +10685,16 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     ] {
         assert!(
             graph
-                .managed_entry_for_managed_path(&ManagedPath::parse(refused).unwrap())
+                .graph_text_entry_for_graph_text_path(&GraphTextPath::parse(refused).unwrap())
                 .is_err(),
             "accepted {refused}"
         );
     }
     for invalid in ["archive/note.txt", "archive/../escape.md"] {
-        assert!(ManagedPath::parse(invalid).is_err(), "accepted {invalid}");
+        assert!(GraphTextPath::parse(invalid).is_err(), "accepted {invalid}");
     }
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_snapshot_excludes_reserved_paths_and_failed_builds_poison() {
-    let root = scratch("admission-exclusions");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(root.join("logseq/config.edn"), "{:hidden [\"private\"]}\n").unwrap();
-    for relative in [
-        ".hidden/x.md",
-        "assets/x.md",
-        "publish/x.org",
-        "node_modules/x.md",
-        ".tine-sync/x.md",
-        "logseq/.recycle/x.md",
-        "private/x.md",
-    ] {
-        let path = root.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"- excluded\n").unwrap();
-    }
-    fs::write(
-        root.join("Dropbox (conflicted copy 2026-07-25).md"),
-        b"- conflict\n",
-    )
-    .unwrap();
-    fs::write(root.join("Visible.md"), b"- visible\n").unwrap();
-    let graph = Graph::open(&root);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(index.files_by_exact_path.iter().count(), 1);
-    assert!(index
-        .files_by_exact_path
-        .contains_key(&ManagedPath::parse("Visible.md").unwrap()));
-
-    let invalid = scratch("admission-invalid-utf8");
-    fs::write(invalid.join("Bad.md"), [0xff, 0xfe]).unwrap();
-    let invalid_graph = Graph::open(&invalid);
-    assert!(invalid_graph
-        .initial_shadow_raw_managed_text_inventory()
-        .is_err());
-
-    let parse = scratch("admission-parse-failure");
-    fs::write(parse.join("Bad.md"), b"- valid bytes\n").unwrap();
-    let parse_graph = Graph::open(&parse);
-    GRAPH_TEXT_PARSE_FAILURE.with(|failure| failure.set(true));
-    assert!(parse_graph
-        .initial_shadow_raw_managed_text_inventory()
-        .is_err());
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&invalid);
-    let _ = fs::remove_dir_all(&parse);
-}
-
-#[cfg(unix)]
-#[test]
-fn admission_snapshot_retains_all_collision_group_evidence() {
-    let portable = scratch("admission-portable-groups");
-    fs::write(portable.join("Caf\u{e9}.md"), b"- composed\n").unwrap();
-    fs::write(
-        portable.join("Cafe\u{301}.MD"),
-        b"- decomposed and mixed case\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&portable);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_portable_key
-            .get(&ManagedPath::parse("Caf\u{e9}.md").unwrap().portable_key())
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let semantic = scratch("admission-semantic-groups");
-    fs::create_dir_all(semantic.join("a")).unwrap();
-    fs::create_dir_all(semantic.join("b")).unwrap();
-    fs::write(semantic.join("a/One.md"), b"title:: Shared\n\n- one\n").unwrap();
-    fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n* two\n").unwrap();
-    let graph = Graph::open(&semantic);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_semantic_key
-            .get(&(0, crate::refs::page_key("Shared")))
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let _ = fs::remove_dir_all(&portable);
-    let _ = fs::remove_dir_all(&semantic);
 }
 
 #[test]
@@ -14527,7 +10704,7 @@ fn graph_text_exact_path_authority_preserves_root_nested_and_markdown_spelling()
     let root_target = graph.graph_text_exact_path("Root.MarkDown", true).unwrap();
     assert!(root_target.parent_components.is_empty());
     assert_eq!(
-        root_target.managed_path.as_ref().unwrap().as_str(),
+        root_target.graph_text_path.as_ref().unwrap().as_str(),
         "Root.MarkDown"
     );
     assert_eq!(root_target.filename, "Root.MarkDown");
@@ -14550,7 +10727,7 @@ fn graph_text_exact_path_authority_preserves_root_nested_and_markdown_spelling()
         .unwrap();
     assert_eq!(nested.parent_components, ["archive", "client"]);
     assert_eq!(
-        nested.managed_path.as_ref().unwrap().as_str(),
+        nested.graph_text_path.as_ref().unwrap().as_str(),
         "archive/client/Plan.Markdown"
     );
     assert_eq!(nested.filename, "Plan.Markdown");
@@ -14594,10 +10771,6 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
         .projection_page_target("archive/2024/client notes/Ünicode Page.md")
         .unwrap();
     assert_eq!(
-        nested.relative_path,
-        "archive/2024/client notes/Ünicode Page.md"
-    );
-    assert_eq!(
         nested.parent_components,
         ["archive", "2024", "client notes"]
     );
@@ -14622,6 +10795,7 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/.recycle/note.md",
         "logseq/bak/pages/note.md",
@@ -14644,12 +10818,12 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
 
 #[test]
 fn projection_twin_check_uses_only_bounded_direct_metadata_lookups() {
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let shape = source
-        .split_once("    fn ensure_projection_target_shape(")
+        .split_once("fn ensure_projection_target_shape(")
         .expect("projection target-shape function")
         .1
-        .split_once("\n    fn ensure_projection_parent_binding(")
+        .split_once("fn ensure_projection_parent_binding(")
         .expect("next projection function")
         .0;
 
@@ -14678,7 +10852,7 @@ fn projection_twin_check_covers_all_supported_extensions_and_preserves_files() {
         fs::write(&twin_path, &twin_bytes).unwrap();
 
         let target = graph.projection_page_target(&target_relative).unwrap();
-        let parent = graph.projection_parent(&target, false).unwrap();
+        let parent = graph.projection_parent(&target).unwrap();
         graph
             .ensure_projection_target_shape(&parent, &target)
             .unwrap();
@@ -14736,51 +10910,10 @@ fn admission_persistent_avl_ordered_keys_stay_logarithmic_and_share_large_values
 }
 
 #[test]
-fn admission_large_same_semantic_key_build_is_linear_in_collision_members() {
-    const FILES: usize = 2048;
-    let root = scratch("admission-large-same-semantic-key");
-    for index in 0..FILES {
-        fs::write(
-            root.join(format!("Page-{index:04}.md")),
-            b"title:: Shared\n\n- body\n",
-        )
-        .unwrap();
-    }
-
-    let graph = Graph::open(&root);
-    reset_graph_text_admission_test_counters();
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(
-        counters.persistent_payload_members,
-        FILES * 2,
-        "each input joins one portable and one semantic group exactly once"
-    );
-    assert!(
-        counters.persistent_node_allocations < FILES * 256,
-        "persistent sealing must stay logarithmic, not clone growing groups: {counters:?}"
-    );
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let first = ManagedPath::parse("Page-0000.md").unwrap();
-    let semantic_key =
-        graph_text_semantic_key(&index.files_by_exact_path.get(&first).unwrap().semantic);
-    assert_eq!(
-        index
-            .paths_by_semantic_key
-            .get(&semantic_key)
-            .unwrap()
-            .len(),
-        FILES
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong_title() {
     let root = scratch("admission-realistic-semantic-accounting");
     let graph = Graph::open(&root);
-    let path = ManagedPath::parse("Ordinary.md").unwrap();
+    let path = GraphTextPath::parse("Ordinary.md").unwrap();
     let observed =
         graph_text_observed_semantic_name_upper_bound(&graph, &path, "- ordinary body\n")
             .unwrap()
@@ -14789,9 +10922,9 @@ fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong
         graph_text_file_record_worst_case_upper_bound(&graph, path.as_str().len() as u64, observed)
             .unwrap();
     let realistic_raw_corpus = 480_u64 * 1024 * 1024;
-    assert!(realistic_raw_corpus < INITIAL_SHADOW_LIMITS.raw_bytes);
+    assert!(realistic_raw_corpus < GRAPH_TEXT_CAPTURE_LIMITS.raw_bytes);
     assert!(
-        checked_mul_bytes(one_record, 4).unwrap() < INITIAL_SHADOW_LIMITS.permanent_index_bytes,
+        checked_mul_bytes(one_record, 4).unwrap() < GRAPH_TEXT_CAPTURE_LIMITS.permanent_index_bytes,
         "ordinary titles must not be charged as four 120 MiB document bodies"
     );
 
@@ -14800,553 +10933,6 @@ fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong
     assert!(graph_text_observed_semantic_name_upper_bound(&graph, &path, &content).is_err());
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_journal_title_format_expansion_rejects_before_render_or_parse() {
-    let root = scratch("admission-huge-journal-title-format");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    let huge_format = "X".repeat(
-        (MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES / MAX_JOURNAL_TITLE_BYTES_PER_FORMAT_BYTE) as usize + 1,
-    );
-    fs::write(
-        root.join("logseq/config.edn"),
-        format!("{{:journal/page-title-format \"{huge_format}\"}}\n"),
-    )
-    .unwrap();
-    fs::write(root.join("2026_07_25.md"), b"- short journal\n").unwrap();
-
-    let graph = Graph::open(&root);
-    reset_graph_text_admission_test_counters();
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-    assert_eq!(
-        graph_text_admission_test_counters().parser_invocations,
-        0,
-        "format input and rendered bound must reject before title rendering or parsing"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_normal_journal_title_format_is_budgeted_and_reconciled() {
-    let root = scratch("admission-normal-journal-title-format");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    let title_format = "EEEE, dd-MM-yyyy";
-    fs::write(
-        root.join("logseq/config.edn"),
-        format!("{{:journal/page-title-format \"{title_format}\"}}\n"),
-    )
-    .unwrap();
-    fs::write(root.join("2026_07_25.md"), b"- short journal\n").unwrap();
-
-    let graph = Graph::open(&root);
-    let format_budget = graph_text_journal_title_format_budget(&graph).unwrap();
-    assert_eq!(format_budget.input_bytes, title_format.len() as u64);
-    assert_eq!(
-        format_budget.rendered_bytes,
-        title_format.len() as u64 * MAX_JOURNAL_TITLE_BYTES_PER_FORMAT_BYTE
-    );
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let record = index
-        .files_by_exact_path
-        .get(&ManagedPath::parse("2026_07_25.md").unwrap())
-        .unwrap();
-    assert_eq!(record.semantic.name, "Saturday, 25-07-2026");
-    assert!(
-        record.semantic.name.capacity() as u64
-            <= owned_string_len_upper_bound(format_budget.rendered_bytes).unwrap()
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_complete_validator_checks_exact_reverse_keys_and_path_kinds() {
-    let root = scratch("admission-total-invariant-checker");
-    fs::write(root.join("One.md"), b"title:: One\n").unwrap();
-    fs::write(root.join("Two.md"), b"title:: Two\n").unwrap();
-    let graph = Graph::open(&root);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let one = ManagedPath::parse("One.md").unwrap();
-    let two = ManagedPath::parse("Two.md").unwrap();
-
-    let mut wrong_semantic = (*index).clone();
-    persistent_set_insert(
-        &mut wrong_semantic.paths_by_semantic_key,
-        graph_text_semantic_key(
-            &wrong_semantic
-                .files_by_exact_path
-                .get(&two)
-                .unwrap()
-                .semantic,
-        ),
-        one.clone(),
-    );
-    assert!(validate_graph_text_admission_index(&wrong_semantic).is_err());
-
-    let mut wrong_resource = (*index).clone();
-    let two_resource = wrong_resource
-        .files_by_exact_path
-        .get(&two)
-        .unwrap()
-        .file_resource_id;
-    persistent_set_insert(
-        &mut wrong_resource.paths_by_file_resource,
-        two_resource,
-        "One.md".to_owned(),
-    );
-    assert!(validate_graph_text_admission_index(&wrong_resource).is_err());
-
-    let mut missing_kind = (*index).clone();
-    missing_kind
-        .file_is_graph_text_by_exact_relative
-        .remove(&"One.md".to_owned());
-    assert!(validate_graph_text_admission_index(&missing_kind).is_err());
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_memory_preflights_capture_maps_parser_and_overflow() {
-    let capture_root = scratch("admission-capture-bound");
-    for index in 0..8 {
-        fs::write(
-            capture_root.join(format!("Page-{index}.md")),
-            vec![b'x'; 8 * 1024],
-        )
-        .unwrap();
-    }
-    let graph = Graph::open(&capture_root);
-    reset_graph_text_admission_test_counters();
-    assert_eq!(
-        graph
-            .initial_shadow_raw_managed_text_inventory_with_limits(INITIAL_SHADOW_LIMITS)
-            .unwrap()
-            .len(),
-        8
-    );
-    assert_eq!(
-        graph_text_admission_test_counters().builder_enumerations,
-        3,
-        "live admission must enumerate each graph root once"
-    );
-
-    let resource_root = scratch("admission-resource-map-preflight");
-    fs::write(
-        resource_root.join("retained-resource-with-a-long-name.bin"),
-        b"x",
-    )
-    .unwrap();
-    let graph = Graph::open(&resource_root);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-    let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-    assert!(permanent > 0);
-    reset_graph_text_admission_test_counters();
-    assert!(graph
-        .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-            permanent_index_bytes: permanent - 1,
-            ..INITIAL_SHADOW_LIMITS
-        })
-        .is_err());
-    assert_eq!(
-        graph_text_admission_test_counters().index_map_insertions,
-        0,
-        "resource maps must be rejected before their first permanent insertion"
-    );
-
-    let parser_root = scratch("admission-parser-peak-preflight");
-    let title = "T".repeat(32 * 1024);
-    let parser_content = format!("title:: {title}\n\n- body\n");
-    fs::write(parser_root.join("Page.md"), &parser_content).unwrap();
-    let graph = Graph::open(&parser_root);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-    let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-    let obsolete_parse_peak = managed_page_build_upper_bound(&parser_content).unwrap();
-    let parser_limit = checked_add_bytes(
-        checked_add_bytes(capture.peak_build_charge, permanent).unwrap(),
-        obsolete_parse_peak - 1,
-    )
-    .unwrap();
-    reset_graph_text_admission_test_counters();
-    assert!(graph
-        .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-            peak_build_bytes: parser_limit,
-            ..INITIAL_SHADOW_LIMITS
-        })
-        .is_ok());
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(counters.parser_invocations, 1);
-    assert!(counters.index_map_insertions > 0);
-
-    let overflow_root = scratch("admission-capture-charge-overflow");
-    let graph = Graph::open(&overflow_root);
-    GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(|charge| charge.set(Some(u64::MAX)));
-    reset_graph_text_admission_test_counters();
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-    assert_eq!(
-        graph_text_admission_test_counters().builder_enumerations,
-        3,
-        "capture-charge overflow must fail after one graph-wide census"
-    );
-
-    let _ = fs::remove_dir_all(&capture_root);
-    let _ = fs::remove_dir_all(&resource_root);
-    let _ = fs::remove_dir_all(&parser_root);
-    let _ = fs::remove_dir_all(&overflow_root);
-}
-
-#[test]
-fn initial_shadow_reads_each_enumerated_file_through_its_retained_binding() {
-    let root = scratch("initial-shadow-open-race");
-    fs::write(root.join("pages/a.md"), b"- first\n").unwrap();
-    let graph = Graph::open(&root);
-    let target = root.join("pages/a.md");
-    let retired = root.join("pages/a.retired.md");
-    MANAGED_INVENTORY_READ_RACE.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&target, &retired)?;
-            fs::write(&target, b"- replacement\n")
-        }));
-    });
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn initial_shadow_uses_configured_nested_roots_and_longest_root_identity() {
-    let root = scratch("initial-shadow-configured-nested");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        "{:pages-directory \"content/pages\"\n\
-              :journals-directory \"content/journals\"\n\
-              :journal/file-name-format \"dd-MM-yyyy\"\n\
-              :journal/page-title-format \"yyyy-MM-dd\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(root.join("content/pages/arbitrary/deeper")).unwrap();
-    fs::create_dir_all(root.join("content/journals/archive/deeper")).unwrap();
-    fs::write(
-        root.join("content/pages/arbitrary/deeper/Project%2FPlan.md"),
-        b"- page\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("content/journals/archive/deeper/25-07-2026.org"),
-        b"* journal\n",
-    )
-    .unwrap();
-
-    let graph = Graph::open(&root);
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(
-        inventory
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "content/journals/archive/deeper/25-07-2026.org",
-                b"* journal\n".as_slice(),
-            ),
-            (
-                "content/pages/arbitrary/deeper/Project%2FPlan.md",
-                b"- page\n".as_slice(),
-            ),
-        ]
-    );
-    let journal = graph
-        .managed_entry_for_managed_path(&inventory[0].0)
-        .unwrap();
-    assert_eq!(journal.kind, PageKind::Journal);
-    assert_eq!(journal.name, "2026-07-25");
-    let page = graph
-        .managed_entry_for_managed_path(&inventory[1].0)
-        .unwrap();
-    assert_eq!(page.kind, PageKind::Page);
-    assert_eq!(page.name, "Project/Plan");
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn initial_shadow_accepts_markdown_in_a_configured_nested_page_root() {
-    let root = scratch("initial-shadow-configured-markdown");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        "{:pages-directory \"content/pages\"}\n",
-    )
-    .unwrap();
-    let path = root.join("content/pages/arbitrary/deeper/Project%2FPlan.markdown");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, b"- markdown page\n").unwrap();
-
-    let graph = Graph::open(&root);
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(inventory.len(), 1);
-    assert_eq!(
-        inventory[0].0.as_str(),
-        "content/pages/arbitrary/deeper/Project%2FPlan.markdown"
-    );
-    assert_eq!(inventory[0].1, b"- markdown page\n");
-    let page = graph
-        .managed_entry_for_managed_path(&inventory[0].0)
-        .unwrap();
-    assert_eq!(page.kind, PageKind::Page);
-    assert_eq!(page.name, "Project/Plan");
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn initial_shadow_handles_overlapping_roots_in_both_directions() {
-    for (tag, pages, journals, expected) in [
-        (
-            "outer-pages",
-            "content",
-            "content/journals",
-            vec![
-                ("content/journals/archive.org", PageKind::Page),
-                ("content/project.md", PageKind::Page),
-            ],
-        ),
-        (
-            "outer-journals",
-            "content/pages",
-            "content",
-            vec![
-                ("content/archive.org", PageKind::Page),
-                ("content/pages/project.md", PageKind::Page),
-            ],
-        ),
-    ] {
-        let root = scratch(&format!("initial-shadow-overlap-{tag}"));
-        fs::create_dir_all(root.join("logseq")).unwrap();
-        fs::write(
-            root.join("logseq/config.edn"),
-            format!("{{:pages-directory \"{pages}\"\n:journals-directory \"{journals}\"}}\n"),
-        )
-        .unwrap();
-        for (path, _) in &expected {
-            let path = root.join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(
-                &path,
-                if path.extension().and_then(|value| value.to_str()) == Some("org") {
-                    b"* entry\n".as_slice()
-                } else {
-                    b"- entry\n".as_slice()
-                },
-            )
-            .unwrap();
-        }
-        let graph = Graph::open(&root);
-        let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        assert_eq!(inventory.len(), 2);
-        for (path, kind) in expected {
-            let (managed, _) = inventory
-                .iter()
-                .find(|(managed, _)| managed.as_str() == path)
-                .unwrap();
-            assert_eq!(
-                graph.managed_entry_for_managed_path(managed).unwrap().kind,
-                kind
-            );
-        }
-        let _ = fs::remove_dir_all(&root);
-    }
-}
-
-#[test]
-fn live_admission_ignores_equal_creation_roots_and_defers_directory_retarget() {
-    let equal = scratch("initial-shadow-equal-roots");
-    fs::create_dir_all(equal.join("logseq")).unwrap();
-    fs::write(
-        equal.join("logseq/config.edn"),
-        "{:pages-directory \"content\" :journals-directory \"content\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(equal.join("content")).unwrap();
-    assert!(Graph::open(&equal)
-        .initial_shadow_raw_managed_text_inventory()
-        .unwrap()
-        .is_empty());
-
-    let retarget = scratch("initial-shadow-configured-retarget");
-    fs::create_dir_all(retarget.join("logseq")).unwrap();
-    fs::write(
-        retarget.join("logseq/config.edn"),
-        "{:pages-directory \"content/pages\" :journals-directory \"content/journals\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(retarget.join("content/pages")).unwrap();
-    fs::write(retarget.join("content/pages/a.md"), b"- same\n").unwrap();
-    let graph = Graph::open(&retarget);
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-        let pages = retarget.join("content/pages");
-        let retired = retarget.join("content/pages-retired");
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&pages, retired)?;
-            fs::create_dir_all(&pages)?;
-            fs::write(pages.join("a.md"), b"- same\n")
-        }));
-    });
-    assert_eq!(
-        graph.initial_shadow_raw_managed_text_inventory().unwrap(),
-        vec![(
-            ManagedPath::parse("content/pages/a.md").unwrap(),
-            b"- same\n".to_vec(),
-        )]
-    );
-
-    let _ = fs::remove_dir_all(&equal);
-    let _ = fs::remove_dir_all(&retarget);
-}
-
-#[cfg(unix)]
-#[test]
-fn initial_shadow_rejects_a_configured_root_symlink() {
-    use std::os::unix::fs::symlink;
-
-    let root = scratch("initial-shadow-configured-symlink");
-    let outside = scratch("initial-shadow-configured-symlink-outside");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        "{:pages-directory \"content/pages\" :journals-directory \"content/journals\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(root.join("content")).unwrap();
-    symlink(outside.join("pages"), root.join("content/pages")).unwrap();
-    let graph = Graph::open(&root);
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-    let _ = fs::remove_file(root.join("content/pages"));
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&outside);
-}
-
-#[test]
-fn initial_shadow_validation_pass_retains_metadata_not_second_raw_inventory() {
-    let root = scratch("initial-shadow-peak");
-    fs::write(root.join("pages/a.md"), vec![b'a'; 4096]).unwrap();
-    fs::write(root.join("pages/b.md"), vec![b'b'; 8192]).unwrap();
-    let graph = Graph::open(&root);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-
-    let first = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-    let validation = collect_initial_shadow_managed_inventory(&graph, &permit, false).unwrap();
-    assert!(first.entries.iter().all(|entry| entry.bytes.is_some()));
-    assert!(validation.entries.iter().all(|entry| entry.bytes.is_none()));
-    assert_eq!(
-        first
-            .entries
-            .iter()
-            .map(|entry| (
-                entry.path.clone(),
-                entry.description,
-                entry.file_resource_id
-            ))
-            .collect::<Vec<_>>(),
-        validation
-            .entries
-            .iter()
-            .map(|entry| (
-                entry.path.clone(),
-                entry.description,
-                entry.file_resource_id
-            ))
-            .collect::<Vec<_>>()
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn initial_shadow_iterative_limits_count_empty_depth_and_nonmanaged_entries() {
-    let deep = scratch("initial-shadow-deep-limit");
-    fs::create_dir_all(deep.join("pages/a/b/c/d")).unwrap();
-    let graph = Graph::open(&deep);
-    let limits = InitialShadowLimits {
-        directory_depth: 3,
-        ..INITIAL_SHADOW_LIMITS
-    };
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    assert!(
-        collect_initial_shadow_managed_inventory_with_limits(&graph, &permit, true, limits, 0,)
-            .is_err()
-    );
-
-    let many = scratch("initial-shadow-all-entry-limit");
-    for index in 0..4 {
-        fs::write(
-            many.join("pages").join(format!(".projection-{index}.tmp")),
-            b"",
-        )
-        .unwrap();
-    }
-    let graph = Graph::open(&many);
-    let limits = InitialShadowLimits {
-        all_entries: 3,
-        ..INITIAL_SHADOW_LIMITS
-    };
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    assert!(
-        collect_initial_shadow_managed_inventory_with_limits(&graph, &permit, true, limits, 0,)
-            .is_err()
-    );
-
-    let pending = scratch("initial-shadow-pending-directory-limit");
-    fs::write(pending.join("pages/a.md"), b"").unwrap();
-    let graph = Graph::open(&pending);
-    let limits = InitialShadowLimits {
-        pending_directories: 0,
-        ..INITIAL_SHADOW_LIMITS
-    };
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    assert!(
-        collect_initial_shadow_managed_inventory_with_limits(&graph, &permit, true, limits, 0,)
-            .is_err()
-    );
-
-    let _ = fs::remove_dir_all(&deep);
-    let _ = fs::remove_dir_all(&many);
-    let _ = fs::remove_dir_all(&pending);
-}
-
-#[cfg(unix)]
-#[test]
-fn initial_shadow_rejects_file_aliases_but_retains_portable_collisions() {
-    let aliases = scratch("initial-shadow-hardlink");
-    fs::write(aliases.join("pages/a.md"), b"- a\n").unwrap();
-    fs::hard_link(aliases.join("pages/a.md"), aliases.join("pages/alias.tmp")).unwrap();
-    let graph = Graph::open(&aliases);
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-    let portable = scratch("initial-shadow-portable");
-    fs::write(portable.join("pages/Foo.md"), b"- upper\n").unwrap();
-    fs::write(portable.join("pages/foo.md"), b"- lower\n").unwrap();
-    let graph = Graph::open(&portable);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_portable_key
-            .get(&ManagedPath::parse("pages/Foo.md").unwrap().portable_key())
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let _ = fs::remove_dir_all(&aliases);
-    let _ = fs::remove_dir_all(&portable);
 }
 
 #[test]
@@ -15371,197 +10957,6 @@ fn bounded_read_stops_file_growth_after_metadata_at_the_ceiling() {
     assert_eq!(fs::metadata(path).unwrap().len(), 32);
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_exact_parent_retarget_cannot_redirect_absent_publication() {
-    let dir = scratch("projection-retarget-absent");
-    let outside = scratch("projection-retarget-absent-outside");
-    let moved = dir.join("pages-retained");
-    fs::write(outside.join("Projection.md"), b"- outside\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    PROJECTION_PARENT_RETARGET.with(|retarget| {
-        *retarget.borrow_mut() = Some(ProjectionParentRetarget {
-            parent: dir.join("pages"),
-            moved: moved.clone(),
-            outside: outside.clone(),
-        });
-    });
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", None, b"- target\n")
-        .is_err());
-    assert_eq!(
-        fs::read(outside.join("Projection.md")).unwrap(),
-        b"- outside\n"
-    );
-    assert!(!moved.join("Projection.md").exists());
-    assert!(!graph
-        .recent_writes
-        .lock()
-        .unwrap()
-        .contains_key(&dir.join("pages/Projection.md")));
-
-    fs::remove_file(dir.join("pages")).unwrap();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&outside);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_exact_parent_retarget_cannot_redirect_replacement() {
-    let dir = scratch("projection-retarget-base");
-    let outside = scratch("projection-retarget-base-outside");
-    let moved = dir.join("pages-retained");
-    fs::write(dir.join("pages/Projection.md"), b"- base\n").unwrap();
-    fs::write(outside.join("Projection.md"), b"- outside\n").unwrap();
-    let graph = Graph::open(&dir);
-
-    PROJECTION_PARENT_RETARGET.with(|retarget| {
-        *retarget.borrow_mut() = Some(ProjectionParentRetarget {
-            parent: dir.join("pages"),
-            moved: moved.clone(),
-            outside: outside.clone(),
-        });
-    });
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
-        .is_err());
-    assert_eq!(
-        fs::read(outside.join("Projection.md")).unwrap(),
-        b"- outside\n"
-    );
-    assert_eq!(fs::read(moved.join("Projection.md")).unwrap(), b"- base\n");
-
-    fs::remove_file(dir.join("pages")).unwrap();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&outside);
-}
-
-#[cfg(unix)]
-#[test]
-fn projection_exact_rejects_unsafe_symlink_special_twin_and_non_utf8_paths() {
-    use std::os::unix::fs::symlink;
-
-    let dir = scratch("projection-exact-paths");
-    let graph = Graph::open(&dir);
-    for invalid in [
-        "/tmp/Projection.md",
-        "pages/../Projection.md",
-        "assets/Projection.md",
-        "pages/Projection.md:stream.md",
-        "pages/CON.md",
-        "pages/NUL.md",
-    ] {
-        assert!(
-            graph
-                .write_projection_exact(invalid, None, b"- target\n")
-                .is_err(),
-            "unsafe path {invalid:?} was accepted"
-        );
-    }
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", None, &[0xff])
-        .is_err());
-    assert!(graph
-        .write_projection_exact("pages/Projection.md", Some(&[0xff]), b"- target\n")
-        .is_err());
-    fs::write(dir.join("pages/NonUtf8.md"), [0xff]).unwrap();
-    assert!(graph
-        .write_projection_exact("pages/NonUtf8.md", Some(&[0xff]), b"- target\n")
-        .is_err());
-    assert!(graph
-        .recover_projection_exact("pages/NonUtf8.md", &[0xff])
-        .is_err());
-
-    let real = dir.join("pages/Real.md");
-    let linked = dir.join("pages/Linked.md");
-    fs::write(&real, b"- real\n").unwrap();
-    symlink(&real, &linked).unwrap();
-    assert!(graph
-        .write_projection_exact("pages/Linked.md", Some(b"- real\n"), b"- target\n")
-        .is_err());
-
-    symlink(dir.join("journals"), dir.join("pages/LinkedParent")).unwrap();
-    assert!(graph
-        .write_projection_exact("pages/LinkedParent/Projection.md", None, b"- target\n")
-        .is_err());
-    assert!(!dir.join("journals/Projection.md").exists());
-
-    fs::create_dir_all(dir.join("pages/Special.md")).unwrap();
-    assert!(graph
-        .write_projection_exact("pages/Special.md", None, b"- target\n")
-        .is_err());
-
-    let special_sibling_target = dir.join("pages/SpecialSibling.md");
-    let special_sibling = dir.join("pages/SpecialSibling.org");
-    fs::write(&special_sibling_target, b"- markdown\n").unwrap();
-    fs::create_dir_all(&special_sibling).unwrap();
-    assert!(graph
-        .write_projection_exact(
-            "pages/SpecialSibling.md",
-            Some(b"- markdown\n"),
-            b"- target\n",
-        )
-        .is_err());
-    assert_eq!(fs::read(&special_sibling_target).unwrap(), b"- markdown\n");
-    assert!(special_sibling.is_dir());
-
-    let twin_md = dir.join("pages/Twin.md");
-    let twin_org = dir.join("pages/Twin.org");
-    fs::write(&twin_md, b"- markdown\n").unwrap();
-    fs::write(&twin_org, b"* org\n").unwrap();
-    let proof = graph
-        .write_projection_exact("pages/Twin.md", Some(b"- markdown\n"), b"- target\n")
-        .unwrap();
-    assert_eq!(proof.bytes(), b"- target\n");
-    assert_eq!(fs::read(&twin_md).unwrap(), b"- target\n");
-    assert_eq!(fs::read(&twin_org).unwrap(), b"* org\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_uses_editor_corruption_firewalls_before_mutation() {
-    let dir = scratch("projection-shared-firewalls");
-    let graph = Graph::open(&dir);
-
-    let org_path = dir.join("pages/Unsafe.org");
-    let unsafe_org = "* a\n*** c\n";
-    fs::write(&org_path, unsafe_org).unwrap();
-    let error = graph
-        .write_projection_exact(
-            "pages/Unsafe.org",
-            Some(unsafe_org.as_bytes()),
-            b"* replacement\n",
-        )
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(fs::read(&org_path).unwrap(), unsafe_org.as_bytes());
-
-    let header_path = dir.join("pages/Header.md");
-    let header_base = "A:: header\nB:: retained\n\n- body\n";
-    fs::write(&header_path, header_base).unwrap();
-    let error = graph
-        .write_projection_exact(
-            "pages/Header.md",
-            Some(header_base.as_bytes()),
-            b"A:: header\n\n- B:: retained\n- body\n",
-        )
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(fs::read(&header_path).unwrap(), header_base.as_bytes());
-
-    let crlf_path = dir.join("pages/Crlf.md");
-    fs::write(&crlf_path, b"- before\r\n").unwrap();
-    let proof = graph
-        .write_projection_exact("pages/Crlf.md", Some(b"- before\r\n"), b"- after\r\n")
-        .unwrap();
-    assert_eq!(proof.bytes(), b"- after\r\n");
-    assert_eq!(fs::read(&crlf_path).unwrap(), b"- after\r\n");
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -15597,121 +10992,30 @@ fn native_case_alias_requires_retirement_before_new_spelling() {
         let _ = fs::remove_dir_all(&dir);
         return;
     }
-    let graph = Graph::open(&dir);
+    let pages = Dir::open_ambient_dir(dir.join("pages"), ambient_authority()).unwrap();
+    fs::write(dir.join("pages/staged"), target).unwrap();
 
-    let conflict = graph
-        .write_projection_exact("pages/Foo.md", None, target)
-        .unwrap_err();
-    assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+    // A new spelling only becomes live through the graph tree's no-clobber
+    // publication. On a case-insensitive filesystem the existing `foo.md` IS
+    // the destination, so publication must refuse rather than replace it, and
+    // the old spelling must be retired first. (Managed Storage's exact-byte
+    // writer performed this rename; ADR 0066 removed the writer, not the rule.)
+    let conflict = rename_projection_noreplace(&pages, "staged", "Foo.md").unwrap_err();
+    assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists, "{conflict}");
     assert_eq!(fs::read(&old).unwrap(), base);
 
-    graph.remove_projection_exact("pages/foo.md", base).unwrap();
-    graph
-        .write_projection_exact("pages/Foo.md", None, target)
-        .unwrap();
+    fs::remove_file(&old).unwrap();
+    rename_projection_noreplace(&pages, "staged", "Foo.md").unwrap();
     assert_eq!(fs::read(&new).unwrap(), target);
 
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn projection_reserved_name_collision_fails_no_replace() {
-    let dir = scratch("projection-reserved-collision");
-    let path = dir.join("pages/Collision.md");
-    fs::write(&path, b"- base\n").unwrap();
-    let graph = Graph::open(&dir);
-    let reservation = ProjectionAttemptReservation::for_test("pages/Collision.md");
-    let reserved = dir.join("pages").join(reservation.recovery_filename());
-    fs::write(&reserved, b"- forged\n").unwrap();
-    let write = graph.admit_retained_managed_text_writer().unwrap();
-    let document = parse_doc(&path, "- target\n");
-    let guarded_layout = GuardedProjectionLayout::canonical_for_test(&document);
-
-    assert!(graph
-        .write_page_projection_with_attempts(
-            &write,
-            "pages/Collision.md",
-            Some(b"- base\n"),
-            b"- target\n",
-            &guarded_layout,
-            &reservation,
-            std::slice::from_ref(&reservation),
-            None,
-        )
-        .is_err());
-    assert_eq!(fs::read(&path).unwrap(), b"- base\n");
-    assert_eq!(fs::read(&reserved).unwrap(), b"- forged\n");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn projection_collision_probes_are_bounded_with_ten_thousand_siblings() {
-    let dir = scratch("projection-exact-probe-count");
-    let pages = dir.join("pages");
-    for index in 0..10_000 {
-        fs::write(
-            pages.join(format!("unrelated-{index}.md")),
-            b"- unrelated\n",
-        )
-        .unwrap();
-    }
-    TEST_PROJECTION_ATTEMPTS.with(|catalog| catalog.borrow_mut().clear());
-    PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
-    let graph = Graph::open(&dir);
-    graph
-        .write_projection_exact("pages/Constant.md", None, b"- target\n")
-        .unwrap();
-    let with_siblings = PROJECTION_EXACT_OPEN_COUNT.with(std::cell::Cell::get);
-
-    let empty = scratch("projection-exact-probe-control");
-    TEST_PROJECTION_ATTEMPTS.with(|catalog| catalog.borrow_mut().clear());
-    PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
-    let graph = Graph::open(&empty);
-    graph
-        .write_projection_exact("pages/Constant.md", None, b"- target\n")
-        .unwrap();
-    let without_siblings = PROJECTION_EXACT_OPEN_COUNT.with(std::cell::Cell::get);
-    assert!(
-            with_siblings <= without_siblings + 16,
-            "exact-path collision authority must not scan unrelated siblings: with_siblings={with_siblings}, without_siblings={without_siblings}"
-        );
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&empty);
-}
-
-#[test]
-fn sparse_giant_projection_file_is_rejected_before_allocation_and_untouched() {
-    let dir = scratch("projection-giant-evidence");
-    let path = dir.join("pages/Giant.md");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .unwrap();
-    file.set_len(MAX_PROJECTION_EVIDENCE_BYTES + 1).unwrap();
-    drop(file);
-    let graph = Graph::open(&dir);
-
-    let error = graph
-        .write_projection_exact("pages/Giant.md", None, b"- target\n")
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(
-        fs::metadata(&path).unwrap().len(),
-        MAX_PROJECTION_EVIDENCE_BYTES + 1
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn production_projection_has_no_alternate_graph_writer_entrypoint() {
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let forbidden = ["pub(crate) fn write_projection", "_exact"].concat();
     assert!(!source.contains(&forbidden));
-    assert!(source.contains("pub(crate) fn write_page_projection"));
     assert!(source.contains("self.serialize_page_document("));
 }
 
@@ -15723,19 +11027,19 @@ fn production_projection_has_no_alternate_graph_writer_entrypoint() {
 /// whose Android arm is hard-link-then-unlink and fails with `EACCES` on the
 /// shared storage a Direct Files graph lives in. v0.6.981 shipped exactly that
 /// and every Android save failed. Imitate `move_graph_text_exact_no_replace`
-/// in `model.rs`; the storage boundary stays for app-private authorities only.
+/// in `model/projection_rename.rs`; the storage boundary stays for app-private authorities only.
 #[test]
 fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     const RULE: &str = "GH #466 / I-16: Direct Files graph-text name transitions use \
         move_graph_text_exact_no_replace (the graph tree's renameat2(RENAME_NOREPLACE) \
         family), never tine-storage's DurableDirectoryPublication, whose Android arm is a \
         hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let create = source
-        .split_once("    fn managed_atomic_create_with_proof(")
+        .split_once("fn graph_text_atomic_create_with_proof(")
         .expect("Direct Files create path")
         .1
-        .split_once("\n    fn managed_atomic_write_with_conflict(")
+        .split_once("fn graph_text_atomic_write_with_conflict(")
         .expect("next Direct Files write function")
         .0;
     assert!(
@@ -15748,13 +11052,13 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!create.contains(".move_exact_no_replace("), "{RULE}");
 
     let write = source
-        .split_once("    fn managed_atomic_write_validated(")
+        .split_once("fn graph_text_atomic_write_validated(")
         .expect("Direct Files validated write path")
         .1
         .split_once("\n    /// Replace an existing editor target")
         .expect("Direct Files bounded replacement")
         .0;
-    assert!(write.contains("self.managed_atomic_replace_bound("));
+    assert!(write.contains("self.graph_text_atomic_replace_bound("));
     assert!(
         write.contains(
             "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
@@ -15766,10 +11070,10 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!write.contains("target.parent().rename("), "{RULE}");
 
     let replace = source
-        .split_once("    fn managed_atomic_replace_bound(")
+        .split_once("fn graph_text_atomic_replace_bound(")
         .expect("Direct Files bounded replacement")
         .1
-        .split_once("\n    fn managed_move_noreplace(")
+        .split_once("fn graph_text_move_noreplace(")
         .expect("next projection method")
         .0;
     // The retire/publish closure, the recovery set-aside, and the restore.
@@ -15779,14 +11083,6 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     );
     assert!(!replace.contains("DurableDirectoryPublication"), "{RULE}");
     assert!(!replace.contains(".move_exact_no_replace("), "{RULE}");
-    assert!(
-        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace"),
-        "the Direct arm must carry the exact-byte protocol, not the bare rename"
-    );
-    assert!(
-        replace.contains("EditorPublicationAuthority::ReconstructibleManagedProjection => {"),
-        "the managed projection arm keeps its own capability-fallback rename"
-    );
 }
 
 /// GH #466. The exact-byte protocol the Direct Files name transition carries:
@@ -16040,7 +11336,7 @@ fn conditional_publish_refuses_when_the_file_changed_underneath() {
     fs::write(&path, b"external").unwrap();
     let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
     match outcome {
-        AtomicReplaceOutcome::ExternalChanged(found) => assert_eq!(found, b"external"),
+        AtomicReplaceOutcome::ExternalChanged => {}
         AtomicReplaceOutcome::Published => panic!("published over an external write"),
     }
     assert_eq!(fs::read(&path).unwrap(), b"external", "their bytes stand");
@@ -16224,7 +11520,7 @@ fn checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound() {
     struct LimitsReset;
     impl Drop for LimitsReset {
         fn drop(&mut self) {
-            MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
+            GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
                 *limits.borrow_mut() = None;
             });
         }
@@ -16232,10 +11528,10 @@ fn checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound() {
 
     let dir = scratch("editor-recovery-walk-bound");
     let _reset = LimitsReset;
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
-        *limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
+        *limits.borrow_mut() = Some(GraphTextInventoryLimits {
             all_entries: 0,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
 
@@ -16437,25 +11733,63 @@ fn checked_open_and_resolve_reject_symlink_escape() {
     let _ = fs::remove_dir_all(&outside);
 }
 
+/// A query export is a copy of graph pages living under the graph root, so the
+/// scanner must never read it back as pages: an exported `Secret.md` would
+/// otherwise reappear as a twin of its own source (and leak into a later
+/// export). The fixed exclusion lives in `graph_text_scope::fixed_excluded`.
+#[test]
+fn published_queries_output_never_becomes_pages() {
+    let dir = scratch("published-queries-excluded");
+    fs::write(dir.join("pages/Secret.md"), "- real-page\n").unwrap();
+    fs::create_dir_all(dir.join("published-queries/open-tasks/pages")).unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/pages/Secret.md"),
+        "- exported-copy\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/Loose Page.md"),
+        "- exported-loose\n",
+    )
+    .unwrap();
+    let g = Graph::open(&dir);
+    let pages = g.list_pages();
+    assert_eq!(
+        pages.iter().filter(|p| p.name == "Secret").count(),
+        1,
+        "{pages:?}"
+    );
+    assert!(
+        pages
+            .iter()
+            .all(|p| !p.rel_path.starts_with("published-queries/")),
+        "{pages:?}"
+    );
+    assert!(g
+        .resolve_rel("published-queries/open-tasks/pages/Secret.md")
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[test]
-fn checked_open_rejects_managed_output_symlink_escapes() {
+fn checked_open_rejects_output_symlink_escapes() {
     use std::os::unix::fs::symlink;
-    for managed in ["assets", "logseq", "publish"] {
-        let dir = scratch(&format!("checked-open-{managed}-symlink"));
+    for output in ["assets", "logseq", "publish"] {
+        let dir = scratch(&format!("checked-open-{output}-symlink"));
         let outside = std::env::temp_dir().join(format!(
-            "tine-checked-open-{managed}-outside-{}",
+            "tine-checked-open-{output}-outside-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&outside).unwrap();
-        let managed_path = dir.join(managed);
-        let _ = fs::remove_dir_all(&managed_path);
-        symlink(&outside, &managed_path).unwrap();
+        let output_path = dir.join(output);
+        let _ = fs::remove_dir_all(&output_path);
+        symlink(&outside, &output_path).unwrap();
 
         assert!(
             Graph::open_checked(&dir).is_err(),
-            "accepted escaped {managed} directory"
+            "accepted escaped {output} directory"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -16558,9 +11892,9 @@ fn checked_open_accepts_an_approved_windows_assets_junction() {
 
 #[cfg(unix)]
 #[test]
-fn checked_open_rejects_managed_directories_aliased_inside_graph() {
+fn checked_open_rejects_graph_text_directories_aliased_inside_graph() {
     use std::os::unix::fs::symlink;
-    let dir = scratch("checked-open-managed-alias");
+    let dir = scratch("checked-open-graph-alias");
     symlink(dir.join("assets"), dir.join("publish")).unwrap();
     assert!(Graph::open_checked(&dir).is_err());
     let _ = fs::remove_dir_all(&dir);
@@ -16688,7 +12022,7 @@ fn nested_page_is_listed_openable_by_name_and_searchable() {
         "- nestedsentinel body\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     g.warm_cache();
 
     // Listed by basename, carrying its nested path.
@@ -16711,7 +12045,7 @@ fn nested_page_is_listed_openable_by_name_and_searchable() {
 
     // Indexed for full-text search (the cache folded it in via list_pages).
     assert!(
-        !g.search("nestedsentinel", 10).is_empty(),
+        !g.search("nestedsentinel", 10).unwrap().is_empty(),
         "nested page is searchable"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -16803,7 +12137,7 @@ fn warmed_duplicate_name_cache_keeps_physical_owners_distinct() {
     fs::write(&flat, "- flat original sentinel\n").unwrap();
     fs::write(&nested, "- nested original sentinel\n").unwrap();
 
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     g.warm_cache();
     let logical_winner = g
         .find_entry("Exact Storage Twin", PageKind::Page)
@@ -16869,6 +12203,7 @@ fn warmed_duplicate_name_cache_keeps_physical_owners_distinct() {
     ] {
         assert!(
             g.run_graph_search(needle, 0, 8, false)
+                .unwrap()
                 .hits
                 .iter()
                 .any(|hit| matches!(
@@ -17029,15 +12364,15 @@ fn rename_refuses_target_that_exists_in_other_format() {
 }
 
 #[test]
-fn managed_text_twin_refusal_includes_markdown_extension_variant() {
-    let dir = scratch("managed-markdown-twin");
+fn graph_text_twin_refusal_includes_markdown_extension_variant() {
+    let dir = scratch("graph-markdown-twin");
     fs::write(dir.join("pages/Twin.md"), "- md body\n").unwrap();
     fs::write(dir.join("pages/Twin.markdown"), "- markdown body\n").unwrap();
     let graph = Graph::open(&dir);
-    let write = graph.admit_managed_text_writer().unwrap();
+    let write = graph.admit_graph_text_writer().unwrap();
 
     assert!(graph
-        .managed_has_twin(&write, "Twin", PageKind::Page)
+        .graph_text_has_twin(&write, "Twin", PageKind::Page)
         .unwrap());
 
     let _ = fs::remove_dir_all(&dir);
@@ -17304,281 +12639,14 @@ fn journal_conflicts_expose_a_routable_path_per_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_mint_and_writer_admission_race_at_the_gate() {
-    let dir = scratch("handoff-admission-race");
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 90_900);
-    let gate = Arc::clone(managed_write_gate(&graph));
-    gate.set_admission_race_barrier(Some(Arc::new(std::sync::Barrier::new(2))));
-
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
-    let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
-    let (mint_release_tx, mint_release_rx) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        let result_tx = result_tx.clone();
-        move || match graph.admit_managed_text_writer() {
-            Ok(permit) => {
-                result_tx.send(("writer", Ok(()))).unwrap();
-                writer_release_rx.recv().unwrap();
-                drop(permit);
-            }
-            Err(error) => {
-                result_tx.send(("writer", Err(error.kind()))).unwrap();
-                writer_release_rx.recv().unwrap();
-            }
-        }
-    });
-    let mint = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        move || match graph.mint_handoff_safe(workspace_id, endpoint) {
-            Ok(handoff) => {
-                result_tx.send(("handoff", Ok(()))).unwrap();
-                mint_release_rx.recv().unwrap();
-                drop(handoff);
-            }
-            Err(error) => {
-                result_tx.send(("handoff", Err(error.kind()))).unwrap();
-                mint_release_rx.recv().unwrap();
-            }
-        }
-    });
-
-    let first = result_rx.recv().unwrap();
-    let second = result_rx.recv().unwrap();
-    gate.set_admission_race_barrier(None);
-    let outcomes = [first, second];
-    assert_eq!(
-        outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
-        1,
-        "the barrier placed both operations inside the admission race"
-    );
-    for (_, result) in outcomes {
-        if let Err(kind) = result {
-            assert_eq!(kind, io::ErrorKind::WouldBlock);
-        }
-    }
-
-    writer_release_tx.send(()).unwrap();
-    mint_release_tx.send(()).unwrap();
-    writer.join().unwrap();
-    mint.join().unwrap();
-    assert!(graph
-        .create_markdown_page_if_absent("after admission race", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_blocks_journal_migration_but_not_auxiliary_conflict_trash() {
-    let dir = scratch("handoff-omitted-entrypoints");
-    fs::create_dir_all(dir.join("logseq")).unwrap();
-    fs::write(
-        dir.join("logseq").join("config.edn"),
-        "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
-    )
-    .unwrap();
-    let title_named = "Thursday, 25-06-2026.org";
-    fs::write(dir.join("journals").join(title_named), "* migrate me\n").unwrap();
-    let conflict = "Foo.sync-conflict-20260705-141233-A2B2C3D.md";
-    fs::write(dir.join("pages").join(conflict), "- trash me\n").unwrap();
-
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 90_950);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    let start = Arc::new(std::sync::Barrier::new(3));
-    let migration = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        let start = Arc::clone(&start);
-        move || {
-            start.wait();
-            graph.migrate_journal_filenames_checked()
-        }
-    });
-    let trash = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        let start = Arc::clone(&start);
-        move || {
-            start.wait();
-            graph.trash_sync_conflict(&format!("pages/{conflict}"))
-        }
-    });
-
-    start.wait();
-    assert_handoff_blocked(migration.join().unwrap());
-    trash.join().unwrap().unwrap();
-    assert!(dir.join("journals").join(title_named).exists());
-    assert!(!dir.join("pages").join(conflict).exists());
-    assert_eq!(
-        trash_stats(&trash_root(&dir)).conflicts,
-        1,
-        "the conflict copy remains recoverable while graph-text authority is retired"
-    );
-
-    drop(handoff);
-    assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_resource_gate_blocks_reopen_but_not_an_independent_graph() {
-    let dir = scratch("handoff-reopen-gate");
-    let other_dir = scratch("handoff-independent-gate");
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_025);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    let reopened = Arc::new(Graph::open(&dir));
-    assert!(Arc::ptr_eq(
-        managed_write_gate(&graph),
-        managed_write_gate(&reopened)
-    ));
-    assert!(handoff
-        .verify_binding(&reopened, workspace_id, endpoint)
-        .is_err());
-    let independent = Arc::new(Graph::open(&other_dir));
-    let start = Arc::new(std::sync::Barrier::new(3));
-    let blocked_writer = std::thread::spawn({
-        let graph = Arc::clone(&reopened);
-        let start = Arc::clone(&start);
-        move || {
-            start.wait();
-            graph.create_markdown_page_if_absent("same resource", "- blocked\n")
-        }
-    });
-    let independent_writer = std::thread::spawn({
-        let graph = Arc::clone(&independent);
-        let start = Arc::clone(&start);
-        move || {
-            start.wait();
-            graph.create_markdown_page_if_absent("other resource", "- admitted\n")
-        }
-    });
-
-    start.wait();
-    assert_handoff_blocked(blocked_writer.join().unwrap());
-    assert!(independent_writer.join().unwrap().unwrap());
-    drop(handoff);
-    assert!(reopened
-        .create_markdown_page_if_absent("same resource released", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&other_dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn handoff_resource_gate_blocks_a_reopened_symlink_alias() {
-    use std::os::unix::fs::symlink;
-
-    let dir = scratch("handoff-symlink-resource");
-    let alias = dir.with_file_name("tine-handoff-symlink-resource-alias");
-    let _ = fs::remove_file(&alias);
-    symlink(&dir, &alias).unwrap();
-    let graph = Graph::open(&dir);
-    let reopened = Graph::open(&alias);
-    assert!(Arc::ptr_eq(
-        managed_write_gate(&graph),
-        managed_write_gate(&reopened)
-    ));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_035);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    assert_handoff_blocked(
-        reopened.create_markdown_page_if_absent("symlink alias blocked", "- no\n"),
-    );
-    assert!(!dir.join("pages").join("symlink alias blocked.md").exists());
-    assert!(handoff
-        .verify_binding(&reopened, workspace_id, endpoint)
-        .is_err());
-
-    drop(handoff);
-    assert!(reopened
-        .create_markdown_page_if_absent("symlink alias released", "- yes\n")
-        .unwrap());
-    let _ = fs::remove_file(&alias);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn managed_writer_identity_failure_never_mints_an_independent_gate() {
-    let dir = scratch("handoff-identity-acquisition-failure");
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_040);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    MANAGED_WRITE_IDENTITY_ACQUISITION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::other(
-                "injected transient graph identity acquisition failure",
-            ))
-        }));
-    });
-    let identity_failed = Graph::open(&dir);
-
-    assert!(identity_failed.managed_write_binding().is_err());
-    assert!(identity_failed
-        .create_markdown_page_if_absent("identity bypass", "- no\n")
-        .is_err());
-    assert!(!dir.join("pages").join("identity bypass.md").exists());
-
-    drop(handoff);
-    assert!(identity_failed
-        .create_markdown_page_if_absent("still fail closed", "- no\n")
-        .is_err());
-    assert!(graph
-        .create_markdown_page_if_absent("original binding released", "- yes\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn stale_graph_writes_retained_resource_not_replacement_reserved_by_another_gate() {
-    let dir = scratch("handoff-stale-root");
-    let moved = dir.with_file_name("tine-handoff-stale-root-moved");
-    let _ = fs::remove_dir_all(&moved);
-    let stale = Graph::open(&dir);
-    fs::rename(&dir, &moved).unwrap();
-    fs::create_dir_all(dir.join("pages")).unwrap();
-    fs::create_dir_all(dir.join("journals")).unwrap();
-    let replacement = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&replacement, 91_045);
-    let handoff = replacement
-        .mint_handoff_safe(workspace_id, endpoint)
-        .unwrap();
-
-    assert!(stale
-        .create_markdown_page_if_absent("retained writer", "- retained\n")
-        .unwrap());
-    assert!(!dir.join("pages").join("retained writer.md").exists());
-    assert_eq!(
-        fs::read(moved.join("pages").join("retained writer.md")).unwrap(),
-        b"- retained\n"
-    );
-    assert_handoff_blocked(
-        replacement.create_markdown_page_if_absent("replacement blocked", "- no\n"),
-    );
-
-    drop(handoff);
-    assert!(replacement
-        .create_markdown_page_if_absent("replacement released", "- yes\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
 #[cfg(unix)]
 #[test]
 fn root_replacement_after_admission_writes_retained_resource() {
-    let dir = scratch("handoff-admission-root-race");
-    let moved = dir.with_file_name("tine-handoff-admission-root-race-moved");
+    let dir = scratch("admission-root-race");
+    let moved = dir.with_file_name("tine-admission-root-race-moved");
     let _ = fs::remove_dir_all(&moved);
     let graph = Graph::open(&dir);
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
+    GRAPH_TEXT_WRITE_AFTER_ADMISSION.with(|hook| {
         let dir = dir.clone();
         let moved = moved.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -17603,8 +12671,8 @@ fn root_replacement_after_admission_writes_retained_resource() {
 #[cfg(unix)]
 #[test]
 fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() {
-    let dir = scratch("handoff-root-replacement-page-lock");
-    let moved = dir.with_file_name("tine-handoff-root-replacement-page-lock-moved");
+    let dir = scratch("root-replacement-page-lock");
+    let moved = dir.with_file_name("tine-root-replacement-page-lock-moved");
     let _ = fs::remove_dir_all(&moved);
     let graph = Arc::new(Graph::open(&dir));
     let target = dir.join("pages").join("page lock retained.md");
@@ -17614,7 +12682,7 @@ fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() 
     let writer = std::thread::spawn({
         let graph = Arc::clone(&graph);
         move || {
-            MANAGED_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
+            GRAPH_TEXT_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || admitted_tx.send(()).unwrap()));
             });
             graph.create_markdown_page_if_absent("page lock retained", "- retained\n")
@@ -17637,55 +12705,11 @@ fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() 
     let _ = fs::remove_dir_all(&moved);
 }
 
-#[cfg(unix)]
-#[test]
-fn replacement_after_final_check_cannot_redirect_mutation_into_reserved_root() {
-    let dir = scratch("handoff-capability-final-window");
-    let moved = dir.with_file_name("tine-handoff-capability-final-window-moved");
-    let _ = fs::remove_dir_all(&moved);
-    let graph = Graph::open(&dir);
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::write(dir.join("pages").join("replacement sentinel.md"), "- B\n")?;
-            let replacement = Graph::open(&dir);
-            let (workspace_id, endpoint) = handoff_binding(&replacement, 91_047);
-            let handoff = replacement.mint_handoff_safe(workspace_id, endpoint)?;
-            MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| {
-                *held.borrow_mut() = Some(handoff);
-            });
-            Ok(())
-        }));
-    });
-
-    assert!(graph
-        .create_markdown_page_if_absent("final window", "- retained A\n")
-        .unwrap());
-    assert_eq!(
-        fs::read(moved.join("pages").join("final window.md")).unwrap(),
-        b"- retained A\n"
-    );
-    assert!(!dir.join("pages").join("final window.md").exists());
-    assert_eq!(
-        fs::read(dir.join("pages").join("replacement sentinel.md")).unwrap(),
-        b"- B\n"
-    );
-    let replacement = Graph::open(&dir);
-    assert_handoff_blocked(replacement.create_markdown_page_if_absent("reserved B", "- blocked\n"));
-    MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| drop(held.borrow_mut().take()));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
 #[test]
 fn retained_content_budget_failed_reservation_is_atomic_and_retryable() {
-    let budget = RetainedContentBudget::new(ManagedTextInventoryLimits {
+    let budget = RetainedContentBudget::new(GraphTextInventoryLimits {
         retained_content_bytes: 10,
-        ..MANAGED_TEXT_INVENTORY_LIMITS
+        ..GRAPH_TEXT_INVENTORY_LIMITS
     });
     let first = budget.reserve(6, "first").unwrap();
     assert_eq!(budget.retained(), 6);
@@ -17711,9 +12735,9 @@ fn budgeted_reader_retains_metadata_capacity_across_repeated_shrink_races() {
     let root = scratch("budgeted-reader-shrink-capacity");
     let path = root.join("pages/shrinking.md");
     let graph = Graph::open(&root);
-    let budget = RetainedContentBudget::new(ManagedTextInventoryLimits {
+    let budget = RetainedContentBudget::new(GraphTextInventoryLimits {
         retained_content_bytes: 64,
-        ..MANAGED_TEXT_INVENTORY_LIMITS
+        ..GRAPH_TEXT_INVENTORY_LIMITS
     });
     for _ in 0..3 {
         fs::write(&path, vec![b'x'; 64]).unwrap();
@@ -17764,15 +12788,15 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
     Graph::open(&probe)
         .rename_page("Project", "Archive")
         .unwrap();
-    let peak = last_managed_content_budget_peak();
+    let peak = last_graph_text_content_budget_peak();
 
     let accepted = scratch("budget-rename-b");
     populate(&accepted);
-    set_managed_content_budget_limit(peak);
+    set_graph_text_content_budget_limit(peak);
     Graph::open(&accepted)
         .rename_page("Project", "Archive")
         .unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(accepted.join("pages/Archive.md").exists());
     assert!(fs::read_to_string(accepted.join("pages/Refs.md"))
         .unwrap()
@@ -17780,7 +12804,7 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
 
     let rejected = scratch("budget-rename-c");
     populate(&rejected);
-    set_managed_content_budget_limit(peak - 1);
+    set_graph_text_content_budget_limit(peak - 1);
     let graph = Graph::open(&rejected);
     let error = graph.rename_page("Project", "Archive").unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -17789,12 +12813,19 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
         "- [[Project/Child]]\n"
     );
     assert!(!rejected.join("pages/Archive.md").exists());
-    assert!(graph.cache.read().unwrap().is_none());
+    // The rejected rename must leave nothing of itself behind. The parsed
+    // cache may legitimately be warm here — `list_pages` joins the shared
+    // page-build flight (GH #550) — but every page in it must still be the
+    // page that is on disk, which is the graph before the rename.
+    if let Some(pages) = graph.cache.read().unwrap().as_ref() {
+        assert!(pages.iter().any(|(entry, _)| entry.name == "Project"));
+        assert!(!pages.iter().any(|(entry, _)| entry.name == "Archive"));
+    }
     assert!(graph.recent_writes.lock().unwrap().is_empty());
 
-    set_managed_content_budget_limit(peak);
+    set_graph_text_content_budget_limit(peak);
     graph.rename_page("Project", "Archive").unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(rejected.join("pages/Archive.md").exists());
     assert!(fs::read_to_string(rejected.join("pages/Refs.md"))
         .unwrap()
@@ -17825,21 +12856,21 @@ fn namespace_rename_many_small_entries_charges_container_state_before_mutation()
     Graph::open(&small)
         .rename_page("Project", "Archive")
         .unwrap();
-    let small_peak = last_managed_content_budget_peak();
+    let small_peak = last_graph_text_content_budget_peak();
 
     let many = scratch("rename-container-many-a");
     populate(&many, 32);
     Graph::open(&many)
         .rename_page("Project", "Archive")
         .unwrap();
-    let many_peak = last_managed_content_budget_peak();
+    let many_peak = last_graph_text_content_budget_peak();
     assert!(many_peak > small_peak);
 
     let rejected = scratch("rename-container-many-b");
     populate(&rejected, 32);
     let before = regular_file_tree(&rejected.join("pages"));
     let graph = Graph::open(&rejected);
-    set_managed_content_budget_limit(many_peak - 1);
+    set_graph_text_content_budget_limit(many_peak - 1);
     assert_eq!(
         graph.rename_page("Project", "Archive").unwrap_err().kind(),
         io::ErrorKind::InvalidData
@@ -17847,27 +12878,15 @@ fn namespace_rename_many_small_entries_charges_container_state_before_mutation()
     assert_eq!(regular_file_tree(&rejected.join("pages")), before);
     assert!(!rejected.join("pages/Archive.md").exists());
     assert!(graph.recent_writes.lock().unwrap().is_empty());
-    set_managed_content_budget_limit(many_peak);
+    set_graph_text_content_budget_limit(many_peak);
     graph.rename_page("Project", "Archive").unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(rejected.join("pages/Archive.md").exists());
     assert!(rejected.join("pages/Archive%2FTiny031.md").exists());
 
     let _ = fs::remove_dir_all(&small);
     let _ = fs::remove_dir_all(&many);
     let _ = fs::remove_dir_all(&rejected);
-}
-
-fn assert_exact_budget_cache_unchanged(
-    graph: &Graph,
-    before: &Option<Arc<Vec<(PageEntry, Arc<Document>)>>>,
-) {
-    let after = graph.cache.read().unwrap();
-    match (&*after, before) {
-        (None, None) => {}
-        (Some(after), Some(before)) => assert!(Arc::ptr_eq(after, before)),
-        _ => panic!("managed cache changed across rejected admission"),
-    }
 }
 
 #[test]
@@ -17922,14 +12941,14 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     let target_doc = nested_document(1, Some("- target"));
     let deepest_reference = format!("- [[Deep target]] and (({TARGET_ID}))");
 
-    let accepted = nested_document(MAX_MANAGED_BLOCK_DEPTH, Some(&deepest_reference));
+    let accepted = nested_document(MAX_BLOCK_DEPTH, Some(&deepest_reference));
     let accepted_dto = page_dto_checked(&entry, &accepted).unwrap();
     let mut accepted_walk = BlockDtoWalk::new(&accepted_dto.blocks);
     let mut accepted_count = 0_usize;
     while accepted_walk.next().unwrap().is_some() {
         accepted_count += 1;
     }
-    assert_eq!(accepted_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_count, MAX_BLOCK_DEPTH);
 
     let accepted_block = block_to_dto(&accepted.roots[0]).unwrap();
     let mut accepted_block_walk = BlockDtoWalk::new(std::slice::from_ref(&accepted_block));
@@ -17937,7 +12956,7 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     while accepted_block_walk.next().unwrap().is_some() {
         accepted_block_count += 1;
     }
-    assert_eq!(accepted_block_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_block_count, MAX_BLOCK_DEPTH);
 
     let accepted_snapshot = Graph::from_page_snapshot(
         &dir,
@@ -17966,10 +12985,10 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
         Some(Arc::new(vec![(entry.clone(), Arc::new(accepted))]));
     assert_eq!(
         accepted_graph.referenced_page_names().len(),
-        MAX_MANAGED_BLOCK_DEPTH,
+        MAX_BLOCK_DEPTH,
     );
 
-    let rejected = nested_document(MAX_MANAGED_BLOCK_DEPTH + 1, Some(&deepest_reference));
+    let rejected = nested_document(MAX_BLOCK_DEPTH + 1, Some(&deepest_reference));
     assert_eq!(
         page_dto_checked(&entry, &rejected).unwrap_err().kind(),
         io::ErrorKind::InvalidData,
@@ -18018,7 +13037,7 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     while accepted_markdown_walk.next().unwrap().is_some() {
         accepted_markdown_count += 1;
     }
-    assert_eq!(accepted_markdown_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_markdown_count, MAX_BLOCK_DEPTH);
     assert_eq!(
         markdown_page_dto("Depth 129", "Depth 129", &nested_markdown(129))
             .unwrap_err()
@@ -18030,831 +13049,6 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     assert_eq!(ordinary.blocks[0].raw, "body");
 
     let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn rename_inventory_and_referrer_reads_stay_on_retained_a_after_reserved_b_replacement() {
-    let dir = scratch("handoff-rename-selection-retained");
-    let moved = dir.with_file_name("tine-handoff-rename-selection-retained-moved");
-    let _ = fs::remove_dir_all(&moved);
-    fs::create_dir_all(dir.join("pages/client/deep")).unwrap();
-    fs::create_dir_all(dir.join("journals/archive/2026")).unwrap();
-    fs::write(dir.join("pages/Old.md"), "- old A\n").unwrap();
-    fs::write(
-        dir.join("pages/client/deep/Ref.md"),
-        "- A-only nested [[Old]]\n",
-    )
-    .unwrap();
-    fs::write(
-        dir.join("journals/archive/2026/07_24.md"),
-        "- A-only journal [[Old]]\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::write(dir.join("pages/Old.md"), "- old B\n")?;
-            fs::write(dir.join("pages/B-only.md"), "- B sentinel\n")?;
-            hold_replacement_handoff(&dir, 91_047_100)
-        }));
-    });
-
-    graph.rename_page_expected("Old", "New", None).unwrap();
-
-    assert!(!moved.join("pages/Old.md").exists());
-    assert_eq!(fs::read(moved.join("pages/New.md")).unwrap(), b"- old A\n");
-    assert_eq!(
-        fs::read(moved.join("pages/client/deep/Ref.md")).unwrap(),
-        b"- A-only nested [[New]]\n"
-    );
-    assert_eq!(
-        fs::read(moved.join("journals/archive/2026/07_24.md")).unwrap(),
-        b"- A-only journal [[New]]\n"
-    );
-    assert_eq!(fs::read(dir.join("pages/Old.md")).unwrap(), b"- old B\n");
-    assert!(!dir.join("pages/New.md").exists());
-    assert!(!dir.join("pages/client/deep/Ref.md").exists());
-    assert_eq!(
-        fs::read(dir.join("pages/B-only.md")).unwrap(),
-        b"- B sentinel\n"
-    );
-    let replacement = Graph::open(&dir);
-    assert_handoff_blocked(replacement.rename_page("Old", "Blocked"));
-
-    release_replacement_handoff();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-#[cfg(unix)]
-#[test]
-fn journal_migration_selection_stays_on_nested_retained_a_after_reserved_b_replacement() {
-    let dir = scratch("handoff-journal-selection-retained");
-    let moved = dir.with_file_name("tine-handoff-journal-selection-retained-moved");
-    let _ = fs::remove_dir_all(&moved);
-    fs::create_dir_all(dir.join("logseq")).unwrap();
-    fs::write(
-        dir.join("logseq/config.edn"),
-        "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(dir.join("journals/imported/deep")).unwrap();
-    let title_named = "Thursday, 25-06-2026.org";
-    fs::write(
-        dir.join("journals/imported/deep").join(title_named),
-        "* journal A\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::write(dir.join("journals").join(title_named), "* title-named B\n")?;
-            fs::write(dir.join("journals/2026_06_25.org"), "* canonical B\n")?;
-            hold_replacement_handoff(&dir, 91_047_200)
-        }));
-    });
-
-    assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
-
-    assert!(!moved
-        .join("journals/imported/deep")
-        .join(title_named)
-        .exists());
-    assert_eq!(
-        fs::read(moved.join("journals/2026_06_25.org")).unwrap(),
-        b"* journal A\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("journals").join(title_named)).unwrap(),
-        b"* title-named B\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("journals/2026_06_25.org")).unwrap(),
-        b"* canonical B\n"
-    );
-
-    release_replacement_handoff();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
-#[cfg(unix)]
-#[test]
-fn save_force_save_and_delete_selection_stay_on_retained_a_after_reserved_b_replacement() {
-    let dir = scratch("handoff-save-delete-selection-retained");
-    let moved = dir.with_file_name("tine-handoff-save-delete-selection-retained-moved");
-    let _ = fs::remove_dir_all(&moved);
-    fs::create_dir_all(dir.join("pages/archive/deep")).unwrap();
-    fs::write(dir.join("pages/Target.org"), "* target A\n").unwrap();
-    fs::write(dir.join("pages/archive/deep/Victim.md"), "- victim A\n").unwrap();
-    let graph = Graph::open(&dir);
-    let mut page = graph.load_named("Target", PageKind::Page).unwrap().unwrap();
-    let base_rev = page.rev.clone().unwrap();
-    as_editor(&graph, &mut page);
-    page.path.clear();
-    page.blocks[0].raw = "saved A".to_owned();
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages/other/deep"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::write(dir.join("pages/Target.md"), "- target B\n")?;
-            fs::write(dir.join("pages/other/deep/Victim.md"), "- victim B\n")?;
-            hold_replacement_handoff(&dir, 91_047_300)
-        }));
-    });
-
-    let saved_rev = graph.save_page(&page, Some(&base_rev)).unwrap();
-    page.blocks[0].raw = "forced A".to_owned();
-    fs::write(moved.join("pages/Target.org"), "* external A\n").unwrap();
-    let shown = graph.save_page(&page, Some(&saved_rev)).unwrap_err();
-    graph
-        .force_save_page_at_revision(&page, Some(&saved_rev), gh254_shown(&shown))
-        .unwrap();
-    graph
-        .delete_page_expected("Victim", PageKind::Page, None)
-        .unwrap();
-
-    assert_eq!(
-        fs::read_to_string(moved.join("pages/Target.org")).unwrap(),
-        "* forced A\n"
-    );
-    assert!(!moved.join("pages/Target.md").exists());
-    assert!(!moved.join("pages/archive/deep/Victim.md").exists());
-    assert_eq!(
-        fs::read(dir.join("pages/Target.md")).unwrap(),
-        b"- target B\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("pages/other/deep/Victim.md")).unwrap(),
-        b"- victim B\n"
-    );
-
-    release_replacement_handoff();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
-#[cfg(unix)]
-#[test]
-fn hls_selection_migration_and_legacy_cleanup_stay_on_retained_a_under_reserved_b() {
-    let dir = scratch("handoff-hls-selection-retained");
-    let moved = dir.with_file_name("tine-handoff-hls-selection-retained-moved");
-    let _ = fs::remove_dir_all(&moved);
-    let pdf = "My Paper.pdf";
-    let legacy_key = crate::pdf::legacy_asset_key(pdf);
-    let new_key = crate::pdf::asset_key(pdf);
-    let highlight = mkhl("11111111-1111-1111-1111-111111111111", 3, Some("legacy"));
-    let mut legacy_page =
-        crate::pdf::hls_page_document(pdf, "Paper", std::slice::from_ref(&highlight));
-    legacy_page.roots[0]
-        .children
-        .push(DocBlock::new("A-only private note"));
-    fs::write(
-        dir.join("pages")
-            .join(format!("{}.md", crate::pdf::hls_page_name(&legacy_key))),
-        doc::serialize(&legacy_page),
-    )
-    .unwrap();
-    let graph = Graph::open(&dir);
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        let b_page = format!("{}.md", crate::pdf::hls_page_name(&new_key));
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::create_dir_all(dir.join("assets"))?;
-            fs::write(dir.join("pages").join(&b_page), "- B-only hls page\n")?;
-            fs::write(dir.join("assets/my_paper.pdf"), b"B collision input")?;
-            hold_replacement_handoff(&dir, 91_047_500)
-        }));
-    });
-
-    graph
-        .write_highlights(
-            pdf,
-            "Paper",
-            std::slice::from_ref(&highlight),
-            std::slice::from_ref(&highlight.id),
-        )
-        .unwrap();
-
-    let a_new = moved
-        .join("pages")
-        .join(format!("{}.md", crate::pdf::hls_page_name(&new_key)));
-    assert!(fs::read_to_string(&a_new)
-        .unwrap()
-        .contains("A-only private note"));
-    assert!(!moved
-        .join("pages")
-        .join(format!("{}.md", crate::pdf::hls_page_name(&legacy_key)))
-        .exists());
-    assert_eq!(
-        fs::read(
-            dir.join("pages")
-                .join(format!("{}.md", crate::pdf::hls_page_name(&new_key)))
-        )
-        .unwrap(),
-        b"- B-only hls page\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("assets/my_paper.pdf")).unwrap(),
-        b"B collision input"
-    );
-
-    release_replacement_handoff();
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
-#[cfg(unix)]
-#[test]
-fn root_replacement_during_rename_rollback_restores_retained_a_and_leaves_b_untouched() {
-    let dir = scratch("handoff-capability-rollback-window");
-    let moved = dir.with_file_name("tine-handoff-capability-rollback-window-moved");
-    let _ = fs::remove_dir_all(&moved);
-    let old = dir.join("pages").join("Old.md");
-    let reference = dir.join("pages").join("Reference.md");
-    fs::write(&old, "- old A\n").unwrap();
-    fs::write(&reference, "- [[Old]] on A\n").unwrap();
-    let graph = Graph::open(&dir);
-    FAIL_NEXT_RENAME_SOURCE_REMOVE.with(|flag| flag.set(true));
-    MANAGED_WRITE_DURING_ROLLBACK.with(|hook| {
-        let dir = dir.clone();
-        let moved = moved.clone();
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&dir, &moved)?;
-            fs::create_dir_all(dir.join("pages"))?;
-            fs::create_dir_all(dir.join("journals"))?;
-            fs::write(dir.join("pages").join("Old.md"), "- old B\n")?;
-            fs::write(dir.join("pages").join("New.md"), "- new B\n")?;
-            fs::write(dir.join("pages").join("Reference.md"), "- [[Old]] on B\n")?;
-            let replacement = Graph::open(&dir);
-            let (workspace_id, endpoint) = handoff_binding(&replacement, 91_048);
-            let handoff = replacement.mint_handoff_safe(workspace_id, endpoint)?;
-            MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| {
-                *held.borrow_mut() = Some(handoff);
-            });
-            Ok(())
-        }));
-    });
-
-    assert!(graph.rename_page("Old", "New").is_err());
-    assert_eq!(
-        fs::read(moved.join("pages").join("Old.md")).unwrap(),
-        b"- old A\n"
-    );
-    assert!(!moved.join("pages").join("New.md").exists());
-    assert_eq!(
-        fs::read(moved.join("pages").join("Reference.md")).unwrap(),
-        b"- [[Old]] on A\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("pages").join("Old.md")).unwrap(),
-        b"- old B\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("pages").join("New.md")).unwrap(),
-        b"- new B\n"
-    );
-    assert_eq!(
-        fs::read(dir.join("pages").join("Reference.md")).unwrap(),
-        b"- [[Old]] on B\n"
-    );
-    let replacement = Graph::open(&dir);
-    assert_handoff_blocked(
-        replacement.create_markdown_page_if_absent("reserved rollback B", "- blocked\n"),
-    );
-    MANAGED_WRITE_REPLACEMENT_HANDOFF.with(|held| drop(held.borrow_mut().take()));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
-}
-
-#[cfg(unix)]
-#[test]
-fn handoff_resource_gate_survives_moved_root_reopen() {
-    let dir = scratch("handoff-moved-reopen-gate");
-    let moved = dir.with_file_name("tine-handoff-moved-reopen-gate");
-    let _ = fs::remove_dir_all(&moved);
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_050);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    fs::rename(&dir, &moved).unwrap();
-    let reopened = Arc::new(Graph::open(&moved));
-    assert!(Arc::ptr_eq(
-        managed_write_gate(&graph),
-        managed_write_gate(&reopened)
-    ));
-    handoff
-        .verify_binding(&graph, workspace_id, endpoint)
-        .unwrap();
-    assert!(handoff
-        .verify_binding(&reopened, workspace_id, endpoint)
-        .is_err());
-
-    let start = Arc::new(std::sync::Barrier::new(2));
-    let writer = std::thread::spawn({
-        let graph = Arc::clone(&reopened);
-        let start = Arc::clone(&start);
-        move || {
-            start.wait();
-            graph.create_markdown_page_if_absent("moved reopen", "- blocked\n")
-        }
-    });
-    start.wait();
-    assert_handoff_blocked(writer.join().unwrap());
-    drop(handoff);
-    assert!(reopened
-        .create_markdown_page_if_absent("moved reopen released", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&moved);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_blocks_both_projection_recovery_entrypoints_before_the_page_lock() {
-    let dir = scratch("handoff-projection-recovery");
-    let graph = Graph::open(&dir);
-    let path = "pages/recovery.md";
-    let target = b"- retained target\n";
-    graph.write_projection_exact(path, None, target).unwrap();
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_060);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    assert_handoff_blocked(graph.recover_projection_exact(path, target));
-    assert_handoff_blocked(graph.recover_removed_projection_exact(path, target));
-    assert_eq!(fs::read(dir.join(path)).unwrap(), target);
-
-    drop(handoff);
-    graph.recover_projection_exact(path, target).unwrap();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_blocks_production_authority_consuming_projection_recovery_entrypoints() {
-    let dir = scratch("handoff-production-projection-recovery");
-    let receipts = dir.with_file_name("tine-handoff-production-projection-receipts");
-    let _ = fs::remove_dir_all(&receipts);
-    fs::create_dir_all(&receipts).unwrap();
-    let graph = Graph::open(&dir);
-    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(91_061));
-    let store =
-        crate::oplog::projection_store::ProjectionReceiptStore::open(&receipts, workspace_id)
-            .unwrap();
-
-    let present_path = "pages/production-recovery.md";
-    let present_target = b"- retained target\n";
-    fs::write(dir.join(present_path), present_target).unwrap();
-    let present_intent = crate::oplog::ProjectionIntent::new(
-        workspace_id,
-        crate::oplog::PageId::from_uuid(Uuid::from_u128(91_062)),
-        ManagedPath::parse(present_path).unwrap(),
-        crate::oplog::FrontierV2::default(),
-        Vec::new(),
-        crate::oplog::ProjectionPrecondition::Absent,
-        crate::oplog::ProjectionTargetKind::Present,
-        BlobDescription::of(present_target),
-        Vec::new(),
-    )
-    .unwrap();
-    store.publish_intent(&present_intent, None).unwrap();
-    store.reserve_attempt(&present_intent).unwrap();
-    let mut present_authority = store.begin_mutation(&present_intent, None).unwrap();
-    let (_, endpoint) = handoff_binding(&graph, 91_063);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    assert_handoff_blocked(graph.recover_page_projection(
-        present_path,
-        None,
-        present_target,
-        &mut present_authority,
-    ));
-    drop(handoff);
-    graph
-        .recover_page_projection(present_path, None, present_target, &mut present_authority)
-        .unwrap();
-
-    let removed_path = "pages/production-removed-recovery.md";
-    let removed_base = b"- retained base\n";
-    fs::write(dir.join(removed_path), removed_base).unwrap();
-    let removed_intent = crate::oplog::ProjectionIntent::new(
-        workspace_id,
-        crate::oplog::PageId::from_uuid(Uuid::from_u128(91_064)),
-        ManagedPath::parse(removed_path).unwrap(),
-        crate::oplog::FrontierV2::default(),
-        Vec::new(),
-        crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(removed_base)),
-        crate::oplog::ProjectionTargetKind::Absent,
-        BlobDescription::of(&[]),
-        Vec::new(),
-    )
-    .unwrap();
-    store
-        .publish_intent(&removed_intent, Some(removed_base))
-        .unwrap();
-    let removed_reservation = store.reserve_attempt(&removed_intent).unwrap();
-    fs::rename(
-        dir.join(removed_path),
-        dir.join("pages")
-            .join(removed_reservation.recovery_filename()),
-    )
-    .unwrap();
-    let mut removed_authority = store.begin_mutation(&removed_intent, None).unwrap();
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    assert_handoff_blocked(graph.recover_removed_page_projection(
-        removed_path,
-        removed_base,
-        &mut removed_authority,
-    ));
-    drop(handoff);
-    graph
-        .recover_removed_page_projection(removed_path, removed_base, &mut removed_authority)
-        .unwrap();
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&receipts);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_blocks_pdf_view_state_before_its_shared_page_lock() {
-    let dir = scratch("handoff-pdf-view-state");
-    let graph = Graph::open(&dir);
-    graph.open_pdf("paper.pdf", "Paper").unwrap();
-    let sidecar = dir
-        .join("assets")
-        .join(format!("{}.edn", crate::pdf::asset_key("paper.pdf")));
-    let baseline = fs::read(&sidecar).unwrap();
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_070);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    assert_handoff_blocked(graph.write_pdf_view_state("paper.pdf", 8, 1.75));
-    assert_eq!(fs::read(&sidecar).unwrap(), baseline);
-
-    drop(handoff);
-    graph.write_pdf_view_state("paper.pdf", 8, 1.75).unwrap();
-    assert_ne!(fs::read(&sidecar).unwrap(), baseline);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_mint_error_releases_a_writer_waiting_at_the_reservation() {
-    let dir = scratch("handoff-mint-error-race");
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_075);
-    let rendezvous = Arc::new(std::sync::Barrier::new(2));
-    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        let rendezvous = Arc::clone(&rendezvous);
-        move || {
-            rendezvous.wait();
-            writer_tx
-                .send(graph.create_markdown_page_if_absent("mint error blocked", "- blocked\n"))
-        }
-    });
-    HANDOFF_MINT_AFTER_RESERVATION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            rendezvous.wait();
-            assert_handoff_blocked(writer_rx.recv().unwrap());
-            Err(io::Error::other("injected handoff mint failure"))
-        }));
-    });
-
-    assert!(graph.mint_handoff_safe(workspace_id, endpoint).is_err());
-    writer.join().unwrap().unwrap();
-    assert!(graph
-        .create_markdown_page_if_absent("mint error released", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_cancel_and_drop_release_waiting_writers() {
-    let dir = scratch("handoff-cancel-drop-race");
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_080);
-    assert_handoff_release_admits_waiting_writer(
-        Arc::clone(&graph),
-        graph.mint_handoff_safe(workspace_id, endpoint).unwrap(),
-        "cancel",
-        |handoff| handoff.cancel(),
-    );
-    assert_handoff_release_admits_waiting_writer(
-        Arc::clone(&graph),
-        graph.mint_handoff_safe(workspace_id, endpoint).unwrap(),
-        "drop",
-        drop,
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_transfer_keeps_the_reservation_during_a_writer_race() {
-    let dir = scratch("handoff-transfer-race");
-    let graph = Arc::new(Graph::open(&dir));
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_090);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    let rendezvous = Arc::new(std::sync::Barrier::new(2));
-    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn({
-        let graph = Arc::clone(&graph);
-        let rendezvous = Arc::clone(&rendezvous);
-        move || {
-            rendezvous.wait();
-            writer_tx.send(graph.create_markdown_page_if_absent("transfer blocked", "- blocked\n"))
-        }
-    });
-    HANDOFF_TRANSFER_HOOK.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            rendezvous.wait();
-            assert_handoff_blocked(writer_rx.recv().unwrap());
-        }));
-    });
-
-    let guard = handoff.into_publisher_guard();
-    guard
-        .verify_binding(&graph, workspace_id, endpoint)
-        .unwrap();
-    writer.join().unwrap().unwrap();
-    drop(guard);
-    assert!(graph
-        .create_markdown_page_if_absent("transfer released", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_seal_closes_the_inventory_to_writer_race() {
-    let dir = scratch("handoff-inventory-race");
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_000);
-
-    // Capturing inventory alone is intentionally not a writer reservation:
-    // this is the pre-handoff race the sealed capability must close.
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert!(inventory.is_empty());
-    assert!(graph
-        .create_markdown_page_if_absent("before seal", "- visible change\n")
-        .unwrap());
-
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    assert_handoff_blocked(graph.create_markdown_page_if_absent("blocked", "- no\n"));
-    assert_handoff_blocked(graph.save_page(
-        &markdown_page_dto("blocked save", "blocked save", "- no\n").unwrap(),
-        None,
-    ));
-    drop(handoff);
-    assert!(graph
-        .create_markdown_page_if_absent("after release", "- admitted\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_rejects_every_managed_page_and_journal_writer_entrypoint() {
-    let dir = scratch("handoff-writer-entrypoints");
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_100);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    let page = markdown_page_dto("blocked page", "blocked page", "- no\n").unwrap();
-    let mut journal = markdown_page_dto("January 1st, 2026", "journal", "- no\n").unwrap();
-    journal.kind = PageKind::Journal;
-
-    assert_handoff_blocked(graph.create_markdown_page_if_absent("create", "- no\n"));
-    assert_handoff_blocked(graph.save_page(&page, None));
-    assert_handoff_blocked(graph.force_save_page_at_revision(
-        &page,
-        None,
-        ConflictOverride {
-            observation_epoch: 0,
-        },
-    ));
-    assert_handoff_blocked(graph.save_page(&journal, None));
-    assert_handoff_blocked(graph.force_save_page_at_revision(
-        &journal,
-        None,
-        ConflictOverride {
-            observation_epoch: 0,
-        },
-    ));
-    assert_handoff_blocked(graph.rename_page_expected("old", "new", None));
-    assert_handoff_blocked(graph.delete_page_expected("page", PageKind::Page, None));
-    assert_handoff_blocked(graph.delete_page_expected(
-        "January 1st, 2026",
-        PageKind::Journal,
-        None,
-    ));
-    assert_handoff_blocked(graph.resolve_sync_conflict(
-        "pages/a.md",
-        "pages/b.md",
-        &Default::default(),
-        "",
-        "",
-        None,
-        "mine",
-    ));
-    assert_handoff_blocked(graph.merge_pages("pages/a.md", "pages/b.md"));
-    assert_handoff_blocked(graph.rename_file_to_page("journals/a.md", "rescued"));
-    assert_handoff_blocked(graph.trash_journal_file("a.md"));
-    assert_handoff_blocked(graph.open_pdf("blocked.pdf", "blocked"));
-    assert_handoff_blocked(graph.write_pdf_view_state("blocked.pdf", 1, 1.0));
-    assert_handoff_blocked(graph.write_highlights("blocked.pdf", "blocked", &[], &[]));
-    assert_handoff_blocked(graph.write_projection_exact("pages/projection.md", None, b"- no\n"));
-    assert_handoff_blocked(graph.recover_projection_exact("pages/projection.md", b"- no\n"));
-    assert_handoff_blocked(
-        graph.recover_removed_projection_exact("pages/projection.md", b"- no\n"),
-    );
-    assert_handoff_blocked(graph.sync_file_checked(&dir.join("pages").join("watch.md")));
-    assert_handoff_blocked(graph.sync_deleted_file(&dir.join("pages").join("deleted.md")));
-
-    drop(handoff);
-    assert!(graph
-        .create_markdown_page_if_absent("writer released", "- yes\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_binding_rejects_reopened_copied_wrong_workspace_endpoint_and_resource() {
-    let dir = scratch("handoff-binding");
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_200);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    handoff
-        .verify_binding(&graph, workspace_id, endpoint)
-        .unwrap();
-    assert_eq!(handoff.binding().workspace_id(), workspace_id);
-    assert_eq!(handoff.binding().endpoint(), endpoint);
-    assert_eq!(
-        handoff.binding().graph_resource_id(),
-        endpoint.graph_resource_id()
-    );
-    assert!(handoff
-        .verify_binding(
-            &graph,
-            WorkspaceId::from_uuid(Uuid::from_u128(91_299)),
-            endpoint,
-        )
-        .is_err());
-    let wrong_endpoint = ProjectionEndpointBinding::enroll_graph(
-        &graph,
-        crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(91_203)),
-        crate::oplog::DeviceId::from_uuid(Uuid::from_u128(91_204)),
-    )
-    .unwrap();
-    assert!(handoff
-        .verify_binding(&graph, workspace_id, wrong_endpoint)
-        .is_err());
-
-    let reopened = Graph::open(&dir);
-    assert!(handoff
-        .verify_binding(&reopened, workspace_id, endpoint)
-        .is_err());
-
-    let copied_root = dir.with_file_name("tine-handoff-binding-copy");
-    let _ = fs::remove_dir_all(&copied_root);
-    fs::create_dir_all(copied_root.join("pages")).unwrap();
-    fs::write(copied_root.join("pages").join("copied.md"), "- copied\n").unwrap();
-    let copied = Graph::open(&copied_root);
-    copied.warm_cache();
-    assert_ne!(
-        copied.canonical_resource_id().unwrap(),
-        endpoint.graph_resource_id()
-    );
-    assert!(handoff
-        .verify_binding(&copied, workspace_id, endpoint)
-        .is_err());
-    assert!(copied
-        .create_markdown_page_if_absent("unrelated graph remains writable", "- yes\n")
-        .unwrap());
-
-    let foreign_endpoint = ProjectionEndpointBinding::enroll_graph(
-        &copied,
-        crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(91_205)),
-        crate::oplog::DeviceId::from_uuid(Uuid::from_u128(91_206)),
-    )
-    .unwrap();
-    assert!(graph
-        .mint_handoff_safe(workspace_id, foreign_endpoint)
-        .is_err());
-    drop(handoff);
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&copied_root);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn handoff_raii_mint_failure_and_transfer_never_leave_an_unlocked_interval() {
-    let dir = scratch("handoff-raii");
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_300);
-
-    let active_writer = graph.admit_managed_text_writer().unwrap();
-    assert_handoff_blocked(graph.mint_handoff_safe(workspace_id, endpoint));
-    drop(active_writer);
-
-    HANDOFF_MINT_AFTER_RESERVATION.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "injected handoff mint failure",
-            ))
-        }));
-    });
-    assert!(graph.mint_handoff_safe(workspace_id, endpoint).is_err());
-    assert!(graph
-        .create_markdown_page_if_absent("released after mint error", "- yes\n")
-        .unwrap());
-
-    let cancelled = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    cancelled.cancel();
-    assert!(graph
-        .create_markdown_page_if_absent("released after cancel", "- yes\n")
-        .unwrap());
-
-    let dropped = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    drop(dropped);
-    assert!(graph
-        .create_markdown_page_if_absent("released after drop", "- yes\n")
-        .unwrap());
-
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-    let gate = Arc::clone(managed_write_gate(&graph));
-    HANDOFF_TRANSFER_HOOK.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || {
-            assert_handoff_blocked(gate.admit_writer());
-        }));
-    });
-    let guard = handoff.into_publisher_guard();
-    guard
-        .verify_binding(&graph, workspace_id, endpoint)
-        .unwrap();
-    assert_handoff_blocked(graph.create_markdown_page_if_absent("still held", "- no\n"));
-    drop(guard);
-    assert!(graph
-        .create_markdown_page_if_absent("released after consume", "- yes\n")
-        .unwrap());
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-#[test]
-fn handoff_retained_resource_identity_survives_supported_move_but_not_replacement() {
-    let dir = scratch("handoff-resource-move");
-    let moved = dir.with_file_name("tine-handoff-resource-moved");
-    let _ = fs::remove_dir_all(&moved);
-    let graph = Graph::open(&dir);
-    let (workspace_id, endpoint) = handoff_binding(&graph, 91_400);
-    let handoff = graph.mint_handoff_safe(workspace_id, endpoint).unwrap();
-
-    fs::rename(&dir, &moved).unwrap();
-    fs::create_dir_all(&dir).unwrap();
-    handoff
-        .verify_binding(&graph, workspace_id, endpoint)
-        .unwrap();
-    let replacement = Graph::open(&dir);
-    assert_ne!(
-        replacement.canonical_resource_id().unwrap(),
-        endpoint.graph_resource_id()
-    );
-    assert!(handoff
-        .verify_binding(&replacement, workspace_id, endpoint)
-        .is_err());
-
-    drop(handoff);
-    graph
-        .write_projection_exact("pages/retained-capability.md", None, b"- exact resource\n")
-        .unwrap();
-    assert_eq!(
-        fs::read(moved.join("pages").join("retained-capability.md")).unwrap(),
-        b"- exact resource\n"
-    );
-    assert!(!dir.join("pages").join("retained-capability.md").exists());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&moved);
 }
 
 #[cfg(unix)]
@@ -18915,9 +13109,11 @@ fn windows_live_graph_root_move_is_denied_without_rebinding() {
         Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
     );
     assert_eq!(graph.graph_text_scope_binding().unwrap(), binding);
-    graph
-        .write_projection_exact("pages/still-bound.md", None, b"- retained\n")
-        .unwrap();
+    // The retained binding still writes. The exact-byte writer this used went
+    // with Managed Storage (ADR 0066); the user path proves the same thing.
+    graph.warm_cache();
+    let page = markdown_page_dto("still-bound", "still-bound", "- retained\n").unwrap();
+    graph.save_page(&page, None).unwrap();
     assert_eq!(
         fs::read(dir.join("pages/still-bound.md")).unwrap(),
         b"- retained\n"
@@ -18925,639 +13121,6 @@ fn windows_live_graph_root_move_is_denied_without_rebinding() {
 
     drop(graph);
     crate::test_support::remove_dir_all(&dir);
-}
-
-fn bootstrap_capture_entries(capture: &BootstrapSourceCapture) -> Vec<BootstrapSourceEntry> {
-    let mut cursor = capture.entries_cursor().unwrap();
-    let mut entries = Vec::new();
-    while let Some(entry) = cursor.next().unwrap() {
-        entries.push(entry);
-    }
-    entries
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct BootstrapCapturedSource {
-    path: String,
-    kind: ManagedTextKind,
-    logical_name: String,
-    chunk_lengths: Vec<u64>,
-    bytes: Vec<u8>,
-}
-
-fn bootstrap_capture_sources(capture: &BootstrapSourceCapture) -> Vec<BootstrapCapturedSource> {
-    let entries = bootstrap_capture_entries(capture);
-    let mut chunks = capture.chunks_cursor().unwrap();
-    let mut sources = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let mut bytes = Vec::new();
-        let mut chunk_lengths = Vec::with_capacity(entry.chunk_count() as usize);
-        for ordinal in 0..entry.chunk_count() {
-            let chunk = chunks.next().unwrap().unwrap();
-            assert_eq!(chunk.path(), entry.path());
-            assert_eq!(chunk.ordinal(), ordinal);
-            let mut reader = capture.open_chunk(&chunk).unwrap();
-            let mut chunk_bytes = Vec::new();
-            reader.read_to_end(&mut chunk_bytes).unwrap();
-            reader.finish().unwrap();
-            chunk_lengths.push(chunk_bytes.len() as u64);
-            bytes.extend_from_slice(&chunk_bytes);
-        }
-        assert_eq!(bytes.len() as u64, entry.description().byte_length());
-        sources.push(BootstrapCapturedSource {
-            path: entry.path().as_str().to_owned(),
-            kind: entry.kind(),
-            logical_name: entry.logical_name().to_owned(),
-            chunk_lengths,
-            bytes,
-        });
-    }
-    assert!(chunks.next().unwrap().is_none());
-    sources
-}
-
-#[test]
-fn inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds() {
-    let root = scratch("bootstrap-source-paths");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        r#"{:pages-directory "notes"
-                :journals-directory "diary"
-                :file/name-format :triple-lowbar
-                :journal/file-name-format "dd-MM-yyyy"
-                :journal/page-title-format "yyyy-MM-dd"}"#,
-    )
-    .unwrap();
-    fs::create_dir_all(root.join("notes/arbitrary/nested")).unwrap();
-    fs::create_dir_all(root.join("notes/深い")).unwrap();
-    fs::create_dir_all(root.join("diary/nested")).unwrap();
-    fs::write(
-        root.join("Root.md"),
-        "title:: Root logical name\n\n- root\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("notes/arbitrary/nested/Markdown.md"),
-        "title:: Markdown title ☕\n\n- semantic page\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("notes/深い/Déjà___計画.markdown"),
-        "- filename-derived page\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("diary/nested/25-07-2026.org"),
-        "#+TITLE: Org title ��\n\n* semantic journal\n",
-    )
-    .unwrap();
-    fs::write(root.join("diary/nested/26-07-2026.md"), "- journal\n").unwrap();
-    let graph = Graph::open(&root);
-    let capture_scratch = bootstrap_capture_scratch("paths");
-    let capture = graph
-        .capture_inactive_bootstrap_sources(&capture_scratch)
-        .unwrap();
-    let entries = bootstrap_capture_entries(&capture);
-    assert_eq!(
-        entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.path().as_str().to_owned(),
-                    entry.kind(),
-                    entry.logical_name().to_owned(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "Root.md".to_owned(),
-                ManagedTextKind::Page,
-                "Root logical name".to_owned(),
-            ),
-            (
-                "diary/nested/25-07-2026.org".to_owned(),
-                ManagedTextKind::Page,
-                "Org title ��".to_owned(),
-            ),
-            (
-                "diary/nested/26-07-2026.md".to_owned(),
-                ManagedTextKind::Journal,
-                "2026-07-26".to_owned(),
-            ),
-            (
-                "notes/arbitrary/nested/Markdown.md".to_owned(),
-                ManagedTextKind::Page,
-                "Markdown title ☕".to_owned(),
-            ),
-            (
-                "notes/深い/Déjà___計画.markdown".to_owned(),
-                ManagedTextKind::Page,
-                "Déjà/計画".to_owned(),
-            ),
-        ]
-    );
-    assert_eq!(capture.instrumentation().parser_calls, 5);
-    let final_proof = capture
-        .verify_before_inactive_bootstrap_authoring(&graph)
-        .unwrap();
-    assert_eq!(final_proof.parser_calls, 0);
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&capture_scratch);
-}
-
-#[test]
-fn portable_bootstrap_identity_ignores_local_filesystem_identity_but_not_content() {
-    let first_root = scratch("portable-bootstrap-identity-first");
-    let second_root = scratch("portable-bootstrap-identity-second");
-    for root in [&first_root, &second_root] {
-        fs::create_dir_all(root.join("logseq")).unwrap();
-        fs::write(
-            root.join("logseq/config.edn"),
-            r#"{:pages-directory "notes" :journals-directory "diary"}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(root.join("notes/層")).unwrap();
-        fs::write(
-            root.join("notes/層/計画.md"),
-            "title:: Shared 計画\n\n- café\n",
-        )
-        .unwrap();
-    }
-    let first_scratch = bootstrap_capture_scratch("portable-identity-first");
-    let second_scratch = bootstrap_capture_scratch("portable-identity-second");
-    let changed_scratch = bootstrap_capture_scratch("portable-identity-changed");
-    let first = Graph::open(&first_root)
-        .capture_inactive_bootstrap_sources(&first_scratch)
-        .unwrap();
-    let second_graph = Graph::open(&second_root);
-    let second = second_graph
-        .capture_inactive_bootstrap_sources(&second_scratch)
-        .unwrap();
-
-    assert_ne!(
-        first.capture_identity().unwrap(),
-        second.capture_identity().unwrap()
-    );
-    assert_eq!(
-        first.portable_capture_identity().unwrap(),
-        second.portable_capture_identity().unwrap()
-    );
-
-    fs::write(
-        second_root.join("notes/層/計画.md"),
-        "title:: Shared 計画\n\n- changed café\n",
-    )
-    .unwrap();
-    let changed = Graph::open(&second_root)
-        .capture_inactive_bootstrap_sources(&changed_scratch)
-        .unwrap();
-    assert_ne!(
-        first.portable_capture_identity().unwrap(),
-        changed.portable_capture_identity().unwrap()
-    );
-
-    let _ = fs::remove_dir_all(&first_root);
-    let _ = fs::remove_dir_all(&second_root);
-    let _ = fs::remove_dir_all(&first_scratch);
-    let _ = fs::remove_dir_all(&second_scratch);
-    let _ = fs::remove_dir_all(&changed_scratch);
-}
-
-#[test]
-fn bootstrap_source_regular_file_sync_uses_supported_handle_access() {
-    let root = scratch("bootstrap-source-file-sync");
-    let path = root.join("capture-artifact");
-    fs::write(&path, b"durable bootstrap artifact").unwrap();
-
-    sync_bootstrap_source_regular_file(&path).unwrap();
-
-    assert_eq!(fs::read(&path).unwrap(), b"durable bootstrap artifact");
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files() {
-    let root = scratch("bootstrap-source-chunks");
-    fs::write(root.join("pages/empty.md"), b"").unwrap();
-    fs::write(root.join("pages/one.md"), b"- one\n").unwrap();
-    let mut many = b"- ".to_vec();
-    many.extend(std::iter::repeat_n(b'x', BOOTSTRAP_SOURCE_CHUNK_BYTES * 2));
-    many.extend_from_slice(b"\n");
-    fs::write(root.join("pages/many.org"), &many).unwrap();
-    let first_scratch = bootstrap_capture_scratch("chunks-first");
-    let second_scratch = bootstrap_capture_scratch("chunks-second");
-    let graph = Graph::open(&root);
-    let first = graph
-        .capture_inactive_bootstrap_sources(&first_scratch)
-        .unwrap();
-    let second = graph
-        .capture_inactive_bootstrap_sources(&second_scratch)
-        .unwrap();
-    let first_sources = bootstrap_capture_sources(&first);
-    let second_sources = bootstrap_capture_sources(&second);
-    assert_eq!(first_sources, second_sources);
-    assert_eq!(
-        first_sources,
-        vec![
-            BootstrapCapturedSource {
-                path: "pages/empty.md".to_owned(),
-                kind: ManagedTextKind::Page,
-                logical_name: "empty".to_owned(),
-                chunk_lengths: vec![],
-                bytes: vec![],
-            },
-            BootstrapCapturedSource {
-                path: "pages/many.org".to_owned(),
-                kind: ManagedTextKind::Page,
-                logical_name: "many".to_owned(),
-                chunk_lengths: vec![
-                    BOOTSTRAP_SOURCE_CHUNK_BYTES as u64,
-                    BOOTSTRAP_SOURCE_CHUNK_BYTES as u64,
-                    3,
-                ],
-                bytes: many,
-            },
-            BootstrapCapturedSource {
-                path: "pages/one.md".to_owned(),
-                kind: ManagedTextKind::Page,
-                logical_name: "one".to_owned(),
-                chunk_lengths: vec![6],
-                bytes: b"- one\n".to_vec(),
-            },
-        ]
-    );
-    assert!(first.instrumentation().peak_owned_rows < 20_000);
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&first_scratch);
-    let _ = fs::remove_dir_all(&second_scratch);
-}
-
-#[test]
-fn inactive_bootstrap_capture_seals_one_pass_and_final_proof_rejects_later_mutations() {
-    for mutation in ["modify", "add", "delete", "rename"] {
-        let root = scratch(&format!("bootstrap-source-mutation-{mutation}"));
-        let source = root.join("pages/one.md");
-        let added = root.join("pages/added.md");
-        let renamed = root.join("pages/renamed.md");
-        fs::write(&source, b"title:: Before\n\n- body\n").unwrap();
-        let scratch = bootstrap_capture_scratch(&format!("mutation-{mutation}"));
-        let graph = Graph::open(&root);
-        BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                let added = added.clone();
-                let renamed = renamed.clone();
-                move || match mutation {
-                    "modify" => fs::write(source, b"title:: After\n\n- body\n"),
-                    "add" => fs::write(added, b"- added externally\n"),
-                    "delete" => fs::remove_file(source),
-                    "rename" => fs::rename(source, renamed),
-                    _ => unreachable!(),
-                }
-            }));
-        });
-        let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
-        assert_eq!(capture.instrumentation().passes, 1);
-        assert!(
-            capture
-                .verify_before_inactive_bootstrap_authoring(&graph)
-                .is_err(),
-            "final source proof admitted an external {mutation} after capture"
-        );
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&scratch);
-    }
-
-    let root = scratch("bootstrap-source-final-proof-mutation");
-    let source = root.join("pages/one.md");
-    fs::write(&source, b"- before final proof\n").unwrap();
-    let scratch = bootstrap_capture_scratch("final-proof-mutation");
-    let graph = Graph::open(&root);
-    let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
-    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new({
-            let source = source.clone();
-            move || fs::write(source, b"- changed immediately before final proof\n")
-        }));
-    });
-    assert!(capture
-        .verify_before_inactive_bootstrap_authoring(&graph)
-        .is_err());
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&scratch);
-}
-
-/// A capture-change refusal has to say WHAT moved.
-///
-/// It reaches the user as a `Retryable` activation failure and nothing
-/// else: on CI 32108957903 the whole report was `Retryable { durable_stage:
-/// Absent, detail: "source capture changed before final inventory proof" }`
-/// — not the path, not the field, not whether one row moved or a thousand.
-/// Both directions are pinned. A file that merely APPEARED matters most:
-/// it changes no source-file and no source-chunk count, so every other
-/// check in the final proof is blind to it.
-#[test]
-fn final_proof_refusal_names_the_rows_that_changed() {
-    for (mutation, expect) in [
-        ("modify", "changed:"),
-        ("add-source", "appeared:"),
-        ("add-other", "appeared:"),
-        ("delete", "gone:"),
-    ] {
-        let root = scratch(&format!("bootstrap-source-named-change-{mutation}"));
-        let source = root.join("pages/one.md");
-        let second = root.join("pages/two.md");
-        fs::write(&source, b"- before the final proof\n").unwrap();
-        fs::write(&second, b"- untouched\n").unwrap();
-        let capture_scratch = bootstrap_capture_scratch(&format!("named-change-{mutation}"));
-        let graph = Graph::open(&root);
-        let capture = graph
-            .capture_inactive_bootstrap_sources(&capture_scratch)
-            .unwrap();
-        BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                let root = root.clone();
-                move || match mutation {
-                    "modify" => fs::write(source, b"- changed under the activation\n"),
-                    "add-source" => fs::write(root.join("pages/three.md"), b"- new page\n"),
-                    "add-other" => fs::write(root.join("pages/notes.txt"), b"not a page\n"),
-                    "delete" => fs::remove_file(source),
-                    _ => unreachable!(),
-                }
-            }));
-        });
-        let error = capture
-            .verify_before_inactive_bootstrap_authoring(&graph)
-            .expect_err("the final proof must refuse a graph that moved");
-        let detail = error.to_string();
-        if mutation == "add-other" {
-            // The only mutation of the four that leaves both counts equal,
-            // so the inventory report is the ONLY thing that localises it.
-            assert!(
-                detail.contains("source capture changed before final inventory proof"),
-                "{mutation}: {detail}"
-            );
-            assert!(detail.contains("pages/notes.txt"), "{mutation}: {detail}");
-            assert!(detail.contains("1 row(s) differ"), "{mutation}: {detail}");
-        }
-        if mutation == "modify" {
-            assert!(detail.contains("pages/one.md"), "{mutation}: {detail}");
-            assert!(detail.contains("content:"), "{mutation}: {detail}");
-        }
-        if detail.contains("inventory proof") {
-            assert!(detail.contains(expect), "{mutation}: {detail}");
-        } else {
-            // A count mismatch is caught before the spools are compared, so
-            // it reports the counts rather than the rows.
-            assert!(
-                detail.contains("source files") && detail.contains("source chunks"),
-                "{mutation}: {detail}"
-            );
-        }
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&capture_scratch);
-    }
-}
-
-/// A named row is worth nothing if the name cannot be told from its twin.
-///
-/// CI 32115065229 reported `changed: file pages/\u{17d} pilot notes
-/// #pilot.md … -> file pages/\u{17d} pilot notes #pilot.md …` for a graph
-/// holding TWO files whose names differ only by Unicode normalization
-/// (`U+017D` against `Z` + `U+030C`). Both spellings print as the same
-/// glyph sequence in every log, so the refusal could not say which file
-/// moved, and the first reading of that evidence — content normalization —
-/// was wrong. The report escapes non-ASCII; ASCII paths are untouched.
-#[test]
-fn a_capture_change_refusal_distinguishes_two_spellings_of_one_glyph() {
-    let root = scratch("bootstrap-source-normalization-twins");
-    let precomposed = root.join("pages/\u{17d} pilot notes.md");
-    let decomposed = root.join("pages/Z\u{30c} pilot notes.md");
-    fs::write(&precomposed, b"- precomposed\n").unwrap();
-    fs::write(&decomposed, b"- decomposed\n").unwrap();
-    let capture_scratch = bootstrap_capture_scratch("normalization-twins");
-    let graph = Graph::open(&root);
-    let capture = graph
-        .capture_inactive_bootstrap_sources(&capture_scratch)
-        .unwrap();
-    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new({
-            let decomposed = decomposed.clone();
-            move || fs::write(decomposed, b"- decomposed, changed under the activation\n")
-        }));
-    });
-    let detail = capture
-        .verify_before_inactive_bootstrap_authoring(&graph)
-        .expect_err("the final proof must refuse a graph that moved")
-        .to_string();
-    assert!(detail.contains("1 row(s) differ"), "{detail}");
-    assert!(
-        detail.contains("pages/Z\\u{30c} pilot notes.md"),
-        "the refusal must name the DECOMPOSED twin as the row that moved: {detail}"
-    );
-    assert!(
-        !detail.contains("pages/\u{17d} pilot notes.md")
-            && !detail.contains("pages/Z\u{30c} pilot notes.md"),
-        "no raw glyph spelling may reach the refusal, or the twins read alike: {detail}"
-    );
-    // An ASCII path is still reported exactly as it is on disk.
-    assert_eq!(
-        bootstrap_source_change_report_path("pages/one.md"),
-        "pages/one.md"
-    );
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&capture_scratch);
-}
-
-#[test]
-fn inactive_bootstrap_capture_rejects_bad_logical_name_frames() {
-    let mut truncated = BootstrapSourceEncoder::new(3);
-    truncated.string("pages/logical.md").unwrap();
-    truncated.u8(managed_text_kind_tag(ManagedTextKind::Page));
-    truncated.u32(4);
-    truncated.bytes.extend_from_slice(b"na");
-    assert!(decode_bootstrap_source_entry(&truncated.finish()).is_err());
-
-    let mut non_utf8 = BootstrapSourceEncoder::new(3);
-    non_utf8.string("pages/logical.md").unwrap();
-    non_utf8.u8(managed_text_kind_tag(ManagedTextKind::Page));
-    non_utf8.u32(1);
-    non_utf8.bytes.push(0xff);
-    assert!(decode_bootstrap_source_entry(&non_utf8.finish()).is_err());
-
-    let mut oversized = BootstrapSourceEncoder::new(3);
-    oversized.string("pages/logical.md").unwrap();
-    oversized.u8(managed_text_kind_tag(ManagedTextKind::Page));
-    oversized
-        .string(&"x".repeat(BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES as usize + 1))
-        .unwrap();
-    assert!(decode_bootstrap_source_entry(&oversized.finish()).is_err());
-}
-
-#[test]
-fn inactive_bootstrap_capture_exact_64_mib_sparse_file_is_accepted() {
-    let root = scratch("bootstrap-source-64mib");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(root.join("pages/boundary.md"))
-        .unwrap();
-    file.set_len(BOOTSTRAP_SOURCE_MAX_FILE_BYTES).unwrap();
-    drop(file);
-    let scratch = bootstrap_capture_scratch("64mib");
-    let graph = Graph::open(&root);
-    let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
-    let entry = bootstrap_capture_entries(&capture).pop().unwrap();
-    assert_eq!(
-        entry.description().byte_length(),
-        BOOTSTRAP_SOURCE_MAX_FILE_BYTES
-    );
-    assert_eq!(entry.chunk_count(), 64);
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&scratch);
-}
-
-#[test]
-fn inactive_bootstrap_capture_ignores_residue_is_idempotent_and_rejects_conflicting_seal() {
-    let root = scratch("bootstrap-source-seal");
-    fs::write(root.join("pages/one.md"), b"- one\n").unwrap();
-    let scratch = bootstrap_capture_scratch("seal");
-    fs::create_dir(scratch.join(BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY)).unwrap();
-    fs::create_dir(
-        scratch
-            .join(BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY)
-            .join(".working-crash-residue"),
-    )
-    .unwrap();
-    fs::write(
-        scratch
-            .join(BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY)
-            .join(".working-crash-residue/unsealed"),
-        b"residue",
-    )
-    .unwrap();
-    let graph = Graph::open(&root);
-    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected pre-rename capture crash",
-            ))
-        }));
-    });
-    assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
-    let first = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
-    let second = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
-    assert_eq!(
-        bootstrap_capture_sources(&first),
-        bootstrap_capture_sources(&second)
-    );
-    fs::write(
-        first.sealed_directory.join(BOOTSTRAP_SOURCE_MANIFEST),
-        b"conflict",
-    )
-    .unwrap();
-    assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&scratch);
-}
-
-#[test]
-fn inactive_bootstrap_capture_rejects_file_cap_before_streaming() {
-    let root = scratch("bootstrap-source-over-file-cap");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(root.join("pages/too-large.md"))
-        .unwrap();
-    file.set_len(BOOTSTRAP_SOURCE_MAX_FILE_BYTES + 1).unwrap();
-    drop(file);
-    let scratch = bootstrap_capture_scratch("over-file-cap");
-    assert!(Graph::open(&root)
-        .capture_inactive_bootstrap_sources(&scratch)
-        .is_err());
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&scratch);
-}
-
-#[cfg(unix)]
-#[test]
-fn inactive_bootstrap_capture_rejects_source_symlinks_and_hard_links() {
-    use std::ffi::OsString;
-    use std::os::unix::{ffi::OsStringExt, fs::symlink};
-
-    let root = scratch("bootstrap-source-links");
-    fs::write(root.join("pages/one.md"), b"- one\n").unwrap();
-    fs::hard_link(root.join("pages/one.md"), root.join("pages/two.md")).unwrap();
-    let scratch = bootstrap_capture_scratch("links");
-    assert!(Graph::open(&root)
-        .capture_inactive_bootstrap_sources(&scratch)
-        .is_err());
-    fs::remove_file(root.join("pages/two.md")).unwrap();
-    symlink(root.join("pages/one.md"), root.join("pages/link.md")).unwrap();
-    assert!(Graph::open(&root)
-        .capture_inactive_bootstrap_sources(&scratch)
-        .is_err());
-    fs::remove_file(root.join("pages/link.md")).unwrap();
-    fs::write(
-        root.join("pages")
-            .join(OsString::from_vec(b"non-utf8-\xff.md".to_vec())),
-        b"- invalid path\n",
-    )
-    .unwrap();
-    assert!(Graph::open(&root)
-        .capture_inactive_bootstrap_sources(&scratch)
-        .is_err());
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&scratch);
-}
-
-#[test]
-fn inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files() {
-    const SYNTHETIC_ROWS: u64 = 1_000_000;
-    let root = scratch("bootstrap-source-streaming-scale");
-    let working = root.join("synthetic-working");
-    fs::create_dir(&working).unwrap();
-    let paths = BootstrapSourcePassPaths::new(&working, "synthetic").unwrap();
-    let mut writers = BootstrapSourcePassWriters::create(&paths).unwrap();
-    let mut instrumentation = BootstrapSourceCaptureInstrumentation::default();
-    for index in (0..SYNTHETIC_ROWS as u32).rev() {
-        let path = ManagedPath::parse(format!("pages/{index:08}.md")).unwrap();
-        write_bootstrap_source_entry(
-            &mut writers.entries,
-            &BootstrapSourceEntry {
-                path,
-                kind: ManagedTextKind::Page,
-                logical_name: format!("Synthetic logical name {index:08}"),
-                description: BlobDescription::from_parts([0; 32], 0),
-                file_resource: ContentDigest::from_bytes([1; 32]),
-                link_count: 1,
-                chunk_count: 0,
-                activation_page: BlobDescription::from_parts([2; 32], 0),
-            },
-            &mut instrumentation,
-        )
-        .unwrap();
-    }
-    writers.sync_to_stable_storage().unwrap();
-    sort_bootstrap_source_spool(
-        &paths,
-        BootstrapSourceSpoolKind::Entries,
-        &mut instrumentation,
-    )
-    .unwrap();
-    assert!(instrumentation.peak_owned_buffer_bytes <= BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES as u64);
-    assert!(instrumentation.sort_runs > 1);
-    assert!(instrumentation.peak_owned_rows < SYNTHETIC_ROWS);
-    validate_bootstrap_source_sorted_entries(
-        &paths.sorted(BootstrapSourceSpoolKind::Entries),
-        SYNTHETIC_ROWS,
-    )
-    .unwrap();
-    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -19713,9 +13276,15 @@ fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
     // An unseen external write invalidates the durable authority rather than
     // being overwritten by choices computed for the prior disk revision.
     fs::write(&path, "- one\n- newer disk two\n").unwrap();
-    assert!(reopened
-        .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union",)
-        .is_err());
+    let rejected = reopened
+        .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union")
+        .unwrap_err();
+    assert_eq!(rejected.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(direct_save_failure_code(&rejected), "conflict.base_rev");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "- one\n- newer disk two\n"
+    );
 
     let refreshed = reopened
         .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
@@ -19745,6 +13314,83 @@ fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// RESEARCH FIXTURE (2026-09-16, private live-save conflict card; see
+/// tine-agents/opencode/reports/2026-09-16-live-save-conflict-research.md).
+///
+/// Mirrors `scripts/e2e-concord-live-save.mjs`'s quarantined Direct leg at
+/// every decisive difference from the green sibling test above: a ONE-block
+/// page, external replacements that swap the inode (rename, the way
+/// Syncthing/Dropbox and the journey's `atomicReplace` do — twice), and an
+/// all-"mine" decision sweep applied through the durable (restart) capsule
+/// authority. If Apply resolution fails in the app with
+/// `Direct Files could not save (reason code: unknown)`, this fixture is the
+/// narrowest layer that can still see the typed error before the command
+/// boundary flattens it.
+#[test]
+fn research_concord_live_save_all_mine_after_rename_restart() {
+    let root = scratch("research-live-save-all-mine");
+    let path = root.join("pages/B3EKeepDraft.md");
+    let staged = root.join("pages/B3EKeepDraft.md.external");
+    fs::write(&path, "- common mine base\n").unwrap();
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let mut page = graph
+        .load_by_path("pages/B3EKeepDraft.md")
+        .unwrap()
+        .unwrap();
+    let activation = graph
+        .activate_editor(
+            "pages/B3EKeepDraft.md",
+            ActivationIntent::Replace,
+            page.rev.as_deref(),
+        )
+        .unwrap();
+    page.activation = Some(activation.activation.as_u64());
+    page.blocks[0].raw = "direct retained laptop draft".into();
+    // The journey's `atomicReplace`: a new inode lands under the same name.
+    fs::write(&staged, "- direct current phone body\n").unwrap();
+    fs::rename(&staged, &path).unwrap();
+    let shown = gh254_shown(&graph.save_page(&page, page.rev.as_deref()).unwrap_err());
+    let capture = graph
+        .capture_live_save_conflict(&page, page.rev.as_deref(), shown)
+        .unwrap();
+    drop(graph);
+
+    // The outage write — again a replacement on a fresh inode.
+    fs::write(&staged, "- direct newer phone body during outage\n").unwrap();
+    fs::rename(&staged, &path).unwrap();
+
+    let reopened = Graph::open(&root);
+    reopened.warm_cache();
+    let diff = reopened
+        .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+        .unwrap();
+    let decisions = diff
+        .rows
+        .iter()
+        .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+        .map(|row| (row.id.clone(), "mine".to_owned()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let result =
+        reopened.resolve_durable_live_save_conflict(&page, &diff.conflict_rev, &decisions, "union");
+    match result {
+        Ok(_) => {
+            let resolved = fs::read_to_string(&path).unwrap();
+            assert!(
+                resolved.contains("direct retained laptop draft"),
+                "keep-mine must write the retained draft: {resolved}"
+            );
+        }
+        Err(error) => panic!(
+            "research fixture: durable all-mine resolve failed before the \
+             command boundary: code={} kind={:?} display={error:?}",
+            direct_save_failure_code(&error),
+            error.kind(),
+        ),
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Make `dto` an EDITOR's DTO, the way the frontend does.
 ///
 /// Since increment 3 a loaded page and a live editor are different things: a
@@ -19757,6 +13403,155 @@ fn as_editor(graph: &Graph, dto: &mut PageDto) {
         .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
         .expect("a loaded page is path-pinned and inside the graph");
     dto.activation = Some(handle.activation.as_u64());
+}
+
+#[test]
+fn durable_draft_deleted_file_review_is_read_only_and_apply_restores() {
+    for extension in ["md", "org"] {
+        let root = scratch("durable-draft-deleted");
+        let relative = format!("pages/Note.{extension}");
+        let path = root.join(&relative);
+        let base = if extension == "md" {
+            "- original\n"
+        } else {
+            "* original\n"
+        };
+        fs::write(&path, base).unwrap();
+        let graph = Graph::open(&root);
+        let mut page = graph.load_by_path(&relative).unwrap().unwrap();
+        page.blocks[0].raw = "retained draft".into();
+        drop(graph);
+        fs::remove_file(&path).unwrap();
+        let reopened = Graph::open(&root);
+        let diff = reopened
+            .durable_live_save_conflict_diff(&page, Some(base))
+            .unwrap();
+        assert!(!path.exists(), "review must not recreate the file");
+        assert_eq!(diff.conflict_rev, "absent");
+        reopened
+            .resolve_durable_live_save_conflict(
+                &page,
+                &diff.conflict_rev,
+                &std::collections::HashMap::new(),
+                "mine",
+            )
+            .unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("retained draft"));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn durable_draft_absence_review_refuses_even_an_empty_recreated_file() {
+    let root = scratch("durable-draft-recreated");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    fs::remove_file(&path).unwrap();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    fs::write(&path, "").unwrap();
+    let error = graph
+        .resolve_durable_live_save_conflict(
+            &page,
+            &diff.conflict_rev,
+            &std::collections::HashMap::new(),
+            "mine",
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_absence_apply_never_clobbers_a_late_creator() {
+    let root = scratch("durable-draft-late-create");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    fs::remove_file(&path).unwrap();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page,
+        &diff.conflict_rev,
+        &std::collections::HashMap::new(),
+        "mine",
+    );
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_present_apply_checks_bytes_at_bound_publication() {
+    let root = scratch("durable-draft-late-write");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page,
+        &diff.conflict_rev,
+        &std::collections::HashMap::new(),
+        "mine",
+    );
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(result.is_err(), "a later write must refuse the stale merge");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_present_apply_refuses_a_late_same_bytes_new_identity() {
+    let root = scratch("durable-draft-late-identity");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    let replacement = root.join("external-replacement.tmp");
+    fs::write(&replacement, "- original\n").unwrap();
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::remove_file(&raced)?;
+            fs::rename(&replacement, &raced)
+        }));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page,
+        &diff.conflict_rev,
+        &std::collections::HashMap::new(),
+        "mine",
+    );
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(
+        result.is_err(),
+        "same bytes must not substitute a different physical file"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- original\n");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
 }
 
 fn gh254_code(error: &io::Error) -> &'static str {
@@ -19802,7 +13597,7 @@ fn gh254_force_binds_the_shown_bytes_not_only_the_revision_or_path() {
     let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
     // Preserve the inode while changing its bytes. Revision-only force used
     // to overwrite this unseen second winner.
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
             fs::write(path, "- unseen second winner\n")
@@ -20643,7 +14438,7 @@ fn gh254_s2_initial_absence_mints_absent() {
 #[test]
 fn gh254_s3_retired_snapshot_reads_bytes_and_identity_together() {
     let (root, path, graph, page) = gh254_loaded("s3");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s3 winner\n")));
     });
@@ -20661,7 +14456,7 @@ fn gh254_s4_pre_retirement_identity_change_observes_live_winner() {
     let (root, path, graph, page) = gh254_loaded("s4");
     let replacement = path.with_file_name(".s4-winner");
     fs::write(&replacement, "- s4 winner\n").unwrap();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
     });
@@ -20683,7 +14478,7 @@ fn the_editor_displacement_hook_observes_the_unpublished_displaced_state() {
     let observed: std::sync::Arc<std::sync::Mutex<Option<(bool, Vec<(String, Vec<u8>)>)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let recorder = std::sync::Arc::clone(&observed);
-    MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+    GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
         let path = path.clone();
         let parent = parent.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -20731,7 +14526,7 @@ fn the_editor_displacement_hook_observes_the_unpublished_displaced_state() {
 #[test]
 fn gh254_s5_retired_mismatch_mints_only_after_restore() {
     let (root, path, graph, page) = gh254_loaded("s5");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s5 winner\n")));
     });
@@ -20752,12 +14547,12 @@ fn gh254_s6_publication_collision_observes_after_restore_outcome() {
         } else {
             "s6-live"
         });
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s6 transient\n")));
         });
         if restore_succeeds {
-            MANAGED_WRITE_BEFORE_RESTORE.with(|hook| {
+            GRAPH_TEXT_WRITE_BEFORE_RESTORE.with(|hook| {
                 let path = path.clone();
                 *hook.borrow_mut() = Some(Box::new(move || fs::remove_file(path)));
             });
@@ -20823,7 +14618,7 @@ fn gh254_s7_absent_creation_losing_noreplace_race_mints_present() {
     let handle = graph.activate_absent_editor("New", PageKind::Page).unwrap();
     assert!(handle.prospective, "no file exists for New yet");
     page.activation = Some(handle.activation.as_u64());
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s7 winner\n")));
     });
@@ -20895,7 +14690,7 @@ fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
     let (root, path, graph, page) = gh254_loaded("tokenless");
     let replacement = path.with_file_name(".tokenless-winner");
     fs::write(&replacement, "- winner\n").unwrap();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
     });
@@ -20926,22 +14721,44 @@ fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
 // The invariant is an ordering one and therefore static: any function that
 // holds a page lock while it (transitively) acquires the identity gate is a
 // deadlock against every function that takes them the other way round. This
-// guard walks `model.rs`'s call graph and fails on any such function.
+// guard walks the model module's call graph (model.rs and its K3 seam files
+// under model/) and fails on any such function.
 #[test]
 fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
     use std::collections::{HashMap, HashSet};
 
-    let source = include_str!("model.rs");
-    let lines: Vec<&str> = source.lines().collect();
+    // The model module is model.rs plus its K3 seam files under model/. Each
+    // line keeps its file and line number, so a finding names the file on disk.
+    let files = crate::test_support::model_module_files();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut origin: Vec<(&str, usize)> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::new();
+    for (path, text) in &files {
+        file_starts.push(lines.len());
+        for (number, line) in text.lines().enumerate() {
+            lines.push(line);
+            origin.push((path.as_str(), number + 1));
+        }
+    }
     let is_fn_start = |line: &str| {
         line.starts_with("    fn ")
             || line.starts_with("    pub fn ")
             || line.starts_with("    pub(crate) fn ")
+            || line.starts_with("    pub(super) fn ")
     };
     let mut starts: Vec<usize> = (0..lines.len())
         .filter(|i| is_fn_start(lines[*i]))
         .collect();
     starts.push(lines.len());
+    // A body ends at the next function or at the end of its own file.
+    file_starts.push(lines.len());
+    let end_of = |a: usize, b: usize| {
+        file_starts
+            .iter()
+            .copied()
+            .find(|&edge| edge > a)
+            .map_or(b, |edge| edge.min(b))
+    };
     assert!(
         starts.len() > 400,
         "the function scan found only {} candidates; the source shape changed",
@@ -20952,6 +14769,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         let rest = line
             .trim_start()
             .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub(super) ")
             .trim_start_matches("pub ")
             .trim_start_matches("fn ");
         let end = rest
@@ -20976,7 +14794,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
 
     let mut bodies: HashMap<&str, Vec<String>> = HashMap::new();
     for pair in starts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
+        let (a, b) = (pair[0], end_of(pair[0], pair[1]));
         bodies
             .entry(name_of(lines[a]))
             .or_default()
@@ -20994,12 +14812,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         .collect();
     // Seeded on the writers that have always taken the gate directly, so this
     // sanity check cannot silently encode the fix it is guarding.
-    for expected in [
-        "save_page",
-        "force_save_page_at_revision",
-        "merge_pages",
-        "write_page_projection_with_attempts",
-    ] {
+    for expected in ["save_page", "force_save_page_at_revision", "merge_pages"] {
         assert!(
             acquires.contains(expected),
             "the gate-acquisition seed is wrong: `{expected}` acquires the identity gate but \
@@ -21028,7 +14841,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
     let mut inversions: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for pair in starts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
+        let (a, b) = (pair[0], end_of(pair[0], pair[1]));
         let body = lines[a..b].join("\n");
         let Some(page_lock_at) = body.find("self.page_lock(") else {
             continue;
@@ -21048,13 +14861,14 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         }
         reaching.sort_unstable();
         inversions.push(format!(
-            "{} (model.rs:{}) holds a page lock and then reaches the identity gate via {reaching:?}",
+            "{} ({}:{}) holds a page lock and then reaches the identity gate via {reaching:?}",
             name_of(lines[a]),
-            a + 1
+            origin[a].0,
+            origin[a].1
         ));
     }
     assert!(
-        checked >= 25,
+        checked >= 16,
         "only {checked} page-lock holders were examined; the guard lost its subjects"
     );
     assert!(
@@ -21063,5 +14877,335 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
          process against `save_page`. Take `lock_graph_text_identity_mutation()` before the \
          page lock, as `save_page`, `force_save_page_at_revision` and `merge_pages` do:\n{}",
         inversions.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The observed property registry: lifecycle and cache identity
+// (SPEC §6.2 end, §6.4, §5.9 guards (b) and (c); dossier B3, B4, O11).
+
+/// A graph with one property key, one page NAMED after that key carrying a
+/// `tine.type::` declaration, and one page that is not a key page.
+fn registry_graph(tag: &str) -> PathBuf {
+    let dir = scratch(tag);
+    fs::write(
+        dir.join("pages/Data.md"),
+        "- row one\n  score:: 01\n- row two\n  score:: 02\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/score.md"),
+        "tine.type:: number\n\n- the key page\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages/Unrelated.md"), "- nothing to do with it\n").unwrap();
+    dir
+}
+
+/// A declaration page changes the meaning of a property query on another page.
+/// `01` is the number 1 under a number key and the text `01` under a text key.
+#[test]
+fn a_declared_type_change_retypes_the_next_sql_query() {
+    let dir = registry_graph("registry-declared-type-query");
+    let graph = ready_graph(&dir);
+
+    let matched = |graph: &Graph| -> usize {
+        when_ready(|| graph.run_query_bounded("(property score 1)", usize::MAX, usize::MAX))
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum()
+    };
+    assert_eq!(
+        matched(&graph),
+        1,
+        "under a number key `01` is the number 1"
+    );
+
+    let mut key_page = graph.load_named("score", PageKind::Page).unwrap().unwrap();
+    key_page.pre_block = Some("tine.type:: text".to_string());
+    graph.save_page(&key_page, key_page.rev.as_deref()).unwrap();
+    wait_for_direct_query_projection(&graph);
+
+    assert_eq!(matched(&graph), 0, "under a text key `01` is not `1`");
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// SPEC §5.9 guard (c), Direct Files half (E6): a query with NO property leaf
+/// is still config-sensitive, because `journal_page_title_format` decides
+/// whether a page in `pages/` is a journal day at all. The config is read at
+/// open, so the guard is a reopen and the next execution must use the new
+/// digest.
+#[test]
+fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
+    let dir = scratch("registry-journal-title-format");
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    // A title none of the default fallback patterns recognises (`yyyy_MM_dd`,
+    // `MMM do, yyyy`, `yyyy-MM-dd`), so the classification turns on the
+    // configured title format alone.
+    fs::write(
+        dir.join("pages/25-12-2020.md"),
+        "- a day written as a page\n",
+    )
+    .unwrap();
+
+    let day_rows = |graph: &Graph| -> usize {
+        when_ready(|| graph.run_query_bounded("(between -10y +10y)", usize::MAX, usize::MAX))
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum()
+    };
+
+    let before = ready_graph(&dir);
+    assert_eq!(
+        day_rows(&before),
+        0,
+        "under the default formats the title parses as nothing, so it is an ordinary page"
+    );
+    let before_digest = before.config.parse_config().digest();
+    drop(before);
+
+    fs::write(
+        dir.join("logseq/config.edn"),
+        "{:journal/page-title-format \"dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    let after = ready_graph(&dir);
+    let after_digest = after.config.parse_config().digest();
+    assert_ne!(
+        before_digest, after_digest,
+        "the title format is one of the six projected-fact inputs (§5.8)"
+    );
+    assert_eq!(
+        day_rows(&after),
+        1,
+        "the same page is now a journal day inside the interval"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// O11: the registry built from the Direct Files READY PROJECTION STREAM and the
+/// one built from the Direct Files cold document iterator are one table. The
+/// producers disagree only about
+/// opaque owner identity and page identity, neither of which the aggregation
+/// carries.
+#[test]
+fn every_implemented_row_source_builds_the_same_registry() {
+    let dir = registry_graph("registry-source-identity");
+    fs::write(
+        dir.join("pages/More.md"),
+        "tags:: alpha, beta\n\n- another row\n  score:: 7\n  note:: [[Book]], plain\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join(".registry-sources/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    let config = graph.config.parse_config();
+
+    let (document_rows, document_pages) = crate::query::property_owner_rows(&graph);
+    let from_documents = crate::query::registry::build_registry(
+        document_rows.into_iter(),
+        &|page_id| document_pages.get(page_id).cloned(),
+        &config,
+    )
+    .expect("every document row names its own page");
+
+    assert!(
+        from_documents
+            .rows()
+            .iter()
+            .any(|row| row.normalized_name == "score"),
+        "the fixture's key is actually in the table"
+    );
+
+    // The third source: the ready projection's raw stream. It exists so that a
+    // registry read on a ready Direct Files graph does not walk every hydrated
+    // document — an adapter onto the SAME `build_registry`, never a second
+    // registry producer.
+    wait_for_direct_query_projection(&graph);
+    let (stream_rows, stream_pages) = graph
+        .direct_projection_property_owner_rows()
+        .expect("a ready projection answers the registry's row source");
+    let from_projection = crate::query::registry::build_registry(
+        stream_rows.into_iter(),
+        &|page_id| stream_pages.get(page_id).cloned(),
+        &config,
+    )
+    .expect("every projection row names its own page");
+    assert_eq!(
+        from_projection.rows(),
+        from_documents.rows(),
+        "the ready projection stream and the cold document walk build one table"
+    );
+
+    // And the graph's own registry, which now PREFERS the ready stream, is that
+    // same table — the adapter is wired, not merely present. Equal tables alone
+    // cannot show WHICH source answered (that is the point of the guard above),
+    // so the projection's own read counter is the witness: a rebuild that fell
+    // back to the document iterator touches the projection zero times.
+    let reads_before = graph.direct_projection_indexed_reads_test();
+    assert_eq!(graph.property_registry().rows(), from_documents.rows());
+    assert!(
+        graph.direct_projection_indexed_reads_test() > reads_before,
+        "the oracle's registry on a ready Direct Files graph reads the projection"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// §6.2's guard on a REAL graph: the registry built from each of the three row
+/// sources reports identical rows. Wave B proved it between two sources on a
+/// constructed fixture; this proves it across all three on the anonymized
+/// corpus, which is the graph whose property vocabulary the campaign's cost
+/// bound is measured against.
+///
+/// ```text
+/// TINE_REGISTRY_TIMING_GRAPH=~/research/logseq-anonymized \
+///   cargo test --release -p tine-core registry_row_sources_agree_on_a_real_graph \
+///   -- --ignored --nocapture
+/// ```
+///
+/// Ignored by default: it needs a graph this repository does not ship. It
+/// prints counts only, never content.
+#[test]
+#[ignore = "needs a real graph named by TINE_REGISTRY_TIMING_GRAPH"]
+fn registry_row_sources_agree_on_a_real_graph() {
+    let Ok(root) = std::env::var("TINE_REGISTRY_TIMING_GRAPH") else {
+        panic!("set TINE_REGISTRY_TIMING_GRAPH to a graph directory");
+    };
+    let graph = Graph::open(std::path::Path::new(&root));
+    let projection_dir =
+        std::env::temp_dir().join(format!("tine-registry-sources-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&projection_dir);
+    fs::create_dir_all(&projection_dir).unwrap();
+    graph
+        .attach_direct_projection(projection_dir.join("projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    let config = graph.config.parse_config();
+
+    let (document_rows, document_pages) = crate::query::property_owner_rows(&graph);
+    let document_row_count = document_rows.len();
+    let from_documents = crate::query::registry::build_registry(
+        document_rows.into_iter(),
+        &|page_id| document_pages.get(page_id).cloned(),
+        &config,
+    )
+    .expect("every document row names its own page");
+
+    wait_for_direct_query_projection(&graph);
+    let (stream_rows, stream_pages) = graph
+        .direct_projection_property_owner_rows()
+        .expect("a ready projection answers the registry's row source");
+    let stream_row_count = stream_rows.len();
+    let from_projection = crate::query::registry::build_registry(
+        stream_rows.into_iter(),
+        &|page_id| stream_pages.get(page_id).cloned(),
+        &config,
+    )
+    .expect("every projection row names its own page");
+
+    println!(
+        "REGISTRYSOURCES	graph=<named by env>	document_rows={document_row_count}	projection_rows={stream_row_count}	keys={}",
+        from_documents.rows().len()
+    );
+    assert_eq!(
+        from_projection.rows(),
+        from_documents.rows(),
+        "ready projection stream vs cold document walk"
+    );
+    let _ = fs::remove_dir_all(&projection_dir);
+}
+
+/// The registry build is a whole-graph pass, so its cost is reported rather
+/// than assumed. The bound the dossier asks for is measured on the anonymized
+/// corpus by the lane and recorded in the receipt; this test measures the same
+/// code on a graph it can construct, so a regression that made the build
+/// quadratic fails here instead of in the field.
+#[test]
+fn the_registry_build_is_measured_and_bounded() {
+    let dir = scratch("registry-build-timing");
+    for page in 0..200 {
+        let mut text = String::new();
+        for block in 0..10 {
+            text.push_str(&format!(
+                "- block {block}\n  score:: {block}\n  note:: [[Ref {block}]], plain text\n"
+            ));
+        }
+        fs::write(dir.join(format!("pages/Page {page}.md")), text).unwrap();
+    }
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let config = graph.config.parse_config();
+
+    let mut micros = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let (rows, pages) = crate::query::property_owner_rows(&graph);
+        let registry = crate::query::registry::build_registry(
+            rows.into_iter(),
+            &|page_id| pages.get(page_id).cloned(),
+            &config,
+        )
+        .expect("every row names its own page");
+        micros.push(started.elapsed().as_micros() as u64);
+        assert!(!registry.rows().is_empty());
+    }
+    micros.sort_unstable();
+    let median = micros[micros.len() / 2];
+    println!("REGISTRYBUILD\tpages=200\tblocks=2000\tmedian_micros={median}");
+    assert!(
+        median < 2_000_000,
+        "a 2000-block graph must not take seconds to aggregate: {median} us"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The same measurement against a REAL graph, named by
+/// `TINE_REGISTRY_TIMING_GRAPH`, so the dossier's bound can be re-measured on
+/// the anonymized corpus by anyone who has it:
+///
+/// ```text
+/// TINE_REGISTRY_TIMING_GRAPH=~/research/logseq-anonymized \
+///   cargo test --release -p tine-core registry_build_timing_on_a_real_graph \
+///   -- --ignored --nocapture
+/// ```
+///
+/// Ignored by default: it needs a graph this repository does not ship, and it
+/// prints a number rather than asserting one — the bound is a receipt line the
+/// manager reads, not a threshold that should fail a build on a slow machine.
+/// It prints page and block COUNTS and a duration, never any content.
+#[test]
+#[ignore = "needs a real graph named by TINE_REGISTRY_TIMING_GRAPH"]
+fn registry_build_timing_on_a_real_graph() {
+    let Ok(root) = std::env::var("TINE_REGISTRY_TIMING_GRAPH") else {
+        panic!("set TINE_REGISTRY_TIMING_GRAPH to a graph directory");
+    };
+    let graph = Graph::open(std::path::Path::new(&root));
+    graph.warm_cache();
+    let config = graph.config.parse_config();
+
+    let mut micros = Vec::new();
+    let mut rows_seen = 0usize;
+    let mut keys_seen = 0usize;
+    for _ in 0..20 {
+        let started = Instant::now();
+        let (rows, pages) = crate::query::property_owner_rows(&graph);
+        rows_seen = rows.len();
+        let registry = crate::query::registry::build_registry(
+            rows.into_iter(),
+            &|page_id| pages.get(page_id).cloned(),
+            &config,
+        )
+        .expect("every row names its own page");
+        micros.push(started.elapsed().as_micros() as u64);
+        keys_seen = registry.rows().len();
+    }
+    micros.sort_unstable();
+    println!(
+        "REGISTRYBUILD\tgraph=<named by env>\tproperty_rows={rows_seen}\tkeys={keys_seen}\tmedian_micros={}",
+        micros[micros.len() / 2]
     );
 }

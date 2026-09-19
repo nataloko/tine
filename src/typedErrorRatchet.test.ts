@@ -1,24 +1,35 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource } from "./rustModelSource.test-helpers";
 import {
-  AdoptionArchivedError,
   AssetTooLargeError,
   BackendError,
   DirectSaveFailureError,
-  ManagedActorRefusalError,
-  ManagedGraphMismatchError,
   OperationCancelledError,
   SaveConflictError,
-  SharedFrontierMismatchError,
-  SparseShutdownRefusedError,
-  SyncDataUnavailableError,
   classifyNativeCallError,
 } from "./backend";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
+
+function rustModuleSource(path: string): string {
+  const root = join(process.cwd(), path);
+  const files = [root];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = root.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 
 function hasStringErrorResult(text: string): boolean {
   let rest = text;
@@ -69,7 +80,14 @@ function withoutRustTestModules(text: string): string {
 
 interface ClassifierSite {
   file: string;
-  line: number;
+  /// A digest of the matched line's normalized text, NOT its line number.
+  /// `Macro.tsx` is edited constantly, and a line pin here would redden this
+  /// ratchet for every patch above line 1281 — the failure mode that made the
+  /// content-out-of-logs censuses unreadable (see the note on CONSOLE_ALLOWLIST
+  /// in src/contentOutOfLogs.ratchet.test.ts, and ALLOWLIST in
+  /// crates/tine-core/tests/content_out_of_logs.rs). The anchor moves with the
+  /// line it classifies, and changes when the classification would need to.
+  anchor: string;
   class: string;
   why: string;
 }
@@ -77,15 +95,13 @@ interface ClassifierSite {
 const ERROR_STRING_CLASSIFIER_ALLOWLIST: readonly ClassifierSite[] = [
   {
     file: "components/Macro.tsx",
-    // FORK: 458 upstream — the query-filter memos above this site push it down.
-    // Pure line drift; the site and its class are upstream's, unchanged.
-    line: 496,
+    anchor: "0009538214aa",
     class: "bounded-result-code",
     why: "the query boundary's result-too-large prefix is a bounded wire code, not prose",
   },
   {
     file: "lib/referenceLoadError.ts",
-    line: 26,
+    anchor: "8aedb709e22a",
     class: "bounded-result-code",
     why: "the references boundary's result-too-large prefix is a bounded wire code, not prose",
   },
@@ -104,8 +120,12 @@ function sourceFiles(dir: string, files: string[] = []): string[] {
   return files;
 }
 
-function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
-  const sites: Omit<ClassifierSite, "class" | "why">[] = [];
+function classifierAnchor(line: string): string {
+  return createHash("sha256").update(line.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 12);
+}
+
+function errorStringClassifierSites(): (Omit<ClassifierSite, "class" | "why"> & { line: number })[] {
+  const sites: (Omit<ClassifierSite, "class" | "why"> & { line: number })[] = [];
   for (const file of sourceFiles(ROOT)) {
     const text = readFileSync(file, "utf8");
     for (const [index, line] of text.split("\n").entries()) {
@@ -114,7 +134,11 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         || /\b(?:detail|message)\.(?:includes|match|startsWith)\(/.test(line)
         || /\.(?:exec|test)\((?:message|detail)\)/.test(line)
       ) {
-        sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: index + 1 });
+        sites.push({
+          file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(line),
+          line: index + 1,
+        });
       }
     }
 
@@ -163,6 +187,7 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         helperNames.add(fn.name);
         sites.push({
           file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(lines[classifierLine]),
           line: classifierLine + 1,
         });
       }
@@ -176,7 +201,11 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         new RegExp(`\\b${name}\\((?:message|text)\\)`).test(body),
       );
       if (convertsErrorToText && delegatesToHelper) {
-        sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: fn.start + 1 });
+        sites.push({
+          file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(lines[fn.start]),
+          line: fn.start + 1,
+        });
       }
     }
   }
@@ -184,17 +213,12 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
     .filter((site, index, all) =>
       all.findIndex((candidate) => candidate.file === site.file && candidate.line === site.line) === index,
     )
-    .sort((left, right) => left.file.localeCompare(right.file) || left.line - right.line);
+    .sort((left, right) => left.file.localeCompare(right.file) || left.anchor.localeCompare(right.anchor));
 }
 
 describe("I-9/I-11 typed backend error boundary", () => {
   it("classifies every tagged native payload once at the backend funnel", () => {
     const cases: [string, new (...args: never[]) => BackendError][] = [
-      ["sync-data-unavailable", SyncDataUnavailableError],
-      ["managed-graph-mismatch", ManagedGraphMismatchError],
-      ["shared-frontier-mismatch", SharedFrontierMismatchError],
-      ["adoption-archived", AdoptionArchivedError],
-      ["sparse-shutdown-refused", SparseShutdownRefusedError],
       ["asset-too-large", AssetTooLargeError],
       ["operation-cancelled", OperationCancelledError],
     ];
@@ -202,13 +226,6 @@ describe("I-9/I-11 typed backend error boundary", () => {
       const classified = classifyNativeCallError(JSON.stringify({ kind }));
       expect(classified).toBeInstanceOf(Type);
     }
-    const actor = classifyNativeCallError(JSON.stringify({
-      kind: "managed-actor-refusal",
-      reason_code: "trusted_local.append_outcome_unknown",
-    }));
-    expect(actor).toBeInstanceOf(ManagedActorRefusalError);
-    expect(actor).toMatchObject({ reasonCode: "trusted_local.append_outcome_unknown" });
-
     const direct = classifyNativeCallError(JSON.stringify({
       kind: "direct-save-failure",
       reason_code: "precheck.symlink",
@@ -225,80 +242,61 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(conflict).toBeInstanceOf(SaveConflictError);
     expect(conflict).toMatchObject({ reasonCode: "conflict.base_rev", epoch: 23 });
 
-    // The one kind with a typed detail object: bounded counts and paths are
-    // validated field by field; a malformed detail degrades to no detail.
-    const mismatch = classifyNativeCallError(JSON.stringify({
-      kind: "shared-frontier-mismatch",
-      detail: {
-        local_pages: 2, shared_pages: 2, local_only: 1, shared_only: 0, changed: 1, omitted: 0,
-        paths: [
-          { path: "notes/local-only.md", side: "local-only" },
-          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
-        ],
-      },
-    }));
-    expect(mismatch).toBeInstanceOf(SharedFrontierMismatchError);
-    expect(mismatch).toMatchObject({
-      detail: {
-        localOnly: 1,
-        paths: [
-          { path: "notes/local-only.md", side: "local-only", categories: [] },
-          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
-        ],
-      },
-    });
-    const malformed = classifyNativeCallError(JSON.stringify({
-      kind: "shared-frontier-mismatch",
-      detail: { local_pages: 1, paths: [{ path: 7, side: "elsewhere" }] },
-    }));
-    expect(malformed).toBeInstanceOf(SharedFrontierMismatchError);
-    expect(malformed).toMatchObject({ detail: null });
   });
 
   it("has no prose-parsing classifier outside the one funnel", () => {
+    const repair = "I-9: error classification must use src/backend.ts "
+      + "SaveConflictError/classifyTaggedBackendError; helper indirection may not restore prose "
+      + "parsing. Sites are anchored to the text of the line, not to its number, so this does not "
+      + "fire merely because lines moved";
+    const sites = errorStringClassifierSites();
+    // One row must name one site, and one site must be named by one row.
+    // Otherwise a second identical line hides behind the first row's blessing.
     expect(
-      errorStringClassifierSites(),
-      "I-9: error classification must use src/backend.ts SaveConflictError/classifyTaggedBackendError; helper indirection may not restore prose parsing",
-    ).toEqual(
-      ERROR_STRING_CLASSIFIER_ALLOWLIST.map(({ file, line }) => ({ file, line })),
-    );
+      new Set(sites.map((site) => `${site.file} ${site.anchor}`)).size,
+      "two identical prose-parsing lines in one file: give one distinct text",
+    ).toBe(sites.length);
+    const allowed = new Set(ERROR_STRING_CLASSIFIER_ALLOWLIST.map((entry) => `${entry.file} ${entry.anchor}`));
+    expect(
+      sites.filter((site) => !allowed.has(`${site.file} ${site.anchor}`))
+        .map((site) => `${site.file}:${site.line} ${site.anchor}`),
+      repair,
+    ).toEqual([]);
+    const present = new Set(sites.map((site) => `${site.file} ${site.anchor}`));
+    expect(
+      ERROR_STRING_CLASSIFIER_ALLOWLIST.filter((entry) => !present.has(`${entry.file} ${entry.anchor}`))
+        .map((entry) => `${entry.file} ${entry.anchor}`),
+      `${repair}. A censused classifier no longer exists with that text: if you changed it, `
+        + "reclassify it and update its anchor; if you removed it, drop the row",
+    ).toEqual([]);
   });
 
   it("keeps phase-B legacy literals compatible with the frontend funnel", () => {
     expect(classifyNativeCallError('{"kind":"operation-cancelled"}')).toBeInstanceOf(OperationCancelledError);
-    expect(classifyNativeCallError('{"kind":"sync-data-unavailable"}')).toBeInstanceOf(SyncDataUnavailableError);
-    expect(classifyNativeCallError('{"kind":"adoption-archived"}')).toBeInstanceOf(AdoptionArchivedError);
     for (const literal of [
       "denied", "asset not found: worker", "asset not found: tauri", "json failure",
       "plugin failure", "clipboard failure", "platform failure", "graph verification failure",
-      "graph failure", "sync runtime failure", "settings failure", "diagnostic failure",
+      "graph failure", "storage transition failure", "settings failure", "diagnostic failure",
       "backup failure", "phase-B prose",
     ]) expect(classifyNativeCallError(literal)).toBe(literal);
   });
 
   it("pins the Rust typed boundaries and the living contract", () => {
-    const wire = source("crates/tine-core/src/oplog/wire.rs");
-    const runtime = source("crates/tine-core/src/sync_runtime.rs");
-    const model = source("crates/tine-core/src/model.rs");
+    const model = modelModuleSource();
+    const vocab = rustModuleSource("crates/tine-core/src/vocab.rs");
     const contract = source("docs/contracts/typed-errors.md");
-    expect(wire).toContain("Io(std::io::ErrorKind)");
-    expect(wire).not.toMatch(/ScenarioError::Io\([^)]*(?:to_string|format!)/s);
     const directClassifier = model.slice(
       model.indexOf("pub fn direct_save_conflict_epoch"),
-      model.indexOf("fn initial_shadow_limit_error"),
+      model.indexOf("fn graph_text_capture_limit_error"),
     );
     expect(directClassifier).toContain("downcast_ref::<DirectSaveError>()");
     expect(directClassifier).not.toMatch(/(?:to_string|contains|starts_with)\s*\(/);
-    // Clean-open failures stay typed until the single OpenRefused projection.
-    expect(runtime.match(/map_err\(display\)/g) ?? []).toHaveLength(0);
-    expect(runtime.match(/fn display\(/g) ?? []).toHaveLength(0);
-    expect(contract).toContain("10 BackendError subclasses");
-    expect(contract).toContain("Core-only clean-open boundary");
+    expect(contract).toContain("7 BackendError subclasses");
     expect(contract).not.toContain("item 3 checkpoint");
     expect(contract).toContain("TauriBackend.call");
 
     const commandError = source("src-tauri/src/command_error.rs");
-    const commands = source("src-tauri/src/commands.rs");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     const state = source("src-tauri/src/state.rs");
     const parity = source("src-tauri/src/backend_command_parity.rs");
     expect(commandError).toContain("impl Serialize for CommandError");
@@ -307,23 +305,22 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(contract).toContain("## `CommandError` boundary");
-    expect(contract).toContain("The phase-A syntactic census remains 113 production sites");
+    expect(contract).toContain("The syntactic census is 47 production sites");
 
-    const quitFixtures = commands.slice(
-      commands.indexOf("mod prepare_tine_quit_tests"),
-      commands.indexOf("pub(crate) fn read_local_image"),
-    );
-    const proseSites = (commands.match(/CommandError::prose/g) ?? []).length
-      - (quitFixtures.match(/CommandError::prose/g) ?? []).length
-      + (state.match(/CommandError::prose/g) ?? []).length;
-    expect(proseSites).toBe(113);
+    const proseSites = (withoutRustTestModules(commands).match(/CommandError::prose/g) ?? []).length
+      + (withoutRustTestModules(state).match(/CommandError::prose/g) ?? []).length;
+    // 47 after the Managed Storage removal (2026-09-15): the managed command
+    // surface and its wrong-reply arms are gone; the one site added since is
+    // query_publication_error's pass-through of the core's composed refusal. The ratchet retires legacy
+    // untyped WORDING; see docs/contracts/typed-errors.md.
+    expect(proseSites).toBe(47);
 
     const phaseB = parity.slice(
       parity.indexOf("const PHASE_B_COMMANDS"),
       parity.indexOf("const INFALLIBLE"),
     );
     const phaseBRows = [...phaseB.matchAll(/\("([^"]+\.rs)", "([^"]+)"\)/g)];
-    expect(phaseBRows.length).toBeGreaterThan(50);
+    expect(phaseBRows.length).toBeGreaterThan(40);
     expect(contract).toContain("Every fallible command registered for desktop, Android, or iOS");
 
     for (const heading of ["### Conversion table", "### `Prose` census"]) {
@@ -335,49 +332,25 @@ describe("I-9/I-11 typed backend error boundary", () => {
       for (const row of rows) expect(row.split("|").length).toBe(7);
     }
 
-    const cleanEnum = runtime.slice(
-      runtime.indexOf("pub(crate) enum CleanOpenError"),
-      runtime.indexOf("impl CleanOpenError"),
-    );
-    expect(cleanEnum).not.toMatch(/\bString\b/);
-    const cleanImpl = runtime.slice(
-      runtime.indexOf("impl CleanOpenError"),
-      runtime.indexOf("impl fmt::Display for CleanOpenError"),
-    );
-    const cleanCodes = [...cleanImpl.matchAll(/"(clean_open\.[a-z_]+)"/g)]
-      .map((match) => match[1]);
-    expect(cleanCodes).toHaveLength(16);
-    expect(new Set(cleanCodes).size).toBe(16);
-    for (const code of cleanCodes) expect(contract).toContain(code);
-    expect(runtime.match(/fn clean_open_error_detail\(/g) ?? []).toHaveLength(1);
-    expect(runtime).toContain('tagged_backend_error("clean-open", Some(error.reason_code()))');
-
-    const directImpl = model.slice(
-      model.indexOf("impl DirectSaveFailureCode"),
-      model.indexOf("/// Typed inner error", model.indexOf("impl DirectSaveFailureCode")),
+    const directImpl = vocab.slice(
+      vocab.indexOf("impl DirectSaveFailureCode"),
+      vocab.indexOf("/// Typed inner error", vocab.indexOf("impl DirectSaveFailureCode")),
     );
     const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
       .map((match) => match[1]);
-    expect(directCodes).toHaveLength(36);
+    expect(directCodes).toHaveLength(35);
 
-    const managedImpl = runtime.slice(
-      runtime.indexOf("impl SyncEditorRefusalCode"),
-      runtime.indexOf("impl fmt::Display for SyncEditorRefusalCode"),
-    );
-    const managedCodes = [...managedImpl.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
-      .map((match) => match[1]);
-    expect(managedCodes).toHaveLength(22);
-    for (const code of [...directCodes, ...managedCodes]) expect(contract).toContain(code);
+    for (const code of directCodes) expect(contract).toContain(code);
 
     const persistence = source("src/persistence.ts");
     const policy = persistence.slice(
       persistence.indexOf("export function isRetryableSaveFailure"),
-      persistence.indexOf("export type SaveFailureDisposition"),
+      persistence.indexOf("function saveFailureCode"),
     );
     const frontendCodes = [...policy.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
-      .map((match) => match[1])
-      .filter((code) => code !== "managed.conflict");
-    const producerUnion = new Set([...directCodes, ...managedCodes]);
+      .map((match) => match[1]);
+    expect(frontendCodes.length).toBeGreaterThan(0);
+    const producerUnion = new Set(directCodes);
     expect(frontendCodes.filter((code) => !producerUnion.has(code))).toEqual([]);
   });
 
@@ -385,7 +358,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const rustDir = join(process.cwd(), "src-tauri/src");
     const rustFiles = readdirSync(rustDir)
       .filter((file) => file.endsWith(".rs"))
-      .map((file) => ({ file, text: readFileSync(join(rustDir, file), "utf8") }));
+      .map((file) => ({ file, text: rustModuleSource(`src-tauri/src/${file}`) }));
     expect(rustFiles.filter(({ text }) => hasStringErrorResult(text)).map(({ file }) => file)).toEqual([]);
     expect(
       rustFiles.filter(({ text }) => /map_err\(\|\w+\|\s*\w+\.to_string\(\)\)/.test(text)).map(({ file }) => file),
@@ -400,19 +373,27 @@ describe("I-9/I-11 typed backend error boundary", () => {
     // Count and placement are pinned as ONE tuple on purpose: asserting them
     // separately lets a count-preserving swap (a Plugin failure re-mapped as
     // Backup) satisfy the count while the fingerprint silently moves.
-    expect(parity).toContain("(498, 17_903_180_402_005_549_371)");
+    //
+    // The VALUE is deliberately NOT repeated here. Only the Rust test can
+    // compute the fingerprint, and it already fails when its pin stops matching
+    // reality, so a literal copy in this file adds no coverage — it just makes
+    // every legitimate re-pin a two-file edit whose second half fails in a
+    // different suite. That is exactly how it broke on 2026-09-11: the Rust pin
+    // moved to the reviewed 507-row manifest and this line went red for a fact
+    // nobody had changed. Assert the SHAPE of the pin instead.
+    expect(parity).toMatch(/\(site_count, site_fingerprint\),\s*\(\d+, [\d_]+\),/);
     // A mismatch must print the rows, not a bare 64-bit number nobody can act on.
     expect(parity).toContain("site_rows.join");
     expect(contract).toContain("### Absolute phase-B rule");
     expect(contract).not.toContain("### E2b phase-B pin");
     for (const family of [
       "Json", "Plugin", "Clipboard", "Platform", "GraphVerification", "Graph",
-      "SyncRuntime", "Settings", "Diagnostic", "Backup",
+      "StorageTransition", "Settings", "Diagnostic", "Backup",
     ]) expect(commandError).toContain(`${family} {`);
     for (const file of [
       "backup.rs", "conflict_capsule.rs", "debug.rs", "graph.rs",
       "graph_verification.rs", "platform.rs", "plugins.rs", "settings.rs",
-      "storage_mode_supervisor.rs", "sync_runtime.rs",
+      "storage_transition_supervisor.rs",
     ]) expect(contract).toContain(`\`${file}\``);
 
     const proseStart = contract.indexOf("### `Prose` census");
@@ -433,9 +414,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const misplaced: string[] = [];
     for (const { file, text } of rustFiles) {
       if (["commands.rs", "state.rs", "command_error.rs", "backend_command_parity.rs"].includes(file)) continue;
-      const production = file === "sync_runtime.rs"
-        ? text.slice(0, text.indexOf("#[cfg(test)]\nmod tests"))
-        : withoutRustTestModules(text);
+      const production = withoutRustTestModules(text);
       for (const match of production.matchAll(/CommandError::prose\b/g)) {
         const symbol = enclosingRustSymbol(production, match.index);
         if (symbol === null || !allowedProse.get(file)?.has(symbol)) misplaced.push(`${file}::${symbol ?? "<none>"}`);

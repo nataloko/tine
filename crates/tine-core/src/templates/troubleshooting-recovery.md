@@ -11,11 +11,6 @@ icon:: 🛟
 	- 1. Open `logseq/.tine-trash/pages/` or `logseq/.tine-trash/journals/` inside your graph. Deleted files have a timestamp followed by `__` before their original name.
 	- 2. Remove the timestamp and `__`, then move the file into the configured pages or journals folder. For a page that originally lived elsewhere, you may return it to that location instead.
 	- 3. What you should see: Tine notices the restored file like any external change, and the page reappears.
-- ## Review several deletions in Tine-managed storage
-	- 1. Open the **Deleted pages** dock after the warning appears. Tier 2 starts at four deletions; Tier 3 covers at least 10% of the graph (rounded up), or 50 pages when that is lower, and pauses propagation for about five minutes. Smaller Tier 1 sweeps stay quiet.
-	- 2. Review every member page, then choose exactly one explicit action: **Restore**, **Re-apply**, or **Keep deletion**. Closing the warning or panel records no choice and does not dispose the sweep.
-	- 3. If Restore fails, read the recorded cause and choose **Run Restore again**. Tine resumes through its durable whole-sweep Restore; do not recreate pages one at a time while it is running.
-	- 4. What you should see: progress and completion update live, and the finished sweep remains visible with **Restored**, **Deletion re-applied**, or **Deletion kept**. This surface applies only to experimental managed storage; the single-file steps above remain the Direct files recovery path. See [[Features/Managed sync]].
 - ## Restore an earlier state of the graph
 	- 1. Open Settings (**t s**) → **Backups & recovery** and find the snapshot from before the damage. (Tine snapshots your Markdown/Org files on every launch; **Snapshots to keep** controls how many survive.)
 	- 2. Choose **Restore** beside it and confirm.
@@ -37,15 +32,25 @@ icon:: 🛟
 	- Meaning: Tine started, but the open itself is stuck or has failed. Once it takes longer than a moment you get a card naming the current phase and the elapsed time; if the open cannot complete, the same card becomes **Tine needs help opening this workspace** with actions.
 	- 1. **Retry lookup** — attempt the same open again. This is safe to repeat.
 	- 2. **Open another graph…** — pick a different folder and leave this one untouched.
-	- 3. **Return … to Direct Files…** — offered only for a graph you enrolled in experimental Tine-managed storage; it puts that graph back on plain files.
-	- 4. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
-	- 5. What you should see: no managed-storage data has been discarded by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
+	- 3. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
+	- 4. What you should see: nothing about the graph has been changed by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
+- ## Part of the window says it could not be displayed
+	- Meaning: one region — the page, the sidebar, Linked or Unlinked References, the conflict panel — hit an error it could not render through. It is reported in place, with a **Retry**, and the rest of the window keeps working.
+	- 1. **Retry** — re-renders just that region. A failure caused by something transient, such as a command that lost a race with a slow startup, usually clears on the first retry.
+	- 2. If the message mentions that Tine is still waiting on operations that have been running for a while, give it a moment and retry again: the region is failing because the backend has not answered yet, not because anything is wrong with your notes.
+	- 3. If it comes back every time, use **Create diagnostic report** below and include the message shown in the region.
+	- 4. What you should see: your notes on disk are untouched either way — a region that cannot be displayed is a display failure, not a data failure.
+- ## A panel says it could not load something
+	- Meaning: one panel could not fetch what it needed — references to a block, the results of a query, the list of pages. It says so instead of drawing itself empty, because an empty panel would tell you there is nothing there, which is a different thing from not being able to find out.
+	- 1. **Retry**, where the panel offers one, re-fetches just that panel. The rest of the page, and the rest of that panel, keep working.
+	- 2. Smaller pieces degrade quietly rather than saying anything: a code block that could not be highlighted shows as plain text, a formula that could not be typeset shows its LaTeX, a preview that could not load shows nothing in its place. These are display-only, and reopening the page re-tries them.
+	- 3. What you should see: the panel keeps its heading and its controls, and the rest of the window is unaffected. Nothing on disk changes.
 - ## Create a privacy-safe diagnostic report
-	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
+	- 1. Open Settings → **Help & diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.
 	- 3. For a suspected Syncthing/Dropbox mismatch, use **Verify synchronized graph** in the same tab on both devices, exchange the generated reports, and compare them. This check includes paths and page names but never note contents.
 	- 4. What you should see: a report you can attach to an issue without first setting up `adb`, SSH, or a terminal. **Clear recorded events** removes the retained flight-recorder history after you are done.
 - ## Something parses or renders wrong
-	- 1. Open Settings → **Help improve Tine**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every place they disagree plus a parse-speed comparison.
+	- 1. Open Settings → **Help & diagnostics** → **Help improve Tine's parser**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every actionable place they disagree plus a parse-speed comparison. Known intentional parser differences are suppressed and shown only in the details count.
 	- 2. Copy the report shown there — every snippet is anonymized (page names and words are scrubbed, markup shape kept) and re-verified to still reproduce the divergence before it is shown. Nothing is uploaded.
 	- 3. What you should see: a local report, including the Tine version, that you can paste into an issue.

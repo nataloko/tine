@@ -1,10 +1,26 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource, rustModuleSource } from "./rustModelSource.test-helpers";
 
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
 describe("living publication contracts stay pinned to production", () => {
+  it("indexes every ADR, so a decision can be found by someone who does not know it exists", () => {
+    const dir = join(process.cwd(), "docs/adr");
+    const readme = source("docs/adr/README.md");
+    const unindexed = readdirSync(dir)
+      .filter((name) => /^\d{4}-.*\.md$/.test(name))
+      .filter((name) => !readme.includes(name.slice(0, 4)));
+    expect(
+      unindexed,
+      "docs/adr/README.md is the only way in to the decision log: an ADR missing from it "
+        + "is a decision the next implementer will re-litigate. Add a line for each of these, "
+        + "matching the existing rows (exemplar: the 0052 row). "
+        + `Unindexed: ${unindexed.join(", ")}`,
+    ).toEqual([]);
+  });
+
   it("pins backup restore to its capability-bound retire-before-publish stack", () => {
     const contract = source("docs/contracts/backup-restore.md");
     const production = source("src-tauri/src/backup.rs");
@@ -40,7 +56,8 @@ describe("living publication contracts stay pinned to production", () => {
 
   it("pins the small-file conditional publish, recovery name, and retry bound", () => {
     const contract = source("docs/contracts/small-file-writes.md");
-    const production = source("crates/tine-core/src/model.rs");
+    const production = modelModuleSource()
+      + rustModuleSource("crates/tine-core/src/filesystem_durability.rs");
     for (const claim of [
       "atomic_replace_expected",
       "Graph::recover_interrupted_publishes()",

@@ -4,9 +4,8 @@
 //! `std::process::abort()` and `std::process::exit()` end the process with no
 //! unwinding: no destructor runs, no in-flight save completes, no lock is
 //! released. Tine's crash-cut tests deliberately use `abort()` to prove that
-//! recovery works — W4-R2 added three such cuts to the Managed activation
-//! commit path, and `oplog/sqlite.rs` carries four more. Every one of them is
-//! `#[cfg(test)]`-gated, so none exists in a shipped binary.
+//! recovery works. Every one of them is `#[cfg(test)]`-gated, so none exists
+//! in a shipped binary.
 //!
 //! Nothing enforced that. Dropping one `#[cfg(test)]` would compile cleanly,
 //! pass every suite, and ship a binary that aborts mid-save on a real graph.
@@ -34,12 +33,25 @@ struct AllowedTermination {
     why: &'static str,
 }
 
-const ALLOWED: &[AllowedTermination] = &[AllowedTermination {
-    file: "src-tauri/src/data_home.rs",
-    call: "exit",
-    why: "the private data directory could not be established, so there is no \
-          state to corrupt and no window to show; startup stops deliberately",
-}];
+const ALLOWED: &[AllowedTermination] = &[
+    AllowedTermination {
+        file: "src-tauri/src/data_home.rs",
+        call: "exit",
+        why: "the private data directory could not be established, so there is no \
+              state to corrupt and no window to show; startup stops deliberately",
+    },
+    AllowedTermination {
+        file: "src-tauri/src/lib.rs",
+        call: "exit",
+        why: "Windows session end (GH #455). The call is `#[cfg(target_os = \
+              \"windows\")]` and sits after the bounded Concord ledger drain and \
+              the clean-shutdown mark, so every durability step this exit could \
+              cut has already completed. On WM_ENDSESSION tao's message loop \
+              receives no WM_QUIT and never switches to an exiting ControlFlow, \
+              so returning instead would leave Tine alive until Windows force- \
+              terminates it, which cuts the same work with no drain at all",
+    },
+];
 
 #[test]
 fn a_shipped_binary_terminates_itself_only_where_the_census_allows() {

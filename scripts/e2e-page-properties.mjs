@@ -16,6 +16,8 @@ import {
 } from "./e2e-capabilities.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
+import { dismissStartupNotices } from "./lib/e2e-toasts.mjs";
 
 await ensureDisplay();
 
@@ -91,41 +93,11 @@ const driver = spawn(TD, driverArgs, {
 await sleep(2500);
 let browser;
 
-async function openPage(name) {
-  const current = await browser.$("h1.page-title").getText().catch(() => "");
-  if (current.trim() === name) return;
-  // Fixture routing is not a sidebar contract. Windows can attach WebDriver
-  // while the sidebar is still absent or intentionally collapsed, so use the
-  // app's visible search control and wait for the exact indexed page instead
-  // of treating one incidental startup surface as readiness proof.
-  // The global shortcut is also the production route when compact/native
-  // chrome has the sidebar button outside the current viewport. Requiring that
-  // incidental button to be WebDriver-clickable made the Windows journey fail
-  // behind an otherwise ready journal at narrow/default window geometry.
-  await browser.keys(["Control", "k"]);
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 10_000 });
-  await input.setValue(name);
-  await browser.waitUntil(() => browser.execute((target) =>
-    [...document.querySelectorAll(".switcher-row")].some((row) =>
-      row.querySelector(".switcher-kind")?.textContent?.trim() === "page"
-      && row.querySelector(".switcher-name")?.textContent?.trim() === target), name), {
-    timeout: 20_000,
-    timeoutMsg: `switcher did not expose exact page ${name}`,
-  });
-  const opened = await browser.execute((target) => {
-    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
-      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
-      && candidate.querySelector(".switcher-name")?.textContent?.trim() === target);
-    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-    return Boolean(row);
-  }, name);
-  if (!opened) throw new Error(`exact switcher result disappeared for ${name}`);
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-    timeout: 10_000,
-    timeoutMsg: `could not open ${name}`,
-  });
-}
+// One shared readiness contract for opening a page: find and activate the
+// exact non-block row in a single round trip and retry against the routed
+// title, so no element handle outlives the switcher's re-render. See
+// scripts/lib/e2e-navigation.mjs.
+const openPage = (name) => openPageByName(browser, name);
 
 async function openPageProperties() {
   await browser.$("[data-page-actions-trigger]").click();
@@ -137,9 +109,14 @@ async function openPageProperties() {
 
 async function setPagePropertyField(label, value) {
   await openPageProperties();
+  // Index over the SAME list that is indexed. Finding the position in `.pp-field`
+  // and then indexing a flat `.pp-input` list misaligns the moment a field before
+  // the target has no `.pp-input` (the bool row) or the page carries properties of
+  // its own - GH #164 lists every one of them - and a misaligned index silently
+  // writes a DIFFERENT property rather than failing.
   const index = await browser.execute((wanted) => {
-    const fields = [...document.querySelectorAll(".page-props-panel .pp-field")];
-    return fields.findIndex((field) => field.querySelector(".pp-label")?.textContent?.trim() === wanted);
+    const inputs = [...document.querySelectorAll(".page-props-panel .pp-field .pp-input")];
+    return inputs.findIndex((input) => input.closest(".pp-field")?.querySelector(".pp-label")?.textContent?.trim() === wanted);
   }, label);
   if (index < 0) throw new Error(`missing page property field ${label}`);
   const input = (await browser.$$(".page-props-panel .pp-field .pp-input"))[index];
@@ -436,6 +413,11 @@ async function activePagePropertyControl() {
     const panel = document.querySelector(".page-props-panel");
     const active = document.activeElement;
     if (!panel || !active || !panel.contains(active)) return null;
+    // GH #164 added two controls this classifier could not name: the add-row's
+    // Add button and a per-row Remove. An unnamed control returns null, which
+    // the caller reads as "focus left the form" - so name them explicitly.
+    if (active.classList.contains("pp-add-commit")) return "Add";
+    if (active.classList.contains("pp-remove")) return "Remove";
     if (active.classList.contains("pp-input")) {
       return active.closest(".pp-field")?.querySelector(".pp-label")?.textContent?.trim() ?? null;
     }
@@ -468,11 +450,34 @@ async function exerciseNativeFormTabTraversal(aliasValue) {
     throw new Error(`native Shift+Tab did not return to Aliases; active=${JSON.stringify(await activePagePropertyControl())}`);
   }
 
-  for (const expected of ["Tags", "Display title", "Icon", "Public", "Done"]) {
+  // The five presets keep their declared order, and that IS the contract. What
+  // follows them is the page's OWN properties - this fixture happens to carry
+  // eleven - and then the add-row, so the number of stops between Public and
+  // Done is a fact about the fixture, not about the product; GH #164 records
+  // field order as an explicit non-requirement. So assert the presets exactly,
+  // then assert the semantic outcome: tabbing stays inside the form, reaches the
+  // add-row, and ends at Done rather than escaping or dead-ending.
+  for (const expected of ["Tags", "Display title", "Icon", "Public"]) {
     await nativeTab();
     if (await activePagePropertyControl() !== expected) {
       throw new Error(`native Tab focus order expected ${expected}; active=${JSON.stringify(await activePagePropertyControl())}`);
     }
+  }
+  const reached = [];
+  for (let step = 0; step < 80; step += 1) {
+    await nativeTab();
+    const control = await activePagePropertyControl();
+    if (control === null) {
+      throw new Error(`native Tab left the properties form; stops so far=${JSON.stringify(reached)}`);
+    }
+    reached.push(control);
+    if (control === "Done") break;
+  }
+  if (!reached.includes("Add a property")) {
+    throw new Error(`native Tab never reached the add-row; stops=${JSON.stringify(reached)}`);
+  }
+  if (reached.at(-1) !== "Done") {
+    throw new Error(`native Tab never reached Done; stops=${JSON.stringify(reached)}`);
   }
   await browser.$(".pp-done").click();
   await browser.$(".page-props-panel").waitForExist({ reverse: true, timeout: 5_000 });
@@ -493,6 +498,15 @@ try {
   // not a named-page `.page-title`; waiting for the latter prevented openPage()
   // from ever exercising the routed page-properties journey on WebView2.
   await browser.$(".ls-block, .journal-title, .page-title").waitForExist({ timeout: 20_000 });
+  // A fresh profile always announces the Guide, and that notice is sticky and
+  // bottom-right - exactly where this panel's Done button sits once the page
+  // carries enough properties to fill the panel. Clear the known first-run
+  // notices before anything is clicked; unexpected toasts deliberately stay up.
+  // Done here, before the first waitForFile, so the dismissal's own graph-meta
+  // write cannot race an assertion about page content.
+  for (const notice of await dismissStartupNotices(browser)) {
+    console.log(`setup: dismissed startup notice: ${notice}`);
+  }
   await openPage("Property detailed");
   await exerciseNativeFormTabTraversal("Test Record, Alternate");
   const customRow = await browser.execute(() => {
@@ -628,7 +642,73 @@ try {
   if ((await browser.$$(".page-properties .prop-row")).length !== 0) {
     throw new Error("deleted page-header properties reappeared after real-app reopen");
   }
-  console.log(`PASS: page-header click/edit/navigation, native replacements (${replacementTrace.length}+${selectAllTrace.length} input events), deletion, disk bytes, and real-app reopen are canonical`);
+  // GH #164 block scope: the property editor is reachable from a BLOCK's own
+  // context menu on a ROUTED NAMED PAGE (not the journal feed - the two use
+  // different visible-order paths), an arbitrary key added there reaches disk
+  // under that block, and it is still there after the page is reopened. This is
+  // the one journey step that proves the new control end to end; the panel's
+  // own unit tests cannot reach the real save path.
+  await openPage("Property detailed");
+  const blockMenuOpened = await browser.execute(() => {
+    const surface = document.querySelector(".page-blocks .ls-block .block-main > .block-content-wrapper");
+    if (!(surface instanceof HTMLElement)) return false;
+    const rect = surface.getBoundingClientRect();
+    surface.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + Math.max(2, Math.min(20, rect.width / 2)),
+      clientY: rect.top + Math.max(2, Math.min(12, rect.height / 2)),
+      view: window,
+    }));
+    return true;
+  });
+  if (!blockMenuOpened) throw new Error("missing block surface for the block-properties context menu");
+  const blockPropsClicked = await browser.waitUntil(async () => browser.execute(() => {
+    const item = [...document.querySelectorAll(".ctx-item")].find((el) => (el.textContent ?? "").trim() === "Properties…");
+    if (!item) return false;
+    item.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    return true;
+  }), { timeout: 5_000, timeoutMsg: "block context menu never offered Properties…" });
+  if (!blockPropsClicked) throw new Error("block context menu never offered Properties…");
+  await browser.$(".page-props-panel").waitForExist({ timeout: 5_000 });
+  const addedBlockProperty = await browser.execute(() => {
+    const key = document.querySelector(".page-props-panel input.pp-add-key");
+    const value = document.querySelector(".page-props-panel input.pp-add-value");
+    const commit = document.querySelector(".page-props-panel button.pp-add-commit");
+    if (!(key instanceof HTMLInputElement) || !(value instanceof HTMLInputElement)
+      || !(commit instanceof HTMLButtonElement)) return false;
+    const set = (input, text) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, text);
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true }));
+    };
+    set(key, "reviewer");
+    set(value, "martin");
+    if (commit.disabled) return false;
+    commit.click();
+    return true;
+  });
+  if (!addedBlockProperty) throw new Error("block properties panel did not accept an arbitrary key");
+  await browser.$(".pp-done").click();
+  await browser.$(".page-props-panel").waitForExist({ reverse: true, timeout: 5_000 });
+  const blockPropAfter = await waitForFile(
+    `${GRAPH}/pages/Property detailed.md`,
+    (text) => text.includes("reviewer:: martin"),
+    "block property added from the block context menu",
+  );
+  if (!blockPropAfter.includes("- Example content block")) {
+    throw new Error(`adding a block property lost the block's own text: ${JSON.stringify(blockPropAfter)}`);
+  }
+  await openPage("Property detailed");
+  const blockPropSurvived = await waitForFile(
+    `${GRAPH}/pages/Property detailed.md`,
+    (text) => text.includes("reviewer:: martin"),
+    "block property survives a real-app reopen",
+  );
+  if (!blockPropSurvived.includes("reviewer:: martin")) {
+    throw new Error("block property did not survive reopening the page");
+  }
+  console.log(`PASS: page-header click/edit/navigation, native replacements (${replacementTrace.length}+${selectAllTrace.length} input events), deletion, disk bytes, real-app reopen, and block-scope arbitrary property add (GH #164) are canonical`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
   if (process.platform === "win32") {

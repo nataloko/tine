@@ -54,10 +54,6 @@ const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "u
 const viteConfig = fs.readFileSync(path.join(process.cwd(), "vite.config.ts"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
-const androidManagedRuntimeScript = fs.readFileSync(
-  path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
-  "utf8"
-);
 const androidUiRuntimeScript = fs.readFileSync(
   path.join(process.cwd(), ".github/scripts/android-ui-runtime.sh"),
   "utf8"
@@ -77,8 +73,8 @@ const issue295Scenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
   "utf8"
 );
-const windowsManagedScenario = fs.readFileSync(
-  path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
+const navigationContract = fs.readFileSync(
+  path.join(process.cwd(), "scripts/lib/e2e-navigation.mjs"),
   "utf8"
 );
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
@@ -187,30 +183,19 @@ assert.match(
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
 assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
-assert.match(
-  uiE2eWorkflow,
-  /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
-  "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
-);
 assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
+// `affe9be1` moved page navigation into ONE implementation, so this property no
+// longer lives in the journey: the scenario calls `openPageByName` and the row
+// selection is in `scripts/lib/e2e-navigation.mjs`. Pin it where it actually is,
+// and pin that the scenario still routes through it -- pinning only the helper
+// would pass while a journey grew its own switcher code again, which is the
+// exact regression the shared contract exists to prevent. The `kind` check the
+// journey used to carry is deliberately not required: excluding `block-result`
+// rows and demanding an exact name match is the same user-visible outcome, and
+// the shared contract states it that way.
 assert.match(
-  uiE2eWorkflow,
-  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
-  "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
-);
-assert.match(
-  windowsManagedScenario,
-  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
-  "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
-);
-assert.match(
-  windowsManagedScenario,
-  /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
-  "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
-);
-assert.match(
-  windowsManagedScenario,
-  /\.switcher-row:not\(\.block-result\)[\s\S]*?kind === "page" \|\| kind === "journal"[\s\S]*?name === title/,
+  navigationContract,
+  /!candidate\.classList\.contains\("block-result"\)[\s\S]*?\.switcher-name[\s\S]*?=== target/,
   "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
 );
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
@@ -866,7 +851,6 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
-const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
 const androidUiRuntime = yamlBlock(ciJobs, "android-ui-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
@@ -884,39 +868,12 @@ assert.match(
   "the focused Android compile lane must execute both host-testable durability branches",
 );
 assert.equal(
-  yamlScalar(androidManagedRuntime, "name", 4),
-  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files"
-);
-assert.equal(
-  yamlScalar(androidManagedRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /grep -Fq 'FAILURES!!!'/,
-  "Android instrumentation must fail closed on a JUnit failure summary"
-);
-assert.ok(
-  androidManagedRuntimeScript.includes("grep -Eq 'OK \\([0-9]+ tests?\\)'"),
-  "Android instrumentation must require the runner's explicit passing summary"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
-  "independent Android native/activity contracts must use separate instrumentation lifetimes"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
-  "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
-);
-assert.equal(
   yamlScalar(androidUiRuntime, "name", 4),
   "Android UI runtime / MotionEvent proof receipts"
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes' || inputs.scope == 'android-ui-runtime-toolbar')"
 );
 assert.match(
   yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"),
@@ -956,6 +913,7 @@ for (const evidence of [
   assert.ok(androidUiRuntimeScript.includes(evidence), `Android UI runtime runner is missing ${evidence}`);
 }
 for (const method of [
+  "toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
   "responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
   "longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
   "initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
@@ -1026,6 +984,28 @@ for (const nonVacuousBoundary of [
     `Android UI instrumentation is missing the non-vacuous ${nonVacuousBoundary} boundary`
   );
 }
+// Every @Test in the class must be SELECTED by the runner, or it is a proof
+// that never runs. `ef7a5fcd` added the GH #467 system-bar test and did not add
+// it to `methods=(...)`, so for four days it existed, was believed to guard the
+// fix, and was never executed once -- which is also why the forbidden
+// `ActivityScenario` teardown it contained never crashed anything. Test
+// existence is not coverage; selection is.
+const declaredAndroidUiMethods = [...androidUiRuntimeTest.matchAll(/@Test\s+fun\s+([A-Za-z0-9_]+)\s*\(/g)]
+  .map((match) => match[1]);
+assert.ok(declaredAndroidUiMethods.length > 0, "found no @Test methods in AndroidUiRuntimeTest.kt");
+const selectedAndroidUiMethods = new Set(
+  (androidUiRuntimeScript.match(/methods=\(([\s\S]*?)\)/)?.[1] ?? "")
+    .split(/\s+/)
+    .filter((token) => /^[A-Za-z0-9_]+$/.test(token))
+);
+for (const method of declaredAndroidUiMethods) {
+  assert.ok(
+    selectedAndroidUiMethods.has(method),
+    `AndroidUiRuntimeTest.${method} is never selected: add it to methods=(...) in `
+      + ".github/scripts/android-ui-runtime.sh, or delete the test"
+  );
+}
+
 assert.doesNotMatch(
   androidUiRuntimeTest,
   /scenario\.close\(\)/,
@@ -1227,36 +1207,9 @@ assert.match(
 );
 assert.match(
   e2eRunner,
-  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\}\]/,
-  "the mandatory Linux release catalog does not prove real two-device managed sync"
-);
-assert.match(
-  e2eRunner,
-  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{[\s\S]*?TINE_E2E_JOIN_ORDERING: "join-from-managed",[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "240000",[\s\S]*?\}\]/,
-  "the mandatory Linux release catalog does not prove joining from a device that already runs Tine-managed storage"
-);
-assert.match(
-  e2eRunner,
   /const scenarioTimeoutMs = Number\(env\.E2E_SCENARIO_TIMEOUT_MS \|\| timeoutMs\);[\s\S]*?setTimeout\([\s\S]*?scenarioTimeoutMs\);/,
   "per-scenario E2E timeout budgets are declared but not applied to the spawned scenario"
 );
-assert.match(
-  e2eRunner,
-  /"linux-managed-real-release": \[[\s\S]*?TINE_MANAGED_RECOVERY_KILL_CYCLES: "2"[\s\S]*?\["sparse-v2-two-device-real", "scripts\/e2e-sparse-v2-two-device\.mjs"/,
-  "the local private-corpus release suite does not prove repeated forced-close recovery and real two-device sync"
-);
-assert.match(
-  packageJson,
-  /"e2e:linux:managed-real-release": "TINE_E2E_MODE=release E2E_SCENARIO_TIMEOUT_MS=1800000 node scripts\/run-e2e\.mjs linux-managed-real-release"/,
-  "the private-corpus managed release suite is not exposed as a strict local command"
-);
-for (const workflow of [ciWorkflow, uiE2eWorkflow, releaseWorkflow]) {
-  assert.doesNotMatch(
-    workflow,
-    /TINE_MANAGED_REAL_GRAPH|linux-managed-real-release/,
-    "a hosted workflow must not reference the private-corpus managed release gate"
-  );
-}
 assert.match(
   uiE2eWorkflow,
   /Snapshot Linux E2E candidate inputs[\s\S]*?Write Linux E2E candidate receipt[\s\S]*?Snapshot Windows E2E candidate inputs[\s\S]*?Write Windows E2E candidate receipt/,
@@ -1325,12 +1278,16 @@ assert.match(
   /TAURI_DRIVER: process\.env\.TAURI_DRIVER \|\| \(process\.platform === "win32" \? "msedgedriver\.exe" : "tauri-driver"\)/,
   "Windows scenarios still route native WebView2 through the unnecessary Tauri proxy"
 );
+const semanticFailureSource = e2eRunner.match(
+  /function hasRecordedSemanticFailure\(output, errors\) \{[\s\S]*?\n\}/
+);
+assert.ok(semanticFailureSource, "the release runner is missing semantic-failure precedence");
 const driverTransportFailureSource = e2eRunner.match(
   /function isRetryableDriverTransportFailure\(output, errors, timedOut\) \{[\s\S]*?\n\}/
 );
 assert.ok(driverTransportFailureSource, "the release runner is missing its WebDriver transport retry predicate");
 const isRetryableDriverTransportFailure = new Function(
-  `${driverTransportFailureSource[0]}\nreturn isRetryableDriverTransportFailure;`
+  `${semanticFailureSource[0]}\n${driverTransportFailureSource[0]}\nreturn isRetryableDriverTransportFailure;`
 )();
 assert.equal(
   isRetryableDriverTransportFailure(
@@ -1363,13 +1320,48 @@ assert.equal(
   isRetryableDriverTransportFailure("WebDriverError: invalid session id", "", true), false,
   "scenario timeouts must not be retried as driver infrastructure failures"
 );
+// Exact generated-graph Sheets output from native release a65aa7ef: semantic
+// FAIL checks preceded a later cleanup invalid-session error.
+const sheetsRetryOutput = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/sheets-stdout.txt"), "utf8");
+const sheetsRetryErrors = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/sheets-stderr.txt"), "utf8");
+assert.equal(isRetryableDriverTransportFailure(sheetsRetryOutput, sheetsRetryErrors, false), false,
+  "a cleanup invalid session must not erase already-recorded Sheets failures");
+for (const semantic of ["FAIL: saved edit was lost", "3 FAILURES (74 checks)", "AssertionError: page content differed", "AssertionError [ERR_ASSERTION]: data differed", "\u001b[31mFAIL: saved edit was lost\u001b[0m"]) {
+  assert.equal(isRetryableDriverTransportFailure(semantic, "WebDriverError: GET /session failed: ECONNRESET", false), false,
+    "recorded semantic failure must dominate later driver transport loss");
+}
+assert.equal(isRetryableDriverTransportFailure("PASS: startup displayed", "WebDriverError: invalid session id", false), true,
+  "successful observations alone must not disable legitimate transport retries");
+assert.equal(isRetryableDriverTransportFailure("0 FAILURES (4 checks)", "WebDriverError: invalid session id", false), true,
+  "a zero-failure summary must not disable a legitimate transport retry");
 const nativeHarnessFailureSource = e2eRunner.match(
   /function isRetryableNativeHarnessFailure\(id, output, errors, timedOut\) \{[\s\S]*?\n\}/
 );
 assert.ok(nativeHarnessFailureSource, "the release runner is missing its Quick Capture native-harness retry predicate");
 const isRetryableNativeHarnessFailure = new Function(
-  `${nativeHarnessFailureSource[0]}\nreturn isRetryableNativeHarnessFailure;`
+  `${semanticFailureSource[0]}\n${nativeHarnessFailureSource[0]}\nreturn isRetryableNativeHarnessFailure;`
 )();
+const captureRetryOutput = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/capture-stdout.txt"), "utf8");
+const captureRetryErrors = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/capture-stderr.txt"), "utf8");
+assert.equal(isRetryableNativeHarnessFailure("capture", captureRetryOutput, captureRetryErrors, false), false,
+  "an explicit Capture expected/actual mismatch must dominate native-window errors");
+const classificationSource = e2eRunner.match(/function failureClassification\(id, output, errors, timedOut\) \{[\s\S]*?\n\}/);
+assert.ok(classificationSource);
+const classifyFailure = new Function(`${semanticFailureSource[0]}\n${driverTransportFailureSource[0]}\n${nativeHarnessFailureSource[0]}\n${classificationSource[0]}\nreturn failureClassification;`)();
+assert.equal(classifyFailure("capture", captureRetryOutput, captureRetryErrors, false), "ambiguous",
+  "withholding retry must also stop classifying the semantic mismatch as infrastructure");
+assert.equal(isRetryableNativeHarnessFailure("capture", "",
+  "Error: native window query unavailable\nxdo_get_active_window reported an error\nXGetWindowProperty[_NET_ACTIVE_WINDOW] failed", false), true,
+  "generic native errors without semantic observations remain retryable");
+assert.equal(isRetryableNativeHarnessFailure("capture", "throw new Error(`expected=${expected} actual=${actual}`)",
+  "xdo_get_active_window reported an error\nXGetWindowProperty[_NET_ACTIVE_WINDOW] failed", false), true,
+  "a source-code excerpt is not an observed expectation mismatch");
+assert.equal(isRetryableNativeHarnessFailure("capture", "FAIL: saved capture was lost",
+  "BadWindow (invalid Window parameter)\nxdo_get_active_window reported an error", false), false,
+  "a native cleanup failure must not erase a recorded semantic failure");
+assert.equal(isRetryableNativeHarnessFailure("page-properties", "FAIL: content changed",
+  "E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown", false), false,
+  "a later missing-input marker must not erase an earlier semantic failure");
 assert.equal(
   isRetryableNativeHarnessFailure(
     "capture",
@@ -1654,3 +1646,6 @@ try {
 }
 
 console.log("Release pipeline fixture tests passed (exact-SHA CI gate + release workflow + fail-closed cases).");
+
+assert.ok(androidUiRuntimeScript.includes('methods=(toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll)'), "focused toolbar scope must execute the physical toolbar journey");
+assert.match(yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"), /inputs\.scope == 'android-ui-runtime-toolbar'[\s\S]*?'toolbar'/);

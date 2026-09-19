@@ -17,6 +17,9 @@
 //! - Writes are enqueued to one background worker thread and are best-effort:
 //!   failures are logged to stderr, never surfaced. The foreground cost of an
 //!   update is one channel send.
+//! - Quitting waits at most `EXIT_DRAIN_BUDGET` for the queue (the app calls
+//!   `drain_for_exit` from every exit path). An update still queued after that
+//!   is lost, so that page's next conflict merges against an older base.
 //!
 //! Layout (all files atomic tmp+rename, schema `LEDGER_SCHEMA`):
 //! - `blobs/<sha256-of-content>`         — content bytes (content-addressed)
@@ -37,12 +40,20 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// On-disk schema of index/pin entries; named by `docs/storage-sync-contract.md`
 /// §4 (a doc-code consistency test below keeps the two in step). Bumping it
 /// invalidates the disposable ledger (entries with another schema read as
 /// "no base") and costs nothing but a repopulation.
 pub const LEDGER_SCHEMA: u32 = 1;
+
+/// How long quitting Tine waits, in total, for queued ledger updates (Martin,
+/// 2026-09-15). Quitting right after a save is the ordinary multi-device
+/// pattern Concord exists for, so that save's base must land; the bound keeps
+/// a wedged disk from holding up the exit. Named with its value in
+/// `docs/storage-sync-contract.md` §4.
+pub const EXIT_DRAIN_BUDGET: Duration = Duration::from_millis(200);
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -71,6 +82,10 @@ pub struct PruneStats {
     pub blobs_removed: usize,
     pub blobs_kept: usize,
     pub corrupt_entries_removed: usize,
+    /// Index/pin entries whose blob is gone (antivirus quarantine, a disk
+    /// cleaner, a partial restore). Their lookups already answer `None`
+    /// forever, so the entry is dead metadata; prune reclaims it.
+    pub dangling_entries_removed: usize,
 }
 
 enum Job {
@@ -140,10 +155,29 @@ impl ConcordLedger {
     /// Wait until every previously enqueued job has been processed. Test /
     /// measurement aid; never called on a hot path.
     pub fn flush(&self) {
+        // 30 s bounds a wedged worker; the ledger is disposable, so give up.
         let (done_tx, done_rx) = mpsc::channel();
         self.enqueue(Job::Flush(done_tx));
-        // 30 s bounds a wedged worker; the ledger is disposable, so give up.
-        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = done_rx.recv_timeout(Duration::from_secs(30));
+    }
+
+    /// Quitting: wait until `deadline` for every update queued so far to land,
+    /// and answer whether they did. Never starts the worker, so a graph that
+    /// queued nothing costs nothing at exit.
+    pub fn drain_for_exit(&self, deadline: Instant) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let guard = self.tx.lock().unwrap();
+            let Some(tx) = guard.as_ref() else {
+                return true;
+            };
+            if tx.send(Job::Flush(done_tx)).is_err() {
+                return false;
+            }
+        }
+        done_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     fn enqueue(&self, job: Job) {
@@ -340,8 +374,12 @@ impl LedgerStore {
         }
     }
 
-    /// Delete blobs referenced by no index entry and no pin, and drop
-    /// unparseable index/pin files (their lookups already answer `None`).
+    /// Delete blobs referenced by no index entry and no pin, and drop index and
+    /// pin files that can no longer answer: unparseable ones, and ones naming a
+    /// blob that is absent. `record` writes a blob before the index entry that
+    /// names it, so an entry without its blob means the blob was removed from
+    /// outside the ledger; the entry is dead and every lookup through it
+    /// already answers `None`.
     fn prune(&self) -> io::Result<PruneStats> {
         let mut stats = PruneStats::default();
         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -368,8 +406,12 @@ impl LedgerStore {
                     }
                 });
                 match hash {
-                    Some(hash) => {
+                    Some(hash) if self.blobs_dir().join(&hash).exists() => {
                         referenced.insert(hash);
+                    }
+                    Some(_) => {
+                        stats.dangling_entries_removed += 1;
+                        let _ = std::fs::remove_file(&path);
                     }
                     None => {
                         stats.corrupt_entries_removed += 1;
@@ -419,7 +461,11 @@ mod tests {
         assert!(contract.contains(&format!("currently {LEDGER_SCHEMA}")));
         assert!(contract.contains("It is never an authority"));
         assert!(contract.contains("safe to delete wholesale at any time"));
-        assert!(contract.contains("a managed\nbinding never attaches one"));
+        assert!(contract.contains("keyed by the graph's root id"));
+        assert!(contract.contains("index and pin entries naming a blob that is absent"));
+        assert!(contract.contains("never warns,\nrefuses, or reports a missing blob to the user"));
+        assert!(contract.contains("`concord_ledger::EXIT_DRAIN_BUDGET` (200 ms)"));
+        assert_eq!(EXIT_DRAIN_BUDGET, Duration::from_millis(200));
     }
 
     #[test]
@@ -434,6 +480,36 @@ mod tests {
         ledger.record_now("pages/A.md", "- one edited\n").unwrap();
         assert_eq!(ledger.base("pages/A.md").as_deref(), Some("- one edited\n"));
         std::fs::remove_dir_all(ledger.dir()).ok();
+    }
+
+    #[test]
+    fn exit_drain_lands_every_queued_update() {
+        let ledger = ConcordLedger::new(scratch("exit-drain"));
+        for n in 0..64 {
+            ledger.record(&format!("pages/P{n}.md"), &format!("- {n}\n"));
+        }
+        // A generous deadline: this pins "the drain waits for the queue", not
+        // the production budget, which a loaded test machine could miss.
+        assert!(ledger.drain_for_exit(Instant::now() + Duration::from_secs(10)));
+        for n in 0..64 {
+            let expected = format!("- {n}\n");
+            assert_eq!(
+                ledger.base(&format!("pages/P{n}.md")).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+        std::fs::remove_dir_all(ledger.dir()).ok();
+    }
+
+    #[test]
+    fn exit_drain_never_starts_the_worker() {
+        let ledger = ConcordLedger::new(scratch("exit-idle"));
+        assert!(ledger.drain_for_exit(Instant::now()));
+        assert!(
+            ledger.tx.lock().unwrap().is_none(),
+            "a graph that queued nothing must not spawn a thread at quit"
+        );
+        assert!(!ledger.dir().exists());
     }
 
     #[test]
@@ -489,6 +565,49 @@ mod tests {
             Some("- version 1\n"),
             "the pinned ancestor must survive the newer record and the prune"
         );
+        std::fs::remove_dir_all(ledger.dir()).ok();
+    }
+
+    #[test]
+    fn prune_reclaims_index_and_pin_entries_whose_blob_vanished() {
+        // GH #411 residue: antivirus quarantine (or a disk cleaner, or a partial
+        // restore) removes blobs from under the ledger. Lookups already degrade
+        // to `None`, but the entries naming those blobs used to survive every
+        // prune as dead metadata.
+        let ledger = ConcordLedger::new(scratch("prune-dangling"));
+        ledger.record_now("pages/A.md", "- version 1\n").unwrap();
+        ledger
+            .pin_conflict_base_now("pages/A.sync-conflict-x.md", "pages/A.md")
+            .unwrap();
+        ledger.record_now("pages/B.md", "- b\n").unwrap();
+
+        // Remove every blob, exactly as an external cleaner would.
+        for entry in std::fs::read_dir(ledger.dir().join("blobs"))
+            .unwrap()
+            .flatten()
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        assert_eq!(ledger.base("pages/A.md"), None, "lookup already degrades");
+
+        let index_dir = ledger.dir().join("index");
+        let pins_dir = ledger.dir().join("pins");
+        let count = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().count();
+        assert_eq!(count(&index_dir), 2, "two index entries before the prune");
+        assert_eq!(count(&pins_dir), 1, "one pin before the prune");
+
+        let stats = ledger.prune_now().unwrap();
+        assert_eq!(stats.dangling_entries_removed, 3, "{stats:?}");
+        assert_eq!(stats.corrupt_entries_removed, 0, "{stats:?}");
+        assert_eq!(count(&index_dir), 0, "dangling index entries are reclaimed");
+        assert_eq!(count(&pins_dir), 0, "dangling pins are reclaimed");
+
+        // Recording again after the cleanup still works and still answers.
+        ledger.record_now("pages/A.md", "- version 2\n").unwrap();
+        assert_eq!(ledger.base("pages/A.md").as_deref(), Some("- version 2\n"));
+        let stats = ledger.prune_now().unwrap();
+        assert_eq!(stats.dangling_entries_removed, 0, "{stats:?}");
+        assert_eq!(stats.blobs_kept, 1, "{stats:?}");
         std::fs::remove_dir_all(ledger.dir()).ok();
     }
 

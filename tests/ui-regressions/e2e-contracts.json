@@ -1,6 +1,22 @@
 {
  "schemaVersion": 1,
  "scenarios": {
+  "scripts/e2e-query-result-scroll.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Completing a TODO in a long multiline query shows DONE immediately, briefly keeps that live row available for reversal, then removes it while preserving surviving result components and the reader's visible place.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Subpixel layout rounding within the harness tolerance."
+   ],
+   "nonRequirements": [
+    "This synthetic control is not proof of the cause of every reported query scroll jump."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-alias.mjs": {
    "contracts": [
     {
@@ -96,8 +112,7 @@
    "nonRequirements": [
     "Exact pixels, menu geometry, coordinate values, CSS/DOM nesting, timing, palette/order, or animation."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-17: harness debt, source-proven, not a product defect. The journey was written on 2026-08-11 (981e8ffd) and no suite, npm script or workflow ever selected it, so nothing noticed when 3d79497f \"fix(outliner): add OG-compatible nested block drops\" (2026-08-12, GH #326) landed one day later. That change added blockDropPosition(), which returns \"child\" whenever clientX - blockRect.left > 50 -- OG's deeper-than-50px nesting zone. This journey drops at target.left + width * 0.65, far beyond 50px, so B+C are now nested under E and the visible roots are A,D,E rather than A,D,E,B,C. Failed identically on two unchanged-binary runs at 4253d52b (72.3s, 72.0s; capsule step \"drag B+C from A bullet to after E\"). The drop x-coordinate is explicitly a nonRequirement of this very contract, so the repair belongs to the harness, not the product: aim the drop inside E's shallow (<= 50px from its left edge) zone and keep the vertical half that means \"after\". Quarantined under the AGENTS.md 2b E2E stop-loss after two attempts instead of debugging further; it stays selected by linux-release so its evidence is retained, and returns to stable with that coordinate repair."
+   "stability": "stable"
   },
   "scripts/e2e-capabilities.mjs": {
    "contracts": [
@@ -309,27 +324,6 @@
    ],
    "stability": "stable"
   },
-  "scripts/e2e-managed-journal-feed.mjs": {
-   "contracts": [
-    {
-     "class": "core-operation",
-     "userOutcome": "After managed-storage activation, the Journals surface opens the newest bounded day window, paginates backward in newest-first order, shows a newly accepted journal edit when the feed is reopened, and accepts a rapid uninterrupted block move across several day boundaries without losing commands or flooding errors.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A 20-root cut from one ordinary page and paste into another commits all selected roots durably without partial source/destination state or error notifications.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Journal title formatting, feed layout, activation duration, and the exact completion latency of queued moves may vary while the same days, order, accepted content, and complete command sequence remain visible."
-   ],
-   "nonRequirements": [
-    "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, millisecond timing, or a particular internal queue implementation."
-   ],
-   "stability": "stable"
-  },
   "scripts/e2e-media.mjs": {
    "contracts": [
     {
@@ -345,12 +339,12 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "Graph media is served and plays under a Managed Storage binding through the native media protocol, not only under Direct Files.",
+     "userOutcome": "Graph media is served and plays through the native media protocol under the graph's current Direct Files binding resolved by the real native command.",
      "blocking": true
     },
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Asset containment and binding authority hold under both authorities: traversal, absolute, and symlink asset paths refuse, and stale or unavailable bindings refuse.",
+     "userOutcome": "Asset containment and binding authority hold: traversal, absolute, and symlink asset paths refuse, and a stale binding generation refuses.",
      "blocking": true,
      "authority": "Media protocol containment (Graph::stream_asset_path) and binding-generation gate"
     }
@@ -384,8 +378,7 @@
     "Exact breakpoint pixel value, drawer width, overlay opacity, or transition duration.",
     "Exact pane coordinates or DOM parentage once the persistent-sidebar mode and workspace containment are proven."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-01: the v0.6.981 release gate exhausted the two-attempt stop-loss on presentation-only oracles after the semantic outcomes succeeded. The exact candidate remained in roomy persistent mode with no modal roles, scrims, inert surfaces, or active drawer; the PDF and source panes both remained bounded by the workspace beside the persistent right sidebar. The journey first rejected the sidebar's changed absolute x coordinate and, after that non-requirement was removed, rejected that .pdf-pane was no longer a direct child of .drawer-workspace after the new ordinary-pane PDF route. Keep the compact and roomy state diagnostics selected, but restore blocking only after the final neighbor assertion is expressed through persistent mode and workspace ownership rather than coordinates or DOM ancestry."
+   "stability": "stable"
   },
   "scripts/e2e-multigraph.mjs": {
    "contracts": [
@@ -480,13 +473,22 @@
      "class": "core-operation",
      "userOutcome": "Page property actions preserve literal header structure through edit, guarded save, reload, and keyboard traversal.",
      "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "An arbitrary property added to a BLOCK from that block's context menu, on a routed named page, reaches the file under that block without disturbing the block's own text, and is still there after the page is reopened.",
+     "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Panel layout and native form-control styling may evolve."
+    "Panel layout and native form-control styling may evolve.",
+    "Which properties a page contributes to the form, and therefore how many controls sit between the last preset and Done.",
+    "Whether the first-run Guide announcement is showing at startup: the journey clears only the KNOWN startup notices before it clicks anything, and an unexpected toast is still allowed to intercept a click and fail the run."
    ],
    "nonRequirements": [
-    "Exact section spacing, control dimensions, or debounce timing."
+    "Exact section spacing, control dimensions, or debounce timing.",
+    "Field order beyond the five presets, the number of rows a page contributes, or the exact stop list of the Tab traversal after Public.",
+    "The wording, kind, or screen position of startup notices."
    ],
    "stability": "stable"
   },
@@ -528,8 +530,7 @@
     "Exact theme palette/RGB.",
     "Exact CSS filter/DOM strategy."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-01: openOutlineWithNativePointer cannot reach the Outline control. The inline button[title=\"Outline\"] probe reports not-visible, so the journey falls through to the More-settings overflow, where .pdf-settings-overflow button Outline has a 0x0 rect and receivesPointer:false -- its computed display is inline-block, i.e. the @container pdfviewer (max-width: 520px) rule that turns that row into a grid did NOT match, which is the same width at which the inline action should have been visible. The two probes therefore disagree about the pane width. Reproduced identically on 20712e3c and on its parent 3a123bc1, so it is independent of the graph-text gate-order fix that surfaced it. UNRESOLVED and deliberately not reasoned away: this is either a harness visibility probe defect or a real product defect in which the Outline is unreachable by pointer at this pane width. Requeue before the next release; the journey still runs for diagnostics, it is only non-blocking."
+   "stability": "stable"
   },
   "scripts/e2e-pdf-routes.mjs": {
    "contracts": [
@@ -540,7 +541,7 @@
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "PDF pane routes and reader position survive relaunch, and a legacy dedicated PDF target migrates without discarding the user's existing pane layout.",
+     "userOutcome": "PDF pane routes and reader position survive relaunch.",
      "blocking": true
     }
    ],
@@ -548,10 +549,10 @@
     "Pane identifiers, split ratios, tab styling, and reader zoom percentages may vary while the route ownership and restored user state remain intact."
    ],
    "nonRequirements": [
-    "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation."
+    "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation.",
+    "Migration of a legacy dedicated-PDF session layout \u2014 Martin, 2026-09-04: not worth a release gate. src/session.test.ts covers the migration, including that an existing pane layout survives."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-01: the v0.6.981 release gate first exposed and then verified the fixed typed-page blur race, advancing the journey to its Notes action. At the narrow companion width the direct .pdf-notes-btn probe reports not displayed, while opening More settings leaves the overflow Notes button present but not clickable; this is the same contradictory inline-versus-overflow visibility boundary as the separately quarantined PDF Outline-pointer journey. The stop-loss is exhausted, so the route/tab/page-state diagnostics stay selected but non-blocking. Restore blocking only after one user-pointer strategy can reach Notes at this width and the complete unchanged-binary route/relaunch journey passes burn-in."
+   "stability": "stable"
   },
   "scripts/e2e-pdf-scroll-resources.mjs": {
    "contracts": [
@@ -654,7 +655,7 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Page-menu PDF export creates only a static, script-disabled print frame.",
+     "userOutcome": "Page-menu PDF export includes complete OG/TQL query descendants, private matches and query tables in a static, script-disabled print frame.",
      "blocking": true,
      "authority": "Tine print-export script isolation contract"
     }
@@ -681,6 +682,79 @@
    ],
    "nonRequirements": [
     "Exact generated whitespace, CSS class names, or visual theme."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-query-sheet.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A query block rests as one plain-English sentence with its result count, expands into a sheet of editable rows over the blocks below it, and what the sheet writes reopens as the same sentence after a restart while an untouched query block stays byte-identical.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Escape peels exactly one layer at a time (the sheet's own open menu, then the sheet), the sheet stays inside the viewport at the narrowest window the app allows, and a deeply nested query still opens as a short sentence and a small sheet rather than growing with its nesting.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The wording of the sentence, the row labels and the field vocabulary may evolve while the query the sheet writes stays the same.",
+    "Sheet padding, shadow and the exact scrim opacity may change, as may where the sheet is placed relative to the sentence, as long as it stays on screen."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the sheet on a wide screen, animation, or the order of the rows within one group."
+   ],
+   "stability": "burn-in"
+  },
+  "scripts/e2e-query-vocabulary.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Adding a condition and changing a row's field open one list of this graph's own vocabulary \u2014 built-in fields plus every property key, commonest first, each with its observed type and its authoritative count \u2014 a rare key stays reachable by typing and by the keyboard however many keys the graph has, and the condition the picked key writes survives a restart.",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "The query text at the foot of an open sheet is always editable, reports the engine's own diagnostic for text it cannot read while the last reading stays on screen and greyed, never saves a parse of text that has since changed, and the \u27e8advanced\u27e9 row puts the cursor in it rather than dead-ending.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The wording of the row metadata, the section headings and the order within one section may evolve while the count and the type shown stay the registry's own.",
+    "How many rows the list keeps mounted, and the pane's debounce, may change as long as a distant key stays reachable and a stale answer is never shown."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the popover, the scroll animation, or the exact set of values previewed on a row."
+   ],
+   "stability": "burn-in"
+  },
+  "scripts/e2e-query-display.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "One Display panel beside a query's conditions states all six of its display facts \u2014 view, grouping field, sort order, visible columns, footer totals and row sample \u2014 each write lands in the block's own plain-text properties, and the settings the panel wrote are the settings that come back after a restart.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A query's grouping is one canonical field identity: an existing note spelled with the older ambiguous key keeps grouping by the same field it always did, and the first save that states the grouping writes the canonical key and removes the ambiguous one rather than leaving two answers in the file.",
+     "blocking": true,
+     "authority": "docs/contracts/query-display.md \u00a73 (the grouping resolution and its precedence), pinned across both languages by crates/tine-core/tests/fixtures/query-grouping/resolution.json"
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A search that answers with both pages and blocks shows them as two named sections, each with its own display settings and its own way back: the Pages section can be shown as a table while the Blocks section is a board, page membership can be matched by name, by content or by both, and after a restart a section given no settings of its own is still distinguishable from one whose settings were cleared.",
+     "blocking": true,
+     "authority": "docs/contracts/query-display.md \u00a715 (mixed results: two families, one operation)"
+    }
+   ],
+   "acceptableVariations": [
+    "Section headings, control labels and the summary line on the panel's own button may evolve while the six facts stay editable in one place.",
+    "Where the panel is placed relative to its trigger may change, as long as it stays on screen at the narrowest window the desktop app allows."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the panel on a wide screen, animation, or the order of rows within one ordered list beyond what the user set."
    ],
    "stability": "stable"
   },
@@ -762,95 +836,6 @@
    ],
    "nonRequirements": [
     "Exact scrollbar palette/RGB, thumb dimensions, CSS selector, or DOM structure."
-   ],
-   "stability": "stable"
-  },
-  "scripts/e2e-sparse-v2-recovery.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Explicit sparse-v2 activation and return to standard Markdown mode preserve the graph's authority transition and user-visible Markdown continuity across real native restarts.",
-     "blocking": true,
-     "authority": "Tine sparse-v2 local authority-transition and Markdown interoperability contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "Users can edit an existing UTF-named page and create a new page in sparse v2, then reopen both saved edits after restart and after returning to standard Markdown mode.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A managed save conflict keeps the editor draft, refuses Keep mine after a newer winner, resolves against the re-observed exact revision, and also resolves a competing winner at a newly activated page's exact path without losing the retained draft.",
-     "blocking": true,
-     "authority": "Tine managed application save, Tauri IPC, serialized actor conflict-resolution, and durable Markdown continuity contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Settings layout, native dialog decoration, page-list order, and restart timing may vary while visible content and Markdown continuity remain intact."
-   ],
-   "nonRequirements": [
-    "Sparse private-storage layout, internal digests, exact native-dialog pixels, or animation timing."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-managed-force-close-recovery.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "On a real-scale graph, an existing-page edit saved through the visible managed editor survives a ten-second settle, SIGKILL of the actual Tine process, and restart with the same graph and private state; managed storage reopens actively and the exact edit remains in both UI and Markdown.",
-     "blocking": true,
-     "authority": "Tine managed-storage process-crash recovery and Markdown projection contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "Native recovery remains visibly observable and reaches a usable graph without native.unavailable, a refusal loop, a silent hang, or recurring error notifications.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Emergency return remains actionable while managed recovery is still running, publishes Direct Files without waiting for managed recovery or changing managed evidence, and preserves a subsequent Direct edit across restart.",
-     "blocking": true,
-     "authority": "Native StorageModeSupervisor priority, Direct-selection receipt, and stale-publication contract"
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A healthy Settings return drains managed storage, confirms the Markdown projection, switches to Direct Files, and preserves the next Direct edit across restart.",
-     "blocking": true,
-     "authority": "Graceful managed-to-Direct transition contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Activation, driver startup, and recovery durations may vary with corpus size and machine speed while progress remains observable and recovery completes within the scenario timeout."
-   ],
-   "nonRequirements": [
-    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing. Managed provider bytes may remain in place after emergency return because the private Direct-selection receipt is authoritative."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-absence-sweeps.mjs": {
-   "contracts": [
-    {
-     "class": "core-operation",
-     "userOutcome": "Reopening a managed graph after a large external group deletion surfaces the affected pages and lets the user Restore their exact Markdown content through the real application.",
-     "blocking": true
-    },
-    {
-     "class": "stateful-ux",
-     "userOutcome": "Closing the group-deletion warning or recovery panel records no decision; the sweep remains waiting, and an explicit Restore remains visible afterward as disposed history without live action controls.",
-     "blocking": true
-    },
-    {
-     "class": "stateful-ux",
-     "userOutcome": "A quit through the app's own close path with all managed slots verified stopped is not reported as an unclean close on the next launch.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Warning and dock wording, control placement, and panel presentation may evolve while the deletion group remains reviewable and its durable state is visible.",
-    "Managed activation, reopen, and Restore durations may vary while the journey reaches each semantic state within its polling bounds."
-   ],
-   "nonRequirements": [
-    "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
    ],
    "stability": "stable"
   },
@@ -1032,70 +1017,6 @@
    ],
    "stability": "burn-in"
   },
-  "scripts/e2e-sparse-v2-two-device.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Two installations with separate private app data can explicitly discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
-     "blocking": true,
-     "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A fresh second device remains in Direct Files until the user explicitly asks to join, then discovers the provider state and becomes a writable managed-sync member.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "While a file-sync tool is still delivering the shared provider tree, asking to join says the data is not ready yet rather than calling it unsafe, says it once instead of repeating, and the same running app joins successfully once the remaining bytes arrive, without a restart.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A device that already runs Tine-managed storage on its own graph is offered the same explicit join action, is told what happens to its own history, and its own post-activation edit stays readable across the attempt and the next restart.",
-     "blocking": true,
-     "authority": "Tine cross-device managed-storage enrollment and local managed-history retention contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout.",
-    "The exact wording of the not-ready-yet notice, and the label of the join action in either storage mode.",
-    "The order in which a provider delivers files outside the canonical enrollment prefix."
-   ],
-   "nonRequirements": [
-    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout.",
-    "Enumerating every possible provider delivery ordering; the journey drives one fixed order through the enrollment prefix the discovery path keys on."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-windows-managed-storage.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "On Windows, explicit managed-storage activation and return to Direct Files preserve every captured Markdown and Org source byte.",
-     "blocking": true,
-     "authority": "Tine managed-storage authority transition and Direct Files interoperability contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a reporter-scale graph while recording comparable Direct Files and Managed Storage timing summaries.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Hosted Windows filesystem speed, WebView2 startup timing, managed-storage activation duration, and individual page-switch timings may vary."
-   ],
-   "nonRequirements": [
-    "Exact native confirmation-dialog appearance, internal private-storage layout, exact progress wording, or equality between Direct Files and Managed Storage timing samples."
-   ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-31: MS-17 exhausted the two-attempt hosted Windows E2E stop-loss without completing the current-candidate timing comparison. Run 33349270671 reached exact-candidate managed activation in 99.36 seconds, then the synthetic fixture's accidental 119,990-backlink hub monopolized the serialized actor and blocked the next page load. Run 33350869828 distributed those references but exposed a separate harness selector bug before activation: Ctrl+K chose a block-search hit containing the requested page title instead of the exact page result. The selector is now structurally corrected to require a page/journal row with an exact displayed name, but a prohibited third debugging run was not used to promote unburned evidence. The scenario remains diagnostic and must complete an unchanged-binary Windows burn-in before returning to release-blocking status."
-  },
   "scripts/e2e-windows-page-reference-latency.mjs": {
    "contracts": [
     {
@@ -1243,13 +1164,13 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule, without persisting Managed replacement authority.",
-     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives SIGKILL and restart with its exact draft, baseline, and graph/page binding; a newer owner arriving during the outage is re-observed, both resolution actions use one semantic surface, and the on-disk capsule is removed before success is shown.",
+     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule.",
+     "userOutcome": "A local draft racing an external replacement survives SIGKILL and restart with its exact draft, baseline, and graph/page binding; a newer owner arriving during the outage is re-observed, both resolution actions use one semantic surface, and the on-disk capsule is removed before success is shown.",
      "blocking": true
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "Both storage modes use the same in-page resolver and queue; after restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
+     "userOutcome": "After restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
      "blocking": true
     }
    ],
@@ -1262,7 +1183,7 @@
     "Exact generated block identities or save debounce duration."
    ],
    "stability": "quarantined",
-   "quarantineReason": "Harvest B3E (2026-09-02): fresh two-attempt stop-loss exhausted on unchanged custom-protocol binary SHA-256 03fbd80834ef7c03ac8d1079186503e79c11f0239b02c9c45b5c809aa7b78848. Attempt 1: harness routing failed before the Direct journey because the spaced fixture title was absent from the exact journal-link selector. Attempt 2: the journal visibly contained both replacement simple-name links, but WebdriverIO exposed their labels as [[B3EKeepDraft]] and [[B3EUseCurrent]] while the selector required unbracketed text; classification: harness. Unproved at the native boundary: conflict capture, SIGKILL restoration on both backends, outage-owner re-observation, both resolution actions, and capsule retirement. Focused unit tests cover refresh coalescing and frontend retirement; this journey stays out of batch blocking until its page-ref selector is repaired and the unchanged-binary matrix burns in green.",
+   "quarantineReason": "2026-09-04 (Claude): the two harness defects behind the previous quarantine are now FIXED in this file \u2014 (1) openPage() compared a .page-ref's visible text to the bare title, but .page-ref renders OG's [[ ]] decoration inside the anchor whenever :ui/show-brackets? is on, which is the default (src/render/inline.tsx, pinned by src/render/showBrackets.test.tsx); (2) resolveEverywhere() probed for a VISIBLE button labelled 'All mine'/'All theirs', but those buttons carry two responsive labels and CSS shows exactly one, so the probe was really an assertion about pane width, which the full-pane-width Concord default legitimately flipped. STILL QUARANTINED FOR A PRODUCT DEFECT, NOT A HARNESS ONE: with those fixed, the Direct Files leg reaches 'Apply resolution' and the click is a no-op. The capsule stays (count 1, text byte-identical, '2 conflicts', '2 of 2 pre-selected') and the app raises two toasts: \"Couldn't resolve it: Direct Files could not save (reason code: unknown).\" and \"'B3EUseCurrent' still has unresolved conflicts\". Reproduced 3/3 on a clean build; not a permissions problem (graph 755, both page files present and writable). The user cannot complete conflict resolution, and the failure is surfaced as an UNCLASSIFIED reason code. Do NOT spend further attempts on the harness: fix the product first. Entry points: src/components/ConflictResolution.tsx:342 apply(); src/backend.ts:319 DirectSaveFailureError; src-tauri/src/command_error.rs reason_code 'unknown'. Unquarantine once Apply resolution actually saves.",
    "notes": "B3E changed the intended journey to kill the actual Tine PID with SIGKILL, restart under a fresh driver, inspect exact capsule draft/baseline/graph-page binding, introduce a newer external owner during the outage, and exercise both resolution sides on both backends. The current quarantined run stops at its journal-link harness selector before those assertions. Exact pixels and filesystem timing are non-contractual."
   },
   "scripts/e2e-dirty-editor-replacement.mjs": {
@@ -1308,13 +1229,18 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "A complete code wrapper exposes only its payload to native select-all, three backticks create a complete scaffold with an interior caret, and ArrowUp at an embed root exits to the preceding host-page block.",
+     "userOutcome": "A complete code wrapper exposes only its payload to native select-all, three backticks create a complete scaffold that offers the language picker on its visible opener line and puts the caret inside when that picker is declined, and ArrowUp at an embed root exits to the preceding host-page block.",
      "blocking": true
     },
     {
      "class": "exact-safety-interoperability",
      "authority": "Markdown and Org wrapper bytes remain file-owned structure while the editor mutates only the projected code payload.",
      "userOutcome": "Editing the code payload preserves exactly one opening and closing wrapper in the Direct Files page.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Dragging from rendered multiline text into lower wrapped rows keeps the selection endpoint at the same native textarea caret position as the pointer.",
      "blocking": true
     }
    ],
@@ -1324,7 +1250,8 @@
    "nonRequirements": [
     "Exact code-card pixels, syntax colors, caret animation, DOM nesting, or generated runtime block ids."
    ],
-   "stability": "stable"
+   "stability": "stable",
+   "notes": "2026-09-13: Three sequential native runs passed on unchanged fb10683605ce8b5f8a61b27cb0a319b9e66af377 executable SHA256 fa58eb8e4d0f585eb851402b994c4e92149592a8575c460de369e2ca142dea71. The combined cf0c2d5761c0f0dfc805f8558d2e32d50eda918c executable also passed the same journey. Covers native code payload/select-all, scaffold bytes, embed-root ArrowUp, and rendered wrapped drag endpoints. 2026-09-15 (GH #507): the scaffold step now asserts the language picker on the opener line first, then Escape for the interior caret; re-run natively on the candidate."
   },
   "scripts/e2e-conflict-keep-mine.mjs": {
    "contracts": [
@@ -1352,6 +1279,66 @@
    "stability": "quarantined",
    "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
    "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit \u2014 a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation \u2014 and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
+  },
+  "scripts/e2e-query-export.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Copy / Export of a query page expands matching Markdown and Org roots with their descendants, without nonmatching siblings or literal unresolved query text.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "Export punctuation and indentation may vary while subtree membership remains correct."
+   ],
+   "nonRequirements": [
+    "No clipboard permissions, screenshots, download dialogs or exact geometry are asserted."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
+  },
+  "scripts/e2e-publish-query.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Export\u2026 on a block query publishes the whole owner pages of its results (and only those) into published-queries/<name>/, with outside page links inert and referenced assets copied into the folder.",
+     "blocking": false
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The dialog lists the owner pages before anything is written and will not export a block query until whole-page export is acknowledged.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "Exact HTML structure, ordering and styling of the exported pages may vary while page membership, link inertness and asset copying hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording or search-index contents are asserted."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-published-app.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A query export served over HTTP opens as the read-only Tine app: the root redirects to app/, the export's home page shows the exported query's rows, the Quick Switcher opens an exported page, and Linked References are the export's own.",
+     "blocking": false
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Tine published query export read-only contract (docs/contracts/typed-errors.md, Published query exports; ADR 0065)",
+     "userOutcome": "Nothing in the export can be edited: clicking a block opens no editor and keystrokes leave the exported text unchanged; ?static keeps the static site.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "The app's layout, styling and the exact row rendering may vary while page membership, query rows, navigation and read-only behaviour hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording, search ranking or bundle file names are asserted."
+   ],
+   "stability": "stable"
   }
  }
 }

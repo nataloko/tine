@@ -25,7 +25,7 @@ const META: GraphMeta = {
   guide_announced: true,
 };
 
-const DIRECT_ADMISSION = { binding_generation: 1, authority: "direct" as const };
+const DIRECT_ADMISSION = { binding_generation: 1 };
 
 async function loadHarness(
   existing: PageDto | null,
@@ -141,11 +141,11 @@ async function loadHarness(
     retirePdfOwnership,
     activatePdfOwnership,
   }));
-  vi.doMock("./managedStorageRuntime", () => ({
-    managedStorageRuntime: {
+  vi.doMock("./graphBindingRuntime", () => ({
+    graphBindingRuntime: {
       bind: vi.fn(),
       clear: vi.fn(),
-      refresh: vi.fn(async () => null),
+      snapshot: () => ({ bindingGeneration: null, applicationPageAdmission: null }),
     },
   }));
   vi.doMock("./store", () => ({ resetStore: vi.fn(), flushAll: vi.fn(async () => true) }));
@@ -271,33 +271,6 @@ describe("mobile graph folder picker", () => {
     await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
     expect(harness.api.inspectGraphAccess).not.toHaveBeenCalled();
     expect(harness.api.loadGraph).not.toHaveBeenCalled();
-  });
-
-  it("keeps a partial-provider picked graph failure sticky and retries the same target", async () => {
-    const harness = await loadHarness(
-      null,
-      undefined,
-      true,
-      false,
-      "android",
-      { status: "picked", path: META.root }
-    );
-    harness.api.loadGraph.mockRejectedValue(
-      new Error(
-        "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
-      )
-    );
-
-    await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
-    expect(harness.pushToast).toHaveBeenCalledWith(
-      "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.",
-      "error",
-      expect.objectContaining({ sticky: true, action: expect.objectContaining({ label: "Retry" }) })
-    );
-    const options = harness.pushToast.mock.calls.at(-1)![2]!;
-    options.action.run();
-    await vi.waitFor(() => expect(harness.api.loadGraph).toHaveBeenCalledTimes(2));
-    expect(harness.api.loadGraph).toHaveBeenLastCalledWith(META.root);
   });
 });
 
@@ -633,7 +606,7 @@ describe("PDF graph ownership", () => {
         kind: "loaded" as const,
         meta: nextMeta,
         binding_generation: 2,
-        application_page_admission: { binding_generation: 2, authority: "direct" as const },
+        application_page_admission: { binding_generation: 2 },
       };
     });
 

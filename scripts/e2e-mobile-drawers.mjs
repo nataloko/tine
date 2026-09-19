@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -99,6 +100,17 @@ async function withApp(index, forced, fn) {
     await browser.$(".main-content").waitForExist({ timeout: 20_000 });
     await fn(browser);
     await sleep(500);
+  } catch (error) {
+    // Retain the live obstruction/focus state before teardown. Diagnostics must
+    // never replace the original assertion or WebDriver failure.
+    try {
+      fs.writeFileSync(path.join(ARTIFACT, `failure-${index}.json`), JSON.stringify(await snapshot(browser), null, 2));
+      fs.writeFileSync(path.join(ARTIFACT, `failure-${index}.html`), await browser.getPageSource());
+      nativeScreenshot(path.join(ARTIFACT, `failure-${index}.png`));
+    } catch (diagnosticError) {
+      console.error("Failure diagnostics:", diagnosticError);
+    }
+    throw error;
   } finally {
     try { await browser?.deleteSession(); } catch {}
     try { process.kill(-driver.pid, "SIGKILL"); } catch {}
@@ -226,30 +238,10 @@ async function shiftClick(browser, element) {
   try { await element.click(); } finally { await browser.releaseActions(); }
 }
 
-async function navigate(browser, name) {
-  const current = await browser.$("h1.page-title");
-  if (await current.isExisting() && (await current.getText()).trim() === name) return;
-  await browser.keys(["Control", "k"]);
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 5_000 });
-  await input.setValue(name);
-  await browser.waitUntil(() => browser.execute((wanted) =>
-    [...document.querySelectorAll(".switcher-row .switcher-name")].some((node) => node.textContent?.trim() === wanted), name),
-  { timeout: 10_000, timeoutMsg: `${name} was not offered by Quick switcher` });
-  const clicked = await browser.execute((wanted) => {
-    const label = [...document.querySelectorAll(".switcher-row .switcher-name")]
-      .find((node) => node.textContent?.trim() === wanted);
-    const row = label?.closest(".switcher-row");
-    if (!row) return false;
-    row.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-    return true;
-  }, name);
-  assert(clicked, `could not activate ${name} Quick switcher row`);
-  await browser.waitUntil(async () => {
-    const heading = await browser.$("h1.page-title");
-    return await heading.isExisting() && (await heading.getText()).trim() === name;
-  }, { timeout: 10_000, timeoutMsg: `${name} did not open` });
-}
+// Shared readiness contract: find and activate the exact page row in one
+// round trip, retrying against the routed title. See
+// scripts/lib/e2e-navigation.mjs for the re-render flake this removes.
+const navigate = (browser, name) => openPageByName(browser, name);
 
 // Forced phone-width native process: literal drawer geometry and behavior.
 await withApp(0, true, async (browser) => {
@@ -518,8 +510,17 @@ await withApp(2, false, async (browser) => {
   await pdfLink.click();
   await browser.$(".pdf-pane").waitForExist({ timeout: 10_000 });
   const pdf = await snapshot(browser);
-  const pdfParent = await browser.execute(() => document.querySelector(".pdf-pane")?.parentElement?.classList.contains("drawer-workspace") ?? false);
-  assert(pdfParent && pdf.pdf.x >= pdf.workspace.x - 1 && pdf.pdf.right <= pdf.workspace.right + 1
+  // The contract is OWNERSHIP — the reader opens inside the workspace, not into
+  // the persistent sidebar or a drawer — not one particular nesting depth. This
+  // asked for `.drawer-workspace` to be the DIRECT parent, and the ordinary-pane
+  // PDF route legitimately added a level between them; that is what exhausted
+  // the stop-loss on 2026-09-01 after every semantic outcome had already
+  // succeeded. `closest` states the same ownership and survives a reasonable
+  // alternative structure.
+  const pdfInWorkspace = await browser.execute(
+    () => !!document.querySelector(".pdf-pane")?.closest(".drawer-workspace"),
+  );
+  assert(pdfInWorkspace && pdf.pdf.x >= pdf.workspace.x - 1 && pdf.pdf.right <= pdf.workspace.right + 1
     && pdf.right && pdf.rightRole === null && pdf.rightModal === null && pdf.scrims === 0,
   "persistent sidebar restructuring displaced the PDF neighbor", pdf);
   proof.artifacts.regular = path.join(ARTIFACT, "regular-wide-split-pdf.png");
@@ -527,7 +528,7 @@ await withApp(2, false, async (browser) => {
   // window. Use the WebDriver window capture here so the 1600px visual receipt
   // includes both 340px split panes, the PDF, and the persistent sidebar.
   await browser.saveScreenshot(proof.artifacts.regular);
-  proof.regularWidth = { closed: regularClosed, simultaneous: regularBoth, split, pdf, pdfParent };
+  proof.regularWidth = { closed: regularClosed, simultaneous: regularBoth, split, pdf, pdfInWorkspace };
 });
 
 proof.finishedAt = new Date().toISOString();

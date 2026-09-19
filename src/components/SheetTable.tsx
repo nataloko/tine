@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount, useContext, type JSX } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount, useContext, type JSX } from "solid-js";
 import {
   blockPageReadOnly,
   blockProperty,
@@ -51,6 +51,10 @@ import {
   fieldLabel,
   formulaReferenceName,
   isFormulaField,
+  queryColumnFieldId,
+  queryAggregateFieldName,
+  queryColumnName,
+  querySortFieldName,
   readField,
   recordFacets,
   rowRaw,
@@ -71,6 +75,14 @@ import {
   type FieldType,
 } from "../sheet/config";
 import { planSheetFieldRename } from "../sheet/renameField";
+import {
+  isLegacyBareColumnList,
+  selectedQueryColumns,
+  serializeQuerySort,
+  type QueryDisplayControl,
+} from "../editor/queryViewProperties";
+import { querySummary, type QueryAggFn } from "../editor/queryAggregate";
+import type { ViewSettings } from "../editor/queryIr";
 import { formulaFieldId, formulaNameFromField, formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import {
   createFormulaFilterMemo,
@@ -169,6 +181,9 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
 export function SheetTable(props: {
   ownerId: string;
   rowSource: "children" | "query";
+  /** Present only on a QUERY table: the resolved view, and the ONE writer its
+   *  header sorts, column order and aggregate footer route through. */
+  queryDisplay?: QueryDisplayControl;
   groups?: readonly RefGroup[];
   addRow?: () => void | Promise<void>;
   addRowLabel?: string;
@@ -180,7 +195,6 @@ export function SheetTable(props: {
   const [extraFields, setExtraFields] = createSignal<FieldId[]>([]);
   const [addingColumn, setAddingColumn] = createSignal(false);
   const [renamingField, setRenamingField] = createSignal<{ field: FieldId; value: string } | null>(null);
-  const [fieldRenamePending, setFieldRenamePending] = createSignal(false);
   const [editingProp, setEditingProp] = createSignal<{ rowId: string; field: FieldId; initial: string } | null>(null);
   const [hovering, setHovering] = createSignal(false);
   const [stableColumns, setStableColumns] = createSignal<string | null>(null);
@@ -224,14 +238,28 @@ export function SheetTable(props: {
       else setPageProperty(home.name, "tine.table-widths", value);
     });
   };
+  /** **A pre-split bare column list is not a declared schema** (P5A).
+   *
+   *  `tine.fields::` used to carry two unrelated things: a typed sheet schema
+   *  (`name=type`) and, on query blocks, the list of columns to show. A value
+   *  with no `=` anywhere is the second one, and reading it as a schema made
+   *  `schemaHome` non-null over an EMPTY parse — which marked every column a
+   *  stray, disabled header reordering, and let the next schema write silently
+   *  replace the column list. Such a value is now treated exactly as if the
+   *  property were absent, which also preserves page-vs-block schema ownership:
+   *  the page's declared schema governs when the block carries no schema. */
   const schemaHome = createMemo<SchemaHome | null>(() => {
     if (doc.byId[props.ownerId]) {
       const value = blockProperty(props.ownerId, "tine.fields");
-      if (value !== null) return { kind: "block", id: props.ownerId, value };
+      if (value !== null && (props.rowSource !== "query" || !isLegacyBareColumnList(value))) {
+        return { kind: "block", id: props.ownerId, value };
+      }
     }
     if (props.schemaPage) {
       const value = readPageProperty(props.schemaPage, "tine.fields");
-      if (value !== null) return { kind: "page", name: props.schemaPage, value };
+      if (value !== null && (props.rowSource !== "query" || !isLegacyBareColumnList(value))) {
+        return { kind: "page", name: props.schemaPage, value };
+      }
     }
     return null;
   });
@@ -297,7 +325,10 @@ export function SheetTable(props: {
     return isFormulaField(field) ? formulaValueToFieldValue(formulaValue(row, field)) : readFormulaRowField(row, field);
   };
 
-  const fields = createMemo<FieldId[]>(() => {
+  /** Every field this table KNOWS: declared schema first, then formulas, then
+   *  whatever the rows carry. Independent of which columns are shown — a field
+   *  definition is not lost because its column is hidden. */
+  const allFields = createMemo<FieldId[]>(() => {
     const loadedIds = rows().filter((r) => liveFormulaRowNode(r)).map((r) => r.id);
     const observed = loadedIds.length === rows().length
       ? fieldIdsForBlocks(loadedIds, { includePage: props.rowSource === "query" })
@@ -316,10 +347,41 @@ export function SheetTable(props: {
       ...inferred.filter((f) => !declaredSet.has(f) && !formulasSet.has(f)),
     ];
   });
+  /** **The columns this table SHOWS** (P5A).
+   *
+   *  A query block's `tine.columns::` selects, in order, which of the known
+   *  fields are visible; the selection is applied AFTER the schema/type lookup
+   *  above, so a shown column keeps the type its `tine.fields::` declaration
+   *  gave it and a hidden one keeps its definition. A selected column no row
+   *  carries is still a column: it renders empty cells rather than shifting its
+   *  neighbours. No selection (absent, or an explicit empty/invalid one) leaves
+   *  the default column set exactly as it was. The title column and the action
+   *  column are outside the selection and stay reachable.
+   *
+   *  Children-backed sheets are not a query face and ignore the property. */
+  const fields = createMemo<FieldId[]>(() => {
+    const known = allFields();
+    if (props.rowSource !== "query") return known;
+    const owner = doc.byId[props.ownerId];
+    if (!owner) return known;
+    const selection = selectedQueryColumns(
+      facetsOf(owner.raw, formatForBlock(props.ownerId)).properties,
+    );
+    if (!selection) return known;
+    const seen = new Set<FieldId>();
+    const out: FieldId[] = [];
+    for (const name of selection) {
+      const field = queryColumnFieldId(name);
+      if (seen.has(field)) continue;
+      seen.add(field);
+      out.push(field);
+    }
+    return out;
+  });
   const formulaHintFields = createMemo(() => {
     const out: string[] = [];
     const seen = new Set<string>();
-    for (const field of fields()) {
+    for (const field of allFields()) {
       const name = formulaReferenceName(field);
       if (!name || seen.has(name)) continue;
       seen.add(name);
@@ -368,7 +430,40 @@ export function SheetTable(props: {
     });
     return tracks.join(" ");
   });
-  const hasAggregates = createMemo(() => config().colAggregates.size > 0);
+  const queryAggregateFn = (field: FieldId): QueryAggFn | null => {
+    const key = queryAggregateFieldName(field);
+    if (key === null) return null;
+    return (props.queryDisplay?.statisticsView?.aggregates ?? props.queryDisplay?.view.aggregates ?? []).find(([k]) => k === key)?.[1] ?? null;
+  };
+  const setQueryAggregate = (field: FieldId, fn: QueryAggFn | null) => {
+    const control = props.queryDisplay;
+    const key = queryAggregateFieldName(field);
+    if (!control || key === null) return;
+    // Edited IN PLACE. The list is ordered and repeats are meaningful, so a
+    // change to one column's function must not reshuffle the others.
+    const entries = [...(control.view.aggregates ?? [])];
+    const at = entries.findIndex(([k]) => k === key);
+    if (fn === null) {
+      if (at < 0) return;
+      entries.splice(at, 1);
+    } else if (at >= 0) entries[at] = [key, fn];
+    else entries.push([key, fn]);
+    control.apply({ ...control.view, aggregates: entries });
+  };
+  /** The value, through the ONE query summary — never the sheet's `aggregate`,
+   *  whose vocabulary has no `avg` and whose numbers are its own. */
+  const queryAggregateText = (field: FieldId, fn: QueryAggFn): string => {
+    const key = queryAggregateFieldName(field);
+    if (key === null) return "";
+    const statistics = props.queryDisplay?.statistics;
+    const at = statistics?.aggregates.findIndex(([field, op]) => field === key && op === fn) ?? -1;
+    return querySummary({ statistics })?.overall[at]?.text ?? "";
+  };
+  const hasAggregates = createMemo(() =>
+    props.queryDisplay
+      ? fields().some((field) => queryAggregateFn(field) !== null)
+      : config().colAggregates.size > 0,
+  );
   const footerPinned = createMemo(() => aggregateFooterPinned(props.ownerId));
   const showFooter = createMemo(() => hasAggregates() || footerPinned());
   const showFooterToggle = createMemo(() => !hasAggregates() && (sheetHovering() || footerPinned()));
@@ -594,7 +689,62 @@ export function SheetTable(props: {
     }
   });
 
+  /** The name a header sort can be SAVED under, or `null` when it cannot be.
+   *
+   *  The engine's `sort_key` understands `priority`, `page`, `scheduled`,
+   *  `deadline` and any property name — and nothing else. Sorting a query table
+   *  by its title, state, tags or a formula column is a real thing to want, and
+   *  this table can do it over the rows it already has; but the note cannot
+   *  carry it, and a control that looked like it saved and came back unsorted
+   *  would be lying. So those stay local and say so. */
+  const persistableSortField = (col: number): string | null => {
+    if (!props.queryDisplay) return null;
+    const column = columns()[col];
+    if (!column || column === "title") return null;
+    return querySortFieldName(column);
+  };
+  /** The SAVED sort, as a column of this table — so the header arrow shows the
+   *  order the engine actually returned the rows in. */
+  const persistedSort = createMemo<SortState>(() => {
+    const entries = props.queryDisplay?.view.sort ?? [];
+    if (entries.length !== 1) return null;
+    const [name, dir] = entries[0];
+    const col = columns().findIndex(
+      (column) => column !== "title" && querySortFieldName(column) === name,
+    );
+    return col < 0 ? null : { col, dir: dir === "desc" ? -1 : 1 };
+  });
+  /** A table-only arrangement belongs to the rows it was chosen for. A new
+   *  result revision or a newly saved sort replaces those rows, so the override
+   *  is dropped rather than silently re-applied to a set nobody sorted.
+   *
+   *  Only where there IS a saved sort to be second to. A query-sourced table
+   *  with no query display control — the tag page's reference table — has the
+   *  local arrangement as its ONLY sort, and dropping it on every refresh of the
+   *  references would be a reset the user never asked for. */
+  createEffect(
+    on(
+      [() => props.groups, () => serializeQuerySort(props.queryDisplay?.view.sort)],
+      () => {
+        if (props.queryDisplay) setSort(null);
+      },
+      { defer: true },
+    ),
+  );
   const sortHeader = (col: number) => {
+    const name = persistableSortField(col);
+    const control = props.queryDisplay;
+    if (name && control) {
+      const saved = persistedSort();
+      // asc → desc → no saved sort, the same three-step cycle the local one has.
+      const next: ViewSettings["sort"] =
+        saved?.col !== col ? [[name, "asc"]] : saved.dir > 0 ? [[name, "desc"]] : [];
+      // A saved sort is the order the engine returns; a local arrangement of the
+      // previous rows on top of it would be a second, invisible answer.
+      setSort(null);
+      control.apply({ ...control.view, sort: next });
+      return;
+    }
     setSort((cur) => {
       if (!cur || cur.col !== col) return { col, dir: 1 };
       if (cur.dir === 1) return { col, dir: -1 };
@@ -602,9 +752,21 @@ export function SheetTable(props: {
     });
   };
   const sortArrow = (col: number) => {
-    const s = sort();
+    const s = sort() ?? persistedSort();
     return s?.col === col ? (s.dir > 0 ? " ▲" : " ▼") : "";
   };
+  /** Shown while a query table is arranged by something the note cannot carry,
+   *  so the difference between "sorted" and "saved as sorted" is visible rather
+   *  than discovered after a reload. */
+  const tableOnlySortLabel = createMemo(() => {
+    if (props.rowSource !== "query" || !props.queryDisplay) return null;
+    const s = sort();
+    if (!s) return null;
+    const column = columns()[s.col];
+    return column === undefined
+      ? null
+      : `Table-only sort: ${column === "title" ? "Title" : fieldLabel(column)}`;
+  });
 
   const createSchemaHome = (): SchemaHome | null => {
     if (doc.byId[props.ownerId]) return { kind: "block", id: props.ownerId, value: "" };
@@ -616,12 +778,40 @@ export function SheetTable(props: {
     if (home.kind === "block") return !blockPageReadOnly(home.id);
     return !(pageByName(home.name)?.readOnly ?? false);
   };
+  /** A pre-split bare column list about to be overwritten by a declared schema,
+   *  and the block it lives on — or `null` when there is nothing to rescue.
+   *
+   *  Declaring a schema writes `tine.fields`, which on a query block may still
+   *  be holding the note's column list. That list is the user's visible choice,
+   *  so it moves to `tine.columns` in the SAME undo unit as the schema write.
+   *  It moves only when `tine.columns` is ABSENT: a present value — including a
+   *  present empty or invalid one — is an explicit statement, and its presence
+   *  wins over a rescue. Only a QUERY face has columns to rescue; an ordinary
+   *  children sheet's inert bare list is not a column choice. */
+  const legacyColumnRescue = (): { id: string; value: string } | null => {
+    if (props.rowSource !== "query") return null;
+    const owner = doc.byId[props.ownerId];
+    if (!owner) return null;
+    if (blockProperty(props.ownerId, "tine.columns") !== null) return null;
+    const legacy = blockProperty(props.ownerId, "tine.fields");
+    if (!isLegacyBareColumnList(legacy)) return null;
+    const columns = selectedQueryColumns(facetsOf(owner.raw, formatForBlock(props.ownerId)).properties);
+    return columns && columns.length > 0 ? { id: props.ownerId, value: columns.join(";") } : null;
+  };
   const writeSchemaFields = (next: readonly FieldSpec[]) => {
     const home = schemaHome() ?? createSchemaHome();
     if (!home || !schemaWriteAllowed()) return;
     const value = serializeFields(next);
-    if (home.kind === "block") setBlockProperty(home.id, "tine.fields", value || null);
-    else setPageProperty(home.name, "tine.fields", value || null);
+    const rescue = legacyColumnRescue();
+    const page = home.kind === "block" ? doc.byId[home.id]?.page : home.name;
+    // ONE undo unit: the rescue and the declaration are a single user action,
+    // and each `setBlockProperty` would otherwise push its own entry.
+    const affected = [...new Set([page, rescue ? doc.byId[rescue.id]?.page : undefined].filter((name): name is string => !!name))];
+    withUndoUnit("sheet:schema-fields", affected, () => {
+      if (rescue) setBlockProperty(rescue.id, "tine.columns", rescue.value);
+      if (home.kind === "block") setBlockProperty(home.id, "tine.fields", value || null);
+      else setPageProperty(home.name, "tine.fields", value || null);
+    });
   };
   const formulaWriteAllowed = (home: FormulaHome | null) => {
     if (!home) return false;
@@ -662,20 +852,84 @@ export function SheetTable(props: {
     writeSchemaFields([...schemaFields(), spec]);
   };
   const declareFreshSchema = () => {
-    const specs = fields().map((field) => specForField(field)).filter((spec): spec is FieldSpec => !!spec);
+    // Every field the table knows, not only the shown ones: declaring a schema
+    // must not silently drop the definition of a column a selection hides.
+    const specs = allFields().map((field) => specForField(field)).filter((spec): spec is FieldSpec => !!spec);
     writeSchemaFields(specs);
   };
   const canDragFieldHeader = (field: FieldId) =>
-    field.startsWith("prop:") && schemaWriteAllowed() && (!schemaHome() || schemaFieldSet().has(field));
+    props.queryDisplay
+      // A query table's column ORDER is `tine.columns`, so anything that key can
+      // spell can be dragged — the six builtins included. What it cannot spell
+      // (a formula column) stays put rather than being silently dropped from the
+      // order it appears to be part of.
+      ? queryColumnName(field) !== null && !blockPageReadOnly(props.ownerId)
+      : field.startsWith("prop:") && schemaWriteAllowed() && (!schemaHome() || schemaFieldSet().has(field));
   const canDropFieldHeader = (field: FieldId, dragged: FieldId) => {
     if (field === dragged) return false;
+    if (props.queryDisplay) return queryColumnName(field) !== null;
     // Formula fields are not serialized in tine.fields. They still make a useful
     // terminal drop boundary: a property dropped on one is inserted before all
     // formulas, which are always rendered at the end.
     if (isFormulaField(field)) return true;
     return schemaHome() ? schemaFieldSet().has(field) : !!specForField(field);
   };
+  /** A query table's header reorder edits the VISIBLE COLUMN ORDER through the
+   *  query's own writer — never `tine.fields`, which is the typed schema and
+   *  says nothing about order or visibility.
+   *
+   *  **`tine.columns` is a complete selection, not a hint.** Whatever it lists
+   *  is what the table shows, so an order written from only the columns the
+   *  grammar can spell would not "leave the others where they are" — it would
+   *  HIDE them. The grammar has no token for a formula column, nor for a
+   *  property named like one of the six builtins (P5A, unchanged here), so when
+   *  one of those is on screen the order is left exactly as it was and the
+   *  reason is said out loud. Coercing it into another field identity is the
+   *  one thing that is never an option: that is a silent data change. */
+  const reorderQueryColumns = (field: FieldId, drop: FieldHeaderDrop) => {
+    const control = props.queryDisplay;
+    if (!control) return;
+    const order = [...fields()];
+    const from = order.indexOf(field);
+    if (from < 0) return;
+    const [moved] = order.splice(from, 1);
+    const target = order.indexOf(drop.field);
+    order.splice(target < 0 ? order.length : target + (drop.before ? 0 : 1), 0, moved);
+    const names: string[] = [];
+    const unrepresentable: FieldId[] = [];
+    for (const column of order) {
+      const name = queryColumnName(column);
+      if (name === null) unrepresentable.push(column);
+      else names.push(name);
+    }
+    if (unrepresentable.length > 0) {
+      const labels = unrepresentable.map(fieldLabel).join(", ");
+      pushToast(
+        unrepresentable.length > 1
+          ? `${labels} are computed columns with no name in a saved column list, so this order cannot be saved`
+          : `${labels} is a computed column with no name in a saved column list, so this order cannot be saved`,
+        "info",
+      );
+      return;
+    }
+    control.apply({ ...control.view, columns: names });
+  };
   const reorderFieldHeader = (field: FieldId, drop: FieldHeaderDrop) => {
+    if (props.queryDisplay) {
+      reorderQueryColumns(field, drop);
+      return;
+    }
+    const owner = doc.byId[props.ownerId];
+    const page = owner?.page ?? props.schemaPage;
+    // A reorder that has to declare a schema first is still ONE user action, so
+    // the freshly declared schema and the reordered one share an undo entry
+    // (nested `withUndoUnit`s collapse into the outermost).
+    const home = schemaHome();
+    const schemaPage = home?.kind === "page" ? home.name : home ? doc.byId[home.id]?.page : undefined;
+    const affected = [...new Set([page, schemaPage].filter((name): name is string => !!name))];
+    withUndoUnit("sheet:schema-reorder", affected, () => reorderFieldHeaderIn(field, drop));
+  };
+  const reorderFieldHeaderIn = (field: FieldId, drop: FieldHeaderDrop) => {
     if (!schemaHome()) declareFreshSchema();
     const next = [...schemaFields()];
     const from = next.findIndex((spec) => spec.field === field);
@@ -778,7 +1032,6 @@ export function SheetTable(props: {
     setRenamingField({ field, value: field.slice("prop:".length) });
   };
   const commitFieldRename = (field: FieldId, value: string): boolean => {
-    if (fieldRenamePending()) return false;
     const owner = doc.byId[props.ownerId];
     const home = schemaHome();
     if (!owner || home?.kind !== "block") return false;
@@ -843,12 +1096,6 @@ export function SheetTable(props: {
       ));
       setRenamingField(null);
     });
-    if (dispatch.kind === "pending") {
-      setFieldRenamePending(true);
-      void dispatch.settled.finally(() => {
-        if (mounted) setFieldRenamePending(false);
-      });
-    }
     return dispatch.kind !== "refused";
   };
   const openFieldHeaderMenu = (e: MouseEvent, field: FieldId) => {
@@ -1096,6 +1343,24 @@ export function SheetTable(props: {
               </span>
             )}
           </Show>
+          {/* Say when the arrangement is this table's own and not the note's,
+              rather than let a reload look like a bug. */}
+          <Show when={tableOnlySortLabel()}>
+            {(label) => (
+              <button
+                type="button"
+                class="sheet-table-only-sort"
+                title="This order is not saved with the query. Click to clear it."
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSort(null);
+                }}
+              >
+                {label()} ✕
+              </button>
+            )}
+          </Show>
           {columnResizeHandle("title")}
         </div>
         <For each={fields()}>
@@ -1151,7 +1416,6 @@ export function SheetTable(props: {
                 <input
                   class="sheet-prop-input sheet-header-rename-input"
                   autofocus
-                  disabled={fieldRenamePending()}
                   value={renamingField()?.value ?? ""}
                   aria-label={`Rename ${fieldLabel(field)} field`}
                   onClick={(e) => e.stopPropagation()}
@@ -1299,9 +1563,21 @@ export function SheetTable(props: {
               <SheetAggregateFooterCell
                 ownerId={props.ownerId}
                 columnKey={field}
-                fn={config().colAggregates.get(field) ?? null}
+                fn={props.queryDisplay ? null : config().colAggregates.get(field) ?? null}
+                query={
+                  props.queryDisplay && queryAggregateFieldName(field) !== null
+                    ? {
+                        fn: queryAggregateFn(field),
+                        text: (() => {
+                          const fn = queryAggregateFn(field);
+                          return fn ? queryAggregateText(field, fn) : "";
+                        })(),
+                        set: (fn) => setQueryAggregate(field, fn),
+                      }
+                    : undefined
+                }
                 values={sortedRows().map((row) => rowFieldValue(row, field))}
-                showEmpty={footerPinned()}
+                showEmpty={footerPinned() && (!props.queryDisplay || queryAggregateFieldName(field) !== null)}
               />
             )}
           </For>

@@ -121,11 +121,45 @@ async function presentationButton(browser, label) {
   throw new Error(`missing ${label} presentation button`);
 }
 
-async function inlineQueryViewButton(browser, label) {
+/** Put an inline query on a named presentation, through whichever control that
+ *  host actually offers.
+ *
+ *  A query with a builder states its view in the Display panel; only the hosts
+ *  with no builder — an authored advanced query, a friendly search, a block
+ *  whose reading has not landed — keep the header switcher
+ *  (`Macro.tsx`: `props.blockId && !inlineDisplay()`). Two controls writing one
+ *  fact is how they came apart, so there is exactly one at a time, and a
+ *  journey that knows only the older one fails on a UI that is working
+ *  correctly. `QueryMacro.test.tsx::clickView` makes the same choice.
+ *
+ *  The panel is left CLOSED: it is portalled over the results this journey then
+ *  reads. */
+async function setInlineQueryView(browser, label) {
   for (const button of await browser.$$(".query-view-switcher button")) {
-    if ((await button.getText()).trim() === label) return button;
+    if ((await button.getText()).trim() === label) { await button.click(); return; }
   }
-  throw new Error(`missing inline-query ${label} view button`);
+  if (!(await browser.$(".qd-trigger").isExisting())) {
+    await browser.$(".qs-gear").waitForExist({ timeout: 15_000 });
+    await browser.$(".qs-gear").click();
+    await browser.$(".qs-sheet").waitForExist({ timeout: 10_000 });
+  }
+  const trigger = await browser.$(".qd-trigger");
+  await trigger.waitForExist({ timeout: 10_000 });
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
+  await browser.$(".qd-panel").waitForExist({ timeout: 10_000 });
+  const buttons = await browser.$$(".qd-panel .qd-view");
+  const seen = [];
+  for (const button of buttons) {
+    const text = (await button.getText()).trim();
+    seen.push(text);
+    if (text === label) {
+      await button.click();
+      await browser.keys("Escape");
+      await browser.$(".qd-panel").waitForExist({ reverse: true, timeout: 5_000 });
+      return;
+    }
+  }
+  throw new Error(`neither control offers the inline-query ${label} view; the Display panel offers ${JSON.stringify(seen)}`);
 }
 
 async function assertInPageFind(browser, query, activeSelector, slowTyping = false) {
@@ -169,7 +203,30 @@ async function assertInPageFind(browser, query, activeSelector, slowTyping = fal
     }));
     throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
   }
-  await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  try {
+    await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  } catch (error) {
+    // A found-but-not-marked match is a different failure from a missing match,
+    // and the two are indistinguishable from the selector alone. Name which
+    // surface the active mark actually landed on, and what each surface offers
+    // in-page find AFTER its interactive controls are excluded - the searchable
+    // text is not the visible text.
+    const proof = await browser.execute(() => ({
+      count: document.querySelector(".inpage-find-count")?.textContent,
+      active: [...document.querySelectorAll(".inpage-find-active-block")]
+        .map((element) => element.className),
+      surfaces: [...document.querySelectorAll("[data-inpage-find-surface]")].map((element) => {
+        const clone = element.cloneNode(true);
+        for (const control of clone.querySelectorAll("button,input,textarea,select")) control.remove();
+        return {
+          id: element.getAttribute("data-inpage-find-surface"),
+          visible: element.textContent?.trim().slice(0, 160),
+          searchable: clone.textContent?.trim().slice(0, 160),
+        };
+      }),
+    }));
+    throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
+  }
   await browser.execute(() => document.querySelector(".inpage-find-input")?.dispatchEvent(
     new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true })
   ));
@@ -226,8 +283,7 @@ await withApp(0, async (browser) => {
     timeout: 10_000, timeoutMsg: "unlinked-reference content did not finish rendering",
   });
   await assertInPageFind(browser, "names Query parity near the start", ".unlinked-references .reference-blocks.inpage-find-active-block");
-  const inlineSearchButton = await inlineQueryViewButton(browser, "Search");
-  await inlineSearchButton.click();
+  await setInlineQueryView(browser, "Search");
   await browser.waitUntil(async () => (await browser.$$(".query-search-results .query-search-hit")).length === 9, {
     timeout: 10_000, timeoutMsg: "Search presentation dropped ordinary DSL query results",
   });
@@ -309,6 +365,9 @@ await withApp(0, async (browser) => {
   // GH #140: every persistent presentation keeps the authoritative evidence
   // highlights, and every visible result remains an in-page-find surface.
   await browser.setWindowSize(720, 700);
+  // Q3: a mixed result is TWO families now, so a bare presentation selector
+  // could be satisfied by the other section's container. Each one is addressed
+  // through its own section.
   const presentations = [
     ["Search", ".query-results-search"],
     ["List", ".query-results-list"],
@@ -317,7 +376,7 @@ await withApp(0, async (browser) => {
   ];
   for (const [label, selector] of presentations) {
     await (await presentationButton(browser, label)).click();
-    await browser.$(selector).waitForExist({ timeout: 5_000 });
+    await browser.$(`[data-query-result-kind="block"] ${selector}`).waitForExist({ timeout: 5_000 });
     await browser.waitUntil(async () => (await browser.$$(".query-workspace mark")).length >= 4, {
       timeout: 5_000, timeoutMsg: `${label} presentation dropped search highlights`,
     });
@@ -331,10 +390,38 @@ await withApp(0, async (browser) => {
       throw new Error(`${label} evidence/surface mismatch: ${JSON.stringify(presentationProof)}`);
     }
   }
+  // This fixture's answer is blocks-only, and that is exactly the case an empty
+  // family must survive: the Pages section stays mounted, keeps its own Display
+  // control, and SAYS it is empty. A section that vanished with its rows would
+  // take the only way to change what it selects with it (I-10).
+  const sectionProof = await browser.execute(() => {
+    const sections = [...document.querySelectorAll(".query-workspace [data-query-result-kind]")];
+    return sections.map((section) => {
+      const heading = section.querySelector("h3");
+      return {
+        kind: section.getAttribute("data-query-result-kind"),
+        heading: heading?.textContent?.trim() ?? null,
+        labelled: !!heading?.id && section.getAttribute("aria-labelledby") === heading.id,
+        controls: [...section.querySelectorAll(".query-result-section-header .qd-trigger")]
+          .map((button) => button.getAttribute("aria-label")),
+        empty: !!section.querySelector(".query-result-section-empty"),
+      };
+    });
+  });
+  if (sectionProof.length !== 2
+    || sectionProof[0].kind !== "page" || sectionProof[1].kind !== "block"
+    || sectionProof[0].heading !== "Pages" || sectionProof[1].heading !== "Blocks"
+    || sectionProof.some((section) => !section.labelled)
+    || sectionProof[0].controls.length !== 1 || sectionProof[0].controls[0] !== "Display pages"
+    || sectionProof[1].controls.length !== 1 || sectionProof[1].controls[0] !== "Display blocks"
+    || !sectionProof[0].empty || sectionProof[1].empty) {
+    throw new Error(`the two result families are not independently mounted: ${JSON.stringify(sectionProof)}`);
+  }
+
   await (await presentationButton(browser, "Search")).click();
   const wrapProof = await browser.execute(() => {
     const workspace = document.querySelector(".query-workspace")?.getBoundingClientRect();
-    return [...document.querySelectorAll(".query-result-row")].map((row) => {
+    return [...document.querySelectorAll('[data-query-result-kind="block"] .query-result-row')].map((row) => {
       const rect = row.getBoundingClientRect();
       return {
         scrollWidth: row.scrollWidth,
@@ -371,15 +458,19 @@ await withApp(0, async (browser) => {
   await friendlyInputs[0].setValue("Overflow");
   await browser.$(".query-advanced-actions .primary").click();
   await browser.$(".query-advanced-modal").waitForExist({ reverse: true, timeout: 5_000 });
-  await browser.waitUntil(async () => (await browser.$$(".query-results-search .query-result-row")).length === 140, {
+  // The reporter's 140 rows are 40 PAGE hits and 100 BLOCK hits; Q3 puts them in
+  // two sections instead of one flat list, so both halves are measured. The
+  // intrinsically wide title is a page name, which is now `.query-page-link`.
+  const ROW_SELECTOR = '[data-query-result-kind="page"] .query-page-link, [data-query-result-kind="block"] .query-result-row';
+  await browser.waitUntil(async () => (await browser.$$(ROW_SELECTOR)).length === 140, {
     timeout: 15_000, timeoutMsg: "persistent workspace did not render the 140 page-result fixture",
   });
-  const fullPaneWrapProof = await browser.execute(() => {
+  const fullPaneWrapProof = await browser.execute((rowSelector) => {
     const pane = document.querySelector(".query-workspace")?.closest(".main-content");
     const workspace = document.querySelector(".query-workspace");
-    const grid = document.querySelector(".query-results-search");
-    const items = [...document.querySelectorAll('.query-results-search > [role="listitem"]')];
-    const rows = [...document.querySelectorAll(".query-results-search .query-result-row")];
+    const grids = [...document.querySelectorAll(".query-result-section .query-results-search")];
+    const items = [...document.querySelectorAll('.query-result-section .query-results-search > [role="listitem"]')];
+    const rows = [...document.querySelectorAll(rowSelector)];
     const measure = (element) => element ? {
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
@@ -391,17 +482,18 @@ await withApp(0, async (browser) => {
       bodyScrollWidth: document.body.scrollWidth,
       pane: measure(pane),
       workspace: measure(workspace),
-      grid: measure(grid),
+      grids: grids.map(measure),
       items: items.map(measure),
       rows: rows.map(measure),
     };
-  });
+  }, ROW_SELECTOR);
   const overflows = (entry) => !entry || entry.scrollWidth > entry.clientWidth + 1
     || entry.left < -1 || entry.right > fullPaneWrapProof.viewport + 1;
   if (fullPaneWrapProof.bodyScrollWidth > fullPaneWrapProof.viewport + 1
     || overflows(fullPaneWrapProof.pane)
     || overflows(fullPaneWrapProof.workspace)
-    || overflows(fullPaneWrapProof.grid)
+    || fullPaneWrapProof.grids.length !== 2
+    || fullPaneWrapProof.grids.some(overflows)
     || fullPaneWrapProof.items.length !== 140
     || fullPaneWrapProof.items.some(overflows)
     || fullPaneWrapProof.rows.length !== 140
@@ -420,24 +512,26 @@ await withApp(0, async (browser) => {
   // the modal itself must not let its parent jump ahead of the still-visible
   // child; one Escape closes only the child and preserves the draft/modal.
   await browser.$(".query-switch-to-dsl").click();
-  await browser.$(".qb-bar").waitForExist({ timeout: 5_000 });
-  await browser.$(".qb-chip").click();
-  await browser.$(".qb-menu").waitForExist({ timeout: 5_000 });
+  // In the workspace the sheet is always open and lives INSIDE the modal, so
+  // the modal's own Tab trap keeps its menus contained.
+  await browser.$(".qs-sheet").waitForExist({ timeout: 5_000 });
+  await browser.$(".qs-row .qs-field").click();
+  await browser.$(".qs-menu").waitForExist({ timeout: 5_000 });
   await browser.keys(["Escape"]);
-  await browser.$(".qb-menu").waitForExist({ reverse: true, timeout: 5_000 });
+  await browser.$(".qs-menu").waitForExist({ reverse: true, timeout: 5_000 });
   if (!(await browser.$(".query-advanced-modal").isExisting())) {
     throw new Error("QueryBuilder child Escape also closed its Advanced parent");
   }
   // Same rung by pointer (GH #472): pressing the modal's own header is an
-  // outside press for the clause menu, so it closes the menu and only the menu.
+  // outside press for the row menu, so it closes the menu and only the menu.
   // This step used to precede the Escape above, to reactivate the parent layer;
   // since every popover now dismisses on an outside press, it IS the dismissal.
-  await browser.$(".qb-chip").click();
-  await browser.$(".qb-menu").waitForExist({ timeout: 5_000 });
+  await browser.$(".qs-row .qs-field").click();
+  await browser.$(".qs-menu").waitForExist({ timeout: 5_000 });
   await browser.execute(() => document.querySelector(".query-advanced-header")?.dispatchEvent(
     new MouseEvent("pointerdown", { bubbles: true, cancelable: true })
   ));
-  await browser.$(".qb-menu").waitForExist({ reverse: true, timeout: 5_000 });
+  await browser.$(".qs-menu").waitForExist({ reverse: true, timeout: 5_000 });
   if (!(await browser.$(".query-advanced-modal").isExisting())) {
     throw new Error("An outside press on the Advanced header closed the modal, not just its child menu");
   }
@@ -715,20 +809,27 @@ await withApp(2, async (browser) => {
   await unlinkedHeader.scrollIntoView();
   await unlinkedHeader.click();
   await browser.$(".unlinked-references .reference-bulk-controls").waitForExist({ timeout: 10_000 });
+  // The bounded excerpt must show BOTH mentions of the page and offer a way to
+  // reach each one. Since GH #200 round 2 the highlighted mention IS that
+  // control, and the numbered jump row is rendered only for mentions the
+  // excerpt cannot show - so a numbered row on this block would be the
+  // duplication the reporter objected to, and its absence is the assertion.
   const unlinkedProof = await browser.execute((expectedRaw) => {
     const groups = [...document.querySelectorAll(".unlinked-references .reference-group")];
     const source = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
     const excerpt = source?.querySelector(".reference-excerpt-text")?.textContent ?? "";
+    const marks = [...(source?.querySelectorAll(".reference-excerpt-mark") ?? [])];
     return {
       groupCount: groups.length,
-      mentions: source?.querySelector(".reference-mention-count")?.textContent?.trim(),
-      jumps: source?.querySelectorAll(".reference-occurrence-jump").length,
-      marks: source?.querySelectorAll("mark").length,
+      markText: marks.map((mark) => mark.textContent?.trim()),
+      marksAreControls: marks.every((mark) => mark instanceof HTMLButtonElement),
+      redundantJumpRow: source?.querySelectorAll(".reference-occurrence-jump").length,
       bounded: excerpt.length < expectedRaw.length,
     };
   }, unlinkedRaw);
-  if (unlinkedProof.groupCount < 2 || unlinkedProof.mentions !== "2 mentions"
-    || unlinkedProof.jumps !== 2 || unlinkedProof.marks !== 2 || !unlinkedProof.bounded) {
+  if (unlinkedProof.groupCount < 2 || !unlinkedProof.bounded || !unlinkedProof.marksAreControls
+    || unlinkedProof.redundantJumpRow !== 0
+    || JSON.stringify(unlinkedProof.markText) !== JSON.stringify(["Query parity", "Query parity"])) {
     throw new Error(`unlinked reference evidence is incomplete: ${JSON.stringify(unlinkedProof)}`);
   }
 
@@ -767,12 +868,12 @@ await withApp(2, async (browser) => {
   const jumped = await browser.execute(() => {
     const source = [...document.querySelectorAll(".unlinked-references .reference-group")]
       .find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
-    const jump = source?.querySelectorAll(".reference-occurrence-jump")[1];
+    const jump = source?.querySelectorAll(".reference-excerpt-mark")[1];
     if (!(jump instanceof HTMLButtonElement)) return false;
     jump.click();
     return true;
   });
-  if (!jumped) throw new Error("second unlinked occurrence control is missing");
+  if (!jumped) throw new Error("the second unlinked mention does not open its source");
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Unlinked source", {
     timeout: 10_000, timeoutMsg: "occurrence jump did not open its source page",
   });
@@ -784,9 +885,13 @@ await withApp(2, async (browser) => {
       ? { value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd }
       : null;
   });
+  // A SELECTION of the mention, not a collapsed caret: iOS paints no caret for a
+  // programmatic focus, so a caret answered "which mention did I ask for?" only
+  // on desktop (GH #200).
   const expectedOffset = unlinkedRaw.lastIndexOf("Query parity");
-  if (!caret || caret.value !== unlinkedRaw || caret.start !== expectedOffset || caret.end !== expectedOffset) {
-    throw new Error(`exact occurrence jump landed at the wrong caret: ${JSON.stringify({ caret, expectedOffset })}`);
+  const expectedEnd = expectedOffset + "Query parity".length;
+  if (!caret || caret.value !== unlinkedRaw || caret.start !== expectedOffset || caret.end !== expectedEnd) {
+    throw new Error(`exact occurrence jump did not select the mention: ${JSON.stringify({ caret, expectedOffset, expectedEnd })}`);
   }
 });
 

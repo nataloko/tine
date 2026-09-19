@@ -13,6 +13,8 @@ import { NamespaceCrumb } from "./Namespace";
 import { LinkedReferences } from "./LinkedReferences";
 import { QueryMacro } from "./Macro";
 import type { RefGroup } from "../types";
+import { backendReadsQueries } from "../queryReadingsTestkit";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 // GH #283 (approved contract): ONE modified-click decision across internal
 // page/block link surfaces:
@@ -243,11 +245,14 @@ describe("modified-click contract on internal links (GH #283)", () => {
   });
 
   it("legacy query-table page cells use the shared background-tab destination", async () => {
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: "Query Owner",
       kind: "page",
       blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
-    }]);
+    }]));
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+    });
     const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
     try {
       const cell = await vi.waitFor(() => {
@@ -408,11 +413,14 @@ describe("Alt+click opens the link in the other pane (GH #438)", () => {
   });
 
   it("Alt+click on a legacy query-table page cell opens the hit page in the other pane", async () => {
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: "Query Owner",
       kind: "page",
       blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
-    }]);
+    }]));
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+    });
     const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
     try {
       const cell = await vi.waitFor(() => {

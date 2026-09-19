@@ -1,5 +1,20 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+
+function rustModuleSource(path: string): string {
+  const files = [path];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = path.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 import {
   dispatchAndroidBack,
   installAndroidBackHandler,
@@ -199,39 +214,22 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(safeBackPlugin).not.toContain("isEnabled = false");
   });
 
-  it("keeps managed Android root Back as typed preparation then explicit activity exit", () => {
+  it("keeps Android root Back as frontend preparation then explicit activity exit", () => {
     const app = readFileSync("src/App.tsx", "utf8");
     const androidBack = readFileSync("src/androidBack.ts", "utf8");
-    const backend = readFileSync("src/backend.ts", "utf8");
-    const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     const lib = readFileSync("src-tauri/src/lib.rs", "utf8");
     const nativePlugin = readFileSync("src-tauri/src/android_safe_back.rs", "utf8");
     const defaultCapability = JSON.parse(
       readFileSync("src-tauri/capabilities/default.json", "utf8"),
     ) as { permissions: string[] };
 
-    expect(backend).toContain("prepareQuit(): Promise<TineQuitPreparation>");
-    expect(backend).toContain('return this.call<TineQuitPreparation>("prepare_tine_quit");');
-    expect(app).toContain("prepareNativeClose: () => backend().prepareQuit()");
-    expect(app).toContain('failure.status === "refused" || failure.status === "partial"');
-    expect(app).toContain("Tine-managed storage could not verify a clean stop.");
-    expect(app).toContain("Couldn't close the app. Your graph remains open.");
-    expect(androidBack).toContain("NativePartiallyPrepared");
-    expect(androidBack).toContain("native_prepare_uncertain");
-    expect(androidBack).toContain("native_prepare_refused");
-    expect(androidBack).toContain("native_prepare_partial");
     expect(app).toContain("finishActivity: exitAndroidActivity");
     expect(androidBack).toContain('import("@tauri-apps/plugin-process")');
     expect(androidBack).toContain("await exit(0)");
     expect(defaultCapability.permissions).toContain("process:allow-exit");
-    expect(commands).toContain("fn prepare_tine_quit_all_slots");
-    expect(commands).toContain("enum TineQuitPreparation");
-    expect(commands).toMatch(/Partial\s*\{\s*safe_slots: Vec<String>,\s*detail: String,\s*\}/);
-    expect(commands).toContain("slots.sort_by");
-    expect(commands).toContain("TineQuitPreparation::Safe");
-    expect(commands).toMatch(/pub\(crate\) fn prepare_tine_quit\([\s\S]*?prepare_tine_quit_all_slots\(&state\)/);
-    expect(commands).toMatch(/pub\(crate\) fn tine_quit\([\s\S]*?prepare_tine_quit_all_slots\(&state\)[\s\S]*?app\.exit\(0\)/);
-    expect(lib).toMatch(/generate_handler!\[[\s\S]*?prepare_tine_quit,[\s\S]*?tine_quit,/);
+    expect(commands).toMatch(/pub\(crate\) fn tine_quit\([\s\S]*?app\.exit\(0\)/);
+    expect(lib).toMatch(/generate_handler!\[[\s\S]*?\btine_quit,/);
     expect(lib).toContain("builder.plugin(android_safe_back::init())");
     expect(nativePlugin).toContain('Builder::new("safe-back")');
     expect(nativePlugin).toContain('register_android_plugin(PLUGIN_IDENTIFIER, "SafeBackPlugin")');

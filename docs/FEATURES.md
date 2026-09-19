@@ -89,10 +89,9 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   and writes to it, and fails closed if the link is later retargeted; pages,
   journals, and configuration never inherit that exception.
 - **Live external-asset refresh** — images replaced by an editor or a
-  whole-graph synchronizer refresh in place in both Direct Files and managed
-  storage. Asset observation is metadata-only and separate from the managed
-  oplog; PDFs, audio, and video already open in Tine are left undisturbed and
-  use the new bytes on their next open.
+  whole-graph synchronizer refresh in place. Asset observation is metadata-only;
+  PDFs, audio, and video already open in Tine are left undisturbed and use the
+  new bytes on their next open.
 - **Drag the corner grip to resize an image *or a video*** — stored as a width % in
   Logseq's `{:width …}` brace, so it round-trips.
 - ⊕ **Audio ⤢ Expand** opens a wide overlay player — a **waveform scrubber** with
@@ -182,8 +181,15 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   with a field selector, `(sort-by …)`. Results render as a list or a sortable
   **table** or board. Search, list, table, and board are presentations of one result
   membership rather than separate query implementations. ⊕ A friendly search-text
-  surface, a Gmail-style filter dialog, the interactive **visual query builder**
-  (chip/clause bar), and the raw DSL all compile to the same query plan. Explanations
+  surface, a Gmail-style filter dialog, the interactive **visual query builder**,
+  and the raw DSL all compile to the same query plan. The builder has two states:
+  at rest a query block is ONE plain-English sentence — *Blocks where task: TODO
+  and page: Roadmap* — with its result count and a ⚙; clicking it opens a **sheet**
+  over the blocks below, with `Find blocks ▾ where …` on top and one
+  `field ▾ | operator ▾ | value | ⋮ | ×` row per condition, groupable as
+  *all of* / *any of* / *none of*. Changing what a query selects re-reads it
+  first and says how many conditions stop applying rather than dropping them.
+  Below ~600px the sheet becomes a bottom sheet. Explanations
   show what Tine understood and diagnostics identify unsupported or invalid parts.
   Nested query matches follow Logseq's exact top-level-result rule: a match is
   suppressed only when its immediate parent is also a match, so a valid match
@@ -203,13 +209,32 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   switches between Search/List/Table/Board without changing membership, and remains
   outside the graph until named. Giving it a title materializes one ordinary query
   page, so exploratory search and durable dashboards share a single path.
-- **Summarize results** (beyond Logseq) — the builder's **∑ summarize** control
-  computes, with no code, a **count** / **sum** / **average** of a property over the
-  matched blocks, and/or a **group-by** (page or property) that breaks the results
-  down into a per-group table. Sum/average parse the property numerically and report
-  how many rows were skipped. Rides in the DSL as `(aggregate count|sum|avg …)` /
-  `(group-by page|<prop>)`; the engine returns the full set and the math is computed
-  client-side. (Logseq does this only via Datalog `:result-transform`.)
+- **Summarize results** (beyond Logseq) — a query computes, with no code, a
+  **count** / **sum** / **average** of a property over the matched blocks, and/or a
+  **group-by** (page, property, or formula) that breaks the results down into a
+  per-group table. Sum/average parse the property numerically and report how many
+  rows were skipped. **Every** requested total is shown, in the order asked for and
+  including repeats — a query summarizing `count; cost=sum` shows both. A tags
+  group-by places a row in every tag's group, exactly as the board does, and says
+  so rather than pretending the counts partition the result. Rides in the DSL as
+  `(aggregate count|sum|avg …)` / `(group-by page|<prop>)`; the engine returns the
+  full set and the math is computed client-side. (Logseq does this only via Datalog
+  `:result-transform`.)
+- ⊕ **Inline Display panel for query blocks** (beyond Logseq) — one popover beside
+  the visual builder sets all six display facts of a query block: the view
+  (Search/List/Table/Board), the grouping field, the sort order, the visible
+  columns, the footer totals, and a row sample. Sort, columns and totals are
+  **ordered lists** with move/remove per entry, so a second sort or a second total
+  is editable rather than invisible, and settings the panel has no control for are
+  preserved untouched. Every change goes through the same save path as the builder,
+  so it is one undo step and one plain-text property write.
+- ⊕ **Query tables sort, reorder and total in place** — clicking a query table
+  header saves the sort into the note (ascending → descending → unsorted) whenever
+  the engine can express it; a column it cannot sort by server-side (title, state,
+  tags, a formula) still sorts the rows on screen and is labelled **Table-only
+  sort**, so "sorted" and "saved as sorted" are never confused. Dragging a header
+  saves the visible column order into `tine.columns::`, and a column footer cycles
+  count / sum / average into `tine.col-aggregates::`.
 - A scoped compatibility path for Logseq's **advanced (Datalog) queries**:
   recognized clauses (`task`, `between` with a field selector, `property`,
   `page-property`, `priority`, `page`, `namespace`, `page-tags`, `scheduled`,
@@ -288,7 +313,13 @@ coordinates, no lock-in.
   grouping field back to the card. A **Group by** dropdown above the columns (and
   a matching **Group by →** submenu in the board right-click menu) changes the
   grouping axis — State, Priority, Tags, or any field — without hand-editing
-  `tine.group-by::`.
+  `tine.group-by::`. On a **query** board the axis list is built from the fields
+  the result rows actually carry (plus the source page and the block's formulas),
+  and both surfaces write the query's own `tine.group-field::`, whose value is a
+  field name such as `prop:status` rather than a bare word that could mean two
+  things on two different views. Children-backed boards keep `tine.group-by::`
+  unchanged; an older query graph that uses it keeps working and is rewritten on
+  the first grouping change.
 - **Tag boards** — boards can group by tags too: a multi-tag card appears in
   each matching column, and moving it adds/removes the tag on that block.
 - **Formula group-by and fail-open filters** — boards can group on computed axes
@@ -715,5 +746,5 @@ within a column; merged cells are still v2+.
 <p align="center">
   <img src="img/dim.png" alt="Dim inactive blocks — spotlight the one you're working on" width="32%">
   <img src="img/carry.png" alt="Carry unfinished tasks forward to today" width="32%">
-  <img src="img/query.png" alt="Query results + the visual query builder chip bar" width="32%">
+  <img src="img/query.png" alt="Query results + the visual query builder: a resting sentence over a sheet of condition rows" width="32%">
 </p>

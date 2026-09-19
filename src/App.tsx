@@ -1,5 +1,6 @@
-import { Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { Match, Show, Suspense, Switch, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
+import { isPublishedExport } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
 import { QuickSwitcher } from "./components/QuickSwitcher";
@@ -13,10 +14,8 @@ import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
-import { AbsenceSweepCenter } from "./components/AbsenceSweepCenter";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
-import { ConflictBar } from "./components/ConflictBar";
 import { RightSidebar } from "./components/RightSidebar";
 // Settings pulls in the plugin/theme catalogues, backup controls, and every
 // settings tab. Most launches never open it, so keep that work out of the
@@ -37,6 +36,7 @@ import {
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
 import { PdfExportDialog } from "./components/PdfExportDialog";
+import { QueryExportDialog } from "./components/QueryExportDialog";
 import { StartupRecoveryLayer } from "./components/StartupRecovery";
 import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
@@ -78,7 +78,6 @@ import {
   bumpPageInventoryRev,
   installPaneTracker,
   isConflicted,
-  conflicts,
   pushToast,
   refreshSyncConflicts,
   refreshConflictQueueIfTouched,
@@ -107,7 +106,6 @@ import {
 } from "./store";
 import {
   applyDivergenceVerdict,
-  conflictObservationKindFor,
   graphBinding,
   isSaving,
   reconcileExternalChange,
@@ -115,7 +113,6 @@ import {
 } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import {
-  SparseShutdownRefusedError,
   backend,
   isTauri,
   type GraphChange,
@@ -139,6 +136,7 @@ import {
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initSettingsLayout } from "./settingsLayout";
+import { initQueryExportBudget } from "./queryExportBudget";
 import {
   conflictPolicyAlwaysAsk,
   holdExternalChange,
@@ -180,22 +178,18 @@ import {
 import { freshnessVisible } from "./freshnessBarrier";
 import { createAndroidRootCloseCoordinator, exitAndroidActivity, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
+import { openUnsavedRecovery, unsavedRecoveryPages } from "./unsavedRecovery";
+import { UnsavedRecovery } from "./components/UnsavedRecovery";
 import { drainPdfWork } from "./pdfOwnership";
 import { currentPdfOwnership } from "./pdfOwnership";
 import { hlsPageName } from "./pdf";
-import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import { createStartupRecoveryController } from "./startupRecovery";
-import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
-import type { SparseV2CancelResult } from "./types";
-import {
-  rebindAbsenceSweepScope,
-  ingestAbsenceSweepEvent,
-} from "./absenceSweeps";
+import { FailureBoundary } from "./components/FailureBoundary";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
-const safeClose = createSafeCloseCoordinator({
+export const safeClose = createSafeCloseCoordinator({
   blurActive() {
     const active = document.activeElement;
     if (active instanceof HTMLElement) active.blur();
@@ -205,12 +199,19 @@ const safeClose = createSafeCloseCoordinator({
   },
   flushPdfWork: drainPdfWork,
   flushAll,
-  confirmDiscard: (reason) => backend().confirm(
-    reason === "still-saving"
-      ? "Tine is still writing your changes and is taking longer than expected — a slow or network drive can do this.\n\nClosing now would lose whatever hasn't been written yet. Close anyway?"
-      : "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
-    "Unsaved changes",
-  ),
+  confirmDiscard: async (reason) => {
+    const pages = unsavedRecoveryPages();
+    const explanation = reason === "still-saving"
+      ? "Tine is still writing your changes and is taking longer than expected — a slow or network drive can do this.\n\nClosing now would lose whatever hasn't been written yet."
+      : "Tine has changes that could not be saved. Closing now can lose them.";
+    const inventory = pages.map((p) => `• ${p.name} — ${p.state}`).join("\n");
+    const discard = await backend().confirm(
+      `${explanation}\n\n${pages.length} affected pages:\n${inventory || "Pending attachments or storage work; no page draft identified."}\n\nChoose No to review, retry saving, or copy your drafts. Close anyway?`,
+      "Unsaved changes",
+    );
+    if (!discard) openUnsavedRecovery();
+    return discard;
+  },
   flushSession,
   setTransition: setGraphTransitioning,
   notifyPdfFailure: () => {
@@ -225,16 +226,9 @@ const safeClose = createSafeCloseCoordinator({
 });
 
 const androidRootClose = createAndroidRootCloseCoordinator(safeClose, {
-  prepareNativeClose: () => backend().prepareQuit(),
   finishActivity: exitAndroidActivity,
-  nativePrepareFailed: (failure) => pushToast(
-    failure.status === "refused" || failure.status === "partial"
-      ? "Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."
-      : "Couldn't close the app. Your graph remains open.",
-    "error",
-  ),
   finishActivityFailed: () => pushToast(
-    "Tine safely stopped managed storage but couldn't close the Android activity. Tap Back to retry closing.",
+    "Tine couldn't close the Android activity. Tap Back to retry closing.",
     "error",
   ),
 });
@@ -322,8 +316,6 @@ installReloadOnFocus();
 // at call time instead, which is why that gate needs no snapshot).
 const ALWAYS_ASK_DEMO =
   typeof location !== "undefined" && /[?&]alwaysask\b/.test(location.search);
-const ABSENCE_SWEEP_DEMO =
-  typeof location !== "undefined" && /[?&]absence-sweeps\b/.test(location.search);
 
 // Concord P5 policy toggle: "Reload from disk" on a held change re-enters the
 // ordinary external-change path with the policy bypassed for that one change, so
@@ -424,8 +416,8 @@ async function applyExternalChange(
     // written, not that it was written to anything other than what we already
     // hold: Tine's own save normally suppresses its echo, but a synced/polled
     // graph or a self-write-marker gap still surfaces one (see store.upsertPage).
-    // Require the same per-page divergence proof as the managed path — a false
-    // conflict here blocks every subsequent save of the very edit it warns about.
+    // Require a per-page divergence proof — a false conflict here blocks every
+    // subsequent save of the very edit it warns about.
     if (!isSaving(c.name)) {
       const current = await backend().getPage(c.name, c.kind);
       if (binding !== graphBinding()) return;
@@ -519,42 +511,6 @@ export async function handleGraphChangedBulk(bulk: GraphChangedBulk) {
     ? ` · ${conflicts} conflict${conflicts === 1 ? "" : "s"} to review`
     : "";
   pushToast(summary + conflictSuffix, "info");
-}
-
-export async function handleSparseV2Changed() {
-  const binding = graphBinding();
-  // Managed reconciliation reports one admitted aggregate epoch rather than
-  // legacy per-file changes. Refresh only live surfaces and invalidate the
-  // bounded inventory; unloaded pages remain demand-loaded from SQLite.
-  bumpDataRev();
-  bumpPageInventoryRev();
-  const routes = layoutPaneIds().map((paneId) => ({
-    paneId,
-    route: paneRouter(paneId).route(),
-  }));
-  const refreshed = new Set<string>();
-  for (const { route } of routes) {
-    if (route.kind !== "page" || refreshed.has(`${route.pageKind}:${route.name}`)) continue;
-    refreshed.add(`${route.pageKind}:${route.name}`);
-    const disposition = reloadDisposition(route.name);
-    if (disposition === "skip") continue;
-    // A save already in flight needs no notification: its own `base_rev` guard is
-    // the authority, and it decides against the exact bytes it is writing. Waking
-    // it with an aggregate epoch can only produce a verdict on staler evidence.
-    if (disposition === "conflict" && isSaving(route.name)) continue;
-    const dto = await backend().getPage(route.name, route.pageKind);
-    if (binding !== graphBinding()) return;
-    if (disposition === "conflict") {
-      // The page has an unsaved edit. Prove this page actually diverged before
-      // blocking its saves — the epoch alone says only that SOMETHING was
-      // admitted, which is usually our own write coming back — and lift an
-      // existing conflict when the proof comes back negative.
-      await applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
-      continue;
-    }
-    if (dto) await reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name), binding);
-  }
-  requestJournalFeedWatcherRestart(routes);
 }
 
 export function PaneTree(props: { node: LayoutNode; path: number[] }): JSX.Element {
@@ -669,7 +625,9 @@ function PaneRouteBody(props: {
           class={props.scrollerClass}
           identifyPane={props.identifyPane}
         >
-          <PaneContent router={props.router} />
+          <FailureBoundary region="This page">
+            <PaneContent router={props.router} />
+          </FailureBoundary>
         </PaneScroller>
       }
     >
@@ -746,81 +704,6 @@ function PaneScroller(props: {
       observer.disconnect();
     });
   });
-  onMount(() => {
-    if (isTauri() || !ABSENCE_SWEEP_DEMO) return;
-    ingestAbsenceSweepEvent({
-      sweep_id: "11111111-1111-4111-8111-111111111111",
-      tier: "tier3",
-      absence_count: 8,
-      pages_at_open: 64,
-      opened_at_unix_ms: 1_777_000_000_000,
-      closed_at_unix_ms: 1_777_000_060_000,
-      grace_deadline_unix_ms: 1_777_000_360_000,
-      disposed_at_unix_ms: null,
-      members: [
-        { page_id: "1", path: "pages/Project roadmap.md" },
-        { page_id: "2", path: "journals/2026_08_28.md" },
-        { page_id: "3", path: "pages/Meeting notes.md" },
-        { page_id: "4", path: "research/Reading queue.org" },
-        { page_id: "5", path: "pages/Release checklist.md" },
-        { page_id: "6", path: "journals/2026_08_27.md" },
-        { page_id: "7", path: "pages/Ideas.md" },
-        { page_id: "8", path: "pages/Archive index.md" },
-      ],
-      latest_action: null,
-    }, { announce: true });
-  });
-  // One generation-scoped listener carries durable absence-sweep snapshots to
-  // the global recovery surface. Rebinding clears the old graph's list; panel
-  // dismissal is intentionally unrelated to this lifecycle.
-  //
-  // Both inputs MUST be memos: a bare `() => snapshot().field` accessor inside
-  // `on(...)` retriggers on every snapshot replacement even when the field
-  // value is unchanged (Solid dedupes per signal, and the snapshot signal
-  // holds a fresh object each status event). Restore's own completion emits
-  // such events, so the unmemoized form re-fired here and — via the
-  // unconditional clear it used to call — closed the recovery panel at the
-  // exact moment a Restore finished. The clear itself is additionally scoped
-  // to real generation changes inside rebindAbsenceSweepScope.
-  const sweepScopeGeneration = createMemo(
-    () => managedStorageRuntime.snapshot().bindingGeneration,
-  );
-  const sweepScopeAuthority = createMemo(
-    () => managedStorageRuntime.snapshot().applicationPageAdmission?.authority,
-  );
-  createEffect(on(
-    [sweepScopeGeneration, sweepScopeAuthority],
-    ([bindingGeneration, authority]) => {
-      if (!isTauri() && ABSENCE_SWEEP_DEMO) return;
-      rebindAbsenceSweepScope(bindingGeneration);
-      if (bindingGeneration === null || authority !== "managed_writable") return;
-      let disposed = false;
-      let unlisten = () => {};
-      void (async () => {
-        try {
-          const stop = await backend().onAbsenceSweepChanged(
-            bindingGeneration,
-            (sweep) => ingestAbsenceSweepEvent(sweep, { announce: true }),
-          );
-          if (disposed) {
-            stop();
-            return;
-          }
-          unlisten = stop;
-        } catch {
-          // The current snapshot remains useful if native event registration
-          // is temporarily unavailable.
-        }
-        const sweeps = await backend().listAbsenceSweeps();
-        if (disposed) return;
-        for (const sweep of sweeps) ingestAbsenceSweepEvent(sweep, { announce: true });
-      })().catch(() => {});
-      onCleanup(() => {
-        disposed = true;
-        unlisten();
-      });
-    },
-  ));
 
   return (
     <main
@@ -985,18 +868,6 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
   return () => document.removeEventListener("click", onClick, true);
 }
 
-/** Install the native post-cancel route before publishing its status.  In
- * particular, Direct Files must never briefly appear as a synthetic
- * managed-unavailable binding during cold recovery. */
-export function acceptColdReturnManagedStorage(result: SparseV2CancelResult): void {
-  managedStorageRuntime.clear();
-  managedStorageRuntime.bind(
-    result.binding_generation,
-    result.status.application_page_admission,
-  );
-  managedStorageRuntime.receiveStatus(result.status);
-}
-
 export function App(): JSX.Element {
   let openCalendarJump = () => {};
   const topbarActions = {
@@ -1013,8 +884,6 @@ export function App(): JSX.Element {
     persistedGraphPath,
     openGraph: (path, supersedeCurrent) => loadGraphPath(path, { supersedeCurrent }),
     pickGraph: switchGraph,
-    coldReturn: (path) => backend().cancelSparseV2Cold(path),
-    acceptColdReturn: acceptColdReturnManagedStorage,
     copyText: writeClipboardTextResilient,
     notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
     completeFirstLoad: () => setFirstLoadDone(true),
@@ -1022,36 +891,6 @@ export function App(): JSX.Element {
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
   onMount(() => void initDebug());
-
-  // The sparse runtime can tick while Settings is closed. Subscribe once at the
-  // app boundary; the shared bridge carries the matching graph generation into
-  // both this feedback and the panel without component-owned duplicate listeners.
-  onMount(() => {
-    let disposed = false;
-    let unlisten = () => {};
-    void managedStorageRuntime.listen().then((stop) => {
-      if (disposed) stop();
-      else unlisten = stop;
-    });
-    onCleanup(() => {
-      disposed = true;
-      unlisten();
-    });
-  });
-  // One calm report per condition, not one per retry. The bridge advances the
-  // notice sequence only for a message the user has not already been shown, and
-  // clears it when the actor genuinely recovers, so a permanently blocked
-  // reconciliation says its piece once and leaves Storage & sync to carry the
-  // live status (GH: Android, 2026-08-18).
-  createEffect(on(
-    () => managedStorageRuntime.snapshot().notice,
-    (notice) => {
-      if (notice) {
-        pushToast(managedStorageRuntimeErrorMessage(notice.message), "error", { dedupe: true });
-      }
-    },
-    { defer: true },
-  ));
 
   // SafeBackPlugin is the single Android native Back owner. A drawer/transient
   // is never represented by synthetic history; route history remains the JS
@@ -1132,13 +971,12 @@ export function App(): JSX.Element {
       startupRecovery.start();
     };
     // Install both observation bridges before opening the graph. Native
-    // managed-open phases can begin synchronously with the graph-open command,
-    // while an image may render before the watcher has finished binding its
+    // open phases can begin synchronously with the graph-open command, while
+    // an image may render before the watcher has finished binding its
     // approved external-assets root. Starting after both listeners settle
     // prevents either early event from falling into a WebView subscription gap.
     void Promise.allSettled([
       backend().onStorageTransition((event) => {
-        storageTransitionRuntime.receive(event);
         startupRecovery.receiveTransition(event);
       }),
       backend().onAssetChanged((batch) => {
@@ -1193,6 +1031,7 @@ export function App(): JSX.Element {
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
   onMount(() => void initSettingsLayout());
+  onMount(() => void initQueryExportBudget());
   onMount(() => void initConflictPolicy());
   // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
   // always-ask policy on and hold one external change, so the bar is visible
@@ -1250,18 +1089,13 @@ export function App(): JSX.Element {
     onCleanup(() => unsub());
   });
   onMount(() => {
+    let disposed = false;
     let unsub = () => {};
-    void backend()
-      .onSparseV2Changed(() => void handleSparseV2Changed())
-      .then((u) => (unsub = u));
-    onCleanup(() => unsub());
-  });
-  onMount(() => {
-    let unsub = () => {};
-    void backend()
-      .onManagedSyncError(() => pushToast("Tine-managed storage stopped. Open Storage & sync to retry setup.", "error"))
-      .then((u) => (unsub = u));
-    onCleanup(() => unsub());
+    void backend().onQueryProjectionChanged(bumpDataRev).then((u) => {
+      if (disposed) u();
+      else unsub = u;
+    });
+    onCleanup(() => { disposed = true; unsub(); });
   });
   // A plain Markdown graph whose folder watch failed a reconcile cycle. Says
   // only what is known: Tine may miss outside changes until it recovers. It
@@ -1354,19 +1188,9 @@ export function App(): JSX.Element {
         try {
           await backend().closeGraphWindow();
           return;
-        } catch (error) {
-          if (error instanceof SparseShutdownRefusedError) {
-            allowClose = false;
-            safeClose.reset();
-            closeInProgress = false;
-            pushToast(
-              "Tine-managed storage could not verify a clean stop. The window remains open so you can retry or inspect recovery status.",
-              "error"
-            );
-            return;
-          }
-          // Non-sparse native window failures retain the established direct
-          // close fallback below.
+        } catch {
+          // Native window failures retain the established direct close
+          // fallback below.
         }
         try {
           await w.destroy();
@@ -1636,7 +1460,9 @@ export function App(): JSX.Element {
             <Show when={mobileDrawerMode()}>
               <button class="mobile-drawer-close" type="button" aria-label="Close navigation sidebar" onClick={() => dismissDrawerAndRestore("explicit")}>Close</button>
             </Show>
-            <Sidebar onActiveNavigationComplete={completeActiveLeftNavigation} />
+            <FailureBoundary region="The sidebar">
+              <Sidebar onActiveNavigationComplete={completeActiveLeftNavigation} />
+            </FailureBoundary>
           </div>
           <div
             class="sidebar-resizer"
@@ -1805,6 +1631,7 @@ export function App(): JSX.Element {
             />
             {/* Settings sits apart at the far right (separated by a divider) so
                 it reads as app-level config, not another content control. */}
+            <Show when={!isPublishedExport()}>
             <span class="topbar-sep" />
             <button class="icon-btn" title="Settings (t s)" onClick={() => openSettings()}>
               <svg viewBox="0 0 24 24" class="nav-icon" aria-hidden="true">
@@ -1814,6 +1641,7 @@ export function App(): JSX.Element {
                 />
               </svg>
             </button>
+            </Show>
             {/* Frameless-window controls live at the very right, where the native
                 title bar's buttons used to be. Hidden when the OS draws its own
                 (macOS Overlay always; Linux/Windows when the native-frame toggle
@@ -1824,12 +1652,7 @@ export function App(): JSX.Element {
             </Show>
           </div>
         </header>
-        {/* Direct Files conflicts are Concord objects rendered in-page. The old
-            global two-button surface remains only for actor-owned managed
-            conflicts until that protocol adopts the multi-side queue. */}
-        <Show when={conflicts().some((name) => conflictObservationKindFor(name) === "managed")}>
-          <ConflictBar />
-        </Show>
+        {/* Direct Files conflicts are Concord objects rendered in-page. */}
         <InPageFind />
         </DrawerBackground>
         {/* Everything below the topbar lives in this row, so the topbar (and its
@@ -1866,7 +1689,9 @@ export function App(): JSX.Element {
       </DrawerBackground>
       <PageProps />
       <ExportModal />
+      <UnsavedRecovery />
       <PdfExportDialog />
+      <QueryExportDialog />
       <Show when={settingsOpen()}>
         <Suspense>
           <Settings />
@@ -1887,7 +1712,6 @@ export function App(): JSX.Element {
         </div>
       </Show>
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
-        <AbsenceSweepCenter />
         <Toasts />
       </DrawerBackground>
       <Lightbox />

@@ -7,6 +7,6 @@ grow sequentially and are unaware of ours) never collide with them on a sync. Sa
 
 | # | Decision | Status |
 |---|----------|--------|
-| [0001](0001-query-formula-refinement.md) | Query filtering: coarse structural query (Rust, Logseq-parity) + optional `tine.query-filter::` formula refinement (frontend); Datalog retired-but-rendered | Accepted |
+| [0001](0001-query-formula-refinement.md) | Query filtering: coarse structural query (Rust, Logseq-parity) + optional `tine.query-filter::` formula refinement (frontend); Datalog retired-but-rendered | Retired at v0.6.984 |
 | [0002](0002-git-integration.md) | Optional Git integration via the system git (no bundling/credentials); commit only when disk is current, push never forces, pull is `--ff-only` and reloads through the watcher → conflict UI | Accepted |
 | [0003](0003-live-code-highlighting-overlay.md) | Live code highlighting while editing via a passive highlighted `<pre>` overlay behind the unchanged textarea (preserves ADR 0013); WYSIWYG, opt-out toggle, full highlight.js | Accepted |

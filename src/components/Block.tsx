@@ -1,6 +1,9 @@
+import { captureEditorScrollAnchor } from "../editor/scrollAnchor";
 import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
+import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
+import { graphBinding } from "../persistence";
 import { clearClipboardSlot, normalize, peekClipboardSlot, writeClipboardText } from "../clipboard";
 import {
   detectTrigger,
@@ -26,18 +29,17 @@ import { pluginManager } from "../plugins/manager";
 import { bindPluginBlockSnapshot, isPluginGraphOwnerCurrent } from "../plugins/ownership";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
-import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { failureShape } from "../failureShape";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
-import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../bulletThreading";
+import { BulletThread, threadClassList, threadStyle } from "./block/bulletThread";
+import { insertCalcBlock, latchCalcOnFence } from "./block/calcBlock";
 import {
   doc,
   pageByName,
   pageWritable,
   setRaw,
-  setBlockProperty,
   makeOwnNumberedList,
   removeOwnNumberedList,
   stopOwnNumberedListOnEmptyEnter,
@@ -53,14 +55,12 @@ import {
   nextVisibleOrExtend,
   beginPageHeaderEdit,
   finishPageHeaderEdit,
-  insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
   replaceTemplateTriggerWithOutline,
   insertOutlineChildren,
   pasteClipboardPayload,
   deleteBlock,
-  moveBlocksRelative,
   moveBlockFeed,
   moveItem,
   selectBlock,
@@ -68,7 +68,6 @@ import {
   extendSelectionTo,
   clearSelection,
   moveSelection,
-  selectedIds,
   isSelected,
   ensureBlockId,
   persistentBlockRef,
@@ -80,18 +79,14 @@ import {
   blockIsGridView,
   trackAssetWrite,
   formatForBlock,
+  BULK_INSERTION_UNAVAILABLE_TOAST,
   depthOf,
-  managedBulkOutlinePlan,
-  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
-  preflightManagedBulkInsertion,
-  consumeManagedBulkInsertionAdmission,
-  reportManagedBulkInsertionRefusal,
   setHeading,
   collapsibleDescendantIds,
   setCollapsedDescendants,
   blockExternalId,
   takeEditorLease,
-  type ManagedBulkInsertionPreflight,
+  type BulkInsertionPreflight,
   type OutlineScope,
 } from "../store";
 import { dispatchBulkInsertion } from "../storageDispatch";
@@ -137,7 +132,7 @@ import type { Format } from "../render/ast";
 import type { Node as StoreNode } from "../store";
 import { AstBody } from "../render/body";
 import { InlineText, CopyButton } from "../render/inline";
-import { clickBeyondRenderedEnd, editorOffsetFromRenderedRange } from "../render/spans";
+import { clickBeyondRenderedEnd, codeCardOffsetFromRange, editorOffsetFromRenderedRange } from "../render/spans";
 import {
   assetMarkdown,
   assetFileName,
@@ -148,7 +143,6 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
-import { dropSelection, setDragSelectionSuppressed } from "../dragSelectionGuard";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
@@ -166,17 +160,19 @@ import { cycleMarkerSmart, markerLabelClickable, toggleMarkerLabel, toggleTaskDo
 import { setMarker } from "../editor/marker";
 import { registerTransientLayer } from "../transientLayers";
 
-import { taskCheckboxState } from "../markers";
+import { leadingMarker, taskCheckboxState } from "../markers";
+import { noteQueryCompletionInteraction } from "../queryResultGrace";
 import { applyTemplateVars, prepareTemplateVars } from "../editor/templateVars";
 import {
   caretAtFirstRow,
   caretAtLastRow,
   caretColumnOnVisualRow,
   caretOffsetOnLastRow,
+  textareaCaretLeft,
   textareaCaretPoints,
 } from "../editor/caretRows";
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, type PropFormat } from "../editor/properties";
-import { queryMacroExtents } from "../editor/edn";
+import { QUERY_MACRO_SCAFFOLD } from "../editor/queryMacroName";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
@@ -204,102 +200,15 @@ import { blockBackgroundColor } from "../blockColors";
 import { blockDtoExternalId } from "../blockIdentity";
 import { SheetContainer } from "./SheetContainer";
 import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
+import { applySheetViewSlashAction } from "./block/sheetSlashAction";
+import { bodyContainsQueryMacro, detectMacro } from "./block/macroDetection";
+import { beginDrag, dragId, dragMoved, dropInd } from "./block/pointerDrag";
+import { DeferredStandaloneMacro } from "./DeferredStandaloneMacro";
 
-type SheetSlashView = "grid" | "table" | "board";
-
-export function applySheetViewSlashAction(id: string, view: SheetSlashView): string | null {
-  const node = doc.byId[id];
-  if (!node) return null;
-  let seededCellId: string | null = null;
-  withUndoUnit(`sheet:view:${view}`, [node.page], () => {
-    const shouldSeedGrid = view === "grid" && (doc.byId[id]?.children.length ?? 0) === 0;
-    setBlockProperty(id, "tine.view", view);
-    if (view === "board") setBlockProperty(id, "tine.group-by", "state");
-    if (shouldSeedGrid) {
-      const rowId = insertEmptyChildBlock(id, 0);
-      if (rowId) seededCellId = insertEmptyChildBlock(rowId, 0);
-    }
-  });
-  endEdit("select-block");
-  if (seededCellId) startEditing(seededCellId, 0);
-  return seededCellId;
-}
-
-// Detect a block whose entire body is a single {{query}} / {{embed}} macro.
-function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | null {
-  // The macro is the block's visible body — strip property lines (the shared line
-  // recognizer) so a `{{query}}\nid:: …` block still matches. Cheap: no parse.
-  const text = raw.split("\n").filter((l) => !isPropertyLine(l)).join("\n").trim();
-  const m = /^\{\{(query|embed)\b([\s\S]*)\}\}$/.exec(text);
-  if (!m) return null;
-  return { kind: m[1] as "query" | "embed", inner: `${m[1]}${m[2]}` };
-}
-
-// Any complete {{query …}} macro anywhere in the body. The shared scanner is
-// brace/string/page-ref aware and catches inline macros ("Tasks {{query …}}"),
-// not only macros occupying their own line.
-function bodyContainsQueryMacro(raw: string): boolean {
-  return queryMacroExtents(raw).length > 0;
-}
+export { applySheetViewSlashAction };
 
 // (Rendered-property hidden set lives in render/block.ts as RENDER_HIDDEN_PROPS /
 // isRenderHiddenProp, shared with body.tsx's renderProps.)
-
-// Pointer-based drag reorder (HTML5 DnD is unreliable in WebKitGTK).
-const [dragId, setDragId] = createSignal<string | null>(null);
-const [dropInd, setDropInd] = createSignal<{ id: string; position: BlockDropPosition } | null>(null);
-let dragMoved = false;
-
-function beginDrag(id: string, e: MouseEvent) {
-  const startX = e.clientX;
-  const startY = e.clientY;
-  let capturedIds: string[] | null = null;
-  dragMoved = false;
-  const onMove = (ev: MouseEvent) => {
-    if (!dragMoved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
-    if (!dragMoved) {
-      dragMoved = true;
-      const selected = selectedIds();
-      capturedIds = selected.length ? [...selected] : [id];
-      setDragId(id);
-      endEdit("drag-start");
-      // Moving a block is not a text gesture. WebKit otherwise runs its own
-      // selection drag from the bullet and paints every block the pointer
-      // crosses blue (GH #424, macOS; Chromium does not do this, which is why
-      // the same build looked clean on Windows).
-      setDragSelectionSuppressed(true);
-    }
-    // WebKit can re-anchor a selection mid-drag; the class alone is not enough.
-    dropSelection();
-    const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(
-      ".ls-block"
-    ) as HTMLElement | null;
-    const tid = el?.dataset.blockId;
-    if (tid) {
-      const main = el!.querySelector(".block-main")!.getBoundingClientRect();
-      setDropInd({
-        id: tid,
-        position: blockDropPosition(ev.clientX, ev.clientY, el!.getBoundingClientRect(), main),
-      });
-    } else {
-      setDropInd(null);
-    }
-  };
-  const onUp = () => {
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", onUp);
-    setDragSelectionSuppressed(false);
-    const ind = dropInd();
-    if (dragMoved && ind && doc.byId[ind.id]) {
-      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
-    }
-    setDragId(null);
-    setDropInd(null);
-    setTimeout(() => (dragMoved = false), 0);
-  };
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", onUp);
-}
 
 // Set ONLY by the quick-capture window (capture.tsx). Flows through the Block
 // tree to every Editor so the capture's submit/cancel gestures and Enter mode
@@ -408,26 +317,7 @@ function CollapseAllBorder(props: { id: string; readOnly: boolean }): JSX.Elemen
   );
 }
 
-// FORK: bullet-threading elbow geometry. GH #459 derives the bullet column from
-// --ls-block-line-height/--ls-block-content-pad-y and centres the bullet on the
-// first line, and typography presets retune the line-height token per
-// .page-section — so the elbow follows the same tokens instead of fixed
-// constants. Bullet centre y = pad + lh/2; the parent bullet sits one first-row
-// higher plus the fixed 3px inter-block gap (at the default 26px/2px tokens:
-// H-run at y=15, top at y=-18, matching the old measured path within 1px). Read
-// off the block itself so a scoped preset override is honoured; each elbow
-// re-measures on mount, which the active path does every time focus moves — a
-// theme switch mid-thread corrects itself on the next edit interaction.
-function threadElbowPath(host: Element): string {
-  const cs = getComputedStyle(host);
-  const lh = parseFloat(cs.getPropertyValue("--ls-block-line-height")) || 26;
-  const pad = parseFloat(cs.getPropertyValue("--ls-block-content-pad-y")) || 2;
-  const by = pad + lh / 2;
-  const gap = by + 3;
-  return `M -4 ${-gap} V ${by - 10} Q -4 ${by} 6 ${by} H 26`;
-}
-
-export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
+export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean; dragHostId?: string }): JSX.Element {
   // ONE store read per block for the node itself. Every derivation below reads
   // `node()` several times over, and each raw `doc.byId[id]` costs two Solid
   // store proxy traps (plus a wrap); on a 2000-block page that proxy `get` was
@@ -537,18 +427,6 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => !pageWritable(node().page);
-  // Bullet threading: this block's role in the active-path thread (elbow at a path
-  // node, or a spine segment on a preceding sibling). Reads threadRoles only while
-  // threading is on, so it stays zero-cost when the feature is off. The per-depth
-  // rainbow colour is handed to CSS via an inline --thread-color.
-  const threadRole = () => (threadingEnabled() ? threadRoles().get(props.id) : undefined);
-  const threadColor = () => {
-    const r = threadRole();
-    if (!r) return undefined;
-    // Accent mode: leave --thread-color unset so the CSS falls back to var(--accent).
-    if (threadColorMode() === "accent") return undefined;
-    return THREAD_PALETTE[(r.elbow ?? r.spine ?? 0) % THREAD_PALETTE.length];
-  };
   // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
   // outline. Showing both this storage block's controls and the referenced root's
   // controls produces two consecutive bullets. Keep the referenced root controls
@@ -567,44 +445,13 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
       class="ls-block"
       classList={{
         ...rowClassList(collapsed(), blockEmbedHost(), threadLineDecoration()),
-        // FORK: bullet threading draws its own SVG elbow/spine. `rowClassList`
-        // above carries upstream's plugin-thread-lines decoration path, which is
-        // active only when an actual plugin declares it — so these never both apply.
-        "thread-elbow": threadRole()?.elbow !== undefined,
-        "thread-spine": threadRole()?.spine !== undefined,
+        ...threadClassList(props.id), // FORK: bullet threading
       }}
-      style={threadColor() ? { "--thread-color": threadColor()! } : undefined}
+      style={threadStyle(props.id)}
       data-block-id={props.id}
       data-block-ref={blockExternalId(props.id) ?? props.id}
     >
-      {/* Bullet-threading stroke (opt-in). An SVG child of the relative .ls-block, so
-          it reflows + scrolls locked to the block. Elbow = a path curving into this
-          bullet; spine = a straight line clipped to the block height (see app.css).
-          The elbow's path is re-derived from the bullet-column tokens on mount
-          (threadElbowPath); the fallback `d` is the default-token geometry. */}
-      <Show when={threadingEnabled() && threadRole()}>
-        <Show
-          when={threadRole()?.elbow !== undefined}
-          fallback={
-            <svg class="thread-svg thread-spine-svg" aria-hidden="true">
-              <line x1="8" y1="0" x2="8" y2="9999" />
-            </svg>
-          }
-        >
-          <svg
-            class="thread-svg thread-elbow-svg"
-            aria-hidden="true"
-            ref={(el) =>
-              queueMicrotask(() => {
-                const host = el.closest(".ls-block");
-                if (host) el.querySelector("path")?.setAttribute("d", threadElbowPath(host));
-              })
-            }
-          >
-            <path d="M -4 -18 V 5 Q -4 15 6 15 H 26" />
-          </svg>
-        </Show>
-      </Show>
+      <BulletThread id={props.id} />
       <div
         class="block-main"
         classList={{
@@ -655,7 +502,13 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
               // PRIMARY-paste that these destinations replace. The bullet ran
               // its own onMouseDown and skipped it.
               internalLinkMouseDown(e);
-              if (e.button === 0 && !readOnly()) beginDrag(props.id, e);
+              // A transparent whole-block embed has only this root bullet. Its
+              // drag moves the occurrence; click/zoom still belongs to source.
+              // Inline/page embeds retain their ordinary source drag semantics.
+              const host = e.currentTarget.closest<HTMLElement>(".block-embed-host");
+              const dragOwner = props.dragHostId && host?.dataset.blockId === props.dragHostId
+                ? props.dragHostId : props.id;
+              if (e.button === 0 && pageWritable(doc.byId[dragOwner].page)) beginDrag(dragOwner, e);
             }}
             onClick={(e) => {
               e.stopPropagation();
@@ -849,7 +702,13 @@ function beginEditGesture(
     if (over === g.blockId) {
       const active = document.activeElement;
       if (active instanceof HTMLTextAreaElement && active.classList.contains("block-editor")) {
-        if (g.caretPoints === undefined) g.caretPoints = textareaCaretPoints(active);
+        if (g.caretPoints === undefined) {
+          // Edit entry maps raw source offsets into the actual textarea (code
+          // wrappers, for example, are hidden). Continue from that native
+          // anchor rather than mixing raw-block and editor coordinates.
+          g.offset = active.selectionStart;
+          g.caretPoints = textareaCaretPoints(active);
+        }
         const points = g.caretPoints;
         if (points?.length) {
           const rect = active.getBoundingClientRect();
@@ -952,6 +811,29 @@ function Rendered(props: {
   const editableEnd = (): number => splitProps(node().raw, isBuiltinHidden, pageFormat()).visible.length;
   const clickOffset = (e: MouseEvent): number | null => {
     if (!contentRef) return null;
+    const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
+    // A whole-block code card is answered first and on its own terms. It is
+    // highlight.js markup with no span data, so the general mapper below always
+    // declined and the caret went to the end of the block — hundreds of lines
+    // from the click in a large block, and, when a long line sits near the end,
+    // scrolled to that line's far right in the no-wrap editor, which is what
+    // makes a clicked code block look blank (GH #489). The past-the-end rule
+    // must not run for it either: a click right of a SHORT line inside a tall
+    // card means that line's end, not the end of the whole block.
+    //
+    // Offsets leave here in the block's own (visible-raw) coordinates, like
+    // every other numeric caret target; `focusNow` maps them through the
+    // wrapper for the body-only code editor.
+    const codeProjection = codeBodyProjection(
+      splitProps(node().raw, isBuiltinHidden, pageFormat()).visible,
+      pageFormat(),
+    );
+    if (codeProjection) {
+      const codeRange = d.caretRangeFromPoint?.(e.clientX, e.clientY);
+      const offset = codeRange ? codeCardOffsetFromRange(contentRef, codeRange) : null;
+      if (offset === null) return null;
+      return codeProjection.open.length + Math.min(offset, codeProjection.body.length);
+    }
     // GH #465: a click in the empty run-out past the last glyph means "the end",
     // whatever the block ends with. Answered from the click's position before
     // consulting the span map, because a trailing construct with an invisible
@@ -959,7 +841,6 @@ function Rendered(props: {
     // interior offset just before the delimiter, so nothing downstream can tell
     // it apart from a deliberate click there.
     if (clickBeyondRenderedEnd(contentRef, e.clientX, e.clientY)) return editableEnd();
-    const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
     const range = d.caretRangeFromPoint?.(e.clientX, e.clientY);
     if (!range) return null;
     return editorOffsetFromRenderedRange(contentRef, range, node().raw, isBuiltinHidden, pageFormat());
@@ -1010,6 +891,7 @@ function Rendered(props: {
       when={!macro()}
       fallback={
         <div class="block-content macro-host" onMouseDown={onMouseDown}>
+          <DeferredStandaloneMacro blockId={props.id} raw={node().raw}>
           <Switch>
             <Match when={macro()!.kind === "query"}>
               <QueryMacro body={macro()!.inner} blockId={props.id} />
@@ -1018,6 +900,7 @@ function Rendered(props: {
               <EmbedMacro body={macro()!.inner} blockId={props.id} />
             </Match>
           </Switch>
+          </DeferredStandaloneMacro>
         </div>
       }
     >
@@ -1130,24 +1013,35 @@ function Rendered(props: {
 // Marker-label clicks follow OG's separate two-state toggle. Keyboard marker
 // cycling remains cycleMarkerSmart and may still reach DONE / no marker.
 function toggleBlockMarkerLabel(id: string) {
-  const raw = toggleMarkerLabel(doc.byId[id].raw, {
+  const before = doc.byId[id].raw;
+  const raw = toggleMarkerLabel(before, {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
   if (raw === null) return;
   setRaw(id, raw, { timetracking: false });
+  noteCompletionBoundaryChange(id, before, raw);
 }
 
 // Toggle the task checkbox (OG check/uncheck): open → DONE (rolling a repeater
 // forward instead), DONE → the workflow's open marker. Used by the block checkbox.
 function toggleBlockCheckbox(id: string) {
-  const raw = toggleTaskDone(doc.byId[id].raw, workflow(), {
+  const before = doc.byId[id].raw;
+  const raw = toggleTaskDone(before, workflow(), {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
-  if (raw !== null) setRaw(id, raw, { timetracking: false });
+  if (raw === null) return;
+  setRaw(id, raw, { timetracking: false });
+  noteCompletionBoundaryChange(id, before, raw);
+}
+
+function noteCompletionBoundaryChange(id: string, before: string, after: string): void {
+  if (taskCheckboxState(leadingMarker(before)) !== taskCheckboxState(leadingMarker(after))) {
+    noteQueryCompletionInteraction(id);
+  }
 }
 
 function formatForBlockId(id: string): "md" | "org" {
@@ -1315,6 +1209,8 @@ export function Editor(props: { id: string }): JSX.Element {
     surfaceKey.startsWith("ref:") || surfaceKey.startsWith("embed:") ? surfaceKey : null;
   const structuralSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
+  let pendingScrollAnchor: ReturnType<typeof captureEditorScrollAnchor> | undefined;
+  onCleanup(() => pendingScrollAnchor?.cancel());
   let pluginSlashInvocation = 0;
   let editorMounted = true;
   onCleanup(() => {
@@ -1368,20 +1264,11 @@ export function Editor(props: { id: string }): JSX.Element {
   // you exit.
   // A ```calc block edits like OG: the textarea shows ONLY the fence-stripped
   // expressions (calcLive), with a line-number gutter + live results beside it,
-  // and the fence is re-added on commit. Calc mode LATCHES: it's true if the block
-  // was a ```calc fence at editor mount, or BECOMES one during the session (typing
-  // the fence, or the /Calculator slash insert), and never flips back to false.
-  // Latching (rather than re-deriving live) means an exit commit still re-fences
-  // even if the committed raw is momentarily malformed, AND a block that turns into
-  // calc mid-edit activates its live results immediately instead of only after a
-  // blur + re-enter (GH: calc block "not activated" on first create).
+  // and the fence is re-added on commit. Calc mode is captured at editor mount,
+  // not re-derived from the latest committed raw, so an exit commit can still
+  // preserve the fence even if the committed raw is temporarily malformed.
   const [editingCalc, setEditingCalc] = createSignal(calcSource(editorValue()) !== null);
-  // Latch on: a settled calc fence (has a newline after the opener, so a half-typed
-  // "```calc" toward some other word — e.g. "```calcite" — never trips it).
-  createEffect(() => {
-    const v = editorValue();
-    if (calcSource(v) !== null && v.includes("\n")) setEditingCalc(true);
-  });
+  latchCalcOnFence(editorValue, setEditingCalc); // FORK: also latch on mid-session
   const calcLive = createMemo(() => {
     if (!editingCalc()) return null;
     return calcSource(editorValue()) ?? editorValue();
@@ -1412,31 +1299,25 @@ export function Editor(props: { id: string }): JSX.Element {
     // dirty or push undo — avoids churn and can't rewrite the block's bytes.
     if (next === node().raw) return;
     const setRawOpts = opts && "timetracking" in opts ? { timetracking: opts.timetracking } : undefined;
+    // Capture at most once for the existing autosize frame, before live mirrors
+    // above us react to setRaw. No document-wide occurrence scan is needed.
+    if (pendingScrollAnchor === undefined) {
+      pendingScrollAnchor = ref && document.activeElement === ref
+        ? captureEditorScrollAnchor(ref, nearestScrollableY(ref)) : null;
+    }
+    autosize();
     setRaw(props.id, next, setRawOpts);
   };
 
-  const admitBulkOutlineInsertion = (
-    nodes: readonly OutlineNode[],
-    reusedHost: boolean,
-  ) => {
-    const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+  const admitBulkOutlineInsertion = () => {
+    const admission = dispatchBulkInsertion<BulkInsertionPreflight>(
       { targetId: props.id },
       {
         direct: () => ({ kind: "direct" }),
-        unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
-        managed: (managedAdmission) => preflightManagedBulkInsertion(
-          managedAdmission,
-          props.id,
-          (limits) => managedBulkOutlinePlan(
-            nodes,
-            depthOf(props.id) + 1,
-            reusedHost ? 1 : 0,
-            limits,
-          ),
-        ),
+        unavailable: () => ({ kind: "refused", toast: BULK_INSERTION_UNAVAILABLE_TOAST }),
       },
     );
-    if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+    if (admission.kind === "refused") pushToast(admission.toast, "error");
     return admission;
   };
 
@@ -1457,6 +1338,21 @@ export function Editor(props: { id: string }): JSX.Element {
 
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
+  const [blockSearchPending, setBlockSearchPending] = createSignal<string | null>(null);
+  const [blockSearchError, setBlockSearchError] = createSignal<string | null>(null);
+  let blockSearchRequest = 0;
+  let blockSearchController: AbortController | undefined;
+  const cancelBlockSearch = () => {
+    ++blockSearchRequest;
+    blockSearchController?.abort();
+    setBlockSearchPending(null);
+    setBlockSearchError(null);
+  };
+  createEffect(() => {
+    graphBinding();
+    cancelBlockSearch();
+    onCleanup(() => { ++blockSearchRequest; blockSearchController?.abort(); });
+  });
   const [acIndex, setAcIndex] = createSignal(0);
   // GH #412/#413: inside a COMPLETE whole-block code wrapper the editor shows
   // only the payload between the wrapper lines (fences stay out of the editing
@@ -1476,6 +1372,26 @@ export function Editor(props: { id: string }): JSX.Element {
   const codeWrapCommit = (text: string): string | null => {
     const p = codeShown();
     return p ? codeBodyJoin(p, text) : null;
+  };
+  // One door to the fence language picker: `/Code block` and the hand-typed
+  // ``` scaffold both come here (GH #507). While it is open `codeShown` keeps
+  // the raw view, so the opener line the language goes on stays visible;
+  // choosing a language — or Escape — then drops into the body-only code view.
+  const openFenceLanguagePicker = (raw: string, fenceEnd: number) => {
+    setAc({ kind: "code-language", query: "", start: fenceEnd, end: fenceEnd });
+    setAcIndex(0);
+    setAcItems(codeLanguageItems("").map((language) => ({
+      label: language.label,
+      sub: [language.id, ...language.aliases].join(" · "),
+      insert: language.id,
+      caret: language.id.length + 1,
+    })));
+    queueMicrotask(() => {
+      ref.value = raw;
+      ref.setSelectionRange(fenceEnd, fenceEnd);
+      ref.focus();
+      autosize();
+    });
   };
   const [propertyValueKey, setPropertyValueKey] = createSignal<string | null>(null);
   let propertyFacets: [string, string[]][] = [];
@@ -1500,7 +1416,7 @@ export function Editor(props: { id: string }): JSX.Element {
     }
   };
   createEffect(() => {
-    if (ac() && acItems().length > 0) updateAcRect(); // re-anchor on open / each keystroke
+    if (ac() && (acItems().length > 0 || blockSearchPending() || blockSearchError())) updateAcRect(); // re-anchor on open / each keystroke
   });
   // Flip the popup above the line when there isn't room below (near the viewport
   // bottom), so it stays fully visible — matches OG's caret-aware placement.
@@ -1525,6 +1441,7 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   const closeAc = () => {
+    cancelBlockSearch();
     setAc(null);
     setAcItems([]);
     setAcIndex(0);
@@ -1560,7 +1477,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // Page/block/tag/command/code completion is a real transient above its editor
   // and, on mobile, above the drawer. One Escape peels only this popup.
   createEffect(() => {
-    if (!ac() || !acItems().length) return;
+    if (!ac() || (!acItems().length && !blockSearchPending() && !blockSearchError())) return;
     const unregister = registerTransientLayer({
       id: autocompleteLayerId,
       root: () => acListRef ?? null,
@@ -1571,6 +1488,7 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   const updateAutocomplete = async () => {
+    cancelBlockSearch();
     const t = detectEditorTrigger();
     if (!t) {
       closeAc();
@@ -1680,9 +1598,25 @@ export function Editor(props: { id: string }): JSX.Element {
       // `((` → full-text search for a block to reference, grouped by page. An
       // empty query (bare `((`) returns nothing — the popup stays hidden until
       // the user types. Selecting inserts the target's durable external ID (see selectAc).
-      const groups = await backend().search(t.query, 20, "block-picker");
-      const cur = ac();
-      if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
+      const mine = blockSearchRequest;
+      const binding = graphBinding();
+      const controller = new AbortController();
+      blockSearchController = controller;
+      const isCurrent = () => mine === blockSearchRequest && !controller.signal.aborted && graphBinding() === binding && ac() === t;
+      setAcItems([]);
+      setBlockSearchPending("Searching…");
+      let groups;
+      try {
+        groups = await runQueryWhenReady(() => backend().search(t.query, 20, "block-picker"), {
+          signal: controller.signal,
+          isCurrent,
+          onPending: (error) => setBlockSearchPending(searchIndexPendingMessage(error)),
+        });
+      } catch (error) {
+        if (isCurrent()) setBlockSearchError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (!isCurrent()) return;
       const items: AcItem[] = [];
       for (const g of groups) {
         for (const b of g.blocks) {
@@ -1746,6 +1680,16 @@ export function Editor(props: { id: string }): JSX.Element {
     setHasSel(selected);
     if (!selected) setSelectionOverflowOpen(false);
   };
+  onMount(() => {
+    const owner = ref.ownerDocument;
+    const syncNativeSelection = () => {
+      if (owner.activeElement === ref) updateSel();
+    };
+    // Native selection may notify the document or textarea without select or
+    // mouseup. Capture both, but only update the editor that owns focus.
+    owner.addEventListener("selectionchange", syncNativeSelection, true);
+    onCleanup(() => owner.removeEventListener("selectionchange", syncNativeSelection, true));
+  });
   createEffect(() => {
     if (!selectionOverflowOpen() || !hasSel()) return;
     const unregister = registerTransientLayer({
@@ -1858,6 +1802,7 @@ export function Editor(props: { id: string }): JSX.Element {
     && editingId() === token.editingBlockId;
   const reportStaleAsset = () =>
     pushToast("The asset was saved, but it was not inserted because the graph or block changed.", "info");
+  let nativeAssetPickerPending = false;
 
   const insertAssetBytes = async (
     token: AssetEditorToken,
@@ -2073,11 +2018,14 @@ export function Editor(props: { id: string }): JSX.Element {
     const editorToken = captureAssetEditorToken();
     if (!editorToken) return;
     let res;
+    nativeAssetPickerPending = true;
     try {
       res = await backend().capturePhoto();
     } catch (err) {
       pushToast(`Couldn’t capture a photo (${String(err)})`, "error");
       return;
+    } finally {
+      nativeAssetPickerPending = false;
     }
     if (res.status === "ok" && res.path) {
       const candidate = captureAssetFileName(res.ext || "jpg");
@@ -2343,9 +2291,8 @@ export function Editor(props: { id: string }): JSX.Element {
       const nodes = item.templateNodes.map((n) => templateToOutline(n, doc.byId[props.id]?.page));
       const wasEmpty =
         r.raw.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("template-insert", [doc.byId[props.id].page], () => {
         if (wasEmpty) return replaceTemplateTriggerWithOutline(props.id, nodes);
         commit(r.raw);
@@ -2356,22 +2303,8 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     switch (item.action) {
-      case "calc-block": {
-        // Insert an empty ```calc fence and commit it — that flips the editor into
-        // calc mode (editingCalc latches true), so the gutter + live results appear
-        // at once. We DON'T set ref.value here (unlike replaceTrigger): the reactive
-        // value binding now owns the textarea as the fence-stripped expression buffer
-        // (empty), so we only drop the caret onto that line.
-        const r = applyCompletion(ref.value, t.start, t.end, "```calc\n\n```");
-        commit(r.raw);
-        closeAc();
-        queueMicrotask(() => {
-          ref.focus();
-          ref.setSelectionRange(0, 0);
-          autosize();
-        });
-        return;
-      }
+      // FORK: /Calculator inserts a live calc fence.
+      case "calc-block": return insertCalcBlock(ref, t.start, t.end, commit, closeAc, autosize);
       case "task-marker": {
         if (!item.taskMarker) return;
         // OG clears the slash query, sets/replaces the leading task marker, and
@@ -2455,8 +2388,9 @@ export function Editor(props: { id: string }): JSX.Element {
       case "query-builder": {
         // Insert an empty query, commit it, and drop straight to the rendered
         // view so the visual builder appears — then flag this block so the
-        // builder opens its add-filter picker on mount.
-        const r = applyCompletion(ref.value, t.start, t.end, "{{query }}");
+        // builder opens its SHEET with the field chooser focused on mount
+        // (SPEC §7.3; `/query` is one command).
+        const r = applyCompletion(ref.value, t.start, t.end, QUERY_MACRO_SCAFFOLD);
         commit(r.raw);
         closeAc();
         setQueryBuilderAutoOpen(props.id);
@@ -2464,31 +2398,11 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       case "code-block": {
-        // Keep the familiar complete fence scaffold, but open the language
-        // picker immediately even though an empty hand-typed fence stays quiet.
-        const scaffold = "```\n\n```";
-        const result = applyCompletion(ref.value, t.start, t.end, scaffold, 3);
-        const languageTrigger: Trigger = {
-          kind: "code-language",
-          query: "",
-          start: t.start + 3,
-          end: t.start + 3,
-        };
+        // The familiar complete fence scaffold, with the language picker open on
+        // its opener line — the same door the hand-typed ``` scaffold uses.
+        const result = applyCompletion(ref.value, t.start, t.end, "```\n\n```", 3);
         commit(result.raw);
-        setAc(languageTrigger);
-        setAcIndex(0);
-        setAcItems(codeLanguageItems("").map((language) => ({
-          label: language.label,
-          sub: [language.id, ...language.aliases].join(" · "),
-          insert: language.id,
-          caret: language.id.length + 1,
-        })));
-        queueMicrotask(() => {
-          ref.value = result.raw;
-          ref.setSelectionRange(result.caret, result.caret);
-          ref.focus();
-          autosize();
-        });
+        openFenceLanguagePicker(result.raw, result.caret);
         return;
       }
       case "page-props": {
@@ -2595,7 +2509,26 @@ export function Editor(props: { id: string }): JSX.Element {
     autosizeRaf = requestAnimationFrame(() => {
       autosizeRaf = undefined;
       resizeNow();
+      pendingScrollAnchor?.restore();
+      pendingScrollAnchor = undefined;
     });
+  };
+
+  // A `wrap="off"` editor (a code card) mounts with its whole value assigned,
+  // which parks the browser's selection at the very end; focusing then reveals
+  // that end and leaves the box scrolled to the right of the longest line, and
+  // the setSelectionRange that follows does not scroll back. On a code block
+  // containing one long line, clicking anywhere opened an editor showing blank
+  // space hundreds of columns past the code (GH #489). Put the horizontal view
+  // where the caret actually is. Costs one mirror measure, and only for an
+  // editor that can scroll horizontally at all — never for ordinary blocks.
+  const revealCaretColumn = (offset: number) => {
+    if (!ref || ref.scrollWidth <= ref.clientWidth) return;
+    const x = textareaCaretLeft(ref, offset);
+    if (x === null) return;
+    const margin = 24;
+    if (x < ref.scrollLeft + margin) ref.scrollLeft = Math.max(0, x - margin);
+    else if (x > ref.scrollLeft + ref.clientWidth - margin) ref.scrollLeft = x - ref.clientWidth + margin;
   };
 
   const focusNow = () => {
@@ -2607,6 +2540,12 @@ export function Editor(props: { id: string }): JSX.Element {
       const end = Math.min(historySelection.end, v.length);
       const start = Math.min(historySelection.start, end);
       ref.setSelectionRange(start, end);
+      revealCaretColumn(start);
+      return;
+    }
+    if (want !== null && typeof want === "object" && "start" in want) {
+      ref.setSelectionRange(want.start, want.end, want.direction);
+      revealCaretColumn(want.direction === "backward" ? want.start : want.end);
       return;
     }
     let offset: number;
@@ -2638,6 +2577,7 @@ export function Editor(props: { id: string }): JSX.Element {
     }
     const o = Math.min(offset, v.length);
     ref.setSelectionRange(o, o);
+    revealCaretColumn(o);
   };
   onMount(() => {
     const unregisterHistoryTarget = registerHistoryEditorTarget({
@@ -2645,6 +2585,7 @@ export function Editor(props: { id: string }): JSX.Element {
       owner: editingOwner(),
       surface: surfaceKey,
       selection: () => ({ start: ref.selectionStart, end: ref.selectionEnd }),
+      viewport: () => ({ editor: ref, scroller: nearestScrollableY(ref) }),
       focused: () => typeof document !== "undefined" && document.activeElement === ref,
     });
     onCleanup(unregisterHistoryTarget);
@@ -2799,8 +2740,10 @@ export function Editor(props: { id: string }): JSX.Element {
       // matching closing fence and land the caret between them. This wins over
       // the generic symmetric-backtick pairing below (which stacked a fourth
       // backtick and never added the closer). Whole-buffer only: a `` ` `` run
-      // inside prose keeps the ordinary inline behavior. With the scaffold
-      // committed, the editor is in the body-only code view below.
+      // inside prose keeps the ordinary inline behavior. The scaffold then
+      // offers the language picker on its still-visible opener line (GH #507):
+      // the body-only code view below hides that line, so landing in it at once
+      // left no way to set a language at all.
       if (
         !handled && ch === "`" && pageFmt() === "md" &&
         !isCalc() && codeShown() === null &&
@@ -2809,14 +2752,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const scaffold = "```\n\n```";
         ref.value = scaffold;
         commit(scaffold);
-        queueMicrotask(() => {
-          const body = codeShown()?.body;
-          if (body !== undefined) ref.value = body;
-          ref.setSelectionRange(0, 0);
-          ref.focus();
-          autosize();
-          refreshAutocompleteAfterInput();
-        });
+        openFenceLanguagePicker(scaffold, 3);
         return;
       }
       if (!handled && autoPairing()) {
@@ -2877,20 +2813,29 @@ export function Editor(props: { id: string }): JSX.Element {
   // reorder briefly blurs the textarea; cross-day it remounts).
   const moveBlockCmd = (e: KeyboardEvent, dir: 1 | -1): boolean => {
     e.preventDefault();
-    const start = ref.selectionStart;
+    const movedEditor = ref;
+    const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+    const restoreMovedEditor = () => {
+      if (ref !== movedEditor || !movedEditor.isConnected || editingId() !== props.id) return;
+      if (document.activeElement !== movedEditor && document.activeElement !== document.body) return;
+      movedEditor.focus();
+      movedEditor.setSelectionRange(
+        Math.min(selection.start, movedEditor.value.length),
+        Math.min(selection.end, movedEditor.value.length), selection.direction,
+      );
+    };
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
-    startEditing(props.id, start, null, structuralSurface());
+    startEditing(props.id, selection, null, structuralSurface());
     const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
+    // Synchronous sibling reorders retain the same textarea. Restore it in this
+    // gesture: waiting a frame lets Android dismiss the IME despite later focus.
+    restoreMovedEditor();
     void move.then(() => {
       requestAnimationFrame(() => {
-        if (ref.isConnected) {
-          ref.focus();
-          const o = Math.min(start, ref.value.length);
-          ref.setSelectionRange(o, o);
-        }
+        if (document.activeElement !== movedEditor) restoreMovedEditor();
         setBlockMoving(false);
       });
     });
@@ -2922,8 +2867,10 @@ export function Editor(props: { id: string }): JSX.Element {
   };
   const cycleTodoCmd = () => {
     const start = ref.selectionStart;
+    const before = ref.value;
     const { raw: newRaw, delta } = cycleMarkerSmart(ref.value, workflow());
     commit(newRaw);
+    noteCompletionBoundaryChange(props.id, before, newRaw);
     const pos = Math.max(0, start + delta);
     queueMicrotask(() => {
       ref.value = newRaw;
@@ -3027,14 +2974,16 @@ export function Editor(props: { id: string }): JSX.Element {
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
       if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
-      commit(ref.value); indentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
+      const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+      commit(ref.value); indentBlock(props.id, selection, structuralSurface()); return true;
     },
     "editor/outdent": (e) => {
       e.preventDefault();
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll && ll.indent.length > 0) { nudgeListItem(ll, -2); return true; }
       if (outlineScope?.forceExpandedRoot === doc.byId[props.id]?.parent) return true;
-      commit(ref.value); outdentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
+      const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+      commit(ref.value); outdentBlock(props.id, selection, structuralSurface()); return true;
     },
   };
   const mobileKeyEvent = { preventDefault() {} } as KeyboardEvent;
@@ -3684,6 +3633,17 @@ export function Editor(props: { id: string }): JSX.Element {
       savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
       return;
     }
+    // Android can blur the WebView editor before document.hasFocus() reflects
+    // that the external camera/file-picker activity covered the app. This is
+    // still the same edit transaction: keep its identity and caret until the
+    // picker returns, so a successfully imported asset can be inserted into
+    // the initiating block (GH #493). Graph/block changes remain guarded by
+    // assetEditorIsCurrent after the native await.
+    if (nativeAssetPickerPending) {
+      commit(ref.value);
+      savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
+      return;
+    }
     // The whole window lost focus (switched to another app/window): stay in edit
     // mode and remember the caret so onWindowFocus can resume exactly here. Commit
     // as-is — we're still editing, not exiting.
@@ -3806,9 +3766,8 @@ export function Editor(props: { id: string }): JSX.Element {
     if (htmlNodes) {
       e.preventDefault();
       const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(htmlNodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("structured-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
@@ -3837,9 +3796,8 @@ export function Editor(props: { id: string }): JSX.Element {
       if (!nodes.length) return;
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("outline-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
@@ -4014,12 +3972,14 @@ export function Editor(props: { id: string }): JSX.Element {
           </Show>
         </div>
       </Show>
-      <Show when={ac() && acItems().length > 0 && acRect()}>
+      <Show when={ac() && (acItems().length > 0 || blockSearchPending() || blockSearchError()) && acRect()}>
         {/* Portaled to <body> + position:fixed so the right sidebar's overflow
             (or any clipping ancestor) can't cut the dropdown off.
             data-lenis-prevent: with smooth scrolling on, scroll it natively. */}
         <Portal>
           <div class="autocomplete" ref={acListRef} data-lenis-prevent style={acStyle()}>
+            <Show when={blockSearchPending()}><div role="status">{blockSearchPending()}</div></Show>
+            <Show when={blockSearchError()}><div role="alert">{blockSearchError()} <button onMouseDown={(event) => event.preventDefault()} onClick={() => void updateAutocomplete()}>Retry search</button></div></Show>
             <For each={acItems()}>
               {(item, i) => (
                 <div

@@ -14,6 +14,22 @@ import {
 } from "../graphVerification";
 import { platformKind } from "../platform";
 import { pushToast } from "../ui";
+import { ImproveTab } from "./ImproveTab";
+
+export const DIAGNOSTIC_PREVIEW_LIMIT = 64 * 1024;
+const DIAGNOSTIC_PREVIEW_TAIL = 8 * 1024;
+
+/**
+ * Keep the selectable WebView control small enough to remain responsive on
+ * Windows. Copy and Save still use DiagnosticReport.text, so shortening this
+ * on-screen review never shortens the exported evidence.
+ */
+export function diagnosticReportPreview(text: string): string {
+  if (text.length <= DIAGNOSTIC_PREVIEW_LIMIT) return text;
+  const headLength = DIAGNOSTIC_PREVIEW_LIMIT - DIAGNOSTIC_PREVIEW_TAIL;
+  const omitted = text.length - DIAGNOSTIC_PREVIEW_LIMIT;
+  return `${text.slice(0, headLength)}\n\n[Preview shortened: ${omitted} characters omitted. Copy report or Save report… exports the complete report.]\n\n${text.slice(-DIAGNOSTIC_PREVIEW_TAIL)}`;
+}
 
 export function DiagnosticsTab() {
   const [report, setReport] = createSignal<DiagnosticReport | null>(null);
@@ -145,7 +161,7 @@ export function DiagnosticsTab() {
 
   return (
     <section class="diagnostics-tab settings-section">
-      <h2>Diagnostics</h2>
+      <h2>Help & diagnostics</h2>
       <p>
         Tine keeps a small, bounded flight recorder for the current and previous run. It records
         operation names, outcomes, timings, counts, platform and build information.
@@ -173,7 +189,13 @@ export function DiagnosticsTab() {
         {(current) => (
           <label class="diagnostics-preview">
             <span>Report preview · {current().suggestedFileName}</span>
-            <textarea readonly spellcheck={false} value={current().text} />
+            <Show when={current().text.length > DIAGNOSTIC_PREVIEW_LIMIT}>
+              <span class="settings-hint">
+                Large report: this preview is shortened to keep Settings responsive. Copy report
+                or Save report… exports the complete report.
+              </span>
+            </Show>
+            <textarea readonly spellcheck={false} value={diagnosticReportPreview(current().text)} />
           </label>
         )}
       </Show>
@@ -253,6 +275,10 @@ export function DiagnosticsTab() {
             </div>
           )}
         </Show>
+      </div>
+      <div class="diagnostics-parser-comparison">
+        <h3>Help improve Tine's parser</h3>
+        <ImproveTab />
       </div>
     </section>
   );

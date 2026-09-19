@@ -30,19 +30,22 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
 
 ## Fork feature surfaces
 
-- Query filter (`tine.query-filter::`): `src/editor/queryFilter.ts`,
-  `src/components/Macro.tsx`, `src/components/QueryBuilder.tsx`, and
-  `src/sheet/config.ts`. Since v0.6.982 the ƒ-filter button's field hints read
-  upstream's ONE shared facets resource in `QueryBuilder` (`sharedQueryResult`,
-  keyed on graphEpoch+dataRev) rather than calling `queryFacets()` again — the
-  fork's own `createResource` was adopted away at that sync. In `Macro.tsx` the
-  filter derives from `groups()`, which upstream's `withoutHostBlock` (GH #469)
-  already strips the host block from; keep that order. The fork's
-  `scripts/shot-advanced-switch.mjs` shoots the ƒ-filter button instead of
-  upstream's retired Datalog switch; it MUST use
-  `e2e-capabilities.mjs::waitForHttpServer` — `scripts/e2e-capabilities.test.mjs`
-  (I-12/DUP-12b) fails any `scripts/*.mjs` that defines its own `waitForServer`.
-- Bullet threading: `src/bulletThreading.ts` and `src/components/Block.tsx`.
+- Bullet threading: `src/bulletThreading.ts`,
+  `src/components/block/bulletThread.tsx`, and three call sites in
+  `src/components/Block.tsx`. Since v0.6.984 the presentation lives in that
+  block module rather than inline, because upstream's budget B1
+  (`src/fileSizeRatchet.test.ts`) caps a production file at 4,000 lines and
+  ships `Block.tsx` at 3,995 — five lines of headroom for the whole fork. The
+  extraction cut the fork's footprint there from 94 lines to 10, which is
+  irreducible (two imports, a `classList` spread, a `style`, one element, the
+  calc latch, and the calc slash case), so `Block.tsx` also carries the ONLY
+  entry in that test's `PINNED` map. The pin must equal the file's exact line
+  count: when upstream grows the file the test fails and names the new number —
+  take it. `src/components/block/calcBlock.ts` holds the fork's other two
+  `Block.tsx` behaviours (the mid-session calc-fence latch and the
+  `/Calculator` slash insert) for the same budget reason. `readBlockModuleSource()`
+  globs `src/components/block/`, so every guard that reads `Block.tsx` still
+  sees all of it — the seam hides nothing.
 - Git integration: `src-tauri/src/git.rs` and Settings. Since v0.6.981,
   upstream's producer census (`crates/tine-core/src/projection_producer_census.rs`)
   pins every `src-tauri` mutation primitive and process construction site, so it
@@ -59,7 +62,12 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   The same ratchet forbids classifying a backend result by parsing its message,
   so `GitResult` carries `needs_pull` and `src/git.ts` reads that field instead
   of matching "Pull first" in the detail. Do not name the lowercase helper in a
-  comment either — the ratchet greps its raw name.
+  comment either — the ratchet greps its raw name. Since v0.6.984 upstream's
+  published-query export forces a third pin: `src/publishedBackend.guard.test.ts`
+  requires EVERY `Backend` method to be classified, so the seven `git*` methods
+  are listed (with a `FORK:` comment) in `PUBLISHED_REFUSED_METHODS` —
+  `gitStatus` included, since a baked export has no working tree to read. A new
+  fork backend command must be classified there or that guard goes red.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
 - Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
   `src/components/AboutTab.tsx`. One behavior drives all of it — `updateMode()`
@@ -83,18 +91,46 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   correcting them buys nothing and costs merge cleanliness. Note `REPO`
   deliberately points at `martinkoutecky/tine`: the toast announces *upstream*
   releases, which is the signal to run this sync.
-- Line-anchored allowlists the fork drifts: `CONSOLE_ALLOWLIST` in
-  `src/contentOutOfLogs.ratchet.test.ts` (six pins) and
-  `ERROR_STRING_CLASSIFIER_ALLOWLIST` in `src/typedErrorRatchet.test.ts` (one)
-  pin upstream sites by LINE NUMBER, and fork insertions above them shift every
-  one. Each carries a `FORK:` comment. On a conflict take upstream's numbers,
-  re-run the test, and re-anchor to whatever it reports — the site, method and
-  class are always upstream's; only the line moves.
+- Fork CSS: `src/styles/app/50-mine.css`, imported last from
+  `src/styles/app.css`. Upstream split `app.css` into `src/styles/app/00..40-*.css`
+  at v0.6.984 and those modules sit at their B1 budget, so fork rules appended
+  into them push the file over the cap AND collide every sync. Everything the
+  fork styles (`.thread-svg`, `.git-badge`, `.git-actions`) lives in this one
+  file it owns outright. All new selectors, so its last position only decides
+  ties. `src/testSource.ts::readAppStylesheet` expands `@import`s, so every CSS
+  guard still sees these rules; `src/styles/cascadeOrder.test.ts` requires base
+  declarations BEFORE any `@media`/`@container` that overrides them.
 - Fork ADRs: `docs/adr/mine/` (its own numbering and README), not the upstream
   `docs/adr/` sequence.
 
 ### Retired
 
+- **Query formula refinement** (`tine.query-filter::`, retired at the v0.6.984
+  sync; fork ADR `mine/0001`). Upstream v0.6.983 replaced the Clause-based visual
+  builder with a new query IR and removed every symbol the fork's ƒ-filter button
+  was built on — `parseQuery`, `toDsl`, `Clause`, `advancedToClause`,
+  `getSimpleForm`, `clearSimpleForm`, `stashSimpleForm` all left
+  `src/editor/queryBuilder.ts` in a 2,428-line rewrite — along with the
+  `.qb-advanced` chip bar that hosted it. `src/components/QueryBuilder.tsx` and
+  `src/components/Macro.tsx` were taken upstream VERBATIM. Upstream's new inline
+  Display panel (`QueryDisplay`, `.qd-panel`) owns view, grouping, sort, columns,
+  totals and limit but has no formula-filter slot, so nothing replaces this; the
+  engine was salvageable but its only affordance was not, so the feature went
+  whole rather than becoming unreachable code. Removed: `src/editor/queryFilter.ts`
+  (+test), the `queryFilter` field and `tine.query-filter` branch in
+  `src/sheet/config.ts` (+ two `config.test.ts` cases), the `filterKey` field on
+  `FormulaEditorTarget` in `src/ui.ts` and its use in
+  `src/components/FormulaEditor.tsx` (+ its test case), the fork's
+  `QueryMacro.test.tsx` cases, and the `.query-filter-error` CSS.
+  `scripts/shot-advanced-switch.mjs` reverted to upstream's file, which now
+  shoots a datalog query's ran/ignored note. Beware the false positives when
+  grepping: upstream owns a community plugin literally named `query-filter`
+  (`page.tine.query-filter`, `scripts/shot-plugin-docs.mjs`) and a
+  `"query-filters"` workspace id — neither is this feature. Upstream's own
+  `tine.filter::` is unrelated and still filters sheet views. `feat/query-filter`
+  (tip `ede2f6db`, also on the `fork` remote) was left untouched — the sync flow never
+  alters a `feat/*` branch — but it now targets an architecture that no longer
+  exists, so it is historical. Deleting it is a separate, deliberate call.
 - **Live code-highlight overlay** (retired at the v0.6.95 sync). Upstream GH #357
   gave the block editor its own whole-block code-fence presentation
   (`codeFenceOnly` in `src/editor/codeFence.ts`, the `.code-edit` card,
@@ -106,7 +142,10 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   `highlightFencedForOverlay`, the extras toggle, and the `.code-editing` /
   `.code-hl-overlay` CSS. The fork's `.code-block code` wrap override was also
   reverted to upstream's `white-space: pre`, since it existed only to match the
-  fork's wrapping editor. `feat/codeblock-editing` was deleted at that sync
+  fork's wrapping editor. One leftover from it survived until v0.6.984, when the
+  fork's removal of `overflow-x: auto` from `.code-block` was reverted too:
+  upstream's new `scripts/check-code-scrollbar.mjs` asserts that block scrolls
+  horizontally. `feat/codeblock-editing` was deleted at that sync
   (tip was `fc0a73c0`; its commits remain ancestors of `mine`).
 - **Page-rename navigation remap** (retired at the v0.6.97 sync). Upstream's
   DUP-2 favorites work rewrote `renamePageInNavigation` in `src/ui.ts` around a
@@ -147,39 +186,37 @@ PATH="<dir with cargo-nextest 0.9.143>:$PATH" nix-shell -p cargo rustc gcc pkg-c
 nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'
 ```
 
-On this host `src/conflictAuthority.guard.test.ts`'s source-scanning case sits
-right on Vitest's 5s default (4.4s of real work), so `npm test` may report it as
-`Test timed out in 5000ms` with no assertion failure. That is a host-speed
-artifact, not a violation: re-run it with `--testTimeout=30000` and it passes
-with zero findings. Upstream's test is unmodified.
+This host has **4 cores**, and Vitest's default worker count starves the
+timing-sensitive suites: a default `npm test` here reported 10 failures on one
+run and 19 on the next, across `store.test.ts`'s selection-move burst cases, the
+source-scanning guards (`conflictAuthority`, `resourceReads`, `clipboard`,
+`pagePropsEditorSurface`), `themeCheckerCli`, `systemBars`, `systemTheme` and
+`clipboard.paste`. Every one passed in isolation, and the whole suite is green
+at `npx vitest run --maxWorkers=2 --testTimeout=30000` (3,695 passed, 1 skipped,
+~4.5 min). Use that invocation as the real signal; a failure that survives it is
+a real failure. None of these tests is modified by the fork.
 
-**Never run bare `cargo test -p tine-core`.** The bare package still contains the
-pre-0.7 adversarial actor oracle: it is deterministically red and several of its
-scenarios never terminate, so the run hangs and prints no summary. Those reds are
-not a regression, and neither upstream CI nor their release ever runs them. Cross-
-check any failure against the exclusions before calling it broken. Since v0.6.982
-those live in two places, NOT the old `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES`
-(gone): `KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` in
-`scripts/tine-core-nextest-contract.mjs`, plus a version-keyed ledger in
-`scripts/release-ci-exception.{mjs,json}` that activates for exactly the version
-in `package.json` — `0.6.982` today. Any other version (including v0.6.983) gets
-the strict contract, so the next sync re-measures from scratch.
+**The known-red exclusion list is now EMPTY, and the machinery that carried it is
+gone.** Every red it ever named was a Managed Storage runtime defect, and v0.6.984
+removed Managed Storage (ADR 0066), so upstream deleted
+`scripts/release-ci-exception.{mjs,json}` outright and
+`KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES` in
+`scripts/tine-core-nextest-contract.mjs` is `[]` — the Linux filterset is now
+plain `all()`. Both `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` and
+`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` are also gone. Adding a name back is
+an open-bug declaration, not a waiver.
 
-The curated selection above is also stricter: one process per test, a 5-minute
-per-test timeout, no retries. It needs cargo-nextest **exactly 0.9.143** (nixpkgs
-has 0.9.140, and the prebuilt binary needs `patchelf` on NixOS — see the
-`sync-upstream` skill for the one-time fix). At v0.6.982 it reports
-`2065 tests run: 2065 passed, 137 skipped` in ~15 min.
+Keep running the contract script rather than bare `cargo test -p tine-core`
+anyway: it is upstream's actual release gate and it is the stricter one — four
+hash shards, one process per test, a 5-minute per-test timeout with
+`on-timeout = "fail"`, and no retries, none of which plain libtest gives you.
+The old hazard (scenarios that never terminate, so the bare run hangs and prints
+no summary) left with Managed Storage, but the bare command has NOT been re-tested
+on this fork since; treat it as unverified, not as known-good.
 
-Under full-run CPU contention on this host, `sync_runtime::tests` scaled-fixture
-scenarios can fail on an ITERATION bound rather than a clock:
-`drain_until_settled` polls 32 ticks and gives up, so a starved run can still be
-`Recovering` at tick 32 and panic with 32 `Recovering` values. Seen once at the
-v0.6.982 sync on
-`startup_scan_absences_coalesce_into_one_sweep_across_a_mid_scan_crash`, which
-then passed 3/3 in isolation and green on a full re-run. Re-run before treating
-any such failure as real — and note the fork touches no `sync_runtime` code, so
-a failure there is never a fork regression.
+It needs cargo-nextest **exactly 0.9.143** (nixpkgs has 0.9.140, and the prebuilt
+binary needs `patchelf` on NixOS — see the `sync-upstream` skill for the one-time
+fix). TODO: record the v0.6.984 test count after the first full run of this gate.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.

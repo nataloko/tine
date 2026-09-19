@@ -1,6 +1,6 @@
 // Harvest B3 live-conflict capsule matrix.
 //
-// For Direct Files and Tine-managed storage, two retained drafts race external
+// Two retained Direct Files drafts race external
 // atomic replacements. A full process restart must restore both exact drafts;
 // one is resolved to the retained draft and one to the current storage owner.
 // The graph-keyed native capsule is observed before restart, shrinks after the
@@ -13,6 +13,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import {
   freeLoopbackPort,
@@ -34,6 +35,7 @@ const NATIVE_PORT = process.env.E2E_NATIVE_PORT
 const RUN_LABEL = (process.env.TINE_E2E_RUN_LABEL || "concord-live-save")
   .replaceAll(/[^A-Za-z0-9_.-]/g, "-");
 const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || "/tmp");
+const MISSING_TARGET = process.env.TINE_E2E_MISSING_TARGET === "1";
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 function waitFor(check, timeout, message, interval = 100) {
@@ -118,11 +120,7 @@ function assertCapsuleRecord(capsule, item, mode, expectedBaseRev) {
     || (expectedBaseRev !== undefined && capsule.live.base_rev !== expectedBaseRev)) {
     throw new Error(`${mode}:${item.name}: exact load baseline is missing or changed`);
   }
-  if (mode === "managed") {
-    if (capsule.live.disk_rev !== undefined || capsule.live.conflict_epoch !== -1) {
-      throw new Error(`${mode}:${item.name}: replacement authority leaked into the durable capsule`);
-    }
-  } else if (typeof capsule.live.disk_rev !== "string") {
+  if (typeof capsule.live.disk_rev !== "string") {
     throw new Error(`${mode}:${item.name}: durable Direct disk revision is missing`);
   }
 }
@@ -134,76 +132,15 @@ async function visibleButtonContaining(browser, text) {
   return undefined;
 }
 
-async function acceptNativeConfirmation(env, label, before) {
-  const dialog = await waitFor(
-    () => windowIds(env).find((id) => !before.has(id)),
-    30_000,
-    `${label} did not show its native confirmation`,
-  );
-  execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
-  execFileSync("xdotool", ["key", "--clearmodifiers", "alt+y"], { env });
-  await waitFor(() => !windowIds(env).includes(dialog), 30_000, `${label} confirmation did not close`);
-}
-
-async function enableManagedStorage(browser, env) {
-  const trigger = await browser.$('button[title^="Settings"]');
-  await trigger.waitForDisplayed({ timeout: 30_000 });
-  await trigger.click();
-  await browser.$(".settings-modal").waitForDisplayed({ timeout: 30_000 });
-  const tab = await waitFor(
-    () => visibleButtonContaining(browser, "Backups & recovery"),
-    30_000,
-    "Backups & recovery settings tab was absent",
-  );
-  await tab.click();
-  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
-  await experimental.waitForDisplayed({ timeout: 30_000 });
-  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
-  const action = await waitFor(
-    () => visibleButtonContaining(browser, "Enable Tine-managed storage..."),
-    30_000,
-    "managed activation action was absent",
-  );
-  const before = new Set(windowIds(env));
-  await action.click();
-  await acceptNativeConfirmation(env, "managed activation", before);
-  await browser.waitUntil(async () => (await browser.$("body").getText()).includes("Tine-managed storage active"), {
-    timeout: 300_000,
-    interval: 250,
-    timeoutMsg: "managed activation did not reach active",
-  });
-  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
-  await close.click();
-  await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
-}
-
 async function openPage(browser, title) {
+  // Route to the journal feed first: the page-ref links only exist there. The
+  // `[[ ]]` tolerance this journey needed (`:ui/show-brackets?` defaults to on)
+  // is now the shared link route's contract, along with re-finding the link on
+  // each attempt. See scripts/lib/e2e-navigation.mjs.
   const journals = await browser.$(".nav-item*=Journals");
   await journals.waitForClickable({ timeout: 30_000 });
   await journals.click();
-  let link;
-  try {
-    link = await waitFor(async () => {
-      for (const candidate of await browser.$$(".page-ref")) {
-        if ((await candidate.getText()).trim() === title) return candidate;
-      }
-      return undefined;
-    }, 30_000, `${title} was absent from the routed journal links`);
-  } catch (error) {
-    const state = await browser.execute(() => ({
-      body: document.body?.innerText.slice(0, 4000),
-      pageRefs: [...document.querySelectorAll(".page-ref")]
-        .map((node) => node.textContent?.trim() ?? ""),
-      titles: [...document.querySelectorAll(".page-title, .journal-title, .journal-day")]
-        .map((node) => node.textContent?.trim() ?? ""),
-    }));
-    throw new Error(`${String(error)}; routed state: ${JSON.stringify(state)}`);
-  }
-  await link.click();
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === title, {
-    timeout: 15_000,
-    timeoutMsg: `${title} did not open`,
-  });
+  await openPageByLink(browser, title, { timeout: 30_000 });
 }
 
 async function editPage(browser, text) {
@@ -241,12 +178,24 @@ async function assertLiveConflict(browser, local, current, phase) {
 }
 
 async function resolveEverywhere(browser, side) {
+  // The resolve-everywhere buttons carry TWO labels: `.conflict-wide` ("Keep
+  // <side label>") and `.conflict-narrow` ("All mine" / "All theirs"). CSS shows
+  // exactly one, so a visible-text probe is really an assertion about pane
+  // width — which is a non-requirement of this journey, and which the
+  // full-pane-width Concord default legitimately flipped. Identify the action
+  // by the stable narrow label that is always present in the DOM, and click the
+  // real button that owns it.
   const selector = side === "mine" ? "All mine" : "All theirs";
-  const choose = await waitFor(
-    () => visibleButtonContaining(browser, selector),
-    15_000,
-    `${selector} action was absent`,
-  );
+  const choose = await waitFor(async () => {
+    for (const button of await browser.$$(".sync-merge-toolbar-actions button")) {
+      const owns = await button.execute(
+        (node, want) => (node.textContent ?? "").includes(want),
+        selector,
+      );
+      if (owns && (await button.isDisplayed())) return button;
+    }
+    return undefined;
+  }, 15_000, `${selector} action was absent`);
   await choose.click();
   const apply = await waitFor(
     () => visibleButtonContaining(browser, "Apply resolution"),
@@ -275,7 +224,7 @@ async function waitForApp(browser, phase) {
 }
 
 async function runBackend(mode) {
-  const suffix = mode === "managed" ? "managed" : "direct";
+  const suffix = MISSING_TARGET ? "direct-missing" : "direct";
   const graph = `/tmp/tgraph-concord-live-save-${suffix}`;
   const xdg = `/tmp/txdg-concord-live-save-${suffix}`;
   const data = `${xdg}/data`;
@@ -285,6 +234,9 @@ async function runBackend(mode) {
   const theirsFile = `${graph}/pages/${theirsName}.md`;
   fs.rmSync(graph, { recursive: true, force: true });
   fs.rmSync(xdg, { recursive: true, force: true });
+  if (process.env.TINE_E2E_SEED_GRAPH) {
+    fs.cpSync(path.resolve(process.env.TINE_E2E_SEED_GRAPH), graph, { recursive: true });
+  }
   for (const dir of [`${graph}/pages`, `${graph}/journals`, `${graph}/logseq`, data, `${xdg}/config`, `${xdg}/cache`]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -356,7 +308,9 @@ async function runBackend(mode) {
   };
   const forceKillApp = async () => {
     const window = await waitFor(
-      () => windowIds(env)[0],
+      // Graph selection gives the main window a graph-qualified title. The
+      // plain title matcher above deliberately remains for native dialogs.
+      () => windowIds(env, "^Tine( — .*)?$")[0],
       30_000,
       `${suffix}: native app window was absent before SIGKILL`,
     );
@@ -367,6 +321,14 @@ async function runBackend(mode) {
     if (!Number.isInteger(pid) || pid <= 0) {
       throw new Error(`${suffix}: native window exposed invalid app pid ${pid}`);
     }
+    const executable = fs.realpathSync(`/proc/${pid}/exe`);
+    if (executable !== fs.realpathSync(APP)) {
+      throw new Error(`${suffix}: refusing to kill unexpected executable ${executable}`);
+    }
+    fs.writeFileSync(path.join(ARTIFACTS, `${suffix}-killed-app.json`), JSON.stringify({
+      window, pid, executable,
+      title: execFileSync("xdotool", ["getwindowname", window], { encoding: "utf8", env }).trim(),
+    }, null, 2));
     process.kill(pid, "SIGKILL");
     await waitFor(() => !processAlive(pid), 30_000, `${suffix}: SIGKILL did not stop Tine pid ${pid}`);
     browser = undefined;
@@ -377,7 +339,6 @@ async function runBackend(mode) {
     await startDriver("initial");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:initial`);
-    if (mode === "managed") await enableManagedStorage(browser, env);
 
     const cases = [
       {
@@ -418,8 +379,29 @@ async function runBackend(mode) {
       baseRevs.set(item.name, capsule.live.base_rev);
     }
 
+    if (MISSING_TARGET) {
+      const before = new Set(windowIds(env, "^Tine( — .*)?$"));
+      const appWindow = [...before][0];
+      if (!appWindow) throw new Error("close recovery: native app window absent");
+      execFileSync("xdotool", ["windowactivate", "--sync", appWindow], { env });
+      execFileSync("xdotool", ["key", "--clearmodifiers", "alt+F4"], { env });
+      const dialog = await waitFor(() => windowIds(env, "^(Tine|Unsaved changes)$").find((id) => !before.has(id)),
+        45_000, "failed close did not ask before discarding drafts");
+      execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
+      execFileSync("xdotool", ["key", "--clearmodifiers", "alt+n"], { env });
+      await browser.$(".unsaved-recovery-panel").waitForDisplayed({ timeout: 15_000 });
+      const recovery = await browser.$(".unsaved-recovery-panel").getText();
+      for (const item of cases) {
+        if (!recovery.includes(item.name) || !recovery.includes(item.local)) {
+          throw new Error(`close recovery omitted ${item.name} or its writing`);
+        }
+      }
+      await browser.saveScreenshot(path.join(ARTIFACTS, "refused-close-recovery.png"));
+      await (await visibleButtonContaining(browser, "Keep working")).click();
+    }
     await forceKillApp();
     for (const item of cases) atomicReplace(item.file, `- ${item.outage}\n`);
+    if (MISSING_TARGET) fs.unlinkSync(mineFile);
     await startDriver("restart");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:restart`);
@@ -438,8 +420,24 @@ async function runBackend(mode) {
       assertCapsuleRecord(restoredByName.get(item.name), item, mode, baseRevs.get(item.name));
     }
 
-    await openPage(browser, mineName);
-    await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
+    if (MISSING_TARGET) {
+      // Use the reported conflict entry, which pins the physical path. A plain
+      // page link may legitimately open a prospective page by name instead.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await browser.$(".conflict-queue-badge").click();
+        await browser.waitUntil(async () => (await browser.$$(".page-conflict")).length > 0,
+          { timeout: 15_000, timeoutMsg: "conflict entry did not open its review" });
+        if ((await browser.$$(".recovery-draft")).length) break;
+      }
+      await browser.$(".recovery-draft").waitForExist({ timeout: 15_000 });
+      const preview = await browser.$(".recovery-draft pre").getText();
+      if (!preview.includes(cases[0].local)) throw new Error("missing-target view lost retained writing");
+      if (fs.existsSync(mineFile)) throw new Error("viewing missing-target recovery created a graph file");
+      await browser.saveScreenshot(path.join(ARTIFACTS, "missing-target-recovery.png"));
+    } else {
+      await openPage(browser, mineName);
+      await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
+    }
     await resolveEverywhere(browser, "mine");
     await waitForFileText(mineFile, (text) => text.includes(cases[0].local), `${suffix}: keep retained draft`);
     const afterFirst = readCapsule(data).envelope.capsules;
@@ -457,20 +455,61 @@ async function runBackend(mode) {
     const legacy = await browser.execute(() => localStorage.getItem("tine.concord.live-conflicts.v1"));
     if (legacy !== null) throw new Error(`${suffix}: retired localStorage channel survived first use`);
     console.log(`PASS: ${suffix} SIGKILL restart restored exact capsules, re-observed newer owners, and resolved both sides`);
+  } catch (error) {
+    try {
+      await browser.saveScreenshot(path.join(ARTIFACTS, `${suffix}-failure.png`));
+      const state = await browser.execute(() => ({
+        body: document.body.innerText,
+        active: document.activeElement?.outerHTML,
+        conflicts: [...document.querySelectorAll(".page-conflict")].map(el => el.outerHTML),
+      }));
+      fs.writeFileSync(path.join(ARTIFACTS, `${suffix}-failure.json`), JSON.stringify(state, null, 2));
+    } catch {}
+    throw error;
   } finally {
     try { await stopDriver(true); } catch {}
     await sleep(1500);
   }
 }
 
+// Xvfb supplies a display, but native dialog activation also needs an EWMH
+// window manager. Keep that owner alive across both app SIGKILL/restart cases.
+function windowManagerReady() {
+  try {
+    return /window id # 0x[1-9a-f][0-9a-f]*/i.test(execFileSync(
+      "xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" },
+    ));
+  } catch { return false; }
+}
+
+let windowManager;
+let windowManagerLog;
 let failure;
 try {
+  if (!windowManagerReady()) {
+    windowManagerLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
+    windowManager = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
+      stdio: ["ignore", windowManagerLog, windowManagerLog],
+    });
+    let startError;
+    windowManager.on("error", (error) => { startError = error; });
+    await waitFor(() => {
+      if (startError) throw startError;
+      return windowManager.exitCode === null && windowManagerReady();
+    }, 15_000, "window manager did not become ready");
+  }
+  fs.writeFileSync(path.join(ARTIFACTS, "window-manager.json"), JSON.stringify({
+    ownedPid: windowManager?.pid ?? null,
+    supportingWindow: execFileSync("xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" }).trim(),
+  }, null, 2));
   await runBackend("direct");
-  await runBackend("managed");
-  console.log("PASS: Harvest B3 Direct/Managed restart capsule matrix");
+  console.log("PASS: Harvest B3 Direct restart capsule matrix");
 } catch (error) {
   failure = error;
   console.error("FAIL:", error?.stack ?? error);
+} finally {
+  windowManager?.kill("SIGTERM");
+  if (windowManagerLog !== undefined) fs.closeSync(windowManagerLog);
 }
 
 process.exit(failure ? 1 : 0);

@@ -1,10 +1,9 @@
 //! Journal-feed selection: which journal pages the Journals surface shows, in
 //! what order, and how its day cursor paginates.
 //!
-//! Both storage modes select the feed through the rules here. Direct Files
-//! supplies candidates from its warmed page cache (`Graph::journals_desc`, which
-//! calls [`journal_feed_candidates_desc`] below); managed storage supplies them
-//! from the actor's retained journal index. One implementation is the point: the
+//! Direct Files selects the feed through the rules here, supplying candidates
+//! from its warmed page cache (`Graph::journals_desc`, which calls
+//! [`journal_feed_candidates_desc`] below). One implementation is the point: the
 //! feed's dedup/ordering/cursor rules are exactly where a silent divergence would
 //! drop a day out of a user's journal history, and two hand-kept copies agreeing
 //! only by inspection is how that happens.
@@ -15,7 +14,7 @@
 //! is the architectural fact that keeps the delegation in place.
 
 use crate::date::JournalDate;
-use crate::model::{PageDto, PageEntry, PageKind};
+use crate::vocab::{PageDto, PageEntry, PageKind};
 
 /// One rendered feed page plus the day cursor that continues it.
 #[derive(Debug)]
@@ -149,22 +148,22 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The module header says both storage modes select the feed through this
-    /// file. Direct Files reaches it through `Graph::journals_desc`, which used
+    /// The module header says the feed is selected through this file. Direct
+    /// Files reaches it through `Graph::journals_desc`, which used
     /// to carry its own copy of the dedup rule instead. A comment cannot hold
     /// that; this can.
     #[test]
     fn direct_files_journals_desc_uses_this_files_dedup() {
-        let model = include_str!("model.rs");
+        let model = crate::test_support::model_module_source();
         assert!(
             !model.contains("fn dedup_journal_days"),
-            "model.rs has grown a second journal-day dedup implementation; the feed's \
-             representative-file rule must have exactly one owner (this file), or a day \
-             silently drops out of a user's history when the two disagree"
+            "the model module has grown a second journal-day dedup implementation; the \
+             feed's representative-file rule must have exactly one owner (this file), or a \
+             day silently drops out of a user's history when the two disagree"
         );
         let start = model
             .find("pub fn journals_desc(&self)")
-            .expect("model.rs must still define Graph::journals_desc");
+            .expect("the model module must still define Graph::journals_desc");
         let body = &model[start..start + 2000.min(model.len() - start)];
         let end = body
             .find("\n    }")

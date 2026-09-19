@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
-use crate::state::{AppState, ApplicationPageAdmissionAuthority};
+use crate::state::AppState;
 
 // `diag` is the existing opt-in detailed trace (`TINE_DEBUG=1` / `--debug`).
 // It may contain a path or an OS error chosen for a directed investigation, so
@@ -59,7 +59,7 @@ fn debug_opt_in_requested() -> bool {
 /// `runtime_debug_diagnostics_enabled()`. Kept because 15 src-tauri callers
 /// read better against a local name; it computes nothing of its own.
 pub(crate) fn debug_enabled() -> bool {
-    tine_core::sync_runtime::runtime_debug_diagnostics_enabled()
+    tine_core::backend_error::runtime_debug_diagnostics_enabled()
 }
 
 fn debug_log_path() -> PathBuf {
@@ -74,7 +74,7 @@ pub(crate) fn debug_init() {
     // The one place the opt-in is parsed, and the one place the flag is set.
     // Everything downstream — in this crate and in `tine-core` — reads it back
     // through `runtime_debug_diagnostics_enabled()`.
-    tine_core::sync_runtime::set_runtime_debug_diagnostics(debug_opt_in_requested());
+    tine_core::backend_error::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {
@@ -476,7 +476,7 @@ fn enum_token<T: Serialize>(value: T) -> Value {
 }
 
 pub(crate) fn record_storage_transition(
-    event: &crate::storage_mode_supervisor::StorageTransitionEvent,
+    event: &crate::storage_transition_supervisor::StorageTransitionEvent,
 ) {
     let mut fields = Map::new();
     fields.insert("operationId".into(), json!(event.operation_id));
@@ -498,30 +498,6 @@ pub(crate) fn record_storage_transition(
         fields.insert("outcome".into(), enum_token(outcome));
     }
     record_fixed_event("storage.transition", fields);
-}
-
-pub(crate) fn record_checkpoint_capture_skip(
-    reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip,
-) {
-    let mut fields = Map::new();
-    fields.insert(
-        "reason".into(),
-        json!(match reason {
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached => {
-                "runtime_not_attached"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IndexedRuntime => "indexed_runtime",
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::BlockedRuntime => "blocked_runtime",
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::UnsettledRuntime => {
-                "unsettled_runtime"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::DurableFrontierAhead => {
-                "durable_frontier_ahead"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::CaptureFailed => "capture_failed",
-        }),
-    );
-    record_fixed_event("managed.checkpoint_capture_skipped", fields);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -574,7 +550,7 @@ pub(crate) fn record_watcher_latency(
 
 #[tauri::command]
 pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u64) {
-    if !crate::managed_command_surface::is_known_command(&command)
+    if !crate::command_surface::is_known_command(&command)
         || matches!(
             command.as_str(),
             "diagnostic_ipc_event"
@@ -730,22 +706,10 @@ fn build_diagnostic_report(
     build_time: String,
 ) -> DiagnosticReport {
     let mut direct = 0u64;
-    let mut managed_writable = 0u64;
-    let mut managed_unavailable = 0u64;
     let mut graph_state_unavailable = false;
     match state.graphs.read() {
         Ok(graphs) => {
-            for (_, slot) in graphs.entries() {
-                match slot.application_page_admission().authority {
-                    ApplicationPageAdmissionAuthority::Direct => direct += 1,
-                    ApplicationPageAdmissionAuthority::ManagedWritable { .. } => {
-                        managed_writable += 1
-                    }
-                    ApplicationPageAdmissionAuthority::ManagedUnavailable => {
-                        managed_unavailable += 1
-                    }
-                }
-            }
+            direct = graphs.entries().len() as u64;
         }
         Err(_) => graph_state_unavailable = true,
     }
@@ -792,10 +756,8 @@ fn build_diagnostic_report(
             "previousExitUnclean": PREVIOUS_EXIT_UNCLEAN.load(Ordering::Acquire),
             "verboseDebugEnabled": debug_enabled(),
             "graphStateUnavailable": graph_state_unavailable,
-            "graphBindings": direct + managed_writable + managed_unavailable,
+            "graphBindings": direct,
             "directBindings": direct,
-            "managedWritableBindings": managed_writable,
-            "managedUnavailableBindings": managed_unavailable,
         },
         "activeStorageTransitions": state.storage_supervisor.diagnostic_snapshot(),
         "watcherLatency": crate::watcher::diagnostic_latency_snapshot(),
@@ -1087,26 +1049,15 @@ mod tests {
     #[test]
     fn fixed_event_shape_contains_no_free_form_message_fields() {
         let source = include_str!("debug.rs");
-        let contract = include_str!("../../docs/contracts/diagnostics.md");
-        assert!(!source.contains("fields.insert(\"message\""));
-        assert!(!source.contains("fields.insert(\"path\""));
-        assert!(!source.contains("fields.insert(\"detail\""));
-        assert!(source.contains("verboseDebugLogIncluded\": false"));
-        assert!(source.contains("managed.checkpoint_capture_skipped"));
-        for reason in [
-            "runtime_not_attached",
-            "indexed_runtime",
-            "blocked_runtime",
-            "unsettled_runtime",
-            "durable_frontier_ahead",
-            "capture_failed",
-        ] {
-            assert!(source.contains(reason));
-            assert!(
-                contract.contains(reason),
-                "the bounded checkpoint-skip cause and diagnostics contract must change together"
-            );
-        }
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
+        assert!(!production.contains("fields.insert(\"message\""));
+        assert!(!production.contains("fields.insert(\"path\""));
+        assert!(!production.contains("fields.insert(\"detail\""));
+        assert!(production.contains("verboseDebugLogIncluded\": false"));
+        assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
     }
 
     #[test]

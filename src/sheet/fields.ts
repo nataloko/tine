@@ -52,6 +52,110 @@ export function isFormulaField(field: FieldId): field is `formula:${string}` {
   return field.startsWith("formula:");
 }
 
+/** One `tine.columns` token as a field identity (P5A).
+ *
+ *  The six builtins keep their own identity; every other string is an ordinary
+ *  property name and becomes `prop:<name>` HERE, at the renderer — the property
+ *  bytes stay the bare name the author wrote, in both formats and in both
+ *  languages. The Rust mirror is `publish.rs::sheet_field_for_column`, and the
+ *  shared corpus `crates/tine-core/tests/fixtures/query-columns/resolution.json`
+ *  pins the RESOLUTION the two of them then map. */
+export function queryColumnFieldId(name: string): FieldId {
+  switch (name) {
+    case "state":
+    case "priority":
+    case "scheduled":
+    case "deadline":
+    case "tags":
+    case "page":
+      return name;
+    default:
+      return `prop:${name}`;
+  }
+}
+
+/** The `tine.columns` token that names this field, or `null` when the columns
+ *  grammar has no spelling for it (P5B).
+ *
+ *  The grammar is P5A's and is not widened here: tokens are bare names, the six
+ *  builtins are reserved, and `queryColumnFieldId` maps everything else to
+ *  `prop:<name>`. Three field identities therefore have no token —
+ *
+ *   * a FORMULA column (`formula:effort`): a bare `effort` token would read
+ *     back as the ordinary property `effort`;
+ *   * a property literally NAMED like a builtin (`prop:state`): a bare `state`
+ *     token would read back as the task marker;
+ *   * a name carrying the serializer's own punctuation.
+ *
+ *  Those choices are shown with an explanation rather than coerced into a
+ *  different field (a coercion is a silent data change; a missing option is
+ *  visible). A property named `prop:x` IS representable — its token is `prop:x`,
+ *  which `queryColumnFieldId` reads back as `prop:prop:x`. */
+export function queryColumnName(field: FieldId): string | null {
+  if (isFormulaField(field)) return null;
+  if (!field.startsWith("prop:")) return field;
+  const name = field.slice(5);
+  if (!name || /[=;\0\r\n]/.test(name)) return null;
+  return queryColumnFieldId(name) === field ? name : null;
+}
+
+/** The `tine.col-aggregates` KEY that names this field, or `null` when that
+ *  grammar has no spelling for it (P5B, contract §5/§6).
+ *
+ *  This is deliberately NOT `queryColumnName`. The two grammars share a shape
+ *  and nothing else:
+ *
+ *   * an aggregate key is a LITERAL property name. `prop:` and `formula:` carry
+ *     no meaning there, so a property named `prop:cost` keeps exactly those
+ *     bytes, and a property named `state` or `page` is an ordinary thing to
+ *     count or sum. The columns grammar RESERVES those six names because a bare
+ *     `state` token selects the task marker — but no builtin has an aggregate
+ *     key at all, so nothing is there to collide with;
+ *   * only an ordinary property has a key. A builtin's bare name and an
+ *     aggregate key are the same bytes but not the same thing, and a formula has
+ *     no key, so those columns simply carry no aggregate rather than a segment
+ *     whose meaning depends on who reads it.
+ *
+ *  What the grammar genuinely cannot carry is its own punctuation: `;` separates
+ *  segments and `=` splits key from function (`view.rs::parse_col_aggregates`),
+ *  CR/LF/NUL end a property line, and an empty key already means the keyless
+ *  whole-result count. A padded key is refused for the same reason: the reader
+ *  trims each segment, so it would come back naming a different property. */
+export function queryAggregateFieldName(field: FieldId): string | null {
+  if (!field.startsWith("prop:")) return null;
+  const name = field.slice(5);
+  if (!name || name !== name.trim() || /[=;\0\r\n]/.test(name)) return null;
+  return name;
+}
+
+/** The sort field names the CURRENT backend sorter understands
+ *  (`crates/tine-core/src/query.rs::sort_key`): four builtins with their own
+ *  semantics, plus any property key, which falls back to the block's visible
+ *  first line when the property is absent.
+ *
+ *  `state` and `tags` are deliberately NOT here — `sort_key` would read them as
+ *  properties of those names, which is not what the columns mean — and neither
+ *  is the title column or a formula. Those keep the table's own transient sort
+ *  and say so; no new sort syntax and no frontend replacement sorter (P5B). */
+const BACKEND_SORT_BUILTINS: ReadonlySet<string> = new Set([
+  "priority",
+  "page",
+  "scheduled",
+  "deadline",
+]);
+
+/** The `tine.sort` field name for this column, or `null` when the saved sort
+ *  cannot express it. */
+export function querySortFieldName(field: FieldId): string | null {
+  if (isFormulaField(field)) return null;
+  if (!field.startsWith("prop:")) return BACKEND_SORT_BUILTINS.has(field) ? field : null;
+  const name = field.slice(5);
+  if (!name || /[=;\0\r\n]/.test(name)) return null;
+  // A property named like one of the sortable builtins is unreachable: the
+  // backend would sort by the builtin's own meaning instead.
+  return BACKEND_SORT_BUILTINS.has(name) ? null : name;
+}
+
 function facetsForBlock(id: string): Facets | null {
   const n = doc.byId[id];
   return n ? facetsOf(n.raw, formatForBlock(id)) : null;
@@ -256,15 +360,65 @@ export function fieldIdsForBlocks(ids: readonly string[], opts: { includePage?: 
   return out;
 }
 
-export function boardGroupByOptions(ownerId: string): FieldId[] {
+/** The board's Group-by choices, for BOTH row sources (P5B, N4).
+ *
+ *  It used to read `doc.byId[ownerId].children` unconditionally, which on a
+ *  query block are the block's OWN children — not its results — so a query
+ *  board could only ever offer `state`/`priority`/`tags`. One implementation,
+ *  two inputs: a children-backed board still passes its owner id and gets
+ *  exactly the list it got before, and a query board passes the fields its
+ *  result rows actually carry.
+ *
+ *  `extra` is appended verbatim after the observed properties, for the
+ *  identities a query board has and a children board does not (the source
+ *  `page`, and formula columns). Passing nothing keeps the old list byte for
+ *  byte. */
+export function boardGroupByOptions(
+  source: string | readonly FieldId[],
+  extra: readonly FieldId[] = [],
+): FieldId[] {
   const out: FieldId[] = ["state", "priority", "tags"];
   const seen = new Set<FieldId>(out);
-  for (const field of fieldIdsForBlocks(doc.byId[ownerId]?.children ?? [])) {
+  const observed =
+    typeof source === "string" ? fieldIdsForBlocks(doc.byId[source]?.children ?? []) : source;
+  for (const field of observed) {
     if (!field.startsWith("prop:") || seen.has(field)) continue;
     seen.add(field);
     out.push(field);
   }
+  for (const field of extra) {
+    if (seen.has(field)) continue;
+    seen.add(field);
+    out.push(field);
+  }
   return out;
+}
+
+/** How a QUERY face changes its own grouping.
+ *
+ *  A query board does not own `tine.group-by`: the grouping is the QUERY's
+ *  `tine.group-field`, resolved once and written through the query's own save
+ *  path. So the toolbar dropdown and the context menu both route through this
+ *  ONE callback rather than each reaching for a property writer of its own —
+ *  which is how the two used to disagree.
+ *
+ *  **`field: null` is not one answer but two**, and a board treats them
+ *  differently (ADR 0030, P5B):
+ *
+ *   * `cleared: true` — the user said "no grouping" out loud. One ungrouped
+ *     column, and the task-marker default may NOT speak over it.
+ *   * `cleared: false` — nothing anywhere states a grouping. That is the
+ *     silence the Board's default has always filled, and a note authored as
+ *     `tine.view:: board` with no grouping key has always shown a task-marker
+ *     board. Collapsing the two would un-group every one of them.
+ *
+ *  A children board has no spelling for the first and is unaffected. */
+export interface QueryGroupingControl {
+  field: FieldId | null;
+  /** Whether `field: null` is an EXPLICIT clear rather than an absent setting. */
+  cleared: boolean;
+  options: readonly FieldId[];
+  set: (field: FieldId | null) => void;
 }
 
 export function fieldLabel(field: FieldId): string {

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { readAppStylesheet } from "../testSource";
 import { Show, createSignal } from "solid-js";
 import { render } from "solid-js/web";
-import { backend } from "../backend";
+import { backend, PublishedExportReadOnlyError } from "../backend";
+import { PUBLISHED_META_NAME } from "../publishedBackend";
+import { setToasts, toasts } from "../ui";
 import {
   KeyedPdfViewer as OwnedKeyedPdfViewer,
   PdfViewer as OwnedPdfViewer,
@@ -759,6 +761,41 @@ describe("PdfViewer OG state and reference behavior", () => {
     } finally {
       dispose();
     }
+  });
+
+  // GH #549 sibling: a published export opens PDFs but has no sidecar to write.
+  // The debounced save after a zoom or scroll, and the flush on close, were
+  // refused, and each one toasted "Couldn't save PDF view position".
+  it("does not try to save the view position in a published export", async () => {
+    const meta = document.createElement("meta");
+    meta.name = PUBLISHED_META_NAME;
+    meta.content = "snapshot.json";
+    document.head.append(meta);
+    setToasts([]);
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 2, scale: 2 });
+    const writeState = vi.spyOn(backend() as any, "writePdfViewState")
+      .mockRejectedValue(new PublishedExportReadOnlyError());
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const pdf = documentWithPages([page(612, 792), page(612, 792)]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="paper.pdf" label="Paper" />, host);
+    try {
+      await flush();
+      vi.useFakeTimers();
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("220%");
+    } finally {
+      dispose();
+      await vi.advanceTimersByTimeAsync(0);
+      meta.remove();
+    }
+    expect(writeState).not.toHaveBeenCalled();
+    expect(toasts()).toEqual([]);
+    setToasts([]);
   });
 
   it("keeps a typed page jump after Enter blurs the page field", async () => {
@@ -1676,7 +1713,7 @@ describe("PdfViewer released-OG themes and outline", () => {
   });
 
   it("matches released OG 1.0.0 page-theme filtering without inverting highlight overlays", () => {
-    const css = readFileSync("src/styles/app.css", "utf8");
+    const css = readAppStylesheet();
     expect(css).toContain('.pdf-viewer[data-theme="light"] {\n  --pdf-container-bg: #fff;\n  --pdf-toolbar-bg: #fff;\n  --pdf-page-bg: #fff;');
     expect(css).toContain('.pdf-viewer[data-theme="warm"] {\n  --pdf-container-bg: #f6efdf;\n  --pdf-toolbar-bg: #f6efdf;\n  --pdf-page-bg: #f8eeda;');
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="warm"\][^{]*\{[^}]*filter:[^}]*\b(?:sepia|saturate)\b/s);
@@ -1689,7 +1726,7 @@ describe("PdfViewer released-OG themes and outline", () => {
   });
 
   it("keeps page geometry stable when offscreen PDF canvases are evicted", () => {
-    const css = readFileSync("src/styles/app.css", "utf8");
+    const css = readAppStylesheet();
     expect(css).toMatch(/\.pdf-page \{[^}]*flex:\s*0 0 auto;/s);
   });
 });

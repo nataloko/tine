@@ -12,6 +12,7 @@ import { isBuiltinHidden, rawOffsetToVisibleOffset } from "../editor/properties"
 import { graphBinding } from "../persistence";
 import { visibleBody } from "../render/block";
 import { LinkDepthContext } from "./linkDepth";
+import { readOr } from "../resourceRead";
 
 // The "near the viewport" lazy-mount observer is shared app-wide (block bodies
 // use it too) — see src/lazyObserve.ts.
@@ -58,7 +59,7 @@ export function LiveRefGroup(props: {
   });
 
   // Load the source page only once the group is near the viewport.
-  const [ready] = createResource(
+  const [readyResource] = createResource(
     () => (near() ? { p: props.page, k: props.kind, path: props.path } : null),
     async ({ p, k, path }) => {
       const occupied = pageByName(p);
@@ -102,6 +103,9 @@ export function LiveRefGroup(props: {
   // O(N) per row → O(N²) per group (250k iterations on a 500-block hub group).
   const byId = createMemo(() => new Map(props.blocks.map((b) => [b.id, b] as const)));
   const evidenceById = createMemo(() => new Map((props.evidence ?? []).map((item) => [item.block_id, item])));
+  // A source page that failed to load leaves the group on its DTO path below,
+  // which is the same path it uses before the page is near the viewport.
+  const ready = () => readOr(readyResource, undefined, "reference group source page");
   const dtoById = (id: string) => byId().get(id);
   const liveBreadcrumb = (id: string): string[] | null => {
     if (!ready() || !doc.byId[id]) return null;
@@ -315,22 +319,27 @@ export function LiveRefGroup(props: {
                       <div class="reference-live-evidence">
                         <OccurrenceControls
                           evidence={item()}
-                          onOccurrence={(offset) => startEditing(
-                            id,
-                            rawOffsetToVisibleOffset(
-                              doc.byId[id]?.raw ?? "",
-                              offset,
-                              isBuiltinHidden,
-                              formatForPage(props.page),
-                            ),
-                            null,
-                            surface,
-                          )}
+                          onOccurrence={(span) => {
+                            // Select the mention rather than collapsing a caret
+                            // onto it: a caret is invisible on iOS, so every
+                            // numbered jump looked identical there (GH #200).
+                            const raw = doc.byId[id]?.raw ?? "";
+                            const format = formatForPage(props.page);
+                            const start = rawOffsetToVisibleOffset(raw, span.start, isBuiltinHidden, format);
+                            const end = rawOffsetToVisibleOffset(raw, span.end, isBuiltinHidden, format);
+                            startEditing(
+                              id,
+                              { start, end: Math.max(start, end), direction: "forward" },
+                              null,
+                              surface,
+                            );
+                          }}
                         />
                       </div>
                     )}
                   </Show>
-                  <Block id={id} hideRefCount={!!props.embedId && id === props.embedId} />
+                  <Block id={id} hideRefCount={!!props.embedId && id === props.embedId}
+                    dragHostId={props.surface === "embed" && id === props.embedId ? props.hostBlockId : undefined} />
                 </Show>
               </>
             );

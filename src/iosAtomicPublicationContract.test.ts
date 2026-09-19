@@ -1,10 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import {
+  modelModuleFiles,
+  modelModuleSource,
+  rustModuleFiles,
+} from "./rustModelSource.test-helpers";
 
 const sources = [
-  "crates/tine-core/src/model.rs",
-  "crates/tine-core/src/oplog/enrollment.rs",
-  "crates/tine-core/src/oplog/projection_store.rs",
+  ...modelModuleFiles(),
+  ...rustModuleFiles("crates/tine-core/src/filesystem_durability.rs"),
 ];
 
 describe("iOS atomic publication platform boundary", () => {
@@ -16,7 +20,7 @@ describe("iOS atomic publication platform boundary", () => {
   });
 
   it("admits iOS wherever the graph projection platform is selected", () => {
-    const model = readFileSync("crates/tine-core/src/model.rs", "utf8");
+    const model = modelModuleSource();
     const platformGate = model.slice(
       model.indexOf("fn require_projection_platform()"),
       model.indexOf("fn open_projection_root_nofollow")

@@ -4,13 +4,104 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GitStatus, GitResult, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, PublishOutcome, QueryExecution, QueryExportBatch, QueryExportSpec, QueryPublicationPlan, QueryPublicationRequest, RefGroup, RenameOutcome, SavePageResult, SyncConflictDiff } from "./types";
+import { sourceOptions, sourceOriginal } from "./editor/queryIr";
+import { groupingToViewValue, resolveQueryGrouping } from "./editor/queryViewProperties";
+import type {
+  ExplainEmptyResult,
+  ParsedQuery,
+  Query,
+  QueryPrintDialect,
+  QueryResult,
+  QueryTextDialect,
+  RegistrySnapshot,
+  Source,
+  ViewKind,
+  ViewSettings,
+} from "./editor/queryIr";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { leadingMarker } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
 import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
 import { parseJournalWith } from "./journal";
+
+/** The dev preview's stand-in for `query_print`'s refusal (§7.1, I-9): the same
+ *  JSON envelope the native command rejects with, so `classifyNativeCallError`
+ *  decodes it into the same `QueryPrintRefusedError` a real refusal produces and
+ *  callers cannot accidentally handle the two differently. */
+function mockPrintRefusal(reasonCode: "not_applicable" | "syntax", message: string): Error {
+  return new Error(JSON.stringify({
+    kind: "query-print-refused",
+    reason_code: reasonCode,
+    detail: { kind: reasonCode, message, suggestions: [], disabled: false },
+  }));
+}
+
+/**
+ * **The one data-only fixture seam for the query commands (P3, T2 step 2).**
+ *
+ * The mock deliberately refuses to print or parse a query — a parser here would
+ * be the frontend twin this campaign deleted (I-12, D-14). But the anchor-switch
+ * preview in the sheet *is* a print-then-parse round trip through the engine, so
+ * a jsdom test and the screenshot harness need the engine's ANSWERS without the
+ * engine.
+ *
+ * So this takes canned VALUES — a printed string, a `ParsedQuery` with `raw`
+ * leaves, a registry list, a result — and never callbacks. It cannot compute
+ * anything, cannot become a parser, and answers the same bytes no matter what it
+ * is asked. The engine's semantics are proven by the Rust cases in
+ * `crates/tine-core/src/query/tql.rs` and by the native journey
+ * `scripts/e2e-query-sheet.mjs`, never by this double.
+ *
+ * It is mock-only by construction: `src/mockQueryFixture.guard.test.ts` asserts
+ * that no production module under `src/` imports it. `shot-query-sheet.mjs`
+ * installs it through `page.addInitScript` on
+ * `globalThis.__tineMockQueryFixture`, which is read here for the same reason.
+ */
+export interface MockQueryFixture {
+  parse?: ParsedQuery;
+  print?: string;
+  registry?: RegistrySnapshot;
+  run?: QueryResult;
+}
+
+let installedQueryFixture: MockQueryFixture | null = null;
+
+/** Install (or, with `null`, clear) the canned query answers. Reset between
+ *  tests; without one the mock keeps its ordinary refusal. */
+export function installMockQueryFixture(fixture: MockQueryFixture | null): void {
+  installedQueryFixture = fixture;
+}
+
+function queryFixture(): MockQueryFixture | null {
+  if (installedQueryFixture) return installedQueryFixture;
+  const injected = (globalThis as { __tineMockQueryFixture?: MockQueryFixture })
+    .__tineMockQueryFixture;
+  return injected ?? null;
+}
+
+/** The `tine.*` view properties a host block carries, as `ViewSettings` (§4.1).
+ *  The real command merges these OVER the directives lifted from the query text;
+ *  the mock has no directives to merge with, so the properties are the whole
+ *  answer.
+ *
+ *  The GROUPING is not decided here. `tine.group-field` versus the legacy
+ *  `tine.group-by`, and what a bare token means at each view, is one question
+ *  with one answer — `resolveQueryGrouping`, the adapter the app itself uses —
+ *  and a second `if` in the dev-preview backend is exactly the twin that would
+ *  disagree with Rust on the inputs that matter. */
+function mockViewFromProperties(properties: [string, string][]): ViewSettings {
+  const view: ViewSettings = {};
+  for (const [key, value] of properties) {
+    if (key === "tine.view" && ["search", "list", "table", "board"].includes(value)) {
+      view.view = value as ViewKind;
+    }
+  }
+  const grouping = groupingToViewValue(resolveQueryGrouping(properties, { view: view.view }));
+  if (grouping !== undefined) view.group_by = grouping;
+  return view;
+}
 
 /** Mock feed membership must use a Logseq journal-title parser, never the
  * host's permissive/non-portable Date string parser. Keep the same explicit
@@ -506,6 +597,9 @@ const mockHighlights: Record<string, { label: string; highlights: Highlight[]; p
 // In-memory UI session for the browser mock (no backend file).
 let mockSession: string | null = null;
 let mockWorkspaces: string | null = null;
+/** The dev preview has no app-data dir, so "dismissed" lives for the session —
+ *  which is the honest device-local answer for a browser preview. */
+let mockNotices = '{"dismissed":[]}';
 let mockLinkFirstMatch = false;
 let mockGuideAnnounced = false;
 const mockAssets: Record<string, Uint8Array> = {};
@@ -675,16 +769,6 @@ const mockActivations = new Map<string, number>();
 
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
-  let sparseV2: SparseV2Status = {
-    state: "legacy_default",
-    runtime: null,
-    can_activate: true,
-    can_retry: false,
-    can_cancel: false,
-    cancel_reason: null,
-    binding_generation: 1,
-    application_page_admission: { binding_generation: 1, authority: "direct" },
-  };
   const find = (name: string) =>
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ?? null;
 
@@ -724,7 +808,7 @@ export function mockBackend(): Backend {
       return {
         kind: "loaded" as const,
         binding_generation: 1,
-        application_page_admission: { binding_generation: 1, authority: "direct" as const },
+        application_page_admission: { binding_generation: 1 },
         meta: {
         root: "/mock/graph",
         journals_dir: "journals",
@@ -845,10 +929,6 @@ export function mockBackend(): Backend {
     async quit(): Promise<void> {
       // No-op in the mock/screenshot harness — there's no process to exit.
     },
-    async prepareQuit() {
-      // No-op in the mock/screenshot harness — there is no managed runtime.
-      return { status: "safe" as const };
-    },
     async closeGraphWindow(): Promise<void> {
       // No-op in the mock/screenshot harness.
     },
@@ -907,241 +987,13 @@ export function mockBackend(): Backend {
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
-      return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
+      return { revision: "mock-rev" }; // no-op in mock (no activation)
     },
     async beginDirectCrossPageMove(_destination: PageDto, _sources: PageDto[]): Promise<string | null> {
       return null; // the browser mock has no app-private root and no durable graph
     },
     async finishDirectCrossPageMove(_moveId: string): Promise<boolean> {
       return false;
-    },
-    async moveManagedApplicationSubtrees(
-      bindingGeneration: number,
-      request: ManagedApplicationMoveSubtreesRequest,
-    ): Promise<ManagedApplicationMoveSubtreesResult> {
-      return {
-        binding_generation: bindingGeneration,
-        application_page_admission: { binding_generation: bindingGeneration, authority: "direct" },
-        outcome: {
-          status: "no_commit",
-          episode_id: request.episode_id,
-          reason: "admission_changed",
-        },
-      };
-    },
-    async acknowledgeManagedApplicationMove(): Promise<void> {},
-    async recoverManagedApplicationSubtrees(
-      bindingGeneration: number,
-      request: ManagedApplicationMoveSubtreesRequest,
-    ): Promise<ManagedApplicationMoveSubtreesRecoveryResult> {
-      const applicationPageAdmission = {
-        binding_generation: bindingGeneration,
-        authority: "managed_unavailable" as const,
-      };
-      return {
-        previous_binding_generation: bindingGeneration,
-        binding_generation: bindingGeneration,
-        status: {
-          ...sparseV2,
-          binding_generation: bindingGeneration,
-          application_page_admission: applicationPageAdmission,
-        },
-        application_page_admission: applicationPageAdmission,
-        episode_id: request.episode_id,
-        outcome: {
-          status: "no_commit",
-          episode_id: request.episode_id,
-          reason: "admission_changed",
-        },
-      };
-    },
-    async preflightManagedPageMutation(page, baseRevision, bindingGeneration) {
-      if (sparseV2.application_page_admission.authority !== "managed_writable"
-          || sparseV2.binding_generation !== bindingGeneration) {
-        return { status: "refused" as const };
-      }
-      return {
-        status: "accepted" as const,
-        binding_generation: bindingGeneration,
-        page_name: page.name,
-        page_path: page.path ?? "",
-        base_revision: baseRevision,
-      };
-    },
-    async sparseV2Status() {
-      return sparseV2;
-    },
-    async onSparseV2Status() {
-      return () => {};
-    },
-    async onSparseV2Tick() {
-      return () => {};
-    },
-    async onSparseV2Error() {
-      return () => {};
-    },
-    async onSparseV2ActivationProgress() {
-      return () => {};
-    },
-    async activateSparseV2() {
-      sparseV2 = {
-        state: "active",
-        runtime: {
-          lifecycle: "active",
-          recovery: "first_promotion",
-          watcher: {
-            latest_enqueue: 0,
-            acknowledged: 0,
-            drain_in_flight: false,
-            pending: false,
-            pending_requires_full_scan: false,
-            deferred: false,
-            quiescing: false,
-            sequence_exhausted: false,
-          },
-          last_tick: null,
-          detail: null,
-          shared_role: null,
-          shared_phase: null,
-          provider_pending: 0,
-          provider_runnable: false,
-          search_index_building: false,
-        },
-        can_activate: false,
-        can_retry: false,
-        can_cancel: true,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "managed_writable",
-          application_save_page_blocks: 511,
-          application_page_request_text_bytes: 1_048_576,
-          application_page_max_depth: 128,
-        },
-      };
-      return sparseV2;
-    },
-    async cancelSparseV2() {
-      sparseV2 = {
-        state: "legacy_default",
-        runtime: null,
-        can_activate: true,
-        can_retry: false,
-        can_cancel: false,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "direct",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        recovery_statement:
-          "Direct file mode is active. Complete recovery state was preserved.",
-      };
-    },
-    async cancelSparseV2Cold() {
-      sparseV2 = {
-        state: "legacy_default",
-        runtime: null,
-        can_activate: true,
-        can_retry: false,
-        can_cancel: false,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "direct",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        recovery_statement:
-          "Direct file mode is active. Complete recovery state was preserved.",
-      };
-    },
-    async prepareSparseV2Share() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "initiator",
-          shared_phase: "active",
-        },
-      };
-      return sparseV2;
-    },
-    async joinSparseV2Shared() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "joiner",
-          shared_phase: "active",
-        },
-      };
-      return sparseV2;
-    },
-    async adoptSparseV2Shared() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "joiner",
-          shared_phase: "active",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        archive_location: "/mock/app-data/managed-recovery/graph-0",
-        adoption_statement:
-          "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived and was not merged.",
-      };
-    },
-    async sparseV2RecoveryLocation() {
-      return "/mock/app-data/managed-recovery";
-    },
-    async sparseV2Query() {
-      return { kind: "pages", value: [] };
-    },
-    async sparseV2EditorLoad() {
-      return { status: "missing_page" };
-    },
-    async sparseV2EditorSave() {
-      return { status: "conflict", reason: "missing_page" };
-    },
-    async sparseV2Tick() {
-      return { state: "idle", detail: null, epoch: null };
-    },
-    async listAbsenceSweeps() {
-      return [];
-    },
-    async onAbsenceSweepChanged() {
-      return () => {};
-    },
-    async reapplyAbsenceSweep(sweepId) {
-      return { sweep_id: sweepId, action_id: "mock-reapply", authored_batch_ids: [] };
-    },
-    async restoreAbsenceSweep(sweepId) {
-      return { sweep_id: sweepId, action_id: "mock-restore", authored_batch_ids: [], fidelity: [] };
-    },
-    async keepAbsenceSweepDeletion() {},
-    async sparseV2CleanShutdown() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
-      sparseV2 = {
-        ...sparseV2,
-        runtime,
-      };
-      return runtime;
     },
     async guidePages(): Promise<GuidePage[]> {
       return mockGuidePages().map((g) => ({ ...g, page: clonePage(g.page) }));
@@ -1251,6 +1103,25 @@ export function mockBackend(): Backend {
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
     },
+    async publishQueryPlan(request: QueryPublicationRequest): Promise<QueryPublicationPlan> {
+      const folder = request.folder ?? (request.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "query");
+      return {
+        anchor: request.advanced ? "block" : "block",
+        rowCount: 3,
+        sampled: false,
+        boundPage: request.currentPage ?? null,
+        pages: all.slice(0, 3).map((p) => ({ path: `pages/${p.name}.md`, name: p.name, journal: false })),
+        folder,
+        path: `/mock/graph/published-queries/${folder}`,
+        exists: false,
+        suggestedFolder: null,
+        fingerprint: "mock-fingerprint",
+      };
+    },
+    async publishQuery(request: QueryPublicationRequest, _fingerprint: string): Promise<PublishOutcome> {
+      const folder = request.folder ?? "query";
+      return { path: `/mock/graph/published-queries/${folder}`, pages: 3, retired: null, warnings: [] };
+    },
     async pagePrintHtml(name: string, _opts): Promise<string> {
       // Dev-preview stub: a small self-contained doc so the print harness/flow can
       // render something without the real publish pipeline.
@@ -1278,6 +1149,126 @@ export function mockBackend(): Backend {
         return { groups, ran: ["task"], ignored: [], supported: true };
       }
       return { groups: [], ran: [], ignored: [], supported: false };
+    },
+    // ---- The six query commands (SPEC §7.1, N23) ------------------------
+    //
+    // **These are deliberately NOT a second query engine** (D-14, I-12). The real
+    // parser, printer and walk live in `crates/tine-core/src/query/`; the browser
+    // dev-preview cannot call them, so these mocks answer the SHAPE of each
+    // command — enough for the screenshot harness and for a caller to be
+    // type-checked against the real contract — and say so when they cannot answer
+    // the substance. Growing them into a working OG/TQL parser here would
+    // reintroduce exactly the frontend twin this packet deleted.
+    async parseQuery(
+      text: string,
+      dialect: QueryTextDialect,
+      blockProperties?: [string, string][],
+    ): Promise<ParsedQuery> {
+      // **The mock does not split the options map, deliberately.** Splitting a
+      // macro argument is the ONE thing this packet moved into Rust (§7.1, X4);
+      // a copy here — even a "just for the dev preview" copy — is the second
+      // answer to "where does the options map start" that I-12 forbids, and it
+      // would disagree with Rust on exactly the input that matters. So the whole
+      // argument is retained verbatim as `original` with no options. That keeps
+      // the property the byte contract actually needs: a `preserveForm` print
+      // re-emits these exact bytes, so a title edit through the dev preview
+      // still cannot corrupt the author's query — it simply cannot separate the
+      // title out to edit it, which is the honest capability of a backend with
+      // no parser.
+      // A canned answer, when a test or the screenshot harness installed one.
+      const canned = queryFixture()?.parse;
+      if (canned) return { query: canned.query, view: { ...canned.view } };
+      const original = text;
+      const ogOptions = "";
+      const kind: Source["kind"] =
+        dialect === "macro_tql" || dialect === "tql"
+          ? "tql"
+          : dialect === "advanced"
+            ? "advanced"
+            : "og";
+      const query: Query = {
+        anchor: "block",
+        // A mock cannot know the filter, and inventing one would make callers
+        // "work" against an answer the real engine would never give. `raw` is the
+        // IR's own honest spelling for retained-but-not-understood text (§4.3.2),
+        // and it carries the payload losslessly so a print can still re-emit it.
+        filter: { kind: "raw", text: original, diagnostic_kind: "not_applicable" },
+        diagnostics: [{
+          kind: "not_applicable",
+          message: "The browser dev preview does not run the query engine.",
+          suggestions: [],
+          disabled: false,
+        }],
+        source: kind === "advanced"
+          ? { kind: "advanced", original, og_options: ogOptions }
+          : kind === "tql"
+            ? { kind: "tql", original, og_options: ogOptions }
+            : { kind: "og", original, og_options: ogOptions },
+      };
+      return { query, view: mockViewFromProperties(blockProperties ?? []) };
+    },
+    async printQuery(
+      query: Query,
+      _view: ViewSettings,
+      dialect: QueryPrintDialect,
+      preserveForm = false,
+    ): Promise<string> {
+      // Source-preserving printing is byte transport, not lowering, so the mock
+      // gets it exactly right (§4.3.1): the original form plus the options map,
+      // once.
+      const canned = queryFixture()?.print;
+      if (canned != null && !preserveForm) return canned;
+      const original = sourceOriginal(query.source);
+      if (preserveForm) {
+        if (original === null) {
+          throw mockPrintRefusal("not_applicable", "A builder query has no source form to preserve.");
+        }
+        const options = sourceOptions(query.source);
+        return options ? `${original} ${options}` : original;
+      }
+      // Re-lowering an IR to text IS the printer, and the printer is in Rust.
+      // Refuse in the command's own envelope rather than returning a plausible
+      // string the caller would then SAVE over the author's query.
+      if (dialect === "og") {
+        throw mockPrintRefusal(
+          "not_applicable",
+          "The browser dev preview cannot print the OG DSL from an IR.",
+        );
+      }
+      throw mockPrintRefusal(
+        "syntax",
+        "The browser dev preview cannot print a query from an IR.",
+      );
+    },
+    async queryOgExpressible(): Promise<boolean> {
+      // The mock's parse never produces an OG-expressible IR (its filter is a
+      // `raw` capsule), so this is not a guess — it is the true answer for the
+      // values this backend hands out.
+      return false;
+    },
+    async queryRegistry(): Promise<RegistrySnapshot> {
+      return queryFixture()?.registry ?? { rows: [], generation: 0 };
+    },
+    async queryRun(query: Query): Promise<QueryResult> {
+      const canned = queryFixture()?.run;
+      if (canned) return canned;
+      // An invalid query returns zero rows plus its diagnostics (§3.5) — which is
+      // precisely the mock's situation, so this arm is the contract, not a stub.
+      return {
+        anchor: "block",
+        groups: [],
+        diagnostics: query.diagnostics ?? [],
+        report: { ran: [], ignored: [], supported: false },
+        total: 0,
+        exceeded: false,
+      };
+    },
+    async queryExplainEmpty(query: Query): Promise<ExplainEmptyResult> {
+      return {
+        rows: [],
+        diagnostics: query.diagnostics ?? [],
+        report: { ran: [], ignored: [], supported: false },
+      };
     },
     async runQuery(query: string): Promise<RefGroup[]> {
       // Simplified mock evaluator: task/todo filter or page-ref filter.
@@ -2098,10 +2089,7 @@ export function mockBackend(): Backend {
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },
-    async onSparseV2Changed(): Promise<() => void> {
-      return () => {};
-    },
-    async onManagedSyncError(): Promise<() => void> {
+    async onQueryProjectionChanged(): Promise<() => void> {
       return () => {};
     },
     async onGraphWatchError(): Promise<() => void> {
@@ -2159,6 +2147,12 @@ export function mockBackend(): Backend {
     },
     async saveWorkspaces(data: string): Promise<void> {
       mockWorkspaces = data;
+    },
+    async loadNotices(): Promise<string> {
+      return mockNotices;
+    },
+    async saveNotices(data: string): Promise<void> {
+      mockNotices = data;
     },
     async takeIdentifierMigrationNotice(): Promise<boolean> {
       return false;

@@ -65,11 +65,6 @@ pub(crate) struct ParsedDocument {
     /// preamble heading that remains unbulleted while owning following outline
     /// blocks as children. Org documents never have this Markdown-only layout.
     pub(crate) promoted_heading_layout: Option<PromotedHeadingLayout>,
-    /// Parser-owned outline event count and maximum representable tree depth.
-    /// Sync admission consumes these instead of running a second handwritten
-    /// structural grammar over the source.
-    pub(crate) outline_nodes: usize,
-    pub(crate) outline_depth: usize,
 }
 
 /// One receipt-proved association between a source structural locator and the
@@ -253,6 +248,15 @@ impl DocBlock {
         }
     }
 
+    /// A page's preamble (`Document::pre_block`) as a block of the page's own
+    /// format, so its properties, tags and visible text come from the same
+    /// lsdoc projection as any block's.
+    pub(crate) fn preamble(raw: &str, is_org: bool) -> Self {
+        let mut block = DocBlock::new(raw);
+        block.is_org = is_org;
+        block
+    }
+
     /// Lazily-computed, memoized projection of `raw` (visible lowercased text +
     /// normalized refs). Safe to memoize because it's a pure function of `raw`
     /// and a cached DocBlock is REPLACED wholesale (a fresh, empty cell) whenever
@@ -365,11 +369,18 @@ pub(crate) const CRUMB_MAX_CHARS: usize = 60;
 /// of its visible text, trimmed, elided with `…` past [`CRUMB_MAX_CHARS`].
 ///
 /// DUP-8: this used to exist three times -- byte-identical in `query.rs` and
-/// `query_plan.rs`, and a third time in `sync_runtime.rs` over a synthesized
+/// `query_plan.rs`, and a third time over a synthesized
 /// `DocBlock`. Three copies of a truncation rule is three places for the rule
 /// to drift.
 pub(crate) fn crumb_line(block: &DocBlock) -> String {
-    let line = block.visible_text().lines().next().unwrap_or("").trim();
+    crumb_line_text(block.visible_text())
+}
+
+/// The breadcrumb transform over an already projected exact visible string.
+/// Database-backed readers use this rather than synthesizing a `DocBlock` or
+/// reparsing source solely to apply the shared first-line/elision rule.
+pub(crate) fn crumb_line_text(visible: &str) -> String {
+    let line = visible.lines().next().unwrap_or("").trim();
     if line.chars().count() > CRUMB_MAX_CHARS {
         format!(
             "{}…",
@@ -1308,17 +1319,19 @@ pub fn markdown_round_trips(content: &str) -> bool {
 /// Whether parsing and format-preserving serialization retain the complete
 /// document model, even when insignificant source trivia is canonicalized.
 ///
-/// Sparse-v2 admission uses this structural criterion: activation preserves the
-/// original source bytes and its backup, so harmless whitespace normalization
-/// must not prevent import. A later edit may canonicalize that trivia, but it
-/// may not change block content or ancestry.
-pub fn markdown_structurally_round_trips(content: &str) -> bool {
+/// Harmless whitespace normalization passes; a change to block content or
+/// ancestry does not. Serializer tests use it as their round-trip oracle. It is
+/// test-only because Direct Files has no Markdown read-only gate; the outline
+/// differential pins the inputs whose canonical save reshapes the outline.
+#[cfg(test)]
+pub(crate) fn markdown_structurally_round_trips(content: &str) -> bool {
     let Ok(parsed) = try_parse_with_source_spans(content) else {
         return false;
     };
     markdown_structurally_round_trips_parsed(content, &parsed)
 }
 
+#[cfg(test)]
 pub(crate) fn markdown_structurally_round_trips_parsed(
     content: &str,
     parsed: &ParsedDocument,
@@ -1802,11 +1815,9 @@ mod promoted_heading_tests {
     /// This is not a hypothetical layout: real Logseq journals contain it. A
     /// journal page in Martin's graph opens with a bulleted `- # A` and then
     /// carries unbulleted `# B` / `# C` siblings, each owning tab-indented
-    /// children — both forms in one file, written by Logseq itself. Managed
-    /// storage has to accept every shape Direct Markdown accepts, so a
-    /// canonicalisation that re-bulleted the later headings would both churn
-    /// those bytes and shrink managed storage to a subset of the graphs that
-    /// already work.
+    /// children — both forms in one file, written by Logseq itself. A
+    /// canonicalisation that re-bulleted the later headings would churn those
+    /// bytes on save.
     #[test]
     fn a_page_mixing_bulleted_and_unbulleted_headings_round_trips_byte_for_byte() {
         let source =

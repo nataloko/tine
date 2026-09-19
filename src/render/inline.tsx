@@ -26,6 +26,8 @@ import { coarseSpanAttrs, literalSpanAttrs, plainSpanAttrs, typographicPlainSpan
 import { createLongPress } from "./longPress";
 import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
+import { leadingMarker, matchLeadingMarker } from "../markers";
+import { isQueryMacroName, queryMacroExtentAtSpan, QUERY_MACRO_NAMES } from "../editor/queryMacro";
 import { AstBody } from "./body";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
@@ -46,6 +48,7 @@ import { annotationInfoForBlock, pdfFileFromPreBlock } from "../editor/annotatio
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { hiccupToHtml } from "./hiccup";
 import { ExternalLink, reportLinkOpenFailure } from "../components/ExternalLink";
+import { readOr } from "../resourceRead";
 
 
 // ===========================================================================
@@ -57,9 +60,29 @@ import { ExternalLink, reportLinkOpenFailure } from "../components/ExternalLink"
 
 // Shared `{{macro}}` dispatch, keyed off a reconstructed body string for built-ins.
 // User macros get parser-supplied args from the AST path so quoted commas survive.
-function renderMacroBody(raw: string, blockId?: string, userArgs?: string[]): JSX.Element {
+//
+// **The query arm does not use `raw` (§4.3.1, §7.9).** `macroBody` rebuilds a
+// body with `args.join(", ")`, and mldoc's macro parser both splits on commas
+// and stops before the first `}` — so for `{{query (task TODO) {:title "T"}}}`
+// the AST argument is `(task TODO) {:title "T"` with the closing brace missing,
+// and `content = 'a,b'` comes back as `content = 'a, b'`. A query is therefore
+// dispatched with its RAW SOURCE SLICE, recovered from the owning block by the
+// macro's own source offset. `rawArgument` is that slice; when the caller has no
+// span or no block (macro expansion, decorator unit tests) the arm falls back to
+// the reconstructed body, which is what every non-query macro still uses.
+function renderMacroBody(
+  raw: string,
+  blockId?: string,
+  userArgs?: string[],
+  rawMacro?: { name: string; argument: string },
+): JSX.Element {
   const body = raw.trimStart();
-  if (/^query\b/i.test(body)) return <QueryMacro body={body} blockId={blockId} />;
+  if (rawMacro) {
+    return <QueryMacro body={`${rawMacro.name} ${rawMacro.argument}`} macroName={rawMacro.name} blockId={blockId} />;
+  }
+  if (QUERY_MACRO_NAMES.some((name) => new RegExp(`^${name}\\b`, "i").test(body))) {
+    return <QueryMacro body={body} blockId={blockId} />;
+  }
   if (/^embed\b/i.test(body)) return <EmbedMacro body={body} blockId={blockId} />;
   if (/^youtube-timestamp\b/i.test(body)) return <YoutubeTimestamp body={body} />;
   if (/^(video|youtube|vimeo|bilibili)\b/i.test(body)) return <VideoMacro body={body} />;
@@ -159,7 +182,7 @@ function renderInline(s: Inline, blockId?: string, spanMode = true, macroExpansi
     case "tag":
       return <PageRef name={astText(s.children)} blockId={blockId} tag spanAttrs={spanMode ? coarseSpanAttrs(s.span) : undefined} />;
     case "macro":
-      return renderMacroBody(macroBody(s), blockId, s.args);
+      return renderMacroBody(macroBody(s), blockId, s.args, rawQueryMacro(s, blockId));
     case "latex":
       return <MathView tex={s.body} display={s.mode === "Displayed"} spanAttrs={spanMode ? coarseSpanAttrs(s.span) : undefined} />;
     case "timestamp":
@@ -245,6 +268,27 @@ function macroBody(s: MacroInline): string {
   return s.args.length ? `${s.name} ${s.args.join(", ")}` : s.name;
 }
 
+/** The RAW source slice of a query macro node, by source offset (§4.3.1).
+ *
+ *  Returns null for a non-query macro, and for a query macro the renderer cannot
+ *  anchor: no span (the AST did not carry one), no owning block, or no extent
+ *  covering the offset. The caller then falls back to the reconstructed body —
+ *  lossy for options maps and literal commas, but never worse than before this
+ *  packet, and it is the only path an expanded user macro can take (its text is
+ *  not a slice of any block's raw source). */
+function rawQueryMacro(s: MacroInline, blockId?: string): { name: string; argument: string } | undefined {
+  if (!isQueryMacroName(s.name)) return undefined;
+  if (!blockId || s.span === undefined) return undefined;
+  const raw = doc.byId[blockId]?.raw;
+  if (raw === undefined) return undefined;
+  // Anchor exactly, or not at all — `queryMacroExtentAtSpan` owns both the
+  // span→index mapping and the exactness requirement, so a span measured against
+  // some OTHER string finds nothing and this falls back rather than rendering one
+  // query's results under another query's text.
+  const extent = queryMacroExtentAtSpan(raw, s.span);
+  return extent ? { name: extent.name, argument: extent.argument } : undefined;
+}
+
 const PEEK_OPEN_MS = 350;
 const PEEK_CLOSE_MS = 150;
 const PEEK_BLOCK_CAP = 50;
@@ -265,7 +309,10 @@ function createPeekBridge(disabled: () => boolean) {
       closeT = undefined;
     }
   };
-  const anchorEnter = () => {
+  const anchorEnter = (event: PointerEvent) => {
+    // Touch WebViews synthesize mouse hover around a hold. Only a real mouse
+    // may arm a hover preview; hybrid devices keep their mouse behavior.
+    if (event.pointerType !== "mouse") { dismiss(); return; }
     if (disabled()) return;
     clearClose();
     clearOpen();
@@ -317,7 +364,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     !props.tag && !isGuidePageName(targetName()) && pageIsMissing(targetName());
   const kind = (): PageKind => (isGuidePageName(targetName()) ? "page" : isJournalTitle(targetName()) ? "journal" : "page");
   const open = (e: MouseEvent) => {
-    if (longPress.consumeClick()) {
+    if (longPress.consumeClick(e)) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -340,10 +387,13 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
   // arms on primary touch/pen pointers.
   const longPress = createLongPress(() => anchorEl);
   onCleanup(longPress.dispose);
-  const [preview] = createResource(
+  const [previewResource] = createResource(
     () => (peek.open() && !isGuidePageName(targetName()) ? `${targetName()}\0${graphEpoch()}` : null),
     () => backend().getPage(targetName(), kind()),
   );
+  // A hover preview that cannot be fetched shows no popup. Before readOr the
+  // rejection threw out of this read and cost the whole page region.
+  const preview = () => readOr(previewResource, undefined, "page peek");
   const capped = createMemo(() => capBlockTree(preview()?.blocks ?? [], PEEK_BLOCK_CAP));
 
   return (
@@ -357,8 +407,8 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         // so the gestures can't leak to the browser (GH #42, GH #207).
         onMouseDown={internalLinkMouseDown}
         onClick={open}
-        onMouseEnter={peek.anchorEnter}
-        onMouseLeave={peek.anchorLeave}
+        onPointerEnter={peek.anchorEnter}
+        onPointerLeave={peek.anchorLeave}
         onPointerDown={longPress.onPointerDown}
         onPointerMove={longPress.onPointerMove}
         onPointerUp={longPress.onPointerUp}
@@ -671,7 +721,7 @@ function loadKatex() {
 export function MathView(props: { tex: string; display: boolean; spanAttrs?: SpanDomAttrs }): JSX.Element {
   const [katex] = createResource(loadKatex);
   const html = createMemo(() => {
-    const k = katex();
+    const k = readOr(katex, undefined, "KaTeX");
     if (!k) return null;
     try {
       return k.renderToString(props.tex, { throwOnError: false, displayMode: props.display });
@@ -986,10 +1036,13 @@ function MediaEmbed(props: {
   const external = /^(https?:|data:|blob:)/.test(props.url);
   const rel = () => assetRelPath(props.url);
   // Graph media uses native range requests; never copy a multi-GB file into a Blob.
-  const [blob] = createResource(
+  const [blobResource] = createResource(
     () => (external ? null : rel()),
     async (r) => (r ? await backend().streamAsset(r) : "")
   );
+  // An asset stream that fails leaves the native element without a src, which
+  // is what `blobFallback()` below already exists to cover.
+  const blob = () => readOr(blobResource, undefined, "inline audio asset");
   const src = () => blobFallback() || (external ? props.url : blob());
   const label = () =>
     decodeURIComponent((rel() || props.url).split("/").pop() || props.url);
@@ -1153,16 +1206,27 @@ function blockInlines(blocks: AstBlock[]): Inline[] {
  *  preview line, …) — anything NOT a full block body. Parses via the in-browser
  *  wasm parser (src/render/parse.ts) and renders the inline run; `blockId` is
  *  threaded to inline `{{query}}` macros so they can rewrite the owning block. */
-export function InlineText(props: { text: string; blockId?: string; format?: Format; macroExpansion?: boolean }): JSX.Element {
+export function InlineText(props: { text: string; blockId?: string; format?: Format; macroExpansion?: boolean; preserveMarker?: boolean }): JSX.Element {
   // Only parse once the wasm parser is ready — `parseBlock` THROWS otherwise, and
   // unlike AstBody these callers (property values, breadcrumbs, ref previews, PDF
   // annotations) have no error boundary. When the parser isn't ready, OR when the
   // line is a block construct that yields no inline-flow content (`> quote`, `---`,
   // `| a | b |`, `[^1]: …`, `$$…$$`, …), fall back to the literal text so the
   // content is never dropped — matching the old inline-only renderer.
-  const inlines = createMemo(() =>
-    parserReady() ? blockInlines(parseBlock(props.text, props.format === "org")) : null,
-  );
+  const inlines = createMemo(() => {
+    if (!parserReady()) return null;
+    const blocks = parseBlock(props.text, props.format === "org");
+    const inline = blockInlines(blocks);
+    // A reference has already separated its task state from the body. A task
+    // word still in that body is literal content (e.g. `TODO TODO buy milk`),
+    // even though the block parser projects it as a header facet on reparse.
+    const marker = props.preserveMarker && matchLeadingMarker(props.text);
+    if (marker && inline.length > 0) {
+      const end = marker.end + (props.text[marker.end] === " " ? 1 : 0);
+      return [{ k: "plain" as const, text: props.text.slice(0, end) }, ...inline];
+    }
+    return inline;
+  });
   return (
     <Show when={inlines() && inlines()!.length > 0} fallback={<EmojiText text={props.text} />}>
       {renderInlines(inlines()!, props.blockId, false, props.macroExpansion ?? false, props.format)}
@@ -1224,17 +1288,21 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
   }
 }
 
-// Inline block reference. Bare `((uuid))` shows the referenced block's first
-// line; the labeled form `[label](((uuid)))` shows the label instead. Both
+// Inline block reference. Bare `((uuid))` shows the referenced block's full
+// visible body; the labeled form `[label](((uuid)))` shows the label instead. Both
 // navigate to the source page on click and show a hover preview of the full
 // referenced block (mirrors OG); a missing target falls back to a short id.
 function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
   const insidePeek = useContext(PeekContext);
   let anchorEl: HTMLSpanElement | undefined;
-  const [grp] = createResource(
+  const [grpResource] = createResource(
     () => `${props.id}\0${graphEpoch()}\0${dataRev()}`,
     () => resolveBlockBatched(props.id)
   );
+  // `undefined` on failure, not `null`: `null` is an AUTHORITATIVE miss (see
+  // targetRaw below) and a failed lookup has not established that. Undefined
+  // keeps a loaded reactive node winning and otherwise shows the short id.
+  const grp = () => readOr(grpResource, undefined, "block reference target");
   const peek = createPeekBridge(() => insidePeek);
   // A loaded target shares the editor's reactive node, so references update on
   // the keystroke without re-resolving every visible uuid after every save. The
@@ -1249,8 +1317,21 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
     if (resolved === null) return undefined;
     return liveTarget()?.raw ?? resolved?.blocks[0].raw;
   };
-  // Visible text: an explicit label wins; otherwise the target's first line.
-  const text = () => props.label ?? (targetRaw() ? visibleBody(targetRaw()!)[0] : undefined);
+  // An explicit label wins. Bare references retain soft line breaks instead of
+  // silently truncating the referenced block at its first line (GH #506).
+  const lines = () => props.label !== undefined
+    ? [props.label]
+    : targetRaw()
+      ? visibleBody(targetRaw()!)
+      : undefined;
+  // Mirror the source's state with its shared recognizer and chip styling.
+  // Explicit aliases remain label-only; targetRaw keeps live and unloaded
+  // references current without another resolver (GH #518).
+  const marker = () => {
+    if (props.label !== undefined) return null;
+    const raw = targetRaw();
+    return raw ? leadingMarker(raw) : null;
+  };
   // Parse the referenced block's text with ITS page's format (org refs render org).
   const fmt = () => liveTarget() ? formatForBlock(props.id) : formatForPage(grp()?.page);
   const annotation = () => {
@@ -1260,10 +1341,11 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
   // Summary resolution stays shallow and graph-lifetime cached. Fetch the
   // descendant tree only after the hover dwell, through a backend operation
   // that applies the cap before DTO allocation and IPC serialization.
-  const [preview] = createResource(
+  const [previewResource] = createResource(
     () => (peek.open() && grp() ? `${props.id}\0${graphEpoch()}\0${dataRev()}` : null),
     () => backend().previewBlock(props.id, PEEK_BLOCK_CAP),
   );
+  const preview = () => readOr(previewResource, undefined, "block reference peek");
   const capped = createMemo(() => capBlockTree(preview()?.group.blocks ?? [], PEEK_BLOCK_CAP));
   const previewTruncated = () => (preview()?.truncated ?? 0) + capped().truncated;
   return (
@@ -1280,8 +1362,8 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
         // Shared guard: suppress native shift-range-selection / middle-click
         // autoscroll up front (GH #42, GH #207).
         onMouseDown={internalLinkMouseDown}
-        onMouseEnter={peek.anchorEnter}
-        onMouseLeave={peek.anchorLeave}
+        onPointerEnter={peek.anchorEnter}
+        onPointerLeave={peek.anchorLeave}
         // Middle-click → background tab with the block anchor (GH #283).
         onAuxClick={(e) => {
           if (internalLinkAuxClick(e, () => {
@@ -1341,8 +1423,18 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}
       >
-        <Show when={text() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
-          <InlineText text={text()!} format={fmt()} />
+        <Show when={lines() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
+          <Show when={marker()}>
+            {(m) => <><span class={`block-marker marker-${m().toLowerCase()}`}>{m()}</span>{" "}</>}
+          </Show>
+          <For each={lines()!}>
+            {(line, index) => (
+              <>
+                <Show when={index() > 0}><br /></Show>
+                <InlineText text={line} format={fmt()} preserveMarker={props.label === undefined} />
+              </>
+            )}
+          </For>
         </Show>
       </span>
       <Show when={peek.open() && preview() && capped().blocks.length > 0}>

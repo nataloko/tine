@@ -23,9 +23,8 @@ Existing specialized exemplars remain `pdfOwnership.ts`, RightSidebar's
 Each entry names the item, the production producer that owns the work, the
 trigger or key that may re-run it, the numeric bound, and the proof test. All
 four are pinned by `src/frontendStaleness.contract.test.ts`; a bound with no
-proof test is not a contract. The packet's fifth item is a Rust-side
-measurement of the Managed clean-reopen path and is recorded in
-`docs/storage-sync-contract.md` instead.
+proof test is not a contract. The packet's fifth item measured a storage mode
+Tine no longer has, so it has no entry here.
 
 **Item 1 — sort-key derivation.** Producer: the `sortedRows` memo in
 `src/components/SheetTable.tsx`. Trigger: a change of sort column/direction or
@@ -50,15 +49,19 @@ is built; a counter downstream would report zero even while the `Set` was
 rebuilt. Proof:
 `src/pages.inventory.test.ts::GH #229 complete page-name inventory::rebuilds the page-name merge zero times across five unchanged-reply lulls`.
 
-**Item 3 — QueryBuilder facets.** Producer: the facets `createResource` in
+**Item 3 — QueryBuilder registry.** Producer: the registry `createResource` in
 `src/components/QueryBuilder.tsx`, routed through `sharedQueryResult` under the
-`query-facets` key namespace. Trigger/key: the canonical graph scope
-`` `${graphMeta()?.root ?? ""}\0${graphEpoch()}` `` plus `dataRev()`. Bound: `1`
-`queryFacets(false)` request per (graph scope, `dataRev`) regardless of how many
-builder instances are mounted, with every mounted builder exposing the current
-payload through its production Property control. `queryFacets(true)`
-(autocomplete) asks a different question and keeps its own call. Proof:
-`src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders`.
+`query-registry` key namespace. Trigger/key: the canonical graph scope
+`sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding())` plus `dataRev()` and the
+module-level declaration revision that `requestQueryRegistryRefresh()` bumps
+when a builder declares a property the snapshot cannot know about yet. Bound:
+`1` `query_registry` request per (graph scope, `dataRev`, declaration revision)
+regardless of how many builder instances are mounted, with every mounted builder
+exposing the current snapshot through its production vocabulary picker. A closed
+sheet asks nothing at all (the key is `undefined` until the sheet opens), and
+`queryFacets(true)` (autocomplete) asks a different question and keeps its own
+call. Proof:
+`src/components/QueryBuilder.transient.test.tsx::QueryBuilder registry sharing (Harvest W4-P1 item 3)::issues one shared registry request per (graph scope, dataRev, declaration) for five mounted builders`.
 
 **Item 4 — tag-table queries (measured, no cut).** Producer: the tag-table query
 resource behind `TagTableToggle`/`TagPageTable` in `src/components/Page.tsx`.
@@ -67,3 +70,14 @@ routed page per invalidation — consumers of the same routed page share one
 request, distinct routed pages are distinct questions. Measured at bound on the
 checked base, so no production change was made. Proof:
 `src/components/Page.test.tsx::tag-page table::issues one tag query per distinct routed page per invalidation, not one per consumer`.
+
+Quick Capture begins each native show with a new request generation and an empty
+read lease. If cold startup has not published a graph yet, Capture stays hidden;
+a successful `load_graph` publication may complete only that pending request,
+after rechecking the published window binding. Completion installs one immutable
+read lease before mapping, notifying, or focusing Capture. A later publication
+cannot retarget it, and delayed focus work from an older show cannot activate a
+newer show. `capture_graph_binding` only reads the selected lease; it never picks
+another graph. `pending_capture_show_is_completed_once_and_newer_show_revokes_it`
+pins pending ownership and one-time completion; the native Capture journey pins
+cold-process autocomplete and the persisted completion policy.

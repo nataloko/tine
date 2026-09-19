@@ -1,3 +1,4 @@
+import { renameFlushFailureMessage } from "../persistence";
 import { For, Show, Switch, Match, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 import {
   contextMenu,
@@ -12,6 +13,7 @@ import {
   graphMeta,
   setJournalTemplate,
   openPageProps,
+  openBlockProps,
   openExportModal,
   openPdfExport,
   openFormulaEditor,
@@ -63,7 +65,15 @@ import {
   focusCell,
   setCellSel,
 } from "../sheet/selection";
-import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, formulaReferenceName, isFieldId, type FieldId } from "../sheet/fields";
+import {
+  boardGroupByOptions,
+  fieldIdsForBlocks,
+  fieldLabel,
+  formulaReferenceName,
+  isFieldId,
+  type FieldId,
+  type QueryGroupingControl,
+} from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
 import { copyBlockOutline, writeClipboardText } from "../clipboard";
@@ -231,7 +241,7 @@ export function ContextMenu(): JSX.Element {
           >
             <Switch>
               <Match when={m().kind === "block"}>
-                <BlockMenu id={(m() as { blockId: string }).blockId} close={close} />
+                <BlockMenu id={(m() as { blockId: string }).blockId} x={m().x} y={m().y} close={close} />
               </Match>
               <Match when={m().kind === "blockref"}>
                 <BlockRefMenu
@@ -269,6 +279,7 @@ export function ContextMenu(): JSX.Element {
                   fields={(m() as { fields?: readonly string[] }).fields}
                   formulas={(m() as { formulas?: readonly [string, string][] }).formulas}
                   filter={(m() as { filter?: string | null }).filter}
+                  queryGrouping={(m() as { queryGrouping?: QueryGroupingControl }).queryGrouping}
                   x={m().x}
                   y={m().y}
                   close={close}
@@ -383,7 +394,7 @@ function ShowChildrenAsSubmenu(props: { id: string; close: () => void }): JSX.El
   );
 }
 
-function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
+function BlockMenu(props: { id: string; x: number; y: number; close: () => void }): JSX.Element {
   const hasChildren = () => (doc.byId[props.id]?.children.length ?? 0) > 0;
   const readOnly = () => blockPageReadOnly(props.id);
   const headingTargets = () => {
@@ -419,7 +430,7 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
 
       <Show when={!readOnly() || headingsWritable()}><div class="ctx-sep" /></Show>
 
-      <For each={blockActions(props.id)}>
+      <For each={blockActions(props.id, props.x, props.y)}>
         {(it) => (
           <div
             class="ctx-item"
@@ -567,6 +578,7 @@ function SheetMenu(props: {
   fields?: readonly string[];
   formulas?: readonly [string, string][];
   filter?: string | null;
+  queryGrouping?: QueryGroupingControl;
   x: number;
   y: number;
   close: () => void;
@@ -588,8 +600,21 @@ function SheetMenu(props: {
     const normalized = raw.startsWith("formula.") ? `formula:${raw.slice("formula.".length)}` : raw;
     return isFieldId(normalized) ? normalized : "state";
   };
-  const doGroupBy = (field: FieldId) => {
-    setBoardGroupBy(props.ownerId, field);
+  // A query board's grouping is the QUERY's to write: the same control its own
+  // toolbar uses, so the two surfaces cannot state it two different ways.
+  const groupOptions = (): readonly FieldId[] =>
+    props.queryGrouping?.options ?? boardGroupByOptions(props.ownerId);
+  /** The grouping the board beside this menu is ACTUALLY showing, so the tick
+   *  marks the column set on screen. A query that states nothing is drawn with
+   *  the task-marker default (ADR 0030); only an explicit clear is ungrouped. */
+  const currentGroupField = (): FieldId | null => {
+    const control = props.queryGrouping;
+    if (!control) return boardGroupField();
+    return control.cleared ? null : control.field ?? "state";
+  };
+  const doGroupBy = (field: FieldId | null) => {
+    if (props.queryGrouping) props.queryGrouping.set(field);
+    else if (field) setBoardGroupBy(props.ownerId, field);
     props.close();
   };
 
@@ -648,14 +673,25 @@ function SheetMenu(props: {
         <div class="ctx-item ctx-submenu">
           <span>Group by →</span>
           <div class="ctx-submenu-menu">
-            <For each={boardGroupByOptions(props.ownerId)}>
+            {/* Only a query can be ungrouped, and only a query offers to be. */}
+            <Show when={props.queryGrouping}>
+              <div
+                class="ctx-item"
+                classList={{ "ctx-active": currentGroupField() === null }}
+                onClick={() => doGroupBy(null)}
+              >
+                {currentGroupField() === null ? "✓ " : ""}
+                No grouping
+              </div>
+            </Show>
+            <For each={groupOptions()}>
               {(field) => (
                 <div
                   class="ctx-item"
-                  classList={{ "ctx-active": field === boardGroupField() }}
+                  classList={{ "ctx-active": field === currentGroupField() }}
                   onClick={() => doGroupBy(field)}
                 >
-                  {field === boardGroupField() ? "✓ " : ""}
+                  {field === currentGroupField() ? "✓ " : ""}
                   {fieldLabel(field)}
                 </div>
               )}
@@ -850,24 +886,32 @@ function PageMenu(props: {
       pushToast("This page target changed; reopen the page actions menu.", "error");
       return;
     }
-    if (isConflicted(name)) {
-      pushToast(`Resolve the save conflict for “${name}” before opening its file.`, "error");
-      return;
-    }
-    if (!page!.readOnly && !(await flushPage(name))) {
+    // A conflicted page is never flushed here — an unsavable draft is exactly
+    // what the conflict IS — but opening or revealing the file on disk is not
+    // refused either. It is the recovery path a stuck conflict needs, and
+    // refusing it defended nothing: the file is untouched whether or not Tine
+    // shows it, and blocking the only way to inspect it turned one stuck page
+    // into an inaccessible one (GH #490). The user is told what they are
+    // looking at instead.
+    let conflicted = isConflicted(name);
+    if (!conflicted && !page!.readOnly && !(await flushPage(name))) {
       pushToast(`Couldn't save “${name}”; its on-disk file was not opened.`, "error");
       return;
     }
-    if (isConflicted(name)) {
-      pushToast(`Resolve the save conflict for “${name}” before opening its file.`, "error");
-      return;
-    }
+    conflicted = conflicted || isConflicted(name);
     try {
       if (!pageTargetMatchesLoaded(captured, pageByName(name))) {
         pushToast("This page target changed; reopen the page actions menu.", "error");
         return;
       }
       await backend().openPageFile(name, kind, captured.path ?? page!.path, reveal);
+      if (conflicted) {
+        pushToast(
+          `“${name}” has an unresolved save conflict — this is the file as it stands on disk. ` +
+            `Your unsaved changes stay in Tine until you resolve it.`,
+          "info",
+        );
+      }
     } catch (error) {
       const message = page!.path
         ? `Couldn't ${reveal ? "show" : "open"} the page file. (${String(error)})`
@@ -1080,7 +1124,7 @@ function RenamePage(props: {
       // from disk to rewrite its `[[refs]]`, so a dirty edit on ANY page would be
       // read stale and lost.
       if (!(await flushAll())) {
-        pushToast("Couldn't save pending edits — resolve the conflict before renaming.", "error");
+        pushToast(renameFlushFailureMessage(), "error", { sticky: true });
         return;
       }
       const outcome = await renameOrMergePage(from, next, props.path);
@@ -1134,7 +1178,7 @@ function RenamePage(props: {
   );
 }
 
-function blockActions(id: string): { label: string; run: () => void; danger?: boolean }[] {
+function blockActions(id: string, x: number, y: number): { label: string; run: () => void; danger?: boolean }[] {
   const numbered = blockProperty(id, "logseq.order-list-type") === "number";
   // If this block is itself a template (`template:: name`), offer to set it as the
   // new-journal default (or clear it if it already is) — right where templates live.
@@ -1159,6 +1203,10 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
     { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+    // Editing this block's properties (GH #164). Deliberately in the WRITABLE
+    // arm: the read-only arm above returns early, so a read-only block offers no
+    // property editing at all, and the panel fails closed again on its own.
+    { label: "Properties…", run: () => openBlockProps(id, x, y) },
     // The keyboard route to "a block above this one" is Enter at offset 0, which
     // splits. A block that owns its own Enter key — a code block, where Enter
     // inserts a newline — therefore has no keyboard route, and when it is the

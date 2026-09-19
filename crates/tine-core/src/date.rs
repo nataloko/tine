@@ -105,10 +105,10 @@ impl JournalDate {
     }
 }
 
-fn is_leap(y: i32) -> bool {
+pub(crate) fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
-fn days_in_month(y: i32, m: u32) -> u32 {
+pub(crate) fn days_in_month(y: i32, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -121,6 +121,38 @@ fn days_in_month(y: i32, m: u32) -> u32 {
         }
         _ => 30,
     }
+}
+
+/// The ONE timestamp-text → `yyyymmdd` primitive (D-14, J10), grown from the
+/// walk's old `parse_angle_date`: it consumes the BRACKETLESS facet text exactly
+/// as `doc::planning_dates` stores it on `BlockProjection::scheduled` and
+/// `BlockProjection::deadline`, and an angle-bracketed caller strips the `<`
+/// first.
+///
+/// **Calendar-validated (C5).** The old parser accepted `2026-13-45` because it
+/// only read three integers. The month/day are now checked against the existing
+/// `date.rs` `is_leap`/`days_in_month` (reused, never re-derived), so a
+/// malformed timestamp has presence and no day.
+pub(crate) fn planning_day(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let text = text.strip_prefix('<').unwrap_or(text);
+    let end = text.find([' ', '>']).unwrap_or(text.len());
+    let mut parts = text[..end].split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let year_i32 = i32::try_from(year).ok()?;
+    let month_u32 = u32::try_from(month).ok()?;
+    if day < 1 || day > i64::from(crate::date::days_in_month(year_i32, month_u32)) {
+        return None;
+    }
+    Some(year * 10000 + month * 100 + day)
 }
 
 // Howard Hinnant's civil <-> days-since-epoch algorithms (1970-01-01 = day 0).
@@ -166,34 +198,7 @@ fn ordinal(n: u32) -> String {
 // `safe-journal-title-formatters`), and render new titles/filenames in the
 // user's format.
 
-impl JournalFormat {
-    /// The one "(sort-by modified)" recency axis (DUP-4, 2026-08-25
-    /// duplication audit): journals rank at their day's midnight parsed with
-    /// THIS GRAPH'S configured title formats (plus the safe defaults) — never
-    /// `JournalDate::from_title`, which knows only the default format and
-    /// ranked every journal of a custom-format graph at `i64::MIN` on three of
-    /// the four former producers. Non-journals rank by file mtime; anything
-    /// unavailable ranks last.
-    pub(crate) fn page_recency_secs(
-        &self,
-        is_journal: bool,
-        name: &str,
-        absolute: &std::path::Path,
-    ) -> i64 {
-        if is_journal {
-            return self
-                .parse(name)
-                .map(|date| date.to_days() * 86_400)
-                .unwrap_or(i64::MIN);
-        }
-        std::fs::metadata(absolute)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(i64::MIN)
-    }
-}
+impl JournalFormat {}
 
 pub const DEFAULT_FILE_FORMAT: &str = "yyyy_MM_dd";
 pub const DEFAULT_TITLE_FORMAT: &str = "MMM do, yyyy";
@@ -494,6 +499,17 @@ impl JournalFormat {
         self.parse_list.iter().find_map(|f| f.parse(s))
     }
 
+    /// Parse a display TITLE with the user's title pattern **alone** — never the
+    /// file pattern and never the default fallback list `parse` walks.
+    ///
+    /// The registry's date classification (SPEC §6.2, B6) needs exactly this:
+    /// with file format `yyyy_MM_dd` and title format `MMM do, yyyy`, the atom
+    /// `2026_09_04` must classify as text while `Sep 4th, 2026` classifies as a
+    /// date. `parse` would accept both and re-type a filename-shaped value.
+    pub fn parse_title(&self, s: &str) -> Option<JournalDate> {
+        self.title.parse(s.trim())
+    }
+
     /// Display title for a date, in the user's `:journal/page-title-format`.
     pub fn title(&self, d: JournalDate) -> String {
         self.title.format(d)
@@ -655,31 +671,23 @@ mod fmt_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod planning_day_tests {
     use super::*;
 
-    /// DUP-4 (2026-08-25 duplication audit): three of the four recency
-    /// producers called `JournalDate::from_title`, which compiles only
-    /// `DEFAULT_TITLE_FORMAT` — on a graph with `:journal/page-title-format
-    /// "yyyy-MM-dd"` every journal ranked at `i64::MIN` under
-    /// `(sort-by modified)`. The one shared axis honours the graph's formats.
     #[test]
-    fn recency_axis_honours_the_configured_journal_title_format() {
-        let format = JournalFormat::new(None, Some("dd.MM.yyyy"));
-        // The pre-fix producer path cannot parse this title at all:
-        assert_eq!(JournalDate::from_title("26.06.2026"), None);
-        // The shared axis can, and ranks the journal at its day's midnight:
-        let date = format
-            .parse("26.06.2026")
-            .expect("configured format parses");
-        assert_eq!(
-            format.page_recency_secs(true, "26.06.2026", std::path::Path::new("")),
-            date.to_days() * 86_400
-        );
-        // An unparseable journal title still ranks last, not by mtime.
-        assert_eq!(
-            format.page_recency_secs(true, "not a date", std::path::Path::new("")),
-            i64::MIN
-        );
+    fn planning_day_accepts_the_bracketless_projection_text_and_the_angle_form() {
+        assert_eq!(planning_day("2026-07-29 Wed"), Some(20260729));
+        assert_eq!(planning_day("<2026-07-29 Wed>"), Some(20260729));
+        assert_eq!(planning_day("2026-07-29"), Some(20260729));
+    }
+
+    #[test]
+    fn planning_day_validates_the_calendar_so_a_malformed_date_has_no_day() {
+        // C5: the old `parse_angle_date` answered 20261345 for the first of these.
+        assert_eq!(planning_day("2026-13-45"), None);
+        assert_eq!(planning_day("2026-02-30"), None);
+        assert_eq!(planning_day("2023-02-29"), None);
+        assert_eq!(planning_day("2026-04-31"), None);
+        assert_eq!(planning_day("2024-02-29"), Some(20240229));
     }
 }

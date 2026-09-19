@@ -1,10 +1,7 @@
 import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
-import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
 import { DiagnosticsTab } from "./DiagnosticsTab";
-import { writeClipboardTextResilient } from "../clipboard";
-import { managedJoinErrorDetail, safeManagedErrorDetail } from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -146,22 +143,23 @@ import {
 import { openPage, openFile, openPageTarget } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
-import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
+import { switchGraph, loadGraphPath } from "../graph";
 import { settingsMaximized, setSettingsMaximized } from "../settingsLayout";
+import {
+  DEFAULT_QUERY_EXPORT_BUDGET_MIB,
+  MAX_QUERY_EXPORT_BUDGET_MIB,
+  MIN_QUERY_EXPORT_BUDGET_MIB,
+  changeQueryExportBudgetMiB,
+  queryExportBudgetMiB,
+  resetQueryExportBudget,
+} from "../queryExportBudget";
 import { flushAll } from "../store";
 import {
-  AdoptionArchivedError,
-  ManagedGraphMismatchError,
-  SharedFrontierMismatchError,
-  SyncDataUnavailableError,
   backend,
   isTauri,
   type BackupInfo,
 } from "../backend";
-import { dbg } from "../debug";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
-import { managedStorageRuntime } from "../managedStorageRuntime";
-import { storageTransitionRuntime } from "../storageTransitionRuntime";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry } from "../types";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
@@ -185,6 +183,7 @@ import {
   setLauncherRankingEnabled,
 } from "../launcherRanking";
 import { registerTransientLayer } from "../transientLayers";
+import { readOr } from "../resourceRead";
 import {
   DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH,
   DEFAULT_STANDARD_CONTENT_WIDTH,
@@ -227,13 +226,6 @@ const DATE_FORMATS = [
 ];
 
 // The one file a joining device waits for, relative to the graph folder.
-// The native side names the absolute path in a message the panel can only show
-// the first line of (`shared_enrollment_not_here_yet`, src-tauri/src/sync_runtime.rs),
-// so the panel names the relative one itself. Pinned from the native side by
-// `the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact`.
-const SHARED_ENROLLMENT_RELATIVE_PATH =
-  ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
-
 type Tab = SettingsTabId;
 const TABS: { id: Tab; label: string }[] = [
   { id: "appearance", label: "Appearance" },
@@ -244,9 +236,8 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "graph", label: "Graph" },
   { id: "extras", label: "mine (extras)" },
   { id: "plugins", label: "Plugins" },
-  { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
-  { id: "diagnostics", label: "Diagnostics" },
+  { id: "diagnostics", label: "Help & diagnostics" },
   { id: "about", label: "About" },
 ];
 
@@ -255,13 +246,13 @@ type SettingSearchEntry = {
   label: string;
   description: string;
   aliases?: string[];
-  level?: "advanced" | "experimental";
+  level?: "advanced";
   /** The setting itself is rendered only on desktop, so search must not offer a
    * result that scrolls to nothing on Android/iOS. */
   desktopOnly?: true;
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
-  { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
+  { tab: "diagnostics", label: "Help & diagnostics", description: "bug report flight recorder timings previous run privacy parser divergences anonymize" },
   { tab: "appearance", label: "Theme mode", description: "light dark system" },
   { tab: "appearance", label: "Style", description: "typography journal headings presentation notnote" },
   { tab: "appearance", label: "Color scheme", description: "default nord solarized gruvbox theme package colors" },
@@ -310,13 +301,6 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
   { tab: "extras", label: "Bullet threading", description: "thread active path outline depth rainbow accent colour animate flow" },
   { tab: "extras", label: "Git integration", description: "commit push pull auto version control repository branch" },
-  {
-    tab: "backups",
-    label: "Storage & sync",
-    description: "Direct files Tine-managed storage recovery",
-    level: "experimental",
-  },
-  { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
 ];
@@ -331,14 +315,10 @@ function advancedMatch(tab: Tab, query: string): boolean {
   return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "advanced" && settingMatches(entry, query));
 }
 
-function experimentalMatch(tab: Tab, query: string): boolean {
-  return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "experimental" && settingMatches(entry, query));
-}
-
 export function Settings(): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("appearance");
   const [settingsQuery, setSettingsQuery] = createSignal("");
-  const [settingsPlatform] = createResource(async () => {
+  const [settingsPlatformResource] = createResource(async () => {
     try {
       return await platformKind();
     } catch {
@@ -347,6 +327,9 @@ export function Settings(): JSX.Element {
       return undefined;
     }
   });
+  // Same "fail closed to unknown" answer the fetcher already gives, now also
+  // reachable when the read itself would have thrown.
+  const settingsPlatform = () => readOr(settingsPlatformResource, undefined, "settings platform");
   const pluginsAvailable = () => settingsPlatform() === "desktop" || settingsPlatform() === "android";
   const availableTabs = createMemo(() => pluginsAvailable() ? TABS : TABS.filter((entry) => entry.id !== "plugins"));
   const matches = createMemo(() => {
@@ -385,15 +368,15 @@ export function Settings(): JSX.Element {
   };
 
   createEffect(() => {
-    if (!settingsPlatform.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
+    if (!settingsPlatformResource.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
   });
 
   createEffect(() => {
     if (!settingsOpen()) return;
     const requested = settingsTabRequest();
     if (!requested) return;
-    if (requested === "plugins" && settingsPlatform.loading) return;
-    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested);
+    if (requested === "plugins" && settingsPlatformResource.loading) return;
+    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested === "improve" ? "diagnostics" : requested);
     clearSettingsTabRequest();
   });
 
@@ -457,6 +440,11 @@ export function Settings(): JSX.Element {
               {(t) => (
                 <button
                   class="settings-nav-item"
+                  // The tab's identity, so a test or a deep link addresses the tab
+                  // rather than its label. Labels are presentation: "Diagnostics"
+                  // became "Help & diagnostics" and every label-coupled selector
+                  // broke with it.
+                  data-settings-tab={t.id}
                   classList={{ active: tab() === t.id }}
                   onClick={() => setTab(t.id)}
                 >
@@ -565,15 +553,16 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "plugins" && pluginsAvailable()}>
                 <PluginsTab />
               </Show>
-              <Show when={tab() === "improve"}>
-                <ImproveTab />
-              </Show>
               <Show when={tab() === "shortcuts"}>
                 <ShortcutsSettingsPane
                   shortcuts={shortcuts()}
                   search={settingsQuery()}
                   recording={recording()}
                   onRecord={(id) => setRecording(recording() === id ? null : id)}
+                  onUnbind={(id) => {
+                    setRecording(null);
+                    setShortcutOverride(id, "false");
+                  }}
                   onReset={resetShortcutOverride}
                 />
               </Show>
@@ -745,7 +734,11 @@ function PluginsTab(): JSX.Element {
   const [busy, setBusy] = createSignal<string | null>(null);
   const [view, setView] = createSignal<"browse" | "installed">("browse");
   const [selectedPluginKey, setSelectedPluginKey] = createSignal<string | null>(null);
-  const [currentPlatform] = createResource(platformKind);
+  const [currentPlatformResource] = createResource(platformKind);
+  // Unlike its two siblings in this file, `platformKind` is uncaught here; an
+  // unknown platform reads as "not yet known", which is what the buttons below
+  // already render.
+  const currentPlatform = () => readOr(currentPlatformResource, undefined, "plugin platform");
   const selectedPlugin = () => {
     const key = selectedPluginKey();
     return key ? installedPlugins().find((plugin) => `${plugin.manifest.id}@${plugin.manifest.version}` === key) : undefined;
@@ -1238,20 +1231,6 @@ function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.El
       label="Advanced"
       storageKey={`tine.settings.advanced.${props.tab}`}
       layerPrefix="settings-advanced"
-      forceOpen={props.forceOpen}
-    >
-      {props.children}
-    </SettingsDisclosure>
-  );
-}
-
-function ExperimentalSection(props: { forceOpen: boolean; children: JSX.Element }): JSX.Element {
-  return (
-    <SettingsDisclosure
-      label="Experimental"
-      storageKey="tine.settings.experimental.storage"
-      layerPrefix="settings-experimental"
-      className="settings-experimental"
       forceOpen={props.forceOpen}
     >
       {props.children}
@@ -1790,7 +1769,10 @@ function AppearanceTab(props: { search: string }): JSX.Element {
 // to the chosen template's block. Uses existing concepts only: templates + the
 // config pointer. No catalogue, no built-in default.
 function JournalTemplateField(): JSX.Element {
-  const [templates] = createResource(() => backend().listTemplates());
+  const [templatesResource] = createResource(() => backend().listTemplates());
+  // An unreadable template list offers no templates; the field still shows and
+  // still accepts the configured pointer.
+  const templates = () => readOr(templatesResource, undefined, "journal templates");
   const current = () => graphMeta()?.default_journal_template ?? "";
   const list = () => templates() ?? [];
   const selected = () => list().find((t) => t.name === current());
@@ -2467,11 +2449,12 @@ function HomePageField(): JSX.Element {
   onCleanup(() => clearTimeout(dqTimer));
   // Page picker over the existing quick-switch index; home pages are ordinary
   // pages, so journals are filtered out here and at open time.
-  const [matches] = createResource(dq, async (s) => {
+  const [matchesResource] = createResource(dq, async (s) => {
     if (value() && !picking()) return [];
     const hits = await backend().quickSwitch(s, 8).catch(() => [] as PageEntry[]);
     return (hits ?? []).filter((p) => p.kind === "page");
   });
+  const matches = () => readOr(matchesResource, undefined, "home page picker completions");
 
   createEffect(on(root, async (r) => {
     setValue(null);
@@ -2630,818 +2613,33 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
           </Show>
         </div>
       </div>
-    </>
-  );
-}
 
-function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
-  const status = () => managedStorageRuntime.snapshot().status;
-  const runtimeError = () => managedStorageRuntime.snapshot().error;
-  const [loading, setLoading] = createSignal(true);
-  const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
-  const [sharing, setSharing] = createSignal(false);
-  const [cancelling, setCancelling] = createSignal(false);
-  // Every managed-storage command in this panel brackets its native call with
-  // these two. `graphTransitioning` fences the editor; the runtime bracket
-  // additionally tells the shared bridge that the sync cut's own retired-actor
-  // window is expected, so it is not toasted as a failure the command is about
-  // to resolve by itself.
-  const beginStorageTransition = () => {
-    managedStorageRuntime.beginTransition();
-    setGraphTransitioning(true);
-  };
-  const endStorageTransition = () => {
-    setGraphTransitioning(false);
-    managedStorageRuntime.endTransition();
-  };
-  const activeNativeTransition = () => storageTransitionRuntime.active();
-  const enabling = () => activeNativeTransition()?.kind === "activate_managed";
-  const retryable = () => {
-    const value = status();
-    return value?.state === "retryable" ? value : null;
-  };
-  const blocked = () => {
-    const value = status();
-    return value?.state === "blocked" ? value : null;
-  };
-  const refused = () => {
-    const value = status();
-    return value?.state === "refused" ? value : null;
-  };
-  const activationProgressLabel = () => {
-    const progress = activationProgress();
-    if (!progress) {
-      const transition = activeNativeTransition();
-      return transition
-        ? `${transition.phase.replaceAll("_", " ")}…`
-        : "Preparing Tine-managed storage…";
-    }
-    if (progress.kind === "readiness_sample") {
-      return "Selecting representative pages for the readiness proof…";
-    }
-    return {
-        private_setup: "Preparing private managed state…",
-        source_capture: "Capturing source files…",
-        bootstrap_import_preparation: "Preparing graph operation history…",
-        immutable_publication_install: "Installing prepared history…",
-        backup_proof: "Verifying the safety backup…",
-        sqlite_open_build: "Building the local index…",
-        shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
-        promotion_receipt_confirmation: "Confirming managed storage…",
-        reconciliation_baseline_actor_open: "Starting managed storage…",
-        retained_runtime_open: "Opening retained managed state…",
-        retained_runtime_tail_replay: "Replaying retained managed changes…",
-        retained_runtime_projection_repair: "Repairing the Markdown projection…",
-        retained_runtime_actor_open: "Starting the retained managed runtime…",
-      }[progress.phase];
-  };
-
-  const refresh = async () => {
-    setLoading(true);
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        managedStorageRuntime.refresh(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error("managed storage status did not answer within 10 seconds")),
-            10_000,
-          );
-        }),
-      ]);
-    } catch (error) {
-      reportManagedFailure("Couldn't read Tine-managed storage status", safeManagedErrorDetail(error));
-    } finally {
-      clearTimeout(timeout);
-      setLoading(false);
-    }
-  };
-  onMount(() => void refresh());
-
-  const acceptNativeAuthority = (result: SparseV2Status) => {
-    if (!managedStorageRuntime.acceptNativeTransition(result)) return false;
-    rebindCurrentStorageAuthority();
-    return true;
-  };
-
-  // Status fields are structured, but some Rust producers still embed native
-  // paths in their detail. Treat every displayed field as untrusted text.
-  const failureDetail = (value: SparseV2Status): string | null => {
-    if (value.state === "retryable") return safeManagedErrorDetail(value.detail);
-    if (value.state === "refused") {
-      const detail = safeManagedErrorDetail(value.detail ?? "managed storage refused the operation");
-      return `${detail} (${value.scenario_id}; reason code: ${value.reason_code})`;
-    }
-    if (value.state === "blocked") {
-      return safeManagedErrorDetail(`${value.scenario_id}; reason code: ${value.reason_code}`);
-    }
-    return null;
-  };
-
-  const reportManagedFailure = (
-    summary: string,
-    detail: string,
-    remedy?: string | null,
-    copyDetail = detail,
-  ) => {
-    const message = `${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`;
-    const copyMessage = `${summary}: ${copyDetail}${remedy ? `\n\n${remedy}` : ""}`;
-    pushToast(message, "error", {
-      sticky: true,
-      action: {
-        label: "Copy details",
-        run: () => {
-          void writeClipboardTextResilient(copyMessage)
-            .then(() => pushToast("Managed storage details copied.", "success"))
-            .catch((error) => pushToast(
-              `Couldn't copy managed storage details: ${safeManagedErrorDetail(error)}`,
-              "error",
-            ));
-        },
-      },
-    });
-  };
-
-  /**
-   * Translate the two refusals the native join branch raises into the action
-   * that actually resolves them. Both leave every authority untouched, which is
-   * the part a raw refusal string never says.
-   * (`join_shared_clean` in crates/tine-core/src/sync_runtime.rs.)
-   */
-  const joinFailureRemedy = (error: unknown): string | null => {
-    // The native side carries only a fixed kind. Author the explanation here,
-    // where wording is not load-bearing. The relative path is a constant, not
-    // user data.
-    if (error instanceof SyncDataUnavailableError) {
-      return (
-        "Nothing was changed on this device. Tine looked for "
-        + `${SHARED_ENROLLMENT_RELATIVE_PATH} inside this graph's folder. `
-        + "Two things usually explain an absent one. The other device may not have finished "
-        + "\"Set up sync with another device\" yet — check that it reports sharing as ready. Or your "
-        + "file-sync tool is not carrying the hidden .tine-sync folder; several skip dot-directories "
-        + "unless you tell them not to."
-      );
-    }
-    if (error instanceof ManagedGraphMismatchError) {
-      return (
-        "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
-        + "not the one the other device is sharing, and Tine will not merge two histories. "
-        + "Joining anyway means adopting the other device's graph, which archives this device's own history rather "
-        + "than deleting it. Use the join action again and accept the second prompt when you are ready."
-      );
-    }
-    if (error instanceof SharedFrontierMismatchError) {
-      return (
-        "Nothing was changed on either device. This device's notes differ from the shared graph, and a join can only "
-        + "adopt a history whose notes already match. Let the other device's changes finish arriving, or reconcile the "
-        + "differing pages, then Join again."
-      );
-    }
-    return null;
-  };
-
-  /**
-   * What the native join branch actually does, said before it happens.
-   * The native join command (src-tauri/src/sync_runtime.rs) has two branches.
-   * From Direct Files it bootstraps a binding out of the shared descriptor.
-   * From Tine-managed storage it hands the descriptor to this device's live
-   * actor, and `join_shared_clean` then either refuses — because the descriptor
-   * names a different managed graph, or because this device's notes are not
-   * already equal to the shared ones — or installs the shared baseline and
-   * operation archive in place of this device's own and deletes the replaced
-   * pair. The managed variant is the dangerous-looking one, so it names that
-   * outcome rather than warning vaguely about "data".
-   */
-  const joinConfirmation = (fromManaged: boolean) => {
-    if (!fromManaged) {
-      return (
-        "Join a synced graph from another device?\n\n"
-        + "Tine verifies that this device is joining the same graph history before it continues. "
-        + "Existing Markdown/Org files stay in place and remain Logseq-compatible."
-      );
-    }
-    return (
-      "Join a synced graph from another device?\n\n"
-      + "This device already has Tine-managed storage of its own, so exactly one of two things will happen:\n\n"
-      + "1. If the other device is sharing the SAME managed history this device holds, this device adopts the shared "
-      + "copy: its own operation history and baseline are replaced by the shared ones and the replaced pair is deleted. "
-      + "Tine performs that swap only when every live page, its outline and its text are already identical on both "
-      + "sides, so no note text is lost.\n\n"
-      + "2. If the other device is sharing a DIFFERENT history — which is the normal case when this device set up "
-      + "Tine-managed storage on its own — Tine changes nothing at all and stops. It then offers to ADOPT the other "
-      + "device's graph instead, in a second prompt that names where this device's own history is archived. Nothing "
-      + "is merged, and nothing happens until you accept that second prompt.\n\n"
-      + "Either way your Markdown/Org files stay in place and remain Logseq-compatible."
-    );
-  };
-
-  /**
-   * The second prompt, shown only when the native join has already refused
-   * because the two devices hold independent histories. It is where the
-   * divergence is named honestly: adoption keeps the shared graph and sets
-   * this device's own history aside; it is not a merge, and nothing of this
-   * device's own managed history crosses over. The archive location comes from
-   * the native side so it can be stated BEFORE the operation, not only in the
-   * receipt afterwards.
-   */
-  const adoptionConfirmation = (location: string | null) =>
-    "Adopt the graph your other device is sharing?\n\n"
-    + "This device set up Tine-managed storage on its own, so it holds a separate history. Tine will not merge two "
-    + "histories.\n\n"
-    + "Adopting keeps the other device's history and sets this device's own aside. This device's history is archived "
-    + "whole, not deleted"
-    + (location ? `, at:\n${location}\n\n` : ", inside Tine's application data folder.\n\n")
-    + "Nothing from this device's own managed history is carried across — not its recorded edits, not its block "
-    + "identities. Your Markdown/Org files are not touched by the archive step, and they must already match the "
-    + "shared graph's files; if they do not, Tine stops and changes nothing.\n\n"
-    + "Cancel now and this device is left exactly as it is. Continue and this device's own managed history is "
-    + "reachable only from that archive.";
-
-  /**
-   * The share cut is one-way. The storage contract never retires an active
-   * shared graph, so this confirmation is the last moment at which the
-   * graph is exactly as it was, and the dialog says so instead of letting the
-   * user discover it afterwards.
-   */
-  const shareConfirmation = () =>
-    "Set up sync with another device?\n\n"
-    + "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place "
-    + "and remain Logseq-compatible.\n\n"
-    + "Cancel now and this graph is left exactly as it is. Once the sync data is written it cannot be un-shared: the "
-    + "only way out is \"Return to Direct files\", which archives this device's managed storage and reopens the "
-    + "Markdown/Org files.";
-
-  const managedDiagnostics = () => {
-    const current = status();
-    const entries: string[] = [];
-    const statusDetail = current ? failureDetail(current) : null;
-    if (statusDetail) entries.push(`Setup: ${statusDetail}`);
-    if (current?.cancel_reason) {
-      entries.push(`Return to Direct files: ${safeManagedErrorDetail(current.cancel_reason)}`);
-    }
-    const liveError = runtimeError();
-    if (liveError) entries.push(`Runtime: ${safeManagedErrorDetail(liveError)}`);
-    return [...new Set(entries)];
-  };
-
-  const copyManagedDiagnostics = async () => {
-    const details = managedDiagnostics();
-    if (!details.length) return;
-    try {
-      await writeClipboardTextResilient(details.join("\n"));
-      pushToast("Managed storage details copied.", "success");
-    } catch (error) {
-      reportManagedFailure("Couldn't copy managed storage details", safeManagedErrorDetail(error));
-    }
-  };
-
-  /**
-   * Say what a shared graph's state IS and where the exit is. Until this, a
-   * completed share left the panel looking identical to a purely local managed
-   * graph: the one success toast scrolled away and nothing named either the
-   * next step on the other device or the fact that sharing is one-way.
-   */
-  const sharedDisclosure = () => {
-    const runtime = status()?.runtime;
-    const phase = runtime?.shared_phase;
-    if (!phase) return null;
-    if (phase === "share_prepared") {
-      return (
-        "Sync setup did not finish writing this graph's sync data. “Retry setup” completes it. "
-        + "Until it does, no other device can join."
-      );
-    }
-    if (phase === "joining") {
-      return "This device is joining a graph shared by another device and has not finished.";
-    }
-    const exit =
-      " Sharing cannot be switched off again: the only exit is “Return to Direct files” below, which archives "
-      + "this device's managed storage and reopens the Markdown/Org files.";
-    if (runtime?.shared_role === "joiner") {
-      return `This device is syncing with a graph shared by another device.${exit}`;
-    }
-    return (
-      "This graph is shared. On your other device, open this same graph folder and use “Join a synced graph "
-      + `from another device” — it is offered in both Direct files and Tine-managed storage.${exit}`
-    );
-  };
-
-  const directFilesWarning = () => {
-    const current = status();
-    if (!current) return null;
-    const shared = Boolean(current.runtime?.shared_phase);
-    const pending = (current.runtime?.provider_pending ?? 0) > 0;
-    if (!current.cancel_reason && !shared && !pending) return null;
-    return (
-      "Warning: Tine reports shared, pending, or otherwise unverified managed-storage state. Its current Markdown files might not include every durable managed or sync change. " +
-      "Returning to Direct files is a recovery exit, not confirmation that every device and pending change has synchronized."
-    );
-  };
-
-  const directFilesConfirmation = () => {
-    const warning = directFilesWarning();
-    return (
-      "Return to Direct files?\n\n" +
-      "Tine first tries to save in-memory edits and drain pending managed work. If that cannot complete, continuing may omit in-memory managed edits that are not yet durable. " +
-      "Tine will archive the complete durable managed-storage and provider state before reopening Direct files." +
-      (warning ? `\n\n${warning}` : "")
-    );
-  };
-
-  const emergencyDirectFilesConfirmation = (detail: string) =>
-    "Managed storage did not stop cleanly. Open the existing Markdown/Org files in Direct Files mode anyway?\n\n" +
-    "This is an emergency exit. In-memory or managed-only changes may be missing from the Markdown/Org tree. " +
-    "Tine will leave the managed-storage evidence untouched and will not silently reopen or merge it.\n\n" +
-    `Managed shutdown detail: ${safeManagedErrorDetail(detail)}`;
-
-  const cancelSparseCooperatively = async () => {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        backend().cancelSparseV2(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error("managed storage did not stop within 10 seconds")),
-            10_000,
-          );
-        }),
-      ]);
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
-
-  const emergencyDirectFiles = async (detail: string) => {
-    const root = graphMeta()?.root;
-    if (!root) throw new Error("The current graph path is unavailable.");
-    if (!(await backend().confirm(emergencyDirectFilesConfirmation(detail)))) return false;
-    const result = await backend().cancelSparseV2Cold(root);
-    if (!managedStorageRuntime.acceptNativeTransition(result.status)) return false;
-    rebindCurrentStorageAuthority();
-    pushToast(result.recovery_statement, "success");
-    return true;
-  };
-
-  const forceDirectFiles = async (detail: string) => {
-    setCancelling(true);
-    beginStorageTransition();
-    try {
-      await emergencyDirectFiles(detail);
-    } catch (error) {
-      reportManagedFailure("Couldn't open the current files in Direct Files", safeManagedErrorDetail(error));
-    } finally {
-      endStorageTransition();
-      setCancelling(false);
-    }
-  };
-
-  const enable = async () => {
-    setActivationProgress(null);
-    beginStorageTransition();
-    let unlisten: (() => void) | undefined;
-    try {
-      const flushed = await flushAll();
-      dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
-      if (!flushed) {
-        pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
-        return;
-      }
-      const confirmed = await backend().confirm(
-        `Enable Tine-managed storage for this graph?\n\n` +
-          `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
-          `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
-      );
-      dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
-      if (!confirmed) return;
-      const generation = status()?.binding_generation;
-      if (generation !== undefined) {
-        try {
-          unlisten = await backend().onSparseV2ActivationProgress(
-            generation,
-            (progress) => {
-              setActivationProgress(progress);
-            }
-          );
-        } catch {
-          // Progress is observational; setup must continue if event listening
-          // is unavailable in an older or closing WebView.
-        }
-      }
-      const result = await backend().activateSparseV2();
-      dbg(`managed storage setup: native activation returned (${result.state})`);
-      if (result.state === "active") {
-        if (!acceptNativeAuthority(result)) return;
-        pushToast("Tine-managed storage is active.", "success");
-      } else {
-        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
-        reportManagedFailure(
-          "Tine-managed storage setup did not complete",
-          failureDetail(result) ?? "Tine-managed storage did not become active."
-        );
-      }
-    } catch (error) {
-      reportManagedFailure("Tine-managed storage was not enabled", safeManagedErrorDetail(error));
-    } finally {
-      unlisten?.();
-      setActivationProgress(null);
-      endStorageTransition();
-    }
-  };
-
-  const prepareShare = async () => {
-    setSharing(true);
-    beginStorageTransition();
-    try {
-      if (!(await flushAll())) {
-        pushToast("Resolve pending save conflicts before preparing sharing.", "error");
-        return;
-      }
-      if (!(await backend().confirm(shareConfirmation()))) return;
-      const result = await backend().prepareSparseV2Share();
-      if (result.state === "active") {
-        if (!acceptNativeAuthority(result)) return;
-        pushToast("Sync is ready to use on another device.", "success");
-      } else {
-        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
-        reportManagedFailure("Sync setup did not complete", failureDetail(result) ?? "Tine-managed storage did not become active.");
-      }
-    } catch (error) {
-      reportManagedFailure("Couldn't set up sync", safeManagedErrorDetail(error));
-    } finally {
-      endStorageTransition();
-      setSharing(false);
-    }
-  };
-
-  /**
-   * Offer adoption in place of the refusal. Returns false when the user
-   * declines, so the caller still reports the refusal and its remedy.
-   * The refused join changed nothing on either device: the native branch
-   * compares identities before it stops the actor or opens the provider.
-   */
-  /** The one typed adoption failure whose remedy depends on how far it got. */
-  const adoptionFailureRemedy = (error: unknown, location: string | null): string | null => {
-    if (!(error instanceof AdoptionArchivedError)) return null;
-    return (
-      "This device's own history is preserved"
-      + (location ? ` in ${location}` : " in Tine's application data folder")
-      + ", and your Markdown/Org files are unchanged. Nothing was merged. This device is back on Direct files, so "
-      + "the join action above retries the remaining half on its own."
-    );
-  };
-
-  const offerAdoption = async (): Promise<boolean> => {
-    let location: string | null = null;
-    try {
-      location = await backend().sparseV2RecoveryLocation();
-    } catch {
-      // Naming the folder is better than naming nothing, but a lookup failure
-      // must not be the reason a user cannot proceed.
-    }
-    if (!(await backend().confirm(adoptionConfirmation(location)))) return false;
-    let result: SparseV2AdoptionResult;
-    try {
-      result = await backend().adoptSparseV2Shared();
-    } catch (error) {
-      reportManagedFailure(
-        "Couldn't adopt the shared graph",
-        safeManagedErrorDetail(error),
-        // Adoption raises the same not-yet refusal as the join it follows,
-        // and the panel truncates it the same way.
-        adoptionFailureRemedy(error, location) ?? joinFailureRemedy(error)
-      );
-      return true;
-    }
-    if (result.status.state === "active") {
-      if (acceptNativeAuthority(result.status)) {
-        pushToast(result.adoption_statement, "success");
-      }
-      return true;
-    }
-    if (managedStorageRuntime.acceptNativeTransition(result.status)) {
-      reportManagedFailure(
-        "Adopting the shared graph did not complete",
-        failureDetail(result.status) ?? "Tine-managed storage did not become active."
-      );
-    }
-    return true;
-  };
-
-  /**
-   * One refusal has an action behind it rather than only an explanation:
-   * a descriptor naming another managed graph is exactly the two-independent-
-   * activations case, and adoption is the operation for it.
-   */
-  const reportJoinRefusal = async (
-    summary: string,
-    error: unknown,
-    visible: string,
-    copy = visible,
-  ) => {
-    if (error instanceof ManagedGraphMismatchError) {
-      try {
-        if (await offerAdoption()) return;
-      } catch (error) {
-        reportManagedFailure("Couldn't adopt the shared graph", safeManagedErrorDetail(error));
-        return;
-      }
-    }
-    reportManagedFailure(summary, visible, joinFailureRemedy(error), copy);
-  };
-
-  const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
-    setSharing(true);
-    beginStorageTransition();
-    try {
-      if (!(await flushAll())) {
-        pushToast("Resolve pending save conflicts before joining.", "error");
-        return;
-      }
-      if (!(await backend().confirm(joinConfirmation(options.fromManaged)))) return;
-      const result = await backend().joinSparseV2Shared();
-      if (result.state === "active") {
-        if (!acceptNativeAuthority(result)) return;
-        pushToast("This device joined the synced graph.", "success");
-      } else {
-        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
-        const detail = failureDetail(result) ?? "Tine-managed storage did not become active.";
-        await reportJoinRefusal("Joining the synced graph did not complete", detail, detail);
-      }
-    } catch (error) {
-      // The refusal that matters most here is raw native text. Read the remedy
-      // off the untruncated message. A clean-join mismatch additionally carries
-      // bounded affected paths which the user needs in order to reconcile it.
-      const joinDetail = managedJoinErrorDetail(error);
-      await reportJoinRefusal(
-        "Couldn't join the synced graph",
-        error,
-        joinDetail.visible,
-        joinDetail.copy,
-      );
-    } finally {
-      endStorageTransition();
-      setSharing(false);
-    }
-  };
-
-  const cancelSparse = async () => {
-    setCancelling(true);
-    beginStorageTransition();
-    try {
-      try {
-        await flushAll();
-      } catch {
-        // Setup may be unavailable in the exact failure state this rollback
-        // repairs. Keep the store intact and retry after Direct files
-        // has been restored.
-      }
-      if (!(await backend().confirm(directFilesConfirmation()))) return;
-      let result: SparseV2CancelResult;
-      try {
-        result = await cancelSparseCooperatively();
-      } catch (error) {
-        if (!(await emergencyDirectFiles(safeManagedErrorDetail(error)))) return;
-        return;
-      }
-      if (!managedStorageRuntime.acceptNativeTransition(result.status)) return;
-      let flushed = false;
-      try {
-        flushed = await flushAll();
-      } catch {
-        // Report the durable rollback separately from the still-unsaved pages.
-      }
-      if (!flushed) {
-        pushToast(
-          "Direct files is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
-          "error"
-        );
-        return;
-      }
-      rebindCurrentStorageAuthority();
-      // Older native builds may still use the former mode name in this recovery text.
-      pushToast(
-        result.recovery_statement
-          .replace(/\bDirect\s+Markdown\b/g, "Direct file mode")
-          .replace(/^Direct files is active\./, "Direct file mode is active."),
-        "success"
-      );
-    } catch (error) {
-      reportManagedFailure("Couldn't return to Direct files", safeManagedErrorDetail(error));
-    } finally {
-      endStorageTransition();
-      setCancelling(false);
-    }
-  };
-
-  return (
-    <>
-      <div class="settings-section">Storage &amp; sync</div>
-      <ExperimentalSection forceOpen={props.forceOpen}>
-        <div class="settings-experimental-warning" role="note">
-          <strong>Known to be buggy.</strong> Tine-managed storage does not yet fully work in our own testing; we're actively working on it. Use it only on a graph you are comfortable testing. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
+      <div class="settings-row" data-setting-label="Query export size limit">
+        <span class="settings-label">Query export size limit</span>
+        <div>
+          <div class="settings-width-control">
+            <input
+              class="settings-num settings-width-number"
+              aria-label="Query export size limit in MiB"
+              type="number"
+              min={MIN_QUERY_EXPORT_BUDGET_MIB}
+              max={MAX_QUERY_EXPORT_BUDGET_MIB}
+              step="64"
+              value={queryExportBudgetMiB()}
+              onChange={(event) => changeQueryExportBudgetMiB(event.currentTarget.valueAsNumber)}
+            />
+            <span class="settings-width-unit">MiB</span>
+            <Show when={queryExportBudgetMiB() !== DEFAULT_QUERY_EXPORT_BUDGET_MIB}>
+              <button class="settings-btn" onClick={resetQueryExportBudget}>Reset</button>
+            </Show>
+          </div>
+          <div class="settings-hint" style={{ "margin-top": "4px" }}>
+            "Export…" on a query copies the images and files its pages reference into the export
+            folder so the folder can be moved anywhere. An export that would copy more than this
+            stops instead of leaving a folder with missing files. Saved on this device.
+          </div>
         </div>
-        <Show
-          when={!loading()}
-          fallback={
-            <div class="settings-hint settings-block">
-              <div>Checking sync state…</div>
-              <div style={{ "margin-top": "6px" }}>
-                <button
-                  class="settings-btn settings-btn-danger"
-                  disabled={cancelling()}
-                  onClick={() => void forceDirectFiles("managed storage status is still loading")}
-                >
-                  {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
-                </button>
-              </div>
-            </div>
-          }
-        >
-          <Show
-            when={status()}
-            fallback={
-              <div class="settings-hint settings-block">
-                <div>Tine-managed storage status is unavailable.</div>
-                <div style={{ "margin-top": "6px" }}>
-                  <button
-                    class="settings-btn settings-btn-danger"
-                    disabled={cancelling()}
-                    onClick={() => void forceDirectFiles("managed storage status is unavailable")}
-                  >
-                    {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
-                  </button>
-                </div>
-              </div>
-            }
-          >
-            {(current) => (
-              <div class="settings-row">
-                <span class="settings-label">Storage mode</span>
-                <div>
-                  <Show when={current().state === "legacy_default"}>
-                    <span class="settings-value">Direct files</span>
-                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Tine reads and writes your graph’s Markdown or Org files directly. Many people will want to stay here.
-                    </div>
-                    <div style={{ "margin-top": "6px" }}>
-                      <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                        {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
-                      </button>
-                    </div>
-                    <div style={{ "margin-top": "6px" }}>
-                      <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                        {sharing() ? "Joining..." : "Join a synced graph from another device..."}
-                      </button>
-                    </div>
-                  </Show>
-                  <Show when={current().state === "joinable"}>
-                    <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                      {sharing() ? "Joining..." : "Join this synced graph..."}
-                    </button>
-                  </Show>
-                  <Show when={retryable()}>
-                    <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                      {enabling() ? "Retrying..." : "Retry setup"}
-                    </button>
-                  </Show>
-                  <Show when={enabling()}>
-                    <div class="settings-activation-progress" role="status" aria-live="polite">
-                      <div class="settings-hint">{activationProgressLabel()}</div>
-                      <progress aria-label={activationProgressLabel()} />
-                    </div>
-                  </Show>
-                  <Show when={current().state === "active"}>
-                    <span class="settings-value">Tine-managed storage active</span>
-                    <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
-                      <div style={{ "margin-top": "6px" }}>
-                        <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
-                          {sharing()
-                            ? "Setting up..."
-                            : current().runtime?.shared_phase === "share_prepared"
-                              ? "Retry setup"
-                              : "Set up sync with another device..."}
-                        </button>
-                      </div>
-                      {/* The native join branch accepts a device that already
-                          holds managed storage, so the action is offered here
-                          rather than hidden until the device is back in Direct
-                          files. Its confirmation, and its refusal, say what
-                          becomes of this device's own managed history. */}
-                      <div style={{ "margin-top": "6px" }}>
-                        <button
-                          class="settings-btn"
-                          disabled={sharing()}
-                          onClick={() => void joinShare({ fromManaged: true })}
-                        >
-                          {sharing() ? "Joining..." : "Join a synced graph from another device..."}
-                        </button>
-                      </div>
-                    </Show>
-                    <Show when={current().runtime?.shared_phase === "joining"}>
-                      <div style={{ "margin-top": "6px" }}>
-                        <button
-                          class="settings-btn"
-                          disabled={sharing()}
-                          onClick={() => void joinShare({ fromManaged: true })}
-                        >
-                          {sharing() ? "Joining..." : "Join this synced graph..."}
-                        </button>
-                      </div>
-                    </Show>
-                    {/* The share cut is a single durable native step: it is
-                        the confirmation, not this moment, that is the point of
-                        no return, and saying so beats a silent spinner. */}
-                    <Show when={sharing()}>
-                      <div class="settings-hint" role="status" aria-live="polite" style={{ "margin-top": "6px" }}>
-                        This step writes durable sync data and cannot be interrupted. If it fails, the panel keeps
-                        “Return to Direct files” below.
-                      </div>
-                    </Show>
-                    <Show when={sharedDisclosure()}>
-                      {(disclosure) => (
-                        <div class="settings-hint" role="note" style={{ "margin-top": "6px" }}>
-                          {disclosure()}
-                        </div>
-                      )}
-                    </Show>
-                  </Show>
-                  <Show when={blocked()}>
-                    <span class="settings-value">Tine-managed storage needs attention.</span>
-                  </Show>
-                  <Show when={refused()}>
-                    <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
-                  </Show>
-                  <Show when={current().state !== "legacy_default" && current().state !== "joinable"}>
-                    <div style={{ "margin-top": "8px" }}>
-                      <button
-                        class="settings-btn settings-btn-danger"
-                        disabled={cancelling()}
-                        onClick={() => void cancelSparse()}
-                      >
-                        {cancelling() ? "Returning..." : "Return to Direct files"}
-                      </button>
-                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                        Complete recovery state is preserved before returning to Direct files.
-                      </div>
-                      <Show when={directFilesWarning()}>
-                        {(warning) => (
-                          <div class="settings-hint" role="note" style={{ "margin-top": "4px" }}>
-                            {warning()}
-                          </div>
-                        )}
-                      </Show>
-                    </div>
-                  </Show>
-                  <Show when={retryable()}>
-                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Setup paused. You can retry setup when you are ready.
-                    </div>
-                  </Show>
-                  <Show when={current().runtime}>
-                    {(runtime) => (
-                      <>
-                        <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
-                          <div class="settings-hint">
-                            Updating external changes...
-                          </div>
-                        </Show>
-                        <Show when={runtime().provider_pending > 0}>
-                          <div class="settings-hint">
-                            Sync updates are pending.
-                          </div>
-                        </Show>
-                      </>
-                    )}
-                  </Show>
-                  <Show when={runtimeError()}>
-                    {(message) => (
-                      <div class="settings-hint" role="alert" style={{ "margin-top": "6px" }}>
-                        Managed storage needs attention: {safeManagedErrorDetail(message())}
-                      </div>
-                    )}
-                  </Show>
-                  <Show when={managedDiagnostics().length > 0}>
-                    <div class="settings-hint settings-block" role="alert" style={{ "margin-top": "8px" }}>
-                      <strong>Managed storage details</strong>
-                      <For each={managedDiagnostics()}>
-                        {(detail) => <div>{detail}</div>}
-                      </For>
-                      <div style={{ "margin-top": "6px" }}>
-                        <button class="settings-btn" onClick={() => void copyManagedDiagnostics()}>
-                          Copy details
-                        </button>
-                      </div>
-                    </div>
-                  </Show>
-                  <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                    Tine-managed storage keeps a durable operation history and a local index while continuously maintaining the same Logseq-compatible Markdown/Org tree. That history is what makes syncing a graph across devices possible; it is the reason to choose this mode, not a newer replacement for Direct files.
-                  </div>
-                </div>
-              </div>
-            )}
-          </Show>
-        </Show>
-      </ExperimentalSection>
+      </div>
     </>
   );
 }
@@ -3530,8 +2728,6 @@ function BackupsTab(props: { search: string }): JSX.Element {
 
   return (
     <>
-      <ManagedSyncPanel forceOpen={experimentalMatch("backups", props.search)} />
-
       <div class="settings-hint settings-block">
           Tine snapshots your graph’s Markdown/Org files to a local folder each time it opens
         (outside the graph, so Syncthing never sees it). A safety net against a bad
@@ -3729,7 +2925,7 @@ function JournalConflictsPanel(): JSX.Element {
 // unrequested diff in a graph kept in git (invariant 4, write-shyness). It is
 // now proposed here and applied only on this button, after a snapshot.
 function JournalFilenamePanel(): JSX.Element {
-  const [pending, { refetch }] = createResource(async () => {
+  const [pendingResource, { refetch }] = createResource(async () => {
     // Best-effort like the other inventories: an absent panel beats a broken
     // Backups tab.
     try {
@@ -3738,6 +2934,8 @@ function JournalFilenamePanel(): JSX.Element {
       return [];
     }
   });
+  // The panel's own comment: an absent panel beats a broken Backups tab.
+  const pending = () => readOr(pendingResource, undefined, "journal filename migrations");
   const [busy, setBusy] = createSignal(false);
   const apply = async () => {
     const files = pending() ?? [];
@@ -3921,13 +3119,15 @@ function reviewInPage(path: string, name: string, kind: "page" | "journal"): voi
 function FilesTab(props: { search: string }): JSX.Element {
   // Unknown platforms fail closed to "not desktop": a section whose backend
   // command errors on this platform must not be offered.
-  const [filesPlatform] = createResource(async () => {
+  const [filesPlatformResource] = createResource(async () => {
     try {
       return await platformKind();
     } catch {
       return undefined;
     }
   });
+  // Fails closed to "not desktop", exactly as the fetcher's own catch does.
+  const filesPlatform = () => readOr(filesPlatformResource, undefined, "files platform");
   // Live preview of the asset-name template, on a fixed sample so every token is
   // visible (and the example doesn't jitter by the second). Shows both a named
   // drag/insert and a clipboard paste (which has no name → timestamp fallback).

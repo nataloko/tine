@@ -3,8 +3,6 @@
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 
 mod android_folder_picker;
-#[cfg(all(target_os = "android", debug_assertions))]
-mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
@@ -14,6 +12,7 @@ mod android_system_bars;
 mod backend_command_parity;
 mod backup;
 mod command_error;
+mod command_surface;
 mod commands;
 mod conflict_capsule;
 mod data_home;
@@ -25,9 +24,6 @@ mod graph_verification;
 mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
-/// Enumeration of what every command can do under Tine-managed storage. The
-/// diagnostics boundary also uses it to reject invented/free-form IPC names.
-mod managed_command_surface;
 mod media_protocol;
 mod migrate_identifier;
 mod native_mouse_history;
@@ -36,45 +32,39 @@ mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
-mod storage_mode_supervisor;
-/// Test-only: the storage-transition enums and their `src/types.ts` unions are
-/// one wire format written twice.
-#[cfg(test)]
-mod storage_transition_wire_parity;
-mod sync_runtime;
+mod storage_transition_supervisor;
 #[cfg(test)]
 mod test_support;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    acknowledge_managed_application_move, activate_absent_editor, activate_editor,
-    apply_journal_filename_migrations, asset_trash_stats, block_ref_counts, block_referrers,
-    capture_live_save_conflict, capture_quick_switch, close_graph_window, conflict_capsule_diff,
-    conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
-    duplicate_journal_diff, durable_live_save_conflict_diff, edit_asset_external,
-    empty_asset_trash, existing_page_names, export_query_subtrees, get_backlink_filter_context,
-    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
-    import_asset, import_native_capture, journal_content_days, journal_feed_page,
-    list_journal_conflicts, list_journal_filename_migrations, list_orphan_assets, list_pages,
-    list_sync_conflicts, list_templates, list_vcs_marker_conflicts, live_save_conflict_diff,
-    load_workspaces, merge_pages, move_managed_application_subtrees, open_asset, open_page_file,
-    open_pdf, page_aliases, page_icons, page_print_html, preflight_managed_page_mutation,
-    prepare_tine_quit, present_conflict_override, preview_block, publish_html, query_facets,
-    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
-    read_local_image, read_text_file, recover_managed_application_subtrees, referenced_page_names,
-    rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
-    resolve_conflict_capsule, resolve_duplicate_journal_day, resolve_durable_live_save_conflict,
-    resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
-    retire_editor_activation, rollback_pdf_area_image, run_advanced_query, run_graph_search,
-    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
-    set_default_home, set_default_journal_template, set_doc_mode_enter_for_new_block,
-    set_favorites, set_favorites_page, set_guide_announced, set_journal_title_format,
-    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
-    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
-    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
-    write_pdf_view_state,
+    activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
+    block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
+    close_graph_window, conflict_capsule_diff, conflict_queue, copy_guide_into_graph, delete_page,
+    detect_media_editor, duplicate_journal_diff, durable_live_save_conflict_diff,
+    edit_asset_external, empty_asset_trash, existing_page_names, export_query_subtrees,
+    get_backlink_filter_context, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
+    graph_source_files, guide_pages, import_asset, import_native_capture, journal_content_days,
+    journal_feed_page, list_journal_conflicts, list_journal_filename_migrations,
+    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, list_vcs_marker_conflicts,
+    live_save_conflict_diff, load_workspaces, merge_pages, open_asset, open_page_file, open_pdf,
+    page_aliases, page_icons, page_print_html, present_conflict_override, preview_block,
+    publish_html, publish_query, publish_query_plan, query_explain_empty, query_facets,
+    query_og_expressible, query_parse, query_print, query_registry, query_run, quick_switch,
+    read_asset, read_custom_css, read_highlights, read_journal_file, read_local_image,
+    read_text_file, referenced_page_names, rename_file_to_page, rename_page, rescan_graph_now,
+    resolve_block, resolve_blocks, resolve_conflict_capsule, resolve_duplicate_journal_day,
+    resolve_durable_live_save_conflict, resolve_live_save_conflict, resolve_sync_conflict,
+    resolve_vcs_marker_conflict, retire_editor_activation, rollback_pdf_area_image,
+    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
+    save_workspaces, search, set_default_home, set_default_journal_template,
+    set_doc_mode_enter_for_new_block, set_favorites, set_favorites_page, set_guide_announced,
+    set_journal_title_format, set_logical_outdenting, set_preferred_format, set_preferred_workflow,
+    set_show_brackets, set_start_of_week, set_timetracking_enabled, stream_asset_path,
+    sync_conflict_diff, text_block_diff, text_block_diff3, tine_open_devtools, tine_quit,
+    trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
+    write_highlights, write_pdf_view_state,
 };
 use conflict_capsule::{load_conflict_capsules, retire_conflict_capsule, store_conflict_capsule};
 use debug::{
@@ -100,9 +90,9 @@ use plugins::{
 };
 use settings::{
     forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
-    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, reveal_known_graph,
-    save_session, set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match,
-    set_smooth_scroll,
+    get_link_first_match, get_smooth_scroll, list_known_graphs, load_notices, load_session,
+    reveal_known_graph, save_notices, save_session, set_app_bool, set_app_string,
+    set_capture_enter_files, set_link_first_match, set_smooth_scroll,
 };
 use spellcheck::{
     apply_spellcheck, apply_spellcheck_all, list_spellcheck_dictionaries, parse_spellcheck_langs,
@@ -111,13 +101,6 @@ use state::AppState;
 #[cfg(desktop)]
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
-use sync_runtime::{
-    activate_sparse_v2, adopt_sparse_v2_shared, cancel_sparse_v2, cancel_sparse_v2_cold,
-    join_sparse_v2_shared, keep_absence_sweep_deletion, list_absence_sweeps,
-    prepare_sparse_v2_share, reapply_absence_sweep, restore_absence_sweep,
-    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
-    sparse_v2_recovery_location, sparse_v2_status, sparse_v2_tick,
-};
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
@@ -245,6 +228,66 @@ fn schedule_main_window_reveal_fallback(app: &tauri::AppHandle) {
 /// No-op if the window is missing.
 #[cfg(desktop)]
 fn show_capture(app: &tauri::AppHandle) {
+    if app.get_webview_window("capture").is_none() {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let show_generation = state.begin_capture_show();
+    match graph::refresh_capture_graph_binding(&state, show_generation) {
+        Ok(Some(_)) => {}
+        Ok(None) => return, // A newer show already owns this window.
+        Err(_) => {
+            // Cold startup opens the graph asynchronously in the main WebView.
+            // Leave Capture hidden until publication installs its read lease.
+            if state.pending_capture_show() == Some(show_generation) {
+                if let Some(window) = app.get_webview_window("capture") {
+                    let _ = window.hide();
+                }
+            }
+            return;
+        }
+    }
+    present_capture(app, show_generation);
+}
+
+#[cfg(desktop)]
+fn complete_pending_capture_show(app: &tauri::AppHandle, label: String, binding_generation: u64) {
+    let Some(show_generation) = app.state::<AppState>().pending_capture_show() else {
+        return;
+    };
+    let ready_app = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if ready_app.get_webview_window(&label).is_none() {
+            return;
+        }
+        let state = ready_app.state::<AppState>();
+        // Keep the slot stable while installing the lease. A completed older
+        // graph open must not resurrect its binding after a switch or close.
+        let completed = {
+            let graphs = state.graphs.read().unwrap();
+            graphs.slot(&label).is_some_and(|slot| {
+                slot.binding_generation == binding_generation
+                    && state.complete_capture_show(
+                        show_generation,
+                        label.clone(),
+                        binding_generation,
+                    )
+            })
+        };
+        if completed {
+            present_capture(&ready_app, show_generation);
+        }
+    });
+}
+
+#[cfg(desktop)]
+fn present_capture(app: &tauri::AppHandle, show_generation: u64) {
+    if !app
+        .state::<AppState>()
+        .capture_show_is_current(show_generation)
+    {
+        return;
+    }
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.set_size(tauri::LogicalSize::new(600.0, 92.0));
         if let Ok(Some(mon)) = w.current_monitor() {
@@ -256,14 +299,6 @@ fn show_capture(app: &tauri::AppHandle) {
             let _ = w.center();
         }
         let _ = w.show();
-        // Retarget the read-only capture lease before the window can receive
-        // the fallback focus. Until its frontend obtains this generation, old
-        // WebView requests fail stale instead of querying a previously selected
-        // graph after a hidden-window reopen.
-        let state = app.state::<AppState>();
-        if graph::refresh_capture_graph_binding(&state).is_err() {
-            state.clear_capture_graph();
-        }
         // Do not activate until the frontend acknowledges that its textarea and
         // capture-shown listener exist. Activating a newly mapped window first
         // lets a fast typist send keys into an unready WebView; Plasma can also
@@ -288,7 +323,7 @@ fn show_capture(app: &tauri::AppHandle) {
                     .and_then(|window| window.is_visible().ok())
                     .unwrap_or(false)
                 {
-                    activate_capture_window(&main_thread_app);
+                    activate_capture_window(&main_thread_app, show_generation);
                 }
             });
         });
@@ -305,10 +340,19 @@ const CAPTURE_FOCUS_RETRY_DELAYS_MS: [u64; 5] = [40, 120, 260, 520, 900];
 /// in the same turn as mapping a frameless window because it is not ready for
 /// painting yet. Every retry follows an explicit `tine --capture` user action.
 #[cfg(desktop)]
-fn activate_capture_window(app: &tauri::AppHandle) {
+fn activate_capture_window(app: &tauri::AppHandle, show_generation: u64) {
+    if !app
+        .state::<AppState>()
+        .capture_show_is_current(show_generation)
+    {
+        return;
+    }
     let Some(window) = app.get_webview_window("capture") else {
         return;
     };
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
     let _ = window.unminimize();
     let _ = window.set_focus();
     let _ = app.emit_to("capture", "capture-focus-editor", ());
@@ -324,7 +368,11 @@ fn activate_capture_window(app: &tauri::AppHandle) {
                 let Some(window) = focus_app.get_webview_window("capture") else {
                     return;
                 };
-                if window.is_visible().unwrap_or(false) {
+                if window.is_visible().unwrap_or(false)
+                    && focus_app
+                        .state::<AppState>()
+                        .capture_show_is_current(show_generation)
+                {
                     let _ = window.set_focus();
                     let _ = focus_app.emit_to("capture", "capture-focus-editor", ());
                 }
@@ -353,7 +401,9 @@ fn capture_frontend_ready(
                 "capture window is hidden",
             ));
         }
-        activate_capture_window(&app);
+        if let Some(show_generation) = app.state::<AppState>().bound_capture_show() {
+            activate_capture_window(&app, show_generation);
+        }
         Ok(())
     }
 
@@ -690,9 +740,11 @@ pub fn run() {
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
-                    state.graphs.write().unwrap().remove(label);
+                    let removed = state.graphs.write().unwrap().remove(label);
                     state::poke_watcher(&state);
                     if state.graphs.read().unwrap().len() == 0 {
+                        // Unregistered above, so `RunEvent::Exit` cannot reach it.
+                        drain_concord_ledgers_for_exit(removed.as_deref());
                         #[cfg(target_os = "linux")]
                         platform::kill_webkit_children();
                         app.exit(0);
@@ -703,11 +755,11 @@ pub fn run() {
         })
         .manage(AppState {
             graphs: RwLock::new(state::GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
-            capture_graph: Mutex::new(None),
-            sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
+            capture_graph: Mutex::new(Default::default()),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
         })
@@ -735,10 +787,9 @@ pub fn run() {
             #[cfg(desktop)]
             schedule_main_window_reveal_fallback(app.handle());
             // The themed WebView owns startup graph loading through the normal
-            // `load_graph` command. In particular, authenticated managed crash
-            // recovery may be legitimate work; running it here would block the
-            // native event loop before either the stable-frame reveal or the
-            // fallback can show a window.
+            // `load_graph` command; running it here would block the native
+            // event loop before either the stable-frame reveal or the fallback
+            // can show a window.
             diag("setup() defers graph open to the visible webview");
             // Watch for external changes (reads whichever graph is current).
             start_watcher(app.handle().clone());
@@ -799,27 +850,6 @@ pub fn run() {
             cancel_graph_verification,
             save_graph_verification_report,
             save_page,
-            move_managed_application_subtrees,
-            acknowledge_managed_application_move,
-            recover_managed_application_subtrees,
-            preflight_managed_page_mutation,
-            sparse_v2_status,
-            activate_sparse_v2,
-            cancel_sparse_v2,
-            cancel_sparse_v2_cold,
-            prepare_sparse_v2_share,
-            join_sparse_v2_shared,
-            adopt_sparse_v2_shared,
-            sparse_v2_recovery_location,
-            sparse_v2_query,
-            sparse_v2_editor_load,
-            sparse_v2_editor_save,
-            sparse_v2_tick,
-            list_absence_sweeps,
-            reapply_absence_sweep,
-            restore_absence_sweep,
-            keep_absence_sweep_deletion,
-            sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,
             get_backlink_filter_context,
@@ -831,12 +861,21 @@ pub fn run() {
             delete_page,
             rename_page,
             publish_html,
+            publish_query_plan,
+            publish_query,
             page_print_html,
             run_query,
             export_query_subtrees,
             run_graph_search,
             run_advanced_query,
             query_facets,
+            // SPEC §7.1: the six commands of the one query engine.
+            query_parse,
+            query_print,
+            query_og_expressible,
+            query_registry,
+            query_run,
+            query_explain_empty,
             page_aliases,
             page_icons,
             existing_page_names,
@@ -936,6 +975,8 @@ pub fn run() {
             save_session,
             load_workspaces,
             save_workspaces,
+            load_notices,
+            save_notices,
             list_known_graphs,
             forget_known_graph,
             reveal_known_graph,
@@ -974,7 +1015,6 @@ pub fn run() {
             diagnostic_report,
             save_diagnostic_report,
             clear_diagnostics,
-            prepare_tine_quit,
             tine_quit,
             close_graph_window,
             tine_open_devtools
@@ -987,14 +1027,76 @@ pub fn run() {
     // `RunEvent::Exit`, which Tauri delivers to this callback before exiting;
     // clearing it anywhere later never runs and every quit is falsely reported
     // as unclean on the next launch (the flight recorder's `session-active`
-    // marker survives). Enforced at the real boundary by
-    // `scripts/e2e-absence-sweeps.mjs`, which reopens the app mid-journey and
-    // asserts the unclean-exit toast is absent.
-    app.run(|_app_handle, event| {
+    // marker survives).
+    app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            let slots: Vec<_> = app_handle
+                .state::<AppState>()
+                .graphs
+                .read()
+                .unwrap()
+                .entries()
+                .into_iter()
+                .map(|(_, slot)| slot)
+                .collect();
+            drain_concord_ledgers_for_exit(slots.iter().map(|slot| slot.as_ref()));
             mark_clean_shutdown();
+            // tao delivers this callback for WM_ENDSESSION, but on that path its
+            // Windows message loop neither receives WM_QUIT nor switches to an
+            // exiting ControlFlow. Returning would therefore leave Tine alive
+            // until Windows force-terminates it (GH #455). The durability work
+            // above is deliberately bounded, so terminate once it is complete.
+            #[cfg(target_os = "windows")]
+            std::process::exit(0);
         }
     });
+}
+
+/// Quitting waits at most `tine_core::concord_ledger::EXIT_DRAIN_BUDGET`, in
+/// total, for the queued Concord ledger updates of `slots`, so a save made just
+/// before quitting keeps its merge base. `concord_exit_drain_tests` pins that
+/// every exit path reaches this.
+fn drain_concord_ledgers_for_exit<'a>(slots: impl IntoIterator<Item = &'a state::GraphSlot>) {
+    let deadline = std::time::Instant::now() + tine_core::concord_ledger::EXIT_DRAIN_BUDGET;
+    for slot in slots {
+        let _ =
+            slot.with_filesystem_graph(|graph| Ok(graph.drain_concord_ledger_for_exit(deadline)));
+    }
+}
+
+#[cfg(test)]
+mod concord_exit_drain_tests {
+    /// Quitting waits, bounded by `tine_core::concord_ledger::EXIT_DRAIN_BUDGET`,
+    /// for every open graph's queued Concord ledger updates, so a save made just
+    /// before quitting keeps its merge base (Martin, 2026-09-15). `tine_quit` and
+    /// `close_graph_window` exit with their graphs still registered, so the
+    /// `RunEvent::Exit` arm drains them. The last window's `Destroyed` handler
+    /// unregisters its graph before exiting, so it drains that slot first.
+    #[test]
+    fn every_exit_path_drains_the_concord_ledgers() {
+        let source = include_str!("lib.rs");
+        let run = &source[source.find("app.run(|").expect("the event loop")..];
+        let run = &run[..run.find("});").expect("the end of the event loop")];
+        assert!(
+            run.contains("RunEvent::Exit")
+                && run.contains("drain_concord_ledgers_for_exit(")
+                && run.contains("std::process::exit(0)"),
+            "I-24: the RunEvent::Exit arm must drain every registered graph's Concord \
+             ledger before Tine exits, beside mark_clean_shutdown(); Windows must then \
+             terminate because WM_ENDSESSION does not break tao's message loop"
+        );
+        let destroyed = &source[source
+            .find("tauri::WindowEvent::Destroyed =>")
+            .expect("the Destroyed handler")..];
+        let destroyed = &destroyed[..destroyed
+            .find("app.exit(0);")
+            .expect("the last-window exit")];
+        assert!(
+            destroyed.contains("drain_concord_ledgers_for_exit("),
+            "I-24: the last window's Destroyed handler unregisters its graph before \
+             app.exit(0), so it must drain that slot's Concord ledger first"
+        );
+    }
 }
 
 #[cfg(test)]

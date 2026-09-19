@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,8 +10,17 @@ const SRC = fileURLToPath(new URL(".", import.meta.url));
 
 interface ConsoleSite {
   file: string;
-  line: number;
+  /// The site's IDENTITY: a digest of the call's method and its normalized
+  /// argument text. Deliberately not the line number -- see the note on
+  /// CONSOLE_ALLOWLIST.
+  anchor: string;
   method: "log" | "warn" | "error" | "debug";
+}
+
+/// Where the site currently sits, for the failure message only. Never asserted.
+interface ConsoleSiteLocation extends ConsoleSite {
+  line: number;
+  text: string;
 }
 
 // Every console site carries one of four buckets. They are the same four the
@@ -31,37 +41,49 @@ interface ConsoleSite {
 // from (c) to (d): it keeps a failure's type, size and identity and drops its
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
-const CONSOLE_ALLOWLIST_SIZE = 21;
-// FORK: six `line` pins below sit BELOW fork insertions in their file (the git
-// commit-on-close block and the threading class list in App.tsx, the calc-mode
-// latch in Block.tsx, the saved-pages sink in persistence.ts, the manual-updater
-// edits in update.ts), so they read higher here than upstream's own numbers. Pure
-// line drift — the site, its method and its class are upstream's, unchanged. Take
-// upstream's numbers on a conflict and re-run this test to re-derive the offsets.
-const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class: string; why: string })[] = [
-  { file: "App.tsx", line: 1081, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
-  { file: "capture.tsx", line: 173, method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
-  { file: "capture.tsx", line: 600, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
-  { file: "components/Block.tsx", line: 1588, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
-  { file: "logbook.ts", line: 43, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
-  { file: "main.tsx", line: 62, method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
-  { file: "main.tsx", line: 70, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
-  { file: "pdfRenderCoordinator.ts", line: 343, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
-  { file: "persistence.ts", line: 1011, method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1016, method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1165, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },
-  { file: "print.ts", line: 98, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a KaTeX/highlight rejection quotes the source it refused" },
-  { file: "print.ts", line: 113, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
-  { file: "print.ts", line: 157, method: "error", bucket: "d", class: "local-error", why: "iframe print failure is a DOM/print-subsystem error over no page identity" },
-  { file: "render/parse.ts", line: 51, method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
-  { file: "sheet/formulaEval.ts", line: 193, method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
-  { file: "store.ts", line: 6969, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — replay-evidence retirement errors carry the private store path" },
-  { file: "ui.ts", line: 491, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
-  { file: "ui.ts", line: 516, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
-  { file: "ui.ts", line: 553, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
-  { file: "update.ts", line: 155, method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
-];
+const CONSOLE_ALLOWLIST_SIZE = 22;
 
+// Rows are keyed by CONTENT, not by line number, and that is the whole point of
+// the `anchor` column.
+//
+// This census used to pin `{ file, line }`. Every such row is a claim about a
+// line number in a file the census does not otherwise care about, so inserting
+// a line anywhere above one of them turned this suite red for a lane that never
+// touched logging: five of six candidate models in the September model
+// comparison reddened `npm test` on files they had not edited, and each one
+// then had to decide whether a safety ratchet it did not understand was
+// reporting a real finding. An anchor moves with its call.
+//
+// It also catches something the line pin actively hid. Two `print.ts` rows had
+// their class and reason SWAPPED -- the row at the iframe site described the
+// pagePrintHtml site and vice versa -- and the suite stayed green for as long
+// as both sites were `error` and both line numbers existed. The classification
+// is the safety content here; binding it to a line number rather than to the
+// call meant the census could be green and wrong at the same time.
+const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class: string; why: string })[] = [
+  { file: "App.tsx", anchor: "bd49af363722", method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
+  { file: "capture.tsx", anchor: "3de353ced60a", method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
+  { file: "capture.tsx", anchor: "c302419aed10", method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
+  { file: "components/Block.tsx", anchor: "ca982a4fd092", method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
+  { file: "components/FailureBoundary.tsx", anchor: "826addd8f4d5", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() plus `region`, which is a fixed seam name chosen in source, never a page or path" },
+  { file: "logbook.ts", anchor: "f27172cceded", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
+  { file: "main.tsx", anchor: "3de353ced60a", method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
+  { file: "main.tsx", anchor: "e4a2943c031b", method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
+  { file: "main.tsx", anchor: "9ea897047c15", method: "error", bucket: "d", class: "local-error", why: "published snapshot fetch failure is an HTTP status or a file:// refusal; no graph content is loaded yet" },
+  { file: "pdfRenderCoordinator.ts", anchor: "0ad719767700", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
+  { file: "persistence.ts", anchor: "56ce51bc820d", method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", anchor: "d000164d69a2", method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "print.ts", anchor: "2403b56e48d3", method: "error", bucket: "d", class: "local-error", why: "iframe print failure is a DOM/print-subsystem error over no page identity" },
+  { file: "print.ts", anchor: "4411f8c9e188", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a KaTeX/highlight rejection quotes the source it refused" },
+  { file: "print.ts", anchor: "99eb03faa4fe", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
+  { file: "render/parse.ts", anchor: "1e8f76713ce3", method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
+  { file: "sheet/formulaEval.ts", anchor: "8259b2f56d25", method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
+  { file: "resourceRead.ts", anchor: "eeeb3a5fdd36", method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() plus `what`, a fixed label chosen in source — never the page, path or query the resource was about" },
+  { file: "ui.ts", anchor: "22fb47f1f860", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
+  { file: "ui.ts", anchor: "350928478727", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
+  { file: "ui.ts", anchor: "ebb833424c2f", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
+  { file: "update.ts", anchor: "b7b0521bc51e", method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
+];
 function sourceFiles(dir: string, files: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
@@ -97,55 +119,89 @@ function isFixedLiteral(argumentsText: string): boolean {
   return /^\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.|\$(?!\{))*`)\s*,?\s*$/s.test(argumentsText);
 }
 
-function variableConsoleSites(): ConsoleSite[] {
-  const sites: ConsoleSite[] = [];
+/// The site's identity. Whitespace is collapsed so that reformatting a call
+/// across lines does not move it; anything else about the arguments -- the
+/// literal, the variable, whether it passes through failureShape() -- changes
+/// the anchor, which is correct: a different payload is a different site and
+/// must be reclassified.
+function anchorOf(method: string, argumentsText: string): string {
+  const normalized = argumentsText.replace(/\s+/g, " ").trim();
+  return createHash("sha256").update(`${method}(${normalized})`).digest("hex").slice(0, 12);
+}
+
+function variableConsoleSites(): ConsoleSiteLocation[] {
+  const sites: ConsoleSiteLocation[] = [];
   for (const file of sourceFiles(SRC)) {
     const text = readFileSync(file, "utf8");
     for (const match of text.matchAll(/\bconsole\.(log|warn|error|debug)\s*\(/g)) {
       const open = match.index! + match[0].lastIndexOf("(");
       const end = closingParen(text, open);
-      if (isFixedLiteral(text.slice(open + 1, end))) continue;
+      const argumentsText = text.slice(open + 1, end);
+      if (isFixedLiteral(argumentsText)) continue;
+      const method = match[1] as ConsoleSite["method"];
       sites.push({
         file: relative(SRC, file).replaceAll("\\", "/"),
+        anchor: anchorOf(method, argumentsText),
+        method,
         line: text.slice(0, match.index).split("\n").length,
-        method: match[1] as ConsoleSite["method"],
+        text: argumentsText.replace(/\s+/g, " ").trim().slice(0, 120),
       });
     }
   }
-  return sites.sort((left, right) => left.file.localeCompare(right.file) || left.line - right.line);
+  return sites.sort((left, right) => left.file.localeCompare(right.file) || left.anchor.localeCompare(right.anchor));
 }
+
+/// A site's identity, in the only two forms the assertions use.
+const identity = (site: ConsoleSite) => `${site.file} ${site.method} ${site.anchor}`;
+const located = (site: ConsoleSiteLocation) => `${site.file}:${site.line} ${site.method} ${site.anchor} — ${site.text}`;
 
 describe("I-5 content-out-of-logs ratchet", () => {
   it("equals the reviewed production console census", () => {
     expect(CONSOLE_ALLOWLIST).toHaveLength(CONSOLE_ALLOWLIST_SIZE);
     for (const entry of CONSOLE_ALLOWLIST) {
-      expect(entry.class, `${entry.file}:${entry.line} needs a class`).not.toBe("");
-      expect(entry.why, `${entry.file}:${entry.line} needs a reason`).not.toBe("");
+      expect(entry.class, `${identity(entry)} needs a class`).not.toBe("");
+      expect(entry.why, `${identity(entry)} needs a reason`).not.toBe("");
     }
+    // An anchor must name one call. Two identical calls in one file would let a
+    // row describe either of them, which is the ambiguity the line pin had.
+    expect(new Set(CONSOLE_ALLOWLIST.map(identity)).size, "duplicate anchors in the allowlist").toBe(
+      CONSOLE_ALLOWLIST.length,
+    );
+    const sites = variableConsoleSites();
+    expect(new Set(sites.map(identity)).size, "two identical console calls in one file: give one a distinct message").toBe(
+      sites.length,
+    );
     expect(
-      CONSOLE_ALLOWLIST.filter((entry) => entry.bucket === "c").map((entry) => `${entry.file}:${entry.line}`),
+      CONSOLE_ALLOWLIST.filter((entry) => entry.bucket === "c").map(identity),
       "I-5: class (c) is always-on plus a variable that can carry user content, and it is ZERO here. "
         + "Do not classify a site into (c); fix it — pass the value through failureShape() (exemplar: "
         + "src/failureShape.ts, used at ui.ts) or log a count (exemplar: persistence.ts logs `{ count }`)",
     ).toEqual([]);
+
+    const allowed = new Set(CONSOLE_ALLOWLIST.map(identity));
     expect(
-      variableConsoleSites(),
-      "I-5: the variable-bearing console census changed. Log a count or a fixed string, never user content "
-        + "(exemplar: persistence.ts logs `{ count }`); if a new site is legitimately content-free, add it to "
-        + "CONSOLE_ALLOWLIST with its class and reason and bump CONSOLE_ALLOWLIST_SIZE",
-    ).toEqual(
-      CONSOLE_ALLOWLIST.map(({ file, line, method }) => ({ file, line, method })),
-    );
+      sites.filter((site) => !allowed.has(identity(site))).map(located),
+      "I-5: a variable-bearing console site is not in the reviewed census. Log a count or a fixed string, "
+        + "never user content (exemplar: persistence.ts logs `{ count }`); if the payload is legitimately "
+        + "content-free, add it to CONSOLE_ALLOWLIST with its anchor, class and reason and bump "
+        + "CONSOLE_ALLOWLIST_SIZE. Anchors are content digests, so this does NOT fire merely because lines moved",
+    ).toEqual([]);
+    const present = new Set(sites.map(identity));
+    expect(
+      CONSOLE_ALLOWLIST.filter((entry) => !present.has(identity(entry))).map(identity),
+      "I-5: a censused console site no longer exists with that payload. If you changed what it logs, "
+        + "reclassify it and update its anchor; if you deleted it, drop the row and lower CONSOLE_ALLOWLIST_SIZE",
+    ).toEqual([]);
   });
 
   it("pins the diagnostics contract to both allowlist sizes and gates", () => {
     const contract = source("docs/contracts/diagnostics.md");
     const rustRatchet = source("crates/tine-core/tests/content_out_of_logs.rs");
-    expect(contract).toContain("74 Rust production print sites");
-    expect(contract).toContain("21 variable-bearing frontend console sites");
+    expect(contract).toContain("18 Rust production print sites");
+    expect(contract).toContain("22 variable-bearing frontend console sites");
     expect(contract).toContain("debug_enabled()");
     expect(contract).toContain("runtime_debug_diagnostics_enabled()");
-    expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 74;");
+    expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 18;");
   });
 
   it("makes parser failures fixed-shape before they cross the lsdoc-diff worker boundary", () => {

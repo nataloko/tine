@@ -1,21 +1,24 @@
+use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
-use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
-use crate::oplog::query_lowering::drain_after;
-use crate::query::{
-    run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
-    ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
-    PropertyFacetAccumulator, SimpleQueryCandidatePlan,
+use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
+use crate::query::registry_sql::{self, PageRegistryMetadata};
+use crate::query::PropertyFacetAccumulator;
+use crate::query_cursor::drain_after;
+use crate::query_jobs::{
+    OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
 };
+use crate::vocab::{Format, PageEntry, PageKind, ReferenceKind};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
-    PhysicalProperty, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
+    PhysicalProjectionQuerySnapshot, PhysicalProperty, PhysicalQueryValue,
+    PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -23,15 +26,32 @@ use uuid::Uuid;
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
 
+struct CommittedRegistryOwner {
+    cache: CommittedRegistryCache,
+    config: Arc<ParseConfig>,
+}
+
+type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
+
 // This is the parser-fact extractor identity, not an on-disk schema version.
 // Bump it whenever unchanged source bytes must be lowered into new/different
 // physical facts. The source-revision delta then rebuilds each page once even
 // when tine-storage's disposable SQLite schema itself remains compatible.
 const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// R6: how many streamed warm deltas may wait in the queue before the warm
+/// thread parses the next batch. It bounds what a cold or changed open retains
+/// beyond the worker's current turn to one batch of documents, instead of the
+/// whole parsed graph the full snapshot used to pin (plan §2D).
+pub(crate) const WARM_STREAM_HIGH_WATER: usize = 64;
 
 #[cfg(test)]
-static PHYSICAL_PAGE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
+// Test receipts count only their own graph, including its worker threads.
+static PHYSICAL_PAGE_LOWERINGS: Mutex<(Option<PathBuf>, u64)> = Mutex::new((None, 0));
+/// R6 test receipt: the most deltas a warm stream ever left queued, so a test
+/// can prove the stream never retained more than `WARM_STREAM_HIGH_WATER`.
+#[cfg(test)]
+static MAX_PENDING_DELTAS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
@@ -43,18 +63,247 @@ fn run_before_apply_pending_hook() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static REGISTRY_READ_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_registry_read_attempts() -> u64 {
+    REGISTRY_READ_ATTEMPTS.with(|count| count.replace(0))
+}
+
+/// One queued page change. **The graph config travels INSIDE the work item**
+/// (§5.8 M21, F11): every arm that lowers a page carries the exact
+/// [`ParseConfig`] it must be lowered under, so the worker cannot reach a state
+/// where queued work exists and the config that describes it does not.
+///
+/// The config used to sit beside the queue, and the worker read it as
+/// `parse_config.clone().unwrap_or_else(|| Arc::new(ParseConfig::default()))`.
+/// That fallback was unreachable — the stop check runs first and every enqueue
+/// path set the config in the same critical section that inserted the work —
+/// but if it had ever fired it would have lowered queued pages under the
+/// DEFAULT config and stamped the result as current: silently wrong rows,
+/// which is exactly what the stamp exists to prevent, reached from inside. A
+/// `debug_assert` would have hidden the release-mode behaviour behind a passing
+/// debug run, so the absence is removed by SHAPE — it can no longer be spelled.
+///
+/// `Delete` deliberately carries no config: it lowers nothing and stamps no
+/// source revision, so a config on that arm would be a value with no reader.
 #[derive(Clone)]
 enum PageDelta {
-    Replace(PageEntry, Arc<Document>, String),
-    Delete(PageEntry),
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+        parse_config: Arc<ParseConfig>,
+        /// `None` while a warm stream is open (R6): the rows carry no order
+        /// position until the stream's closing order turn reconciles the
+        /// whole `query_page_order` table, because a position written mid-stream
+        /// could collide with a retained page's previous-session position.
+        query_page_order: Option<u64>,
+        identity: DeltaIdentity,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
+/// R6 session identity rule (WARM-IDENTITY-ORDER-CONTRACT.md item 3): where a
+/// replacement's runtime ids came from decides whether the page joins or
+/// leaves `ProjectionShared::session_pages`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeltaIdentity {
+    /// The document is this process's live one (a save, or a parsed-cache
+    /// snapshot that may carry preserved ids): the stored `result_id`s ARE the
+    /// public ids, so the page is added.
+    Live,
+    /// A fresh parse (the warm stream): the stored ids are structural, equal to
+    /// what `doc_runtime_id_for_order` derives, so the page is removed — an
+    /// external incompatible revision invalidates any live mapping it had.
+    Structural,
+}
+
+impl PageDelta {
+    fn entry(&self) -> &PageEntry {
+        match self {
+            PageDelta::Replace { entry, .. } | PageDelta::Delete { entry } => entry,
+        }
+    }
+}
+
+/// A queued whole-graph snapshot and the config it must be lowered under. The
+/// config is stamped into every page's `projection_source_revision`, so a
+/// config edit re-lowers every page on the next snapshot instead of leaving
+/// rows that answer a question the config no longer asks (J7, D-1: rebuild,
+/// never migrate).
+struct PendingFull {
+    pages: PageSnapshot,
+    revisions: PageRevisions,
+    parse_config: Arc<ParseConfig>,
+}
+
+/// R6 warm validation: the walk inventory with each page's exact content
+/// revision, and nothing parsed. The worker compares it with
+/// `direct_source_revisions`; an unchanged graph publishes readiness from this
+/// alone, a changed one names the pages the warm thread must parse.
+struct PendingWarm {
+    sources: Vec<(PageEntry, String)>,
+    parse_config: Arc<ParseConfig>,
+}
+
+/// What the worker's warm-validation turn decided (R6), read by the warm
+/// thread through `wait_warm_outcome`.
+#[derive(Clone, Debug)]
+pub(crate) enum WarmOutcome {
+    /// Every walk page's rows are current: readiness publishes without a parse.
+    Clean,
+    /// These pages' rows are missing or stale; the warm thread streams them.
+    Replacements(Vec<PageEntry>),
+    /// A full parsed snapshot arrived first and owns readiness.
+    Superseded,
+    /// The validation turn failed; the parser fallback owns readiness.
+    Failed,
+}
+
+/// One page of the R6 warm stream, as the warm thread hands it over.
+pub(crate) enum WarmStreamItem {
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+        identity: DeltaIdentity,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
+enum QueryCaptureRequirement {
+    CurrentSnapshot,
+    #[cfg(test)]
+    StrictGeneration(u64),
+}
+
+struct PendingQueryCapture {
+    requirement: QueryCaptureRequirement,
+    registry_sensitivity: RegistrySensitivity,
+    slot: crate::query_jobs::OwnedJobSlot,
+    reply: std::sync::mpsc::SyncSender<QueryJobOpen>,
+}
+
+/// Whether a query can observe property type inference. Registry-sensitive
+/// jobs freeze the cache input beside their SQL snapshot; all other jobs carry
+/// no registry state at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegistrySensitivity {
+    Insensitive,
+    Required,
+}
+
+fn reject_query_captures(captures: Vec<PendingQueryCapture>) {
+    for capture in captures {
+        // Release admission before replying, so the receiver can immediately
+        // retry without being held behind its own rejected capture.
+        drop(capture.slot);
+        let _ = capture.reply.send(QueryJobOpen::Cancelled);
+    }
 }
 
 #[derive(Default)]
 struct PendingProjection {
-    full: Option<(u64, PageSnapshot, PageRevisions)>,
+    // Each capture owns one slot from the shared two-job cap.
+    captures: Vec<PendingQueryCapture>,
+    full: Option<PendingFull>,
+    rebuild: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
     stop: bool,
+    page_order: BTreeMap<String, u64>,
+    next_page_order: u64,
+    /// R6 warm validation queued for the worker.
+    warm: Option<PendingWarm>,
+    /// R6: the worker's verdict on the last warm validation.
+    warm_outcome: Option<WarmOutcome>,
+    /// R6: a warm stream is open at this generation. Readiness never publishes
+    /// while it is `Some`, and deltas recorded meanwhile carry no order
+    /// position (see `PageDelta::Replace::query_page_order`).
+    warm_stream: Option<u64>,
+    /// R6: the stream's closing turn — reconcile `query_page_order` over the
+    /// queue's own inventory and then publish readiness.
+    order: Option<u64>,
+    /// R6: a full snapshot was queued after the warm; the stream must stop
+    /// enqueueing (its deltas would drop the snapshot's order rows).
+    warm_superseded: bool,
+    /// R6: an abandoned stream left stale rows behind; only a full snapshot may
+    /// publish readiness again (the worker turns this into
+    /// `requires_full_rebuild`).
+    needs_full: bool,
+}
+
+impl PendingProjection {
+    fn record_delta(&mut self, generation: u64, mut delta: PageDelta) {
+        let key = delta.entry().rel_path.clone();
+        match &mut delta {
+            PageDelta::Replace {
+                query_page_order, ..
+            } => {
+                let position = if let Some(position) = self.page_order.get(&key) {
+                    *position
+                } else {
+                    let position = self.next_page_order;
+                    self.next_page_order += 1;
+                    self.page_order.insert(key.clone(), position);
+                    position
+                };
+                *query_page_order = self.warm_stream.is_none().then_some(position);
+            }
+            PageDelta::Delete { .. } => {
+                self.page_order.remove(&key);
+            }
+        }
+        self.deltas.insert(key, (generation, delta));
+        self.latest_generation = self.latest_generation.max(generation);
+    }
+
+    /// Seed the queue's page order from a complete inventory (a full snapshot
+    /// or a warm walk), replacing whatever a cache-less session appended.
+    fn seed_page_order<'a>(&mut self, inventory: impl ExactSizeIterator<Item = &'a str>) {
+        let mut inventory = inventory.collect::<Vec<_>>();
+        if self.rebuild {
+            // Repair preserves the session's retained/append order. Stable
+            // sorting leaves newly discovered paths in their inventory order,
+            // after existing pages. Re-number both owners together below.
+            inventory.sort_by_key(|path| self.page_order.get(*path).copied().unwrap_or(u64::MAX));
+        }
+        self.next_page_order = inventory.len() as u64;
+        self.page_order = inventory
+            .into_iter()
+            .enumerate()
+            .map(|(position, rel_path)| (rel_path.to_owned(), position as u64))
+            .collect();
+    }
+
+    /// The queue's own page inventory in position order: the R6 order turn's
+    /// authority. After a warm seed the map tracks every applied replacement
+    /// and deletion, so it names exactly the pages the projection holds.
+    fn ordered_inventory(&self) -> Vec<[u8; 16]> {
+        let mut ordered = self
+            .page_order
+            .iter()
+            .map(|(rel_path, position)| (*position, page_id(rel_path)))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(position, _)| *position);
+        ordered.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn has_work(&self) -> bool {
+        self.full.is_some()
+            || !self.deltas.is_empty()
+            || self.warm.is_some()
+            || self.order.is_some()
+            || self.needs_full
+    }
 }
 
 struct ProjectionShared {
@@ -63,18 +312,430 @@ struct ProjectionShared {
     changed: Condvar,
     ready: AtomicBool,
     ready_generation: AtomicU64,
+    /// Presentation invalidation only; never a requested edit or read target.
+    commit_notification: AtomicU64,
+    commit_waker: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
+    /// R3: the ONE admission/cancellation owner for database-owned query jobs
+    /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
+    /// drains every job before it replaces or resets the file, and `Drop`
+    /// drains before the worker is stopped.
+    query_jobs: Arc<QueryJobOwner>,
+    /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
+    /// 2–3): the pages whose rows THIS process lowered. Their stored
+    /// `query_block_results.result_id` is the live runtime id the parsed
+    /// document carried when the row was written. Every other page's rows
+    /// survived from an earlier session, and a fresh parse of an unchanged
+    /// page assigns STRUCTURAL runtime ids, so their public id is derived from
+    /// `(path, order_key)` through `model::doc_runtime_id_for_order` instead.
+    /// Copy-on-write: the worker swaps a new `Arc` after each successful
+    /// apply, and a job clones the `Arc` at snapshot acquisition — never a
+    /// live lookup during output.
+    session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
+    committed_registry: SharedCommittedRegistry,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
+    /// The writer worker has RETURNED, and every resource it owned — the
+    /// SQLite writer connection and the exclusive writer lease — is closed.
+    ///
+    /// `worker_available` says only that the worker will take no further work;
+    /// it is stored before those two locals drop. A caller that must remove the
+    /// database's directory needs the stronger fact, so this flag is published
+    /// by a guard declared FIRST in `projection_worker` and therefore dropped
+    /// LAST. See [`DirectProjection::close_and_wait_for_worker`].
+    worker_finished: AtomicBool,
+    /// Resources whose destruction must follow the writer connection and
+    /// lease. None closes registration once worker teardown starts.
+    worker_resources: Mutex<Option<Vec<Arc<dyn Send + Sync>>>>,
+    /// R6: this session has validated the complete page inventory against
+    /// the projection at least once (a full snapshot, or a warm validation's
+    /// `Clean` or closing order turn). Until then a live delta keeps the file
+    /// converging but must not publish readiness: rows of pages this session
+    /// has never compared to disk could be stale from an earlier session.
+    /// In-scope scenario: an external edit between two sessions, followed by
+    /// a save of some other page before the warm runs.
+    validated: AtomicBool,
+    #[cfg(test)]
+    after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    capture_thread: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
     #[cfg(test)]
     indexed_reads: AtomicU64,
+    /// §5.9's dispatched statements: how many times the lowering ANSWERED a
+    /// user query through the seam. Separate from `indexed_reads`, which counts
+    /// every seam read including the FTS-readiness probe, so a route guard can
+    /// say "exactly one statement per query" and mean it.
+    #[cfg(test)]
+    statement_reads: AtomicU64,
+    #[cfg(test)]
+    registry_capture_attempts: AtomicU64,
+    /// Repairs currently computing the payload they will enqueue. A repair
+    /// that has not reached its `enqueue_*` yet has published nothing, so
+    /// without this a query racing it reads the queue as idle and stale and
+    /// its own repair attempt as one that "did not take" — a terminal
+    /// `Unavailable(ReadFailed)` on a projection that is being repaired
+    /// perfectly well by the thread beside it.
+    repairs_in_flight: AtomicUsize,
+    /// §5.9's failed-read injection: one read through the seam fails, exactly as
+    /// a torn or truncated projection file, a disk error or a resource limit
+    /// makes it fail. It exists because the obligation a failed read carries —
+    /// note the fallback AND schedule the full-snapshot recovery — is invisible
+    /// on a healthy projection, and an obligation nothing can observe is one a
+    /// future arm silently drops (M9).
+    #[cfg(test)]
+    inject_read_failure: AtomicBool,
     #[cfg(test)]
     fallback_reads: AtomicU64,
     #[cfg(test)]
     referenced_name_reads: AtomicU64,
     #[cfg(test)]
     fuzzy_candidate_reads: AtomicU64,
+}
+
+impl ProjectionShared {
+    fn ready_at(&self, generation: u64) -> bool {
+        self.ready.load(Ordering::Acquire)
+            && self.ready_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn cancel_queued_captures(&self, close: bool) -> crate::query_jobs::QueryDrainFence {
+        let (fence, captures) = {
+            let mut pending = self.pending.lock().unwrap();
+            let fence = if close {
+                pending.stop = true;
+                self.query_jobs.begin_close()
+            } else {
+                // Reset/config replacement invalidates existing reader jobs.
+                // Ordinary page deltas never enter this lifecycle boundary.
+                self.query_jobs.begin_drain()
+            };
+            (fence, std::mem::take(&mut pending.captures))
+        };
+        reject_query_captures(captures);
+        self.changed.notify_all();
+        fence
+    }
+
+    /// R3 identity policy bookkeeping, run by the worker after every
+    /// successful apply: the pages just lowered carry this process's live ids;
+    /// the pages just deleted carry nothing.
+    fn record_session_pages(&self, applied: &AppliedPages) {
+        if applied.lowered.is_empty()
+            && applied.deleted.is_empty()
+            && applied.relowered_structurally.is_empty()
+        {
+            return;
+        }
+        let mut current = self.session_pages.lock().unwrap();
+        let mut next: HashSet<[u8; 16]> = (**current).clone();
+        next.extend(applied.lowered.iter().copied());
+        for page in applied
+            .deleted
+            .iter()
+            .chain(applied.relowered_structurally.iter())
+        {
+            next.remove(page);
+        }
+        *current = Arc::new(next);
+    }
+}
+
+/// Completeness gate shared by admission and producer snapshot capture.
+/// Live queries may read an older committed image, but a partial warm stream,
+/// replacement or failed write must not be mistaken for a complete graph.
+fn query_capture_available(
+    shared: &ProjectionShared,
+    requirement: &QueryCaptureRequirement,
+) -> bool {
+    match requirement {
+        QueryCaptureRequirement::CurrentSnapshot => {
+            let pending = shared.pending.lock().unwrap();
+            !pending.stop
+                && !pending.rebuild
+                && !pending.needs_full
+                && pending.warm_stream.is_none()
+                && shared.validated.load(Ordering::Acquire)
+                && !shared.worker_failed.load(Ordering::Acquire)
+        }
+        #[cfg(test)]
+        QueryCaptureRequirement::StrictGeneration(generation) => shared.ready_at(*generation),
+    }
+}
+
+fn capture_query_job(
+    shared: &ProjectionShared,
+    requirement: QueryCaptureRequirement,
+    registry_sensitivity: RegistrySensitivity,
+    slot: crate::query_jobs::OwnedJobSlot,
+) -> QueryJobOpen {
+    #[cfg(test)]
+    if let Some(observed) = shared.capture_thread.lock().unwrap().take() {
+        observed.send(std::thread::current().id()).unwrap();
+    }
+    if slot.is_cancelled() {
+        return QueryJobOpen::Cancelled;
+    }
+    let validate = || {
+        if query_capture_available(shared, &requirement) {
+            Ok(())
+        } else {
+            Err(tine_storage::sqlite::MaterializationError::Incomplete(
+                "projection became unavailable during snapshot acquisition".into(),
+            ))
+        }
+    };
+    let mut snapshot = match PhysicalProjectionQuerySnapshot::open_direct(&shared.path, validate) {
+        Ok(snapshot) => snapshot,
+        // The validator is the only `Incomplete` this call can produce and
+        // it means the acquisition condition changed, not a corrupt read.
+        // Anything else is an unopenable or unreadable file.
+        Err(_) if !query_capture_available(shared, &requirement) => return QueryJobOpen::NotReady,
+        Err(_) => return QueryJobOpen::Failed,
+    };
+    if !slot.register(snapshot.cancellation()) {
+        return QueryJobOpen::Cancelled;
+    }
+    let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
+    let query_revision = match snapshot.query_revision() {
+        Ok(revision) => revision,
+        Err(_) => return QueryJobOpen::Failed,
+    };
+    // Config is an input to every query, even when no property registry is
+    // needed. Capture it beside this transaction, never from the live Graph.
+    let (config, registry) = {
+        let owner = shared.committed_registry.lock().unwrap();
+        let Some(owner) = owner.as_ref() else {
+            return QueryJobOpen::NotReady;
+        };
+        let registry = match registry_sensitivity {
+            RegistrySensitivity::Insensitive => None,
+            RegistrySensitivity::Required => {
+                #[cfg(test)]
+                shared
+                    .registry_capture_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let Ok(capture) = owner.cache.capture(query_revision, &owner.config) else {
+                    return QueryJobOpen::Failed;
+                };
+                Some(capture)
+            }
+        };
+        (Arc::clone(&owner.config), registry)
+    };
+    if slot.is_cancelled() {
+        return QueryJobOpen::Cancelled;
+    }
+    if !query_capture_available(shared, &requirement) {
+        return QueryJobOpen::NotReady;
+    }
+    #[cfg(test)]
+    shared.statement_reads.fetch_add(1, Ordering::Relaxed);
+    QueryJobOpen::Job(DirectQueryJob {
+        _slot: slot,
+        snapshot,
+        session_pages,
+        config,
+        #[cfg(test)]
+        query_revision,
+        registry,
+        registry_owner: Arc::clone(&shared.committed_registry),
+    })
+}
+
+/// One admitted, snapshot-owning Direct query job (R3). Everything the result
+/// read needs is captured here at a complete producer boundary: the pinned read transaction, the compiled-regex program already
+/// installed on its connection, and the identity policy input. Dropping the
+/// job releases the transaction and the capacity slot.
+pub(crate) struct DirectQueryJob {
+    // Field drop order is a lifecycle boundary: release the SQLite transaction
+    // before the admission slot can wake a projection replacement drain.
+    pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
+    /// Held for its `Drop`: releasing the slot is the job's only exit.
+    _slot: crate::query_jobs::OwnedJobSlot,
+    /// The pages whose rows this process lowered (see
+    /// `ProjectionShared::session_pages`), as of the snapshot.
+    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) config: Arc<ParseConfig>,
+    /// Actual acquired SQL image, distinct from the admission target.
+    #[cfg(test)]
+    pub(crate) query_revision: u64,
+    registry: Option<RegistryCapture>,
+    registry_owner: SharedCommittedRegistry,
+}
+
+impl DirectQueryJob {
+    /// Check the existing static publisher's fresh source capture against this
+    /// pinned projection image. Ordinary query reads do not call this method.
+    /// These fingerprints are disposable metadata, not a second source authority.
+    pub(crate) fn publication_sources_match(
+        &mut self,
+        sources: &[(PageEntry, String)],
+        capture_config: &ParseConfig,
+    ) -> Result<bool, crate::query::results::ResultReadError> {
+        use crate::query::results::{sql_or_cancelled, ResultReadError};
+        let config_digest = capture_config.digest();
+        let mut expected = sources
+            .iter()
+            .map(|(entry, revision)| {
+                (
+                    page_id(&entry.rel_path),
+                    projection_source_revision(revision, config_digest),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        if expected.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ResultReadError::Corrupt(
+                "duplicate physical page in publication capture".into(),
+            ));
+        }
+        let mut at = 0;
+        let mut matches = true;
+        let mut malformed = false;
+        let read = self.snapshot.visit_projection_query(
+            "SELECT p.page_id, s.revision FROM pages p \
+             LEFT JOIN direct_source_revisions s ON s.page_id = p.page_id \
+             ORDER BY p.page_id",
+            &[],
+            |row| {
+                let [PhysicalQueryValue::Blob(id), PhysicalQueryValue::Text(revision)] = row else {
+                    malformed = true;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                };
+                if id.len() != 16 {
+                    malformed = true;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                if !expected
+                    .get(at)
+                    .is_some_and(|(wanted_id, wanted_revision)| {
+                        wanted_id.as_slice() == id.as_slice() && wanted_revision == revision
+                    })
+                {
+                    matches = false;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                at += 1;
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        );
+        read.map_err(|error| sql_or_cancelled(&self.snapshot, error))?;
+        if self.snapshot.cancellation().is_cancelled() {
+            return Err(ResultReadError::Cancelled);
+        }
+        if malformed {
+            return Err(ResultReadError::Corrupt(
+                "publication source fingerprint is absent or malformed".into(),
+            ));
+        }
+        Ok(matches && at == expected.len())
+    }
+
+    /// Registry input and selection share this owned transaction. This scans
+    /// metadata, not result payload; inference remains build_registry's job.
+    pub(crate) fn read_registry(
+        &mut self,
+        config: &ParseConfig,
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
+        #[cfg(test)]
+        REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
+        let capture =
+            self.registry
+                .as_ref()
+                .ok_or(crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                ))?;
+        let built = capture.build(&mut self.snapshot, config)?;
+        let mut owner = self.registry_owner.lock().unwrap();
+        // A failed/replaced producer cannot seed its successor from this job.
+        // The captured result itself remains coherent with the owned read.
+        match owner.as_mut() {
+            Some(owner) => owner.cache.publish(capture.clone(), built),
+            None => Ok(built),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DirectQueryJob {
+    /// True once a drain (rebuild, reset, close) has cancelled this job. The
+    /// production read checks the snapshot's own sticky flag between batches;
+    /// this is the slot's view, for the drain tests.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self._slot.is_cancelled()
+    }
+}
+
+/// What one attempt to open a query job produced (R3; the §5.9 states plus
+/// the two the job owner adds).
+pub(crate) enum QueryJobOpen {
+    Job(DirectQueryJob),
+    /// Not ready at this generation, or the generation moved while the
+    /// snapshot was being pinned. Nothing is wrong with the projection;
+    /// `ProjectionProgress` decides whether readiness is on its way.
+    NotReady,
+    /// No capacity slot freed within the admission wait (R3). Distinct from
+    /// `NotReady`: the projection IS ready and other jobs are draining, so the
+    /// caller owes a retry and never a repair.
+    Busy,
+    /// The snapshot could not be opened or the regex program could not be
+    /// installed: a failed read, owed recovery.
+    Failed,
+    /// A drain or close cancelled the job before it ran. No recovery is owed
+    /// against a projection that is being replaced on purpose.
+    Cancelled,
+}
+
+/// Whether a query that found the projection NOT READY can expect readiness to
+/// arrive on its own, needs one repair, or must stop retrying (RET2).
+///
+/// The vocabulary is deliberately the queue's own: this reads the existing
+/// `pending` queue plus `worker_available` / `worker_failed` / `worker_busy`
+/// and translates them into the three answers the public boundary can act on.
+/// It adds no state of its own, because a second opinion about whether the
+/// worker is making progress is exactly the twin D-14 forbids.
+pub(crate) enum ProjectionProgress {
+    /// Ready at this generation by the time the question was asked: the two
+    /// reads straddled a save. Retryable.
+    Ready,
+    /// Queued or in-flight work will publish readiness. Retryable, with the
+    /// reason the queue is holding it.
+    Working(crate::query::QueryReadinessReason),
+    /// Nothing is queued, the worker is idle, and the projection is stale at
+    /// this generation. Only a repair can make it ready.
+    Stale,
+    /// The worker thread is gone — it never started, lost the writer lease, or
+    /// returned. No repair this graph can schedule will be picked up, so a
+    /// retry loop here would never end.
+    Stopped,
+}
+
+/// Whether the projection can narrow THIS reference target at all.
+///
+/// A `Plain` (unlinked) target with no alphanumeric character has no usable
+/// posting to look up, so the index cannot say which pages might contain it and
+/// the exact parser walk is the only answer. This is a property of the TARGET,
+/// not of the projection's readiness, which is why it is a free function: the
+/// caller that decides between "wait for the index" and "walk every page" must
+/// ask the same question the read itself asks, and one definition is the only
+/// way those two can stay in agreement.
+pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: ReferenceKind) -> bool {
+    kind != ReferenceKind::Plain
+        || names_norm
+            .iter()
+            .all(|name| name.chars().any(char::is_alphanumeric))
+}
+
+/// One reference target's candidate set, as the index can name it.
+///
+/// `blocks` is `Some` only when the index enumerated the referring blocks for
+/// EVERY name in the target's equivalence class. A `None` there means "classify
+/// every block of every candidate page", which is what the walk did before this
+/// existed, so a partial index can never silently drop a row.
+pub(crate) struct ReferenceCandidateIndex {
+    pub paths: std::collections::BTreeSet<PathBuf>,
+    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
 }
 
 /// Direct Files' disposable parser-fact projection.
@@ -88,6 +749,14 @@ pub(crate) struct DirectProjection {
 }
 
 impl DirectProjection {
+    /// Subscribe the existing application watcher before observing the latest
+    /// published image, so a commit cannot fall between registration and read.
+    pub(crate) fn observe_commits(&self, wake: std::sync::mpsc::Sender<()>) -> u64 {
+        let mut notifier = self.shared.commit_waker.lock().unwrap();
+        *notifier = Some(wake);
+        self.shared.commit_notification.load(Ordering::Acquire)
+    }
+
     pub(crate) fn start(path: PathBuf) -> std::io::Result<Self> {
         let shared = Arc::new(ProjectionShared {
             path,
@@ -95,12 +764,31 @@ impl DirectProjection {
             changed: Condvar::new(),
             ready: AtomicBool::new(false),
             ready_generation: AtomicU64::new(0),
+            commit_notification: AtomicU64::new(0),
+            commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
+            query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
+            session_pages: Mutex::new(Arc::new(HashSet::new())),
+            committed_registry: Arc::new(Mutex::new(None)),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            worker_finished: AtomicBool::new(false),
+            worker_resources: Mutex::new(Some(Vec::new())),
+            validated: AtomicBool::new(false),
+            #[cfg(test)]
+            after_sql_commit: Mutex::new(None),
+            #[cfg(test)]
+            capture_thread: Mutex::new(None),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            statement_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            registry_capture_attempts: AtomicU64::new(0),
+            repairs_in_flight: AtomicUsize::new(0),
+            #[cfg(test)]
+            inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -115,19 +803,275 @@ impl DirectProjection {
         Ok(Self { shared })
     }
 
+    /// Keep repair requested until a complete source inventory or parser snapshot arrives.
+    /// Publish that a repair is computing its payload. `progress_at` reports
+    /// `Working(Recovering)` for as long as the returned guard lives, so a
+    /// concurrent query waits for it instead of declaring the repair failed.
+    pub(crate) fn begin_repair(&self) -> RepairInFlight {
+        self.shared.repairs_in_flight.fetch_add(1, Ordering::AcqRel);
+        RepairInFlight(Arc::clone(&self.shared))
+    }
+
+    /// True while the last worker turn failed. The flag clears on the next
+    /// successful turn, so it names a projection that owes a reset — not one
+    /// that has merely never started.
+    pub(crate) fn worker_failed(&self) -> bool {
+        self.shared.worker_failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_rebuild(&self) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.rebuild = true;
+        self.shared.ready.store(false, Ordering::Release);
+    }
+
     pub(crate) fn enqueue_full(
         &self,
         generation: u64,
         pages: PageSnapshot,
         revisions: PageRevisions,
+        parse_config: Arc<ParseConfig>,
     ) {
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.full = Some((generation, pages, revisions));
+        pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        pending.full = Some(PendingFull {
+            pages,
+            revisions,
+            parse_config,
+        });
         pending.deltas.clear();
         pending.latest_generation = generation;
-        self.shared.changed.notify_one();
+        // R6: a complete parsed snapshot owns readiness from here. A warm
+        // validation or stream still in flight must not lower beside it — its
+        // deltas carry no order positions and would erase the snapshot's.
+        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
+            pending.warm = None;
+            pending.warm_stream = None;
+            pending.order = None;
+            pending.warm_superseded = true;
+            pending.warm_outcome = Some(WarmOutcome::Superseded);
+        }
+        pending.needs_full = false;
+        self.shared.changed.notify_all();
+    }
+
+    /// R6 warm validation: hand the worker the walk inventory with exact
+    /// content revisions and nothing parsed. Refused (`false`) when a newer
+    /// mutation or queued work already outranks this generation — the caller
+    /// then leaves readiness to the parser fallback, exactly as
+    /// `install_built` does on generation drift.
+    pub(crate) fn enqueue_warm(
+        &self,
+        generation: u64,
+        sources: Vec<(PageEntry, String)>,
+        parse_config: Arc<ParseConfig>,
+    ) -> bool {
+        if !self.shared.worker_available.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.has_work()
+            || pending.warm_stream.is_some()
+            || pending.latest_generation > generation
+            || (self.shared.worker_failed.load(Ordering::Acquire) && !pending.rebuild)
+        {
+            return false;
+        }
+        self.shared.ready.store(false, Ordering::Release);
+        pending.seed_page_order(sources.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        // Optimistically open the stream now so every delta recorded from here
+        // until the outcome carries no order position; the worker closes it
+        // again in the same turn when the outcome is `Clean`.
+        pending.warm_stream = Some(generation);
+        pending.warm_outcome = None;
+        pending.warm_superseded = false;
+        pending.warm = Some(PendingWarm {
+            sources,
+            parse_config,
+        });
+        pending.latest_generation = generation;
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Block until the worker has decided the queued warm validation.
+    pub(crate) fn wait_warm_outcome(&self) -> WarmOutcome {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if let Some(outcome) = pending.warm_outcome.take() {
+                return outcome;
+            }
+            if !self.shared.worker_available.load(Ordering::Acquire) || pending.stop {
+                return WarmOutcome::Failed;
+            }
+            pending = self.shared.changed.wait(pending).unwrap();
+        }
+    }
+
+    /// R6 stream back-pressure: wait until fewer than `WARM_STREAM_HIGH_WATER`
+    /// deltas are queued, so the warm thread never parses further ahead than
+    /// one batch beyond the worker's current turn. `false` when the stream is
+    /// no longer this thread's to feed (superseded, failed, or drifted).
+    pub(crate) fn warm_stream_admit(&self, generation: u64, batch_len: usize) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if pending.warm_superseded
+                || pending.warm_stream != Some(generation)
+                || pending.latest_generation > generation
+                || pending.stop
+                || !self.shared.worker_available.load(Ordering::Acquire)
+                || self.shared.worker_failed.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            if pending.deltas.len() + batch_len <= WARM_STREAM_HIGH_WATER {
+                return true;
+            }
+            pending = self.shared.changed.wait(pending).unwrap();
+        }
+    }
+
+    /// Queue one parsed batch of the warm stream. The session identity owner
+    /// marks exact-revision restored IDs as Live, fresh IDs as Structural. A page that failed to
+    /// parse is deleted from the projection. `false` means the batch was
+    /// refused: a newer mutation outranks this generation, a full snapshot
+    /// superseded the stream, or the worker failed — the caller abandons.
+    pub(crate) fn enqueue_warm_stream(
+        &self,
+        generation: u64,
+        batch: Vec<WarmStreamItem>,
+        parse_config: Arc<ParseConfig>,
+    ) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded
+            || pending.warm_stream != Some(generation)
+            || pending.latest_generation > generation
+            || self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        for item in batch {
+            let delta = match item {
+                WarmStreamItem::Replace {
+                    entry,
+                    document,
+                    revision,
+                    identity,
+                } => PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config: Arc::clone(&parse_config),
+                    query_page_order: None,
+                    identity,
+                },
+                WarmStreamItem::Delete { entry } => PageDelta::Delete { entry },
+            };
+            pending.record_delta(generation, delta);
+        }
+        #[cfg(test)]
+        MAX_PENDING_DELTAS.fetch_max(pending.deltas.len() as u64, Ordering::Relaxed);
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Close the warm stream (R6): the worker reconciles `query_page_order`
+    /// over the queue's inventory and then publishes readiness. `false` when
+    /// the stream is no longer this thread's; a superseding snapshot owns
+    /// readiness in that case and nothing is owed.
+    pub(crate) fn finish_warm_stream(&self, generation: u64) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded {
+            return true;
+        }
+        if pending.warm_stream != Some(generation)
+            || pending.latest_generation > generation
+            || self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        pending.order = Some(generation);
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Abandon an open warm stream (R6: cancellation, drift, or a refused
+    /// batch). Rows already validated or streamed are consistent, but the
+    /// replacements not yet streamed are stale; only a full snapshot may
+    /// publish readiness again. In-scope scenario: a save racing the warm.
+    /// Returns whether a full snapshot superseded the stream — in which case
+    /// that snapshot owns readiness and the caller has nothing to fall back to.
+    pub(crate) fn abandon_warm_stream(&self, generation: u64) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded {
+            return true;
+        }
+        if pending.warm_stream != Some(generation) {
+            return false;
+        }
+        pending.warm_stream = None;
+        pending.order = None;
+        pending.needs_full = true;
+        self.shared.ready.store(false, Ordering::Release);
+        self.shared.changed.notify_all();
+        false
+    }
+
+    /// R6: the projected page inventory as `(name, path, text_kind)` rows,
+    /// read through `drain_after` from the ready projection. `list_pages`
+    /// rebuilds `PageEntry`s from it instead of parsing every file.
+    pub(crate) fn page_inventory(
+        &self,
+        cache_generation: u64,
+    ) -> Option<Vec<(String, String, i64)>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut rows = Vec::new();
+        drain_after(
+            |cursor: Option<([u8; 16], String)>, batch| {
+                read.navigation_pages_after_with_header_validation(
+                    cursor.as_ref().map(|(_, path)| path.as_str()),
+                    cursor.as_ref().map(|(id, _)| id),
+                    batch,
+                    |_, kind| match kind {
+                        0 | 1 => Ok(()),
+                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
+                            format!("unknown Direct Files text kind {kind}"),
+                        )),
+                    },
+                )
+            },
+            |row| (row.page_id, row.path.clone()),
+            |row| {
+                rows.push((row.name, row.path, row.text_kind));
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
+        self.ready_at(cache_generation).then_some(rows)
+    }
+
+    /// Bounded wait for readiness at `generation` (R6): the whole-graph derived
+    /// reads that would otherwise fall to a full parse in the milliseconds
+    /// after a save or a warm turn wait for that bounded worker turn first.
+    /// Same ceiling and same non-authority as `wait_for_reference_generation`.
+    pub(crate) fn wait_ready_at(&self, generation: u64) -> bool {
+        self.wait_for_reference_generation(generation)
     }
 
     pub(crate) fn enqueue_replace(
@@ -136,27 +1080,36 @@ impl DirectProjection {
         entry: PageEntry,
         document: Arc<Document>,
         revision: String,
+        parse_config: Arc<ParseConfig>,
     ) {
-        self.enqueue_delta(generation, PageDelta::Replace(entry, document, revision));
+        self.enqueue_delta(
+            generation,
+            PageDelta::Replace {
+                entry,
+                document,
+                revision,
+                parse_config,
+                query_page_order: None, // Filled under the queue lock, before coalescing.
+                identity: DeltaIdentity::Live,
+            },
+        );
     }
 
     pub(crate) fn enqueue_delete(&self, generation: u64, entry: PageEntry) {
-        self.enqueue_delta(generation, PageDelta::Delete(entry));
+        self.enqueue_delta(generation, PageDelta::Delete { entry });
     }
 
     fn enqueue_delta(&self, generation: u64, delta: PageDelta) {
         self.shared.ready.store(false, Ordering::Release);
-        let key = match &delta {
-            PageDelta::Replace(entry, _, _) | PageDelta::Delete(entry) => entry.rel_path.clone(),
-        };
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.deltas.insert(key, (generation, delta));
-        pending.latest_generation = pending.latest_generation.max(generation);
+        pending.record_delta(generation, delta);
         self.shared.changed.notify_one();
     }
 
     pub(crate) fn mark_stale(&self) {
         self.shared.ready.store(false, Ordering::Release);
+        // Source-oriented navigation waits for reconciliation; live queries
+        // can still read the complete committed image.
     }
 
     /// A reference read which races an already-queued one-page fact delta is
@@ -181,8 +1134,8 @@ impl DirectProjection {
             {
                 return false;
             }
-            if pending.full.is_none()
-                && pending.deltas.is_empty()
+            if !pending.has_work()
+                && pending.warm_stream.is_none()
                 && !self.shared.worker_busy.load(Ordering::Acquire)
             {
                 return false;
@@ -201,222 +1154,6 @@ impl DirectProjection {
                 return false;
             }
         }
-    }
-
-    pub(crate) fn sparse_task_query(
-        &self,
-        graph_root: &Path,
-        journal_format: &crate::date::JournalFormat,
-        cache_generation: u64,
-        pages: &[(PageEntry, Arc<Document>)],
-        query_src: &str,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<BoundedGroups> {
-        let eligibility = sparse_task_query_eligibility(query_src)?;
-        if !self.shared.ready.load(Ordering::Acquire)
-            || self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
-        {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let mut by_block = BTreeMap::new();
-        let uses_recency = eligibility.uses_recency;
-        for marker in eligibility.markers {
-            drain_after(
-                |after, batch| read.task_candidate_locators_after(&marker, after, batch),
-                |row| (row.page_id, row.block_id),
-                |row| {
-                    by_block.entry(row.block_id).or_insert(row);
-                    Ok(())
-                },
-                |_, _| None,
-            )
-            .ok()?;
-        }
-        if self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
-            || !self.shared.ready.load(Ordering::Acquire)
-        {
-            return None;
-        }
-        let mut page_recencies = HashMap::<String, i64>::new();
-        struct CandidateMetadata {
-            block_id: String,
-            parent_identity: Option<String>,
-            order: Vec<String>,
-            page: ApplicationSparseQueryPage,
-        }
-        let metadata = by_block
-            .into_values()
-            .map(|row| {
-                let recency = if uses_recency {
-                    *page_recencies
-                        .entry(row.page_path.clone())
-                        .or_insert_with(|| {
-                            page_recency(
-                                graph_root,
-                                &row.page_name,
-                                &row.page_path,
-                                row.page_text_kind,
-                                journal_format,
-                            )
-                        })
-                } else {
-                    i64::MIN
-                };
-                CandidateMetadata {
-                    block_id: Uuid::from_bytes(row.block_id).to_string(),
-                    parent_identity: row.parent.map(|id| Uuid::from_bytes(id).to_string()),
-                    order: vec![row.order, Uuid::from_bytes(row.block_id).to_string()],
-                    page: ApplicationSparseQueryPage {
-                        name: row.page_name,
-                        path: row.page_path.clone(),
-                        kind: page_kind_from_sql(row.page_text_kind)?,
-                        is_org: Format::from_path(Path::new(&row.page_path)) == Format::Org,
-                        recency,
-                    },
-                }
-                .into()
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let documents = pages
-            .iter()
-            .map(|(entry, document)| (entry.rel_path.as_str(), document.as_ref()))
-            .collect::<HashMap<_, _>>();
-        let candidates = metadata
-            .iter()
-            .map(|candidate| {
-                let document = documents.get(candidate.page.path.as_str())?;
-                let block = block_at_order(&document.roots, &candidate.order[0])?;
-                (block.uuid == candidate.block_id).then_some(ParserSparseQueryCandidate {
-                    block,
-                    identity: &candidate.block_id,
-                    page: &candidate.page,
-                    parent_identity: candidate.parent_identity.as_deref(),
-                    dfs_order: &candidate.order,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let result =
-            run_parser_sparse_task_query_bounded(&candidates, query_src, max_rows, max_bytes)
-                .ok()?;
-        let current = (self.shared.ready.load(Ordering::Acquire)
-            && self.shared.ready_generation.load(Ordering::Acquire) == cache_generation)
-            .then_some(result);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        current
-    }
-
-    /// Abandon the projection read when the lowering's candidate set is not
-    /// selective enough to beat the parser walk it would replace.
-    ///
-    /// The walk costs one cheap in-memory predicate per page of the whole
-    /// graph, so its cost is proportional to the graph. The projection route
-    /// costs a SQL scan plus, per candidate, a SQLite point read, a page DTO
-    /// construction and a document clone — each far more expensive than one
-    /// walk step. So the route only wins while the candidate set is a small
-    /// FRACTION of the graph, which is why the cutoff scales with the graph
-    /// rather than being an absolute count.
-    ///
-    /// `1/32` is taken from the measured corpus (1,049 pages, 14,538 blocks;
-    /// `tine-agents/evidence/wave4/b4b/`). Every class the route made faster
-    /// there produced at most 3 candidates (0.29% of the graph); the two
-    /// classes it made dramatically slower produced 91 and 104 (8.7% and 9.9%,
-    /// costing 1.08 -> 11.19 ms and 0.46 -> 3.31 ms). `1/32` sits about 10x
-    /// above every measured winner and about 2.8x below every measured loser.
-    /// The floor keeps small graphs — including test fixtures — on the route,
-    /// where the absolute cost of materializing a few candidates is trivial.
-    ///
-    /// Abandoning is the safe direction: it returns exactly today's behaviour.
-    /// A cutoff set too low forfeits a speedup; one set too high reintroduces a
-    /// 10x stall on the typing path.
-    fn candidate_cutoff(graph_page_count: usize) -> usize {
-        const SELECTIVE_FRACTION: usize = 32;
-        const SMALL_GRAPH_FLOOR: usize = 32;
-        (graph_page_count / SELECTIVE_FRACTION).max(SMALL_GRAPH_FLOOR)
-    }
-
-    pub(crate) fn simple_query_candidate_paths(
-        &self,
-        cache_generation: u64,
-        plan: &SimpleQueryCandidatePlan,
-        graph_page_count: usize,
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
-            &read,
-            plan,
-            &std::collections::HashSet::new(),
-        )
-        .ok()?;
-
-        // RETIREMENT-CANDIDATE: the candidate-count escape hatch below, together
-        // with the Direct whole-graph parser walk it hands the query back to.
-        //
-        // WHAT MAY BE DELETED: this `candidate_cutoff` test and the
-        // `run_query`/`run_query_bounded` fallback arms that call
-        // `Graph::direct_projection_note_fallback_read` after it fires. Deleting
-        // them makes every ready `SimpleQueryCandidatePlan::Indexed` plan
-        // unconditionally candidate-only.
-        //
-        // CONDITION FOR DELETION: the hatch exists only because
-        // `lower_simple_query_candidate_plan` returns a page SUPERSET rather
-        // than the answer — `and` takes the first leaf instead of intersecting,
-        // `Page`/`Namespace`/`Journal` full-scan `navigation_pages`, values never
-        // push down, and the block ids SQL already returned are discarded at the
-        // trait boundary. When the lowering returns the ANSWER, the candidate set
-        // is selective by construction, this test can never fire, and it goes.
-        // That work is card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`, not this packet.
-        //
-        // WHAT CURRENTLY BLOCKS DELETION — read this before deleting the walk
-        // along with the hatch: the parser walk is not merely the fallback, it is
-        // the CORRECTNESS ORACLE for the real lowering that would replace it, and
-        // no external oracle exists (Logseq's DB version evaluates in in-memory
-        // DataScript with SQLite as a mere datom store; Dataview is frozen; Bases
-        // is closed). The walk answers every query from the parsed documents in
-        // ~1 ms over the 1,045-file anonymized graph, so the acceptance gate for
-        // a real lowering is DIFFERENTIAL AGAINST THE WALK — the shape
-        // `crate::query::tests::sparse_task_query_runner_matches_existing_page_evaluator`
-        // already uses. The walk therefore outlives the lowering by at least one
-        // release as a test-only oracle; it is NOT deletable the moment SQL
-        // works. Retire the hatch first, keep the walk, and retire the walk only
-        // after a release of differential agreement.
-        if lowered.page_ids.len() > Self::candidate_cutoff(graph_page_count) {
-            return None;
-        }
-
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in lowered.page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, kind| match kind {
-                    0 | 1 => Ok(()),
-                    _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                        format!("unknown Direct Files text kind {kind}"),
-                    )),
-                })
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
-        }
-        let current = self.ready_at(cache_generation).then_some(paths);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        current
     }
 
     pub(crate) fn property_facets(
@@ -462,6 +1199,255 @@ impl DirectProjection {
         #[cfg(test)]
         self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
         Some(accumulator.finish())
+    }
+
+    /// The §6.2 registry row source for **Direct Files, projection ready**: the
+    /// ready raw property stream plus the same-snapshot `page_id → (format,
+    /// name)` map, taken under ONE read of the projection database.
+    ///
+    /// **CLOSURE §4 rejects deferring this to the document walk.** The wrapper
+    /// above (`property_facets`) aggregates owner identity away, so it cannot
+    /// serve a registry that reports cardinality and distinct-owner counts; and
+    /// answering a registry read by walking every hydrated document is exactly
+    /// the graph-wide scan the ready projection exists to avoid. This is an
+    /// ADAPTER onto the one `build_registry` aggregator, not a competing
+    /// registry producer: it yields the same [`OwnerRow`] stream the cold document
+    /// iterator yields, and the
+    /// aggregator downstream is byte-for-byte the same function.
+    ///
+    /// `None` means "not ready, or the read refused" — the caller falls back to
+    /// the document iterator, exactly as §5.9's dispatch does for queries.
+    #[cfg(test)]
+    pub(crate) fn property_owner_rows(
+        &self,
+        cache_generation: u64,
+    ) -> Option<(
+        Vec<crate::query::registry::OwnerRow>,
+        HashMap<String, crate::query::registry::PageMeta>,
+    )> {
+        use crate::query::registry::{OwnerRow, OwnerType, PageMeta};
+        #[cfg(test)]
+        REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
+
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+
+        // The page map and the rows are read from the SAME `read`, i.e. the same
+        // snapshot: a row naming a page the map does not have is a
+        // snapshot-consistency defect and fails the build (§6.2), never a
+        // silent fallback to Markdown.
+        let mut pages: HashMap<String, PageMeta> = HashMap::new();
+        drain_after(
+            |cursor: Option<([u8; 16], String)>, batch| {
+                read.navigation_pages_after_with_header_validation(
+                    cursor.as_ref().map(|(_, path)| path.as_str()),
+                    cursor.as_ref().map(|(id, _)| id),
+                    batch,
+                    |_, kind| match kind {
+                        0 | 1 => Ok(()),
+                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
+                            format!("unknown Direct Files text kind {kind}"),
+                        )),
+                    },
+                )
+            },
+            |row| (row.page_id, row.path.clone()),
+            |row| {
+                pages.insert(
+                    crate::query::registry_sql::page_key(row.page_id),
+                    PageMeta {
+                        // §6.2 E4: `Format::from_path`, case-insensitive —
+                        // never `reference_source_is_org`.
+                        format: Format::from_path(Path::new(&row.path)).into(),
+                        name: row.name,
+                    },
+                );
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
+
+        let mut rows: Vec<OwnerRow> = Vec::new();
+        drain_after(
+            |cursor, batch| read.property_facet_rows_after(false, cursor, batch),
+            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                let (owner_type, owner_id) = match row.owner {
+                    PhysicalEntityId::Page(id) => (
+                        OwnerType::Page,
+                        format!("p:{}", crate::query::registry_sql::hex16(id)),
+                    ),
+                    PhysicalEntityId::Block(id) => (
+                        OwnerType::Block,
+                        format!("b:{}", crate::query::registry_sql::hex16(id)),
+                    ),
+                };
+                rows.push(OwnerRow {
+                    owner_type,
+                    owner_id,
+                    page_id: crate::query::registry_sql::page_key(row.page_id),
+                    source_name: row.source_name,
+                    normalized_name: row.normalized_name,
+                    ordinal: row.ordinal,
+                    value: row.value,
+                });
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
+
+        // The generation must still hold AFTER both scans, or the two halves
+        // could straddle a rebuild — the same re-check `property_facets` makes.
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        #[cfg(test)]
+        self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        Some((rows, pages))
+    }
+
+    /// R3: open a database-owned query job at the current cache generation.
+    ///
+    /// Capacity is acquired on the caller before enqueueing a capture. The
+    /// producer opens the snapshot and captures session identity between write
+    /// turns, validating `ready_at(generation)` around the transaction. A
+    /// registry-sensitive request also freezes its registry input there; an
+    /// insensitive request carries none. The producer registers cancellation
+    /// before handing the owned job back. Selection and payload construction
+    /// then execute on the caller, off the producer.
+    /// The statement's compiled-regex program is installed by
+    /// `query::results::read_results` on the job's own connection — the ONE
+    /// install site — so a job carries no regex state of its own.
+    #[cfg(test)]
+    pub(crate) fn open_query_job_for(
+        &self,
+        cache_generation: u64,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
+        if !self.ready_at(cache_generation) {
+            return QueryJobOpen::NotReady;
+        }
+        self.enqueue_query_capture(
+            QueryCaptureRequirement::StrictGeneration(cache_generation),
+            registry_sensitivity,
+        )
+    }
+
+    /// Existing reader lifecycle identity; ordinary saves do not advance it.
+    pub(crate) fn query_epoch(&self) -> crate::query_jobs::QueryJobEpoch {
+        self.shared.query_jobs.capture_epoch()
+    }
+
+    /// Acquire the current complete projection without waiting for a saved edit.
+    /// Ordinary queued deltas do not invalidate the committed image.
+    pub(crate) fn open_current_query_job(
+        &self,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
+        if !self.shared.worker_available.load(Ordering::Acquire)
+            || !query_capture_available(&self.shared, &QueryCaptureRequirement::CurrentSnapshot)
+        {
+            return QueryJobOpen::NotReady;
+        }
+        self.enqueue_query_capture(
+            QueryCaptureRequirement::CurrentSnapshot,
+            registry_sensitivity,
+        )
+    }
+
+    fn enqueue_query_capture(
+        &self,
+        requirement: QueryCaptureRequirement,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
+        #[cfg(test)]
+        if self
+            .shared
+            .inject_read_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            return QueryJobOpen::Failed;
+        }
+        let slot = match self
+            .shared
+            .query_jobs
+            .acquire_owned_at_within(self.shared.query_jobs.capture_epoch(), QUERY_JOB_WAIT)
+        {
+            OwnedAdmission::Slot(slot) => slot,
+            OwnedAdmission::Cancelled => return QueryJobOpen::Cancelled,
+            // RET2: capacity, not readiness. The projection is ready and other
+            // jobs are draining, so this is the one `NotReady` the public
+            // boundary may retry without ever considering a repair.
+            OwnedAdmission::Busy => return QueryJobOpen::Busy,
+        };
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            if pending.stop || slot.is_cancelled() {
+                return QueryJobOpen::Cancelled;
+            }
+            if !self.shared.worker_available.load(Ordering::Acquire) {
+                return QueryJobOpen::Failed;
+            }
+            let available = match &requirement {
+                QueryCaptureRequirement::CurrentSnapshot => {
+                    !pending.rebuild
+                        && !pending.needs_full
+                        && pending.warm_stream.is_none()
+                        && self.shared.validated.load(Ordering::Acquire)
+                        && !self.shared.worker_failed.load(Ordering::Acquire)
+                }
+                #[cfg(test)]
+                QueryCaptureRequirement::StrictGeneration(generation) => self.ready_at(*generation),
+            };
+            if !available {
+                return QueryJobOpen::NotReady;
+            }
+            pending.captures.push(PendingQueryCapture {
+                requirement,
+                registry_sensitivity,
+                slot,
+                reply,
+            });
+        }
+        self.shared.changed.notify_all();
+        result.recv().unwrap_or(QueryJobOpen::Failed)
+    }
+
+    /// Existing low-level fixtures exercise the stronger registry-bearing job.
+    #[cfg(test)]
+    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen {
+        self.open_query_job_for(cache_generation, RegistrySensitivity::Required)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<[u8; 16]>> {
+        Arc::clone(&self.shared.session_pages.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_query_jobs_test(&self) -> usize {
+        self.shared.query_jobs.active()
     }
 
     pub(crate) fn note_fallback_read(&self) {
@@ -515,42 +1501,6 @@ impl DirectProjection {
             .referenced_name_reads
             .fetch_add(1, Ordering::Relaxed);
         Some(names)
-    }
-
-    pub(crate) fn fuzzy_candidate_paths(
-        &self,
-        cache_generation: u64,
-        normalized_needle: &str,
-    ) -> Option<std::collections::HashSet<String>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let mut paths = std::collections::HashSet::new();
-        drain_after(
-            |after, batch| {
-                read.fuzzy_subsequence_candidate_pages_after(normalized_needle, after, batch)
-            },
-            |row| row.page_id,
-            |row| {
-                paths.insert(row.path);
-                Ok(())
-            },
-            |_, _| None,
-        )
-        .ok()?;
-        let current = self.ready_at(cache_generation).then_some(paths);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared
-                .fuzzy_candidate_reads
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        current
     }
 
     pub(crate) fn page_aliases_with_owners(
@@ -635,20 +1585,32 @@ impl DirectProjection {
         self.ready_at(cache_generation).then_some(names)
     }
 
-    pub(crate) fn reference_candidate_paths(
+    /// The candidate set for one reference target: the pages that may contain a
+    /// match and, when the index can name them, the BLOCKS.
+    ///
+    /// The block set is not an optimization bolted on afterwards — it is what
+    /// `page_referrer_candidates_after` already returns. Its rows are
+    /// `(source_page_id, source_entity)` and the caller used to drop the
+    /// entity, so the read narrowed to 184 pages and then re-parsed all 3,434
+    /// of their blocks to find the 412 that referred to the target (measured on
+    /// the anonymized graph; see `sql_gates_tests.rs`'s narrowing receipt).
+    /// Carrying the entity through spends nothing extra in SQL and removes
+    /// roughly nine of every ten per-block parses.
+    ///
+    /// The block set is a SUPERSET filter and never the answer: the parser
+    /// still decides membership, exactly as before. It is `None` whenever the
+    /// index cannot name blocks for this target, and then every block of every
+    /// candidate page is classified as it was.
+    pub(crate) fn reference_candidates(
         &self,
         cache_generation: u64,
         names_norm: &[String],
         kind: ReferenceKind,
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+    ) -> Option<ReferenceCandidateIndex> {
         if !self.ready_at(cache_generation) {
             return None;
         }
-        if kind == ReferenceKind::Plain
-            && names_norm
-                .iter()
-                .any(|name| !name.chars().any(char::is_alphanumeric))
-        {
+        if !reference_narrowing_supported(names_norm, kind) {
             return None;
         }
         let mut reader = self.shared.reader.lock().unwrap();
@@ -657,6 +1619,8 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let mut page_ids = std::collections::BTreeSet::new();
+        let mut blocks = std::collections::HashSet::new();
+        let mut blocks_are_complete = true;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
@@ -665,6 +1629,17 @@ impl DirectProjection {
                         |row| (row.source_page_id, row.source),
                         |row| {
                             page_ids.insert(row.source_page_id);
+                            match row.source {
+                                PhysicalEntityId::Block(block_id) => {
+                                    blocks.insert(block_id);
+                                }
+                                // A page-level posting names no block. The
+                                // page-property pseudo-block it stands for is
+                                // built from the page preamble and never
+                                // classified through the block walk, so the
+                                // block set stays complete for the walk.
+                                PhysicalEntityId::Page(_) => {}
+                            }
                             Ok(())
                         },
                         |_, _| None,
@@ -672,6 +1647,11 @@ impl DirectProjection {
                     .ok()?;
                 }
                 ReferenceKind::Plain => {
+                    // FTS narrows to pages here; `plain_text_candidate_pages_after`
+                    // projects `owner.page_id` and does not expose the owning
+                    // entity, so the walk still classifies every block of a
+                    // candidate page.
+                    blocks_are_complete = false;
                     drain_after(
                         |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
                         |row| row.page_id,
@@ -692,7 +1672,11 @@ impl DirectProjection {
                 .ok()??;
             paths.insert(PathBuf::from(page.path));
         }
-        self.ready_at(cache_generation).then_some(paths)
+        self.ready_at(cache_generation)
+            .then_some(ReferenceCandidateIndex {
+                paths,
+                blocks: blocks_are_complete.then_some(blocks),
+            })
     }
 
     /// Outer `None` means projection unavailable/stale and requires parser
@@ -794,13 +1778,121 @@ impl DirectProjection {
     }
 
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
-        self.shared.ready.load(Ordering::Acquire)
-            && self.shared.ready_generation.load(Ordering::Acquire) == generation
+        self.shared.ready_at(generation)
+    }
+
+    /// RET2's readiness lifecycle: why this generation is not ready, and what
+    /// the caller may do about it.
+    ///
+    /// The order of the tests is the order of authority.
+    ///
+    /// * `worker_available` is stored `false` exactly where the worker thread
+    ///   gives up for good — no parent directory, an unopenable database, a
+    ///   writer lease another instance owns, or a `stop` turn. Nothing this
+    ///   graph enqueues afterwards is ever taken, so retrying is endless by
+    ///   construction and the caller owes a bounded error instead.
+    /// * A queued turn is progress even when the LAST turn failed:
+    ///   `worker_failed` stays set until the next successful turn, and the
+    ///   repair that clears it is exactly the `full`/`rebuild` work below.
+    /// * A failed worker with an EMPTY queue is the stale-idle case: the turn
+    ///   failed, `requires_full_rebuild` latched inside the worker, and until
+    ///   a complete source inventory arrives every further delta turn refuses.
+    ///   That is a repair, not a wait.
+    pub(crate) fn progress_at(&self, generation: u64) -> ProjectionProgress {
+        use crate::query::QueryReadinessReason as Reason;
+        if self.ready_at(generation) {
+            return ProjectionProgress::Ready;
+        }
+        let pending = self.shared.pending.lock().unwrap();
+        if pending.stop || !self.shared.worker_available.load(Ordering::Acquire) {
+            return ProjectionProgress::Stopped;
+        }
+        if pending.rebuild || pending.needs_full || pending.full.is_some() {
+            return ProjectionProgress::Working(Reason::Recovering);
+        }
+        if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
+            return ProjectionProgress::Working(Reason::Recovering);
+        }
+        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
+            return ProjectionProgress::Working(Reason::Indexing);
+        }
+        if !pending.deltas.is_empty() {
+            return ProjectionProgress::Working(Reason::PendingEdits);
+        }
+        if self.shared.worker_failed.load(Ordering::Acquire) {
+            // The queue is empty and the last turn failed: nothing is coming.
+            return ProjectionProgress::Stale;
+        }
+        if self.shared.worker_busy.load(Ordering::Acquire) {
+            return ProjectionProgress::Working(Reason::Busy);
+        }
+        ProjectionProgress::Stale
+    }
+
+    /// Test diagnostic: the queue and readiness state in one line, for a
+    /// convergence failure that would otherwise be a bare timeout.
+    #[cfg(test)]
+    pub(crate) fn debug_state_test(&self) -> String {
+        let pending = self.shared.pending.lock().unwrap();
+        format!(
+            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} warm_stream={:?} order={:?} superseded={} needs_full={} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={}",
+            self.shared.ready.load(Ordering::Acquire),
+            self.shared.validated.load(Ordering::Acquire),
+            self.shared.ready_generation.load(Ordering::Acquire),
+            pending.latest_generation,
+            pending.full.is_some(),
+            pending.deltas.len(),
+            pending.warm.is_some(),
+            pending.warm_outcome.as_ref().map(|outcome| match outcome {
+                WarmOutcome::Clean => "Clean".to_owned(),
+                WarmOutcome::Replacements(pages) => format!("Replacements({})", pages.len()),
+                WarmOutcome::Superseded => "Superseded".to_owned(),
+                WarmOutcome::Failed => "Failed".to_owned(),
+            }),
+            pending.warm_stream,
+            pending.order,
+            pending.warm_superseded,
+            pending.needs_full,
+            pending.rebuild,
+            pending.stop,
+            pending.page_order.len(),
+            self.shared.worker_available.load(Ordering::Acquire),
+            self.shared.worker_failed.load(Ordering::Acquire),
+            self.shared.worker_busy.load(Ordering::Acquire),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
+    }
+
+    /// Close this projection's query-job admission, the way `Drop` does when a
+    /// graph is closing. Every later `open_query_job` is `Cancelled`, which is
+    /// the ONE §5.9 state a public query must never repair or retry.
+    #[cfg(test)]
+    pub(crate) fn close_query_jobs_test(&self) {
+        let fence = self.shared.query_jobs.begin_close();
+        self.shared.query_jobs.wait_for_drain(fence);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_statement_failure(&self) {
+        self.shared
+            .inject_read_failure
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_reads(&self) -> u64 {
+        self.shared.statement_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_registry_capture_attempts(&self) -> u64 {
+        self.shared
+            .registry_capture_attempts
+            .swap(0, Ordering::AcqRel)
     }
 
     #[cfg(test)]
@@ -817,33 +1909,82 @@ impl DirectProjection {
     pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
         self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
-}
 
-fn block_at_order<'a>(roots: &'a [DocBlock], order: &str) -> Option<&'a DocBlock> {
-    let mut siblings = roots;
-    let mut found = None;
-    for component in order.split('/') {
-        if component.len() != 8 {
-            return None;
-        }
-        let index = usize::try_from(u32::from_str_radix(component, 16).ok()?).ok()?;
-        let block = siblings.get(index)?;
-        found = Some(block);
-        siblings = &block.children;
+    /// R3: refuse new jobs, interrupt the active ones and wait for their slots
+    /// before the worker is told to stop, so no snapshot outlives the
+    /// projection that admitted it. Idempotent — `stop` and a closed admission
+    /// owner are both terminal, so a caller that closes explicitly and then
+    /// drops pays a second no-op drain and nothing else.
+    fn close(&self) {
+        let fence = self.shared.cancel_queued_captures(true);
+        self.shared.query_jobs.wait_for_drain(fence);
     }
-    found
+
+    /// Retain a resource until the writer has released its connection and lease.
+    /// The publication root also has a foreground owner until its graph drops.
+    #[cfg(test)]
+    pub(crate) fn retain_worker_resource(&self, resource: Arc<dyn Send + Sync>) {
+        if let Some(resources) = self.shared.worker_resources.lock().unwrap().as_mut() {
+            resources.push(resource);
+        }
+    }
+
+    /// [`DirectProjection::close`], then wait until the writer worker has
+    /// actually RETURNED — up to `timeout`. `true` when it did.
+    ///
+    /// The only caller that needs this is one that owns the database's
+    /// directory and is about to remove it: on Windows an open handle refuses
+    /// the delete, and on every platform a worker still finishing its turn can
+    /// recreate the file under a directory that was just removed. Ordinary
+    /// graph close does NOT wait — an app teardown must not block on SQLite —
+    /// which is why the wait is an explicit call and not part of `Drop`.
+    ///
+    /// A `stop` turn is taken as soon as the worker reaches the top of its
+    /// loop, so the bound is one in-flight apply, never a queue.
+    pub(crate) fn close_and_wait_for_worker(&self, timeout: std::time::Duration) -> bool {
+        self.close();
+        let started = std::time::Instant::now();
+        while !self.shared.worker_finished.load(Ordering::Acquire) {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
 }
 
 impl Drop for DirectProjection {
     fn drop(&mut self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        pending.stop = true;
-        self.shared.changed.notify_one();
+        self.close();
     }
 }
 
-/// Report a Direct Files projection failure that leaves the parser fallback in
-/// charge.
+/// Publish the worker's exit AFTER every resource it owns has been released.
+///
+/// Declared as the FIRST local in [`projection_worker`], so it drops LAST —
+/// after the writer connection and the exclusive writer lease. `Drop` is the
+/// only correct place for it: the worker has five early returns and one
+/// steady-state one, and a flag stored at each of them is a flag the next arm
+/// forgets.
+struct ProjectionWorkerExit(Arc<ProjectionShared>);
+
+impl Drop for ProjectionWorkerExit {
+    fn drop(&mut self) {
+        self.0.worker_available.store(false, Ordering::Release);
+        let captures = std::mem::take(&mut self.0.pending.lock().unwrap().captures);
+        reject_query_captures(captures);
+        let resources = self.0.worker_resources.lock().unwrap().take();
+        drop(resources);
+        self.0.worker_finished.store(true, Ordering::Release);
+        self.0.changed.notify_all();
+    }
+}
+
+const PROJECTION_UPDATE_FAILURE: &str = "is stale; indexed reads are unavailable";
+
+/// Report a Direct Files projection write failure. Each read surface owns its
+/// readiness/error policy; this writer cannot claim that a query will traverse.
 ///
 /// The always-on line names the failure family in fixed words and carries
 /// nothing else. I-5: the detail at both call sites is free-form prose from the
@@ -852,15 +1993,84 @@ impl Drop for DirectProjection {
 /// `MaterializationError`'s payloads are free-form `String`s produced while
 /// storing parsed page text. I-9: the family still reaches the always-on
 /// record, because a user who is not running under `TINE_DEBUG` otherwise sees
-/// only a silently slower graph. The prose stays on the directed debug channel.
+/// only an unavailable index. The prose stays on the directed debug channel.
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
+    #[cfg(test)]
+    REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
     eprintln!("[tine] Direct Files SQLite projection {family}");
-    if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+    if crate::backend_error::runtime_debug_diagnostics_enabled() {
         eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
     }
 }
 
+/// How many times the always-on failure family has been printed this process.
+///
+/// The counter exists because the ONLY difference between a reported failure and
+/// a silent handoff is which `eprintln!` runs, and a test cannot read stderr.
+/// It is what makes [`ProjectionRefusal`]'s split checkable rather than merely
+/// asserted in a comment.
+#[cfg(test)]
+static REPORTED_PROJECTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reported_projection_failures_test() -> u64 {
+    REPORTED_PROJECTION_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Why one worker turn produced no serving image.
+///
+/// The two arms leave the SAME state behind — `requires_full_rebuild` latched,
+/// `worker_failed` set, readiness withdrawn — because in both cases only a
+/// complete source inventory may publish readiness again. They differ in ONE
+/// thing: whether a user is told the index broke.
+///
+/// `AwaitingFullInventory` is not a failure and must never reach the always-on
+/// channel. It is the ordinary cold-open handoff: an edit or an external write
+/// (Syncthing, an external editor) raced the warm stream, `stream_warm_replacements`
+/// abandoned it, `abandon_warm_stream` set `needs_full`, and the next turn
+/// carried only deltas. The parser fallback is ALREADY on its way with the full
+/// snapshot that repairs this; nothing is wrong and nothing is owed by the user.
+/// Reporting it printed `PROJECTION_UPDATE_FAILURE` once per delta turn, so a
+/// cold open under sync traffic emitted the alarming line hundreds of times
+/// (Martin, 2026-09-10) while queries answered correctly throughout.
+enum ProjectionRefusal {
+    AwaitingFullInventory,
+    Failed(String),
+}
+
+impl ProjectionRefusal {
+    /// Whether this refusal is a genuine write failure the user must be told
+    /// about on the always-on channel.
+    fn is_reportable_failure(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+impl std::fmt::Display for ProjectionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AwaitingFullInventory => {
+                f.write_str("a complete source inventory is owed before deltas can lower again")
+            }
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
+/// Lives for one repair attempt; see `DirectProjection::begin_repair`.
+pub(crate) struct RepairInFlight(Arc<ProjectionShared>);
+
+impl Drop for RepairInFlight {
+    fn drop(&mut self) {
+        self.0.repairs_in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_all();
+    }
+}
+
 fn projection_worker(shared: Arc<ProjectionShared>) {
+    // FIRST local, so it is the LAST thing dropped: the writer connection and
+    // the exclusive lease below are both released before the exit is published.
+    let _exit = ProjectionWorkerExit(Arc::clone(&shared));
     let Some(parent) = shared.path.parent() else {
         shared.worker_available.store(false, Ordering::Release);
         shared.changed.notify_all();
@@ -893,8 +2103,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             return;
         }
     };
-    let mut database = match open_projection_database(&shared.path) {
-        Ok(database) => database,
+    let mut writer_slot = match open_projection_database(&shared.path) {
+        Ok(database) => Some(database),
         Err(error) => {
             report_projection_failure("disabled: its database could not be opened", &error);
             shared.worker_available.store(false, Ordering::Release);
@@ -908,9 +2118,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
-        let (full, deltas, latest_generation) = {
+        let turn = {
             let mut pending = shared.pending.lock().unwrap();
-            while pending.full.is_none() && pending.deltas.is_empty() && !pending.stop {
+            while !pending.has_work() && pending.captures.is_empty() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
             }
             if pending.stop {
@@ -918,47 +2128,328 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 shared.changed.notify_all();
                 return;
             }
+            let captures = std::mem::take(&mut pending.captures);
+            drop(pending);
+            for capture in captures {
+                let job = capture_query_job(
+                    &shared,
+                    capture.requirement,
+                    capture.registry_sensitivity,
+                    capture.slot,
+                );
+                let _ = capture.reply.send(job);
+            }
+            let mut pending = shared.pending.lock().unwrap();
+            if pending.stop {
+                return;
+            }
+            if !pending.has_work() {
+                continue;
+            }
             shared.worker_busy.store(true, Ordering::Release);
-            (
-                pending.full.take(),
-                std::mem::take(&mut pending.deltas),
-                pending.latest_generation,
-            )
+            if std::mem::take(&mut pending.needs_full) {
+                requires_full_rebuild = true;
+            }
+            let rebuild = (pending.full.is_some() || pending.warm.is_some())
+                && std::mem::take(&mut pending.rebuild);
+            // R6: a full snapshot queued beside a warm validation owns
+            // readiness; the warm is dropped as superseded.
+            let warm = if pending.full.is_some() {
+                if pending.warm.take().is_some() {
+                    pending.warm_stream = None;
+                    pending.warm_superseded = true;
+                    pending.warm_outcome = Some(WarmOutcome::Superseded);
+                }
+                None
+            } else {
+                pending.warm.take()
+            };
+            let order = pending.order.take();
+            let deltas = std::mem::take(&mut pending.deltas);
+            let unordered = deltas.values().any(|(_, delta)| {
+                matches!(
+                    delta,
+                    PageDelta::Replace {
+                        query_page_order: None,
+                        ..
+                    }
+                )
+            });
+            let inventory = (order.is_some() || warm.is_some() || unordered)
+                .then(|| pending.ordered_inventory());
+            WorkerTurn {
+                full: pending.full.take(),
+                warm,
+                deltas,
+                order,
+                inventory,
+                stream_open: pending.warm_stream.is_some(),
+                latest_generation: pending.latest_generation,
+                rebuild,
+            }
         };
+        let WorkerTurn {
+            full,
+            warm,
+            deltas,
+            order,
+            inventory,
+            stream_open,
+            latest_generation,
+            rebuild,
+        } = turn;
         let had_full = full.is_some();
+        let had_warm = warm.is_some();
+        let stream_closed = order.is_some();
+        let registry_config = full
+            .as_ref()
+            .map(|full| Arc::clone(&full.parse_config))
+            .or_else(|| warm.as_ref().map(|warm| Arc::clone(&warm.parse_config)))
+            .or_else(|| {
+                deltas
+                    .values()
+                    .filter_map(|(generation, delta)| match delta {
+                        PageDelta::Replace { parse_config, .. } => Some((generation, parse_config)),
+                        PageDelta::Delete { .. } => None,
+                    })
+                    .max_by_key(|(generation, _)| *generation)
+                    .map(|(_, config)| Arc::clone(config))
+            });
+        let registry_reset = had_full || had_warm || rebuild || requires_full_rebuild;
+        let config_changed = registry_config.as_ref().is_some_and(|config| {
+            shared
+                .committed_registry
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|owner| owner.config.digest() != config.digest())
+        });
+        let touched_pages = deltas
+            .values()
+            .map(|(_, delta)| page_id(&delta.entry().rel_path))
+            .collect::<std::collections::BTreeSet<_>>();
         #[cfg(test)]
         run_before_apply_pending_hook();
-        let applied = if requires_full_rebuild && !had_full {
-            Err("a prior projection failure requires a complete parser snapshot".into())
+        let applied: Result<AppliedTurn, ProjectionRefusal> = if requires_full_rebuild
+            && !had_full
+            && !had_warm
+        {
+            // NOT necessarily a prior failure: `abandon_warm_stream` sets
+            // `needs_full` on ordinary generation drift. See `ProjectionRefusal`.
+            Err(ProjectionRefusal::AwaitingFullInventory)
         } else {
-            apply_pending(&mut database, full, deltas)
+            (|| {
+                if config_changed && !(rebuild || requires_full_rebuild || writer_slot.is_none()) {
+                    let fence = shared.cancel_queued_captures(false);
+                    shared.query_jobs.wait_for_drain(fence);
+                }
+                if rebuild || requires_full_rebuild || writer_slot.is_none() {
+                    // R3: interrupt and drain every query job first, so no
+                    // owned snapshot retains a handle to the file about to be
+                    // reset or removed, and the rebuild never waits on a read
+                    // nobody will finish. In-scope scenario: a torn projection
+                    // rebuilt under a live reader (D-3).
+                    let fence = shared.cancel_queued_captures(false);
+                    shared.query_jobs.wait_for_drain(fence);
+                    // Drop every connection before the disposable file can be
+                    // replaced; a reader must not retain an old file handle.
+                    let mut reader = shared.reader.lock().unwrap();
+                    reader.take();
+                    writer_slot.take();
+                    let mut database = open_projection_database(&shared.path)
+                        .map_err(|error| error.to_string())?;
+                    // Even repaired DDL leaves unchanged source stamps behind.
+                    // Reset them so the complete inventory relowers every source page.
+                    database.reset().map_err(|error| error.to_string())?;
+                    writer_slot = Some(database);
+                }
+                let registry_before = if !registry_reset
+                    && !touched_pages.is_empty()
+                    && shared.committed_registry.lock().unwrap().is_some()
+                {
+                    let mut snapshot =
+                        PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                            .map_err(|error| error.to_string())?;
+                    registry_sql::read_page_registry_metadata(&mut snapshot, &touched_pages)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    PageRegistryMetadata::new()
+                };
+                let mut applied =
+                    apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
+                // R6: the stream's closing turn (or a `Clean` warm turn, or a
+                // turn that lowered mid-stream deltas without positions)
+                // reconciles the order table over the queue's inventory. The
+                // queue's map tracks every applied replacement and deletion
+                // since its seed, so it names exactly the projected pages.
+                let warm_clean = matches!(applied.warm_outcome, Some(WarmOutcome::Clean));
+                applied.stream_open = if had_warm {
+                    matches!(applied.warm_outcome, Some(WarmOutcome::Replacements(_)))
+                } else {
+                    stream_open && !stream_closed
+                };
+                if !applied.stream_open
+                    && (stream_closed || warm_clean || applied.unordered_replacements)
+                {
+                    let inventory = inventory.ok_or_else(|| {
+                        "the order turn ran without its queue inventory".to_owned()
+                    })?;
+                    writer_slot
+                        .as_mut()
+                        .unwrap()
+                        .apply_with_source_revisions_aliases_and_page_order(
+                            &PhysicalGraphProjectionChange {
+                                replacements: Vec::new(),
+                                deletions: Vec::new(),
+                                reference_postings: Vec::new(),
+                            },
+                            &[],
+                            &[],
+                            &inventory,
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                // All SQL writes, including the separate ordering transaction,
+                // have completed. No maintenance transaction survives a write.
+                let revision = {
+                    let mut snapshot =
+                        PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                            .map_err(|error| error.to_string())?;
+                    snapshot
+                        .query_revision()
+                        .map_err(|error| error.to_string())?
+                };
+                #[cfg(test)]
+                if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
+                    hook();
+                }
+                shared.record_session_pages(&applied.pages);
+                let changes =
+                    registry_sql::registry_changes(&registry_before, &applied.registry_pages);
+                let mut registry = shared.committed_registry.lock().unwrap();
+                let config = registry_config
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| registry.as_ref().map(|owner| Arc::clone(&owner.config)));
+                if let Some(config) = config {
+                    match registry.as_mut() {
+                        Some(owner)
+                            if !registry_reset && owner.config.digest() == config.digest() =>
+                        {
+                            owner
+                                .cache
+                                .committed(
+                                    revision,
+                                    changes.normalized_keys,
+                                    changes.declaration_page_names,
+                                )
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Some(owner) => {
+                            owner.cache.reset(revision, &config);
+                            owner.config = config;
+                        }
+                        None => {
+                            *registry = Some(CommittedRegistryOwner {
+                                cache: CommittedRegistryCache::new(revision, &config),
+                                config,
+                            })
+                        }
+                    }
+                }
+                drop(registry);
+                Ok(applied)
+            })()
+            .map_err(ProjectionRefusal::Failed)
         };
-        if let Err(error) = applied {
-            requires_full_rebuild = true;
-            shared.ready.store(false, Ordering::Release);
-            shared.worker_failed.store(true, Ordering::Release);
-            shared.worker_busy.store(false, Ordering::Release);
-            shared.changed.notify_all();
-            report_projection_failure("is stale; using parser fallback", &error);
-            continue;
-        }
-        if had_full {
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(error) => {
+                shared.committed_registry.lock().unwrap().take();
+                requires_full_rebuild = true;
+                shared.ready.store(false, Ordering::Release);
+                shared.worker_failed.store(true, Ordering::Release);
+                {
+                    let mut pending = shared.pending.lock().unwrap();
+                    if had_warm {
+                        pending.warm_outcome = Some(WarmOutcome::Failed);
+                    }
+                    if had_warm || stream_closed {
+                        pending.warm_stream = None;
+                        pending.order = None;
+                    }
+                }
+                shared.worker_busy.store(false, Ordering::Release);
+                shared.changed.notify_all();
+                if error.is_reportable_failure() {
+                    report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
+                } else if crate::backend_error::runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] Direct Files SQLite projection deferred this turn: {error}");
+                }
+                continue;
+            }
+        };
+        if had_full || had_warm {
             requires_full_rebuild = false;
         }
+        if had_full || stream_closed || matches!(applied.warm_outcome, Some(WarmOutcome::Clean)) {
+            shared.validated.store(true, Ordering::Release);
+        }
         shared.worker_failed.store(false, Ordering::Release);
-        let pending = shared.pending.lock().unwrap();
+        let mut pending = shared.pending.lock().unwrap();
         shared.worker_busy.store(false, Ordering::Release);
-        if pending.full.is_none()
-            && pending.deltas.is_empty()
+        if had_warm {
+            // A `Replacements` outcome keeps the stream open at its generation
+            // and readiness waits for the closing order turn; any other
+            // outcome closes the stream this warm opened.
+            if !applied.stream_open {
+                pending.warm_stream = None;
+            }
+            if pending.warm_outcome.is_none() && !pending.warm_superseded {
+                pending.warm_outcome = applied.warm_outcome.clone();
+            }
+        }
+        if stream_closed {
+            pending.warm_stream = None;
+        }
+        if !pending.rebuild
+            && !pending.has_work()
+            && pending.warm_stream.is_none()
             && pending.latest_generation == latest_generation
+            && shared.validated.load(Ordering::Acquire)
         {
             shared
                 .ready_generation
                 .store(latest_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
-            shared.changed.notify_all();
+        }
+        drop(pending);
+        shared.changed.notify_all();
+        // Source-change events may have preceded this commit. Wake the existing
+        // application watcher after every serving-image publication, without
+        // retaining a query or requiring any edit to be covered by its read.
+        if shared.validated.load(Ordering::Acquire) && !applied.stream_open {
+            shared.commit_notification.fetch_add(1, Ordering::Release);
+            if let Some(wake) = shared.commit_waker.lock().unwrap().as_ref() {
+                let _ = wake.send(());
+            }
         }
     }
+}
+
+/// One worker turn's queued work (R6 widened it beyond full + deltas).
+struct WorkerTurn {
+    full: Option<PendingFull>,
+    warm: Option<PendingWarm>,
+    deltas: BTreeMap<String, (u64, PageDelta)>,
+    order: Option<u64>,
+    /// The queue's inventory captured with the deltas, so the order turn
+    /// reconciles exactly the pages this turn leaves projected.
+    inventory: Option<Vec<[u8; 16]>>,
+    /// Whether a warm stream was open when the turn was taken.
+    stream_open: bool,
+    latest_generation: u64,
+    rebuild: bool,
 }
 
 fn open_projection_database(
@@ -984,25 +2475,115 @@ fn open_projection_database(
     Ok(database)
 }
 
+/// Which pages one worker turn actually WROTE (R3 identity policy): the pages
+/// whose rows now carry this process's live runtime ids, and the pages whose
+/// rows are gone. A full snapshot on a warm reopen reuses every unchanged
+/// page's rows, so "a full snapshot was applied" is not "every page was
+/// lowered" — only the source delta's replacements were.
+#[derive(Default)]
+struct AppliedPages {
+    lowered: Vec<[u8; 16]>,
+    deleted: Vec<[u8; 16]>,
+    /// R6: pages relowered from a fresh parse; they leave the session set.
+    relowered_structurally: Vec<[u8; 16]>,
+}
+
+#[derive(Default)]
+struct AppliedTurn {
+    pages: AppliedPages,
+    registry_pages: PageRegistryMetadata,
+    /// R6: the warm validation's verdict, when this turn ran one.
+    warm_outcome: Option<WarmOutcome>,
+    /// R6: this turn lowered replacements that carried no order position
+    /// (queued while a stream was open), so the order table must be
+    /// reconciled once the stream is closed.
+    unordered_replacements: bool,
+    stream_open: bool,
+}
+
+/// R6 warm validation inside one worker turn: compare the walk inventory's
+/// exact revisions with `direct_source_revisions`, delete what the walk no
+/// longer has, and name what must be relowered. Nothing here parses.
+fn validate_warm(
+    database: &mut PhysicalGraphProjectionDatabase,
+    warm: &PendingWarm,
+    applied: &mut AppliedPages,
+) -> Result<WarmOutcome, String> {
+    let config_digest = warm.parse_config.digest();
+    let sources = warm
+        .sources
+        .iter()
+        .map(|(entry, revision)| PhysicalGraphProjectionSourceRevision {
+            page_id: page_id(&entry.rel_path),
+            revision: projection_source_revision(revision, config_digest),
+        })
+        .collect::<Vec<_>>();
+    let source_delta = database
+        .source_delta(&sources)
+        .map_err(|error| error.to_string())?;
+    if !source_delta.deletions.is_empty() {
+        applied
+            .deleted
+            .extend(source_delta.deletions.iter().copied());
+        database
+            .apply_with_source_revisions_and_aliases(
+                &PhysicalGraphProjectionChange {
+                    replacements: Vec::new(),
+                    deletions: source_delta.deletions,
+                    reference_postings: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if source_delta.replacements.is_empty() {
+        return Ok(WarmOutcome::Clean);
+    }
+    let needed = source_delta
+        .replacements
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(WarmOutcome::Replacements(
+        warm.sources
+            .iter()
+            .filter(|(entry, _)| needed.contains(&page_id(&entry.rel_path)))
+            .map(|(entry, _)| entry.clone())
+            .collect(),
+    ))
+}
+
 fn apply_pending(
     database: &mut PhysicalGraphProjectionDatabase,
-    full: Option<(u64, PageSnapshot, PageRevisions)>,
+    full: Option<PendingFull>,
+    warm: Option<&PendingWarm>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<(), String> {
-    if let Some((_, pages, revisions)) = full {
+) -> Result<AppliedTurn, String> {
+    let mut turn = AppliedTurn::default();
+    let applied = &mut turn.pages;
+    if let Some(PendingFull {
+        pages,
+        revisions,
+        parse_config,
+    }) = full
+    {
+        let parse_config = parse_config.as_ref();
+        let config_digest = parse_config.digest();
         let sources = pages
             .iter()
             .map(|(entry, _)| {
                 Ok(PhysicalGraphProjectionSourceRevision {
                     page_id: page_id(&entry.rel_path),
-                    revision: projection_source_revision(revisions.get(&entry.path).ok_or_else(
-                        || {
+                    revision: projection_source_revision(
+                        revisions.get(&entry.path).ok_or_else(|| {
                             format!(
                                 "parsed page has no exact source revision: {}",
                                 entry.rel_path
                             )
-                        },
-                    )?),
+                        })?,
+                        config_digest,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1014,10 +2595,19 @@ fn apply_pending(
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let inventory = sources
+            .iter()
+            .map(|source| source.page_id)
+            .collect::<Vec<_>>();
         let lowered = pages
             .iter()
-            .filter(|(entry, _)| replacements_needed.contains(&page_id(&entry.rel_path)))
-            .map(|(entry, document)| physical_page(entry, document))
+            .enumerate()
+            .filter(|(_, (entry, _))| replacements_needed.contains(&page_id(&entry.rel_path)))
+            .map(|(position, (entry, document))| {
+                let (mut page, postings, aliases) = physical_page(entry, document, parse_config)?;
+                page.query_page_order = Some(position as u64);
+                Ok::<_, String>((page, postings, aliases))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut replacements = Vec::with_capacity(lowered.len());
         let mut reference_postings = Vec::new();
@@ -1031,8 +2621,12 @@ fn apply_pending(
             .into_iter()
             .filter(|source| replacements_needed.contains(&source.page_id))
             .collect::<Vec<_>>();
+        applied.lowered.extend(replacements_needed.iter().copied());
+        applied
+            .deleted
+            .extend(source_delta.deletions.iter().copied());
         database
-            .apply_with_source_revisions_and_aliases(
+            .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions: source_delta.deletions,
@@ -1040,8 +2634,12 @@ fn apply_pending(
                 },
                 &replacement_sources,
                 &aliases,
+                &inventory,
             )
             .map_err(|error| error.to_string())?;
+    }
+    if let Some(warm) = warm {
+        turn.warm_outcome = Some(validate_warm(database, warm, applied)?);
     }
     if !deltas.is_empty() {
         let mut replacements = Vec::new();
@@ -1051,17 +2649,45 @@ fn apply_pending(
         let mut deletions = Vec::new();
         for (_, (_, delta)) in deltas {
             match delta {
-                PageDelta::Replace(entry, document, revision) => {
+                // Each replacement lowers under the config it was queued with,
+                // never under a later page's or a default (F11).
+                PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config,
+                    query_page_order,
+                    identity,
+                } => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
-                        revision: projection_source_revision(&revision),
+                        revision: projection_source_revision(&revision, parse_config.digest()),
                     });
-                    let (page, mut postings, mut page_aliases) = physical_page(&entry, &document)?;
+                    let (mut page, mut postings, mut page_aliases) =
+                        physical_page(&entry, &document, &parse_config)?;
+                    page.query_page_order = query_page_order;
+                    if query_page_order.is_none() {
+                        turn.unordered_replacements = true;
+                    }
+                    match identity {
+                        DeltaIdentity::Live => applied.lowered.push(page.page_id),
+                        DeltaIdentity::Structural => {
+                            applied.relowered_structurally.push(page.page_id)
+                        }
+                    }
+                    turn.registry_pages.insert(
+                        page.page_id,
+                        registry_sql::registry_metadata_from_physical_page(&page)?,
+                    );
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
                 }
-                PageDelta::Delete(entry) => deletions.push(page_id(&entry.rel_path)),
+                PageDelta::Delete { entry } => {
+                    let id = page_id(&entry.rel_path);
+                    applied.deleted.push(id);
+                    deletions.push(id);
+                }
             }
         }
         database
@@ -1076,16 +2702,44 @@ fn apply_pending(
             )
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(turn)
 }
 
-fn projection_source_revision(content_revision: &str) -> String {
-    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{content_revision}")
+/// The revision Direct Files compares to decide whether a page's rows are still
+/// current. Folding the parse-config digest in is what makes a config edit a
+/// full re-lowering (§5.8 J7): reconciliation compares only source revisions,
+/// so without it an unchanged file would keep rows built under the old config.
+fn projection_source_revision(
+    content_revision: &str,
+    parse_config_digest: tine_storage::ContentDigest,
+) -> String {
+    let digest = parse_config_digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{digest}:{content_revision}")
+}
+
+/// The Direct Files producer, reachable from the cross-backend parity guard.
+///
+/// Named as a seam rather than widened: the guard has to compare the rows this
+/// exact function emits against the walk's,
+/// and a reimplementation in the test would prove only that the test agrees
+/// with itself (§5.8 G1, I-19).
+#[cfg(test)]
+pub(crate) fn physical_page_for_test(
+    entry: &PageEntry,
+    document: &Document,
+    parse_config: &ParseConfig,
+) -> Result<PhysicalPage, String> {
+    physical_page(entry, document, parse_config).map(|(page, _, _)| page)
 }
 
 fn physical_page(
     entry: &PageEntry,
     document: &Document,
+    parse_config: &ParseConfig,
 ) -> Result<
     (
         PhysicalPage,
@@ -1095,9 +2749,23 @@ fn physical_page(
     String,
 > {
     #[cfg(test)]
-    PHYSICAL_PAGE_LOWERINGS.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut receipt = PHYSICAL_PAGE_LOWERINGS.lock().unwrap();
+        if receipt
+            .0
+            .as_ref()
+            .is_some_and(|root| entry.path.starts_with(root))
+        {
+            receipt.1 += 1;
+        }
+    }
     let id = page_id(&entry.rel_path);
-    let is_org = Format::from_path(Path::new(&entry.rel_path)) == Format::Org;
+    let format = Format::from_path(Path::new(&entry.rel_path));
+    let is_org = format == Format::Org;
+    // `Format::from_path` and never `reference_source_is_org`: the latter is a
+    // case-sensitive `ends_with(".org")` and would type an `Outline.ORG` page
+    // Markdown here while Direct Files types it Org (§5.8 E4).
+    let atom_format = crate::query::atom::AtomFormat::from(format);
     let (preamble_search, properties, tags) = document
         .pre_block
         .as_deref()
@@ -1135,6 +2803,7 @@ fn physical_page(
             crate::doc::property_reference_page_names(preamble).into_iter(),
         )?;
     }
+    let mut block_refs_norm: Vec<Vec<String>> = Vec::new();
     lower_blocks(
         &document.roots,
         id,
@@ -1142,21 +2811,51 @@ fn physical_page(
         &mut Vec::new(),
         &mut blocks,
         &mut reference_postings,
+        &mut block_refs_norm,
+        parse_config,
+        atom_format,
     )?;
+    // The two derived tables come from the ONE tine-core computation (§5.8):
+    // this side only hands it the block's own `refs_norm` and its parent.
+    let flat = blocks
+        .iter()
+        .zip(block_refs_norm.iter())
+        .map(|(block, refs)| crate::query::path_refs::PathRefBlock {
+            id: block.block_id,
+            parent: block.parent,
+            refs: refs.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let mut path_refs = crate::query::derived::path_ref_rows(&entry.name, &flat);
+    for block in &mut blocks {
+        block.path_refs = path_refs.remove(&block.block_id).unwrap_or_default();
+    }
+    let journal_days = crate::query::derived::JournalDays::new(parse_config);
+    let page_property_atoms = crate::query::derived::property_atom_rows(
+        &properties
+            .iter()
+            .map(|property| (property.name.clone(), property.value.clone()))
+            .collect::<Vec<_>>(),
+        atom_format,
+        parse_config,
+    );
     Ok((
         PhysicalPage {
             page_id: id,
+            query_page_order: None,
             home_document_id: id,
             name: entry.name.clone(),
             name_key: crate::refs::page_key(&entry.name),
             path: entry.rel_path.clone(),
             text_kind: page_kind_to_sql(entry.kind),
+            journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
             references: Vec::new(),
             properties,
-            tags,
+            tags: crate::query::derived::tag_rows(&tags),
+            property_atoms: page_property_atoms,
             blocks,
         },
         reference_postings,
@@ -1164,6 +2863,28 @@ fn physical_page(
     ))
 }
 
+/// The 16-byte key a block's rows are stored under.
+///
+/// A parsed page carries structural UUIDs. A page saved from the editor keeps
+/// the FRONTEND's live ids (`src/store.ts` `freshId()`: `b<base36 time>-<n>`),
+/// which `cache_upsert_inner` deliberately preserves so the editor can keep
+/// addressing the block; the public identity of a row is `query_result_id`,
+/// the id STRING, so a non-UUID live id only needs a deterministic key here.
+/// This used to be a refusal, and a refusal scoped to the whole page: one
+/// block created in the editor failed the page's delta, the failed turn
+/// latched a full rebuild, and every rebuild re-lowered the same live document
+/// and failed the same way — so after one such save every query in the app
+/// answered "Rebuilding the query index…" until restart (2026-09-11,
+/// master d61cfb3d). `a_block_created_in_the_editor_keeps_queries_answering`
+/// (`tests/search_edit.rs`) pins the user outcome.
+fn block_projection_key(runtime_id: &str) -> [u8; 16] {
+    match Uuid::parse_str(runtime_id) {
+        Ok(uuid) => uuid.into_bytes(),
+        Err(_) => crate::vocab::live_runtime_id_key(runtime_id).into_bytes(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_blocks(
     source: &[DocBlock],
     page_id: [u8; 16],
@@ -1171,19 +2892,15 @@ fn lower_blocks(
     structural_path: &mut Vec<u32>,
     out: &mut Vec<PhysicalBlock>,
     reference_postings: &mut Vec<PhysicalReferencePosting>,
+    refs_norm: &mut Vec<Vec<String>>,
+    parse_config: &ParseConfig,
+    atom_format: crate::query::atom::AtomFormat,
 ) -> Result<(), String> {
     for (position, block) in source.iter().enumerate() {
         let position = u32::try_from(position)
             .map_err(|_| "page has more than u32::MAX sibling blocks".to_string())?;
         structural_path.push(position);
-        let block_id = Uuid::parse_str(&block.uuid)
-            .map_err(|_| {
-                format!(
-                    "block has no assigned runtime UUID in projection: {}",
-                    block.uuid
-                )
-            })?
-            .into_bytes();
+        let block_id = block_projection_key(&block.uuid);
         let projection = block.projection();
         let order = structural_path
             .iter()
@@ -1220,6 +2937,11 @@ fn lower_blocks(
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        // The query columns are the EXACT visible text and its fold, never the
+        // whitespace-collapsed `searchable_text` beside them (§5.10).
+        // `visible_lower` is exactly `search_query::canonical_fold(visible)`.
+        let (query_visible, query_visible_folded) =
+            (projection.visible.clone(), projection.visible_lower.clone());
         let properties = projection
             .properties
             .iter()
@@ -1229,31 +2951,51 @@ fn lower_blocks(
                 value: value.clone(),
             })
             .collect();
+        let property_atoms = crate::query::derived::property_atom_rows(
+            &projection.properties,
+            atom_format,
+            parse_config,
+        );
+        refs_norm.push(projection.refs_norm.clone());
         let logseq_uuid = block
             .property("id")
             .and_then(|value| Uuid::parse_str(value.trim()).ok())
             .map(Uuid::into_bytes);
         out.push(PhysicalBlock {
             block_id,
+            query_result_id: block.uuid.clone(),
+            own_refs: projection.refs_norm.clone(),
             home_document_id: page_id,
             parent,
             order,
             content: block.raw.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
+            query_visible,
+            query_visible_folded,
             heading_level: projection.heading_level,
             collapsed: block.collapsed(),
             logseq_uuid,
             logseq_identity_origin: logseq_uuid.map(|_| 0),
             references: Vec::new(),
             properties,
-            tags: projection.tags.clone(),
+            tags: crate::query::derived::tag_rows(&projection.tags),
             task: projection.marker.as_ref().map(|marker| PhysicalTask {
                 marker: marker.to_ascii_uppercase(),
                 priority: projection.priority.clone(),
                 scheduled: projection.scheduled.clone(),
                 deadline: projection.deadline.clone(),
             }),
+            // Written from the three projection fields alone, so a markerless
+            // block gets a row exactly as a marked one does (§3.2 M2).
+            planning: crate::query::derived::planning_row(
+                projection.priority.as_deref(),
+                projection.scheduled.as_deref(),
+                projection.deadline.as_deref(),
+            ),
+            // Filled once per page, after the whole flat block list exists.
+            path_refs: Vec::new(),
+            property_atoms,
         });
         lower_blocks(
             &block.children,
@@ -1262,6 +3004,9 @@ fn lower_blocks(
             structural_path,
             out,
             reference_postings,
+            refs_norm,
+            parse_config,
+            atom_format,
         )?;
         structural_path.pop();
     }
@@ -1303,8 +3048,7 @@ fn append_reference_postings(
 }
 
 fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String>) {
-    let mut block = DocBlock::new(raw);
-    block.is_org = is_org;
+    let block = DocBlock::preamble(raw, is_org);
     let searchable = block
         .visible_text()
         .split_whitespace()
@@ -1340,7 +3084,10 @@ fn page_kind_to_sql(kind: PageKind) -> i64 {
     }
 }
 
-fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
+/// `pages.text_kind` back to the parser's `PageKind`. A value outside the two
+/// the producer writes is projection damage, not a third kind, so every reader
+/// treats `None` as a failed read (D-3).
+pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
     match kind {
         0 => Some(PageKind::Page),
         1 => Some(PageKind::Journal),
@@ -1348,1581 +3095,82 @@ fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
     }
 }
 
-fn page_recency(
-    root: &Path,
-    name: &str,
-    relative_path: &str,
-    kind: i64,
-    journal_format: &crate::date::JournalFormat,
-) -> i64 {
-    journal_format.page_recency_secs(kind == 1, name, &root.join(relative_path))
+#[cfg(test)]
+/// Release a projection so the SAME database can be reattached.
+///
+/// `Drop` deliberately does NOT wait for the worker (see
+/// [`DirectProjection::close_and_wait_for_worker`]: an app teardown must not
+/// block on SQLite), and the worker releases its exclusive writer lease only
+/// just before it publishes its exit. So a fixture that drops one graph and
+/// immediately reattaches the same path can find the lease still held. The
+/// second instance then never becomes ready -- by design, proven by
+/// `concurrent_graph_instance_cannot_replace_ready_projection_facts` -- and
+/// `wait_ready` spins its whole 15s before panicking "did not converge" with
+/// `cache_generation=0`, naming the reopen rather than the handoff.
+///
+/// That is not hypothetical: it is what took down the Linux release
+/// selection on 2026-09-09, on a loaded hosted runner, in two tests that
+/// pass locally in 0.05s. Every fixture that reopens a projection database
+/// calls this first.
+pub(crate) fn release_projection<G: crate::query::graph::QueryGraph>(graph: &G) {
+    let Some(projection) = graph.direct_projection_test() else {
+        return;
+    };
+    assert!(
+        projection.close_and_wait_for_worker(std::time::Duration::from_secs(15)),
+        "the projection worker did not release its writer lease, so reattaching \
+         the same database would race it"
+    );
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::Graph;
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    static PROJECTION_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn scratch(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("tine-direct-projection-{tag}-{}", Uuid::new_v4()))
-    }
-
-    fn reset_lowerings() {
-        PHYSICAL_PAGE_LOWERINGS.store(0, Ordering::Relaxed);
-    }
-
-    fn lowerings() -> u64 {
-        PHYSICAL_PAGE_LOWERINGS.load(Ordering::Relaxed)
-    }
-
-    fn signature(groups: &[crate::model::RefGroup]) -> Vec<(String, Vec<(String, String)>)> {
-        groups
-            .iter()
-            .map(|group| {
-                (
-                    group.page.clone(),
-                    group
-                        .blocks
-                        .iter()
-                        .map(|block| (block.id.clone(), block.raw.clone()))
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
-    fn wait_ready(graph: &Graph) {
-        let started = Instant::now();
+/// Drive projection recovery the way the app does: by retrying.
+///
+/// `direct_projection_recover_after_failed_read` is ONE attempt and is allowed
+/// to accomplish nothing -- `model.rs` says so itself where it turns "the
+/// repair did not take" into `Unavailable(ReadFailed)`. The mechanism is that
+/// recovery latches `pending.rebuild`, but the worker consumes that flag only
+/// together with a `full` or `warm` payload (`rebuild = (full|warm) &&
+/// take(rebuild)`). If the turn carrying that payload fails, the payload is
+/// gone and the rebuild stays latched with nothing left to ride in on, so the
+/// projection stays failed until something enqueues work again. In the running
+/// app that something is the user's next query, which calls recovery again.
+///
+/// A fixture that calls recovery once and then waits has assumed a convergence
+/// guarantee the contract does not make. It fails about one run in twenty on a
+/// loaded machine and passes every time on an idle one, which is how
+/// `current_snapshot_write_failure_recovers_from_authoritative_source` took
+/// down the Linux release selection on 2026-09-10 after passing all night.
+pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G) {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(30);
+    loop {
+        graph.direct_projection_recover_after_failed_read();
+        let attempt = std::time::Instant::now();
         while !graph.direct_projection_ready_test() {
-            assert!(
-                started.elapsed() < Duration::from_secs(15),
-                "Direct Files projection did not converge"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn direct_projection_matches_parser_tasks_and_tracks_replace_delete() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("task-parity");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::create_dir_all(root.join("journals")).unwrap();
-        std::fs::write(
-            root.join("pages/tasks.md"),
-            "- TODO [#A] parent\n\t- TODO child\n- TODO other\n  SCHEDULED: <2026-08-13 Thu>\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("pages/org.org"), "* TODO [#B] org task\n").unwrap();
-
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        for query in [
-            "(task TODO)",
-            "(and (task TODO) (priority A))",
-            "(and (task TODO) (scheduled))",
-            "(and (task TODO) (sort-by priority desc))",
-        ] {
-            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
-            assert_eq!(
-                signature(&indexed.groups),
-                signature(&oracle.groups),
-                "{query}"
-            );
-            assert_eq!(
-                (indexed.total, indexed.exceeded),
-                (oracle.total, oracle.exceeded)
-            );
-        }
-        assert!(graph.direct_projection_indexed_reads_test() >= 4);
-        let indexed_reads = graph.direct_projection_indexed_reads_test();
-        let repeated = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(
-            signature(&repeated.groups),
-            signature(
-                &crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000).groups
-            )
-        );
-        assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_reads,
-            "the generation-keyed presentation memo must avoid repeated SQL/parser work"
-        );
-
-        let entry = graph
-            .list_pages()
-            .into_iter()
-            .find(|entry| entry.name == "tasks")
-            .unwrap();
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "DONE [#A] parent".into();
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        wait_ready(&graph);
-        for query in ["(task TODO)", "(task DONE)"] {
-            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
-            assert_eq!(
-                signature(&indexed.groups),
-                signature(&oracle.groups),
-                "{query}"
-            );
-        }
-
-        graph.delete_page("org", PageKind::Page).unwrap();
-        wait_ready(&graph);
-        let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
-        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn b4_page_ref_and_property_facets_record_indexed_reads() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("b4-indexed-reads");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/source.md"),
-            "category:: work\ntags:: work\n\n- TODO points to [[Target]]\n  status:: active\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
-        std::fs::write(root.join("pages/Project___Child.md"), "- namespace child\n").unwrap();
-        std::fs::create_dir_all(root.join("journals")).unwrap();
-        std::fs::write(root.join("journals/2026_09_03.md"), "- journal block\n").unwrap();
-
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        let indexed_before = graph.direct_projection_indexed_reads_test();
-        for query in [
-            "(page-ref Target)",
-            "(and (page-ref Target) \"points\")",
-            "(and \"points\" (page-ref Target))",
-        ] {
-            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
-            assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
-            assert_eq!(
-                (indexed.total, indexed.exceeded),
-                (oracle.total, oracle.exceeded)
-            );
-        }
-        assert_eq!(
-            graph.property_facets(),
-            crate::query::property_facets(&graph)
-        );
-        assert_eq!(
-            graph.autocomplete_property_facets_bounded(100, 1_000_000),
-            crate::query::autocomplete_property_facets_bounded(&graph, 100, 1_000_000)
-        );
-        assert!(
-            graph.direct_projection_indexed_reads_test() >= indexed_before + 5,
-            "PageRef and both property-facet entry points must use the generation-bound SQLite read"
-        );
-
-        for query in [
-            "(and (task TODO) (page source))",
-            "(property status active)",
-            "(page-property category work)",
-            "(page source)",
-            "(namespace Project)",
-            "(journal)",
-            "(and (property status active) (page source))",
-            "(or (page source) (page Target))",
-        ] {
-            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let expected_paths = graph
-                .direct_projection_candidate_paths_test(
-                    &crate::query::simple_query_candidate_plan(query),
-                    usize::MAX,
-                )
-                .unwrap();
-            let indexed_before = graph.direct_projection_indexed_reads_test();
-            let fallback_before = graph.direct_projection_fallback_reads_test();
-            graph.reset_direct_projection_candidate_probe_test();
-            let actual = graph.run_query_bounded(query, 100, 1_000_000);
-            assert_eq!(
-                signature(&actual.groups),
-                signature(&oracle.groups),
-                "{query}"
-            );
-            assert_eq!(
-                (actual.total, actual.exceeded),
-                (oracle.total, oracle.exceeded),
-                "{query}"
-            );
-            assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_before + 1, "{query}: exactly one candidate query must complete; expected candidate paths {expected_paths:?}");
-            assert_eq!(
-                crate::query::full_graph_query_evaluations(),
-                0,
-                "{query}: production invocation entered the forbidden full-graph evaluator"
-            );
-            assert_eq!(
-                graph.direct_projection_fallback_reads_test(),
-                fallback_before,
-                "{query}: ready candidate route fell back"
-            );
-            assert_eq!(
-                graph
-                    .direct_projection_candidate_evaluated_paths_test()
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>(),
-                expected_paths,
-                "{query}: production must evaluate exactly the lowering's candidate paths"
-            );
-        }
-
-        let indexed_before = graph.direct_projection_indexed_reads_test();
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.reset_direct_projection_candidate_probe_test();
-        let empty = graph.run_query_bounded("(", 100, 1_000_000);
-        assert!(empty.groups.is_empty());
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            0,
-            "Plan::Empty must not enter the graph evaluator"
-        );
-        assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before,
-            "Plan::Empty must not touch the projection"
-        );
-        assert_eq!(
-            graph.direct_projection_fallback_reads_test(),
-            fallback_before,
-            "Plan::Empty must not record fallback access"
-        );
-
-        graph.reset_direct_projection_candidate_probe_test();
-        let _ = graph.run_query_bounded("\"points\"", 100, 1_000_000);
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            1,
-            "Plan::All alone uses the parser whole-graph evaluator"
-        );
-
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.direct_projection_mark_stale_test();
-        let fallback_query = "(and (page-ref Target) (not (page Missing)))";
-        let oracle = crate::query::run_query_bounded(&graph, fallback_query, 100, 1_000_000);
-        let fallback = graph.run_query_bounded(fallback_query, 100, 1_000_000);
-        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
-        assert_eq!(
-            graph.property_facets(),
-            crate::query::property_facets(&graph)
-        );
-        assert!(
-            graph.direct_projection_fallback_reads_test() >= fallback_before + 2,
-            "stale PageRef and facet reads must record parser fallbacks"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// An `Indexed` plan whose candidate set is a large fraction of the graph
-    /// abandons the projection and hands the query back to the parser walk.
-    ///
-    /// The user outcome this protects: on a real graph, `(journal)` and
-    /// non-sparse `(and (task ...) ...)` name most of the pages, and
-    /// materializing every one of them through SQLite made those query blocks
-    /// 7x and 10x SLOWER than the walk they replaced. The hatch is what keeps a
-    /// query block from stalling typing on the very shapes the route cannot
-    /// help. It must fire on the unselective shape and must NOT fire on a
-    /// selective one in the same graph.
-    #[test]
-    fn b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("b4-candidate-cutoff");
-        std::fs::create_dir_all(root.join("journals")).unwrap();
-        // 50 real journal dates, comfortably past the 32-page small-graph
-        // floor. Two months, because a date that does not exist (2026-09-31)
-        // is not a journal and would not become a candidate.
-        for (month, days) in [(9, 30), (10, 20)] {
-            for day in 1..=days {
-                std::fs::write(
-                    root.join(format!("journals/2026_{month:02}_{day:02}.md")),
-                    "- journal block\n",
-                )
-                .unwrap();
+            if attempt.elapsed() >= std::time::Duration::from_millis(500)
+                || started.elapsed() >= budget
+            {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/source.md"),
-            "- TODO points to [[Target]]\n  status:: active\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
-
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        // The lowering itself still produces the whole unselective candidate
-        // set; the hatch is a routing decision, not a change to the lowering.
-        let unselective = "(journal)";
-        let raw = graph
-            .direct_projection_candidate_paths_test(
-                &crate::query::simple_query_candidate_plan(unselective),
-                usize::MAX,
-            )
-            .expect("the lowering answers the unselective plan");
+        if graph.direct_projection_ready_test() {
+            return;
+        }
         assert!(
-            raw.len() > 32,
-            "fixture must exceed the cutoff; got {} candidates",
-            raw.len()
-        );
-
-        // Run the oracle BEFORE resetting the probes, so the oracle's own walk
-        // is not counted as the production invocation's route evidence.
-        let oracle = crate::query::run_query_bounded(&graph, unselective, 500, 4_000_000);
-        let indexed_before = graph.direct_projection_indexed_reads_test();
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.reset_direct_projection_candidate_probe_test();
-        let abandoned = graph.run_query_bounded(unselective, 500, 4_000_000);
-
-        assert_eq!(
-            signature(&abandoned.groups),
-            signature(&oracle.groups),
-            "abandoning must not change the answer"
-        );
-        assert_eq!(
-            (abandoned.total, abandoned.exceeded),
-            (oracle.total, oracle.exceeded),
-            "abandoning must not change the bound outcome"
-        );
-        assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before,
-            "an abandoned plan must complete no candidate query"
-        );
-        assert_eq!(
-            graph.direct_projection_fallback_reads_test(),
-            fallback_before + 1,
-            "abandoning must record exactly one fallback read on the existing hatch"
-        );
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            1,
-            "an abandoned plan takes the parser whole-graph walk exactly once"
-        );
-        assert!(
+            started.elapsed() < budget,
+            "Direct Files projection did not converge across repeated recovery attempts: \
+             cache_generation={} {}",
+            graph.cache_generation(),
             graph
-                .direct_projection_candidate_evaluated_paths_test()
-                .is_empty(),
-            "an abandoned plan must materialize no candidate pages"
+                .direct_projection_test()
+                .map(|projection| projection.debug_state_test())
+                .unwrap_or_else(|| "no projection".to_owned())
         );
-
-        // Same graph, same readiness: a selective plan still routes.
-        let selective = "(page-ref Target)";
-        let selective_paths = graph
-            .direct_projection_candidate_paths_test(
-                &crate::query::simple_query_candidate_plan(selective),
-                usize::MAX,
-            )
-            .expect("the lowering answers the selective plan");
-        assert!(selective_paths.len() <= 32, "selective fixture drifted");
-        let selective_oracle = crate::query::run_query_bounded(&graph, selective, 500, 4_000_000);
-        let indexed_before = graph.direct_projection_indexed_reads_test();
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.reset_direct_projection_candidate_probe_test();
-        let routed = graph.run_query_bounded(selective, 500, 4_000_000);
-        assert_eq!(
-            signature(&routed.groups),
-            signature(&selective_oracle.groups)
-        );
-        assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before + 1,
-            "a selective plan must still complete exactly one candidate query"
-        );
-        assert_eq!(
-            graph.direct_projection_fallback_reads_test(),
-            fallback_before,
-            "a selective plan must not fall back"
-        );
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            0,
-            "a selective plan must not enter the full-graph evaluator"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[ignore = "manual B4 corpus gate; set TINE_B4_QUERY_CORPUS"]
-    fn b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence() {
-        fn copy_tree(source: &Path, target: &Path) {
-            std::fs::create_dir_all(target).unwrap();
-            for entry in std::fs::read_dir(source).unwrap() {
-                let entry = entry.unwrap();
-                let kind = entry.file_type().unwrap();
-                let destination = target.join(entry.file_name());
-                if kind.is_dir() {
-                    copy_tree(&entry.path(), &destination);
-                } else if kind.is_file() {
-                    std::fs::copy(entry.path(), destination).unwrap();
-                }
-            }
-        }
-
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let source = PathBuf::from(
-            std::env::var("TINE_B4_QUERY_CORPUS").expect("TINE_B4_QUERY_CORPUS is required"),
-        );
-        let root = scratch("b4-corpus");
-        if source.is_dir() {
-            copy_tree(&source, &root);
-        } else {
-            std::fs::create_dir_all(root.join("pages")).unwrap();
-            std::fs::copy(&source, root.join("pages/corpus-fixture.md")).unwrap();
-        }
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/B4 Indexed Source.md"),
-            "b4-page-facet:: yes\ntags:: b4-tag\n\n- TODO synthetic [[B4 Indexed Target]]\n  b4-facet:: yes\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("pages/B4___Namespace.md"),
-            "- synthetic namespace\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("journals")).unwrap();
-        std::fs::write(root.join("journals/2026_09_03.md"), "- synthetic journal\n").unwrap();
-        std::fs::write(
-            root.join("pages/B4 Indexed Target.md"),
-            "- synthetic target\n",
-        )
-        .unwrap();
-
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join(".b4-private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        // The real graph is the only place the candidate-count escape hatch can
-        // be observed end to end: `(journal)` lowers to a candidate set the size
-        // of the journal directory, which no synthetic fixture reproduces at
-        // scale. Both sides of the hatch are asserted, and the oracle equality
-        // below holds on BOTH — that equality is what makes the parser walk the
-        // correctness oracle the retirement marker names.
-        let graph_page_count = graph.with_pages(|pages| pages.len());
-        let cutoff = DirectProjection::candidate_cutoff(graph_page_count);
-        let mut routed = 0usize;
-        let mut abandoned = 0usize;
-        for query in [
-            "(page-ref \"B4 Indexed Target\")",
-            "(and (task TODO) (page \"B4 Indexed Source\"))",
-            "(property b4-facet yes)",
-            "(page-property b4-page-facet yes)",
-            "(page \"B4 Indexed Source\")",
-            "(namespace B4)",
-            "(journal)",
-            "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
-            "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
-        ] {
-            let plan = crate::query::simple_query_candidate_plan(query);
-            let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
-            // `usize::MAX` asks for the raw lowering result; the production
-            // cutoff then decides whether that set is worth materializing.
-            let raw_paths = graph
-                .direct_projection_candidate_paths_test(&plan, usize::MAX)
-                .unwrap();
-            let hatch_fires = raw_paths.len() > cutoff;
-            // Probe the production cutoff itself, before any counter is
-            // captured, so the probe's own read cannot skew the assertions.
-            let routed_paths =
-                graph.direct_projection_candidate_paths_test(&plan, graph_page_count);
-            assert_eq!(
-                routed_paths.is_none(),
-                hatch_fires,
-                "{query}: {} candidates against cutoff {cutoff} must decide the route",
-                raw_paths.len()
-            );
-            let indexed_before = graph.direct_projection_indexed_reads_test();
-            let fallback_before = graph.direct_projection_fallback_reads_test();
-            graph.reset_direct_projection_candidate_probe_test();
-            let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
-            assert_eq!(
-                signature(&indexed.groups),
-                signature(&oracle.groups),
-                "{query}: routed result must equal the parser oracle (hatch_fires={hatch_fires})"
-            );
-            assert_eq!(
-                (indexed.total, indexed.exceeded),
-                (oracle.total, oracle.exceeded)
-            );
-            if hatch_fires {
-                abandoned += 1;
-                assert_eq!(
-                    graph.direct_projection_indexed_reads_test(),
-                    indexed_before,
-                    "{query}: an abandoned candidate set must not count an indexed read"
-                );
-                assert_eq!(
-                    graph.direct_projection_fallback_reads_test(),
-                    fallback_before + 1,
-                    "{query}: an abandoned candidate set must note exactly one fallback read"
-                );
-                assert_eq!(
-                    crate::query::full_graph_query_evaluations(),
-                    1,
-                    "{query}: an abandoned candidate set must take the parser walk"
-                );
-                assert!(
-                    graph
-                        .direct_projection_candidate_evaluated_paths_test()
-                        .is_empty(),
-                    "{query}: an abandoned candidate set must materialize no pages"
-                );
-            } else {
-                routed += 1;
-                assert_eq!(
-                    graph.direct_projection_indexed_reads_test(),
-                    indexed_before + 1
-                );
-                assert_eq!(
-                    graph.direct_projection_fallback_reads_test(),
-                    fallback_before
-                );
-                assert_eq!(crate::query::full_graph_query_evaluations(), 0);
-                assert_eq!(
-                    graph
-                        .direct_projection_candidate_evaluated_paths_test()
-                        .into_iter()
-                        .collect::<std::collections::BTreeSet<_>>(),
-                    raw_paths
-                );
-            }
-        }
-        // Neither branch may go vacuous: a corpus that never routes proves
-        // nothing about the projection, and one that never abandons proves
-        // nothing about the hatch.
-        assert!(
-            routed > 0 && abandoned > 0,
-            "the corpus gate must exercise both sides of the hatch \
-             (routed={routed}, abandoned={abandoned}, cutoff={cutoff}, pages={graph_page_count})"
-        );
-        assert!(
-            graph.property_facets() == crate::query::property_facets(&graph),
-            "corpus query-builder facets differ from the parser oracle"
-        );
-        assert!(
-            graph.autocomplete_property_facets_bounded(20_000, 32 * 1024 * 1024)
-                == crate::query::autocomplete_property_facets_bounded(
-                    &graph,
-                    20_000,
-                    32 * 1024 * 1024,
-                ),
-            "corpus autocomplete facets differ from the parser oracle"
-        );
-        // One indexed read per routed query, plus the two facet families above.
-        assert!(graph.direct_projection_indexed_reads_test() >= (routed + 2) as u64);
-
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.direct_projection_mark_stale_test();
-        let fallback_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
-        let oracle =
-            crate::query::run_query_bounded(&graph, fallback_query, 20_000, 32 * 1024 * 1024);
-        let fallback = graph.run_query_bounded(fallback_query, 20_000, 32 * 1024 * 1024);
-        assert!(
-            signature(&fallback.groups) == signature(&oracle.groups),
-            "corpus stale fallback differs from the parser oracle"
-        );
-        assert!(graph.direct_projection_fallback_reads_test() > fallback_before);
-
-        let pages = graph.with_pages(|pages| pages.len());
-        println!(
-            "b4_corpus_gate pages={pages} indexed_reads={} fallback_reads={}",
-            graph.direct_projection_indexed_reads_test(),
-            graph.direct_projection_fallback_reads_test()
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("search-reference-parity");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/one.md"),
-            "tags:: Page Tag, [[Property Page]]\nalias:: Alias Page\nquoted:: untouched\n\n- Characteristically useful [[Inline Page]]\n  aliases:: #Block Alias\n- c% literal\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("pages/two.md"), "- unrelated content\n").unwrap();
-        let graph = Graph::open(&root);
-        graph.warm_cache();
-        let oracle = crate::query::search(&graph, "cly", 20);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        wait_ready(&graph);
-
-        let candidate_pages = graph
-            .direct_projection_fuzzy_candidate_pages("cly")
-            .unwrap();
-        assert_eq!(candidate_pages.len(), 1);
-        assert_eq!(candidate_pages[0].0.rel_path, "pages/one.md");
-        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
-        assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
-        let names = graph
-            .referenced_page_names()
-            .into_iter()
-            .map(|name| crate::refs::page_key(&name))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            names,
-            [
-                "page tag",
-                "property page",
-                "alias page",
-                "inline page",
-                "block",
-                "block alias",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        );
-        assert!(graph.direct_projection_referenced_name_reads_test() > 0);
-
-        let fuzzy_reads = graph.direct_projection_fuzzy_candidate_reads_test();
-        let name_reads = graph.direct_projection_referenced_name_reads_test();
-        graph.direct_projection_mark_stale_test();
-        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
-        assert_eq!(
-            graph
-                .referenced_page_names()
-                .into_iter()
-                .map(|name| crate::refs::page_key(&name))
-                .collect::<std::collections::BTreeSet<_>>(),
-            names
-        );
-        assert_eq!(
-            graph.direct_projection_fuzzy_candidate_reads_test(),
-            fuzzy_reads,
-            "a stale generation must use the parser fallback"
-        );
-        assert_eq!(
-            graph.direct_projection_referenced_name_reads_test(),
-            name_reads,
-            "a stale generation must not read reference names from SQLite"
-        );
-
-        let entry = graph
-            .list_pages()
-            .into_iter()
-            .find(|entry| entry.name == "one")
-            .unwrap();
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "Nothing matching [[Replacement Page]]".into();
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        wait_ready(&graph);
-        assert!(graph.search("cly", 20).is_empty());
-        let names = graph
-            .referenced_page_names()
-            .into_iter()
-            .map(|name| crate::refs::page_key(&name))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(names.contains("replacement page"));
-        assert!(!names.contains("inline page"));
-
-        std::fs::write(
-            root.join("pages/one.md"),
-            "tags:: External Tag\n\n- Externally changed fuzzy [[External Page]]\n",
-        )
-        .unwrap();
-        graph.sync_file_checked(&root.join("pages/one.md")).unwrap();
-        wait_ready(&graph);
-        assert!(!graph.search("ecf", 20).is_empty());
-        let names = graph
-            .referenced_page_names()
-            .into_iter()
-            .map(|name| crate::refs::page_key(&name))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(names.contains("external tag"));
-        assert!(names.contains("external page"));
-        assert!(!names.contains("replacement page"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("reference-family-parity");
-        let target_id = "11111111-2222-4333-8444-555555555555";
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/target.md"),
-            format!("alias:: Alias Target\n\n- target\n  id:: {target_id}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("pages/referrer.md"),
-            format!(
-                "- [[Alias Target]] and plain Alias Target and (({target_id})) (({target_id}))\n- another (({target_id}))\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(root.join("pages/unrelated.md"), "- unrelated\n").unwrap();
-
-        let graph = Graph::open(&root);
-        graph.warm_cache();
-        let parser_aliases = crate::query::page_aliases_with_owners(&graph);
-        let parser_backlinks = crate::query::backlinks(&graph, "target");
-        let parser_unlinked = crate::query::unlinked_refs(&graph, "target");
-        let parser_referrers = crate::query::block_referrers(&graph, target_id);
-        let parser_resolved = crate::query::resolve_block(&graph, target_id);
-        let parser_counts = graph.block_ref_counts().unwrap();
-
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        wait_ready(&graph);
-
-        assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
-        let explicit_candidates = graph.reference_candidate_pages(
-            &[
-                crate::refs::page_key("target"),
-                crate::refs::page_key("Alias Target"),
-            ],
-            ReferenceKind::Explicit,
-        );
-        assert!(explicit_candidates.indexed);
-        assert!(explicit_candidates.pages.len() < explicit_candidates.full_page_count);
-        assert_eq!(
-            signature(&crate::query::backlinks(&graph, "target")),
-            signature(&parser_backlinks)
-        );
-        assert_eq!(
-            signature(&crate::query::unlinked_refs(&graph, "target")),
-            signature(&parser_unlinked)
-        );
-        assert_eq!(
-            signature(&crate::query::block_referrers(&graph, target_id)),
-            signature(&parser_referrers)
-        );
-        assert_eq!(
-            crate::query::resolve_block(&graph, target_id)
-                .as_ref()
-                .map(|group| signature(std::slice::from_ref(group))),
-            parser_resolved
-                .as_ref()
-                .map(|group| signature(std::slice::from_ref(group)))
-        );
-        assert_eq!(
-            graph.block_ref_counts().unwrap().as_ref(),
-            parser_counts.as_ref()
-        );
-        assert_eq!(graph.block_ref_counts().unwrap().get(target_id), Some(&2));
-
-        let custom_path = root.join("pages/custom.md");
-        std::fs::write(&custom_path, "- custom identity\n  id:: not-a-uuid\n").unwrap();
-        assert!(graph.sync_file(&custom_path).is_some());
-        wait_ready(&graph);
-        assert_eq!(
-            crate::query::resolve_block(&graph, "not-a-uuid")
-                .and_then(|group| group.blocks.into_iter().next())
-                .map(|block| block.raw),
-            Some("custom identity\nid:: not-a-uuid".to_string())
-        );
-
-        graph.direct_projection_mark_stale_test();
-        assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
-        assert_eq!(
-            signature(&crate::query::backlinks(&graph, "target")),
-            signature(&parser_backlinks)
-        );
-        assert_eq!(
-            signature(&crate::query::block_referrers(&graph, target_id)),
-            signature(&parser_referrers)
-        );
-        assert_eq!(
-            graph.block_ref_counts().unwrap().as_ref(),
-            parser_counts.as_ref()
-        );
-
-        let target_path = root.join("pages/target.md");
-        std::fs::write(
-            &target_path,
-            format!("alias:: Changed Alias\n\n- target\n  id:: {target_id}\n"),
-        )
-        .unwrap();
-        assert!(graph.sync_file(&target_path).is_some());
-        wait_ready(&graph);
-        let changed_aliases = graph.page_aliases_with_owners();
-        assert!(changed_aliases
-            .iter()
-            .any(|(alias, owner, _)| alias == "changed alias" && owner == "target"));
-        assert!(!changed_aliases
-            .iter()
-            .any(|(alias, _, _)| alias == "alias target"));
-
-        graph.delete_page("target", PageKind::Page).unwrap();
-        wait_ready(&graph);
-        assert!(!graph
-            .page_aliases_with_owners()
-            .iter()
-            .any(|(alias, _, _)| alias == "changed alias"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// GH #400. An ordinary edit has already published its parsed page and
-    /// queued the exact one-page SQLite delta. A reference read which overlaps
-    /// that short worker turn must not immediately turn into a whole-graph
-    /// parser scan. Waiting for this already-running bounded delta preserves the
-    /// same semantics and avoids the reported multi-second fallback.
-    #[test]
-    fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("reference-delta-handoff");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
-        std::fs::write(root.join("pages/source.md"), "- unrelated\n").unwrap();
-
-        let graph = Arc::new(Graph::open(&root));
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
-        let (release_worker_tx, release_worker_rx) = mpsc::channel();
-        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-            worker_paused_tx.send(()).unwrap();
-            release_worker_rx.recv().unwrap();
-        }));
-
-        let entry = graph
-            .list_pages()
-            .into_iter()
-            .find(|entry| entry.name == "source")
-            .unwrap();
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "plain target mention".into();
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        worker_paused_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the one-page projection delta reached the worker");
-
-        let reader = Arc::clone(&graph);
-        let (result_tx, result_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let candidates = reader.reference_candidate_pages(
-                &[crate::refs::page_key("target")],
-                ReferenceKind::Plain,
-            );
-            result_tx.send(candidates.indexed).unwrap();
-        });
-
-        match result_rx.recv_timeout(Duration::from_millis(100)) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            result => {
-                let _ = release_worker_tx.send(());
-                panic!(
-                    "reference lookup escaped to parser fallback before its queued delta completed: {result:?}"
-                );
-            }
-        }
-        release_worker_tx.send(()).unwrap();
-        assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            true,
-            "the converged lookup must use current indexed candidates"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reference_wait_is_zero_cost_when_no_projection_work_exists() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("reference-no-work-wait");
-        let projection = DirectProjection::start(root.join("projection.sqlite")).unwrap();
-        let started = Instant::now();
-        assert!(!projection.wait_for_reference_generation(1));
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "an unavailable projection must fall back immediately"
-        );
-        drop(projection);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn direct_projection_preserves_external_uuid_ambiguity_for_parser_resolution() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("external-uuid-ambiguity");
-        let target_id = "11111111-2222-4333-8444-555555555555";
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/alpha.md"),
-            format!("- alpha claimant\n  id:: {target_id}\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("pages/beta.md"),
-            format!("- beta claimant\n  id:: {target_id}\n"),
-        )
-        .unwrap();
-
-        let graph = Graph::open(&root);
-        graph.warm_cache();
-        let parser_resolution = crate::query::resolve_block(&graph, target_id)
-            .map(|group| signature(std::slice::from_ref(&group)));
-        let projection_path = root.join("private/projection.sqlite");
-        graph
-            .attach_direct_projection(projection_path.clone())
-            .unwrap();
-        wait_ready(&graph);
-
-        let database = PhysicalGraphProjectionDatabase::open_read_only(&projection_path).unwrap();
-        let claim = Uuid::parse_str(target_id).unwrap().into_bytes();
-        assert_eq!(
-            database
-                .read()
-                .blocks_by_logseq_uuid(claim, 2)
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            crate::query::resolve_block(&graph, target_id)
-                .map(|group| signature(std::slice::from_ref(&group))),
-            parser_resolution,
-            "SQLite must not choose one external UUID owner from an ambiguous graph"
-        );
-        drop(database);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reference_family_has_no_second_in_memory_semantic_index() {
-        let model = include_str!("model.rs");
-        for removed in [
-            "alias_cache",
-            "reference_candidate_index",
-            "block_ref_count_cache",
-            "block_index: RwLock",
-        ] {
-            assert!(
-                !model.contains(removed),
-                "Direct Files reference family reintroduced {removed} beside SQLite"
-            );
-        }
-    }
-
-    #[test]
-    fn direct_projection_fuzzy_candidates_preserve_parser_corpus_semantics() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("search-corpus-parity");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/search.md"),
-            "- Characteristically useful\n  - descendant Needle\n- Café and cafe\u{301}\n- 100% under_score back\\slash\n- MixedCASE\n- x a y b z\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("pages/other.md"),
-            "- Another characteristically useful result\n",
-        )
-        .unwrap();
-        let cases = [
-            ("", 20),
-            ("   ", 20),
-            ("cly", 20),
-            ("needle", 20),
-            ("CAFÉ", 20),
-            ("cafe\u{301}", 20),
-            ("%", 20),
-            ("_", 20),
-            ("\\", 20),
-            ("mixedcase", 20),
-            ("xyz", 20),
-            ("cly", 1),
-        ];
-        let oracle_graph = Graph::open(&root);
-        oracle_graph.warm_cache();
-        let oracle = cases
-            .iter()
-            .map(|(query, limit)| signature(&crate::query::search(&oracle_graph, query, *limit)))
-            .collect::<Vec<_>>();
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        assert!(
-            graph.warm_cache_cancellable(|| false),
-            "corpus cache failed to warm: {:?}",
-            graph.page_index_failures()
-        );
-        wait_ready(&graph);
-        for ((query, limit), expected) in cases.into_iter().zip(oracle) {
-            assert_eq!(
-                signature(&graph.search(query, limit)),
-                expected,
-                "{query:?}"
-            );
-        }
-        let cancellation_checks = std::cell::Cell::new(0);
-        assert!(crate::query::search_cancellable(&graph, "cly", 20, || {
-            cancellation_checks.set(cancellation_checks.get() + 1);
-            cancellation_checks.get() > 1
-        })
-        .is_empty());
-
-        graph.rename_page("search", "renamed search").unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-        assert_eq!(
-            signature(&graph.search("needle", 20)),
-            signature(&crate::query::search(&graph, "needle", 20))
-        );
-        graph.delete_page("renamed search", PageKind::Page).unwrap();
-        wait_ready(&graph);
-        assert!(graph.search("needle", 20).is_empty());
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unavailable_projection_keeps_direct_files_query_semantics() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("fallback");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(
-            root.join("pages/tasks.md"),
-            "- TODO Characteristically readable [[Inline Only]]\n  alias:: #Alias Only\n",
-        )
-        .unwrap();
-        let blocked_parent = root.join("not-a-directory");
-        std::fs::write(&blocked_parent, b"ordinary file").unwrap();
-
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(blocked_parent.join("projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        std::thread::sleep(Duration::from_millis(30));
-        let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
-        let fallback = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
-        assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
-        assert_eq!(
-            signature(&graph.search("cly", 20)),
-            signature(&crate::query::search(&graph, "cly", 20))
-        );
-        let names = graph
-            .referenced_page_names()
-            .into_iter()
-            .map(|name| crate::refs::page_key(&name))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(names.contains("inline only"));
-        assert!(names.contains("alias only"));
-        assert_eq!(graph.direct_projection_fuzzy_candidate_reads_test(), 0);
-        assert_eq!(graph.direct_projection_referenced_name_reads_test(), 0);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn concurrent_graph_instance_cannot_replace_ready_projection_facts() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("single-writer");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(root.join("pages/tasks.md"), "- TODO one\n").unwrap();
-        let database = scratch("single-writer-db").join("projection.sqlite");
-
-        let owner = Graph::open(&root);
-        owner.attach_direct_projection(database.clone()).unwrap();
-        owner.warm_cache();
-        wait_ready(&owner);
-
-        let fallback = Graph::open(&root);
-        fallback.attach_direct_projection(database.clone()).unwrap();
-        fallback.warm_cache();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !fallback.direct_projection_ready_test(),
-            "a second graph instance must not publish into the first instance's ready database"
-        );
-        let oracle = crate::query::run_query_bounded(&fallback, "(task TODO)", 100, 1_000_000);
-        let actual = fallback.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(signature(&actual.groups), signature(&oracle.groups));
-        assert_eq!(fallback.direct_projection_indexed_reads_test(), 0);
-
-        let owner_oracle = crate::query::run_query_bounded(&owner, "(task TODO)", 100, 1_000_000);
-        let owner_actual = owner.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(
-            signature(&owner_actual.groups),
-            signature(&owner_oracle.groups)
-        );
-        assert!(owner.direct_projection_indexed_reads_test() > 0);
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(database.parent().unwrap());
-    }
-
-    #[test]
-    fn clean_reopen_reuses_sqlite_and_external_edit_relowers_only_one_page() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = scratch("reopen-revisions");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
-        std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
-        let database = scratch("reopen-revisions-db").join("projection.sqlite");
-
-        reset_lowerings();
-        {
-            let graph = Graph::open(&root);
-            graph.attach_direct_projection(database.clone()).unwrap();
-            graph.warm_cache();
-            wait_ready(&graph);
-            assert_eq!(lowerings(), 2);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-
-        reset_lowerings();
-        {
-            let graph = Graph::open(&root);
-            graph.attach_direct_projection(database.clone()).unwrap();
-            graph.warm_cache();
-            wait_ready(&graph);
-            assert_eq!(lowerings(), 0, "unchanged pages must stay inside SQLite");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-
-        std::fs::write(root.join("pages/one.md"), "- TODO one changed\n").unwrap();
-        reset_lowerings();
-        {
-            let graph = Graph::open(&root);
-            graph.attach_direct_projection(database.clone()).unwrap();
-            graph.warm_cache();
-            wait_ready(&graph);
-            assert_eq!(
-                lowerings(),
-                1,
-                "one changed page must produce one SQL delta"
-            );
-            assert_eq!(
-                signature(
-                    &graph
-                        .run_query_bounded("(task TODO)", 100, 1_000_000)
-                        .groups
-                ),
-                signature(
-                    &crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000).groups
-                )
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(database.parent().unwrap());
-    }
-
-    #[test]
-    fn extractor_version_participates_in_disposable_source_revision() {
-        let source = "sha256:unchanged-source";
-        let projected = projection_source_revision(source);
-        assert_eq!(projected, "direct-facts-v2:sha256:unchanged-source");
-        assert_ne!(projected, source);
-    }
-
-    #[test]
-    fn storage_contract_names_the_generation_bound_cutover() {
-        let contract = include_str!("../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
-        assert!(contract.contains("sparse_task_query_eligibility"));
-        assert!(contract.contains("shared\nproperty-facet rows"));
-        assert!(contract.contains("PageRef simple-query candidate plan"));
-        assert!(contract.contains("same SQL read family in\nboth storage regimes"));
-        assert!(contract.contains("literal fuzzy-search candidate"));
-        assert!(contract.contains("referenced-page\ninventory"));
-        assert!(contract.contains("retains no separate semantic memo"));
-        assert!(contract.contains("exact current parser-cache\ngeneration"));
-        assert!(contract.contains("Direct fact-extractor version"));
-        assert!(contract.contains("app-private graph-fact projection contains no managed state"));
-        assert!(contract.contains("clean\nreopen lowers none"));
-        assert!(
-            contract.contains("memo of already-shaped frontend result DTOs remains Tine-native")
-        );
-        assert!(contract.contains("grants no\n   authority"));
-
-        // The routing rule is asserted inside its own section, not anywhere in
-        // the document: a whole-document `contains` passes with the sentence
-        // parked under an unrelated heading, which is exactly how a contract
-        // stops describing the subsystem it claims to describe.
-        let heading = "### 1.3 Direct Files disposable graph projection";
-        let start = contract.find(heading).expect("Direct projection section");
-        let body = &contract[start + heading.len()..];
-        let section = body
-            .find("\n## ")
-            .map_or(body, |end| &body[..end])
-            .to_owned();
-        for sentence in [
-            "every\n`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the\nshared lowering and evaluates only those pages",
-            "larger than one thirty-second of the graph's page count or 32 pages, whichever\nis greater, in which case the projection read is abandoned and the parser\nfallback runs instead",
-            "`Empty` returns without projection or graph access.",
-            "`All`\nuses the parser whole-graph evaluator.",
-            "An unavailable, stale, failed, or raced\nprojection uses the parser fallback.",
-        ] {
-            assert!(
-                section.contains(sentence),
-                "§1.3 must state the Indexed routing rule verbatim: {sentence}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
-    fn real_corpus_projection_converges_and_matches_task_query() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = PathBuf::from(
-            std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
-                .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
-        );
-        let database = scratch("real-corpus").join("projection.sqlite");
-        let oracle_graph = Graph::open(&root);
-        oracle_graph.warm_cache();
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        let started = Instant::now();
-        graph.warm_cache();
-        let warm = started.elapsed();
-        wait_ready(&graph);
-        let converged = started.elapsed();
-        let oracle_started = Instant::now();
-        let oracle =
-            crate::query::run_query_bounded(&oracle_graph, "(task TODO)", 20_000, 32 << 20);
-        let oracle_elapsed = oracle_started.elapsed();
-        let query_started = Instant::now();
-        let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
-        let indexed_elapsed = query_started.elapsed();
-        assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
-        let indexed_reads = graph.direct_projection_indexed_reads_test();
-        let memo_started = Instant::now();
-        let repeated = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
-        let memo_elapsed = memo_started.elapsed();
-        assert_eq!(signature(&repeated.groups), signature(&oracle.groups));
-        assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_reads);
-        let mut fuzzy_indexed = Duration::ZERO;
-        let mut fuzzy_oracle = Duration::ZERO;
-        for value in ["a", "todo", "http", "2026", "%", "_", "é"] {
-            let indexed_started = Instant::now();
-            let indexed_search = graph.search(value, 5_000);
-            fuzzy_indexed += indexed_started.elapsed();
-            let oracle_started = Instant::now();
-            let oracle_search = crate::query::search(&oracle_graph, value, 5_000);
-            fuzzy_oracle += oracle_started.elapsed();
-            assert_eq!(
-                signature(&indexed_search),
-                signature(&oracle_search),
-                "real-corpus fuzzy search diverged for a bounded probe"
-            );
-        }
-        eprintln!(
-            "direct projection fuzzy receipt: indexed_total_ms={} oracle_total_ms={}",
-            fuzzy_indexed.as_millis(),
-            fuzzy_oracle.as_millis(),
-        );
-        let normalize_names = |mut names: Vec<String>| {
-            names.sort_by_key(|name| crate::refs::page_key(name));
-            names
-        };
-        assert_eq!(
-            normalize_names(graph.referenced_page_names()),
-            normalize_names(oracle_graph.referenced_page_names()),
-            "real-corpus referenced-page inventory diverged"
-        );
-        assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
-        assert!(graph.direct_projection_referenced_name_reads_test() > 0);
-        let task_candidates = PhysicalGraphProjectionDatabase::open_read_only(&database)
-            .unwrap()
-            .read()
-            .task_candidate_blocks_after("TODO", None, 10_000)
-            .unwrap()
-            .len();
-        eprintln!(
-            "direct projection receipt: warm_ms={} projection_total_ms={} oracle_query_us={} indexed_query_us={} repeated_query_us={} pages={} task_candidates={}",
-            warm.as_millis(),
-            converged.as_millis(),
-            oracle_elapsed.as_micros(),
-            indexed_elapsed.as_micros(),
-            memo_elapsed.as_micros(),
-            graph.list_pages().len(),
-            task_candidates,
-        );
-    }
-
-    #[test]
-    #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
-    fn real_corpus_clean_reopen_reuses_projected_pages() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = PathBuf::from(
-            std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
-                .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
-        );
-        let database = scratch("real-corpus-reopen").join("projection.sqlite");
-        {
-            let graph = Graph::open(&root);
-            graph.attach_direct_projection(database.clone()).unwrap();
-            graph.warm_cache();
-            wait_ready(&graph);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-
-        reset_lowerings();
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        let started = Instant::now();
-        graph.warm_cache();
-        let warm = started.elapsed();
-        wait_ready(&graph);
-        let converged = started.elapsed();
-        let query_started = Instant::now();
-        let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
-        let indexed_elapsed = query_started.elapsed();
-        let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 << 20);
-        assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
-        assert_eq!(
-            lowerings(),
-            0,
-            "clean reopen must not lower unchanged pages"
-        );
-        eprintln!(
-            "direct projection clean-reopen receipt: warm_ms={} projection_total_ms={} projection_tail_ms={} indexed_query_us={} pages_lowered={}",
-            warm.as_millis(),
-            converged.as_millis(),
-            converged.saturating_sub(warm).as_millis(),
-            indexed_elapsed.as_micros(),
-            lowerings(),
-        );
-        let _ = std::fs::remove_dir_all(database.parent().unwrap());
-    }
-
-    #[test]
-    #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
-    fn real_corpus_reference_family_matches_parser_oracle() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = PathBuf::from(
-            std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
-                .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
-        );
-        let database = scratch("real-corpus-reference-family").join("projection.sqlite");
-        let oracle = Graph::open(&root);
-        oracle.warm_cache();
-        let aliases = crate::query::page_aliases_with_owners(&oracle);
-        let alias_target = aliases.first().map(|(alias, _, _)| alias.clone());
-        let oracle_backlinks = alias_target
-            .as_deref()
-            .map(|target| crate::query::backlinks(&oracle, target));
-        let oracle_unlinked_started = Instant::now();
-        let oracle_unlinked = alias_target
-            .as_deref()
-            .map(|target| crate::query::unlinked_refs(&oracle, target));
-        let oracle_unlinked_elapsed = oracle_unlinked_started.elapsed();
-        let oracle_count_started = Instant::now();
-        let oracle_counts = oracle.block_ref_counts().unwrap();
-        let oracle_count_elapsed = oracle_count_started.elapsed();
-        let block_claim = oracle.with_pages(|pages| {
-            pages.iter().find_map(|(_, document)| {
-                let mut claim = None;
-                fn visit(blocks: &[DocBlock], claim: &mut Option<String>) {
-                    for block in blocks {
-                        if claim.is_none() {
-                            *claim = block.projection().block_refs.first().cloned();
-                        }
-                        visit(&block.children, claim);
-                    }
-                }
-                visit(&document.roots, &mut claim);
-                claim
-            })
-        });
-        let oracle_referrers = block_claim
-            .as_deref()
-            .map(|claim| crate::query::block_referrers(&oracle, claim));
-        let oracle_resolved = block_claim
-            .as_deref()
-            .and_then(|claim| crate::query::resolve_block(&oracle, claim));
-
-        let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-        assert_eq!(graph.page_aliases_with_owners(), aliases);
-        let projected_count_started = Instant::now();
-        let projected_counts = graph.block_ref_counts().unwrap();
-        let projected_count_elapsed = projected_count_started.elapsed();
-        assert_eq!(projected_counts.as_ref(), oracle_counts.as_ref());
-        eprintln!(
-            "real-corpus-reference counts={} parser_count_us={} sqlite_count_us={}",
-            projected_counts.len(),
-            oracle_count_elapsed.as_micros(),
-            projected_count_elapsed.as_micros(),
-        );
-        if let Some(target) = alias_target.as_deref() {
-            let indexed_unlinked_started = Instant::now();
-            let indexed_unlinked = crate::query::unlinked_refs(&graph, target);
-            let indexed_unlinked_elapsed = indexed_unlinked_started.elapsed();
-            assert_eq!(
-                signature(&crate::query::backlinks(&graph, target)),
-                signature(oracle_backlinks.as_deref().unwrap())
-            );
-            assert_eq!(
-                signature(&indexed_unlinked),
-                signature(oracle_unlinked.as_deref().unwrap())
-            );
-            let candidates = graph.reference_candidate_pages(
-                &[crate::refs::page_key(target)],
-                ReferenceKind::Explicit,
-            );
-            assert!(candidates.indexed);
-            eprintln!(
-                "real-corpus-reference explicit_candidates={} full_pages={} parser_unlinked_us={} indexed_unlinked_us={}",
-                candidates.pages.len(),
-                candidates.full_page_count,
-                oracle_unlinked_elapsed.as_micros(),
-                indexed_unlinked_elapsed.as_micros(),
-            );
-        }
-        if let Some(claim) = block_claim.as_deref() {
-            assert_eq!(
-                signature(&crate::query::block_referrers(&graph, claim)),
-                signature(oracle_referrers.as_deref().unwrap())
-            );
-            assert_eq!(
-                crate::query::resolve_block(&graph, claim)
-                    .as_ref()
-                    .map(|group| signature(std::slice::from_ref(group))),
-                oracle_resolved
-                    .as_ref()
-                    .map(|group| signature(std::slice::from_ref(group)))
-            );
-        }
-        let _ = std::fs::remove_dir_all(database.parent().unwrap());
-    }
-
-    /// Child half of the two `retired_class_c_*` probes. Emits BOTH retired
-    /// class-(c) reports, each with its own planted marker, through the exact
-    /// production reporter and the exact error types the call sites hand it.
-    #[test]
-    #[ignore = "child process for the retired class-(c) stderr probe"]
-    fn w4_i5b_projection_failure_marker_child() {
-        if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
-            crate::sync_runtime::set_runtime_debug_diagnostics(true);
-        }
-        // Exactly what `open_projection_database` returns: a free-form
-        // `MaterializationError` payload.
-        report_projection_failure(
-            "disabled: its database could not be opened",
-            &tine_storage::sqlite::MaterializationError::Sqlite(
-                "planted-open-marker-Zq7Page".to_owned(),
-            ),
-        );
-        // Exactly what `apply_pending` returns: a `String` naming the
-        // graph-relative page it was projecting.
-        report_projection_failure(
-            "is stale; using parser fallback",
-            &"parsed page has no exact source revision: pages/planted-apply-marker-Zq7Page.md"
-                .to_owned(),
-        );
-    }
-
-    fn projection_failure_child_stderr(set_flag: &str) -> String {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "direct_projection::tests::w4_i5b_projection_failure_marker_child",
-                "--nocapture",
-            ])
-            .env_remove("TINE_DEBUG")
-            .env("TINE_I5B_SET_FLAG", set_flag)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "projection-failure child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stderr).into_owned()
-    }
-
-    /// I-5, retired class-(c) row `direct_projection.rs` "projection database
-    /// could not be opened": the always-on line carried a free-form
-    /// `MaterializationError` payload.
-    #[test]
-    fn retired_class_c_projection_database_open_emits_no_planted_marker() {
-        let marker = "planted-open-marker-Zq7Page";
-        assert!(
-            !projection_failure_child_stderr("0").contains(marker),
-            "I-5: the always-on projection-open failure still carried its error prose. \
-             The always-on line names the failure family only; the detail belongs behind \
-             `runtime_debug_diagnostics_enabled()` (I-9 keeps the family, not the prose)."
-        );
-        assert!(
-            projection_failure_child_stderr("1").contains(marker),
-            "the directed debug channel must still carry the detail, or this probe proves \
-             nothing about where the prose went"
-        );
-    }
-
-    /// I-5, retired class-(c) row `direct_projection.rs` "projection is stale;
-    /// using parser fallback": `apply_pending` formats the graph-relative page
-    /// path into the error this line used to print always-on.
-    #[test]
-    fn retired_class_c_projection_apply_failure_emits_no_planted_marker() {
-        let marker = "planted-apply-marker-Zq7Page";
-        assert!(
-            source_of_this_file().contains("parsed page has no exact source revision: {}"),
-            "non-vacuity: this probe exists because `apply_pending` names the page it was \
-             projecting in its error string. If that error no longer does, re-derive the row's \
-             class before relaxing the probe."
-        );
-        assert!(
-            !projection_failure_child_stderr("0").contains(marker),
-            "I-5: the always-on parser-fallback line still carried the graph-relative page \
-             path from `apply_pending`. The always-on line names the failure family only."
-        );
-        assert!(
-            projection_failure_child_stderr("1").contains(marker),
-            "the directed debug channel must still carry the detail, or this probe proves \
-             nothing about where the prose went"
-        );
-    }
-
-    fn source_of_this_file() -> String {
-        std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct_projection.rs"),
-        )
-        .unwrap()
     }
 }
+
+#[cfg(test)]
+#[path = "direct_projection_tests.rs"]
+mod tests;

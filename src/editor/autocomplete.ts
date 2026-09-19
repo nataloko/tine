@@ -2,6 +2,7 @@
 // trigger at the caret, and apply a chosen completion. No DOM — unit-testable.
 
 import { TEMPLATE_VARS } from "./templateVars";
+import { QUERY_MACRO_SCAFFOLD, QUERY_MACRO_SCAFFOLD_CARET } from "./queryMacroName";
 import { isBareTagPrefix, tagRef } from "../tags";
 import { propertyKeyNorm } from "../render/block";
 
@@ -183,8 +184,9 @@ export function detectTrigger(
   }
 
   // Opening Markdown fence language. Do not pop a menu for a bare fence typed
-  // by hand (Enter keeps its established behavior); one language character is
-  // enough. The /Code block command explicitly opens the empty picker instead.
+  // inside other content (Enter keeps its established behavior); one language
+  // character is enough. /Code block and the whole-block ``` scaffold open the
+  // empty picker explicitly instead (Block.tsx `openFenceLanguagePicker`).
   const fence = /^( {0,3})(`{3,}|~{3,})([\w+#.-]+)$/.exec(before);
   if (fence && !insideFenceBefore(raw, lineStart)) {
     const start = lineStart + fence[1].length + fence[2].length;
@@ -503,8 +505,17 @@ const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     caret: `#+BEGIN_${t}\n`.length,
   })),
   { label: "Divider", insert: "---" },
-  { label: "Query", insert: "{{query }}", caret: 8 },
-  { label: "Query (visual builder)", action: "query-builder" },
+  // **One query command (SPEC §7.3).** There used to be two — "Query", which
+  // inserted the scaffold, and "Query (visual builder)", which opened the chip
+  // bar — and there is one query block, which opens in the builder. So this
+  // inserts the scaffold AND flags the block, and the sheet opens with the
+  // field chooser focused.
+  {
+    label: "Query",
+    insert: QUERY_MACRO_SCAFFOLD,
+    caret: QUERY_MACRO_SCAFFOLD_CARET,
+    action: "query-builder",
+  },
   { label: "Embed", insert: "{{embed }}", caret: 8 },
   // OG's slash entry is named "Embed Youtube timestamp" (og-1.0.0
   // 6e7afa8eb, commands.cljs:294-300).
@@ -529,7 +540,7 @@ const BARE_ORDER = new Map<string, number>([
   "Grid", "Table", "Board",
   "Code block", "Calculator", "Quote",
   "Admonition: note", "Admonition: tip", "Admonition: important", "Admonition: warning", "Admonition: caution",
-  "Divider", "Query", "Query (visual builder)", "Embed", "Embed Youtube timestamp", "Math block", "Page properties",
+  "Divider", "Query", "Embed", "Embed Youtube timestamp", "Math block", "Page properties",
 ].map((label, index) => [label, index]));
 
 /** One registry drives rendering, matching, selection and tests. The old

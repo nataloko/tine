@@ -277,8 +277,7 @@ function FormulaEditorPopup(props: { target: FormulaEditorTarget }): JSX.Element
     if (!h) return;
     const value = expr().trim();
     if (props.target.mode === "filter") {
-      const filterKey = props.target.filterKey ?? "tine.filter";
-      if (h.kind === "block") setBlockProperty(h.id, filterKey, value ? encodeFormulaExpr(value) : null);
+      if (h.kind === "block") setBlockProperty(h.id, "tine.filter", value ? encodeFormulaExpr(value) : null);
       closeFormulaEditor();
       return;
     }

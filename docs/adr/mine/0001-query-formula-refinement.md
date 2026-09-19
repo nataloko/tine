@@ -1,7 +1,17 @@
 # mine/0001. Query filtering: coarse structural query + optional formula refinement
 
-- **Status:** Accepted
+- **Status:** Retired at the v0.6.984 sync (2026-09-19)
 - **Date:** 2026-07-09
+
+> **Retired.** Upstream v0.6.983 replaced the Clause-based visual query builder with a
+> new query IR (`src/editor/queryIr.ts`, `QuerySheet`, the inline `QueryDisplay` panel),
+> removing every symbol this decision's UI was built on — `parseQuery`, `toDsl`, `Clause`,
+> `advancedToClause` — and the `.qb-advanced` chip bar that hosted the ƒ-filter button.
+> The refinement engine itself still had a home, but the affordance did not, so the
+> feature was retired whole rather than carried as an engine with no way to reach it.
+> `tine.query-filter::` is no longer read. Upstream's Display panel now owns view,
+> grouping, sort, columns, totals and row limit; `tine.filter::` still filters sheet
+> views. See the Retired section of `AGENTS.md` for what was removed.
 
 ## Context
 

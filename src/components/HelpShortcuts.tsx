@@ -109,6 +109,10 @@ export interface ShortcutSettingRow {
   id: string;
   label: string;
   binding: string;
+  /** A second built-in chord that runs the same command. Shown beside the
+   *  binding so it is discoverable, but not remappable and not its own row:
+   *  it disappears the moment the user binds the command themselves. */
+  alias?: string;
   effective: string;
   overridden: boolean;
   scope: ShortcutScope;
@@ -165,7 +169,7 @@ export function shortcutPaneCommandIds(sections: ShortcutPaneSection[]): string[
 function displayBinding(binding: string): string {
   const b = binding.trim();
   if (!b) return "Unbound";
-  if (b === "false") return "Disabled";
+  if (b === "false") return "Unbound";
   return b;
 }
 
@@ -314,21 +318,38 @@ function ShortcutRow(props: {
   row: ShortcutSettingRow;
   recording: string | null;
   onRecord: (id: string) => void;
+  onUnbind: (id: string) => void;
   onReset: (id: string) => void;
 }): JSX.Element {
   const recording = () => props.recording === props.row.id;
   return (
     <div class="help-shortcut-row">
       <span class="help-shortcut-label">{props.row.label}</span>
-      <button
-        class="help-keycap help-keycap-button"
-        classList={{ recording: recording(), overridden: props.row.overridden, disabled: props.row.effective === "false" }}
-        onClick={() => props.onRecord(props.row.id)}
-        title="Click to remap"
-      >
-        {recording() ? "Press keys..." : displayBinding(props.row.effective)}
-      </button>
+      <span class="help-shortcut-keys">
+        <button
+          class="help-keycap help-keycap-button"
+          classList={{ recording: recording(), overridden: props.row.overridden, disabled: props.row.effective === "false" }}
+          onClick={() => props.onRecord(props.row.id)}
+          title="Click to remap"
+        >
+          {recording() ? "Press keys..." : displayBinding(props.row.effective)}
+        </button>
+        <Show when={props.row.alias && !props.row.overridden}>
+          <span class="help-shortcut-alias">
+            or <span class="help-keycap help-keycap-static">{displayBinding(props.row.alias!)}</span>
+          </span>
+        </Show>
+      </span>
       <span class="help-shortcut-tail">
+        <Show when={props.row.effective.trim() && props.row.effective !== "false"}>
+          <button
+            class="help-reset"
+            title="Remove this keybinding"
+            onClick={() => props.onUnbind(props.row.id)}
+          >
+            Unbind
+          </button>
+        </Show>
         <Show when={props.row.overridden}>
           <button
             class="help-reset"
@@ -367,6 +388,7 @@ export function ShortcutsSettingsPane(props: {
   search: string;
   recording: string | null;
   onRecord: (id: string) => void;
+  onUnbind: (id: string) => void;
   onReset: (id: string) => void;
 }): JSX.Element {
   const query = () => props.search.trim();
@@ -411,6 +433,7 @@ export function ShortcutsSettingsPane(props: {
                       row={row}
                       recording={props.recording}
                       onRecord={props.onRecord}
+                      onUnbind={props.onUnbind}
                       onReset={props.onReset}
                     />
                   )}

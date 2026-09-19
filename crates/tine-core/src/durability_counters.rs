@@ -7,29 +7,22 @@
 //! the *number* of barriers an operation performs — not the time any one phase
 //! reports — is the cost that scales with the user's hardware.
 //!
-//! The 2026-08-26 managed-storage cost-model audit found that one accepted
-//! single-block managed save executed ~66 barriers against a blind budget of 3,
-//! because durability was decided artifact by artifact and nobody ever saw the
-//! per-operation sum. Phase timers cannot see multiplicity; counters can. These
-//! counters therefore exist to make that sum a **testable budget** rather than
-//! an invisible property — see
-//! `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`.
+//! The 2026-08-26 cost-model audit found that one accepted single-block save
+//! in the since-removed Managed Storage mode executed ~66 barriers against a
+//! blind budget of 3, because durability was decided artifact by artifact and
+//! nobody ever saw the per-operation sum. Phase timers cannot see
+//! multiplicity; counters can. These counters therefore exist to make that sum
+//! a **testable budget** rather than an invisible property — see
+//! `model::tests::a_cross_directory_move_flushes_one_directory_per_side`
+//! and `tests::the_contract_states_the_barrier_budget`.
 //!
 //! ## What is counted, and what is not
 //!
-//! Every barrier `tine-core` itself initiates is counted, including the two
-//! barriers that `tine_storage::publish_immutable_exact*` performs on the
-//! caller's behalf: its documented contract is one file `fsync` plus one
-//! directory `fsync` per published artifact, and
-//! [`note_immutable_publication`] records exactly that pair.
-//!
-//! Barriers executed *inside* `tine-storage` on its own account — the local
-//! journal's append `fsync`s, the SQLite VFS, and SQLite file-set publication —
-//! are **not** counted, because they are not reachable from this crate without
-//! a `tine-storage` API change. The audit measured that undercount at three
-//! barriers per ordinary managed save (two local-journal appends and one SQLite
-//! file-set checkpoint) and about four for a cross-page move. Budgets stated in
-//! this crate are therefore *core-initiated* barriers, and the tests say so.
+//! Every barrier `tine-core` itself initiates is counted. Barriers executed
+//! *inside* `tine-storage` on its own account and the SQLite VFS are **not**
+//! counted, because they are not reachable from this crate without a
+//! `tine-storage` API change. Budgets stated in this crate are therefore
+//! *core-initiated* barriers, and the tests say so.
 //!
 //! ## Attribution
 //!
@@ -41,32 +34,14 @@
 //! Tests need per-operation numbers, and `cargo test` runs many graphs
 //! concurrently in one process, so process-wide totals cannot be differenced
 //! safely. [`BarrierSession`] solves that: a session is a thread-local
-//! attribution channel that the managed actor thread **inherits from whichever
-//! thread spawned it**, so a test that opens a session before creating its
-//! runtime sees that runtime's barriers and no other test's.
+//! attribution channel that a worker thread **inherits from whichever thread
+//! spawned it**, so a test that opens a session before creating its worker
+//! sees that worker's barriers and no other test's.
 
 use std::cell::RefCell;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-/// The exact number of core-initiated durability barriers one accepted
-/// single-block managed save performs in the pinned fixture.
-///
-/// This is the current measured behaviour, not the destination: the
-/// cost-model audit's target is 3, and `docs/storage-sync-contract.md`
-/// §2.10a-i attributes the remaining work. Its job is to make any drift fail a
-/// test instead of
-/// disappearing into a phase timer.
-///
-/// The value is asserted against the contract document by
-/// `durability_counters::tests::the_contract_states_the_barrier_budget`, so
-/// the two cannot drift apart.
-pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 10;
-
-/// The same exact fixture total for one accepted cross-page (for example
-/// cross-day) move, which projects two pages.
-pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 13;
 
 /// The primitive kinds counted here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,21 +83,6 @@ fn attribute(kind: Barrier, count: u64) {
             counts[kind as usize].fetch_add(count, Ordering::Relaxed);
         }
     });
-}
-
-/// Record the two barriers that one `tine_storage` immutable publication
-/// performs: the temporary file's `fsync`, and the containing directory's
-/// `fsync` after the immutable name is installed.
-///
-/// Counting the storage crate's documented contract at its `tine-core` call
-/// site keeps the per-operation sum complete without a `tine-storage` API
-/// change. `tine_storage::publish_immutable_exact_impl` is the function whose
-/// contract this mirrors; if it ever stops performing exactly one file barrier
-/// and one directory barrier, this helper is what must change with it.
-#[inline]
-pub(crate) fn note_immutable_publication() {
-    note(Barrier::File);
-    note(Barrier::Directory);
 }
 
 /// A regular file or directory handle that can be forced to stable storage.
@@ -206,9 +166,9 @@ impl BarrierCounts {
 
 /// A thread-local attribution channel for durability barriers.
 ///
-/// Open one before creating a managed runtime; the actor thread inherits it at
-/// spawn, so [`BarrierSession::counts`] reports the barriers that runtime
-/// performed — on the actor thread and on the opening thread — without seeing
+/// Open one before spawning a worker; the worker thread inherits it at
+/// spawn, so [`BarrierSession::counts`] reports the barriers that worker
+/// performed — on the worker thread and on the opening thread — without seeing
 /// the barriers of any concurrently running test.
 ///
 /// Attachment is EXPLICIT in both directions: [`BarrierSession::detach_current_thread`]
@@ -262,7 +222,7 @@ impl BarrierSession {
 ///
 /// A thread that is about to spawn a long-lived worker calls this and passes
 /// the result into the new thread, which calls [`BarrierSession::attach`]. That
-/// is how the managed actor thread inherits its creator's attribution.
+/// is how a worker thread inherits its creator's attribution.
 pub fn current_session() -> Option<BarrierSession> {
     ATTRIBUTED.with(|slot| {
         slot.borrow().as_ref().map(|counts| BarrierSession {
@@ -284,22 +244,6 @@ mod tests {
             contract.contains("Durability barriers and the batch commit point"),
             "the storage contract must carry the durability-barrier section"
         );
-        assert!(
-            contract.contains(&format!(
-                "`MANAGED_SAVE_BARRIER_BUDGET` = **{MANAGED_SAVE_BARRIER_BUDGET}**"
-            )),
-            "the storage contract must state the enforced save barrier budget \
-             ({MANAGED_SAVE_BARRIER_BUDGET})"
-        );
-        assert!(
-            contract.contains(&format!(
-                "`MANAGED_MOVE_BARRIER_BUDGET` =\n**{MANAGED_MOVE_BARRIER_BUDGET}**"
-            )) || contract.contains(&format!(
-                "`MANAGED_MOVE_BARRIER_BUDGET` = **{MANAGED_MOVE_BARRIER_BUDGET}**"
-            )),
-            "the storage contract must state the enforced move barrier budget \
-             ({MANAGED_MOVE_BARRIER_BUDGET})"
-        );
         for required in [
             "writable WAL uses `synchronous=NORMAL`",
             "fresh schema DDL is one atomic transaction",
@@ -314,7 +258,7 @@ mod tests {
 
     #[test]
     fn no_read_path_reintroduces_a_durability_barrier() {
-        let source = include_str!("model.rs");
+        let source = crate::test_support::model_module_source();
         for banned in [
             "fn sync_and_read_projection_regular",
             "fn sync_open_and_read_projection_regular",
@@ -616,8 +560,6 @@ mod tests {
             vec![
                 ("durability_counters.rs".into(), ".sync_all("),
                 ("durability_counters.rs".into(), ".sync_all("),
-                ("filesystem_durability.rs".into(), "libc::syncfs("),
-                ("filesystem_durability.rs".into(), "libc::syncfs("),
             ],
             "a production durability primitive exists outside the counted \
              file/directory wrappers in durability_counters.rs or the counted \
@@ -625,14 +567,21 @@ mod tests {
         );
 
         let wrappers = without_inline_test_modules(include_str!("durability_counters.rs"));
-        assert_eq!(wrappers.matches("note(Barrier::File);").count(), 2);
-        assert_eq!(wrappers.matches("note(Barrier::Directory);").count(), 2);
-        let filesystem_wrappers = include_str!("filesystem_durability.rs");
+        assert_eq!(wrappers.matches("note(Barrier::File);").count(), 1);
+        assert_eq!(wrappers.matches("note(Barrier::Directory);").count(), 1);
+        let filesystem_wrappers =
+            crate::test_support::rust_module_production_files("filesystem_durability.rs")
+                .into_iter()
+                .map(|path| without_inline_test_modules(&fs::read_to_string(path).unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
         assert_eq!(
             filesystem_wrappers
                 .matches("note(crate::durability_counters::Barrier::Filesystem);")
                 .count(),
-            2
+            0,
+            "no production path takes a filesystem-wide barrier since the Managed Storage \
+             syncfs publication was removed; adding one needs a counted wrapper here"
         );
     }
 
@@ -656,16 +605,6 @@ mod tests {
         assert_eq!(counts.get(Barrier::Directory), 2);
         assert_eq!(counts.get(Barrier::Filesystem), 1);
         assert_eq!(counts.total(), 4);
-        BarrierSession::detach_current_thread();
-    }
-
-    #[test]
-    fn an_immutable_publication_costs_one_file_and_one_directory_barrier() {
-        let session = BarrierSession::begin();
-        note_immutable_publication();
-        let counts = session.counts();
-        assert_eq!(counts.get(Barrier::File), 1);
-        assert_eq!(counts.get(Barrier::Directory), 1);
         BarrierSession::detach_current_thread();
     }
 

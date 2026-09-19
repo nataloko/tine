@@ -19,9 +19,6 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 const CONFIG_RS: &str = include_str!("config.rs");
 
-#[cfg(test)]
-const MODEL_RS: &str = include_str!("model.rs");
-
 /// The TypeScript side of the wire. The path leaves the crate deliberately —
 /// the whole point is that the frontend declaration is the third copy, and a
 /// guard that cannot see it is not a guard. `#[cfg(test)]` keeps it out of
@@ -71,6 +68,18 @@ const CONFIG_FIELDS_NOT_PROJECTED: &[(&str, &str)] = &[
         "logbook",
         "flattened rather than dropped: `LogbookSettings` is projected as the \
          three scalar `logbook_*` fields below, which the parity test checks",
+    ),
+    (
+        "separated_by_commas",
+        "`:property/separated-by-commas` is a parser input: it reaches the query \
+         engine as part of `ParseConfig` and decides how a property VALUE splits \
+         into atoms. The frontend reads the already-split atoms, never the rule",
+    ),
+    (
+        "ignored_page_references_keywords",
+        "`:ignored-page-references-keywords` is the same kind of parser input — \
+         it suppresses reference extraction for the named property keys inside \
+         `ParseConfig`, before anything the frontend can see exists",
     ),
 ];
 
@@ -173,7 +182,7 @@ mod tests {
     }
 
     fn graph_meta_rust() -> Vec<String> {
-        rust_struct_pub_fields(MODEL_RS, "GraphMeta")
+        rust_struct_pub_fields(&crate::test_support::model_module_source(), "GraphMeta")
     }
 
     fn graph_meta_ts() -> Vec<String> {

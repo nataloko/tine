@@ -26,11 +26,11 @@ import {
   endFreshnessBarrier,
   installFreshnessInputGate,
 } from "./freshnessBarrier";
-import { managedStorageRuntime } from "./managedStorageRuntime";
 import { sweepReplaceable } from "./store";
 import { pushToast } from "./ui";
 import { graphBinding } from "./persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "./landAsync";
+import { isPublishedExport } from "./publishedBackend";
 
 /** Minimum spacing between focus-driven rescans. Below this, returning to the
  *  window is answered by the sweep alone (which is pure in-memory work). */
@@ -130,6 +130,10 @@ export function trackGraphChangeApplication(work: Promise<unknown>): void {
 
 /** Exported for tests; `installReloadOnFocus` wires it to focus/visibility. */
 export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
+  // A published export is an immutable snapshot with no watcher behind it, and
+  // its backend refuses the rescan, so asking only produced an error toast on
+  // every refocus (GH #549). There is nothing to refresh and nothing deferred.
+  if (isPublishedExport()) return Promise.resolve();
   // Always cheap: replay anything already deferred that has become replaceable.
   sweepReplaceable();
   const bindingChanged = retireChangedBinding();
@@ -168,16 +172,10 @@ export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
       if (error instanceof StaleFocusRefresh) return;
       // The watcher remains the primary path. Most importantly, a failed
       // fallback must release the input gate rather than strand the editor.
-      // Share/join deliberately retires and republishes the managed actor.
-      // During that window this rescan is a subordinate probe, not a second
-      // operation with its own terminal outcome: the owning Settings command
-      // reports exactly one success or failure after the actor is reopened.
-      if (!managedStorageRuntime.transitioning()) {
-        pushToast(
-          `Tine couldn't finish checking for external changes. Editing is available, but reopen the page before relying on it being current. (${String(error)})`,
-          "error",
-        );
-      }
+      pushToast(
+        `Tine couldn't finish checking for external changes. Editing is available, but reopen the page before relying on it being current. (${String(error)})`,
+        "error",
+      );
     } finally {
       endFreshnessBarrier();
       if (activeRefresh === refresh) {
@@ -202,7 +200,7 @@ export function resetFocusRescanThrottle(): void {
 }
 
 export function installReloadOnFocus(): void {
-  if (installed || typeof window === "undefined") return;
+  if (installed || typeof window === "undefined" || isPublishedExport()) return;
   installed = true;
   installFreshnessInputGate();
   window.addEventListener("focus", () => void refreshOnReturnToWindow());

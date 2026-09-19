@@ -78,6 +78,18 @@ const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}.md`;
 fs.writeFileSync(path.join(GRAPH, "journals", journal), "- ![Long PDF](../assets/long.pdf)\n");
 
+// Provision the display BEFORE snapshotting process.env. `env` is what the app
+// is launched with, so calling ensureDisplay() after this object is built hands
+// the app an environment with no DISPLAY: it dies inside the driver with
+// "Failed to initialize gtk backend!" and the journey only ever sees
+// UND_ERR_HEADERS_TIMEOUT from the WebDriver session POST -- which reads as a
+// hang, and is the exact misdiagnosis scripts/lib/e2e-display.mjs was written
+// to prevent. It was invisible under scripts/run-e2e.mjs, which wraps every
+// native Linux scenario in `xvfb-run -a` so DISPLAY is already set; only a
+// direct run of this file hit it. Every sibling journey calls ensureDisplay at
+// the top for this reason.
+await ensureDisplay({ geometry: "1600x1100x24" });
+
 const env = {
   ...process.env,
   TINE_GRAPH: GRAPH,
@@ -193,7 +205,6 @@ async function wheel(browser, deltaY, id) {
   }
 }
 
-await ensureDisplay({ geometry: "1600x1100x24" });
 const driverLog = fs.openSync(path.join(ARTIFACTS, "tauri-driver.log"), "w");
 let webviewTarget;
 let driver;
@@ -251,12 +262,27 @@ try {
   // pane, so select the reader before exercising its keyboard zoom contract.
   await click(browser, ".pdf-scroll");
 
+  // Read the zoom the reader has ACTUALLY settled on. Fit-to-width is still
+  // animating when this step is reached - the probe once opened at 73% and read
+  // 80% on its first frame - so a probe installed mid-settle measures the
+  // settle, sees "the zoom changed", closes its window, and reports that Ctrl+
+  // did nothing. Waiting for two equal readings makes the keyboard step the
+  // only thing under test.
+  const settledZoom = await browser.waitUntil(async () => {
+    const first = await browser.execute(() => document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "");
+    await browser.pause(120);
+    const second = await browser.execute(() => document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "");
+    return first && first === second ? first : false;
+  }, { timeout: 10_000, timeoutMsg: "the PDF reader never settled on a zoom before the keyboard zoom step" });
+
   // A retained ordinary canvas is already width/height:100% of its page
   // wrapper. During optimistic zoom it must never receive a second scale
   // transform: the released failure made one Ctrl+ step overshoot, then visibly
   // shrink when the 120 ms settled render replaced it.
-  await browser.execute(() => {
-    const probe = window.__tinePdfZoomProbe = { startedAt: performance.now(), samples: [], done: false };
+  await browser.execute((settledZoom) => {
+    const probe = window.__tinePdfZoomProbe = {
+      startedAt: performance.now(), samples: [], done: false, startZoom: settledZoom, changedAt: null,
+    };
     const frame = (now) => {
       const scroll = document.querySelector(".pdf-scroll");
       const viewport = scroll?.getBoundingClientRect();
@@ -278,21 +304,26 @@ try {
           transform: canvas.style.transform,
         });
       }
-      if (now - probe.startedAt < 750) requestAnimationFrame(frame);
+      const zoom = document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "";
+      if (probe.changedAt === null && zoom !== probe.startZoom) probe.changedAt = now;
+      const keepSampling = probe.changedAt === null
+        ? now - probe.startedAt < 4_000
+        : now - probe.changedAt < 750;
+      if (keepSampling) requestAnimationFrame(frame);
       else probe.done = true;
     };
     requestAnimationFrame(frame);
-  });
+  }, settledZoom);
   await browser.keys(["Control", "="]);
   await browser.waitUntil(() => browser.execute(() => window.__tinePdfZoomProbe?.done === true), {
-    timeout: 5_000,
+    timeout: 8_000,
     timeoutMsg: "PDF zoom frame probe did not finish",
   });
   const zoomProbe = await browser.execute(() => window.__tinePdfZoomProbe);
   observations.push({ label: "single-step-zoom", zoomProbe });
   assert(zoomProbe?.samples?.length > 2, "PDF zoom probe collected too few frames", zoomProbe);
   const finalZoom = zoomProbe.samples.at(-1)?.zoom;
-  assert(finalZoom && finalZoom !== zoomProbe.samples[0]?.zoom, "Ctrl+ did not change focused PDF zoom", zoomProbe);
+  assert(finalZoom && finalZoom !== settledZoom, "Ctrl+ did not change focused PDF zoom", { settledZoom, ...zoomProbe });
   const maxCanvasToPage = Math.max(...zoomProbe.samples.map((entry) => entry.canvasToPage));
   assert(maxCanvasToPage <= 1.02, "ordinary PDF canvas overshot its resized wrapper during zoom", {
     maxCanvasToPage,

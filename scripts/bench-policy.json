@@ -5,45 +5,13 @@
     "purpose": "Last pre-Sheets and pre-split-view patch release; never advances automatically."
   },
   "previousRelease": {
-    "ref": "v0.6.981",
+    "ref": "v0.6.983",
     "purpose": "Most recently published release. Advance immediately after publication; a tagged candidate automatically compares with the preceding tag."
   },
   "reliability": {
     "rounds": 5,
     "runsPerRound": 4,
     "maxCalibrationSpreadPct": 25
-  },
-  "storageMode": {
-    "requiredFixture": {
-      "minTextFiles": 1000,
-      "purpose": "A small synthetic graph materially understated managed cold-open overhead; the release gate uses a copied real-scale corpus."
-    },
-    "modes": [
-      "direct",
-      "managed"
-    ],
-    "operations": {
-      "coldOpenMs": {
-        "label": "cold open",
-        "managedMaxMs": 3000,
-        "managedMaxDeltaPct": 400,
-        "maxRoundSpreadPct": 30
-      },
-      "saveMs": {
-        "label": "edited-page save",
-        "managedMaxMs": 900,
-        "managedMaxDeltaPct": 50,
-        "maxRoundSpreadPct": 25
-      },
-      "keystrokeP95Ms": {
-        "label": "steady keystroke p95",
-        "managedMaxMs": 5
-      },
-      "keystrokeScheduleLagP95Ms": {
-        "label": "keystroke scheduling-lag p95",
-        "managedMaxMs": 5
-      }
-    }
   },
   "metrics": {
     "bigLoad": {

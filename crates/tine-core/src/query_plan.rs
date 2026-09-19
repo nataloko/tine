@@ -6,10 +6,18 @@
 //! block-query result contract.  The plan/result types are the seam that a
 //! durable query workspace can grow into later.
 
+#![cfg_attr(test, allow(private_bounds))]
+
+#[cfg(test)]
 use crate::doc::DocBlock;
-use crate::model::{BlockDto, Graph, PageEntry, PageKind};
+#[cfg(test)]
+use crate::model::Graph;
+#[cfg(test)]
+use crate::query::graph::QueryGraph;
+#[cfg(test)]
 use crate::refs;
 use crate::search_query::{canonical_fold, Matcher, Term};
+use crate::vocab::{BlockDto, PageEntry, PageKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -19,13 +27,16 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_EVIDENCE_SPANS: usize = 32;
 
-/// How many times the shared block evaluator has produced match evidence and a
-/// result DTO. The architectural claim is that this is once per WINNER, not
-/// once per retained candidate -- O(limit), not O(retained) -- and a counter is
-/// the only way to state that as a test rather than as a comment.
+// How many times the shared block evaluator has produced match evidence and a
+// result DTO. The architectural claim is that this is once per WINNER, not
+// once per retained candidate -- O(limit), not O(retained) -- and a counter is
+// the only way to state that as a test rather than as a comment.
 #[cfg(test)]
 thread_local! {
     static BLOCK_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    // Count at the span-producing matcher, not merely at a public wrapper.
+    static TEXT_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -135,41 +146,31 @@ pub struct QueryBranch {
     pub limit: usize,
 }
 
-impl QueryBranch {
-    /// The already-folded needle of a branch that is EXACTLY one literal fuzzy
-    /// `VisibleContent` predicate -- the `((` block-picker shape produced by
-    /// [`QueryPlan::block_search_literal`].
-    ///
-    /// Such a branch, and only such a branch, can be narrowed by a stored
-    /// ordered-subsequence candidate index: the index answers "which pages
-    /// could contain this subsequence", the parser-owned matcher still ranks
-    /// blocks and produces evidence, and a narrowed scan therefore returns the
-    /// same results as a full scan. A branch with boolean structure, negation
-    /// or a regex is NOT narrowable this way, because a page that fails the
-    /// literal test can still satisfy the branch.
-    ///
-    /// One accessor, used by both storage modes, so a future narrowable shape
-    /// cannot be taught to one evaluator and not the other.
-    pub(crate) fn fuzzy_visible_content_needle(&self) -> Option<&str> {
-        match &self.predicate {
-            QueryExpr::Text(TextPredicate {
-                field: TextField::VisibleContent,
-                mode: TextMatchMode::Fuzzy,
-                value,
-                ..
-            }) => Some(value.as_str()),
-            _ => None,
-        }
-    }
-}
-
 impl QueryPlan {
-    /// The narrowable fuzzy needle of this plan's block branch, if it has one.
-    pub(crate) fn fuzzy_block_needle(&self) -> Option<&str> {
-        self.branches
-            .iter()
-            .find(|branch| branch.target == QueryTarget::Blocks)
-            .and_then(QueryBranch::fuzzy_visible_content_needle)
+    /// Captured current-page scope for projection-backed Friendly execution.
+    /// A physical path, when present, remains authoritative over display name.
+    pub(crate) fn page_scope(&self) -> Option<&QueryPageScope> {
+        self.page_scope.as_ref()
+    }
+
+    /// The membership source this search asks for, with absence resolved to the
+    /// historic names-and-aliases behaviour. One resolution, at the boundary
+    /// the request crosses, so no reader can pick a different default.
+    pub(crate) fn page_match_scope(&self) -> crate::query::ir::FriendlyPageMatchScope {
+        self.display
+            .page_match_scope
+            .unwrap_or(crate::query::ir::FriendlyPageMatchScope::Names)
+    }
+
+    /// The already-resolved effective view of the Pages section, present only
+    /// where the caller enabled Display for this search.
+    pub(crate) fn page_view(&self) -> Option<&crate::query::ir::ViewSettings> {
+        self.display.page_view.as_ref()
+    }
+
+    /// The already-resolved effective view of the Blocks section.
+    pub(crate) fn block_view(&self) -> Option<&crate::query::ir::ViewSettings> {
+        self.display.block_view.as_ref()
     }
 }
 
@@ -222,6 +223,18 @@ pub enum QueryHit {
         match_class: ObjectiveMatchClass,
         #[serde(skip_serializing_if = "Option::is_none")]
         matched_alias: Option<String>,
+        /// The hydrated page row, present exactly when this hit came from the
+        /// Display-enabled Friendly path AND names a stored page.
+        ///
+        /// It is ADDITIVE: `page`, `display_text`, `evidence`, `score`,
+        /// `match_class` and `matched_alias` keep their meanings, so the
+        /// switcher, the block picker and every other navigation consumer read
+        /// exactly what they read before. A virtual reference-name suggestion
+        /// names no stored page, so it carries no row and consumes no
+        /// hydration budget — fabricating properties for one would be a page
+        /// that does not exist claiming to have them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<crate::query::ir::PageRow>,
     },
     Block {
         page: String,
@@ -261,17 +274,68 @@ pub struct QueryExecution {
     pub cancelled: bool,
 }
 
-/// One exact current managed page paired with the same inventory entry used by
-/// Direct Files for scope, path tie-breaking and page-hit projection.
+/// **The Display facts a Friendly search runs under** (SPEC §7.6, Q3).
 ///
-/// `roots` is the page's already-converted block tree, supplied by the caller
-/// from its `ApplicationProjectionCache`. It is the managed analogue of the
-/// cached `Arc<Document>` Direct Files walks: retaining it here is what lets
-/// the shared evaluator hold `&DocBlock` winners and defer evidence/DTO
-/// construction until the heap is drained, exactly as the Direct path does.
-pub(crate) struct ApplicationQueryPlanPage {
-    pub(crate) entry: PageEntry,
-    pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
+/// These are operation INPUT, exactly like [`QueryPageScope`] beside them: the
+/// caller has already resolved inheritance (an absent scoped draft against the
+/// singular settings) before it gets here, so the reader never re-inherits a
+/// missing member. Absence at this boundary therefore means "this consumer
+/// stated nothing", not "look somewhere else".
+///
+/// They ride on the plan rather than on a parallel input struct because
+/// `page_scope` — the other per-operation Friendly input — already does, and a
+/// second carriage for the same class of fact is the fork this campaign exists
+/// to remove (D-14).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendlyDisplayOptions {
+    /// Which source of page membership this search asks for. `None` is the
+    /// historic names-and-aliases behaviour, resolved HERE and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_match_scope: Option<crate::query::ir::FriendlyPageMatchScope>,
+    /// The already-resolved effective view of the Pages section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_view: Option<crate::query::ir::ViewSettings>,
+    /// The already-resolved effective view of the Blocks section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_view: Option<crate::query::ir::ViewSettings>,
+}
+
+impl FriendlyDisplayOptions {
+    /// The row bound one family actually requests: its own `sample`, never
+    /// larger than the bound its consumer already had. `sample: 0` empties that
+    /// family and only that family; an absent sample leaves the consumer's
+    /// bound alone. No unused capacity transfers between the two.
+    fn admitted(view: Option<&crate::query::ir::ViewSettings>, limit: usize) -> usize {
+        match view.and_then(|view| view.sample) {
+            Some(sample) => (sample as usize).min(limit),
+            None => limit,
+        }
+    }
+}
+
+/// **The one Friendly graph-search plan builder** (I-12, D-4).
+///
+/// Every public Friendly route — Direct's `run_graph_search*` — asks THIS
+/// function which plan a
+/// `(source, limits, routed scope, Display)` request means. Each used to spell
+/// the same `match scope { … }` itself, and a routed search that forgot to
+/// carry a section's sample or membership scope would have been a difference
+/// between backends nobody could see from either side (I-19).
+pub fn friendly_search_plan(
+    source: &str,
+    page_limit: usize,
+    block_limit: usize,
+    scope: Option<QueryPageScope>,
+    display: FriendlyDisplayOptions,
+) -> QueryPlan {
+    match scope {
+        // A routed search selects blocks inside ONE physical page, so it has no
+        // Pages section and page membership scope does not apply to it.
+        Some(scope) => {
+            QueryPlan::friendly_for_page_with_display(source, block_limit, scope, display)
+        }
+        None => QueryPlan::friendly_with_display(source, page_limit, block_limit, display),
+    }
 }
 
 /// Compiled friendly graph-search plan.  Regexes are compiled once and kept off
@@ -281,6 +345,7 @@ pub struct QueryPlan {
     pub branches: Vec<QueryBranch>,
     pub diagnostics: Vec<QueryDiagnostic>,
     page_scope: Option<QueryPageScope>,
+    display: FriendlyDisplayOptions,
     // Ctrl-K keeps the literal trimmed launcher source so a multi-word page
     // title/alias can retain the objective Exact class. The parsed AND terms
     // alone would otherwise downgrade `Foo Bar` to Prefix/Substring and make
@@ -294,6 +359,32 @@ impl QueryPlan {
     /// ordinary contains/phrase/regex semantics for block content.  Multi-term
     /// and operator searches use the same boolean grammar on both entity kinds.
     pub fn friendly(query: &str, page_limit: usize, block_limit: usize) -> Self {
+        Self::friendly_with_display(
+            query,
+            page_limit,
+            block_limit,
+            FriendlyDisplayOptions::default(),
+        )
+    }
+
+    /// The same plan, under stated Display settings. Each family's `sample`
+    /// reduces ITS OWN requested rows before selection, so the two sections are
+    /// independently bounded and neither can spend the other's capacity.
+    pub fn friendly_with_display(
+        query: &str,
+        page_limit: usize,
+        block_limit: usize,
+        display: FriendlyDisplayOptions,
+    ) -> Self {
+        let page_limit = FriendlyDisplayOptions::admitted(display.page_view.as_ref(), page_limit);
+        let block_limit =
+            FriendlyDisplayOptions::admitted(display.block_view.as_ref(), block_limit);
+        let mut plan = Self::friendly_plan(query, page_limit, block_limit);
+        plan.display = display;
+        plan
+    }
+
+    fn friendly_plan(query: &str, page_limit: usize, block_limit: usize) -> Self {
         let matcher = Matcher::parse(query);
         let mut next_id = 1;
         let mut regexes = HashMap::new();
@@ -342,6 +433,7 @@ impl QueryPlan {
             branches,
             diagnostics,
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: (!query.trim().is_empty()).then(|| canonical_fold(query.trim())),
             regexes,
         }
@@ -350,8 +442,28 @@ impl QueryPlan {
     /// Current-page search is a block-only execution profile of the same typed
     /// friendly plan—not a frontend filter over whole-graph results.
     pub fn friendly_for_page(query: &str, block_limit: usize, scope: QueryPageScope) -> Self {
+        Self::friendly_for_page_with_display(
+            query,
+            block_limit,
+            scope,
+            FriendlyDisplayOptions::default(),
+        )
+    }
+
+    /// Routed-page search under stated Display settings. Page membership scope
+    /// is not consulted: this profile selects blocks inside one physical page,
+    /// so there is no Pages section for it to describe.
+    pub fn friendly_for_page_with_display(
+        query: &str,
+        block_limit: usize,
+        scope: QueryPageScope,
+        display: FriendlyDisplayOptions,
+    ) -> Self {
+        let block_limit =
+            FriendlyDisplayOptions::admitted(display.block_view.as_ref(), block_limit);
         let mut plan = Self::block_search(query, block_limit);
         plan.page_scope = Some(scope);
+        plan.display = display;
         plan
     }
 
@@ -373,6 +485,7 @@ impl QueryPlan {
             }],
             diagnostics: Vec::new(),
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
         }
@@ -412,6 +525,7 @@ impl QueryPlan {
             branches,
             diagnostics,
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes,
         }
@@ -439,6 +553,7 @@ impl QueryPlan {
             branches,
             diagnostics: Vec::new(),
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
         }
@@ -472,13 +587,19 @@ impl QueryPlan {
 
     /// Execute all graph-backed branches.  Cancellation is checked between page
     /// candidates and before every block projection; no partial result escapes.
-    pub fn execute(&self, graph: &Graph, cancelled: impl Fn() -> bool) -> QueryExecution {
+    #[cfg(test)]
+    pub fn execute<G: QueryGraph>(
+        &self,
+        graph: &G,
+        cancelled: impl Fn() -> bool,
+    ) -> QueryExecution {
         self.execute_with_explain(graph, cancelled, true)
     }
 
-    pub fn execute_with_explain(
+    #[cfg(test)]
+    pub fn execute_with_explain<G: QueryGraph>(
         &self,
-        graph: &Graph,
+        graph: &G,
         cancelled: impl Fn() -> bool,
         explain: bool,
     ) -> QueryExecution {
@@ -525,68 +646,9 @@ impl QueryPlan {
             cancelled: false,
         }
     }
-
-    pub(crate) fn execute_application_with_explain(
-        &self,
-        file_pages: Vec<PageEntry>,
-        pages: &[ApplicationQueryPlanPage],
-        aliases: Vec<(String, String, String)>,
-        referenced: Vec<String>,
-        cancelled: impl Fn() -> bool,
-        explain: bool,
-    ) -> QueryExecution {
-        let explanation = if explain {
-            self.explanation()
-        } else {
-            QueryExplanation {
-                branches: Vec::new(),
-            }
-        };
-        if !self.diagnostics.is_empty() {
-            return QueryExecution {
-                hits: Vec::new(),
-                diagnostics: self.diagnostics.clone(),
-                explanation,
-                has_more: QueryHasMore::default(),
-                cancelled: false,
-            };
-        }
-        let mut hits = Vec::new();
-        let mut has_more = QueryHasMore::default();
-        for branch in &self.branches {
-            if cancelled() {
-                return cancelled_execution(self, explanation);
-            }
-            let branch_hits = match branch.target {
-                QueryTarget::Pages => execute_page_candidates(
-                    self,
-                    file_pages.clone(),
-                    aliases.clone(),
-                    referenced.clone(),
-                    branch,
-                    &cancelled,
-                ),
-                QueryTarget::Blocks => execute_application_blocks(self, pages, branch, &cancelled),
-            };
-            let Some((mut branch_hits, branch_has_more)) = branch_hits else {
-                return cancelled_execution(self, explanation);
-            };
-            match branch.target {
-                QueryTarget::Pages => has_more.pages |= branch_has_more,
-                QueryTarget::Blocks => has_more.blocks |= branch_has_more,
-            }
-            hits.append(&mut branch_hits);
-        }
-        QueryExecution {
-            hits,
-            diagnostics: self.diagnostics.clone(),
-            explanation,
-            has_more,
-            cancelled: false,
-        }
-    }
 }
 
+#[cfg(test)]
 fn cancelled_execution(plan: &QueryPlan, explanation: QueryExplanation) -> QueryExecution {
     QueryExecution {
         hits: Vec::new(),
@@ -769,6 +831,8 @@ fn eval_expr_fast(
 }
 
 fn match_text(plan: &QueryPlan, pred: &TextPredicate, original: &str) -> Option<MatchEvidence> {
+    #[cfg(test)]
+    TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
     match pred.mode {
         TextMatchMode::Contains | TextMatchMode::Phrase => {
             let spans = casefold_substring_spans(original, &pred.value);
@@ -1047,9 +1111,169 @@ impl BlockRelevance {
             - length_penalty
             - occurrence_penalty
     }
+
+    /// Lossless lexicographic sort key. ASCENDING byte order is EXACTLY
+    /// [`Self::cmp_quality`] reversed, i.e. best first, so a database that can
+    /// only `ORDER BY <blob> ASC` reproduces this module's ranking without
+    /// re-implementing it.
+    ///
+    /// [`Self::score`] is deliberately NOT encoded: it saturates offsets,
+    /// lengths and occurrence counts into one display `i32`, so two distinct
+    /// tuples can collide there. `cmp_quality` is the ordering authority and
+    /// all five of its components are carried here, in its own precedence
+    /// order, each at fixed width so whole-key byte comparison equals
+    /// component-wise comparison.
+    ///
+    /// `positive` is not a `cmp_quality` component and is not encoded; it is a
+    /// membership detail of [`block_relevance`]'s neutral-negation arm.
+    fn order_key(&self) -> [u8; BLOCK_RANK_KEY_LEN] {
+        let mut key = [0u8; BLOCK_RANK_KEY_LEN];
+        // Higher class rank is better, so the i32 encoding is inverted.
+        key[0..4].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        // `true` (a word-boundary match) is better, so the flag is inverted.
+        key[4] = u8::from(!self.word_boundary);
+        // The remaining three are "smaller is better" in `cmp_quality`, which
+        // ascending unsigned order already gives. In particular the existing
+        // rule that FEWER occurrences win is preserved, not reversed.
+        key[5..13].copy_from_slice(&ascending_usize_key(self.first_offset));
+        key[13..21].copy_from_slice(&ascending_usize_key(self.text_len));
+        key[21..29].copy_from_slice(&ascending_usize_key(self.occurrences));
+        key
+    }
+}
+
+/// Width of [`BlockRelevance::order_key`]: `cmp_quality`'s five components at
+/// fixed width -- class rank, boundary, first offset, UTF-16 text length,
+/// occurrences.
+const BLOCK_RANK_KEY_LEN: usize = 4 + 1 + 8 + 8 + 8;
+
+/// The key widens `usize` into `u64`. Every shipped target is 32- or 64-bit, so
+/// that widening is exact; this assertion is what makes "no truncation" a build
+/// failure rather than a comment if a wider target ever appears.
+const _: () = assert!(usize::BITS <= u64::BITS);
+
+/// Order-preserving big-endian `i32` encoding whose ASCENDING byte order is
+/// DESCENDING numeric order. Biasing by the sign bit makes negative values sort
+/// below positive ones; complementing then reverses the whole order.
+fn descending_i32_key(value: i32) -> [u8; 4] {
+    (!((value as u32) ^ (1u32 << 31))).to_be_bytes()
+}
+
+/// Order-preserving big-endian `usize` encoding: ascending byte order is
+/// ascending numeric order, exactly, including `usize::MAX`.
+fn ascending_usize_key(value: usize) -> [u8; 8] {
+    (value as u64).to_be_bytes()
+}
+
+/// Text-only block rank for a consumer that holds a block's exact visible text
+/// but no `Graph`, `Document` or `DocBlock` -- the seam the forthcoming SQLite
+/// adapter binds its `ORDER BY` to.
+///
+/// D-14, the existing-primitive rule: this is NOT a second matcher, parser or
+/// regex grammar. The searched-for existing implementations ARE the
+/// implementation here -- [`canonical_fold`] for the folded text,
+/// [`block_relevance`] / [`text_predicate_relevance`] for the tuple, the plan's
+/// already-compiled `regexes` map for regex predicates, and
+/// [`eval_ranked_block_expr`] for evidence. The bridge only admits text and
+/// re-encodes the existing tuple; it decides nothing about matching.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BlockTextRank {
+    relevance: BlockRelevance,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlockTextRank {
+    /// The BLOB sort key. Bind it as-is and `ORDER BY key ASC` for best first.
+    pub(crate) fn order_key(&self) -> [u8; BLOCK_RANK_KEY_LEN] {
+        self.relevance.order_key()
+    }
+
+    /// The same display score existing block hits carry. Display only: it
+    /// saturates, so it must never be the `ORDER BY` term.
+    pub(crate) fn score(&self) -> i32 {
+        self.relevance.score()
+    }
+
+    /// The same primary relevance band existing block hits carry.
+    pub(crate) fn match_class(&self) -> ObjectiveMatchClass {
+        self.relevance.match_class
+    }
+}
+
+/// Rank one block's exact visible text against a block branch, with no graph,
+/// document, page or traversal input at all.
+///
+/// `None` means the branch does not admit this text -- the same Boolean
+/// membership [`block_relevance`] already decides, including a successful NOT
+/// admitting on a neutral tuple, AND combining its positive children, and OR
+/// taking its best branch.
+///
+/// Selection is rank-only: no [`MatchEvidence`] spans and no `BlockDto` are
+/// constructed here. Physical page path and traversal index remain the
+/// equal-rank tie breakers and are the SQL adapter's to supply; they are
+/// deliberately not encoded in this text-only key. Page-name/alias ranking is
+/// likewise not covered by these five components.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_block_text(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+) -> Option<BlockTextRank> {
+    rank_block_text_folded(plan, branch, visible, &canonical_fold(visible))
+}
+
+/// [`rank_block_text`] for a caller that ALREADY holds the fold, so ranking a
+/// whole projection does not recompute it per row.
+///
+/// `folded` MUST be exactly `canonical_fold(visible)`; every ranking property
+/// of [`rank_block_text`] is preserved only under that equality, and passing
+/// any other string silently changes which blocks a search admits. The
+/// projection stores the pair in adjacent columns -- `block_text.query_visible`
+/// and `blocks.query_visible_folded`, written together from one
+/// `BlockProjection` -- and that they satisfy this equality on real rows is
+/// pinned by `the_projection_stores_the_exact_fold_of_every_visible_text`, not
+/// by this comment.
+///
+/// `visible` is still required in EVERY mode: the rank key's `text_len`
+/// component counts UTF-16 units of the original, and a regex predicate matches
+/// the original directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_block_text_folded(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+    folded: &str,
+) -> Option<BlockTextRank> {
+    if branch.target != QueryTarget::Blocks {
+        return None;
+    }
+    block_relevance(plan, &branch.predicate, visible, folded)
+        .map(|relevance| BlockTextRank { relevance })
+}
+
+/// Optional companion to [`rank_block_text`] for a consumer that has already
+/// admitted a row and now wants the reason. It calls the existing
+/// [`eval_ranked_block_expr`] on the admitted text and returns its existing
+/// [`MatchEvidence`] values verbatim -- same spans, same UTF-16 offsets, same
+/// best-branch OR choice, same empty evidence for a satisfied negation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn admitted_block_evidence(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+) -> Option<Vec<MatchEvidence>> {
+    if branch.target != QueryTarget::Blocks {
+        return None;
+    }
+    let lower = canonical_fold(visible);
+    #[cfg(test)]
+    BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    eval_ranked_block_expr(plan, &branch.predicate, visible, &lower).map(|matched| matched.evidence)
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct ScoredBlock<'a> {
     relevance: BlockRelevance,
     index: usize,
@@ -1058,6 +1282,7 @@ struct ScoredBlock<'a> {
     breadcrumb: Vec<String>,
 }
 
+#[cfg(test)]
 impl ScoredBlock<'_> {
     fn is_better_than(&self, other: &Self) -> bool {
         let quality = self.relevance.cmp_quality(&other.relevance);
@@ -1068,6 +1293,7 @@ impl ScoredBlock<'_> {
     }
 }
 
+#[cfg(test)]
 impl PartialEq for ScoredBlock<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.relevance.cmp_quality(&other.relevance) == Ordering::Equal
@@ -1075,12 +1301,15 @@ impl PartialEq for ScoredBlock<'_> {
                 == (other.page.rel_path.as_str(), other.index)
     }
 }
+#[cfg(test)]
 impl Eq for ScoredBlock<'_> {}
+#[cfg(test)]
 impl PartialOrd for ScoredBlock<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+#[cfg(test)]
 impl Ord for ScoredBlock<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Max-heap root is the WORST retained candidate, ready for eviction.
@@ -1091,6 +1320,7 @@ impl Ord for ScoredBlock<'_> {
     }
 }
 
+#[cfg(test)]
 fn push_block<'a>(
     heap: &mut BinaryHeap<ScoredBlock<'a>>,
     limit: usize,
@@ -1357,56 +1587,161 @@ fn page_base_score(
     }
 }
 
+/// Text-only rank for one page name or alias. This is deliberately one level
+/// below a page hit: the caller still groups the physical page name and its
+/// aliases, chooses exactly one winning text for that owner, and supplies the
+/// physical path/reference-name tie key after ranking owners globally.
+///
+/// Owner-local choice and global page rank are different comparisons. An
+/// admitted text equal to `page_exact` carries `exact_override`; that bit wins
+/// the owner-local choice even when name and alias both expose the same public
+/// Exact/1500 rank. It is not part of [`Self::global_order_key`], because the
+/// existing [`ScoredPage`] comparator globally orders only match class then the
+/// length-adjusted score. Equal ordinary aliases therefore remain stable when
+/// the caller replaces only on [`Self::is_better_owner_choice_than`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PageTextRank {
+    base_score: i32,
+    match_class: ObjectiveMatchClass,
+    exact_override: bool,
+}
+
+/// Width of [`PageTextRank::global_order_key`]: signed match-class rank followed
+/// by signed length-adjusted score, both in the existing comparator's order.
+const PAGE_RANK_KEY_LEN: usize = 4 + 4;
+/// Width of [`PageTextRank::owner_order_key`]: exact-override bit, match class,
+/// then the unadjusted score used while choosing one text for an owner.
+const PAGE_OWNER_RANK_KEY_LEN: usize = 1 + 4 + 4;
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PageTextRank {
+    pub(crate) fn base_score(&self) -> i32 {
+        self.base_score
+    }
+
+    pub(crate) fn match_class(&self) -> ObjectiveMatchClass {
+        self.match_class
+    }
+
+    pub(crate) fn is_exact_override(&self) -> bool {
+        self.exact_override
+    }
+
+    /// Strict owner-local comparison. Callers iterate the physical page name
+    /// first and aliases in source order, replacing only when this returns
+    /// true; that preserves the name on ordinary equal ties and the first alias
+    /// on equal alias ties while still honoring an exact alias override.
+    pub(crate) fn is_better_owner_choice_than(&self, other: &Self) -> bool {
+        self.exact_override > other.exact_override
+            || (self.exact_override == other.exact_override
+                && (self.match_class.rank() > other.match_class.rank()
+                    || (self.match_class == other.match_class
+                        && self.base_score > other.base_score)))
+    }
+
+    /// Lossless owner-local page-text key. Ascending byte order is best first,
+    /// including the private exact override that is deliberately absent from
+    /// the global page comparator. Candidate source order remains the final tie
+    /// breaker, preserving name-first and first-alias behavior.
+    pub(crate) fn owner_order_key(&self) -> [u8; PAGE_OWNER_RANK_KEY_LEN] {
+        let mut key = [0u8; PAGE_OWNER_RANK_KEY_LEN];
+        key[0] = u8::from(!self.exact_override);
+        key[1..5].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        key[5..9].copy_from_slice(&descending_i32_key(self.base_score));
+        key
+    }
+
+    /// Existing final score for a physical page/reference name. This uses the
+    /// physical name's UTF-8 byte length even when the winning text is an alias,
+    /// exactly as [`execute_page_candidates`] has always done.
+    pub(crate) fn global_score(&self, physical_page_name: &str) -> i32 {
+        self.base_score - physical_page_name.len() as i32
+    }
+
+    /// Lossless global page-rank key. Ascending byte order is best first and is
+    /// exactly the first two terms of [`ScoredPage`] ordering. The owner-local
+    /// exact bit and the consumer-owned path/reference-name tie key are omitted
+    /// deliberately; neither is a global rank term.
+    pub(crate) fn global_order_key(&self, physical_page_name: &str) -> [u8; PAGE_RANK_KEY_LEN] {
+        let mut key = [0u8; PAGE_RANK_KEY_LEN];
+        key[0..4].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        key[4..8].copy_from_slice(&descending_i32_key(self.global_score(physical_page_name)));
+        key
+    }
+}
+
+fn rank_page_text_expr(plan: &QueryPlan, expr: &QueryExpr, text: &str) -> Option<PageTextRank> {
+    let folded = canonical_fold(text);
+    let (mut base_score, mut match_class) = page_base_score(plan, expr, text, &folded)?;
+    let exact_override = plan.page_exact.as_deref() == Some(folded.as_str());
+    if exact_override {
+        base_score = 1500;
+        match_class = ObjectiveMatchClass::Exact;
+    }
+    Some(PageTextRank {
+        base_score,
+        match_class,
+        exact_override,
+    })
+}
+
+/// Rank one exact page-name or alias text under a page branch without building
+/// spans, page inventory objects, graph state or result DTOs. Regex predicates
+/// use the plan's already-compiled regex map through [`page_base_score`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_page_text(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    text: &str,
+) -> Option<PageTextRank> {
+    if branch.target != QueryTarget::Pages {
+        return None;
+    }
+    rank_page_text_expr(plan, &branch.predicate, text)
+}
+
+/// Produce the existing page-name evidence only after a text has been admitted.
+/// The caller passes the exact winning name/alias text, so evidence retains the
+/// original spelling and UTF-16 relationship exposed by current page hits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn admitted_page_evidence(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    text: &str,
+) -> Option<Vec<MatchEvidence>> {
+    if branch.target != QueryTarget::Pages {
+        return None;
+    }
+    eval_expr(plan, &branch.predicate, TextField::PageName, text).map(|matched| matched.evidence)
+}
+
 fn best_page_match(
     plan: &QueryPlan,
     expr: &QueryExpr,
     page_name: &str,
     aliases: &[String],
 ) -> Option<(i32, ObjectiveMatchClass, String, Option<String>)> {
-    let page_match = page_base_score(plan, expr, page_name, &canonical_fold(page_name));
-    let mut best = page_match.map(|(score, class)| (score, class, page_name.to_string(), None));
+    let page_match = rank_page_text_expr(plan, expr, page_name);
+    let mut best = page_match.map(|rank| (rank, page_name.to_string(), None));
     for alias in aliases {
-        let Some((score, class)) = page_base_score(plan, expr, alias, &canonical_fold(alias))
-        else {
+        let Some(rank) = rank_page_text_expr(plan, expr, alias) else {
             continue;
         };
-        let replace = best.as_ref().is_none_or(|(best_score, best_class, _, _)| {
-            class.rank() > best_class.rank() || (class == *best_class && score > *best_score)
-        });
+        let replace = best
+            .as_ref()
+            .is_none_or(|(current, _, _)| rank.is_better_owner_choice_than(current));
         if replace {
-            best = Some((score, class, alias.clone(), Some(alias.clone())));
+            best = Some((rank, alias.clone(), Some(alias.clone())));
         }
     }
-    // Upgrade only an outcome that already satisfied the parsed expression.
-    // This repairs the objective class for ordinary multi-word titles without
-    // bypassing NOT/OR/regex membership semantics for syntax-looking names.
-    if let Some(exact) = plan.page_exact.as_deref() {
-        if page_match.is_some() && canonical_fold(page_name) == exact {
-            return Some((
-                1500,
-                ObjectiveMatchClass::Exact,
-                page_name.to_string(),
-                None,
-            ));
-        }
-        if let Some(alias) = aliases.iter().find(|alias| {
-            canonical_fold(alias) == exact
-                && page_base_score(plan, expr, alias, &canonical_fold(alias)).is_some()
-        }) {
-            return Some((
-                1500,
-                ObjectiveMatchClass::Exact,
-                alias.clone(),
-                Some(alias.clone()),
-            ));
-        }
-    }
-    best
+    best.map(|(rank, text, alias)| (rank.base_score, rank.match_class, text, alias))
 }
 
-fn execute_pages(
+#[cfg(test)]
+fn execute_pages<G: QueryGraph>(
     plan: &QueryPlan,
-    graph: &Graph,
+    graph: &G,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
@@ -1524,14 +1859,8 @@ fn execute_page_candidates(
                     PageCandidate::File(index) => file_pages[index].clone(),
                     PageCandidate::Referenced(page) => page,
                 };
-                let evidence = eval_expr(
-                    plan,
-                    &branch.predicate,
-                    TextField::PageName,
-                    &winner.matched_text,
-                )
-                .map(|matched| matched.evidence)
-                .unwrap_or_default();
+                let evidence =
+                    admitted_page_evidence(plan, branch, &winner.matched_text).unwrap_or_default();
                 QueryHit::Page {
                     display_text: winner.matched_text,
                     page,
@@ -1539,6 +1868,8 @@ fn execute_page_candidates(
                     score: winner.score,
                     match_class: winner.match_class,
                     matched_alias: winner.matched_alias,
+                    // The walk oracle answers no Display-enabled request.
+                    row: None,
                 }
             })
             .collect(),
@@ -1547,9 +1878,7 @@ fn execute_page_candidates(
 }
 
 /// Execute the established literal page autocomplete/quick-switch semantics
-/// over an explicitly supplied exact-frontier candidate set. Managed storage
-/// uses this to share ranking with Direct Files without constructing a parsed
-/// `Graph` cache.
+/// over an explicitly supplied candidate set.
 pub(crate) fn legacy_page_search_entries(
     file_pages: Vec<PageEntry>,
     aliases: Vec<(String, String, String)>,
@@ -1566,6 +1895,7 @@ pub(crate) fn legacy_page_search_entries(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -1585,23 +1915,19 @@ fn walk_blocks<'a>(
     true
 }
 
-/// The one block-branch evaluator, shared by Direct Files and managed storage.
+/// The block-branch evaluator.
 ///
-/// `pages` yields borrowed `(inventory entry, converted roots)` pairs, which is
-/// the only thing the two storage modes genuinely disagree about: Direct
-/// borrows from `Graph::with_pages`'s cached `Arc<Document>`, managed from the
-/// converted tree its projection cache retains. Everything the two paths used
-/// to disagree about by accident -- when evidence is evaluated, when the result
-/// DTO is built, what is cloned per candidate -- lives here now and therefore
-/// cannot drift again.
+/// `pages` yields borrowed `(inventory entry, converted roots)` pairs from
+/// `Graph::with_pages`'s cached `Arc<Document>`.
 ///
 /// Evidence and the result DTO are produced once per WINNER, after the heap is
-/// drained. Doing it per retained candidate inside the walk (which the managed
-/// twin used to do) is O(retained) parses and DTOs where this is O(limit).
+/// drained. Doing it per retained candidate inside the walk is O(retained)
+/// parses and DTOs where this is O(limit).
 ///
 /// Generic, not `dyn`: monomorphization keeps each caller's walk exactly the
 /// code it would have written by hand -- no per-block allocation, no indirect
 /// call inside the block walk.
+#[cfg(test)]
 fn execute_block_candidates<'a, I>(
     plan: &QueryPlan,
     pages: I,
@@ -1693,7 +2019,7 @@ where
                 // Search hits are result identities, not independent copies
                 // of their entire descendant trees. The source page owns the
                 // hierarchy and live consumers hydrate it once per page.
-                let mut dto = crate::model::block_to_shallow_dto(winner.block);
+                let mut dto = crate::vocab::block_to_shallow_dto(winner.block);
                 dto.breadcrumb = winner.breadcrumb;
                 QueryHit::Block {
                     page: winner.page.name.clone(),
@@ -1711,18 +2037,16 @@ where
     ))
 }
 
-fn execute_blocks(
+#[cfg(test)]
+fn execute_blocks<G: QueryGraph>(
     plan: &QueryPlan,
-    graph: &Graph,
+    graph: &G,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
     if branch.limit == 0 {
         return Some((Vec::new(), false));
     }
-    let candidate_pages = branch
-        .fuzzy_visible_content_needle()
-        .and_then(|needle| graph.direct_projection_fuzzy_candidate_pages(needle));
     let execute = |pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)]| {
         execute_block_candidates(
             plan,
@@ -1733,41 +2057,15 @@ fn execute_blocks(
             cancelled,
         )
     };
-    match candidate_pages.as_deref() {
-        Some(pages) => execute(pages),
-        None => graph.with_pages(execute),
-    }
-}
-
-fn execute_application_blocks(
-    plan: &QueryPlan,
-    pages: &[ApplicationQueryPlanPage],
-    branch: &QueryBranch,
-    cancelled: &impl Fn() -> bool,
-) -> Option<(Vec<QueryHit>, bool)> {
-    if branch.limit == 0 {
-        return Some((Vec::new(), false));
-    }
-    // Managed candidate narrowing for a fuzzy predicate happens at the CALLER,
-    // which owns the materialized index and decides whether the accepted
-    // frontier is the whole story; by the time pages reach here they are
-    // already the narrowed set. See `SyncRuntimeActor::application_query_plan_ready`.
-    execute_block_candidates(
-        plan,
-        pages
-            .iter()
-            .map(|source| (&source.entry, source.roots.as_slice())),
-        branch,
-        cancelled,
-    )
+    graph.with_pages(execute)
 }
 
 /// Convert typed block hits back to the exact grouped shape used by existing
 /// search/query consumers. Hits arrive in global relevance order; only contiguous
 /// hits from the same page are coalesced, so flattening the groups preserves that
 /// order even when a page appears in more than one group.
-pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::model::RefGroup> {
-    let mut groups: Vec<crate::model::RefGroup> = Vec::new();
+pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::vocab::RefGroup> {
+    let mut groups: Vec<crate::vocab::RefGroup> = Vec::new();
     for hit in hits {
         let QueryHit::Block {
             page, kind, block, ..
@@ -1781,7 +2079,7 @@ pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::model::Ref
                 continue;
             }
         }
-        groups.push(crate::model::RefGroup {
+        groups.push(crate::vocab::RefGroup {
             page,
             kind,
             blocks: vec![block],
@@ -1848,18 +2146,11 @@ mod tests {
         (dir, graph)
     }
 
-    /// The shared block evaluator, driven on both storage modes over literally
-    /// the same content: identical results, and evidence plus result DTOs
-    /// produced once per WINNER rather than once per retained candidate.
-    ///
-    /// The evaluation count is the point. The managed twin used to call
-    /// `eval_ranked_block_expr` and build a `BlockDto` inside the walk for
-    /// every candidate the heap retained, so a `limit`-bounded search over a
-    /// large page set did O(retained) work where Direct did O(limit). Asserting
-    /// the count is what turns "they share an evaluator now" from a comment
-    /// into a test.
+    /// The block evaluator produces evidence and result DTOs once per WINNER
+    /// rather than once per retained candidate, so a `limit`-bounded search
+    /// over a large page set does O(limit) evidence work, not O(retained).
     #[test]
-    fn application_block_evaluator_matches_direct_and_evaluates_evidence_per_winner() {
+    fn block_evaluator_evaluates_evidence_once_per_winner() {
         const PAGES: usize = 5;
         const BLOCKS: usize = 20;
         let nonce = SystemTime::now()
@@ -1889,45 +2180,19 @@ mod tests {
         }
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let entries = graph.list_pages();
-        let pages = graph.with_pages(|pages| {
-            pages
-                .iter()
-                .map(|(entry, doc)| ApplicationQueryPlanPage {
-                    entry: entry.clone(),
-                    // Cloning a `DocBlock` resets its memoized projection, so
-                    // the managed side genuinely starts cold here rather than
-                    // borrowing Direct's warm cache.
-                    roots: std::sync::Arc::new(doc.roots.clone()),
-                })
-                .collect::<Vec<_>>()
-        });
         let matching = PAGES * BLOCKS * 2;
         for limit in [1_usize, 3, 7, 50, 1_000] {
             let plan = QueryPlan::block_search("needle", limit);
             let _ = take_block_evidence_evaluations();
-            let direct = plan.execute(&graph, || false);
-            let direct_evaluations = take_block_evidence_evaluations();
-            let managed = plan.execute_application_with_explain(
-                entries.clone(),
-                &pages,
-                Vec::new(),
-                Vec::new(),
-                || false,
-                true,
-            );
-            let managed_evaluations = take_block_evidence_evaluations();
+            let execution = plan.execute(&graph, || false);
+            let evaluations = take_block_evidence_evaluations();
             assert_eq!(
-                serde_json::to_value(&managed).unwrap(),
-                serde_json::to_value(&direct).unwrap(),
-                "managed block evaluation diverged from Direct Files at limit={limit}"
+                execution.hits.len(),
+                limit.min(matching),
+                "block search returns limit.min(matching) hits at limit={limit}"
             );
             assert_eq!(
-                direct_evaluations, managed_evaluations,
-                "the two modes must do the same amount of evidence work at limit={limit}"
-            );
-            assert_eq!(
-                managed_evaluations,
+                evaluations,
                 limit.min(matching),
                 "evidence and DTOs must be produced once per winner, not once per retained candidate, at limit={limit}"
             );
@@ -1947,7 +2212,11 @@ mod tests {
             .collect()
     }
 
-    fn reference_literal_search(graph: &Graph, query: &str, limit: usize) -> Vec<(String, String)> {
+    fn reference_literal_search<G: QueryGraph>(
+        graph: &G,
+        query: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
         if limit == 0 || query.is_empty() {
             return Vec::new();
         }
@@ -2017,15 +2286,21 @@ mod tests {
     fn graph_search_reports_per_category_truncation() {
         let (dir, graph) = fixture();
 
-        let page_truncated = graph.run_graph_search("opdf", 2, 1, false);
+        let page_truncated = crate::query_plan::QueryPlan::friendly("opdf", 2, 1)
+            .execute_with_explain(&graph, || false, false);
         assert!(page_truncated.has_more.pages);
         assert!(!page_truncated.has_more.blocks);
 
-        let block_truncated = graph.run_graph_search("foo", 10, 1, false);
+        let block_truncated = crate::query_plan::QueryPlan::friendly("foo", 10, 1)
+            .execute_with_explain(&graph, || false, false);
         assert!(!block_truncated.has_more.pages);
         assert!(block_truncated.has_more.blocks);
 
-        let complete = graph.run_graph_search("foo", 10, 10, false);
+        let complete = crate::query_plan::QueryPlan::friendly("foo", 10, 10).execute_with_explain(
+            &graph,
+            || false,
+            false,
+        );
         assert!(!complete.has_more.pages);
         assert!(!complete.has_more.blocks);
 
@@ -2255,8 +2530,8 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
 
-        let alias_hits = graph
-            .run_graph_search("bar", 10, 0, false)
+        let alias_hits = crate::query_plan::QueryPlan::friendly("bar", 10, 0)
+            .execute_with_explain(&graph, || false, false)
             .hits
             .into_iter()
             .filter_map(|hit| match hit {
@@ -2280,8 +2555,8 @@ mod tests {
             "a duplicate-named sibling must not inherit another file's alias"
         );
 
-        let unique_hits = graph
-            .run_graph_search("quux", 10, 0, false)
+        let unique_hits = crate::query_plan::QueryPlan::friendly("quux", 10, 0)
+            .execute_with_explain(&graph, || false, false)
             .hits
             .into_iter()
             .filter_map(|hit| match hit {
@@ -2347,19 +2622,20 @@ mod tests {
         graph.warm_cache();
 
         for query in ["book", "BOOK", "Book", "reading"] {
-            let page_hits: Vec<(String, String, Option<String>)> = graph
-                .run_graph_search(query, 100, 0, false)
-                .hits
-                .into_iter()
-                .filter_map(|hit| match hit {
-                    QueryHit::Page {
-                        page,
-                        matched_alias,
-                        ..
-                    } => Some((page.name, page.rel_path, matched_alias)),
-                    QueryHit::Block { .. } => None,
-                })
-                .collect();
+            let page_hits: Vec<(String, String, Option<String>)> =
+                crate::query_plan::QueryPlan::friendly(query, 100, 0)
+                    .execute_with_explain(&graph, || false, false)
+                    .hits
+                    .into_iter()
+                    .filter_map(|hit| match hit {
+                        QueryHit::Page {
+                            page,
+                            matched_alias,
+                            ..
+                        } => Some((page.name, page.rel_path, matched_alias)),
+                        QueryHit::Block { .. } => None,
+                    })
+                    .collect();
             // The exact invariant: an alias's folded text must never be a
             // path-less (referenced/virtual) page candidate. Unrelated
             // referenced pages (e.g. "Book Shelf") MAY appear — they are real.
@@ -2389,8 +2665,8 @@ mod tests {
                 );
             }
             // A genuinely unrelated referenced page is NOT affected.
-            let shelf: Vec<String> = graph
-                .run_graph_search("Book Shelf", 100, 0, false)
+            let shelf: Vec<String> = crate::query_plan::QueryPlan::friendly("Book Shelf", 100, 0)
+                .execute_with_explain(&graph, || false, false)
                 .hits
                 .into_iter()
                 .filter_map(|hit| match hit {
@@ -2512,7 +2788,8 @@ mod tests {
         });
         assert_eq!(virtual_hit.unwrap().rel_path, "");
 
-        let execution = graph.run_graph_search("foo -draft OR ready", 10, 10, true);
+        let execution = crate::query_plan::QueryPlan::friendly("foo -draft OR ready", 10, 10)
+            .execute_with_explain(&graph, || false, true);
         let blocks = execution
             .hits
             .iter()
@@ -2541,7 +2818,8 @@ mod tests {
         assert!(!explanation.contains("PageName"));
         assert!(!explanation.contains("VisibleContent"));
 
-        let no_explain = graph.run_graph_search("foo", 10, 10, false);
+        let no_explain = crate::query_plan::QueryPlan::friendly("foo", 10, 10)
+            .execute_with_explain(&graph, || false, false);
         assert!(no_explain.explanation.branches.is_empty());
         crate::test_support::remove_dir_all(dir);
     }
@@ -2613,7 +2891,8 @@ mod tests {
     #[test]
     fn regex_evidence_is_authoritative_and_bounded_to_projected_text() {
         let (dir, graph) = fixture();
-        let execution = graph.run_graph_search("/[A-Z]{3}/", 10, 10, true);
+        let execution = crate::query_plan::QueryPlan::friendly("/[A-Z]{3}/", 10, 10)
+            .execute_with_explain(&graph, || false, true);
         let (text, evidence) = execution
             .hits
             .iter()
@@ -2645,7 +2924,12 @@ mod tests {
             "/[A-Z]{3}/",
             "/(unclosed/",
         ] {
-            let full = block_fingerprint(crate::query::search(&graph, query, usize::MAX));
+            let full = block_fingerprint(crate::query::search_cancellable(
+                &graph,
+                query,
+                usize::MAX,
+                || false,
+            ));
             let mut full_membership = full.clone();
             full_membership.sort();
             let mut reference = reference_literal_search(&graph, query, usize::MAX);
@@ -2653,7 +2937,12 @@ mod tests {
             assert_eq!(full_membership, reference, "query={query:?}");
             for limit in [0, 1, 2, 20] {
                 assert_eq!(
-                    block_fingerprint(crate::query::search(&graph, query, limit)),
+                    block_fingerprint(crate::query::search_cancellable(
+                        &graph,
+                        query,
+                        limit,
+                        || false
+                    )),
                     full.iter().take(limit).cloned().collect::<Vec<_>>(),
                     "query={query:?} limit={limit}"
                 );
@@ -2683,6 +2972,9 @@ mod tests {
             score: 1_000,
             match_class: ObjectiveMatchClass::Prefix,
             matched_alias: None,
+            // Additive and absent: the wire shape of a hit that carries no
+            // hydrated row is EXACTLY the shape it had before this field.
+            row: None,
         };
 
         assert_eq!(
@@ -2719,5 +3011,847 @@ mod tests {
         assert!(execution.cancelled);
         assert!(execution.hits.is_empty());
         crate::test_support::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Page text rank bridge: owner-local name/alias choice stays distinct
+    // from the global page ordering consumed by SQLite.
+    // -----------------------------------------------------------------
+
+    fn page_branch(plan: &QueryPlan) -> Option<&QueryBranch> {
+        plan.branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Pages)
+    }
+
+    fn bridge_page_choice<'a>(
+        plan: &QueryPlan,
+        branch: &QueryBranch,
+        name: &'a str,
+        aliases: &'a [&'a str],
+    ) -> Option<(PageTextRank, &'a str, Option<&'a str>)> {
+        let mut best = rank_page_text(plan, branch, name).map(|rank| (rank, name, None));
+        for &alias in aliases {
+            let Some(rank) = rank_page_text(plan, branch, alias) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(current, _, _)| rank.is_better_owner_choice_than(current))
+            {
+                best = Some((rank, alias, Some(alias)));
+            }
+        }
+        best
+    }
+
+    // Independent pre-extraction owner-selection oracle from a6f49357. This
+    // deliberately does not call PageTextRank or its owner comparator.
+    fn legacy_page_choice(
+        plan: &QueryPlan,
+        expr: &QueryExpr,
+        page_name: &str,
+        aliases: &[String],
+    ) -> Option<(i32, ObjectiveMatchClass, String, Option<String>)> {
+        let page_match = page_base_score(plan, expr, page_name, &canonical_fold(page_name));
+        let mut best = page_match.map(|(score, class)| (score, class, page_name.to_string(), None));
+        for alias in aliases {
+            let Some((score, class)) = page_base_score(plan, expr, alias, &canonical_fold(alias))
+            else {
+                continue;
+            };
+            let replace = best.as_ref().is_none_or(|(best_score, best_class, _, _)| {
+                class.rank() > best_class.rank() || (class == *best_class && score > *best_score)
+            });
+            if replace {
+                best = Some((score, class, alias.clone(), Some(alias.clone())));
+            }
+        }
+        // Upgrade only an outcome that already satisfied the parsed expression.
+        // This repairs the objective class for ordinary multi-word titles without
+        // bypassing NOT/OR/regex membership semantics for syntax-looking names.
+        if let Some(exact) = plan.page_exact.as_deref() {
+            if page_match.is_some() && canonical_fold(page_name) == exact {
+                return Some((
+                    1500,
+                    ObjectiveMatchClass::Exact,
+                    page_name.to_string(),
+                    None,
+                ));
+            }
+            if let Some(alias) = aliases.iter().find(|alias| {
+                canonical_fold(alias) == exact
+                    && page_base_score(plan, expr, alias, &canonical_fold(alias)).is_some()
+            }) {
+                return Some((
+                    1500,
+                    ObjectiveMatchClass::Exact,
+                    alias.clone(),
+                    Some(alias.clone()),
+                ));
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn page_rank_bridge_matches_best_page_match_across_compiled_shapes() {
+        let cases = [
+            (
+                QueryPlan::page_name_fuzzy("opdf", 8),
+                "Opdf Notes",
+                vec!["Research Hub"],
+            ),
+            (
+                QueryPlan::friendly("foo ready", 8, 8),
+                "foo ready notes",
+                vec!["unrelated"],
+            ),
+            (
+                QueryPlan::friendly("zzz OR ready", 8, 8),
+                "ready page",
+                vec!["zzz alias"],
+            ),
+            (
+                QueryPlan::friendly("foo -draft", 8, 8),
+                "foo ready",
+                vec!["foo draft"],
+            ),
+            (
+                QueryPlan::friendly("/A[BC]+/", 8, 8),
+                "regex ABC",
+                vec!["regex ACC"],
+            ),
+            (
+                QueryPlan::friendly("foo -draft", 8, 8),
+                "foo -draft",
+                vec![],
+            ),
+        ];
+        for (plan, name, aliases) in &cases {
+            let branch = page_branch(plan).expect("the case must plan a page branch");
+            let owned_aliases = aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect::<Vec<_>>();
+            let expected = legacy_page_choice(plan, &branch.predicate, name, &owned_aliases);
+            let actual = bridge_page_choice(plan, branch, name, aliases);
+            assert_eq!(actual.is_some(), expected.is_some(), "name={name:?}");
+            if let (
+                Some((rank, text, alias)),
+                Some((score, class, expected_text, expected_alias)),
+            ) = (actual, expected)
+            {
+                assert_eq!((rank.base_score(), rank.match_class()), (score, class));
+                assert_eq!(text, expected_text);
+                assert_eq!(alias.map(str::to_string), expected_alias);
+            }
+        }
+
+        assert!(QueryPlan::friendly("", 8, 8).branches.is_empty());
+        assert!(QueryPlan::friendly("/(unclosed/", 8, 8).branches.is_empty());
+    }
+
+    #[test]
+    fn page_rank_bridge_owner_choice_keeps_exact_override_and_stable_equal_ties_separate() {
+        let override_plan = QueryPlan::friendly("foo OR bar", 8, 8);
+        let override_branch = page_branch(&override_plan).unwrap();
+        let name = rank_page_text(&override_plan, override_branch, "foo").unwrap();
+        let alias = rank_page_text(&override_plan, override_branch, "foo OR bar").unwrap();
+        assert_eq!(
+            (name.base_score(), name.match_class()),
+            (1500, ObjectiveMatchClass::Exact)
+        );
+        assert_eq!(
+            (alias.base_score(), alias.match_class()),
+            (1500, ObjectiveMatchClass::Exact)
+        );
+        assert!(!name.is_exact_override());
+        assert!(alias.is_exact_override());
+        assert!(alias.is_better_owner_choice_than(&name));
+        assert_eq!(
+            alias.global_order_key("Owner"),
+            name.global_order_key("Owner")
+        );
+        let selected =
+            bridge_page_choice(&override_plan, override_branch, "foo", &["foo OR bar"]).unwrap();
+        assert_eq!((selected.1, selected.2), ("foo OR bar", Some("foo OR bar")));
+
+        let equal_plan = QueryPlan::page_name_fuzzy("foo", 8);
+        let equal_branch = page_branch(&equal_plan).unwrap();
+        let name_wins =
+            bridge_page_choice(&equal_plan, equal_branch, "foo name", &["foo alias"]).unwrap();
+        assert_eq!((name_wins.1, name_wins.2), ("foo name", None));
+        let first_alias_wins = bridge_page_choice(
+            &equal_plan,
+            equal_branch,
+            "unrelated",
+            &["foo first", "foo later"],
+        )
+        .unwrap();
+        assert_eq!(
+            (first_alias_wins.1, first_alias_wins.2),
+            ("foo first", Some("foo first"))
+        );
+    }
+
+    #[test]
+    fn page_owner_rank_blob_matches_the_existing_strict_comparator() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let ranks = [false, true].into_iter().flat_map(|exact_override| {
+            classes.into_iter().flat_map(move |match_class| {
+                [i32::MIN, -1, 0, 1, i32::MAX]
+                    .into_iter()
+                    .map(move |base_score| PageTextRank {
+                        base_score,
+                        match_class,
+                        exact_override,
+                    })
+            })
+        });
+        let ranks = ranks.collect::<Vec<_>>();
+        for left in &ranks {
+            for right in &ranks {
+                assert_eq!(
+                    left.owner_order_key() < right.owner_order_key(),
+                    left.is_better_owner_choice_than(right)
+                );
+                assert_eq!(
+                    left.owner_order_key() == right.owner_order_key(),
+                    !left.is_better_owner_choice_than(right)
+                        && !right.is_better_owner_choice_than(left)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_rank_bridge_blob_matches_scored_page_class_then_signed_score_order() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let scores = [i32::MIN, -1, 0, 1, i32::MAX];
+        let ranks = classes
+            .into_iter()
+            .flat_map(|match_class| {
+                scores.into_iter().map(move |base_score| PageTextRank {
+                    base_score,
+                    match_class,
+                    exact_override: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        for left in &ranks {
+            for right in &ranks {
+                let left_page = ScoredPage {
+                    score: left.base_score,
+                    match_class: left.match_class,
+                    matched_text: String::new(),
+                    matched_alias: None,
+                    tie_key: String::new(),
+                    candidate: PageCandidate::Referenced(PageEntry {
+                        name: String::new(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: PathBuf::new(),
+                    }),
+                };
+                let right_page = ScoredPage {
+                    score: right.base_score,
+                    match_class: right.match_class,
+                    matched_text: String::new(),
+                    matched_alias: None,
+                    tie_key: String::new(),
+                    candidate: PageCandidate::Referenced(PageEntry {
+                        name: String::new(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: PathBuf::new(),
+                    }),
+                };
+                assert_eq!(
+                    left.global_order_key("").cmp(&right.global_order_key("")),
+                    right
+                        .match_class
+                        .rank()
+                        .cmp(&left.match_class.rank())
+                        .then_with(|| right.base_score.cmp(&left.base_score))
+                );
+                assert_eq!(
+                    left.global_order_key("") < right.global_order_key(""),
+                    left_page.is_better_than(&right_page)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_rank_bridge_rank_only_builds_no_evidence_and_admitted_evidence_is_utf16_exact() {
+        let plan = QueryPlan::page_name_fuzzy("caf\u{e9}", 8);
+        let branch = page_branch(&plan).unwrap();
+        let text = "\u{1D11E} CAFE\u{301}";
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(0));
+        let rank = rank_page_text(&plan, branch, text).expect("canonical fold must match");
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Substring);
+        TEXT_EVIDENCE_EVALUATIONS
+            .with(|count| assert_eq!(count.get(), 0, "page rank selection must produce no spans"));
+        let evidence = admitted_page_evidence(&plan, branch, text).unwrap();
+        TEXT_EVIDENCE_EVALUATIONS
+            .with(|count| assert!(count.get() > 0, "the actual span producer must be observed"));
+        assert_eq!(evidence[0].spans, vec![MatchSpan { start: 3, end: 8 }]);
+        assert_eq!(evidence[0].field, TextField::PageName);
+
+        let block = plan
+            .branches
+            .iter()
+            .find(|candidate| candidate.target == QueryTarget::Blocks);
+        assert!(block.is_none(), "page-only plan has no block branch");
+        let mixed = QueryPlan::friendly("caf\u{e9}", 8, 8);
+        let block = mixed
+            .branches
+            .iter()
+            .find(|candidate| candidate.target == QueryTarget::Blocks)
+            .unwrap();
+        assert!(rank_page_text(&mixed, block, text).is_none());
+        assert!(admitted_page_evidence(&mixed, block, text).is_none());
+    }
+
+    #[test]
+    fn page_rank_bridge_handles_zero_limits_actual_alias_hits_and_virtual_names() {
+        let zero = QueryPlan::friendly("opdf", 0, 0);
+        let zero_branch = page_branch(&zero).unwrap();
+        assert!(rank_page_text(&zero, zero_branch, "Opdf Notes").is_some());
+
+        let (dir, graph) = fixture();
+        let plan = QueryPlan::friendly("Research Hub", 10, 0);
+        let branch = page_branch(&plan).unwrap();
+        let alias_rank = rank_page_text(&plan, branch, "research hub").unwrap();
+        let alias_hit = plan
+            .execute(&graph, || false)
+            .hits
+            .into_iter()
+            .find_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    display_text,
+                    score,
+                    match_class,
+                    matched_alias,
+                    ..
+                } if page.name == "Opdf Notes" => {
+                    Some((page, display_text, score, match_class, matched_alias))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(alias_hit.1, "research hub");
+        assert_eq!(alias_hit.2, alias_rank.global_score(&alias_hit.0.name));
+        assert_eq!(alias_hit.3, alias_rank.match_class());
+        assert_eq!(alias_hit.4.as_deref(), Some("research hub"));
+
+        let virtual_plan = QueryPlan::friendly("Virtual Opdf", 10, 0);
+        let virtual_branch = page_branch(&virtual_plan).unwrap();
+        let virtual_rank = rank_page_text(&virtual_plan, virtual_branch, "Virtual Opdf").unwrap();
+        let virtual_hit = virtual_plan
+            .execute(&graph, || false)
+            .hits
+            .into_iter()
+            .find_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    score,
+                    match_class,
+                    ..
+                } if page.name == "Virtual Opdf" => Some((page, score, match_class)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(virtual_hit.0.rel_path.is_empty());
+        assert_eq!(
+            virtual_hit.1,
+            virtual_rank.global_score(&virtual_hit.0.name)
+        );
+        assert_eq!(virtual_hit.2, virtual_rank.match_class());
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Block text rank bridge: the text-only seam a SQLite adapter binds
+    // its ORDER BY to. Ranking authority stays here; the adapter only
+    // sorts the bytes and supplies the equal-rank tie breakers.
+    // -----------------------------------------------------------------
+
+    fn relevance(
+        match_class: ObjectiveMatchClass,
+        word_boundary: bool,
+        first_offset: usize,
+        text_len: usize,
+        occurrences: usize,
+    ) -> BlockRelevance {
+        BlockRelevance {
+            match_class,
+            word_boundary,
+            first_offset,
+            text_len,
+            occurrences,
+            positive: true,
+        }
+    }
+
+    fn block_branch(plan: &QueryPlan) -> Option<&QueryBranch> {
+        plan.branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Blocks)
+    }
+
+    /// Read the five components back out of the key, proving the encoding is
+    /// lossless rather than a hash of the tuple.
+    fn decode_rank_key(key: &[u8; BLOCK_RANK_KEY_LEN]) -> (i32, bool, usize, usize, usize) {
+        let class_rank =
+            ((!u32::from_be_bytes(key[0..4].try_into().unwrap())) ^ (1u32 << 31)) as i32;
+        let number = |at: usize| {
+            usize::try_from(u64::from_be_bytes(key[at..at + 8].try_into().unwrap())).unwrap()
+        };
+        (class_rank, key[4] == 0, number(5), number(13), number(21))
+    }
+
+    /// Fail-before gate. `score()` saturates offsets, lengths and occurrence
+    /// counts, so two objectively UNEQUAL tuples collide on it; ordering by the
+    /// display score would make their order arbitrary. The BLOB key must still
+    /// separate them, in the direction `cmp_quality` chose.
+    #[test]
+    fn rank_blob_separates_large_tuples_whose_display_score_collides() {
+        let collisions = [
+            // Both offsets are past the 50_000 penalty clamp.
+            (
+                relevance(ObjectiveMatchClass::Exact, true, 60_000, 0, 1),
+                relevance(ObjectiveMatchClass::Exact, true, 70_000, 0, 1),
+            ),
+            // Both lengths are past the 40_000 clamp.
+            (
+                relevance(ObjectiveMatchClass::Substring, false, 7, 40_001, 3),
+                relevance(ObjectiveMatchClass::Substring, false, 7, 900_000, 3),
+            ),
+            // Both occurrence counts are past the 9_999 clamp, and the existing
+            // rule that FEWER occurrences win is preserved.
+            (
+                relevance(ObjectiveMatchClass::Prefix, true, 0, 10, 10_001),
+                relevance(ObjectiveMatchClass::Prefix, true, 0, 10, 25_000),
+            ),
+            // The extreme: every component of the worse tuple is `usize::MAX`
+            // and every one of them still collapses into the same clamp.
+            (
+                relevance(ObjectiveMatchClass::Fuzzy, true, 50_001, 40_001, 10_000),
+                relevance(
+                    ObjectiveMatchClass::Fuzzy,
+                    true,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
+            ),
+        ];
+        for (better, worse) in collisions {
+            assert_eq!(
+                better.score(),
+                worse.score(),
+                "the display score must actually collide for this gate to mean anything"
+            );
+            assert_eq!(better.cmp_quality(&worse), Ordering::Greater);
+            assert!(
+                better.order_key() < worse.order_key(),
+                "ascending BLOB order must still put the better tuple first"
+            );
+        }
+
+        // Sorting by the key alone, with no access to the tuple, recovers the
+        // order `cmp_quality` intended.
+        for (better, worse) in collisions {
+            let mut keys = [worse.order_key(), better.order_key()];
+            keys.sort();
+            assert_eq!(keys, [better.order_key(), worse.order_key()]);
+        }
+    }
+
+    /// The BLOB order is EXACTLY `cmp_quality` reversed at every component
+    /// boundary -- both saturation cliffs and `usize::MAX` -- in both
+    /// directions and on equality.
+    #[test]
+    fn rank_blob_order_is_cmp_quality_reversed_at_every_component_boundary() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let offsets = [0usize, 1, 50_000, 50_001, usize::MAX];
+        let lengths = [0usize, 1, 40_000, 40_001, usize::MAX];
+        let counts = [0usize, 1, 2, 9_999, 10_000, usize::MAX];
+        let mut tuples = Vec::new();
+        for class in classes {
+            for word_boundary in [false, true] {
+                for &first_offset in &offsets {
+                    for &text_len in &lengths {
+                        for &occurrences in &counts {
+                            tuples.push(relevance(
+                                class,
+                                word_boundary,
+                                first_offset,
+                                text_len,
+                                occurrences,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(tuples.len(), 5 * 2 * 5 * 5 * 6);
+        let keys = tuples
+            .iter()
+            .map(BlockRelevance::order_key)
+            .collect::<Vec<_>>();
+        for (left_at, left) in tuples.iter().enumerate() {
+            for (right_at, right) in tuples.iter().enumerate() {
+                assert_eq!(
+                    keys[left_at].cmp(&keys[right_at]),
+                    right.cmp_quality(left),
+                    "ascending key order must be cmp_quality reversed for {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    /// The key carries every component losslessly, and carries nothing else:
+    /// `positive` is a membership detail, not a `cmp_quality` component.
+    #[test]
+    fn rank_blob_is_lossless_and_ignores_the_non_ordering_positive_flag() {
+        let sample = relevance(ObjectiveMatchClass::Substring, true, 12_345, usize::MAX, 7);
+        let key = sample.order_key();
+        assert_eq!(key.len(), 29);
+        assert_eq!(
+            decode_rank_key(&key),
+            (
+                ObjectiveMatchClass::Substring.rank(),
+                true,
+                12_345,
+                usize::MAX,
+                7
+            )
+        );
+
+        let unbounded = relevance(ObjectiveMatchClass::Substring, false, 12_345, usize::MAX, 7);
+        assert_eq!(unbounded.order_key()[4], 1);
+        assert!(key < unbounded.order_key(), "a boundary match sorts first");
+
+        let mut negated = sample;
+        negated.positive = false;
+        assert_eq!(negated.order_key(), key);
+        assert_eq!(negated.cmp_quality(&sample), Ordering::Equal);
+    }
+
+    /// The point of a BLOB key is that the DATABASE does the sort. This binds
+    /// real bridge keys and lets SQLite's own `ORDER BY ... ASC` produce the
+    /// order, then checks it against the independent `cmp_quality`.
+    #[test]
+    fn sqlite_order_by_bound_rank_blobs_reproduces_the_ranked_order() {
+        let plan = QueryPlan::friendly("ready", 8, 8);
+        let branch = block_branch(&plan).expect("a bare term plans a block branch");
+        let texts = [
+            "ready",
+            "ready only",
+            "not ready yet",
+            "alreadyx",
+            "ready ready ready",
+            "a rather long line that only mentions ready quite late in its text",
+        ];
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE ranked (label TEXT NOT NULL, rank_key BLOB NOT NULL)",
+                [],
+            )
+            .unwrap();
+        for text in texts {
+            let rank = rank_block_text(&plan, branch, text)
+                .unwrap_or_else(|| panic!("{text:?} must match"));
+            connection
+                .execute(
+                    "INSERT INTO ranked (label, rank_key) VALUES (?1, ?2)",
+                    rusqlite::params![text, rank.order_key().to_vec()],
+                )
+                .unwrap();
+        }
+        let mut statement = connection
+            .prepare("SELECT label FROM ranked ORDER BY rank_key ASC")
+            .unwrap();
+        let ordered = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let reference = |text: &str| {
+            block_relevance(&plan, &branch.predicate, text, &canonical_fold(text)).unwrap()
+        };
+        let mut expected = texts.to_vec();
+        expected.sort_by(|left, right| reference(right).cmp_quality(&reference(left)));
+        assert_eq!(ordered, expected);
+        // Pin the ends so an accidentally uniform key cannot pass vacuously.
+        assert_eq!(ordered.first().map(String::as_str), Some("ready"));
+        assert_eq!(ordered.last().map(String::as_str), Some("alreadyx"));
+    }
+
+    /// Every compiled predicate shape, driven through the bridge on text alone
+    /// and through the existing evaluator on the same text.
+    #[test]
+    fn rank_bridge_reproduces_block_relevance_for_every_compiled_shape() {
+        let texts = [
+            "ready",
+            "🧠 foo ready",
+            "foo draft",
+            "ready only",
+            "regex ABC",
+            "abc ready foo abc",
+            "unrelated",
+            "",
+        ];
+        let plans = [
+            QueryPlan::friendly("ready", 8, 8),         // literal contains
+            QueryPlan::friendly("\"foo ready\"", 8, 8), // phrase
+            QueryPlan::friendly("/A[BC]+/", 8, 8),      // compiled regex
+            QueryPlan::friendly("foo ready", 8, 8),     // AND
+            QueryPlan::friendly("zzz OR ready", 8, 8),  // OR
+            QueryPlan::friendly("foo -draft", 8, 8),    // AND with NOT
+            QueryPlan::block_search("ready", 8),        // block-only plan
+            QueryPlan::block_search_literal("rdy", 8),  // fuzzy subsequence
+        ];
+        for plan in &plans {
+            let branch = block_branch(plan).expect("every plan here has a block branch");
+            for text in texts {
+                let expected =
+                    block_relevance(plan, &branch.predicate, text, &canonical_fold(text));
+                let actual = rank_block_text(plan, branch, text);
+                assert_eq!(
+                    actual.is_some(),
+                    expected.is_some(),
+                    "membership must not change for {text:?}"
+                );
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert_eq!(actual.order_key(), expected.order_key());
+                    assert_eq!(actual.score(), expected.score());
+                    assert_eq!(actual.match_class(), expected.match_class);
+                }
+            }
+        }
+    }
+
+    /// The stronger check: the bridge, holding nothing but visible text, agrees
+    /// with what real graph-backed execution ranked those very blocks at --
+    /// including that its own `canonical_fold` reproduces the projection's
+    /// cached `visible_lower`.
+    #[test]
+    fn rank_bridge_agrees_with_executed_block_hits_over_real_projected_text() {
+        let (dir, graph) = fixture();
+        for query in [
+            "ready",
+            "foo ready",
+            "zzz OR ready",
+            "foo -draft",
+            "/A[BC]+/",
+            "\"foo ready\"",
+        ] {
+            let plan = QueryPlan::friendly(query, 10, 10);
+            let branch = block_branch(&plan).expect("every query here plans a block branch");
+            let hits = plan
+                .execute(&graph, || false)
+                .hits
+                .into_iter()
+                .filter_map(|hit| match hit {
+                    QueryHit::Block {
+                        display_text,
+                        score,
+                        match_class,
+                        ..
+                    } => Some((display_text, score, match_class)),
+                    QueryHit::Page { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(!hits.is_empty(), "{query} matched no block");
+            let mut previous: Option<[u8; BLOCK_RANK_KEY_LEN]> = None;
+            for (display_text, score, match_class) in hits {
+                let rank = rank_block_text(&plan, branch, &display_text)
+                    .unwrap_or_else(|| panic!("{query}: bridge rejected executed hit"));
+                assert_eq!(rank.score(), score, "{query}: {display_text:?}");
+                assert_eq!(rank.match_class(), match_class, "{query}: {display_text:?}");
+                let key = rank.order_key();
+                if let Some(previous) = previous {
+                    assert!(
+                        previous <= key,
+                        "{query}: executed order must be non-decreasing in the BLOB key"
+                    );
+                }
+                previous = Some(key);
+            }
+        }
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    /// Casefold + NFC + UTF-16 offsets, computed from visible text alone. The
+    /// leading musical symbol is two UTF-16 units but one scalar, so a
+    /// char-counting encoder would report offset 2 rather than 3.
+    #[test]
+    fn rank_bridge_folds_unicode_and_counts_utf16_units() {
+        // Decomposed "CAFE" + combining acute; the parsed needle is precomposed.
+        let text = "\u{1D11E} CAFE\u{301} note";
+        let plan = QueryPlan::friendly("caf\u{e9}", 8, 8);
+        let branch = block_branch(&plan).expect("a bare term plans a block branch");
+        let rank = rank_block_text(&plan, branch, text)
+            .expect("casefold + NFC must admit the decomposed block text");
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Substring);
+        assert_eq!(
+            decode_rank_key(&rank.order_key()),
+            (ObjectiveMatchClass::Substring.rank(), true, 3, 13, 1)
+        );
+        assert_eq!(
+            text.chars().count(),
+            12,
+            "UTF-16 length is not the char count"
+        );
+
+        // The precomposed spelling folds to the same needle position and class;
+        // only `text_len` differs, because UTF-16 length is measured on the
+        // ORIGINAL visible text, exactly as the existing evaluator measures it.
+        let precomposed = "\u{1D11E} CAF\u{c9} note";
+        let composed_rank = rank_block_text(&plan, branch, precomposed)
+            .expect("the precomposed spelling matches the same needle");
+        assert_eq!(
+            decode_rank_key(&composed_rank.order_key()),
+            (ObjectiveMatchClass::Substring.rank(), true, 3, 12, 1)
+        );
+        assert!(
+            composed_rank.order_key() < rank.order_key(),
+            "the shorter original text is the better tuple"
+        );
+        assert!(rank_block_text(&plan, branch, "\u{1D11E} cafe note").is_none());
+    }
+
+    /// Selection is rank-only: it constructs no match evidence. The optional
+    /// accessor reproduces the existing evaluator's spans exactly, including
+    /// its BEST-branch OR choice, which is not the membership evaluator's
+    /// first-branch choice.
+    #[test]
+    fn rank_only_selection_builds_no_evidence_while_the_accessor_reproduces_it() {
+        let plan = QueryPlan::friendly("zzz OR ready", 8, 8);
+        let branch = block_branch(&plan).expect("an OR query plans a block branch");
+        let text = "ready and zzz";
+
+        let _ = take_block_evidence_evaluations();
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(0));
+        let rank = rank_block_text(&plan, branch, text).expect("both OR arms match");
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| {
+            assert_eq!(count.get(), 0, "selection must not construct text evidence");
+        });
+        assert_eq!(
+            take_block_evidence_evaluations(),
+            0,
+            "rank-only selection must not run the evidence evaluator"
+        );
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Prefix);
+
+        let evidence =
+            admitted_block_evidence(&plan, branch, text).expect("the admitted row has a reason");
+        assert_eq!(take_block_evidence_evaluations(), 1);
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| {
+            assert!(
+                count.get() > 0,
+                "the evidence counter must observe the matcher"
+            );
+        });
+        let reference =
+            eval_ranked_block_expr(&plan, &branch.predicate, text, &canonical_fold(text)).unwrap();
+        assert_eq!(evidence, reference.evidence);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].spans, vec![MatchSpan { start: 0, end: 5 }]);
+        assert_eq!(evidence[0].mode, TextMatchMode::Contains);
+
+        // Best branch, not first branch.
+        let first_branch = eval_expr(&plan, &branch.predicate, TextField::VisibleContent, text)
+            .expect("membership evaluator also admits");
+        assert_ne!(evidence[0].clause_id, first_branch.evidence[0].clause_id);
+    }
+
+    /// Boolean membership is preserved verbatim, including a satisfied
+    /// negation admitting on the neutral tuple with no evidence at all. Page
+    /// branches are deliberately out of scope: page-name/alias ranking is not
+    /// covered by these five block components.
+    #[test]
+    fn rank_bridge_preserves_neutral_negation_and_stays_out_of_page_ranking() {
+        let plan = QueryPlan::friendly("draft", 8, 8);
+        let source = block_branch(&plan).expect("a bare term plans a block branch");
+        let negated = QueryBranch {
+            target: QueryTarget::Blocks,
+            predicate: QueryExpr::Not(Box::new(source.predicate.clone())),
+            limit: source.limit,
+        };
+        let rank = rank_block_text(&plan, &negated, "ship it").expect("a satisfied NOT admits");
+        assert_eq!(
+            decode_rank_key(&rank.order_key()),
+            (ObjectiveMatchClass::Exact.rank(), true, 0, 0, 0)
+        );
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Exact);
+        assert_eq!(
+            admitted_block_evidence(&plan, &negated, "ship it"),
+            Some(Vec::new()),
+            "a successful negation contributes no positive evidence"
+        );
+        assert!(rank_block_text(&plan, &negated, "draft one").is_none());
+
+        let pages = plan
+            .branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Pages)
+            .expect("friendly plans a page branch");
+        assert!(rank_block_text(&plan, pages, "draft").is_none());
+        assert!(admitted_block_evidence(&plan, pages, "draft").is_none());
+    }
+
+    /// There is no second regex grammar and no literal fallback behind the
+    /// bridge: a clause the plan never compiled matches nothing, and an
+    /// unparseable regex never reaches a branch at all.
+    #[test]
+    fn rank_bridge_has_no_fallback_for_an_uncompiled_regex_clause() {
+        assert!(QueryPlan::friendly("/(unclosed/", 8, 8).branches.is_empty());
+        let plan = QueryPlan::friendly("/A[BC]+/", 8, 8);
+        let branch = block_branch(&plan).expect("a valid regex plans a block branch");
+        assert!(rank_block_text(&plan, branch, "regex ABC").is_some());
+
+        let pred = match &branch.predicate {
+            QueryExpr::Text(pred) => pred.clone(),
+            other => panic!("a single regex term compiles to one text clause, got {other:?}"),
+        };
+        let uncompiled = QueryBranch {
+            target: QueryTarget::Blocks,
+            predicate: QueryExpr::Text(TextPredicate {
+                clause_id: pred.clause_id.wrapping_add(1_000),
+                ..pred
+            }),
+            limit: branch.limit,
+        };
+        assert!(rank_block_text(&plan, &uncompiled, "regex ABC").is_none());
+        assert!(admitted_block_evidence(&plan, &uncompiled, "regex ABC").is_none());
     }
 }

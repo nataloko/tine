@@ -1,22 +1,29 @@
-// Native Linux semantic journey for GH #240 selection-owned heading and drag.
+// Native semantic journey for GH #240 selection-owned heading and drag. It runs
+// on Linux (wry + tauri-driver) and on Windows (WebView2 + msedgedriver attach
+// mode); see scripts/e2e-capabilities.mjs for why Windows must attach rather
+// than let EdgeDriver launch the app.
 // It intentionally observes content, active block selection, root order, and
 // durable reload only; coordinate values come from live rows and are not an
 // oracle. Run with the staged binary explicitly, for example:
 // TINE_APP=/path/to/tine TINE_CANDIDATE_COMMIT=$(git rev-parse HEAD) node scripts/e2e-selection-actions.mjs
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { remote, Key } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   freeLoopbackPort,
+  startWebdriverApplication,
+  stopWebdriverApplication,
   tauriCapabilities,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 
 const CANDIDATE_COMMIT = process.env.TINE_CANDIDATE_COMMIT;
 if (!CANDIDATE_COMMIT || !/^[0-9a-f]{40}$/.test(CANDIDATE_COMMIT)) {
@@ -31,8 +38,12 @@ await ensureDisplay();
 
 const RUN_ID = `${process.pid}-${Date.now()}`;
 // Native Linux test runners can advertise a read-only Node tmpdir. `/tmp` is
-// the controlled writable parent; every child remains uniquely GH240-named.
-const TMP = path.join("/tmp", `tine-gh240-selection-action-ownership-e2e-${RUN_ID}`);
+// the controlled writable parent there; every child remains uniquely
+// GH240-named. Windows has no `/tmp`, so it uses the real temp directory.
+const TMP = path.join(
+  process.platform === "win32" ? os.tmpdir() : "/tmp",
+  `tine-gh240-selection-action-ownership-e2e-${RUN_ID}`,
+);
 const GRAPH = path.join(TMP, "graph");
 const XDG = path.join(TMP, "xdg");
 const ARTIFACTS = path.join(TMP, "artifacts");
@@ -68,19 +79,65 @@ const env = {
   XDG_DATA_HOME: path.join(XDG, "data"),
   XDG_CONFIG_HOME: path.join(XDG, "config"),
   XDG_CACHE_HOME: path.join(XDG, "cache"),
+  // Windows reads app state from APPDATA/LOCALAPPDATA, not XDG_*. Without these
+  // the journey would run against the runner's own profile instead of its
+  // private GH240 state, and the relaunch step would prove nothing.
+  APPDATA: path.join(TMP, "appdata"),
+  LOCALAPPDATA: path.join(TMP, "localappdata"),
   WEBKIT_DISABLE_DMABUF_RENDERER: "1",
   WEBKIT_DISABLE_COMPOSITING_MODE: "1",
   LIBGL_ALWAYS_SOFTWARE: "1",
   GDK_BACKEND: "x11",
 };
 
+if (process.platform === "win32" && process.env.CI === "true") {
+  spawnSync("taskkill", ["/IM", path.basename(APP), "/T", "/F"], { stdio: "ignore" });
+}
+
 const driverLogPath = path.join(ARTIFACTS, "tauri-driver.log");
 const driverLog = fs.openSync(driverLogPath, "w");
-const driver = spawn(
-  process.env.TAURI_DRIVER || "tauri-driver",
-  webdriverServerArgs(DRIVER, NATIVE, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"),
-  { env, stdio: ["ignore", driverLog, driverLog], detached: process.platform !== "win32" },
+const DRIVER_BIN = process.env.TAURI_DRIVER || "tauri-driver";
+const DRIVER_ARGS = webdriverServerArgs(
+  DRIVER,
+  NATIVE,
+  process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
 );
+
+// On Linux the wry driver launches the app per WebDriver session, so a session
+// IS the app process. On Windows the app must be started first with a fixed
+// remote-debugging port and attached to, because EdgeDriver's launch-mode
+// DevToolsActivePort handshake is unreliable on hosted runners (see
+// scripts/e2e-capabilities.mjs). That also means `deleteSession` alone does not
+// restart the app there, so the relaunch step drives the tree explicitly.
+let webviewTarget = await startWebdriverApplication(APP, env, NATIVE, "initial");
+let driver = spawn(DRIVER_BIN, DRIVER_ARGS, {
+  env: webviewTarget.env,
+  stdio: ["ignore", driverLog, driverLog],
+  detached: process.platform !== "win32",
+});
+// msedgedriver does not bind its port instantly, and webdriverio treats the
+// resulting ECONNREFUSED as a dead server rather than retrying it: run
+// 33960379224 gave up 4.5s in. The restart path below already waits; the
+// initial spawn must too. Same constant as scripts/e2e-page-properties.mjs.
+await sleep(2500);
+
+function killDriverTree() {
+  try {
+    if (process.platform === "win32") driver.kill("SIGKILL");
+    else process.kill(-driver.pid, "SIGKILL");
+  } catch {}
+  stopWebdriverApplication(webviewTarget);
+}
+
+async function startDriverTree(session) {
+  webviewTarget = await startWebdriverApplication(APP, env, NATIVE, session);
+  driver = spawn(DRIVER_BIN, DRIVER_ARGS, {
+    env: webviewTarget.env,
+    stdio: ["ignore", driverLog, driverLog],
+    detached: process.platform !== "win32",
+  });
+  await sleep(2500);
+}
 
 let browser;
 let step = "start driver";
@@ -161,7 +218,7 @@ async function assertNoWebviewErrors(label) {
   assert(errors.length === 0, `uncaught webview errors at ${label}`, errors);
 }
 
-async function openSession() {
+async function openSession(session = "initial") {
   browser = await remote({
     hostname: "127.0.0.1",
     port: DRIVER,
@@ -169,39 +226,18 @@ async function openSession() {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: tauriCapabilities(APP),
+    capabilities: tauriCapabilities(APP, session, process.platform, webviewTarget.debuggerAddress),
   });
   await browser.$(".page-title, .ls-block").waitForExist({ timeout: 20_000 });
   await installWebviewErrorCapture();
 }
 
 async function openPage(name) {
-  await browser.waitUntil(async () => {
-    const refs = await browser.$$(".page-ref");
-    for (const ref of refs) {
-      const text = (await ref.getText()).trim();
-      if (text === name || text === `[[${name}]]`) return true;
-    }
-    return false;
-  }, {
-    timeout: 15_000,
-    timeoutMsg: `journal did not render a normal page link for ${name}`,
-  });
-  const refs = await browser.$$(".page-ref");
-  let pageRef;
-  for (const ref of refs) {
-    const text = (await ref.getText()).trim();
-    if (text === name || text === `[[${name}]]`) {
-      pageRef = ref;
-      break;
-    }
-  }
-  assert(pageRef, `rendered journal link for ${name} disappeared before click`, []);
-  await pageRef.click();
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-    timeout: 10_000,
-    timeoutMsg: `rendered journal link did not route to ${name}`,
-  });
+  // The shared link route already tolerates `[[ ]]` decoration and re-finds the
+  // link on each attempt, so a rendered journal link replaced between discovery
+  // and click can no longer strand this journey. See
+  // scripts/lib/e2e-navigation.mjs.
+  await openPageByLink(browser, name, { timeout: 15_000 });
   await waitForRoots((rows) => rows.length === 5, "routed page roots did not load");
 }
 
@@ -325,8 +361,10 @@ async function relaunchAndAssert() {
   phase("end session and relaunch exact artifact", "the same graph/XDG/artifact routes back to the named page with durable A,D,E,B,C");
   await browser.deleteSession();
   browser = undefined;
+  killDriverTree();
   await sleep(900);
-  await openSession();
+  await startDriverTree("relaunch");
+  await openSession("relaunch");
   await openPage(PAGE);
   await waitForRoots((rows) => rows.map((row) => row.label).join(",") === EXPECTED_ORDER.join(","), "relaunch did not render persisted A,D,E,B,C order");
   await assertNoWebviewErrors("post-relaunch");
@@ -381,11 +419,7 @@ try {
   process.exitCode = 1;
 } finally {
   try { await browser?.deleteSession(); } catch {}
-  if (process.platform === "win32") {
-    try { driver.kill("SIGKILL"); } catch {}
-  } else {
-    try { process.kill(-driver.pid, "SIGKILL"); } catch {}
-  }
+  killDriverTree();
   try { fs.closeSync(driverLog); } catch {}
   stopDisplay();
   if (!failure) fs.rmSync(TMP, { recursive: true, force: true });

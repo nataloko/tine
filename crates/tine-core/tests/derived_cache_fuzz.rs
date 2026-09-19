@@ -10,6 +10,9 @@
 use std::sync::Arc;
 use tine_core::{BlockDto, Graph, PageKind, RefGroup};
 
+#[path = "support/ready_query.rs"]
+mod ready_query;
+
 // --- deterministic PRNG (xorshift64) so a failure reproduces from its seed ----
 struct Rng(u64);
 impl Rng {
@@ -96,6 +99,14 @@ fn gen_pre(r: &mut Rng, page_idx: usize) -> Option<String> {
 // Order-sensitive fingerprint (page order + within-page block order both matter,
 // e.g. for sorted queries). uuid-free: compares block first-lines, since the two
 // graphs assign generated uuids independently.
+/// Both graphs answer `{{query}}` through the real dispatched route. The LIVE
+/// graph's projection and memo stayed warm across every edit; the FRESH graph
+/// opened cold and built its projection from scratch, so a memoized answer an
+/// edit should have invalidated disagrees with it. Until K2 the fresh side ran
+/// the walk oracle, which the product no longer contains; walk-vs-SQL parity is
+/// gated inside the crate by
+/// `the_database_result_equals_the_walk_on_every_shape_and_bound`. Backlinks and
+/// unlinked references stay on the memoized reference readers on both sides.
 fn fingerprint(g: &Graph) -> String {
     let fmt = |label: String, groups: Arc<Vec<RefGroup>>| {
         let body = groups
@@ -123,7 +134,7 @@ fn fingerprint(g: &Graph) -> String {
         ));
     }
     for q in QUERIES {
-        out.push(fmt(format!("q:{q}"), g.run_query(q)));
+        out.push(fmt(format!("q:{q}"), ready_query::run_query(g, q)));
     }
     out.join("\n")
 }
@@ -156,9 +167,11 @@ fn run_seed(seed: u64) {
         std::fs::write(root.join("pages").join(format!("{p}.md")), s).unwrap();
     }
 
-    // The LIVE graph keeps its cache warm across every edit.
+    // The LIVE graph keeps its cache warm across every edit, and answers
+    // queries through the attached projection exactly as the app does.
     let live = Graph::open(&root);
-    live.warm_cache();
+    ready_query::attach_projection(&live, &root);
+    let scratch = format!("dcfuzz-{seed}");
 
     for iter in 0..200 {
         // Apply one random CONTENT edit to a random page through the real save path.
@@ -185,8 +198,10 @@ fn run_seed(seed: u64) {
         live.save_page(&dto, dto.rev.as_deref()).expect("save");
 
         // Oracle: warm live cache must equal a cold fresh graph on the same files.
+        // The fresh graph gets its own projection, rebuilt from the files: one
+        // scratch database per seed, recreated for every iteration.
         let fresh = Graph::open(&root);
-        fresh.warm_cache();
+        ready_query::attach_scratch_projection(&fresh, &scratch);
         let live_fp = fingerprint(&live);
         let fresh_fp = fingerprint(&fresh);
         if live_fp != fresh_fp {
@@ -200,12 +215,18 @@ fn run_seed(seed: u64) {
             panic!("seed {seed} iter {iter}: warm cache diverged from fresh after editing {name}{diff}");
         }
     }
+    ready_query::remove_scratch_projection(&scratch);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn derived_cache_matches_fresh_under_random_edits() {
-    for seed in [1u64, 2, 3, 4, 5, 0xC0FFEE, 0xDEADBEEF] {
-        run_seed(seed);
-    }
+    // The seeds share nothing (own graph directory, own scratch database), so
+    // they run side by side: rebuilding the fresh side's projection on every
+    // iteration is most of this test's time.
+    std::thread::scope(|scope| {
+        for seed in [1u64, 2, 3, 4, 5, 0xC0FFEE, 0xDEADBEEF] {
+            scope.spawn(move || run_seed(seed));
+        }
+    });
 }

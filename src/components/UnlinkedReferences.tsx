@@ -8,10 +8,11 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
 import type { RefGroup } from "../types";
 import {
-  classifyReferenceLoadError,
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
+import { createReferenceFetcher, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -21,6 +22,7 @@ import {
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
+import { readOr } from "../resourceRead";
 
 
 type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
@@ -60,18 +62,19 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
     setOpenSignal(sectionOverride("unlinked", page) ?? false);
     setCollapsedGroupsSignal(collapsedGroupsFor("unlinked", page));
   });
-  const [groups] = createResource(
+  const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
+  const fetchReferences = createReferenceFetcher({
+    currentName: () => props.name,
+    setLoadError,
+    setIndexPending,
+  });
+  const [groupsResource] = createResource(
     () => props.name,
-    async (n) => {
-      setLoadError(null);
-      try {
-        return await backend().getUnlinkedRefs(n);
-      } catch (error) {
-        setLoadError(classifyReferenceLoadError(error));
-        return [];
-      }
-    }
+    (n) => fetchReferences(n, () => backend().getUnlinkedRefs(n))
   );
+  // `createReferenceFetcher` already routes a failure to `loadError` (rendered
+  // below), so this covers the read itself rather than replacing that channel.
+  const groups = () => readOr(groupsResource, undefined, "unlinked references");
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   const count = () => mergedGroups().reduce((a, g) => a + g.blocks.length, 0);
   const groupKey = (group: RefGroup) => pageIdentityKey(group.page);
@@ -106,7 +109,9 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
         <Show when={groups()}>
           <span class="references-count">{count()}</span>
         </Show>
-        <Show when={groups.loading}><span class="references-loading"> Loading…</span></Show>
+        <Show when={groupsResource.loading}>
+          <span class="references-loading"> {referenceIndexPendingMessage(indexPending()) ?? "Loading…"}</span>
+        </Show>
         <button
           type="button"
           class="reference-export-toggle"

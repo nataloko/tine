@@ -46,8 +46,9 @@ import {
 } from "../ui";
 import {
   dropObservation,
+  graphBinding,
   flushPageToQuiescence,
-  holdManagedMovePages,
+  holdPageSaves,
   isDirty,
   isSaving,
   reobserve,
@@ -60,6 +61,7 @@ import {
   pageToDto,
   pageInstanceGeneration,
   reloadPage,
+  loadRoutedPage,
 } from "../store";
 import {
   DiffRowView,
@@ -69,6 +71,7 @@ import {
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
+import { readOr } from "../resourceRead";
 
 function errorDetail(error: unknown): string {
   // Tauri rejects a `Result<T, String>` with the bare string; keep its text.
@@ -111,7 +114,7 @@ function sideLabels(conflict: ConflictObject): {
 }
 
 /** The in-page conflict resolver for the page currently being viewed. */
-export function PageConflictResolution(props: { conflict: ConflictObject }): JSX.Element {
+export function PageConflictResolution(props: { conflict: ConflictObject; unavailable?: boolean; onResolved?: () => void }): JSX.Element {
   const conflict = () => props.conflict;
   // These survive removal of the surrounding `<Show>`. Cleanup runs precisely
   // while that owner is being disposed, when reading `props.conflict` again is
@@ -290,12 +293,22 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     }
   );
 
+  // EVERY read of the diff resource goes through here. Reading an errored Solid
+  // resource THROWS (solid.js `read()`), and Tine registers no ErrorBoundary
+  // anywhere, so that throw reaches `runUpdates`' catch — which nulls the
+  // pending Effects queue before rehandling it. The discarded queue includes the
+  // effect that would swap this panel's own fallback text off "Reading both
+  // versions…", and every other DOM effect batched with it, so one unreadable
+  // conflict froze the panel AND blanked the page body (GH #490). A failure is
+  // an absent diff here; the fallback below says what happened.
+  const diffValue = (): SyncConflictDiff | null => readOr(diff, null, "conflict diff") ?? null;
+
   // Every fresh alignment restarts from the suggested resolution (and the
   // no-loss choice where there is no suggestion). Row decisions belong to ONE
   // exact pair of texts, so they are never carried across a refetch.
   let alignment: string | undefined;
   createEffect(() => {
-    const current = diff();
+    const current = diffValue();
     if (!current) return;
     const next = `${current.base_rev}\0${current.conflict_rev}`;
     if (alignment !== next) {
@@ -306,10 +319,10 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     alignment = next;
   });
 
-  const pending = createMemo(() => collectRows(diff()?.rows ?? []));
+  const pending = createMemo(() => collectRows(diffValue()?.rows ?? []));
   const countSuggestions = (rows: DiffRow[]): number =>
     rows.reduce((n, r) => n + (r.suggestion ? 1 : 0) + countSuggestions(r.children), 0);
-  const suggestedCount = createMemo(() => countSuggestions(diff()?.rows ?? []));
+  const suggestedCount = createMemo(() => countSuggestions(diffValue()?.rows ?? []));
 
   const setDecision = (id: string, d: MergeDecision) => setDecisions((m) => ({ ...m, [id]: d }));
   const setAll = (d: MergeDecision) => {
@@ -318,7 +331,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     setDecisions(next);
   };
   const applyAllSuggested = () => {
-    const current = diff();
+    const current = diffValue();
     if (!current) return;
     // The sweep re-applies Tine's OWN suggestions. A merge tool's proposed
     // text (an artifact-source merged row) keeps whatever the user set —
@@ -340,7 +353,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   };
 
   const apply = async () => {
-    const current = diff();
+    const current = diffValue();
     if (!current || diff.loading || busy()) return;
     const c = conflict();
     // `c` belongs to the surrounding Solid <Show>. Resolving or refreshing can
@@ -352,6 +365,8 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     const pagePath = c.page_path;
     const sides = [...c.sides];
     const live = c.live;
+    const onResolved = props.onResolved;
+    const binding = graphBinding();
     setBusy(true);
     let releasePageUi = () => {};
     let releasePageSaves = () => {};
@@ -373,8 +388,13 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         const edit = editGeneration(pageName);
         const transaction = editorTransactionGeneration(pageName);
         const reviewedDraft = pageToDto(pageName);
-        if (!reviewedDraft || instance === null) {
+        const detached = props.unavailable && !reviewedDraft && instance === null;
+        if ((!reviewedDraft || instance === null) && !detached) {
           pushToast("This page is no longer open. Open it again before applying the resolution.", "error");
+          return;
+        }
+        if (reviewedDraft && reviewedDraft.path !== live.page.path) {
+          pushToast("Another file with this page name is open. Preserve its edits before resolving this retained draft.", "error");
           return;
         }
         if (
@@ -415,15 +435,15 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           );
           return;
         }
-        if (!live.restored && snapshot(reviewedDraft) !== snapshot(live.page)) {
+        if (!detached && !live.restored && reviewedDraft && snapshot(reviewedDraft) !== snapshot(live.page)) {
           await refreshLiveSaveConflictDraft(reviewedDraft);
           alignment = undefined;
           void refetch();
           pushToast("Your draft changed. Review the updated comparison, then apply it again.", "info");
           return;
         }
-        const draftToResolve = live.restored ? live.page : reviewedDraft;
-        releasePageSaves = holdManagedMovePages([pageName]);
+        const draftToResolve = detached || live.restored ? live.page : reviewedDraft!;
+        releasePageSaves = holdPageSaves([pageName]);
         const authority = capsuleAuthority();
         if (!authority) {
           void refetch();
@@ -436,6 +456,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           decisions(),
           preChoice(),
         );
+        if (!mounted || graphBinding() !== binding) return;
         if (
           pageInstanceGeneration(pageName) !== instance
           || editGeneration(pageName) !== edit
@@ -447,9 +468,13 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         // the capsule before acknowledging or replacing the editor, so a crash
         // immediately after the click cannot resurrect a resolved conflict.
         await retireLiveSaveConflict(pageName);
+        if (graphBinding() !== binding) return;
         dropObservation(pageName);
         clearConflict(pageName);
-        await reloadPage(resolved);
+        if (detached) await loadRoutedPage(resolved, binding);
+        else await reloadPage(resolved);
+        if (graphBinding() !== binding) return;
+        onResolved?.();
         pushToast(`Resolved the live conflict in “${pageName}”`, "success");
       } else if (source === "vcs-markers") {
         await backend().resolveVcsMarkerConflict(
@@ -500,7 +525,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           pushToast("Your latest edit was saved. Review the updated comparison, then apply it again.", "info");
           return;
         }
-        releasePageSaves = holdManagedMovePages([pageName]);
+        releasePageSaves = holdPageSaves([pageName]);
         // A duplicate journal day reaches the same two-file reconciliation
         // through its own guarded command: the guard is what keeps it from
         // being a merge-any-two-pages surface. Everything around it — the
@@ -632,14 +657,16 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         </For>
       </Show>
       <Show
-        when={diff()}
+        when={diffValue()}
         fallback={
           <div class="page-conflict-empty">
             {diff.loading
               ? "Reading both versions…"
-              : conflict().source === "duplicate-journal"
-                ? "These two files can’t be folded together — they’re in different formats. Use the actions above."
-                : "Couldn’t read this conflict."}
+              : diff.error
+                ? `Couldn’t read this conflict. (${errorDetail(diff.error)})`
+                : conflict().source === "duplicate-journal"
+                  ? "These two files can’t be folded together — they’re in different formats. Use the actions above."
+                  : "Couldn’t read this conflict."}
           </div>
         }
       >

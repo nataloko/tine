@@ -1,271 +1,133 @@
-//! Platform durability helpers shared by managed-storage bootstrap paths.
+//! The Direct move-recovery journal's directory barrier.
 //!
-//! Linux can cheaply flush the filesystem containing a complete private tree.
-//! Android exposes the same syscall, but some kernels and ROMs deny that
-//! filesystem-wide operation even though ordinary app-private file and
-//! directory synchronization works. In that case we synchronize the exact
-//! private tree instead of refusing managed-storage activation.
+//! Graph-text publication does not come through here: its barriers are strict
+//! on every platform, Android included (`model::sync_projection_directory`,
+//! `docs/storage-sync-contract.md` §2.10a). The journal's barrier keeps one
+//! Android tolerance: app sandboxes and vendor filesystems can deny directory
+//! fsync even after permitting every exact file sync, and only that capability
+//! refusal is accepted — never a real I/O error, and never on another platform.
 
 use std::fs;
-#[cfg(any(test, not(target_os = "linux")))]
-use std::fs::OpenOptions;
-use std::io;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::io::{self, Write};
 use std::path::Path;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
-pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        return sync_filesystem(path);
-    }
+mod atomic_fs;
 
-    #[cfg(target_os = "android")]
-    {
-        return finish_android_private_tree_sync(path, sync_filesystem(path));
-    }
+pub(crate) use atomic_fs::{
+    atomic_replace_expected, atomic_write_new, barrier_sync_all, move_file_noreplace, sync_dir,
+    AtomicReplaceOutcome, RETIRED_SUFFIX,
+};
+#[cfg(test)]
+pub(crate) use atomic_fs::{atomic_replace_expected_with_hooks, dir_fsync_is_unsupported};
+pub use atomic_fs::{atomic_write, dir_fsync_error_is_unsupported, sync_dir_for_rename};
 
-    #[cfg(not(target_os = "linux"))]
-    sync_private_tree_exact(path)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn sync_filesystem(path: &Path) -> io::Result<()> {
-    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
-    let directory = fs::File::open(path)?;
-    // SAFETY: the opened descriptor names the filesystem containing the
-    // complete private tree. Android may reject this filesystem-wide operation
-    // and then takes the exact-tree path below.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(any(test, target_os = "android"))]
-const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
-    )
-}
-
-/// Flush every dirty byte of the filesystem containing `directory` with one
-/// barrier.
-///
-/// This is the single durability point of a batched publication: after it
-/// returns, every byte written into that filesystem — including files this
-/// process has not individually `fsync`ed — is on stable storage. One syscall
-/// replaces one `fsync` per staged artifact, which is the whole point (the
-/// 2026-08-26 cost-model audit measured ten of those per ordinary edit).
-///
-/// The caller owns the fallback policy: this function reports the platform's
-/// refusal rather than deciding what to do about it, because the right answer
-/// differs between "flush a graph-sized private tree" and "flush the four
-/// files I just staged".
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn sync_filesystem_containing(directory: &Dir) -> io::Result<()> {
-    use std::os::fd::FromRawFd as _;
-
-    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
-    // cap-std may retain an O_PATH capability, which cannot be the subject of
-    // syncfs. Derive one real descriptor through the retained capability.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_fd().as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat returned one newly owned directory descriptor.
-    let opened = unsafe { fs::File::from_raw_fd(fd) };
-    let result = unsafe { libc::syncfs(opened.as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Whether a platform refused a durability primitive as a capability, rather
-/// than reporting a real I/O failure. Android vendor filesystems deny
-/// filesystem-wide flush on app-private storage even where per-file flush
-/// works; every other errno stays fatal.
-#[cfg(any(test, target_os = "android"))]
-pub(crate) fn is_capability_refusal(error: &io::Error) -> bool {
-    android_filesystem_sync_may_fallback(error.kind())
-}
-
-/// Which durability class an artifact belongs to. Platform durability policy is
-/// stated per class and per platform; it is never global and never a blanket
-/// "ignore I/O errors".
-///
-/// The two classes are not symmetric, and the asymmetry is the whole contract:
-///
-/// * [`DurabilityArtifactClass::PrivateDurableAuthority`] — the oplog manifest,
-///   its object archive, the local journal and the receipt store, all below
-///   app-private storage. These *are* the durable truth. A barrier they cannot
-///   provide is a real durability failure and stays fatal on every platform,
-///   Android included.
-/// * [`DurabilityArtifactClass::SharedReconstructibleProjection`] — the
-///   Markdown/Org projection of an already-accepted manifest into the user's
-///   graph tree. On Android that tree is shared storage served by FUSE
-///   (MediaProvider) or sdcardfs, which does not uniformly provide the
-///   filesystem-wide and directory-level flush primitives and reports the
-///   refusal as `EPERM`/`ENOTSUP`/`EINVAL`. Those bytes are derived state: the
-///   accepted manifest in private storage still records them, and a crash that
-///   loses an unflushed directory entry is repaired by the projection drain on
-///   the next open, exactly as an interrupted projection already is. Retrying a
-///   capability refusal cannot ever succeed, so retrying it forever is not
-///   crash-safety — it is an availability bug that strands the user's edit.
-///   On Android only, and only for those three capability errors, the barrier
-///   degrades. Every other errno (a real I/O error, `ENOSPC`, `EIO`) stays
-///   fatal, and every other platform stays strict.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DurabilityArtifactClass {
-    PrivateDurableAuthority,
-    SharedReconstructibleProjection,
-}
-
-/// Apply the per-class, per-platform policy to one durability barrier result.
-///
-/// Only the Android leg can degrade, and only for the reconstructible
-/// projection class. Every other platform returns the result unchanged, so a
-/// desktop or Windows build has no branch that can swallow a barrier failure.
-pub(crate) fn finish_durability_barrier(
-    class: DurabilityArtifactClass,
-    result: io::Result<()>,
+/// Read–modify–write a small text file (config.edn, device settings) under a lock,
+/// committed via [`atomic_write`]. The ONE guarded path every settings writer goes
+/// through, so the discipline is uniform rather than re-derived per call site:
+///   - a MISSING file is the empty document `{}`, but any OTHER read error
+///     (permission, NFS stale handle, transient I/O) ABORTS — otherwise `edit` would
+///     rebuild the whole file from `{}` and destroy every other key (audit H2);
+///   - the `lock` serializes concurrent writers to the same logical file so a
+///     read-modify-write can't clobber a concurrent one (audit M1/M2);
+///   - `edit` returns the new full contents, or an `Err` to abort without writing;
+///   - the commit is atomic (temp + fsync + rename), so a crash can't truncate it.
+pub fn atomic_update(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+    edit: impl Fn(&str) -> io::Result<String>,
 ) -> io::Result<()> {
-    #[cfg(target_os = "android")]
-    {
-        return android_durability_barrier(class, result);
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = class;
-        result
-    }
+    atomic_update_with_hooks(path, lock, edit, |_| {}, |_| {})
 }
 
-/// The exact Android arm of [`finish_durability_barrier`], reachable from host
-/// tests so the branch the device takes is the branch under test.
-#[cfg(any(test, target_os = "android"))]
-pub(crate) fn android_durability_barrier(
-    class: DurabilityArtifactClass,
-    result: io::Result<()>,
+pub(crate) fn atomic_update_with_hooks(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+    edit: impl Fn(&str) -> io::Result<String>,
+    before_recheck: impl Fn(usize),
+    before_publish: impl Fn(usize),
 ) -> io::Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                class,
-                DurabilityArtifactClass::SharedReconstructibleProjection
-            ) && android_filesystem_sync_may_fallback(error.kind()) =>
-        {
-            Ok(())
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for attempt in 0..4 {
+        let baseline = match fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let next = edit(baseline.as_deref().unwrap_or("{}\n"))?;
+        // CONFIG_LOCK serializes Tine writers, but Logseq/Syncthing do not take
+        // it. Re-read immediately before publish and retry the key-local edit on
+        // their new bytes instead of overwriting an external update with our stale
+        // full-file copy.
+        before_recheck(attempt);
+        let current = match fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if current != baseline {
+            continue;
         }
-        Err(error) => Err(error),
+        before_publish(attempt);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match baseline.as_deref() {
+            // Creation is already no-clobber: `create_new` + no-replace rename.
+            None => match atomic_write_new(path, next.as_bytes()) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            },
+            // Update: the recheck above narrows the race but cannot close it -
+            // an external writer can still land between it and the rename. Make
+            // the publish itself conditional so their bytes cannot be lost.
+            Some(current) => {
+                match atomic_replace_expected(path, current.as_bytes(), next.as_bytes())? {
+                    AtomicReplaceOutcome::Published => return Ok(()),
+                    AtomicReplaceOutcome::ExternalChanged => continue,
+                }
+            }
+        }
     }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "config changed repeatedly during update",
+    ))
 }
 
-#[cfg(any(test, target_os = "android"))]
-fn finish_android_private_tree_sync(path: &Path, result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => {
-            sync_private_tree_exact(path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(any(test, not(target_os = "linux")))]
-fn sync_private_tree_exact(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "private durability tree contains a symlink",
-            ));
-        }
-        if metadata.is_dir() {
-            sync_private_tree_exact(&child)?;
-        } else if metadata.is_file() {
-            sync_regular_file(&child)?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "private durability tree contains a non-file entry",
-            ));
-        }
-    }
+/// Make one directory-entry change of the Direct move-recovery journal durable:
+/// a retired record, or an image entry recovery removed. Desktop platforms take
+/// the strict barrier; Android accepts only the documented capability refusal.
+pub(crate) fn sync_move_recovery_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    sync_reconstructible_directory(&directory)
-}
-
-/// Synchronize a directory belonging to a pre-promotion, reconstructible
-/// managed-storage tree. Android app sandboxes and vendor filesystems can deny
-/// directory fsync even after permitting every exact file sync. That platform
-/// limitation must not block activation; ordinary I/O errors remain fatal.
-pub(crate) fn sync_reconstructible_directory(directory: &Dir) -> io::Result<()> {
     crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
-    finish_android_reconstructible_directory_sync(tine_storage::sync_dir_required(directory))
-}
-
-/// Synchronize one already-created directory entry while its contents are
-/// still reconstructible from Direct Files. This is the publication barrier
-/// used immediately before the clean activation marker: Linux/desktop keeps
-/// the strict directory barrier, while Android tolerates only the documented
-/// directory-fsync capability refusal after all exact files were flushed.
-pub(crate) fn sync_reconstructible_directory_path(path: &Path) -> io::Result<()> {
-    let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    sync_reconstructible_directory(&directory)
-}
-
-#[cfg(target_os = "android")]
-fn finish_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn finish_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
+    let result = tine_storage::sync_dir_required(&directory);
+    #[cfg(target_os = "android")]
+    return tolerate_android_capability_refusal(result);
+    #[cfg(not(target_os = "android"))]
     result
 }
 
-#[cfg(test)]
-fn simulate_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
+/// The exact Android arm, reachable from host tests so the branch the device
+/// takes is the branch under test.
+#[cfg(any(test, target_os = "android"))]
+fn tolerate_android_capability_refusal(result: io::Result<()>) -> io::Result<()> {
     match result {
-        Ok(()) => Ok(()),
-        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => Ok(()),
-        Err(error) => Err(error),
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Err(error)
+        }
+        _ => Ok(()),
     }
-}
-
-#[cfg(any(test, not(target_os = "linux")))]
-pub(crate) fn sync_regular_file(path: &Path) -> io::Result<()> {
-    crate::durability_counters::note(crate::durability_counters::Barrier::File);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    // FlushFileBuffers requires a write-capable handle on Windows.
-    #[cfg(windows)]
-    options.write(true);
-    crate::durability_counters::sync_file(&options.open(path)?)
 }
 
 #[cfg(test)]
@@ -273,120 +135,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn android_falls_back_only_when_the_filesystem_wide_primitive_is_unavailable() {
+    fn android_tolerates_only_the_three_capability_refusals() {
         for kind in [
             io::ErrorKind::PermissionDenied,
             io::ErrorKind::Unsupported,
             io::ErrorKind::InvalidInput,
         ] {
-            assert!(android_filesystem_sync_may_fallback(kind));
+            tolerate_android_capability_refusal(Err(io::Error::new(kind, "denied"))).unwrap();
         }
         for kind in [
             io::ErrorKind::NotFound,
             io::ErrorKind::Interrupted,
             io::ErrorKind::InvalidData,
             io::ErrorKind::WriteZero,
-            io::ErrorKind::Other,
-        ] {
-            assert!(!android_filesystem_sync_may_fallback(kind));
-        }
-    }
-
-    #[test]
-    fn android_capability_refusal_flushes_the_exact_private_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "tine-android-private-tree-sync-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(root.join("nested")).unwrap();
-        fs::write(root.join("nested/artifact"), b"durable private state").unwrap();
-
-        finish_android_private_tree_sync(
-            &root,
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "simulated Android syncfs refusal",
-            )),
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read(root.join("nested/artifact")).unwrap(),
-            b"durable private state"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// The artifact-class asymmetry, stated as a test rather than a comment:
-    /// Android degrades the reconstructible projection barrier and NEVER the
-    /// private durable authority, and no platform degrades anything that is not
-    /// one of the three documented capability refusals.
-    #[test]
-    fn only_the_reconstructible_projection_class_degrades_and_only_on_android() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Unsupported,
-            io::ErrorKind::InvalidInput,
-        ] {
-            android_durability_barrier(
-                DurabilityArtifactClass::SharedReconstructibleProjection,
-                Err(io::Error::new(kind, "capability refusal")),
-            )
-            .unwrap();
-
-            // The durable authority keeps the strict barrier on Android too.
-            let error = android_durability_barrier(
-                DurabilityArtifactClass::PrivateDurableAuthority,
-                Err(io::Error::new(kind, "capability refusal")),
-            )
-            .unwrap_err();
-            assert_eq!(error.kind(), kind);
-
-            // And off Android nothing degrades at all.
-            #[cfg(not(target_os = "android"))]
-            {
-                let error = finish_durability_barrier(
-                    DurabilityArtifactClass::SharedReconstructibleProjection,
-                    Err(io::Error::new(kind, "capability refusal")),
-                )
-                .unwrap_err();
-                assert_eq!(error.kind(), kind);
-            }
-        }
-    }
-
-    #[test]
-    fn a_real_io_failure_on_the_projection_stays_fatal_even_on_android() {
-        for kind in [
-            io::ErrorKind::WriteZero,
             io::ErrorKind::StorageFull,
             io::ErrorKind::Other,
-            io::ErrorKind::NotFound,
         ] {
-            let error = android_durability_barrier(
-                DurabilityArtifactClass::SharedReconstructibleProjection,
-                Err(io::Error::new(kind, "real I/O failure")),
-            )
-            .unwrap_err();
+            let error =
+                tolerate_android_capability_refusal(Err(io::Error::new(kind, "real I/O failure")))
+                    .unwrap_err();
             assert_eq!(error.kind(), kind);
         }
-    }
-
-    #[test]
-    fn android_reconstructible_directory_accepts_only_capability_refusals() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Unsupported,
-            io::ErrorKind::InvalidInput,
-        ] {
-            simulate_android_reconstructible_directory_sync(Err(io::Error::new(kind, "denied")))
-                .unwrap();
-        }
-        let error = simulate_android_reconstructible_directory_sync(Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "real I/O failure",
-        )))
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 }

@@ -101,54 +101,6 @@ pub(crate) fn update_settings(
     .map_err(crate::command_error::CommandError::from)
 }
 
-/// Stable installation identity for managed sync. It lives in device-local app
-/// settings, never in the provider-shared graph: two installations writing the
-/// same device stream would violate the one-writer invariant. Loro peer ids are
-/// session-scoped separately; this UUID names the installation directory only.
-pub(crate) fn managed_sync_device_id(
-    app: &tauri::AppHandle,
-) -> Result<uuid::Uuid, crate::command_error::CommandError> {
-    let path = settings_path(app)
-        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
-    managed_sync_device_id_at(&path)
-}
-
-fn managed_sync_device_id_at(
-    path: &std::path::Path,
-) -> Result<uuid::Uuid, crate::command_error::CommandError> {
-    let chosen = std::sync::Mutex::new(None);
-    update_settings_strict_at(path, |json| {
-        let id = match json.get("managed_sync_device_id") {
-            None => uuid::Uuid::new_v4(),
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| {
-                    crate::command_error::CommandError::prose(
-                        "managed_sync_device_id must be a UUID string",
-                    )
-                })
-                .and_then(|value| {
-                    uuid::Uuid::parse_str(value).map_err(|_| {
-                        crate::command_error::CommandError::prose(
-                            "managed_sync_device_id is not a valid UUID",
-                        )
-                    })
-                })?,
-        };
-        json["managed_sync_device_id"] = serde_json::Value::String(id.to_string());
-        *chosen.lock().unwrap() = Some(id);
-        Ok(())
-    })?;
-    chosen
-        .into_inner()
-        .map_err(|_| {
-            crate::command_error::CommandError::prose("managed sync device-id lock poisoned")
-        })?
-        .ok_or_else(|| {
-            crate::command_error::CommandError::prose("managed sync device id was not written")
-        })
-}
-
 fn graph_display_name(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -288,17 +240,6 @@ pub(crate) fn reveal_known_graph(
             "showing a graph folder is available on desktop only",
         ))
     }
-}
-
-pub(crate) fn last_graph_path(app: &tauri::AppHandle) -> Option<String> {
-    settings_path(app)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|json| {
-            json.get("last_graph_path")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
 }
 
 /// Quick-capture Enter behaviour (app-level, in tine-settings.json): true → a
@@ -471,6 +412,100 @@ fn workspaces_path(app: &tauri::AppHandle, root: &std::path::Path) -> Option<Pat
         .app_data_dir()
         .ok()
         .map(|d| d.join("sessions").join(format!("{stem}-workspaces.json")))
+}
+
+/// `sessions/<graph key>-notices.json` — the device-local, graph-keyed record of
+/// which one-time notices this device has been told not to show again (§4.3
+/// "Notice", D-11, I-18).
+///
+/// D-11's exemplar exactly: per-graph state that must NOT travel with the graph.
+/// "Don't show this again" is a statement about this device's user, not about
+/// the graph's content, so it belongs in app-data keyed by graph — never in the
+/// graph directory and never in the disposable projection.
+fn notices_id(root: &std::path::Path) -> String {
+    let id = session_id(root);
+    let stem = id.strip_suffix(".json").unwrap_or(&id);
+    format!("{stem}-notices.json")
+}
+
+fn notices_path(app: &tauri::AppHandle, root: &std::path::Path) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("sessions").join(notices_id(root)))
+}
+
+/// The whole payload: the keys of the notices this device has dismissed
+/// (`"query-crossing"` is the only one today).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DismissedNotices {
+    #[serde(default)]
+    dismissed: Vec<String>,
+}
+
+static NOTICES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// **Not `load_workspaces_at`'s body.** That one migrates a legacy session file
+/// on `NotFound` and REFUSES a malformed file. Neither applies here: there is no
+/// legacy notices file and no migration (D-1), and a notices file that cannot be
+/// read is not a reason to fail a graph open — losing a "don't show again" is
+/// worth exactly one extra notice, whereas refusing costs the user the graph
+/// (D-3/G2: prefer recovery over refusal). A missing, unreadable or malformed
+/// file therefore reads as "nothing dismissed" and the next save overwrites it.
+fn load_notices_at(path: &std::path::Path) -> String {
+    let _guard = NOTICES_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let notices = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<DismissedNotices>(&text).ok())
+        .unwrap_or_default();
+    serde_json::to_string(&notices).unwrap_or_else(|_| r#"{"dismissed":[]}"#.to_string())
+}
+
+fn save_notices_at(
+    path: &std::path::Path,
+    data: &str,
+) -> Result<(), crate::command_error::CommandError> {
+    // Re-serialize rather than echo the caller's bytes: the file the loader reads
+    // is then always the shape the loader expects, whatever the frontend sent.
+    let notices: DismissedNotices =
+        serde_json::from_str(data).map_err(crate::command_error::CommandError::from)?;
+    let body = serde_json::to_string(&notices).map_err(crate::command_error::CommandError::from)?;
+    let _guard = NOTICES_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::command_error::CommandError::prose("notices file has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;
+    // Named audited app-private publication protocol (I-1/I-2, D-7): the shared
+    // primitive, never `fs::write`.
+    tine_core::model::atomic_write(path, body.as_bytes())
+        .map_err(crate::command_error::CommandError::from)
+}
+
+#[tauri::command]
+pub(crate) fn load_notices(
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<String, crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let path = notices_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
+    Ok(load_notices_at(&path))
+}
+
+#[tauri::command]
+pub(crate) fn save_notices(
+    data: String,
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<(), crate::command_error::CommandError> {
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
+    let path = notices_path(&app, &slot.root_key)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
+    save_notices_at(&path, &data)
 }
 
 fn blank_session_json() -> serde_json::Value {
@@ -702,7 +737,7 @@ mod tests {
             &[
                 AuditedWriteAllowance {
                     source_line: "std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;",
-                    expected_count: 3,
+                    expected_count: 4,
                 },
                 AuditedWriteAllowance {
                     source_line: "std::fs::rename(legacy, path).map_err(crate::command_error::CommandError::from)?;",
@@ -942,6 +977,70 @@ mod tests {
     }
 
     #[test]
+    fn notice_dismissals_live_beside_the_session_file_and_are_graph_keyed() {
+        // The exact D-11 shape: same `sessions/` directory, same graph key, a
+        // distinct suffix — so two graphs never share a dismissal and the file
+        // never lands inside the graph (I-18).
+        let one = notices_id(std::path::Path::new("/one/graph"));
+        let two = notices_id(std::path::Path::new("/two/graph"));
+        assert_ne!(one, two);
+        assert!(one.ends_with("-notices.json"), "{one}");
+        assert_eq!(
+            one.strip_suffix("-notices.json"),
+            session_id(std::path::Path::new("/one/graph")).strip_suffix(".json")
+        );
+    }
+
+    #[test]
+    fn a_dismissed_notice_round_trips_and_survives_a_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions/graph-notices.json");
+
+        // Nothing dismissed yet, and reading does not create the file: a graph
+        // that never dismissed anything leaves no app-data behind.
+        assert_eq!(load_notices_at(&path), r#"{"dismissed":[]}"#);
+        assert!(!path.exists());
+
+        save_notices_at(&path, r#"{"dismissed":["query-crossing"]}"#).unwrap();
+        assert_eq!(
+            load_notices_at(&path),
+            r#"{"dismissed":["query-crossing"]}"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_notices_file_reads_as_empty_and_the_next_save_repairs_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions/graph-notices.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json at all").unwrap();
+
+        // D-3/G2: recovery over refusal. A damaged dismissal record costs the
+        // user one extra notice; refusing here would cost them the graph.
+        assert_eq!(load_notices_at(&path), r#"{"dismissed":[]}"#);
+        save_notices_at(&path, r#"{"dismissed":["query-crossing"]}"#).unwrap();
+        assert_eq!(
+            load_notices_at(&path),
+            r#"{"dismissed":["query-crossing"]}"#
+        );
+    }
+
+    #[test]
+    fn saving_notices_leaves_the_graph_bytes_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("tine-test");
+        let pages = graph.join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        let page = pages.join("byte-identical.md");
+        std::fs::write(&page, "- original graph bytes\n").unwrap();
+        let before = std::fs::read(&page).unwrap();
+
+        let path = temp.path().join("app-data/sessions/tine-test-notices.json");
+        save_notices_at(&path, r#"{"dismissed":["query-crossing"]}"#).unwrap();
+        assert_eq!(std::fs::read(&page).unwrap(), before);
+    }
+
+    #[test]
     fn external_asset_approvals_are_device_local_and_target_specific() {
         let mut json = serde_json::json!({ "unrelated": true });
         remember_external_assets_approval_json(&mut json, "/graphs/a", "/media/one");
@@ -973,43 +1072,5 @@ mod tests {
         assert!(app_bool_at(&path, "missing", true));
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn managed_sync_device_id_is_stable_and_preserves_other_settings() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("tine-settings.json");
-        std::fs::write(&path, r#"{"unrelated":true}"#).unwrap();
-
-        let first = managed_sync_device_id_at(&path).unwrap();
-        let second = managed_sync_device_id_at(&path).unwrap();
-        let persisted: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-        assert_eq!(second, first);
-        assert_eq!(persisted["managed_sync_device_id"], first.to_string());
-        assert_eq!(persisted["unrelated"], true);
-    }
-
-    #[test]
-    fn managed_sync_device_id_refuses_to_replace_malformed_settings() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("tine-settings.json");
-        let malformed = b"not json\n";
-        std::fs::write(&path, malformed).unwrap();
-
-        assert!(managed_sync_device_id_at(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), malformed);
-    }
-
-    #[test]
-    fn managed_sync_device_id_refuses_to_regenerate_an_invalid_existing_id() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("tine-settings.json");
-        let invalid = br#"{"managed_sync_device_id":"not-a-uuid","unrelated":true}"#;
-        std::fs::write(&path, invalid).unwrap();
-
-        assert!(managed_sync_device_id_at(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), invalid);
     }
 }

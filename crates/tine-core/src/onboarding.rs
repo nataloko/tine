@@ -69,10 +69,6 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         markdown: include_str!("templates/plugins.md"),
     },
     GuideTemplate {
-        title: "Features/Managed sync",
-        markdown: include_str!("templates/managed-sync.md"),
-    },
-    GuideTemplate {
         title: "Features/Tips & shortcuts",
         markdown: include_str!("templates/tips.md"),
     },
@@ -167,7 +163,6 @@ pub struct GuideCopyResult {
 pub(crate) struct GuideCopyPage {
     pub(crate) name: String,
     pub(crate) markdown: String,
-    pub(crate) page: PageDto,
 }
 
 pub(crate) struct GuideCopyAsset {
@@ -308,12 +303,7 @@ pub(crate) fn guide_copy_plan(title: &str) -> io::Result<GuideCopyPlan> {
                 rewrite_bundled_guide_links(template.markdown, &renames),
                 &name,
             );
-            let page = markdown_page_dto(&name, &name, &markdown)?;
-            Ok(GuideCopyPage {
-                name,
-                markdown,
-                page,
-            })
+            Ok(GuideCopyPage { name, markdown })
         })
         .collect::<io::Result<Vec<_>>>()?;
     let assets = referenced_guide_assets()?
@@ -665,6 +655,14 @@ mod tests {
         assert!(page.markdown.contains("`logseq/config.edn` is live too"));
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("Retry saving"));
+        // Query export: the whole-page consequence and the size limit must be
+        // in the Guide, because the dialog's one checkbox is all the UI says.
+        assert!(page.markdown.contains("published-queries/<name>/"));
+        assert!(page.markdown.contains("exports **whole pages**"));
+        assert!(page.markdown.contains("Query export size limit"));
+        assert!(page.markdown.contains("Copy complete recovery data"));
+        assert!(page.markdown.contains("Try opening again"));
 
         let index = GUIDE_TEMPLATES
             .iter()
@@ -695,7 +693,6 @@ mod tests {
         let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
             .expect("files reference was copied");
         assert!(copied_markdown.contains("logseq/.tine-trash"));
-        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -745,7 +742,6 @@ mod tests {
         assert!(
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
-        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -764,6 +760,12 @@ mod tests {
             .markdown
             .contains("Create a privacy-safe diagnostic report"));
         assert!(page.markdown.contains("**Verify synchronized graph**"));
+        assert!(page
+            .markdown
+            .contains("Part of the window says it could not be displayed"));
+        assert!(page
+            .markdown
+            .contains("A panel says it could not load something"));
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page
@@ -803,49 +805,6 @@ mod tests {
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn absence_sweep_recovery_is_taught_in_both_guide_surfaces() {
-        let managed = GUIDE_TEMPLATES
-            .iter()
-            .find(|template| template.title == "Features/Managed sync")
-            .expect("managed-sync page is registered");
-        assert!(managed
-            .markdown
-            .contains("Review a detected group deletion"));
-        assert!(managed.markdown.contains("Four deleted pages"));
-        assert!(managed.markdown.contains("**Restore**"));
-        assert!(managed.markdown.contains("**Re-apply**"));
-        assert!(managed.markdown.contains("**Keep deletion**"));
-        assert!(managed.markdown.contains("Run Restore again"));
-        assert!(managed
-            .markdown
-            .contains("Closing either the warning or the panel makes no decision"));
-        assert!(managed
-            .markdown
-            .contains("[[Reference/Troubleshooting and recovery]]"));
-
-        let recovery = GUIDE_TEMPLATES
-            .iter()
-            .find(|template| template.title == "Reference/Troubleshooting and recovery")
-            .expect("recovery page is registered");
-        assert!(recovery
-            .markdown
-            .contains("Review several deletions in Tine-managed storage"));
-        assert!(recovery
-            .markdown
-            .contains("Closing the warning or panel records no choice"));
-        assert!(recovery.markdown.contains("finished sweep remains visible"));
-
-        let dir = scratch("tine-guide-absence-sweep-copy");
-        let graph = Graph::open(&dir);
-        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
-        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
-            .expect("managed-sync page was copied");
-        assert!(copied_markdown.contains("Run Restore again"));
-        assert!(copied_markdown.contains("[[tine-guide/Reference/Troubleshooting and recovery]]"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -903,6 +862,162 @@ mod tests {
         assert!(copied_markdown.contains("**Insert block above**"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Guide's task query, run for real against the Guide's own corpus.
+    ///
+    /// [`capture_plan_day_workflow_is_registered_linked_and_copyable`] checks
+    /// that the sentence and the query are PRESENT. This checks that the
+    /// sentence is TRUE: "the query covers the whole graph - a task written on
+    /// any page turns up here, not just the ones on this page".
+    ///
+    /// It matters now because the query engine no longer answers by reading
+    /// every page (P1-d routes a Direct Files graph through the projection and
+    /// loads only the pages the result names). That is exactly the kind of
+    /// change that can quietly narrow a promise the Guide makes to someone on
+    /// their first day, and a string assertion would not have noticed. So the
+    /// claim is asserted the way the reader experiences it: copy the two Guide
+    /// pages the sentence names, run the Guide's own query text, and require
+    /// answers from BOTH pages and no `DONE`.
+    #[test]
+    fn the_guides_task_query_reaches_tasks_on_a_page_other_than_its_own() {
+        let dir = scratch("tine-guide-task-query-is-graph-wide");
+        let graph = Graph::open(&dir);
+        let workflow = copy_guide_into_graph(&graph, "Workflows/Capture and plan your day")
+            .unwrap()
+            .name;
+        let showcase = copy_guide_into_graph(&graph, "Feature showcase")
+            .unwrap()
+            .name;
+        // RET2: a public Direct query answers from the projection or reports a
+        // typed failure, so the guide fixture attaches and initializes one
+        // exactly as the app does rather than relying on a parsed-graph walk.
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .expect("the disposable projection attaches");
+        graph.warm_cache();
+
+        let result = loop {
+            match graph.run_query_bounded("(task TODO DOING NOW LATER)", 20_000, 32 * 1024 * 1024) {
+                Ok(result) => break result,
+                Err(crate::query::QueryExecutionError::NotReady(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("the guide query route refused: {error}"),
+            }
+        };
+        let pages: HashSet<&str> = result
+            .groups
+            .iter()
+            .map(|group| group.page.as_str())
+            .collect();
+        assert!(
+            pages.contains(workflow.as_str()),
+            "the workflow page's own tasks must answer: {pages:?}"
+        );
+        assert!(
+            pages.contains(showcase.as_str()),
+            "the sentence promises the showcase's tasks too, from a page the \
+             query was not written on: {pages:?}"
+        );
+
+        let markers = ["TODO", "DOING", "NOW", "LATER"];
+        for group in result.groups.iter() {
+            for block in group.blocks.iter() {
+                let raw = block.raw.trim_start();
+                assert!(
+                    markers.iter().any(|marker| raw.starts_with(marker)),
+                    "only the four named markers answer, got {raw:?}"
+                );
+                assert!(!raw.starts_with("DONE"), "DONE must not appear: {raw:?}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The Guide's scoped-Display example, read by the reader it documents**
+    /// (SPEC §7.6, Q3).
+    ///
+    /// The page tells the reader what those five property lines mean: pages as a
+    /// table with a `status` column, blocks with a present-but-empty draft that
+    /// clears rather than inherits, and a page counting as a match by name or by
+    /// content. A string assertion would only prove the lines are PRINTED. This
+    /// runs them through `read_scoped_display_settings` — the one reader every
+    /// query block goes through — so the sentence is checked against the
+    /// behaviour it promises, and a change to either one has to change both.
+    #[test]
+    fn q3_guide_scoped_display_example_roundtrips() {
+        use crate::query::ir::{Field, FriendlyPageMatchScope, ViewKind};
+
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Workflows/Find and revisit")
+            .expect("the find-and-revisit workflow is registered");
+        // The example is prose AND a live block: find the one query block that
+        // carries the scoped properties, rather than re-typing them here.
+        fn find(blocks: &[crate::doc::DocBlock]) -> Option<Vec<(String, String)>> {
+            for block in blocks {
+                let properties = &block.projection().properties;
+                if properties
+                    .iter()
+                    .any(|(key, _)| key == "tine.page-match-scope")
+                {
+                    return Some(properties.clone());
+                }
+                if let Some(found) = find(&block.children) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let document = crate::doc::parse(workflow.markdown);
+        let properties = find(&document.roots)
+            .expect("the workflow page carries the scoped-display example block");
+
+        let state = crate::query::view::read_scoped_display_settings(&properties);
+        assert!(
+            state.unreadable_settings.is_empty(),
+            "the Guide must not print a setting Tine cannot read: {:?}",
+            state.unreadable_settings
+        );
+        // "pages as a table with a `status` column"
+        assert_eq!(state.page_presentation, Some(ViewKind::Table));
+        let page = state
+            .page_display
+            .as_ref()
+            .expect("the page marker is present, so the page draft is present");
+        assert_eq!(page.columns, Some(vec![Field::new("status")]));
+        // "blocks with no extra settings of their own" — PRESENT and empty, which
+        // clears; an absent draft would inherit instead, and the page says so.
+        let block = state
+            .block_display
+            .as_ref()
+            .expect("the block marker is present, so the block draft is present");
+        assert_eq!(block.columns, None);
+        assert_eq!(block.sort, None);
+        assert_eq!(block.group_by, None);
+        assert_eq!(block.sample, None);
+        assert_eq!(state.block_presentation, None);
+        // "a page counts as a match by its name or by its content"
+        assert_eq!(state.page_match_scope, Some(FriendlyPageMatchScope::Both));
+
+        // And the prose that explains them is on the page the reader lands on.
+        assert!(workflow.markdown.contains("**Page matches**"));
+        assert!(workflow.markdown.contains("**Use inherited settings**"));
+        assert!(workflow.markdown.contains("**Clear settings**"));
+        assert!(workflow.markdown.contains("**Display pages**"));
+
+        let reference = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Pages, links, references, and search")
+            .expect("the pages/search reference page is registered");
+        // The exact wire values, spelled where the reference reader looks.
+        assert!(reference.markdown.contains("`names`"));
+        assert!(reference.markdown.contains("`content`"));
+        assert!(reference.markdown.contains("`both`"));
+        assert!(reference.markdown.contains("`tine.page-match-scope`"));
+        assert!(reference.markdown.contains("`tine.page-display:: 1`"));
     }
 
     #[test]
@@ -973,15 +1088,194 @@ mod tests {
         // GH #463: the keyboard reaches every destination the mouse does.
         assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
         assert!(page.markdown.contains("+ New group"));
-        // GH #464: the row's name is the link and the rest of the row is the
-        // drag handle, which is what makes the documented reorder reliable.
-        assert!(page.markdown.contains("the page's name is the link"));
+        // GH #468 / GH #464: the two sidebars answer this differently on
+        // purpose, and the reorder the page documents depends on the reader
+        // knowing which. The left row is entirely a link; the right one is not.
+        assert!(page
+            .markdown
+            .contains("In the left sidebar the whole row is the link"));
+        assert!(page
+            .markdown
+            .contains("In the right sidebar, where items are parked pages"));
         assert!(page.markdown.contains("copy/export button"));
         assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
         assert!(page
             .markdown
             .contains("Name this search to save it as a page"));
         assert!(page.markdown.contains("What you should see"));
+        // The P3 section. The builder has two states and the Guide has to name
+        // both, because a reader who only sees the sentence has no reason to
+        // suspect there is anything to click. The anchor-switch prompt is
+        // promised in the same words the prompt itself uses.
+        assert!(page.markdown.contains("- ## Read a query, then edit it"));
+        assert!(page
+            .markdown
+            .contains("type **/query** and choose **Query**"));
+        assert!(page.markdown.contains("field chooser ready"));
+        assert!(page.markdown.contains("observed majority type"));
+        assert!(page.markdown.contains("cannot be read as the key’s type"));
+        assert!(page
+            .markdown
+            .contains("A hand-written advanced query stays editable as text"));
+        assert!(page.markdown.contains("**Find blocks ▾ where …**"));
+        assert!(page.markdown.contains("**+ Add condition**"));
+        assert!(page.markdown.contains("**Try again**"));
+        // P6 keeps selection, disabling and movement distinct in the Guide.
+        assert!(page.markdown.contains("**Group selected ▾**"));
+        assert!(page.markdown.contains("**disabled by group**"));
+        assert!(page.markdown.contains("**Move up**"));
+        assert!(page.markdown.contains("**Move down**"));
+        assert!(page
+            .markdown
+            .contains("**Escape** in the middle of one cancels it"));
+        assert!(page.markdown.contains("**Remove them**"));
+        assert!(page
+            .markdown
+            .contains("**all of** / **any of** / **none of**"));
+        assert!(page.markdown.contains("`⟨advanced⟩`"));
+
+        // The P4 section. The pane's own "I did not understand this" message
+        // routes the reader HERE by name, so the heading is part of the
+        // frontend's contract and not a free-text choice
+        // (`src/components/QueryBuilder.tsx`: "the Guide under *Find and
+        // revisit → Query text (TQL)*").
+        assert!(page.markdown.contains("- ## Query text (TQL)"));
+        assert!(page.markdown.contains("**Save query text**"));
+        assert!(page
+            .markdown
+            .contains("complete default page/document order"));
+        assert!(page
+            .markdown
+            .contains("Statistics describe the complete sample"));
+        assert!(page.markdown.contains("**Unavailable** with a reason"));
+        assert!(page
+            .markdown
+            .contains("Exact query statistics exceed the available memory limit."));
+        assert!(page
+            .markdown
+            .contains("Exact statistics by formula are not supported yet."));
+        // The one picker: a key's count and observed type are what the list
+        // shows, and a typed key is offered honestly in BOTH scopes a block
+        // query can write it in — the pair of field kinds the two-stage chooser
+        // used to expose, which one list has to keep offering.
+        assert!(page.markdown.contains("**Use \"…\" as a block property**"));
+        assert!(page.markdown.contains("**Use \"…\" as a page property**"));
+        assert!(page.markdown.contains("`0 blocks today`"));
+        // **Show me is conditional, and the Guide says so.** The engine attaches
+        // a span to some diagnostics and not to others (`unknown_ident` carries
+        // none today), and the pane draws the button only where there is a range
+        // to select. A Guide that promises it unconditionally teaches a reader to
+        // look for a control that is correctly absent.
+        assert!(page
+            .markdown
+            .contains("When the message comes with a place in the text"));
+        assert!(
+            !page
+                .markdown
+                .contains("offers **Show me** to select it in the text"),
+            "the Guide must not promise Show me for every unknown word"
+        );
+        // The pane shows Tine's READING of the query, not the block's bytes:
+        // a saved block may hold Logseq's `{{query …}}` form while the pane
+        // shows the same query in TQL.
+        assert!(
+            !page
+                .markdown
+                .contains("the query text at the foot of the sheet shows exactly what was written"),
+            "the pane is not a view of the saved macro's bytes"
+        );
+
+        // **The examples are checked against the engine, not proof-read.** A
+        // reference whose sample queries do not parse is worse than no
+        // reference: the reader concludes the language is the thing that is
+        // broken. Every fenced ```tql block on the page is parsed by the ONE
+        // parser, with no registry, and must come back valid.
+        let fenced: Vec<String> = page
+            .markdown
+            .split("```tql")
+            .skip(1)
+            .map(|rest| {
+                rest.split("```")
+                    .next()
+                    .expect("a fenced tql block is closed")
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        assert!(
+            fenced.len() >= 2,
+            "the TQL reference must SHOW the language, not only describe it"
+        );
+        for example in &fenced {
+            let (parsed, _) = crate::query::parse_query_text(
+                example,
+                crate::query::QueryDialect::Tql,
+                crate::date::JournalDate::today(),
+            );
+            assert!(
+                !parsed.is_invalid(),
+                "the Guide's TQL example {example:?} does not parse: {:?}",
+                parsed.diagnostics
+            );
+        }
+
+        // Every block/page attribute the parser accepts is NAMED in the
+        // section, in backticks. A vocabulary reference that lists four of five
+        // fields sends the reader to the pane to guess the fifth.
+        let tql_section = page
+            .markdown
+            .split("- ## Query text (TQL)")
+            .nth(1)
+            .expect("the TQL section is present")
+            .split("\n- ## ")
+            .next()
+            .expect("the TQL section ends at the next heading");
+        for attribute in [
+            "content",
+            "task",
+            "priority",
+            "scheduled",
+            "deadline",
+            "name",
+            "journal",
+            "namespace",
+        ] {
+            assert!(
+                tql_section.contains(&format!("`{attribute}`")),
+                "the TQL reference never names the `{attribute}` field"
+            );
+        }
+        for form in ["prop('key')", "any(", "every(", "off(", "@block", "@page"] {
+            assert!(
+                tql_section.contains(form),
+                "the TQL reference never shows {form}"
+            );
+        }
+
+        // The two P2 sections. A declared property type is only actionable if
+        // the page the declaration must live on is named: the engine binds
+        // `tine.type::` by the NORMALIZED key, so a reader who authors the line
+        // by hand on the page they spelled the property with declares nothing.
+        assert!(page.markdown.contains("declare type…"));
+        assert!(page.markdown.contains("`tine.type:: number`"));
+        assert!(page
+            .markdown
+            .contains("a property written `due date::` declares on the page `due-date`"));
+        // The crossing sentences are the SAME sentences the notice shows
+        // (`src/components/CrossingNotice.tsx`, §7.5). A reader who met the
+        // notice and then came here must not have to decide whether two
+        // differently-worded promises are the same promise.
+        assert!(page
+            .markdown
+            .contains("This query now uses Tine features Logseq can't read."));
+        assert!(page
+            .markdown
+            .contains("Logseq will show the block as plain text."));
+        assert!(page.markdown.contains("**Undo that change**"));
+        assert!(page.markdown.contains("**Don't show this again**"));
         assert!(page
             .markdown
             .contains("[[Reference/Pages, links, references, and search]]"));
@@ -1035,6 +1329,10 @@ mod tests {
         assert!(page
             .markdown
             .contains(":ref/linked-references-collapsed-threshold"));
+        // The unlinked-reference highlight is itself the way into the source
+        // block (GH #200); nothing in the UI announces that a highlighted word
+        // is clickable, so the Guide has to.
+        assert!(page.markdown.contains("the highlight is clickable"));
         assert!(page.markdown.contains("available page/tag chips"));
         assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));
@@ -1042,8 +1340,35 @@ mod tests {
         // nothing else in the app tells the reader which link forms are live.
         assert!(page.markdown.contains("A `file:` link"));
         assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
+        // The empty result is the one moment a user most needs to know WHICH
+        // condition emptied it, and nothing else in the app says the disclosure
+        // is there. Same for page-anchored results: `(page-property …)` used to
+        // answer with blocks, so a reader who learned that needs telling.
+        assert!(page.markdown.contains("**why empty?**"));
+        assert!(page.markdown.contains("lists the pages themselves"));
+        assert!(page.markdown.contains("`{{query (all-page-tags)}}`"));
+        assert!(page
+            .markdown
+            .contains("every page with at least one `tags::` value"));
+        assert!(page
+            .markdown
+            .contains("Unlinked References header identifies that waiting state"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
+        // GH #164: properties became editable as a form for ANY key, on a page
+        // and on a block. Nothing else in the app tells a reader the control
+        // exists, so the page must name both doors and say that a read-only page
+        // has neither — otherwise the only discoverable way to set a property is
+        // still to type the raw line.
+        assert!(page.markdown.contains("**Page properties…**"));
+        assert!(page
+            .markdown
+            .contains("right-click a block for **Properties…**"));
+        assert!(page.markdown.contains("**Add a property**"));
+        assert!(page.markdown.contains("offers no property editing at all"));
+        // A non-ASCII key is an ordinary property, not a curiosity: it was
+        // uneditable until this release, so the page says plainly that it is not.
+        assert!(page.markdown.contains("does not have to be plain ASCII"));
         assert!(page.markdown.contains("[[Workflows/Find and revisit]]"));
 
         let index = GUIDE_TEMPLATES
@@ -1093,6 +1418,16 @@ mod tests {
         assert!(page.markdown.contains("hls__"));
         assert!(page.markdown.contains("normal tab in a companion pane"));
         assert!(page.markdown.contains("drag the PDF tab"));
+        assert!(page.markdown.contains("PDF preparation waits and retries"));
+        assert!(page
+            .markdown
+            .contains("A query about pages cannot currently be included"));
+        assert!(page
+            .markdown
+            .contains("Starting another **Export to PDF…** or switching graphs"));
+        assert!(page
+            .markdown
+            .contains("opens no print dialog for an incomplete page"));
         assert!(page.markdown.contains("structural companion pane"));
         assert!(page
             .markdown
@@ -1387,7 +1722,26 @@ mod tests {
         assert!(tips.markdown.contains("**Ctrl/Cmd-click** any bullet"));
         assert!(tips.markdown.contains("**Alt-click** the same thing"));
         assert!(tips.markdown.contains("whose only modifier is Alt"));
+        // GH #491: the Guide states both redo chords, says which platforms get
+        // the second one, and says that remapping Redo replaces both -- the
+        // alias is a default, not a hidden extra binding.
+        assert!(tips.markdown.contains("redo is Ctrl/Cmd+Shift+Z"));
+        assert!(tips
+            .markdown
+            .contains("On Windows and Linux **Ctrl+Y** also redoes"));
+        assert!(tips.markdown.contains("remapping Redo replaces both"));
         assert!(tips.markdown.contains("custom maximum"));
+        assert!(tips.markdown.contains("**Unbind**"));
+        assert!(tips.markdown.contains("**Reset** restores its default"));
+        assert!(tips.markdown.contains("**Reset interface zoom**"));
+        assert!(tips
+            .markdown
+            .contains("PDF/image zoom and block zoom unchanged"));
+        let capture = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Quick capture")
+            .expect("capture page is registered");
+        assert!(capture.markdown.contains("**File capture** button"));
     }
 
     #[test]
@@ -1445,6 +1799,32 @@ mod tests {
             out.contains("[[Martin]] #demo #sheets-demo"),
             "non-guide refs must stay verbatim: {out}"
         );
+    }
+
+    /// The Guide must document that search can be still catching up, because
+    /// that is the one moment a user sees an answer that is not simply "here is
+    /// what matched". A changelog entry is not user documentation, so this is
+    /// the assertion that fails if the page and the product drift apart.
+    #[test]
+    fn the_search_guide_page_documents_the_indexing_and_retry_states() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|p| p.title == "Reference/Pages, links, references, and search")
+            .expect("the search reference page is part of the Guide")
+            .markdown;
+        for phrase in [
+            "still being built",
+            "says it is searching",
+            "Retry",
+            "nothing matched",
+        ] {
+            assert!(
+                page.contains(phrase),
+                "the search Guide page no longer documents {phrase:?}; the switcher \
+                 shows a pending state and a retry affordance, and the Guide is where \
+                 a user learns that an empty list is not the same as an unavailable one"
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,34 @@
 
 import { transitionFence, displayMathOpenAfter, closesDisplayMath, type FenceState } from "./fences";
 
-export const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
+/** The editor's `key:: value` matcher for reading and rewriting property lines.
+ * The key class is the same Unicode class as `PAGE_HEADER_KEY` below. lsdoc's
+ * canonical recognizer (`crates/tine-core/src/property_line.rs`) does not use a
+ * character class at all — a key is any nonempty run without a colon, parser
+ * space, CR or LF — so an ASCII-only class here made a non-ASCII key WRITE-ONCE:
+ * the new-key path created it unconditionally, then no later edit could match
+ * the line, and an update prepended a second line with the same key instead of
+ * replacing the first (GH #164). Only the charset is widened: the `::`
+ * separator rule stays as it is, because the page-header grammar
+ * (`parsePageHeaderPropertyLine`) is deliberately a different, laxer rule for a
+ * different job, pinned by its own tests. */
+export const PROP_LINE = /^([\p{L}\p{M}\p{N}_./-]+):: ?(.*)$/u;
+
+/** Whether `key` may be committed as a property key from the UI.
+ *
+ *  This deliberately asks the very matcher that will later have to FIND the key
+ *  ({@link PROP_LINE}) instead of carrying its own rule, so anything accepted
+ *  here is guaranteed matchable for update and removal. A validator that
+ *  disagrees with the finder is precisely how GH #164's write-once bug existed:
+ *  the new-key path wrote unconditionally while the matcher could not find what
+ *  it had written.
+ *
+ *  It compares the recovered key rather than just testing the line, because a
+ *  key such as `a::b` produces a line the matcher happily accepts by binding
+ *  `a` and treating `b:: value` as the value. */
+export function isEditablePropertyKey(key: string): boolean {
+  return PROP_LINE.exec(`${key}:: value`)?.[1] === key;
+}
 
 const PAGE_HEADER_KEY = /^[\p{L}\p{M}\p{N}_./-]+$/u;
 
@@ -115,7 +142,12 @@ export const isSheetCellHidden = (key: string): boolean =>
 export const hideAll = (_key: string): boolean => true;
 
 function propLineKey(line: string): string | null {
-  const m = /^\s*([A-Za-z0-9_./-]+)::/.exec(line);
+  // Same Unicode key class as PROP_LINE. An ASCII-only class here meant a
+  // non-ASCII-keyed property line was never classified as a property at all, so
+  // `isHidden` was never consulted for it: with `hideAll` (annotation blocks,
+  // which hide every property and edit only their text) the line stayed visible
+  // as raw metadata in the edit textarea (GH #164).
+  const m = /^\s*([\p{L}\p{M}\p{N}_./-]+)::/u.exec(line);
   return m ? m[1].toLowerCase() : null;
 }
 
@@ -413,3 +445,141 @@ export const PAGE_PROP_SPECS: PagePropSpec[] = [
   { key: "icon", label: "Icon", hint: "An emoji/character shown with the title", kind: "text" },
   { key: "public", label: "Public", hint: "Include this page when exporting/publishing public pages", kind: "bool" },
 ];
+
+// --------------------------------------------------------------------------
+// Raw block-property writers (one per on-disk format)
+// --------------------------------------------------------------------------
+//
+// These are the store's own placement rules, lifted here UNCHANGED so that a
+// caller that builds a block's raw text before it belongs to any store — the
+// query workspace materializing its first `{{query …}}` block — writes a
+// property exactly where `setBlockProperty` would. A markdown `key:: value`
+// line written into an org file renders as visible body text and is never read
+// back as a property (the GH #25 class), so the format is the writer's choice,
+// not a formatting detail.
+
+/** Pure Markdown property rewrite for one compound store mutation. It scans only
+ * the canonical head (title, planning, contiguous properties) plus the legacy
+ * trailing property block, so a `key::` lookalike in body text or a code fence is
+ * never touched or reordered. Existing property order is retained. */
+export function markdownRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const first = lines[0] ?? "";
+  const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*</;
+  let i = 1;
+  while (i < lines.length && PLANNING_LINE.test(lines[i])) i++;
+  const planningEnd = i;
+  while (i < lines.length && PROP_LINE.test(lines[i])) i++;
+  const propsEnd = i;
+  let j = lines.length;
+  while (j > propsEnd && PROP_LINE.test(lines[j - 1] ?? "")) j--;
+  const notKey = (l: string) => PROP_LINE.exec(l)?.[1] !== key;
+  const props = lines.slice(planningEnd, propsEnd);
+  const at = props.findIndex((l) => PROP_LINE.exec(l)?.[1] === key);
+  if (value !== null) {
+    const line = `${key}:: ${value}`;
+    if (at >= 0) props[at] = line;
+    else props.push(line);
+  } else if (at >= 0) {
+    props.splice(at, 1);
+  }
+  return [
+    first,
+    ...lines.slice(1, planningEnd),
+    ...props,
+    ...lines.slice(propsEnd, j),
+    ...lines.slice(j).filter(notKey),
+  ].join("\n");
+}
+
+/** `raw` with an org drawer property set/updated/removed. Operates ONLY on the
+ *  first `:PROPERTIES:` drawer in the canonical head region (title, planning,
+ *  drawer, body — the same placement rawWithBlockId uses); body text and code
+ *  blocks are never scanned. Removing the last property removes the drawer. */
+export function orgRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const start = lines.findIndex((l) => l.trim().toUpperCase() === ":PROPERTIES:");
+  const end =
+    start >= 0 ? lines.findIndex((l, i) => i > start && l.trim().toUpperCase() === ":END:") : -1;
+  const keyRe = new RegExp(`^:${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*`, "i");
+  if (start >= 0 && end > start) {
+    // Update in place so an existing drawer key keeps its position (GH #216);
+    // only a new key appends.
+    const inner = lines.slice(start + 1, end);
+    const at = inner.findIndex((l) => keyRe.test(l.trim()));
+    if (value !== null) {
+      const line = `:${key}: ${value}`;
+      if (at >= 0) inner[at] = line;
+      else inner.push(line);
+    } else if (at >= 0) {
+      inner.splice(at, 1);
+    }
+    if (inner.length === 0) {
+      // Drawer emptied: drop it entirely.
+      return [...lines.slice(0, start), ...lines.slice(end + 1)].join("\n");
+    }
+    return [...lines.slice(0, start + 1), ...inner, ...lines.slice(end)].join("\n");
+  }
+  if (value === null) return raw; // nothing to remove
+  // No drawer yet: title, SCHEDULED*, DEADLINE*, drawer, rest (rawWithBlockId's rule).
+  const [title, ...rest] = lines;
+  const isPlan = (l: string) => l.startsWith("SCHEDULED") || l.startsWith("DEADLINE");
+  let planEnd = 0;
+  while (planEnd < rest.length && isPlan(rest[planEnd])) planEnd++;
+  return [
+    title,
+    ...rest.slice(0, planEnd),
+    ":PROPERTIES:",
+    `:${key}: ${value}`,
+    ":END:",
+    ...rest.slice(planEnd),
+  ].join("\n");
+}
+
+/** A page's org PRE-BLOCK with one page property set, updated or removed.
+ *
+ *  Org carries PAGE properties as `#+key: value` file directives; the
+ *  `:PROPERTIES:` drawer that {@link orgRawWithProperty} writes is the BLOCK
+ *  form. Logseq splits the same way and this is transcribed from its page
+ *  writer, `frontend.util.page-property/insert-property`
+ *  (og 6e7afa8eb, `src/main/frontend/util/page_property.cljs:10-32`), against
+ *  its block writer `frontend.util.property/build-properties-str`
+ *  (`property.cljs:169-177`), which is the one that emits the drawer. Writing a
+ *  markdown `key:: value` line into an org preamble instead is not a property
+ *  to org at all: neither Tine's own org reader nor Logseq reads it back, and
+ *  the metadata silently does not exist (I-4, GH #164).
+ *
+ *  Transcribed exactly: the key is lower-cased, and an existing directive is
+ *  found case-insensitively by the `#+key: ` prefix INCLUDING its trailing
+ *  space, so `#+TAGS: x` is matched and `#+TAGS:x` is not. A new key is
+ *  prepended, as OG's `cons` does.
+ *
+ *  Two deliberate departures. Duplicate keys collapse to the first slot rather
+ *  than being left in place as OG leaves them, so this agrees with
+ *  {@link upsertPropertyLine}; an org page and a markdown page must not
+ *  disagree about what a second `tags` line means. And removal has no OG
+ *  counterpart at all — its value is never null — so dropping the matching
+ *  directive is Tine's own complement of the same markdown rule.
+ *
+ *  Returns null when no nonblank content remains. */
+export function orgPreBlockWithProperty(
+  preBlock: string | null,
+  key: string,
+  value: string | null
+): string | null {
+  const v = value == null ? null : value.trim();
+  const prefix = `#+${key.toLowerCase()}: `;
+  const lines = preBlock == null || preBlock === "" ? [] : preBlock.split("\n");
+  const out: string[] = [];
+  let matched = false;
+  for (const line of lines) {
+    if (line.toLowerCase().startsWith(prefix)) {
+      if (!matched && v) out.push(`${prefix}${v}`);
+      matched = true;
+      continue;
+    }
+    out.push(line);
+  }
+  if (!matched && v) out.unshift(`${prefix}${v}`);
+  return out.some((line) => line.trim() !== "") ? out.join("\n") : null;
+}

@@ -27,6 +27,8 @@ import { RightSidebar } from "./RightSidebar";
 import { PageView } from "./Page";
 import type { PageEntry, QueryExecution } from "../types";
 import { LONG_PRESS_DELAY } from "../render/longPress";
+import { backendReadsQueries } from "../queryReadingsTestkit";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 // GH #207: the internal-link gesture contract (linkGesture.ts, GH #283) is ONE
 // decision — plain click opens, Shift+click → right sidebar, Ctrl/Cmd+click or
@@ -199,7 +201,8 @@ describe("reference page headers follow the gesture contract (GH #207)", () => {
       vi.advanceTimersByTime(LONG_PRESS_DELAY);
       expect(contextMenu()).toMatchObject({ kind: "page", name: "Backlink Owner" });
       header.dispatchEvent(touch("pointerup"));
-      header.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      // Touch compatibility clicks have a nonzero detail; zero is keyboard activation.
+      header.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
       expect(activeRouteName()).toBe("Elsewhere");
       vi.useRealTimers();
     } finally {
@@ -427,11 +430,11 @@ describe("query search-presentation rows follow the gesture contract (GH #207)",
 
   it("block-hit rows: middle/ctrl → background tab with block anchor, shift → sidebar", async () => {
     loadQueryDoc("{{query (task TODO)}}\ntine.view:: search");
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: "Sheet",
       kind: "page",
       blocks: [{ id: "b1", raw: "Body hit", collapsed: false, children: [] }],
-    }]);
+    }]));
     const m = mount(() => <Block id="query" />);
     try {
       const row = await vi.waitFor(() => {
@@ -495,11 +498,15 @@ describe("query search-presentation rows follow the gesture contract (GH #207)",
   });
 
   it("legacy table page cells and list headers suppress the middle-mousedown default", async () => {
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: "Query Owner",
       kind: "page",
       blocks: [{ id: "q1", raw: "TODO row", collapsed: false, children: [] }],
-    }]);
+    }]));
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+      "(task DONE)": { form: "(task DONE)" },
+    });
     loadQueryDoc("{{query (task TODO) {:table-view? true}}}");
     const table = mount(() => <Block id="query" />);
     try {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ahash = "0.8.12"
+im = "=15.1.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -21,7 +22,6 @@ dirs = "6"
 regex = "1"
 ring = "0.17"
 crc32fast = "1"
-loro = { path = "../../vendor/loro-1.13.6", version = "=1.13.6" }
 libc = "0.2"
 cap-std = "4.0.2"
 same-file = "1.0.6"
@@ -29,7 +29,8 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 unicode-normalization = "=0.1.25"
 unicode-segmentation = "1"
-tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.12.2" }
+sqlparser = { workspace = true }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.20.0" }
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext = "=4.0.2"
@@ -37,13 +38,16 @@ windows-sys = { version = "0.61.2", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
 ] }
 
 [dev-dependencies]
+tempfile = "=3.27.0"
 pretty_assertions = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
-tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.12.2", features = ["test-support"] }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.20.0", features = ["test-support"] }

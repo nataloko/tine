@@ -7,12 +7,18 @@
 //! temporary, and — much worse — can be silently deleted along with the code it
 //! was warning about. Both are deliberate acts, so both fail here first.
 //!
-//! This is the first deliberate use of the convention, so the exemplar is the
-//! `simple_query_candidate_paths` hatch in `direct_projection.rs`. Copy its
-//! shape: WHAT may be deleted, the CONDITION that makes it deletable, and WHAT
-//! CURRENTLY BLOCKS deletion — the last being the part a future sweep actually
-//! needs, because a marker that only says "delete me eventually" tells the
-//! sweep nothing about whether now is the time.
+//! The convention's first deliberate use was the `simple_query_candidate_paths`
+//! hatch in `direct_projection.rs`, and it worked exactly as intended: RET2
+//! deleted the Direct query walk, the hatch's stated CONDITION was met, and the
+//! hatch, its marker and this row all went with it. The pre-SQL candidate
+//! planner in `query.rs` retired the same way once the SQL route took over its
+//! work, and so did the in-memory query walk's marker when K2 (2026-09-15)
+//! compiled the walk out of the product: it is a test-only oracle now, not
+//! temporary production code. No marker is live today. A new one states WHAT
+//! may be deleted, the CONDITION that makes it deletable, and WHAT CURRENTLY
+//! BLOCKS deletion — the last being the part a future sweep actually needs,
+//! because a marker that only says "delete me eventually" tells the sweep
+//! nothing about whether now is the time.
 //!
 //! Pinned by `(file, marker text)` and never by line number: a line-anchored
 //! pin reddens on every unrelated packet that edits the file above it, which is
@@ -21,17 +27,16 @@
 #[path = "support/production_source.rs"]
 mod production_source;
 
-use production_source::{compiled_source, production_source_files, relative_path, repo_root};
+use production_source::{
+    compiled_source, module_raw_source, production_source_files, relative_path, repo_root,
+};
 use std::collections::BTreeSet;
 
 const MARKER: &str = "// RETIREMENT-CANDIDATE:";
 
 /// The exact `(file, first line of the marker)` set. Adding or removing a row
 /// is the deliberate act this guard exists to force.
-const PINNED: &[(&str, &str)] = &[(
-    "crates/tine-core/src/direct_projection.rs",
-    "// RETIREMENT-CANDIDATE: the candidate-count escape hatch below, together",
-)];
+const PINNED: &[(&str, &str)] = &[];
 
 fn markers() -> BTreeSet<(String, String)> {
     let root = repo_root();
@@ -73,9 +78,8 @@ fn retirement_candidate_markers_are_pinned() {
          \n\
          Adding a marker and deleting one are both deliberate acts, so both \
          update this list. If you deleted the code, delete its row. If you \
-         added a marker, add its row and copy the exemplar's shape: \
-         `crates/tine-core/src/direct_projection.rs`, on the candidate-count \
-         escape hatch in `simple_query_candidate_paths`.\n\
+         added a marker, add its row and state the three parts named in \
+         `tests/retirement_candidates.rs`'s module doc.\n\
          \n\
          I-12: this census uses the one production-source scanner \
          (`tests/support/production_source.rs`); do not add a second walker."
@@ -116,22 +120,25 @@ fn every_retirement_candidate_states_condition_and_blocker() {
     }
 }
 
-/// The one blocker this packet's marker records: the parser walk is the
-/// correctness ORACLE for the lowering that would replace it, so it outlives
+/// The walk's reason to exist, asserted where the walk lives: the parser walk
+/// is the correctness ORACLE for the lowering that replaced it, so it outlives
 /// that lowering by at least one release. A sweep that deletes the walk the
 /// moment SQL works removes the only way to prove SQL right.
 ///
 /// Martin, 2026-09-03, card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`. Asserted rather
 /// than merely written, because this is exactly the reasoning a later reader
 /// would otherwise have to reconstruct — and would get wrong.
+///
+/// The note has moved twice: RET2 moved it from the Direct candidate hatch to
+/// the walk's production marker, and K2 moved it to the module doc of
+/// `query/walk.rs` when the walk became test-only.
 #[test]
-fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
+fn the_walk_records_itself_as_the_correctness_oracle() {
     let root = repo_root();
-    let source = compiled_source(&root.join("crates/tine-core/src/direct_projection.rs"));
-    let start = source.find(MARKER).expect("the exemplar marker");
-    let note = source[start..]
+    let walk = std::fs::read_to_string(root.join("crates/tine-core/src/query/walk.rs")).unwrap();
+    let note = walk
         .lines()
-        .take_while(|line| line.trim().starts_with("//"))
+        .take_while(|line| line.starts_with("//!"))
         .collect::<Vec<_>>()
         .join("\n");
     for required in [
@@ -139,22 +146,29 @@ fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
         "no external oracle exists",
         "DIFFERENTIAL AGAINST THE WALK",
         "outlives the lowering by at least one",
-        "sparse_task_query_runner_matches_existing_page_evaluator",
+        "the_database_result_equals_the_walk_on_every_shape_and_bound",
         "PVTI_lAHOAAbLVc4BhPsyzg5VyLk",
     ] {
         assert!(
             note.contains(required),
-            "the query hatch's {MARKER} note must record `{required}`: the \
-             walk is not merely the fallback, it is the acceptance gate for \
-             the lowering that replaces it, and retiring the hatch is NOT \
-             permission to retire the walk."
+            "the walk's module doc must record `{required}`: the walk is the \
+             acceptance gate for the lowering that replaced it, and shipping \
+             that lowering is NOT permission to retire the walk."
         );
     }
-    // The named oracle must actually exist, or the marker points at nothing.
-    let query = std::fs::read_to_string(root.join("crates/tine-core/src/query.rs")).unwrap();
+    // Test-only is what took the walk off the retirement list, so pin it.
+    let query = module_raw_source(&root, "crates/tine-core/src/query.rs");
     assert!(
-        query.contains("fn sparse_task_query_runner_matches_existing_page_evaluator("),
-        "the marker's cited differential oracle test no longer exists; \
+        query.contains("#[cfg(test)]\nmod walk;"),
+        "the walk is the oracle, compiled only under cfg(test); a production \
+         walk is temporary code again and needs a {MARKER} note"
+    );
+    // The named oracle must actually exist, or the note points at nothing.
+    let results =
+        std::fs::read_to_string(root.join("crates/tine-core/src/query/results_tests.rs")).unwrap();
+    assert!(
+        results.contains("fn the_database_result_equals_the_walk_on_every_shape_and_bound("),
+        "the walk's cited differential oracle test no longer exists; \
          relocate it by symbol and update the note"
     );
 }

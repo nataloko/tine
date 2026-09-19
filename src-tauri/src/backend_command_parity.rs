@@ -9,8 +9,8 @@
 //! call it. Nothing fails to compile, and no test notices.
 //!
 //! This module makes the two lists agree at test time. It re-derives both from
-//! the sources — `managed_command_surface.rs` is the house pattern — so the
-//! guard cannot drift from the code it guards.
+//! the sources — `command_surface.rs` is the sibling pattern — so the guard
+//! cannot drift from the code it guards.
 //!
 //! It pins *names*, not argument shapes or return types. Those are separate
 //! (and much larger) parity questions.
@@ -184,22 +184,15 @@ fn line_containing(source: &str, char_index: usize) -> String {
 /// same hole one level up: a command added in a NEW file would be invisible.
 #[cfg(test)]
 fn commands_that_reopen_the_graph() -> BTreeSet<String> {
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&source_dir)
-        .expect("src-tauri/src must be readable")
-        .map(|entry| entry.expect("readable directory entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .collect();
-    entries.sort();
+    let modules = crate::test_support::rust_module_sources();
     assert!(
-        entries.len() > 10,
+        modules.len() > 10,
         "the src-tauri/src scan found {} sources -- the scanner broke, not the code",
-        entries.len()
+        modules.len()
     );
 
     let mut names = BTreeSet::new();
-    for path in entries {
-        let source = std::fs::read_to_string(&path).expect("readable source");
+    for (_, source) in modules {
         for (name, body) in tauri_command_bodies(&source) {
             if body.contains("refresh_graph(") {
                 names.insert(name);
@@ -380,23 +373,6 @@ mod tests {
         ("settings.rs", "set_capture_enter_files"),
         ("settings.rs", "set_link_first_match"),
         ("settings.rs", "set_smooth_scroll"),
-        ("sync_runtime.rs", "activate_sparse_v2"),
-        ("sync_runtime.rs", "adopt_sparse_v2_shared"),
-        ("sync_runtime.rs", "cancel_sparse_v2"),
-        ("sync_runtime.rs", "cancel_sparse_v2_cold"),
-        ("sync_runtime.rs", "join_sparse_v2_shared"),
-        ("sync_runtime.rs", "keep_absence_sweep_deletion"),
-        ("sync_runtime.rs", "list_absence_sweeps"),
-        ("sync_runtime.rs", "prepare_sparse_v2_share"),
-        ("sync_runtime.rs", "reapply_absence_sweep"),
-        ("sync_runtime.rs", "restore_absence_sweep"),
-        ("sync_runtime.rs", "sparse_v2_clean_shutdown"),
-        ("sync_runtime.rs", "sparse_v2_editor_load"),
-        ("sync_runtime.rs", "sparse_v2_editor_save"),
-        ("sync_runtime.rs", "sparse_v2_query"),
-        ("sync_runtime.rs", "sparse_v2_recovery_location"),
-        ("sync_runtime.rs", "sparse_v2_status"),
-        ("sync_runtime.rs", "sparse_v2_tick"),
         ("watcher.rs", "set_watch_mode"),
     ];
 
@@ -415,6 +391,10 @@ mod tests {
         "get_backup_keep",
         "get_capture_enter_files",
         "get_link_first_match",
+        // SPEC §7.1: a total predicate over the IR it is handed. There is no
+        // failure mode to report -- the OG DSL either can say this query or
+        // cannot, and saying so is the whole point of the command.
+        "query_og_expressible",
         "get_smooth_scroll",
         "get_watch_mode",
         "gpu_env",
@@ -422,7 +402,6 @@ mod tests {
         "list_known_graphs",
         "list_spellcheck_dictionaries",
         "load_plugin_registry_cache",
-        "prepare_tine_quit",
         "rescan_graph_now",
         "startup_graph_path",
         "take_data_home_fallback_notice",
@@ -519,23 +498,16 @@ mod tests {
                 "Result<MediaCaptureResult, crate::command_error::CommandError>".into(),
             );
         }
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let selected = if module_path.is_empty() {
             None
         } else {
             Some(format!("{module_path}.rs"))
         };
         let mut matches = Vec::new();
-        for entry in std::fs::read_dir(source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let file = path.file_name().unwrap().to_string_lossy().to_string();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if selected.as_ref().is_some_and(|selected| selected != &file) {
                 continue;
             }
-            let source = std::fs::read_to_string(path).unwrap();
             for (found, signature) in command_signatures(&source) {
                 if found == name {
                     matches.push((file.clone(), signature));
@@ -567,7 +539,9 @@ mod tests {
 
     #[test]
     fn phase_a_command_error_manifest_is_exact_for_every_target() {
-        let commands = include_str!("commands.rs");
+        let commands = crate::test_support::rust_module_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+        );
         let state = include_str!("state.rs");
         let command_error = include_str!("command_error.rs");
         assert!(
@@ -625,20 +599,9 @@ mod tests {
                 && !direct_mapper.contains("CommandError::from"),
             "DirectSaveError must retain its closed code and epoch in Tagged, never Io/Prose"
         );
-        let close = commands
-            .split("pub(crate) fn close_graph_window")
-            .nth(1)
-            .unwrap()
-            .split("#[tauri::command]")
-            .next()
-            .unwrap();
-        assert!(
-            close.contains("CommandError::tagged(\"sparse-shutdown-refused\""),
-            "close_graph_window must delegate its refusal to the Tagged mapper"
-        );
 
         let worker_mapper = ".map_err(CommandError::worker)";
-        let mut rest = commands;
+        let mut rest = commands.as_str();
         while let Some(at) = rest.find(worker_mapper) {
             assert!(
                 rest[..at].trim_end().ends_with(".await"),
@@ -670,19 +633,12 @@ mod tests {
     /// plugin system, whose only producer is `plugins.rs`.
     #[test]
     fn native_platform_calls_convert_through_a_family_constructor() {
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         let mut checked = 0_usize;
-        for entry in std::fs::read_dir(&source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let file = path.file_name().unwrap().to_string_lossy().to_string();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if file == "backend_command_parity.rs" {
                 continue;
             }
-            let source = std::fs::read_to_string(&path).unwrap();
             for call in ["run_mobile_plugin", ".open_url("] {
                 let mut offset = 0;
                 while let Some(relative) = source[offset..].find(call) {
@@ -722,22 +678,13 @@ mod tests {
 
     #[test]
     fn phase_b_command_error_manifest_is_exact_for_every_target() {
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut string_results = Vec::new();
         let mut phase_b_sources = Vec::new();
-        for entry in std::fs::read_dir(source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if result_error_is_string(&source) {
-                string_results.push(path.file_name().unwrap().to_string_lossy().to_string());
+                string_results.push(file.clone());
             }
-            phase_b_sources.push((
-                path.file_name().unwrap().to_string_lossy().to_string(),
-                source,
-            ));
+            phase_b_sources.push((file, source));
         }
         assert!(
             string_results.is_empty(),
@@ -751,7 +698,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (498, 17_903_180_402_005_549_371),
+            (240, 13_237_046_910_067_947_179),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \
@@ -849,10 +796,7 @@ mod tests {
             ),
             ("graph_verification", &["graph_verification.rs"]),
             ("graph", &["graph.rs", "watcher.rs"]),
-            (
-                "sync_runtime",
-                &["sync_runtime.rs", "storage_mode_supervisor.rs"],
-            ),
+            ("storage_transition", &["storage_transition_supervisor.rs"]),
             ("settings", &["settings.rs"]),
             ("diagnostic", &["debug.rs"]),
             ("backup", &["backup.rs"]),
@@ -863,7 +807,6 @@ mod tests {
                     "graph_verification.rs",
                     "plugins.rs",
                     "settings.rs",
-                    "sync_runtime.rs",
                 ],
             ),
         ];

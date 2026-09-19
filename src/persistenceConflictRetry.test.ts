@@ -17,10 +17,9 @@ const calls: {
   name: string;
   force: boolean;
   conflictEpoch: number | null;
-  managedConflictObservation: { path: string; revision: string } | null;
 }[] = [];
 let nextResult: (() => Promise<{ revision: string }>) | null = null;
-let observedManagedPage: { rev: string; path: string } | null = null;
+let observedPage: { rev: string; path: string } | null = null;
 let draftPath = "pages/Notes.md";
 
 vi.mock("./store", () => ({
@@ -46,11 +45,6 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
-  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
-    constructor(readonly reasonCode: string) {
-      super("managed actor refusal");
-    }
-  },
   isSaveConflictError: (error: unknown) =>
     typeof error === "object" && error !== null && "kind" in error && error.kind === "save-conflict",
   backend: () => ({
@@ -59,15 +53,14 @@ vi.mock("./backend", () => ({
       _baseRev: string | null,
       force: boolean,
       conflictEpoch: number | null,
-      managedConflictObservation: { path: string; revision: string } | null,
     ) => {
-      calls.push({ name: page.name, force, conflictEpoch, managedConflictObservation });
+      calls.push({ name: page.name, force, conflictEpoch });
       const result = nextResult;
       nextResult = null;
       return result ? result() : Promise.resolve({ revision: "rev-after" });
     },
-    getPageByPath: () => Promise.resolve(observedManagedPage),
-    getPage: () => Promise.resolve(observedManagedPage),
+    getPageByPath: () => Promise.resolve(observedPage),
+    getPage: () => Promise.resolve(observedPage),
   }),
 }));
 
@@ -85,11 +78,9 @@ vi.mock("./ui", () => ({
 
 const {
   canForceSave,
-  flushPage,
   forceSave,
   markDirty,
   resetSaveState,
-  setBaseRev,
 } = await import("./persistence");
 
 // GH #254 increment 2, fourth correction-delta re-verification, HIGH. A Direct
@@ -111,7 +102,7 @@ describe("a failure is classified by its code, not by the page's name", () => {
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
-    observedManagedPage = null;
+    observedPage = null;
     draftPath = "pages/Notes.md";
     resetSaveState();
   });
@@ -134,7 +125,7 @@ describe("a failure is classified by its code, not by the page's name", () => {
         kind: "direct-save-failure",
         reasonCode: "precheck.symlink",
         ioErrorKind: "InvalidInput",
-        message: `managed text entry is a symlink or reparse point: pages/${name}.md`,
+        message: `graph text entry is a symlink or reparse point: pages/${name}.md`,
       });
 
       expect(await forceSave(name)).toBe(false);
@@ -174,7 +165,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
-    observedManagedPage = null;
+    observedPage = null;
     draftPath = "pages/Notes.md";
     resetSaveState();
   });
@@ -226,104 +217,5 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(false);
     expect(calls.length).toBe(1);
-  });
-});
-
-describe("managed save conflict resolution", () => {
-  beforeEach(() => {
-    calls.length = 0;
-    toasts.length = 0;
-    conflicted.clear();
-    nextResult = null;
-    observedManagedPage = null;
-    draftPath = "pages/Notes.md";
-    resetSaveState();
-  });
-
-  it("retains the draft and binds Keep mine to the exact managed revision it observed", async () => {
-    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-
-    expect(await flushPage("Notes")).toBe(false);
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(true);
-
-    nextResult = () => Promise.resolve({ revision: "managed-mine" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      conflictEpoch: null,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-a",
-      },
-    });
-  });
-
-  it("re-observes after a second managed winner and never upgrades an earlier click", async () => {
-    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-    await flushPage("Notes");
-
-    observedManagedPage = { rev: "managed-winner-b", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    expect(await forceSave("Notes")).toBe(false);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-a",
-      },
-    });
-
-    nextResult = () => Promise.resolve({ revision: "managed-mine" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[2]).toMatchObject({
-      force: true,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-b",
-      },
-    });
-  });
-
-  it("binds a losing new-page draft to the identifiable winner's exact path and revision", async () => {
-    draftPath = "";
-    observedManagedPage = { rev: "managed-created-winner", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: page_already_exists");
-    markDirty("Notes");
-
-    expect(await flushPage("Notes")).toBe(false);
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(true);
-
-    nextResult = () => Promise.resolve({ revision: "managed-new-draft-won" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      conflictEpoch: null,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-created-winner",
-      },
-    });
-  });
-
-  it("fails closed when the exact managed owner was deleted or renamed", async () => {
-    observedManagedPage = null;
-    nextResult = () => Promise.reject("managed.conflict: missing_page");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-
-    await flushPage("Notes");
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(false);
-    const before = calls.length;
-    expect(await forceSave("Notes")).toBe(false);
-    expect(calls).toHaveLength(before);
   });
 });

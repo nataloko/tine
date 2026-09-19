@@ -3,11 +3,11 @@ import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
 import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
 import { activeId, closeTab, route, tabRoute, tabs } from "../router";
-import { backend } from "../backend";
+import { backend, QueryNotReadyError } from "../backend";
 import { closePane, focusPane, layoutPaneIds, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
 import { loadSingle, resetStore } from "../store";
-import type { PageDto, SparseV2Status } from "../types";
-import { managedStorageRuntime } from "../managedStorageRuntime";
+import type { PageDto } from "../types";
+import { graphBindingRuntime } from "../graphBindingRuntime";
 import { resetSaveState } from "../persistence";
 
 beforeEach(() => {
@@ -22,7 +22,7 @@ afterEach(() => {
   setRightSidebar([]);
   setRightSidebarOpen(false);
   resetPaneLayoutToSingle({ tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }], activeIndex: 0 });
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   resetStore();
   setGraphMeta(null);
   setGraphTransitioning(false);
@@ -30,63 +30,25 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher search syntax help", () => {
-  it("explains that managed search stays complete while its index builds", async () => {
-    const bindingGeneration = 7;
-    const status: SparseV2Status = {
-      state: "active",
-      runtime: {
-        lifecycle: "active",
-        recovery: "first_promotion",
-        watcher: {
-          latest_enqueue: 0,
-          acknowledged: 0,
-          drain_in_flight: false,
-          pending: false,
-          pending_requires_full_scan: false,
-          deferred: false,
-          quiescing: false,
-          sequence_exhausted: false,
-        },
-        last_tick: null,
-        detail: null,
-        shared_role: null,
-        shared_phase: null,
-        provider_pending: 0,
-        provider_runnable: false,
-        search_index_building: true,
-      },
-      can_activate: false,
-      can_retry: false,
-      can_cancel: true,
-      cancel_reason: null,
-      binding_generation: bindingGeneration,
-      application_page_admission: {
-        binding_generation: bindingGeneration,
-        authority: "managed_writable",
-        application_save_page_blocks: 511,
-        application_page_request_text_bytes: 1_048_576,
-        application_page_max_depth: 128,
-      },
-    };
-    managedStorageRuntime.bind(bindingGeneration, status.application_page_admission);
-    expect(managedStorageRuntime.receiveStatus(status)).toBe(true);
-    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
-      hits: [], diagnostics: [], explanation: { branches: [] }, cancelled: false,
-    });
 
+  it("says a rebuild is a rebuild while search is not ready", async () => {
+    // The index is REBUILDING, not merely catching up on edits. Keeping that
+    // distinction is the whole point of `searchIndexPendingMessage`, and it
+    // reaches the user only if this call site actually uses it: hardcoding the
+    // indexing sentence here still satisfied the helper's own unit test.
+    // Rejection is persistent on purpose — `runQueryWhenReady` retries on a real
+    // 100ms timer, so a reject-then-resolve mock would race the retry and could
+    // miss the pending state this test exists to observe.
+    vi.spyOn(backend(), "runGraphSearch").mockRejectedValue(new QueryNotReadyError("recovering"));
     const root = document.createElement("div");
     document.body.append(root);
     const dispose = render(() => <QuickSwitcher />, root);
     openSwitcher();
     const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
-    input.value = "needle";
+    input.value = "Needle";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
 
-    await vi.waitFor(() => {
-      expect(root.textContent).toContain(
-        "Search index building… Results remain complete but may be slower for a moment.",
-      );
-    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Rebuilding the search index"));
     dispose();
   });
 

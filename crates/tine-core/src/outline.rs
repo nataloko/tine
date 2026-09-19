@@ -11,29 +11,8 @@ use std::fmt;
 use std::ops::Range;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-#[cfg(test)]
 thread_local! {
     static OUTLINE_PARSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static MANAGED_PARSE_CENSUS_CALLS: AtomicUsize = AtomicUsize::new(0);
-/// Cross-thread parser-primitive counter for the ignored MS cost census. Run
-/// that probe with one test thread; ordinary assertions remain thread-local.
-#[cfg(test)]
-pub(crate) fn start_managed_parse_census() {
-    MANAGED_PARSE_CENSUS_CALLS.store(0, Ordering::Relaxed);
-    MANAGED_PARSE_CENSUS_ENABLED.store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-pub(crate) fn finish_managed_parse_census() -> usize {
-    MANAGED_PARSE_CENSUS_ENABLED.store(false, Ordering::Release);
-    MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel)
 }
 
 #[cfg(test)]
@@ -253,23 +232,21 @@ fn attach(stack: &mut Vec<(u32, usize, DocBlock)>, roots: &mut Vec<DocBlock>, bl
     }
 }
 
-fn build_tree(flat: Vec<(u32, DocBlock)>) -> (Vec<DocBlock>, usize) {
+fn build_tree(flat: Vec<(u32, DocBlock)>) -> Vec<DocBlock> {
     let mut roots = Vec::new();
     let mut stack: Vec<(u32, usize, DocBlock)> = Vec::new();
-    let mut maximum_depth = 0_usize;
     for (level, block) in flat {
         while stack.last().is_some_and(|(open, _, _)| *open >= level) {
             let (_, _, done) = stack.pop().expect("checked nonempty");
             attach(&mut stack, &mut roots, done);
         }
         let depth = stack.len().saturating_add(1);
-        maximum_depth = maximum_depth.max(depth);
         stack.push((level, depth, block));
     }
     while let Some((_, _, done)) = stack.pop() {
         attach(&mut stack, &mut roots, done);
     }
-    (roots, maximum_depth)
+    roots
 }
 
 fn markdown_preamble(
@@ -346,9 +323,6 @@ fn parse_document_uncached(
     #[cfg(test)]
     {
         OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
-        if MANAGED_PARSE_CENSUS_ENABLED.load(Ordering::Relaxed) {
-            MANAGED_PARSE_CENSUS_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
     }
     let outline = lsdoc::parse_outline(source, format.lsdoc_name())
         .map_err(|_| OutlineAdapterError::ParserOwnership)?;
@@ -367,8 +341,6 @@ fn parse_document_uncached(
             blank_lines_after_preamble: 0,
             leading_blank_lines: 0,
             promoted_heading_layout: None,
-            outline_nodes: 0,
-            outline_depth: 0,
         });
     }
 
@@ -477,8 +449,7 @@ fn parse_document_uncached(
         }
         _ => None,
     };
-    let outline_nodes = flat.len();
-    let (roots, outline_depth) = build_tree(flat);
+    let roots = build_tree(flat);
     Ok(ParsedDocument {
         document: Document { pre_block, roots },
         block_spans,
@@ -487,8 +458,6 @@ fn parse_document_uncached(
         blank_lines_after_preamble,
         leading_blank_lines,
         promoted_heading_layout,
-        outline_nodes,
-        outline_depth,
     })
 }
 
@@ -600,7 +569,29 @@ mod tests {
                 .any(|pair| pair[0].line.start >= pair[1].line.start)
     }
 
-    fn assert_differential(label: &str, input: &str, format: OutlineFormat) {
+    /// Markdown inputs whose format-preserving canonical save reshapes the
+    /// outline. Direct Files has no Markdown read-only gate: that refusal was
+    /// Managed Storage's import admission, removed with it (ADR 0066). So each
+    /// entry is a page that an edit elsewhere restructures on save. A new entry
+    /// is a serializer regression and a vanished one is a fix; update the list
+    /// deliberately either way.
+    const MARKDOWN_SAVE_RESHAPES: &[&str] = &[];
+    /// Generated layouts: the three indented lone-CR variants reshape on
+    /// canonical save, the shape minimized in
+    /// `lone_cr_fence_reclassification_reshapes_the_outline_on_canonical_save`.
+    /// No file of the anonymized real graph changes structure on save.
+    const GENERATED_MARKDOWN_SAVE_RESHAPES: &[&str] = &[
+        "generated-md-\"    \"-cr",
+        "generated-md-\"  \"-cr",
+        "generated-md-\"\\t\"-cr",
+    ];
+
+    /// Runs the parser differential for one input and reports whether the
+    /// format-preserving canonical save would reshape a Markdown outline. An
+    /// Org mismatch must be refused by the production read-only gate
+    /// (`org::org_editable`); Markdown has no such gate, so the caller pins
+    /// the exact set instead of excusing it with a predicate nothing consults.
+    fn assert_differential(label: &str, input: &str, format: OutlineFormat) -> bool {
         let direct = lsdoc::parse_outline(input, format.lsdoc_name())
             .unwrap_or_else(|error| panic!("{label}: lsdoc ownership failure: {error}"));
         let parsed = match parse_document(input, format) {
@@ -611,7 +602,7 @@ mod tests {
                     "{label}: unexpected adapter refusal {error}; events={:?}",
                     direct.headers
                 );
-                return;
+                return false;
             }
         };
         assert!(
@@ -632,16 +623,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             event_locators(&direct.headers),
             "{label}: parser-level topology"
-        );
-        assert_eq!(parsed.outline_nodes, direct.headers.len(), "{label}");
-        assert_eq!(
-            parsed.outline_depth,
-            blocks
-                .iter()
-                .map(|(locator, _)| locator.len())
-                .max()
-                .unwrap_or(0),
-            "{label}: tree depth"
         );
 
         for (index, ((_, block), header)) in blocks.iter().zip(direct.headers.iter()).enumerate() {
@@ -671,16 +652,28 @@ mod tests {
         };
         let reparsed = parse_document(&canonical, format)
             .unwrap_or_else(|error| panic!("{label}: canonical output refused: {error}"));
-        if reparsed.document != parsed.document {
-            let safely_refused = match format {
-                OutlineFormat::Markdown => !doc::markdown_structurally_round_trips(input),
-                OutlineFormat::Org => !crate::org::org_editable(input),
-            };
-            assert!(
-                safely_refused,
-                "{label}: semantic canonicalization mismatch was not refused"
-            );
+        if reparsed.document == parsed.document {
+            return false;
         }
+        match format {
+            OutlineFormat::Markdown => true,
+            OutlineFormat::Org => {
+                assert!(
+                    !crate::org::org_editable(input),
+                    "{label}: Org canonicalization mismatch was not refused by the read-only gate"
+                );
+                false
+            }
+        }
+    }
+
+    fn assert_pinned_reshapes(mut reshaped: Vec<String>, pinned: &[&str]) {
+        reshaped.sort();
+        assert_eq!(
+            reshaped, pinned,
+            "the set of Markdown inputs whose canonical save reshapes the outline changed; \
+             a new entry is a serializer regression (Direct Files saves it), a missing one is a fix"
+        );
     }
 
     #[test]
@@ -714,6 +707,7 @@ mod tests {
         assert!(corpus.provenance.selection.contains("tracked public cases"));
         assert_eq!(corpus.cases.len(), 1_895);
 
+        let mut reshaped = Vec::new();
         for case in corpus.cases {
             assert!(
                 corpus.provenance.sources.contains(&case.source),
@@ -725,8 +719,12 @@ mod tests {
             } else {
                 OutlineFormat::Markdown
             };
-            assert_differential(&format!("{}:{}", case.source, case.id), &case.input, format);
+            let label = format!("{}:{}", case.source, case.id);
+            if assert_differential(&label, &case.input, format) {
+                reshaped.push(label);
+            }
         }
+        assert_pinned_reshapes(reshaped, MARKDOWN_SAVE_RESHAPES);
     }
 
     #[test]
@@ -740,8 +738,6 @@ mod tests {
 
         let parsed = parse_document(&source, OutlineFormat::Markdown)
             .expect("large flat parser-owned outline");
-        assert_eq!(parsed.outline_nodes, BLOCKS);
-        assert_eq!(parsed.outline_depth, 1);
         assert_eq!(parsed.document.roots.len(), BLOCKS);
         assert_eq!(parsed.document.roots[0].raw, "block 0");
         assert_eq!(
@@ -760,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_layout_mutations_preserve_topology_or_refuse_safely() {
+    fn generated_layout_mutations_preserve_topology_or_are_pinned() {
         let markdown = concat!(
             "title:: café Ω\n",
             "\n",
@@ -792,21 +788,26 @@ mod tests {
             "#+BEGIN_NOTE\n",
             "* parser decides this\n",
         );
+        let mut reshaped = Vec::new();
         for indent in ["\t", "  ", "    "] {
             let markdown = markdown.replace("{i}", indent);
             for (ending_name, ending) in [("lf", "\n"), ("crlf", "\r\n"), ("cr", "\r")] {
-                assert_differential(
-                    &format!("generated-md-{indent:?}-{ending_name}"),
+                let label = format!("generated-md-{indent:?}-{ending_name}");
+                if assert_differential(
+                    &label,
                     &with_line_endings(&markdown, ending),
                     OutlineFormat::Markdown,
-                );
-                assert_differential(
+                ) {
+                    reshaped.push(label);
+                }
+                assert!(!assert_differential(
                     &format!("generated-org-{indent:?}-{ending_name}"),
                     &with_line_endings(org, ending),
                     OutlineFormat::Org,
-                );
+                ));
             }
         }
+        assert_pinned_reshapes(reshaped, GENERATED_MARKDOWN_SAVE_RESHAPES);
     }
 
     #[test]
@@ -826,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn lone_cr_fence_reclassification_is_a_minimized_safe_refusal() {
+    fn lone_cr_fence_reclassification_reshapes_the_outline_on_canonical_save() {
         let input = "- root\r  ```\r  - fake\r  ```";
         let parsed = parse_document(input, OutlineFormat::Markdown)
             .expect("source events are representable");

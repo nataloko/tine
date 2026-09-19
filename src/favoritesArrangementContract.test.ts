@@ -2,16 +2,32 @@
 // docs/contracts/config-live-reload.md. A contract that can drift silently is
 // not a contract; this fails CI instead of letting the documents rot
 // (AGENTS.md §2, living contracts).
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource } from "./rustModelSource.test-helpers";
+
+function rustModuleSource(path: string): string {
+  const files = [path];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = path.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 
 const arrangement = readFileSync("docs/contracts/favorites-arrangement.md", "utf8");
 const reload = readFileSync("docs/contracts/config-live-reload.md", "utf8");
 const layout = readFileSync("src/favoritesLayout.ts", "utf8");
 const store = readFileSync("src/favoritesStore.ts", "utf8");
 const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
-const watcher = readFileSync("src-tauri/src/watcher.rs", "utf8");
-const model = readFileSync("crates/tine-core/src/model.rs", "utf8");
+const watcher = rustModuleSource("src-tauri/src/watcher.rs");
+const model = modelModuleSource();
 const graph = readFileSync("src/graph.ts", "utf8");
 
 describe("favorites arrangement contract matches the source", () => {
@@ -69,11 +85,21 @@ describe("config live-reload contract matches the source", () => {
 
   it("routes every settings write through one funnel that records it", () => {
     expect(reload).toContain("`Graph::write_config` is therefore the single funnel");
-    const config = readFileSync("crates/tine-core/src/config.rs", "utf8");
-    expect(config).toContain("fn write_config(");
     // No setter may go around it, or the watcher stops being able to tell
-    // Tine's own write from an outside one.
-    expect(config).not.toContain("crate::model::atomic_update(&path, &CONFIG_LOCK");
+    // Tine's own write from an outside one. Count the lock-taking write at any
+    // module path and anywhere in the crate: K5 moved `atomic_update` out of
+    // `model`, and a pattern spelled with the old path went blind (I-11).
+    const crateRoot = "crates/tine-core/src";
+    const crate = (readdirSync(crateRoot, { recursive: true }) as string[])
+      .filter((file) => file.endsWith(".rs"))
+      .sort()
+      .map((file) => readFileSync(join(crateRoot, file), "utf8"))
+      .join("\n");
+    expect([...crate.matchAll(/\batomic_update\([^)]*&CONFIG_LOCK\b/g)]).toHaveLength(1);
+    const funnelStart = model.indexOf("fn write_config(");
+    expect(funnelStart).toBeGreaterThan(-1);
+    const funnel = model.slice(funnelStart, model.indexOf("\n    }\n", funnelStart));
+    expect(funnel).toMatch(/\batomic_update\(path, &CONFIG_LOCK\b/);
     expect(watcher).toContain("lease.recent_config_write() == disk");
   });
 
@@ -81,12 +107,6 @@ describe("config live-reload contract matches the source", () => {
     expect(reload).toContain("`GraphMeta` derives `PartialEq`");
     expect(model).toContain("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\npub struct GraphMeta");
     expect(watcher).toContain("if after != before {");
-  });
-
-  it("remembers the last configuration seen for a managed root", () => {
-    expect(reload).toContain("`config_seen`");
-    expect(watcher).toContain("seen: &mut HashMap<PathBuf, Option<tine_core::model::ConfigDescription>>");
-    expect(watcher).toContain("if seen.get(root).copied() == Some(disk) {");
   });
 
   it("keeps ONE producer of config-derived frontend state", () => {

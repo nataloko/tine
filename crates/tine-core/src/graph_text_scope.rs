@@ -4,8 +4,8 @@
 //! the readable/indexable text scope. It deliberately grants no creation,
 //! projection, enrollment, rename, or deletion authority.
 
-use crate::oplog::{
-    managed_component_is_portable, CanonicalGraphResourceId, PortablePathKey,
+use crate::graph_text_path::{
+    graph_text_component_is_portable, CanonicalGraphResourceId, PortablePathKey,
     PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION, PORTABLE_PATH_KEY_VERSION,
     PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,
 };
@@ -17,7 +17,9 @@ use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// Version bound by later watcher, enrollment, backup, and restore packets.
-pub const GRAPH_TEXT_SCOPE_VERSION: u32 = 1;
+/// 2 (2026-09-14): `published-queries/` — the query-export output tree — became
+/// a fixed exclusion, so no scan admits pages out of an export.
+pub const GRAPH_TEXT_SCOPE_VERSION: u32 = 2;
 pub const GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_HIDDEN_EDN_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_HIDDEN_EDN_ENTRIES: usize = 1024;
@@ -607,7 +609,7 @@ fn lexical_components(relative: &str) -> Option<Vec<&str>> {
     let components = relative.split('/').collect::<Vec<_>>();
     components
         .iter()
-        .all(|component| managed_component_is_portable(component))
+        .all(|component| graph_text_component_is_portable(component))
         .then_some(components)
 }
 
@@ -625,6 +627,7 @@ fn fixed_excluded(components: &[&str]) -> bool {
         .any(|component| component.eq_ignore_ascii_case("node_modules"))
         || starts_with(components, &["assets"])
         || starts_with(components, &["publish"])
+        || starts_with(components, &[crate::vocab::PUBLISHED_QUERIES_DIR])
         || starts_with(components, &[".tine-sync"])
         || starts_with(components, &["logseq", ".recycle"])
         || starts_with(components, &["logseq", "bak"])
@@ -646,7 +649,7 @@ fn provider_conflict_copy(filename: &str) -> bool {
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(filename);
-    crate::model::is_sync_conflict(stem)
+    crate::vocab::is_sync_conflict(stem)
 }
 
 #[cfg(test)]
@@ -689,6 +692,9 @@ mod tests {
             "logseq/pages-metadata.edn",
             "assets/page.md",
             "publish/page.org",
+            "published-queries/open-tasks/page.md",
+            "published-queries/open-tasks/pages/nested.md",
+            "Published-Queries/x/page.md",
             ".tine-sync/page.md",
             "logseq/.tine-trash/pages/page.md",
             "archive/private/page.md",

@@ -24,9 +24,7 @@ pub(crate) fn backup_async(
     app: tauri::AppHandle,
     slot: Arc<GraphSlot>,
 ) -> Result<(), crate::command_error::CommandError> {
-    let graph = slot
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
     drop(graph);
     std::thread::spawn(move || {
@@ -426,9 +424,7 @@ pub(crate) fn set_backup_keep(
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
     let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
-    let graph = slot
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
@@ -483,8 +479,7 @@ pub(crate) async fn list_backups(
 ) -> Result<Vec<BackupInfo>, crate::command_error::CommandError> {
     let root = slot_for_context(&state)
         .map_err(crate::command_error::CommandError::from)?
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?
+        .graph()
         .root
         .clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -549,9 +544,7 @@ pub(crate) async fn restore_backup(
         ));
     }
     let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
-    let graph = slot
-        .legacy_graph_cloned()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -932,7 +925,7 @@ struct RestoreDirectoryBarriers {
     synced: std::sync::Mutex<
         std::collections::HashMap<
             (RestoreDirectoryRoot, std::path::PathBuf),
-            tine_core::oplog::object_store::ControlDirectoryIdentity,
+            tine_core::directory_identity::DirectoryIdentity,
         >,
     >,
 }
@@ -942,7 +935,7 @@ impl RestoreDirectoryBarriers {
         &self,
         root: RestoreDirectoryRoot,
         relative: &std::path::Path,
-        identity: tine_core::oplog::object_store::ControlDirectoryIdentity,
+        identity: tine_core::directory_identity::DirectoryIdentity,
         directory: &Dir,
         reprove_first_observation: bool,
     ) -> std::io::Result<()> {
@@ -965,7 +958,7 @@ impl RestoreDirectoryBarriers {
         &self,
         root: RestoreDirectoryRoot,
         relative: &std::path::Path,
-        identity: tine_core::oplog::object_store::ControlDirectoryIdentity,
+        identity: tine_core::directory_identity::DirectoryIdentity,
     ) -> std::io::Result<()> {
         self.synced
             .lock()
@@ -1050,7 +1043,7 @@ fn reserve_restore_recovery(
     sync_restore_directory(&parent)?;
     let dir = parent.open_dir(recovery_id)?;
     let recovery_relative = recovery_parent.join(recovery_id);
-    let recovery_identity = tine_core::oplog::object_store::control_directory_identity(&dir)
+    let recovery_identity = tine_core::directory_identity::directory_identity(&dir)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     directory_barriers.record_changed(
         RestoreDirectoryRoot::Live,
@@ -1096,7 +1089,7 @@ fn open_or_create_real_parent(
             ));
         }
         let child = current.open_dir(name)?;
-        let child_identity = tine_core::oplog::object_store::control_directory_identity(&child)
+        let child_identity = tine_core::directory_identity::directory_identity(&child)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let child_relative = current_relative.join(name);
         if created {
@@ -2793,8 +2786,8 @@ mod tests {
     }
 
     #[test]
-    fn managed_restore_collection_keeps_graph_relative_paths() {
-        let root = scratch("managed-restore-graph-wide");
+    fn restore_collection_keeps_graph_relative_paths() {
+        let root = scratch("graph-restore-graph-wide");
         let graph = root.join("graph");
         std::fs::create_dir_all(graph.join("archive/自由")).unwrap();
         std::fs::write(graph.join("Root.md"), "- root\n").unwrap();

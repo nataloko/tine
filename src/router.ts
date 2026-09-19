@@ -19,6 +19,12 @@ import {
   type HistoryRouteContext,
 } from "./store";
 import { backend } from "./backend";
+import {
+  normalizeFriendlyPageMatchScope,
+  normalizeQueryDisplayDraft,
+  type FriendlyPageMatchScope,
+  type QueryDisplayDraft,
+} from "./editor/queryDisplayDraft";
 import { renderedBlocks } from "./lazyObserve";
 import { navReuseTabs } from "./navSettings";
 import { isMobilePlatform } from "./nativeChrome";
@@ -100,6 +106,15 @@ export interface InvalidRoute {
 }
 
 export type QueryPresentation = "search" | "list" | "table" | "board";
+export type { FriendlyPageMatchScope } from "./editor/queryDisplayDraft";
+
+const QUERY_PRESENTATIONS: ReadonlySet<string> = new Set(["search", "list", "table", "board"]);
+
+export function normalizeQueryPresentation(value: unknown): QueryPresentation | null {
+  return typeof value === "string" && QUERY_PRESENTATIONS.has(value)
+    ? value as QueryPresentation
+    : null;
+}
 
 export interface QueryRoute {
   kind: "query";
@@ -109,6 +124,29 @@ export interface QueryRoute {
   sourceKind: "search" | "dsl";
   source: string;
   presentation: QueryPresentation;
+  /** The workspace's own display choices, as a complete snapshot of the
+   *  non-view half of `ViewSettings` (P5C).
+   *
+   *  A workspace has no block to hang `tine.*` properties on, so the draft lives
+   *  here. Three states, all meaningful:
+   *
+   *   * ABSENT — nothing chosen; the workspace inherits whatever the query text
+   *     already states.
+   *   * `{}` — every non-view setting explicitly cleared.
+   *   * populated — exactly these settings, and only these.
+   *
+   *  `presentation` above stays the only authority for the view, which is why
+   *  `QueryDisplayDraft` cannot carry one. Every value here has been through
+   *  `normalizeQueryDisplayDraft`. */
+  display?: QueryDisplayDraft;
+  /** Mixed-result overrides. Each absence inherits its singular counterpart;
+   *  a present empty draft clears only that result family. */
+  pagePresentation?: QueryPresentation;
+  pageDisplay?: QueryDisplayDraft;
+  blockPresentation?: QueryPresentation;
+  blockDisplay?: QueryDisplayDraft;
+  /** Friendly page membership. Absence retains historical name/alias matching. */
+  pageMatchScope?: FriendlyPageMatchScope;
 }
 
 export interface Tab {
@@ -161,7 +199,7 @@ export interface PaneRouter {
   updateActivePdfViewState(state: { page?: number; scale?: number }): void;
   closePdf(): Promise<boolean>;
   openQueryInNewTab(source: string, presentation?: QueryPresentation, foreground?: boolean): QueryRoute;
-  updateActiveQuery(patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>): void;
+  updateActiveQuery(patch: QueryRoutePatch): void;
   replaceActiveRoute(route: Route): void;
   resetTabsToJournals(): void;
   openFile(
@@ -252,6 +290,88 @@ export function makeQueryRoute(
     source,
     presentation,
   };
+}
+
+/** What one atomic edit to the active query workspace may change.
+ *
+ *  Each singular or scoped display field distinguishes three cases:
+ *
+ *   * the key is ABSENT from the patch — a source-only or presentation-only
+ *     edit, which keeps whatever snapshot the route already had, `{}` included;
+ *   * an explicit `undefined` — remove that override and inherit its baseline;
+ *   * a present object — the new snapshot, which must normalize; `{}` stays a
+ *     present, explicit clear. */
+export type QueryRoutePatch =
+  Partial<Pick<QueryRoute,
+    | "source"
+    | "sourceKind"
+    | "presentation"
+    | "display"
+    | "pagePresentation"
+    | "pageDisplay"
+    | "blockPresentation"
+    | "blockDisplay"
+    | "pageMatchScope"
+  >>;
+
+/** The pure half of `updateActiveQuery`: the next route, or `null` when the
+ *  patch carries a display this build cannot read and the whole edit must be
+ *  refused. Exported so the future display panel can prevalidate exactly the
+ *  edit it is about to submit. */
+export function applyQueryRoutePatch(
+  current: QueryRoute,
+  patch: QueryRoutePatch,
+): QueryRoute | null {
+  const next: QueryRoute = { ...current };
+
+  if (Object.hasOwn(patch, "source")) {
+    if (typeof patch.source !== "string") return null;
+    next.source = patch.source;
+  }
+  if (Object.hasOwn(patch, "sourceKind")) {
+    if (patch.sourceKind !== "search" && patch.sourceKind !== "dsl") return null;
+    next.sourceKind = patch.sourceKind;
+  }
+  if (Object.hasOwn(patch, "presentation")) {
+    const presentation = normalizeQueryPresentation(patch.presentation);
+    if (!presentation) return null;
+    next.presentation = presentation;
+  }
+
+  for (const key of ["display", "pageDisplay", "blockDisplay"] as const) {
+    if (!Object.hasOwn(patch, key)) continue;
+    const value = patch[key];
+    if (value === undefined) {
+      delete next[key];
+      continue;
+    }
+    const display = normalizeQueryDisplayDraft(value);
+    if (!display) return null;
+    next[key] = display;
+  }
+
+  for (const key of ["pagePresentation", "blockPresentation"] as const) {
+    if (!Object.hasOwn(patch, key)) continue;
+    const value = patch[key];
+    if (value === undefined) {
+      delete next[key];
+      continue;
+    }
+    const presentation = normalizeQueryPresentation(value);
+    if (!presentation) return null;
+    next[key] = presentation;
+  }
+
+  if (Object.hasOwn(patch, "pageMatchScope")) {
+    if (patch.pageMatchScope === undefined) {
+      delete next.pageMatchScope;
+    } else {
+      const scope = normalizeFriendlyPageMatchScope(patch.pageMatchScope);
+      if (!scope) return null;
+      next.pageMatchScope = scope;
+    }
+  }
+  return next;
 }
 
 export function mintPdfViewId(used: ReadonlySet<string> = new Set()): string {
@@ -625,12 +745,15 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     return queryRoute;
   }
 
-  function updateActiveQuery(
-    patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>
-  ) {
+  function updateActiveQuery(patch: QueryRoutePatch) {
     const current = route();
     if (current.kind !== "query") return;
-    const next = { ...current, ...patch };
+    const next = applyQueryRoutePatch(current, patch);
+    // An unreadable display leaves the route ENTIRELY untouched — the source and
+    // presentation in the same patch included. A half-applied edit would be a
+    // silent partial success, and the display panel that will own this seam
+    // prevalidates with `normalizeQueryDisplayDraft` so it can say so visibly.
+    if (!next) return;
     setTabs(tabs().map((tab) => {
       if (tab.id !== activeId()) return tab;
       const history = [...tab.history];
@@ -1216,9 +1339,7 @@ export function openQueryInNewTab(
   return focusedRouterInstance().openQueryInNewTab(source, presentation, foreground);
 }
 
-export function updateActiveQuery(
-  patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>
-) {
+export function updateActiveQuery(patch: QueryRoutePatch) {
   focusedRouterInstance().updateActiveQuery(patch);
 }
 
