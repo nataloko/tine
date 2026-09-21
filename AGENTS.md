@@ -216,7 +216,31 @@ on this fork since; treat it as unverified, not as known-good.
 
 It needs cargo-nextest **exactly 0.9.143** (nixpkgs has 0.9.140, and the prebuilt
 binary needs `patchelf` on NixOS — see the `sync-upstream` skill for the one-time
-fix). TODO: record the v0.6.984 test count after the first full run of this gate.
+fix). NOTE: the patched interpreter is a `/nix/store` path, so a later garbage
+collection breaks the binary again with `cannot execute: required file not
+found`. Re-run the same `patchelf` line; the fix is idempotent.
+
+At v0.6.984 the gate reports `1630 tests run: 1628 passed (1 slow), 2 failed,
+36 skipped` in ~9.5 min, over a clean contract (`1630 release tests exactly once
+across 4 hash shards`, zero known-red exclusions). Both failures were triaged at
+that sync and NEITHER is a fork regression — the fork's only `crates/` change is
+the two producer-census pin rows:
+
+- `model::tests::the_registry_build_is_measured_and_bounded` asserts
+  `median < 2_000_000` µs and measured 2,460,217 µs under full-run contention.
+  It PASSES in isolation on this host. A performance bound, so treat a ~20%
+  overshoot here as the weak CPU, and confirm in isolation before believing it.
+- `direct_projection::tests::cold_open_streams_without_retaining_the_graph`
+  fails deterministically in 0.8s on
+  `assert!(!graph.has_parsed_cache_test())` ("a cold open must stream, not pin
+  the graph"). Not timing. Verified by running it on a detached, pristine
+  `v0.6.984` with no fork code present, where it fails identically: this is an
+  UPSTREAM failure on Linux, reproducible from their own release tag. Re-check
+  it the same way next sync rather than assuming the fork broke it.
+
+`derived_cache_fuzz::derived_cache_matches_fresh_under_random_edits` also runs
+~365s here and trips nextest's SLOW marker while still passing; its 5-minute
+per-test timeout leaves little headroom on this host.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.
