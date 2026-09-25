@@ -32,10 +32,19 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
 
 - Bullet threading: `src/bulletThreading.ts`,
   `src/components/block/bulletThread.tsx`, and a few call sites in
-  `src/components/Block.tsx`. Since v0.6.984 the presentation lives in that
+  `src/components/Block.tsx`. Since v0.6.986 the fork also re-pins upstream's new
+  `src/e2eLabelSelectorRatchet.test.ts`: upstream's plugin-registry fixture ships
+  a community plugin whose display name is literally "Bullet threading"
+  (`page.tine.bullet-threading`), and the fork's extras tab labels its toggle the
+  same way, so that journey's selector reclassifies from fixture string to `src/`
+  match — `scripts/e2e-plugins.mjs` is `[1, 5]` here where upstream has `[0, 6]`.
+  A pure classification move; the journey still selects the plugin card, not a
+  Settings tab. Same false-positive family as the `query-filter` plugin below. Since v0.6.984 the presentation lives in that
   block module rather than inline, because upstream's budget B1
   (`src/fileSizeRatchet.test.ts`) caps a production file at 4,000 lines and
-  ships `Block.tsx` at 3,995 — five lines of headroom for the whole fork. The
+  shipped `Block.tsx` at 3,995 — five lines of headroom for the whole fork. At
+  v0.6.986 upstream reached 4,000 exactly, so there is now NO headroom and the
+  pin is the only thing holding the file. The
   extraction cut the fork's footprint there from 94 lines to 10, which is
   irreducible (two imports, a `classList` spread, a `style`, one element, the
   calc latch, and the calc slash case), so `Block.tsx` also carries the ONLY
@@ -67,7 +76,11 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   requires EVERY `Backend` method to be classified, so the seven `git*` methods
   are listed (with a `FORK:` comment) in `PUBLISHED_REFUSED_METHODS` —
   `gitStatus` included, since a baked export has no working tree to read. A new
-  fork backend command must be classified there or that guard goes red.
+  fork backend command must be classified there or that guard goes red. Since
+  v0.6.986 a fourth pin applies: upstream's `src/dataRevReads.guard.test.ts`
+  (GH #543 R11-09) demands a named owner for every `dataRev` use in `src/`, so
+  `src/git.ts` carries a `FORK:` row saying it owns no index read at all — its
+  one use arms the 60s auto-commit debounce.
 - "mine (extras)" settings tab: `src/components/Settings.tsx`.
 - Notification-only updater: `src/update.ts`, `src/update.test.ts`, and
   `src/components/AboutTab.tsx`. One behavior drives all of it — `updateMode()`
@@ -94,7 +107,11 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
 - Fork CSS: `src/styles/app/70-mine.css`, imported last from
   `src/styles/app.css`. Upstream split `app.css` into `src/styles/app/00..40-*.css`
   at v0.6.984 and those modules sit at their B1 budget, so fork rules appended
-  into them push the file over the cap AND collide every sync. Everything the
+  into them push the file over the cap AND collide every sync. Upstream then took
+  `50-conflict-overview.css` and `60-indexing-progress.css` at v0.6.986, so the
+  fork's module moved from `50-mine.css` to `70-mine.css`: the import list
+  conflicts EVERY sync (both sides append), and the fork's entry must end up last.
+  Renumber rather than let a low number sit below a higher one. Everything the
   fork styles (`.thread-svg`, `.git-badge`, `.git-actions`) lives in this one
   file it owns outright. All new selectors, so its last position only decides
   ties. `src/testSource.ts::readAppStylesheet` expands `@import`s, so every CSS
@@ -102,6 +119,12 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   declarations BEFORE any `@media`/`@container` that overrides them.
 - Fork ADRs: `docs/adr/mine/` (its own numbering and README), not the upstream
   `docs/adr/` sequence.
+- Fork doc notes: `docs/DEVELOPING.md` carries the `CARGO_TARGET_DIR` /
+  persistent-cache paragraph. It lived in `README.md` until v0.6.986, when
+  upstream's website-and-README reorg moved the whole Build-and-run section out
+  to `docs/DEVELOPING.md` and `docs/RELEASE-CHECKLIST.md`. `README.md` is now
+  taken from upstream verbatim; if a sync conflicts there again, check where the
+  section went before re-applying anything.
 
 ### Retired
 
@@ -164,11 +187,14 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
 
 Source `scripts/env.sh` first. It configures the Rust toolchain paths, native
 library paths, and persistent build cache. It activates only when
-`../.toolchain/cargo/bin/rustup` exists; if that mount has been wiped it stays
-silent, `CARGO_TARGET_DIR` is never exported, and the repo's `./target` symlink
-dangles — cargo then fails with `failed to create directory .../target: Not a
-directory`. Fix with `mkdir -p ../.toolchain/target` (the symlink resolves again
-and the cache stays off the repo); `nix-shell` supplies cargo/rustc regardless.
+`../.toolchain/cargo/bin/rustup` exists. That mount gets wiped periodically, and
+then env.sh stays silent and never exports `CARGO_TARGET_DIR`. That alone is
+harmless — the repo's `./target` symlink still points at
+`../.toolchain/target`, so cargo writes to the persistent mount anyway and the
+cache stays warm. What breaks is the symlink DANGLING, i.e. the target directory
+itself gone: cargo then fails with `failed to create directory .../target: Not a
+directory`. Fix with `mkdir -p ../.toolchain/target`. Either way `nix-shell`
+supplies cargo/rustc, so check the symlink target before assuming env.sh matters.
 
 Cargo commands run in `nix-shell` with `cargo rustc gcc pkg-config`. The `tine`
 app crate also needs `webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk
@@ -192,9 +218,17 @@ run and 19 on the next, across `store.test.ts`'s selection-move burst cases, the
 source-scanning guards (`conflictAuthority`, `resourceReads`, `clipboard`,
 `pagePropsEditorSurface`), `themeCheckerCli`, `systemBars`, `systemTheme` and
 `clipboard.paste`. Every one passed in isolation, and the whole suite is green
-at `npx vitest run --maxWorkers=2 --testTimeout=30000` (3,695 passed, 1 skipped,
-~4.5 min). Use that invocation as the real signal; a failure that survives it is
-a real failure. None of these tests is modified by the fork.
+at `npx vitest run --maxWorkers=2 --testTimeout=30000` (4,053 passed, 2 skipped,
+~4.5 min at v0.6.986). Use that invocation as the real signal; a failure that
+survives it is a real failure. None of these tests is modified by the fork.
+
+`npm test` is more than Vitest, and upstream keeps adding steps to it — at
+v0.6.986 it also runs `test:search-scaling-fixture`, `test:script-identifiers`
+and `test:e2e-provenance`, and `test:e2e-harness` grew to seven files. Run the
+two Vitest passes with the worker settings above, then the remaining `npm test`
+scripts individually; all of them are quick. The render pass
+(`vitest run --config vitest.render.config.ts`) takes ~13.5 min here on its own
+(229 files, 2,040 tests).
 
 **The known-red exclusion list is now EMPTY, and the machinery that carried it is
 gone.** Every red it ever named was a Managed Storage runtime defect, and v0.6.984
@@ -208,8 +242,10 @@ an open-bug declaration, not a waiver.
 
 Keep running the contract script rather than bare `cargo test -p tine-core`
 anyway: it is upstream's actual release gate and it is the stricter one — four
-hash shards, one process per test, a 5-minute per-test timeout with
-`on-timeout = "fail"`, and no retries, none of which plain libtest gives you.
+hash shards, one process per test, and no retries, none of which plain libtest
+gives you. The timeout is `slow-timeout = { period = "5m", terminate-after = 2,
+on-timeout = "fail" }` in `.config/nextest.toml`: a test is MARKED slow at 5
+minutes but KILLED at 10, which matters on this host (see the fuzz test below).
 The old hazard (scenarios that never terminate, so the bare run hangs and prints
 no summary) left with Managed Storage, but the bare command has NOT been re-tested
 on this fork since; treat it as unverified, not as known-good.
@@ -220,27 +256,37 @@ fix). NOTE: the patched interpreter is a `/nix/store` path, so a later garbage
 collection breaks the binary again with `cannot execute: required file not
 found`. Re-run the same `patchelf` line; the fix is idempotent.
 
-At v0.6.984 the gate reports `1630 tests run: 1628 passed (1 slow), 2 failed,
-36 skipped` in ~9.5 min, over a clean contract (`1630 release tests exactly once
-across 4 hash shards`, zero known-red exclusions). Both failures were triaged at
-that sync and NEITHER is a fork regression — the fork's only `crates/` change is
-the two producer-census pin rows:
+At v0.6.986 the gate reports `1949 tests run: 1946 passed (1 slow), 2 failed,
+1 timed out, 44 skipped` in ~20 min. All three reds were triaged at that sync and
+NONE is a fork regression. The proof is structural rather than comparative: the
+fork's ENTIRE `crates/` delta against the release tag is 8 added lines inside two
+`#[test]` pin tables in `projection_producer_census.rs`
+(`git diff --stat v0.6.986 mine -- crates/`). Test-only data tables cannot change
+runtime throughput or scheduling, so a slow or worker-starved core test here is
+this host, not the fork. Re-run that one-line diff next sync before spending time
+on a pristine-tree comparison.
 
 - `model::tests::the_registry_build_is_measured_and_bounded` asserts
-  `median < 2_000_000` µs and measured 2,460,217 µs under full-run contention.
-  It PASSES in isolation on this host. A performance bound, so treat a ~20%
-  overshoot here as the weak CPU, and confirm in isolation before believing it.
-- `direct_projection::tests::cold_open_streams_without_retaining_the_graph`
-  fails deterministically in 0.8s on
-  `assert!(!graph.has_parsed_cache_test())` ("a cold open must stream, not pin
-  the graph"). Not timing. Verified by running it on a detached, pristine
-  `v0.6.984` with no fork code present, where it fails identically: this is an
-  UPSTREAM failure on Linux, reproducible from their own release tag. Re-check
-  it the same way next sync rather than assuming the fork broke it.
+  `median < 2_000_000` µs. Measured 4,240,687 µs in the full run and 2,138,153 µs
+  in isolation — so at v0.6.986 it fails even ALONE, by ~7%, where at v0.6.984 it
+  still passed in isolation at 2,460,217 µs under contention. A performance bound
+  on a weak CPU, not a correctness failure. Expect it to stay red.
+- `model::tests::gh543_r12::a_corrupt_derived_row_asks_for_a_new_image` (new at
+  this release) fails in the full run and PASSES in isolation in 0.78s. It waits
+  on a background index worker (`wait_ready(10s)`, `wait_drained_test()`), and the
+  failure's own state dump shows the tell: `rebuild=true building=false
+  worker_available=true worker_busy=false` — the rebuild was owed and never got
+  scheduled. Contention, not logic. Check it in isolation first.
+- `derived_cache_fuzz::derived_cache_matches_fresh_under_random_edits` is now
+  KILLED at the 600s terminate-after bound. It still PASSES in isolation, in
+  798s — up from ~365s at v0.6.984 although the test file itself is byte-identical
+  upstream, because the derived-cache path under it was rewritten by the GH #543
+  and compact-projection work. A duration problem on this host only.
 
-`derived_cache_fuzz::derived_cache_matches_fresh_under_random_edits` also runs
-~365s here and trips nextest's SLOW marker while still passing; its 5-minute
-per-test timeout leaves little headroom on this host.
+Upstream's v0.6.984 red
+`direct_projection::tests::cold_open_streams_without_retaining_the_graph` is FIXED
+at v0.6.986 and no longer appears; the note about reproducing it on a pristine tag
+can go.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.
