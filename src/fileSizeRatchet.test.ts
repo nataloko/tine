@@ -30,15 +30,15 @@ const SKIPPED_DIRS = new Set(["node_modules", "target", "dist", "vendor", "gen"]
 
 /** Files above their cap when the ratchet landed, pinned at that length. */
 const PINNED: Record<string, number> = {
-  // FORK: upstream ships Block.tsx at 3,995 lines — 5 under the cap — so any
-  // fork feature that touches it is over budget on arrival. The fork's threading
-  // and calc-block bodies already live out of the file, in
-  // src/components/block/{bulletThread.tsx,calcBlock.ts}, which readBlockModuleSource()
-  // globs; what remains is 10 call-site lines and cannot be cut further. A pin
-  // is keyed by path and length, not by line number, so it does not drift the
-  // way a line-anchored allowlist does. On a sync this fails with the exact new
-  // number to use: take it.
-  "src/components/Block.tsx": 4005,
+  // FORK: upstream ships Block.tsx at 4,000 lines — the cap exactly, with no
+  // headroom at all — so any fork feature that touches it is over budget on
+  // arrival. The fork's threading and calc-block bodies already live out of the
+  // file, in src/components/block/{bulletThread.tsx,calcBlock.ts}, which
+  // readBlockModuleSource() globs; what remains is 10 call-site lines and cannot
+  // be cut further. A pin is keyed by path and length, not by line number, so it
+  // does not drift the way a line-anchored allowlist does. On a sync this fails
+  // with the exact new number to use: take it.
+  "src/components/Block.tsx": 4010,
 };
 
 export function isTestFile(relative: string): boolean {

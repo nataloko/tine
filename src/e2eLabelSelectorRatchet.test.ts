@@ -83,7 +83,13 @@ const ALLOWED: Record<string, [number, number]> = {
   "e2e-native-titlebar.mjs": [1, 0],
   "e2e-og-parity-references.mjs": [1, 0],
   "e2e-pdf-routes.mjs": [1, 0],
-  "e2e-plugins.mjs": [0, 6],
+  // FORK: upstream's registry fixture ships a community plugin whose display
+  // name is literally "Bullet threading" (page.tine.bullet-threading), and the
+  // fork's "mine (extras)" tab labels its own threading toggle the same way. The
+  // journey still selects the plugin card, not a Settings tab — only the
+  // classifier moved, because the string now appears in src/ too. Upstream's
+  // number here is [0, 6].
+  "e2e-plugins.mjs": [1, 5],
   "e2e-search-parity.mjs": [1, 0],
   "e2e-theme-presentation.mjs": [1, 2],
 };

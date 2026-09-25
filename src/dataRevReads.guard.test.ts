@@ -27,6 +27,11 @@ const OWNERS: Record<string, { uses: number; owner: string }> = {
   "src/App.tsx": { uses: 1, owner: "refreshAliases single-flight (src/graph.ts)" },
   "src/components/Block.tsx": { uses: 1, owner: "templates: read on user request, not per save" },
   "src/sheet/formulaEval.ts": { uses: 2, owner: "no backend read (formula recompute)" },
+  // FORK: the git integration reads no index. Its one use arms a 60s idle
+  // debounce (`on(dataRev, ...)`, defer:true) so an auto-commit lands after a
+  // save batch has quiesced; the backend call it eventually makes is `git_commit`,
+  // which never touches the projection.
+  "src/git.ts": { uses: 1, owner: "no backend read (arms the auto-commit debounce)" },
 };
 const LANED = [
   "src/blockRefCounts.ts",
